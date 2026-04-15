@@ -82,6 +82,26 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_hip_batched_matmul_view(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_rank: c_int,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs_batch_strides: *const c_int,
+        rhs_batch_strides: *const c_int,
+        out_batch_dims: *const c_int,
+        lhs_row_stride: c_int,
+        lhs_k_stride: c_int,
+        rhs_k_stride: c_int,
+        rhs_col_stride: c_int,
+        lhs: *const c_void,
+        rhs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     // ---- Original prefill kernel declarations ----
 
     fn dotcache_qwen35_hip_embedding_lookup(
@@ -491,6 +511,50 @@ pub fn mul_scalar(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("mul_scalar failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Matmul with transposed rhs (y = x @ W^T) ----
+
+/// Matrix multiply with transposed rhs: out [m, n] = lhs [m, k] × rhs^T where rhs is [n, k].
+/// This is the standard linear projection: y = x @ W.T where W is [out_dim, in_dim].
+pub fn matmul_rhs_transposed(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let batch_dims = [batch_elems as c_int];
+    let batch_strides = [1 as c_int]; // no batching
+    let status = unsafe {
+        dotcache_qwen35_hip_batched_matmul_view(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            1, // batch_rank
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            batch_strides.as_ptr(), // lhs_batch_strides
+            batch_strides.as_ptr(), // rhs_batch_strides
+            batch_dims.as_ptr(),    // out_batch_dims
+            k as c_int,            // lhs_row_stride = k (standard row-major)
+            1,                      // lhs_k_stride = 1 (contiguous)
+            1,                      // rhs_k_stride = 1 (k dim contiguous in rhs)
+            k as c_int,            // rhs_col_stride = k (virtually transpose: rhs[kk,col] reads rhs_data[col*k + kk])
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("matmul_rhs_transposed failed: {status}")));
     }
     Ok(())
 }

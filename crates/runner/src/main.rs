@@ -227,7 +227,7 @@ fn main() -> Result<()> {
             &prompt_ids,
             cli.max_new_tokens,
             &cli.oracle_dtype,
-            false, // don't need state — just logits for comparison
+            false, // only need logits for comparison
         )?;
 
         // Compare prefill logits

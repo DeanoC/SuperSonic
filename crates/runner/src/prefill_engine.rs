@@ -227,6 +227,7 @@ pub fn prefill(
 
         // MLP: gate_proj + up_proj → SwiGLU → down_proj → residual add
         prefill_mlp_layer(weights, &mut scratch, config, idx, seq_len, ordinal)?;
+
     }
 
     // 3. Final RMSNorm on last token only
@@ -304,224 +305,152 @@ fn prefill_full_attention_layer(
     let num_q_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
-    let q_dim = num_q_heads * head_dim;
+    let q_dim = num_q_heads * head_dim;           // 2048 — query-only dimension
+    let q_proj_dim = num_q_heads * head_dim * 2;  // 4096 — query + gate (gated attention)
     let kv_dim = num_kv_heads * head_dim;
     let rotary_dim = config.rotary_dim();
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
 
-    // 1. Q projection: normed [seq, hidden] × q_proj_w [q_dim, hidden]^T → [seq, q_dim]
-    prefill_ffi::batched_matmul(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        seq_len,
-        q_dim,
-        hidden_dim,
-        &scratch.normed,
-        &fw.q_proj_w,
-        &mut scratch.proj_buf,
+    // 1. Q projection: normed [seq, hidden] × q_proj_w [q_proj_dim, hidden]^T → [seq, q_proj_dim]
+    //    Output layout per head: [query(head_dim) | gate(head_dim)]
+    let mut q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_proj_dim])
+        .map_err(|e| anyhow::anyhow!("q_full alloc: {e}"))?;
+    prefill_ffi::matmul_rhs_transposed(
+        ordinal, ScalarType::BF16, 1, seq_len, q_proj_dim, hidden_dim,
+        &scratch.normed, &fw.q_proj_w, &mut q_full,
     )?;
 
-    // 2. K projection: normed [seq, hidden] × k_proj_w [kv_dim, hidden]^T → [seq, kv_dim]
-    prefill_ffi::batched_matmul(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        seq_len,
-        kv_dim,
-        hidden_dim,
-        &scratch.normed,
-        &fw.k_proj_w,
-        &mut scratch.proj_buf2,
-    )?;
-
-    // 3. Q normalization: RMSNorm per head [seq*num_q_heads, head_dim]
-    //    In-place: proj_buf treated as [seq*num_q_heads, head_dim]
-    {
-        let mut q_normed =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * num_q_heads, head_dim])
-                .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal,
-            ScalarType::BF16,
-            seq_len * num_q_heads,
-            head_dim,
-            1e-6,
-            &scratch.proj_buf,
-            &fw.q_norm_w,
-            &mut q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
-        // Copy back (same size buffer, different logical shape)
-        gpu_hal::copy_d2d(
-            ordinal,
-            scratch.proj_buf.as_ptr() as *mut c_void,
-            q_normed.as_ptr(),
-            seq_len * q_dim * ScalarType::BF16.size_in_bytes(),
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
+    // 2. Split Q into query [seq, q_dim] and gate [seq, q_dim]
+    //    Q layout: [seq, num_heads, 2*head_dim] → split each head's [2*head_dim] into [query(hd), gate(hd)]
+    let mut query_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_dim])
+        .map_err(|e| anyhow::anyhow!("query_buf alloc: {e}"))?;
+    let mut gate_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_dim])
+        .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
+    for s in 0..seq_len {
+        for h in 0..num_q_heads {
+            let src_off = (s * q_proj_dim + h * head_dim * 2) * elem_bytes;
+            let q_dst_off = (s * q_dim + h * head_dim) * elem_bytes;
+            let g_dst_off = q_dst_off;
+            // Copy query portion (first head_dim)
+            gpu_hal::copy_d2d(
+                ordinal,
+                query_buf.offset_ptr(q_dst_off) as *mut c_void,
+                q_full.offset_ptr(src_off),
+                head_dim * elem_bytes,
+            ).map_err(|e| anyhow::anyhow!("layer {idx} Q split query s={s} h={h}: {e}"))?;
+            // Copy gate portion (second head_dim)
+            gpu_hal::copy_d2d(
+                ordinal,
+                gate_buf.offset_ptr(g_dst_off) as *mut c_void,
+                q_full.offset_ptr(src_off + head_dim * elem_bytes),
+                head_dim * elem_bytes,
+            ).map_err(|e| anyhow::anyhow!("layer {idx} Q split gate s={s} h={h}: {e}"))?;
+        }
     }
 
-    // 4. K normalization: RMSNorm per head [seq*num_kv_heads, head_dim]
-    {
-        let mut k_normed =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * num_kv_heads, head_dim])
-                .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal,
-            ScalarType::BF16,
-            seq_len * num_kv_heads,
-            head_dim,
-            1e-6,
-            &scratch.proj_buf2,
-            &fw.k_norm_w,
-            &mut k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
-        gpu_hal::copy_d2d(
-            ordinal,
-            scratch.proj_buf2.as_ptr() as *mut c_void,
-            k_normed.as_ptr(),
-            seq_len * kv_dim * ScalarType::BF16.size_in_bytes(),
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
-    }
-
-    // 5. RoPE on Q [seq, num_q_heads, head_dim] and K [seq, num_kv_heads, head_dim]
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        seq_len,
-        num_q_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        &mut scratch.proj_buf,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
-
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        seq_len,
-        num_kv_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        &mut scratch.proj_buf2,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
-
-    // 6. V projection: normed [seq, hidden] × v_proj_w [kv_dim, hidden]^T → [seq, kv_dim]
-    //    We use mlp_buf as temp since it's large enough (intermediate_size > kv_dim)
-    let mut v_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, kv_dim])
-            .map_err(|e| anyhow::anyhow!("v_buf alloc: {e}"))?;
-    prefill_ffi::batched_matmul(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        seq_len,
-        kv_dim,
-        hidden_dim,
-        &scratch.normed,
-        &fw.v_proj_w,
-        &mut v_buf,
+    // 3. K projection
+    prefill_ffi::matmul_rhs_transposed(
+        ordinal, ScalarType::BF16, 1, seq_len, kv_dim, hidden_dim,
+        &scratch.normed, &fw.k_proj_w, &mut scratch.proj_buf2,
     )?;
 
-    // 7. Transpose Q [S, H, D] → [H, S, D], K and V same
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        seq_len,
-        num_q_heads,
-        head_dim,
-        &scratch.proj_buf,
-        &mut scratch.attn_q,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
+    // 4. Q normalization: RMSNorm per head on query only
+    {
+        let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * num_q_heads, head_dim])
+            .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
+        prefill_ffi::rms_norm_rows(
+            ordinal, ScalarType::BF16, seq_len * num_q_heads, head_dim, 1e-6,
+            &query_buf, &fw.q_norm_w, &mut q_normed,
+        ).map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
+        gpu_hal::copy_d2d(ordinal, query_buf.as_ptr() as *mut c_void, q_normed.as_ptr(), seq_len * q_dim * elem_bytes)
+            .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
+    }
 
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        seq_len,
-        num_kv_heads,
-        head_dim,
-        &scratch.proj_buf2,
-        &mut scratch.attn_k,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} K transpose: {e}"))?;
+    // 5. K normalization
+    {
+        let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * num_kv_heads, head_dim])
+            .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
+        prefill_ffi::rms_norm_rows(
+            ordinal, ScalarType::BF16, seq_len * num_kv_heads, head_dim, 1e-6,
+            &scratch.proj_buf2, &fw.k_norm_w, &mut k_normed,
+        ).map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
+        gpu_hal::copy_d2d(ordinal, scratch.proj_buf2.as_ptr() as *mut c_void, k_normed.as_ptr(), seq_len * kv_dim * elem_bytes)
+            .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
+    }
 
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        seq_len,
-        num_kv_heads,
-        head_dim,
-        &v_buf,
-        &mut scratch.attn_v,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
+    // 6. RoPE on query and K
+    prefill_ffi::apply_rope_prefill(
+        ordinal, ScalarType::BF16, seq_len, num_q_heads, head_dim, rotary_dim,
+        &rotary.cos, &rotary.sin, &mut query_buf,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
 
-    // 8. Causal attention: Q [1, q_heads, seq, hd] × K,V [1, kv_heads, seq, hd]
-    //    Output is F32 [1, q_heads, seq, hd]
+    prefill_ffi::apply_rope_prefill(
+        ordinal, ScalarType::BF16, seq_len, num_kv_heads, head_dim, rotary_dim,
+        &rotary.cos, &rotary.sin, &mut scratch.proj_buf2,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+
+    // 7. V projection
+    let mut v_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, kv_dim])
+        .map_err(|e| anyhow::anyhow!("v_buf alloc: {e}"))?;
+    prefill_ffi::matmul_rhs_transposed(
+        ordinal, ScalarType::BF16, 1, seq_len, kv_dim, hidden_dim,
+        &scratch.normed, &fw.v_proj_w, &mut v_buf,
+    )?;
+
+    // 8. Transpose Q [S, H, D] → [H, S, D], K and V same
+    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, num_q_heads, head_dim, &query_buf, &mut scratch.attn_q)
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, num_kv_heads, head_dim, &scratch.proj_buf2, &mut scratch.attn_k)
+        .map_err(|e| anyhow::anyhow!("layer {idx} K transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, num_kv_heads, head_dim, &v_buf, &mut scratch.attn_v)
+        .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
+
+    // 9. Causal attention → F32 output [q_heads, seq, head_dim]
     let scale = 1.0 / (head_dim as f32).sqrt();
     prefill_ffi::full_attention_prefill(
-        ordinal,
-        ScalarType::BF16,
-        1, // batch_size
-        num_q_heads,
-        num_kv_heads,
-        seq_len,  // q_len
-        seq_len,  // kv_len
-        head_dim,
-        scale,
-        0, // seqlen_offset (fresh prefill)
-        &scratch.attn_q,
-        &scratch.attn_k,
-        &scratch.attn_v,
-        &mut scratch.attn_out_f32,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+        ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
+        seq_len, seq_len, head_dim, scale, 0,
+        &scratch.attn_q, &scratch.attn_k, &scratch.attn_v, &mut scratch.attn_out_f32,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
-    // 9. Cast attention output F32 → BF16 (reuse attn_q buffer)
-    prefill_ffi::cast(
-        ordinal,
-        ScalarType::F32,
-        ScalarType::BF16,
-        num_q_heads * seq_len * head_dim,
-        &scratch.attn_out_f32,
-        &mut scratch.attn_q,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+    // 10. Cast F32 → BF16
+    prefill_ffi::cast(ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * seq_len * head_dim, &scratch.attn_out_f32, &mut scratch.attn_q)
+        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
 
-    // 10. Transpose back [H, S, D] → [S, H, D] = [S, q_dim]
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        num_q_heads,
-        seq_len,
-        head_dim,
-        &scratch.attn_q,
-        &mut scratch.proj_buf,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+    // 11. Transpose back [H, S, D] → [S, H, D] = [S, q_dim]
+    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, num_q_heads, seq_len, head_dim, &scratch.attn_q, &mut scratch.proj_buf)
+        .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
-    // 11. O projection: proj_buf [seq, q_dim] × o_proj_w [hidden, q_dim]^T → [seq, hidden]
-    prefill_ffi::batched_matmul(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        seq_len,
-        hidden_dim,
-        q_dim,
-        &scratch.proj_buf,
-        &fw.o_proj_w,
-        &mut scratch.proj_buf2,
+    // 12. Apply gate: attn_out *= sigmoid(gate)
+    //     gate_buf is [seq, q_dim], proj_buf is [seq, q_dim]
+    //     Compute sigmoid(gate) then element-wise multiply
+    //     We can reuse element_add infrastructure — but we need sigmoid + mul.
+    //     For now, do it on CPU (small: seq_len * q_dim values)
+    {
+        let attn_bytes = scratch.proj_buf.to_host_bytes().map_err(|e| anyhow::anyhow!("attn D2H: {e}"))?;
+        let gate_bytes = gate_buf.to_host_bytes().map_err(|e| anyhow::anyhow!("gate D2H: {e}"))?;
+        let gated_elems = seq_len * q_dim;
+        let mut gated_bf16 = Vec::with_capacity(gated_elems * 2);
+        for i in 0..gated_elems {
+            let a = half::bf16::from_le_bytes([attn_bytes[i*2], attn_bytes[i*2+1]]).to_f32();
+            let g = half::bf16::from_le_bytes([gate_bytes[i*2], gate_bytes[i*2+1]]).to_f32();
+            let sigmoid_g = 1.0 / (1.0 + (-g).exp());
+            let gated = a * sigmoid_g;
+            gated_bf16.extend_from_slice(&half::bf16::from_f32(gated).to_le_bytes());
+        }
+        let gated_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[seq_len, q_dim], &gated_bf16)
+            .map_err(|e| anyhow::anyhow!("gated upload: {e}"))?;
+        gpu_hal::copy_d2d(ordinal, scratch.proj_buf.as_ptr() as *mut c_void, gated_gpu.as_ptr(), gated_elems * elem_bytes)
+            .map_err(|e| anyhow::anyhow!("gated copy: {e}"))?;
+    }
+
+    // 13. O projection: [seq, q_dim] × o_proj_w [hidden, q_dim]^T → [seq, hidden]
+    prefill_ffi::matmul_rhs_transposed(
+        ordinal, ScalarType::BF16, 1, seq_len, hidden_dim, q_dim,
+        &scratch.proj_buf, &fw.o_proj_w, &mut scratch.proj_buf2,
     )?;
 
-    // 12. Residual: hidden += O projection output
+    // 14. Residual: hidden += O projection output
     residual_add(ordinal, seq_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf2)
         .map_err(|e| anyhow::anyhow!("layer {idx} attention residual: {e}"))?;
 
@@ -602,7 +531,7 @@ fn prefill_linear_attention_layer(
     let z_dim = val_dim;
 
     // 1. QKV projection: normed [seq, hidden] → [seq, qkv_dim]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -629,7 +558,7 @@ fn prefill_linear_attention_layer(
     }
 
     // 2. Z projection: normed [seq, hidden] → [seq, z_dim]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -644,7 +573,7 @@ fn prefill_linear_attention_layer(
     // 3. B projection: normed [seq, hidden] → [seq, nv]
     let mut b_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, nv])
         .map_err(|e| anyhow::anyhow!("b_buf alloc: {e}"))?;
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -659,7 +588,7 @@ fn prefill_linear_attention_layer(
     // 4. A projection: normed [seq, hidden] → [seq, nv]
     let mut a_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, nv])
         .map_err(|e| anyhow::anyhow!("a_buf alloc: {e}"))?;
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -961,7 +890,7 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("layer {idx} gated transpose: {e}"))?;
 
     // 16. O projection: [S, val_dim] × out_proj_w [hidden, val_dim]^T → [S, hidden]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -993,7 +922,7 @@ fn prefill_mlp_layer(
     let intermediate = config.intermediate_size;
 
     // gate_proj: normed [seq, hidden] × gate_w [intermediate, hidden]^T → [seq, intermediate]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1, // batch=1
@@ -1006,7 +935,7 @@ fn prefill_mlp_layer(
     )?;
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
@@ -1029,7 +958,7 @@ fn prefill_mlp_layer(
     )?;
 
     // down_proj: mlp_buf [seq, intermediate] × down_w [hidden, intermediate]^T → [seq, hidden]
-    prefill_ffi::batched_matmul(
+    prefill_ffi::matmul_rhs_transposed(
         ordinal,
         ScalarType::BF16,
         1,
