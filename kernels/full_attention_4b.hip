@@ -3593,9 +3593,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 // K_norm = K / ||K||
                 {
                     float* conv_out = gate_up;  // reused
-                    const int nk = nv / L.linear_head_k_dim;  // num_k_heads (might differ from nv)
-                    // Actually: num_k_heads = num_v_heads / head_repeat where head_repeat = nv/nk
-                    // For Qwen3.5: nk=16, nv=16, head_repeat=1 so each v_head maps to one k_head
+                    // nk already derived above from qkv_out_dim
                     // Q layout: conv_out[k_head * hkd .. (k_head+1) * hkd]
                     // K layout: conv_out[key_dim + k_head * hkd .. key_dim + (k_head+1) * hkd]
 
@@ -3695,6 +3693,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                 }
 
+                __syncthreads();
+
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
                 // Single-threaded to avoid LDS reduction issues (will parallelize once correct)
                 {
@@ -3727,6 +3727,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
 
             }
+
             // Grid barrier: block 0 wrote attn_scratch, all blocks need it for out_proj
             grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -3767,6 +3768,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
+
         }
 
         // Residual add for token mixer is fused into o_proj/out_proj above.

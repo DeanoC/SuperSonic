@@ -22,7 +22,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-MAX_DELTA_THRESHOLD="${MAX_DELTA_THRESHOLD:-50.0}"
+MAX_DELTA_THRESHOLD="${MAX_DELTA_THRESHOLD:-1.0}"
 TIMEOUT="${TIMEOUT:-300}"
 PROMPT="Hello"
 MAX_NEW_TOKENS=4
@@ -32,7 +32,7 @@ trap "rm -f $TMPOUT" EXIT
 echo "=== SuperSonic E2E Test: gfx1150 / qwen3.5-4b ==="
 echo "Model dir:  $MODEL_DIR"
 echo "Threshold:  $MAX_DELTA_THRESHOLD"
-echo "NOTE: 4B kernel accuracy is WIP — threshold is relaxed"
+echo ""
 echo ""
 
 # Build
