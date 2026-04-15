@@ -87,4 +87,12 @@ run_test "Test 1: Baked path"
 # Test 2: Safetensors path (--no-bake)
 run_test "Test 2: Safetensors path (--no-bake)" --no-bake
 
+# Test 3: Golden corpus — multi-prompt regression tests
+GOLDEN="$REPO_ROOT/tests/corpus/golden_0.8b.json"
+if [ -f "$GOLDEN" ]; then
+    "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-0.8b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC"
+else
+    echo "--- Skipping golden corpus (not found: $GOLDEN) ---"
+fi
+
 echo "=== All tests passed ==="

@@ -54,6 +54,8 @@ pub struct TextConfig {
     pub rms_norm_eps: f64,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
     #[serde(default = "default_head_dim")]
     pub head_dim: usize,
     #[serde(default = "default_linear_conv_kernel_dim")]
@@ -104,6 +106,21 @@ impl TextConfig {
 
     pub fn rotary_dim(&self) -> usize {
         (self.head_dim as f64 * self.partial_rotary_factor()) as usize
+    }
+
+    /// Get EOS token IDs (may be a single ID or a list).
+    pub fn eos_token_ids(&self) -> Vec<u32> {
+        match &self.eos_token_id {
+            Some(serde_json::Value::Number(n)) => {
+                n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
+            }
+            Some(serde_json::Value::Array(arr)) => {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|n| n as u32))
+                    .collect()
+            }
+            _ => vec![],
+        }
     }
 
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {

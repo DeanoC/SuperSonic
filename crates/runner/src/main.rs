@@ -273,9 +273,15 @@ fn main() -> Result<()> {
     let seqlen_start = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut max_delta = 0.0f32;
+    let eos_ids = text_config.eos_token_ids();
 
     let decode_start = Instant::now();
     for step in 0..cli.max_new_tokens {
+        // Stop on EOS token
+        if eos_ids.contains(&next_token) {
+            break;
+        }
+
         let seqlen_offset = seqlen_start + step;
         let logits = engine.decode_step(next_token, seqlen_offset)?;
 
