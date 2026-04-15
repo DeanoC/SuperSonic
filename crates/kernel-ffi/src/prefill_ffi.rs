@@ -1,0 +1,418 @@
+//! FFI bindings for prefill kernels.
+//! These are component kernels (not megakernels) — the prefill engine
+//! orchestrates them layer by layer.
+
+use std::ffi::{c_int, c_void};
+use gpu_hal::{GpuBuffer, GpuError, ScalarType};
+
+unsafe extern "C" {
+    fn dotcache_qwen35_hip_embedding_lookup(
+        dtype: c_int,
+        index_dtype: c_int,
+        device_ordinal: usize,
+        token_count: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        embeddings: *const c_void,
+        indexes: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_batched_matmul(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_rank: c_int,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs_batch_dims: *const c_int,
+        rhs_batch_dims: *const c_int,
+        out_batch_dims: *const c_int,
+        lhs: *const c_void,
+        rhs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_full_attention_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        q_len: usize,
+        kv_len: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
+        seqlen_offset: usize,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_linear_prefill_conv_pack(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        conv_dim: usize,
+        total_len: usize,
+        seq_len: usize,
+        kernel_size: usize,
+        mixed_qkv: *const c_void,
+        weights: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_delta_recurrent_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_l2norm(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        xs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_swiglu_mul(
+        dtype: c_int,
+        device_ordinal: usize,
+        elem_count: usize,
+        gate: *const c_void,
+        up: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_rms_norm_gated(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        hidden: *const c_void,
+        gate: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_mul_scalar(
+        dtype: c_int,
+        device_ordinal: usize,
+        total_elems: usize,
+        scalar: f32,
+        xs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+}
+
+// --- Safe wrappers ---
+
+/// Embedding lookup: token IDs → hidden states.
+/// indexes: U32 device buffer of token IDs
+/// out: [token_count, hidden_size] in dtype
+pub fn embedding_lookup(
+    ordinal: usize,
+    dtype: ScalarType,
+    token_count: usize,
+    vocab_size: usize,
+    hidden_size: usize,
+    embeddings: &GpuBuffer,
+    indexes: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_embedding_lookup(
+            dtype.kernel_dtype_code(),
+            1, // index_dtype=1 → uint32
+            ordinal,
+            token_count,
+            vocab_size,
+            hidden_size,
+            embeddings.as_ptr(),
+            indexes.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("embedding_lookup failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Batched matrix multiply: lhs [batch, m, k] × rhs [batch, k, n] → out [batch, m, n].
+/// For weight projections: lhs = activations, rhs = weights^T (or transposed layout).
+pub fn batched_matmul(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    // Simple rank-1 batch (no broadcasting)
+    let batch_dims = [batch_elems as c_int];
+    let status = unsafe {
+        dotcache_qwen35_hip_batched_matmul(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            1, // batch_rank
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            batch_dims.as_ptr(),
+            batch_dims.as_ptr(),
+            batch_dims.as_ptr(),
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("batched_matmul failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Full causal attention for prefill.
+pub fn full_attention_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let num_kv_groups = q_heads / kv_heads;
+    let status = unsafe {
+        dotcache_qwen35_hip_full_attention_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            num_kv_groups,
+            scale,
+            seqlen_offset,
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("full_attention_prefill failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Linear attention conv1d + SiLU for prefill.
+pub fn linear_prefill_conv_pack(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    conv_dim: usize,
+    total_len: usize,
+    seq_len: usize,
+    kernel_size: usize,
+    mixed_qkv: &GpuBuffer,
+    weights: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_linear_prefill_conv_pack(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            conv_dim,
+            total_len,
+            seq_len,
+            kernel_size,
+            mixed_qkv.as_ptr(),
+            weights.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("linear_prefill_conv_pack failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Delta recurrent state accumulation for linear attention prefill.
+pub fn delta_recurrent_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_delta_recurrent_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            initial_state.as_ptr(),
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            beta.as_ptr(),
+            g.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("delta_recurrent_prefill failed: {status}")));
+    }
+    Ok(())
+}
+
+/// L2 normalization per row.
+pub fn l2norm(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_l2norm(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("l2norm failed: {status}")));
+    }
+    Ok(())
+}
+
+/// SwiGLU: out = silu(gate) * up, element-wise.
+pub fn swiglu_mul(
+    ordinal: usize,
+    dtype: ScalarType,
+    elem_count: usize,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_swiglu_mul(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            elem_count,
+            gate.as_ptr(),
+            up.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("swiglu_mul failed: {status}")));
+    }
+    Ok(())
+}
+
+/// RMSNorm with SiLU gating: out = rms_norm(hidden) * weight * silu(gate).
+pub fn rms_norm_gated(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    hidden: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_rms_norm_gated(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            hidden.as_ptr(),
+            gate.as_ptr(),
+            weight.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("rms_norm_gated failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Multiply all elements by a scalar: out = xs * scalar.
+pub fn mul_scalar(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    scalar: f32,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_mul_scalar(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            total_elems,
+            scalar,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("mul_scalar failed: {status}")));
+    }
+    Ok(())
+}
