@@ -2,7 +2,7 @@
 
 Optimized LLM inference with persistent decode megakernels. Each supported (model, backend, GPU) combination gets a hand-tuned kernel — no fallback to generic slow paths.
 
-Currently supports Qwen3.5-0.8B on AMD gfx1150 (RDNA 3.5) via HIP.
+Currently supports Qwen3.5-0.8B and Qwen3.5-4B on AMD gfx1150 (RDNA 3.5) via HIP.
 
 ## Quick Start
 
@@ -27,12 +27,17 @@ Tests are machine-specific — each GPU architecture has its own test script und
 ### Running tests
 
 ```bash
-# gfx1150 (RDNA 3.5)
+# gfx1150 (RDNA 3.5) — Qwen3.5-0.8B
 ./tests/gfx1150/run.sh /path/to/Qwen3.5-0.8B
 
-# Or set the env var once
+# gfx1150 (RDNA 3.5) — Qwen3.5-4B
+./tests/gfx1150/run_4b.sh /path/to/Qwen3.5-4B
+
+# Or set env vars once
 export SUPERSONIC_MODEL_DIR=/path/to/Qwen3.5-0.8B
+export SUPERSONIC_MODEL_DIR_4B=/path/to/Qwen3.5-4B
 ./tests/gfx1150/run.sh
+./tests/gfx1150/run_4b.sh
 ```
 
 ### Adding tests for a new machine

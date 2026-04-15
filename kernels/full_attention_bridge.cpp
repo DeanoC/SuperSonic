@@ -4402,7 +4402,9 @@ int persistent_decode_device(
     unsigned int* barrier_flag,
     const void* cos_table,
     const void* sin_table,
-    int rotary_dim
+    int rotary_dim,
+    int proj_buf_floats,
+    int attn_scratch_floats
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4436,7 +4438,9 @@ int persistent_decode_device(
         barrier_flag,
         static_cast<const T*>(cos_table),
         static_cast<const T*>(sin_table),
-        rotary_dim);
+        rotary_dim,
+        proj_buf_floats,
+        attn_scratch_floats);
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4459,7 +4463,9 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
     unsigned int* barrier_flag,
     const void* cos_table,
     const void* sin_table,
-    size_t rotary_dim) {
+    size_t rotary_dim,
+    size_t proj_buf_floats,
+    size_t attn_scratch_floats) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4470,7 +4476,9 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
             static_cast<int>(seqlen_offset),
             layers, hidden_io, workspace, counters,
             barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim));
+            cos_table, sin_table, static_cast<int>(rotary_dim),
+            static_cast<int>(proj_buf_floats),
+            static_cast<int>(attn_scratch_floats));
     default:
         return 256;
     }

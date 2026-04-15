@@ -193,8 +193,8 @@ fn main() -> Result<()> {
     let mut engine = DecodeEngine::new(
         weights,
         ordinal,
+        params.proj_buf_floats,
         params.attn_scratch_floats,
-        params.saved_gate_floats,
         params.kv_chunk_size,
     )?;
 

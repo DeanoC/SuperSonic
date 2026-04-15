@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVariant {
     Qwen3_5_0_8B,
+    Qwen3_5_4B,
 }
 
 impl ModelVariant {
@@ -11,6 +12,7 @@ impl ModelVariant {
     pub fn from_cli_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "qwen3.5-0.8b" | "qwen35-0.8b" | "0.8b" => Some(Self::Qwen3_5_0_8B),
+            "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
             _ => None,
         }
     }
@@ -19,6 +21,7 @@ impl ModelVariant {
     pub fn hf_model_id(&self) -> &'static str {
         match self {
             Self::Qwen3_5_0_8B => "Qwen/Qwen3.5-0.8B",
+            Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
         }
     }
 }
@@ -27,6 +30,7 @@ impl fmt::Display for ModelVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Qwen3_5_0_8B => write!(f, "qwen3.5-0.8b"),
+            Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
         }
     }
 }
@@ -73,8 +77,10 @@ impl fmt::Display for GpuArch {
 
 /// Kernel-specific parameters tied to a (model, backend, arch) combination.
 pub struct KernelParams {
+    /// Max projection output buffer size in floats (kernel: proj_buf).
+    pub proj_buf_floats: usize,
+    /// Attention/recurrent scratch buffer size in floats (kernel: attn_scratch).
     pub attn_scratch_floats: usize,
-    pub saved_gate_floats: usize,
     pub weight_prefix: &'static str,
     pub kv_chunk_size: usize,
 }
@@ -120,8 +126,24 @@ static REGISTRY: &[RegistryEntry] = &[
             overhead_factor: 1.1,
         },
         params: KernelParams {
-            attn_scratch_floats: 8224,
-            saved_gate_floats: 2048,
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 2048,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        },
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            // ~8.8 GiB weights (BF16) + scratch + activations + buffers
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: KernelParams {
+            proj_buf_floats: 12320,
+            attn_scratch_floats: 4096,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
         },
@@ -146,6 +168,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
         .iter()
         .map(|e| match &e.model {
             ModelVariant::Qwen3_5_0_8B => "qwen3.5-0.8b",
+            ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
         })
         .collect();
     models.dedup();

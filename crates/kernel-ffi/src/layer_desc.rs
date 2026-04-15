@@ -28,6 +28,7 @@ pub struct DecodeLayerDesc {
     pub linear_out_proj_w: *const c_void,
     pub linear_value_dim: c_int,
     pub linear_num_v_heads: c_int,
+    pub linear_num_k_heads: c_int,
     pub linear_head_k_dim: c_int,
     pub linear_head_v_dim: c_int,
     pub dt_bias_w: *const c_void,

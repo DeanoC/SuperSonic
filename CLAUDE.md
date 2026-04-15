@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SuperSonic is a persistent decode megakernel for LLM inference on AMD GPUs (ROCm/HIP), targeting Qwen3.5 models. Instead of launching separate GPU kernels for each transformer operation, the entire decode step (attention + MLP + norms) runs in a single monolithic kernel to minimize launch overhead and maximize occupancy.
+SuperSonic is a persistent decode megakernel for LLM inference on AMD GPUs (ROCm/HIP), targeting Qwen3.5 models (0.8B and 4B). Instead of launching separate GPU kernels for each transformer operation, the entire decode step (attention + MLP + norms) runs in a single monolithic kernel to minimize launch overhead and maximize occupancy.
 
 ## Build & Run
 

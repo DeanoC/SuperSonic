@@ -19,6 +19,8 @@ unsafe extern "C" {
         cos_table: *const c_void,
         sin_table: *const c_void,
         rotary_dim: usize,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
     ) -> c_int;
 
     fn dotcache_qwen35_hip_rms_norm(
@@ -67,6 +69,8 @@ pub fn persistent_decode(
     cos_table: &GpuBuffer,
     sin_table: &GpuBuffer,
     rotary_dim: usize,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
 ) -> Result<(), GpuError> {
     // sync_buf layout: counters[16 bytes] + barrier_counter[4 bytes] + barrier_flag[4 bytes]
     let counters = sync_buf.as_mut_ptr();
@@ -90,6 +94,8 @@ pub fn persistent_decode(
             cos_table.as_ptr(),
             sin_table.as_ptr(),
             rotary_dim,
+            proj_buf_floats,
+            attn_scratch_floats,
         )
     };
     if status != 0 {
