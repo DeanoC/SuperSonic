@@ -1,0 +1,11 @@
+[package]
+name = "kernel-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpu-hal = { path = "../gpu-hal" }
+thiserror = "2"
+
+[build-dependencies]
+cc = "1"

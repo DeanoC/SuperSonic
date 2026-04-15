@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/gpu-hal",
+    "crates/kernel-ffi",
+    "crates/qwen35",
+    "crates/runner",
+]
+resolver = "2"

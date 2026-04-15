@@ -1,0 +1,9 @@
+[package]
+name = "gpu-hal"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+half = "2.4"
+safetensors = "0.5"
+thiserror = "2"
