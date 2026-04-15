@@ -83,12 +83,17 @@ run_test "Test 1: Baked path"
 # Test 2: Safetensors path (--no-bake)
 run_test "Test 2: Safetensors path (--no-bake)" --no-bake
 
-# Test 3: Golden corpus — multi-prompt regression tests
+# Test 3: Golden corpus — baked weights
 GOLDEN="$REPO_ROOT/tests/corpus/golden_4b.json"
 if [ -f "$GOLDEN" ]; then
     CORPUS_TIMEOUT=600 "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-4b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC"
 else
     echo "--- Skipping golden corpus (not found: $GOLDEN) ---"
+fi
+
+# Test 4: Golden corpus — raw safetensors (--no-bake)
+if [ -f "$GOLDEN" ]; then
+    CORPUS_TIMEOUT=600 "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-4b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC" --no-bake
 fi
 
 echo "=== All tests passed ==="

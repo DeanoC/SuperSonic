@@ -3,8 +3,9 @@
 # Called from machine-specific test scripts (e.g. tests/gfx1150/run.sh).
 #
 # Usage:
-#   tests/corpus/run_golden.sh <model-variant> <model-dir> <golden-json> <supersonic-binary>
+#   tests/corpus/run_golden.sh <model-variant> <model-dir> <golden-json> <supersonic-binary> [extra-flags...]
 #
+# Extra flags are passed to supersonic (e.g. --no-bake).
 # Returns 0 if all tests pass, 1 if any fail.
 
 set -euo pipefail
@@ -13,6 +14,8 @@ MODEL="$1"
 MODEL_DIR="$2"
 GOLDEN="$3"
 SUPERSONIC="$4"
+shift 4
+EXTRA_FLAGS=("$@")
 TIMEOUT="${CORPUS_TIMEOUT:-300}"
 
 if [ ! -f "$GOLDEN" ]; then
@@ -22,7 +25,12 @@ fi
 
 NUM_TESTS=$(python3 -c "import json; print(len(json.load(open('$GOLDEN'))['test_cases']))")
 echo ""
-echo "--- Golden Corpus Tests ($NUM_TESTS cases) ---"
+EXTRA_STR="${EXTRA_FLAGS[*]:-}"
+if [ -n "$EXTRA_STR" ]; then
+    echo "--- Golden Corpus Tests ($NUM_TESTS cases) [$EXTRA_STR] ---"
+else
+    echo "--- Golden Corpus Tests ($NUM_TESTS cases) ---"
+fi
 
 PASSED=0
 FAILED=0
@@ -41,11 +49,12 @@ golden = json.load(open('$GOLDEN'))
 tc = golden['test_cases'][$i]
 prompt = tc['prompt']
 expected = tc['expected_text']
+extra = '$EXTRA_STR'.split() if '$EXTRA_STR' else []
 
 try:
     proc = subprocess.run(
         ['$SUPERSONIC', '--model', '$MODEL', '--model-dir', '$MODEL_DIR',
-         '--prompt', prompt, '--max-new-tokens', str(tc['max_new_tokens'])],
+         '--prompt', prompt, '--max-new-tokens', str(tc['max_new_tokens'])] + extra,
         capture_output=True, text=True, timeout=$TIMEOUT
     )
     if proc.returncode != 0:
