@@ -94,14 +94,19 @@ impl PrefillScratch {
         let head_dim = config.head_dim;
         let kern = config.linear_conv_kernel_dim;
 
-        // Max projection dim across all layer types
-        let max_proj = std::cmp::max(
-            // Full attention: q_out + k_out + v_out
-            num_q_heads * head_dim + num_kv_heads * head_dim * 2,
-            // Linear attention: qkv_out (largest single projection)
+        // Max projection dim across all layer types and MLP
+        let max_proj = [
+            // Full attention: q_proj (doubled for gate)
+            num_q_heads * head_dim * 2,
+            // Linear attention: qkv_out
             config.linear_num_key_heads * config.linear_key_head_dim * 2
                 + config.linear_num_value_heads * config.linear_value_head_dim,
-        );
+            // MLP: intermediate_size (gate/up projection output)
+            intermediate,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
 
         let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
             + config.linear_num_value_heads * config.linear_value_head_dim;
