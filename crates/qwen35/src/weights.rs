@@ -162,4 +162,92 @@ impl Qwen35Weights {
             layers,
         })
     }
+
+    /// Load all weights from a baked SuperSonic package.
+    /// No CPU transforms needed — everything was pre-processed at bake time.
+    pub fn load_baked(
+        store: &model_store::BakedStore,
+        config: &TextConfig,
+        ordinal: usize,
+        weight_prefix: &str,
+    ) -> Result<Self, model_store::Error> {
+        let prefix = weight_prefix;
+
+        let embed_tokens = Arc::new(
+            store.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?,
+        );
+
+        let lm_head = if store.contains("lm_head.weight") {
+            Arc::new(store.load_to_gpu("lm_head.weight", ordinal)?)
+        } else {
+            embed_tokens.clone()
+        };
+
+        let norm_weight = store.load_to_gpu(&format!("{prefix}.norm.weight"), ordinal)?;
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for idx in 0..config.num_hidden_layers {
+            let lp = format!("{prefix}.layers.{idx}");
+            let is_full = config.is_full_attention(idx);
+
+            let input_norm_w =
+                store.load_to_gpu(&format!("{lp}.input_layernorm.weight"), ordinal)?;
+            let post_attn_norm_w =
+                store.load_to_gpu(&format!("{lp}.post_attention_layernorm.weight"), ordinal)?;
+            let gate_proj_w =
+                store.load_to_gpu(&format!("{lp}.mlp.gate_proj.weight"), ordinal)?;
+            let up_proj_w =
+                store.load_to_gpu(&format!("{lp}.mlp.up_proj.weight"), ordinal)?;
+            let down_proj_w =
+                store.load_to_gpu(&format!("{lp}.mlp.down_proj.weight"), ordinal)?;
+
+            let (linear, full) = if is_full {
+                let fa = format!("{lp}.self_attn");
+                let full = FullWeights {
+                    q_proj_w: store.load_to_gpu(&format!("{fa}.q_proj.weight"), ordinal)?,
+                    k_proj_w: store.load_to_gpu(&format!("{fa}.k_proj.weight"), ordinal)?,
+                    v_proj_w: store.load_to_gpu(&format!("{fa}.v_proj.weight"), ordinal)?,
+                    o_proj_w: store.load_to_gpu(&format!("{fa}.o_proj.weight"), ordinal)?,
+                    q_norm_w: store.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?,
+                    k_norm_w: store.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?,
+                };
+                (None, Some(full))
+            } else {
+                let la = format!("{lp}.linear_attn");
+                // A_log is already pre-transformed (exp, BF16) at bake time.
+                // Conv1d is already squeezed, dt_bias already reshaped.
+                let linear = LinearWeights {
+                    qkv_proj_w: store.load_to_gpu(&format!("{la}.in_proj_qkv.weight"), ordinal)?,
+                    z_proj_w: store.load_to_gpu(&format!("{la}.in_proj_z.weight"), ordinal)?,
+                    b_proj_w: store.load_to_gpu(&format!("{la}.in_proj_b.weight"), ordinal)?,
+                    a_proj_w: store.load_to_gpu(&format!("{la}.in_proj_a.weight"), ordinal)?,
+                    conv1d_w: store.load_to_gpu(&format!("{la}.conv1d.weight"), ordinal)?,
+                    out_proj_w: store.load_to_gpu(&format!("{la}.out_proj.weight"), ordinal)?,
+                    dt_bias: store.load_to_gpu(&format!("{la}.dt_bias"), ordinal)?,
+                    a_log_exp: store.load_to_gpu(&format!("{la}.A_log"), ordinal)?,
+                    norm_w: store.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                };
+                (Some(linear), None)
+            };
+
+            layers.push(LayerWeights {
+                kind: if is_full { LayerKind::Full } else { LayerKind::Linear },
+                input_norm_w,
+                post_attn_norm_w,
+                gate_proj_w,
+                up_proj_w,
+                down_proj_w,
+                linear,
+                full,
+            });
+        }
+
+        Ok(Self {
+            config: config.clone(),
+            embed_tokens,
+            lm_head,
+            norm_weight,
+            layers,
+        })
+    }
 }

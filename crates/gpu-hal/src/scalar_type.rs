@@ -30,6 +30,19 @@ impl ScalarType {
         }
     }
 
+    /// Convert from a string name (used by baked manifest).
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "f16" => Some(Self::F16),
+            "bf16" => Some(Self::BF16),
+            "f32" => Some(Self::F32),
+            "u8" => Some(Self::U8),
+            "u32" => Some(Self::U32),
+            "i64" => Some(Self::I64),
+            _ => None,
+        }
+    }
+
     /// Convert from safetensors Dtype.
     pub fn from_safetensors(dtype: safetensors::Dtype) -> Option<Self> {
         match dtype {

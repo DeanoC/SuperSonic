@@ -489,6 +489,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "model-store"
+version = "0.1.0"
+dependencies = [
+ "gpu-hal",
+ "half",
+ "memmap2",
+ "safetensors",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "monostate"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -607,6 +620,7 @@ dependencies = [
  "half",
  "kernel-ffi",
  "memmap2",
+ "model-store",
  "safetensors",
  "serde",
  "serde_json",
@@ -718,6 +732,7 @@ dependencies = [
  "gpu-hal",
  "half",
  "kernel-ffi",
+ "model-store",
  "qwen35",
  "serde",
  "serde_json",

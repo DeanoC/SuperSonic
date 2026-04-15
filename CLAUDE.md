@@ -37,7 +37,8 @@ The `--model` flag selects a model variant from the registry (`crates/runner/src
 
 - **`gpu-hal`** — Low-level HIP bindings. `GpuBuffer` provides typed device memory with shape/dtype metadata. Operations: alloc, H2D/D2H/D2D copy, memset.
 - **`kernel-ffi`** — FFI bridge between Rust and the HIP megakernel. `build.rs` compiles `kernels/*.hip` and `kernels/*.cpp` into a static library. Exports `persistent_decode`, `rms_norm`, `standalone_matvec`, `query_gpu_info`.
-- **`qwen35`** — Model implementation: config loading, safetensors weight loading (memory-mapped), model state (KV caches, conv/recurrent state), RoPE tables, scratch buffer allocation, and `DecodeLayerDesc` builder. Kernel-specific parameters (scratch sizes, KV chunk size, weight prefix) are passed in from the caller.
+- **`model-store`** — Weight baking and loading. Converts HuggingFace safetensors into an optimized binary format (`weights.bin` + `manifest.json`) with 4096-byte aligned tensors and precomputed transforms. See "Weight Baking" section below.
+- **`qwen35`** — Model implementation: config loading, weight loading (from safetensors or baked store), model state (KV caches, conv/recurrent state), RoPE tables, scratch buffer allocation, and `DecodeLayerDesc` builder. Kernel-specific parameters (scratch sizes, KV chunk size, weight prefix) are passed in from the caller.
 - **`runner`** — CLI binary (`supersonic`). Contains the model/backend/GPU registry (`registry.rs`) and `DecodeEngine` which orchestrates the decode loop. Uses a PyTorch oracle (`oracle/`) for prefill and optional logit validation.
 
 ### Key Design Patterns
@@ -56,4 +57,15 @@ The megakernel lives in `kernels/full_attention.hip` with its Rust-callable brid
 
 ### Model/Backend/GPU Registry
 
-`crates/runner/src/registry.rs` defines the set of supported (model, backend, GPU arch) combinations. Each entry specifies kernel parameters (scratch buffer sizes, weight prefix, KV chunk size) and minimum VRAM. To add support for a new model size or GPU architecture, add a new `RegistryEntry` to the `REGISTRY` static slice.
+`crates/runner/src/registry.rs` defines the set of supported (model, backend, GPU arch) combinations. Each entry specifies kernel parameters (scratch buffer sizes, weight prefix, KV chunk size) and VRAM budget. To add support for a new model size or GPU architecture, add a new `RegistryEntry` to the `REGISTRY` static slice.
+
+### Weight Baking
+
+On first run, SuperSonic automatically bakes HuggingFace safetensors into an optimized binary package stored at `{model_dir}/.supersonic/v{VERSION}/`. Subsequent runs load from the baked format — a single mmap + H2D copy per tensor with zero parsing or CPU transforms.
+
+Bake-time transforms for Qwen3.5 linear attention layers:
+- Conv1d weight squeeze: `[C_out, 1, K]` → `[C_out, K]`
+- dt_bias reshape: `[H]` → `[1, 1, H]`
+- A_log precompute: F32 exp() → BF16, reshape to `[1, 1, H]`
+
+Use `--no-bake` to bypass baking and load directly from safetensors (useful for debugging). Baked packages are version-checked; changing `FORMAT_VERSION` or `CONVERTER_VERSION` in `model-store` triggers automatic re-bake.

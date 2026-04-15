@@ -4476,7 +4476,7 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
     }
 }
 
-int dotcache_query_gpu_info(
+extern "C" int dotcache_query_gpu_info(
     int device_ordinal,
     char* arch_name_out,
     size_t arch_name_len,

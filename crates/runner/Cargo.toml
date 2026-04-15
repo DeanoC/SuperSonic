@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
+model-store = { path = "../model-store" }
 qwen35 = { path = "../qwen35" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

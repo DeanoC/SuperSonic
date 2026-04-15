@@ -51,6 +51,10 @@ struct Cli {
     /// HuggingFace model ID (for oracle; defaults based on model variant)
     #[arg(long)]
     model_id: Option<String>,
+
+    /// Skip baked format and load directly from safetensors (for debugging)
+    #[arg(long)]
+    no_bake: bool,
 }
 
 fn main() -> Result<()> {
@@ -139,15 +143,50 @@ fn main() -> Result<()> {
         );
     }
 
-    // Load weights
+    // Load weights (baked format with auto-bake, or raw safetensors with --no-bake)
     let t0 = Instant::now();
-    let weights = qwen35::weights::Qwen35Weights::load(
-        &cli.model_dir,
-        &text_config,
-        ordinal,
-        params.weight_prefix,
-    )
-    .map_err(|e| anyhow::anyhow!("load weights: {e}"))?;
+    let weights = if cli.no_bake {
+        eprintln!("[weights] loading from safetensors (--no-bake)...");
+        qwen35::weights::Qwen35Weights::load(
+            &cli.model_dir,
+            &text_config,
+            ordinal,
+            params.weight_prefix,
+        )
+        .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
+    } else {
+        let bake_dir = model_store::bake_dir(&cli.model_dir);
+        if !model_store::version_ok(&bake_dir) {
+            eprintln!("[bake] no baked package found — baking weights (one-time)...");
+            let bake_start = Instant::now();
+            let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
+                .map(|i| text_config.is_full_attention(i))
+                .collect();
+            model_store::bake_qwen35(
+                &cli.model_dir,
+                params.weight_prefix,
+                text_config.num_hidden_layers,
+                &layer_is_full,
+                &|msg| eprintln!("{msg}"),
+            )
+            .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+            eprintln!(
+                "[bake] done in {:.1}s",
+                bake_start.elapsed().as_secs_f64()
+            );
+        } else {
+            eprintln!("[weights] found baked package at {}", bake_dir.display());
+        }
+        let store = model_store::BakedStore::open(&bake_dir)
+            .map_err(|e| anyhow::anyhow!("open baked store: {e}"))?;
+        qwen35::weights::Qwen35Weights::load_baked(
+            &store,
+            &text_config,
+            ordinal,
+            params.weight_prefix,
+        )
+        .map_err(|e| anyhow::anyhow!("load baked weights: {e}"))?
+    };
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     // Create decode engine
