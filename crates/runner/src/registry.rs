@@ -145,7 +145,7 @@ static REGISTRY: &[RegistryEntry] = &[
             overhead_factor: 1.1,
         },
         params: KernelParams {
-            proj_buf_floats: 12320,
+            proj_buf_floats: 12352,
             attn_scratch_floats: 4096,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,

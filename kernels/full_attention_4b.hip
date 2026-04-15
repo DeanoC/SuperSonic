@@ -3463,10 +3463,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
-            // Derive num_k_heads from existing descriptor fields
-            const int nk_heads = (L.qkv_out_dim - L.linear_num_v_heads * L.linear_head_v_dim)
-                               / (2 * L.linear_head_k_dim);
-            const int total_proj = L.qkv_out_dim + L.z_out_dim + nk_heads + nk_heads;
+            // b_proj and a_proj have linear_num_v_heads rows (not num_k_heads)
+            const int nv_heads = L.linear_num_v_heads;
+            const int total_proj = L.qkv_out_dim + L.z_out_dim + nv_heads + nv_heads;
             {
                 for (;;) {
                     __shared__ unsigned int sr;
@@ -3483,12 +3482,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w = static_cast<const T*>(L.z_proj_w);
                         row = sr - L.qkv_out_dim;
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nk_heads)) {
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w = static_cast<const T*>(L.b_proj_w);
                         row = sr - L.qkv_out_dim - L.z_out_dim;
                     } else {
                         w = static_cast<const T*>(L.a_proj_w);
-                        row = sr - L.qkv_out_dim - L.z_out_dim - nk_heads;
+                        row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
                     }
                     const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
@@ -3514,12 +3513,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* qkv_f32 = proj_buf;
                 float* z_f32 = proj_buf + L.qkv_out_dim;
                 float* b_f32 = proj_buf + L.qkv_out_dim + L.z_out_dim;
-                float* a_f32 = b_f32 + nk_heads;
+                float* a_f32 = b_f32 + nv_heads;
 
                 const int conv_dim = L.qkv_out_dim;
                 const int kern = L.conv_kernel_size;
                 const int nv = L.linear_num_v_heads;
-                const int nk = nk_heads;
+                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
                 const int hkd = L.linear_head_k_dim;
                 const int hvd = L.linear_head_v_dim;
                 const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
@@ -3648,15 +3647,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                         if (h < nv) {
                             float* sh = state + h * hkd * hvd;
-                            // Map value head to key head (b/a/dt_bias/a_log have nk elements)
-                            const int h_k = h * nk / nv;
-                            // Compute beta = sigmoid(b) and decay = exp(g)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h_k]));
+                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
+                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
                             float decay = 1.0f;
                             if (dt_bw != nullptr && ale_w != nullptr) {
                                 float sp = logf(1.0f + expf(
-                                    a_f32[h_k] + dotcache_qwen35_to_float(dt_bw[h_k])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h_k]));
+                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                             }
 
                             // Apply decay: state *= exp(g)
@@ -3664,8 +3661,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 sh[k * hvd + v] *= decay;
                             }
 
+                            // Map value head to key head for Q/K indexing
+                            // nk key heads shared among nv value heads
+                            const int h_k = h * nk / nv;
+
                             // kv_mem[v] = sum_k(state[k, v] * key[k])
-                            // Q/K indexed by key head h_k, not value head h
                             float kv_mem_v = 0.0f;
                             for (int k = 0; k < hkd; ++k) {
                                 kv_mem_v += sh[k * hvd + v]
