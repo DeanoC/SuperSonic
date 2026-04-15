@@ -23,19 +23,19 @@ impl PersistentDecodeScratch {
         hidden_dim: usize,
         intermediate_size: usize,
         num_layers: usize,
-        proj_buf_floats: usize,
         attn_scratch_floats: usize,
+        saved_gate_floats: usize,
     ) -> Result<Self, GpuError> {
         // Workspace layout matches the kernel expectation:
-        // hidden_f32[hidden] + normed[hidden] + gate_up[intermediate*2] +
-        // mlp_out[hidden] + token_out[hidden] + proj_buf + attn_scratch
+        // normed[hidden] + proj_buf[hidden + hidden + intermediate*2] +
+        // post_norm[hidden] + residual[hidden] + attn_scratch + saved_gate
         let workspace_floats = hidden_dim
             + hidden_dim
             + intermediate_size * 2
             + hidden_dim
             + hidden_dim
-            + proj_buf_floats
-            + attn_scratch_floats;
+            + attn_scratch_floats
+            + saved_gate_floats;
         let workspace = GpuBuffer::zeros(
             ordinal,
             ScalarType::F32,

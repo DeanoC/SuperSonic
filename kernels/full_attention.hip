@@ -32,8 +32,7 @@ struct Qwen35DecodeLayerDesc {
     int conv_kernel_size;              // 4
     const void* linear_out_proj_w;    // [hidden_size, 2048] BF16
     int linear_value_dim;              // 2048
-    int linear_num_v_heads;            // 16 (0.8B) / 32 (4B)
-    int linear_num_k_heads;            // 16
+    int linear_num_v_heads;            // 16
     int linear_head_k_dim;             // 128
     int linear_head_v_dim;             // 128
     const void* dt_bias_w;             // [num_v_heads] BF16 (decay bias)
@@ -3089,18 +3088,13 @@ __device__ inline void grid_barrier(
 ) {
     __syncthreads();
     if (threadIdx.x == 0) {
-        // Sense-reversing barrier: avoids the race where fast blocks from the
-        // next barrier call corrupt the counter before slow blocks exit.
-        // barrier_flag acts as phase: even/odd toggles each barrier.
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
-            // Last block to arrive: reset counter and flip phase
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
             __threadfence();
             __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
         } else {
-            // Wait for phase to change (last block flipped it)
             while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
         }
     }
@@ -3143,9 +3137,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     unsigned int* __restrict__ barrier_flag,
     const T* __restrict__ cos_table,   // [max_positions, rotary_dim/2] RoPE cos
     const T* __restrict__ sin_table,   // [max_positions, rotary_dim/2] RoPE sin
-    int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
-    int proj_buf_floats,                 // max projection output buffer size
-    int attn_scratch_floats              // attention/recurrent scratch buffer size
+    int rotary_dim                      // partial rotary dimension (64 for Qwen3.5)
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3160,8 +3152,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     float* mlp_out    = gate_up + intermediate_size * 2;        // [hidden_dim]
     // Section 3: token mixer scratch
     float* token_out  = mlp_out + hidden_dim;                   // [hidden_dim]
-    float* proj_buf   = token_out + hidden_dim;                 // [proj_buf_floats] max proj output
-    float* attn_scratch = proj_buf + proj_buf_floats;           // [attn_scratch_floats] attention/recurrent output
+    float* proj_buf   = token_out + hidden_dim;                 // [8224] max proj output
+    float* attn_scratch = proj_buf + 8224;                      // [2048] attention/recurrent output
     // proj_buf holds projection results as F32 for all layer types
     // attn_scratch holds intermediate attention or recurrent output
 
@@ -3469,8 +3461,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
-            const int nk_heads = L.linear_num_k_heads;  // 16
-            const int total_proj = L.qkv_out_dim + L.z_out_dim + nk_heads + nk_heads;
+            const int total_proj = L.qkv_out_dim + L.z_out_dim + 16 + 16;
             {
                 for (;;) {
                     __shared__ unsigned int sr;
@@ -3487,12 +3478,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w = static_cast<const T*>(L.z_proj_w);
                         row = sr - L.qkv_out_dim;
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nk_heads)) {
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + 16)) {
                         w = static_cast<const T*>(L.b_proj_w);
                         row = sr - L.qkv_out_dim - L.z_out_dim;
                     } else {
                         w = static_cast<const T*>(L.a_proj_w);
-                        row = sr - L.qkv_out_dim - L.z_out_dim - nk_heads;
+                        row = sr - L.qkv_out_dim - L.z_out_dim - 16;
                     }
                     const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
@@ -3518,15 +3509,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* qkv_f32 = proj_buf;
                 float* z_f32 = proj_buf + L.qkv_out_dim;
                 float* b_f32 = proj_buf + L.qkv_out_dim + L.z_out_dim;
-                float* a_f32 = b_f32 + L.linear_num_k_heads;
+                float* a_f32 = b_f32 + 16;
 
                 const int conv_dim = L.qkv_out_dim;  // 6144
                 const int kern = L.conv_kernel_size;  // 4
-                const int nv = L.linear_num_v_heads;  // 16 (0.8B) / 32 (4B)
-                const int nk = L.linear_num_k_heads;  // 16
+                const int nv = L.linear_num_v_heads;  // 16
                 const int hkd = L.linear_head_k_dim;  // 128
                 const int hvd = L.linear_head_v_dim;  // 128
-                const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
+                const int key_dim = nv * hkd;         // 2048 (or num_k_heads * k_head_dim)
                 const int val_dim = L.linear_value_dim; // 2048
 
                 // Step B: Conv1d stateful update
@@ -3604,8 +3594,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     // Q layout: conv_out[k_head * hkd .. (k_head+1) * hkd]
                     // K layout: conv_out[key_dim + k_head * hkd .. key_dim + (k_head+1) * hkd]
 
-                    // Normalize Q and K per head using threads 0..nk-1
-                    if (tid < nk) {
+                    // Normalize Q and K per head using threads 0..nv-1
+                    if (tid < nv) {
                         const int h = tid;
                         // Q head
                         float* qh = conv_out + h * hkd;  // q_key_offset + h * hkd
@@ -3652,15 +3642,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                         if (h < nv) {
                             float* sh = state + h * hkd * hvd;
-                            // Map value head to key head (b/a/dt_bias/a_log have nk elements)
-                            const int h_k = h * nk / nv;
                             // Compute beta = sigmoid(b) and decay = exp(g) for this head only
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h_k]));
+                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
                             float decay = 1.0f;
                             if (dt_bw != nullptr && ale_w != nullptr) {
                                 float sp = logf(1.0f + expf(
-                                    a_f32[h_k] + dotcache_qwen35_to_float(dt_bw[h_k])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h_k]));
+                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                             }
 
                             // Apply decay: state *= exp(g)
@@ -3668,14 +3656,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 sh[k * hvd + v] *= decay;
                             }
 
-                            // Map value head to key head for Q/K indexing
-                            const int h_kq = h_k;  // h_k already computed above
-
                             // kv_mem[v] = sum_k(state[k, v] * key[k])
                             float kv_mem_v = 0.0f;
                             for (int k = 0; k < hkd; ++k) {
                                 kv_mem_v += sh[k * hvd + v]
-                                          * conv_out[k_key_offset + h_kq * hkd + k];
+                                          * conv_out[k_key_offset + h * hkd + k];
                             }
 
                             // delta = (value - kv_mem) * beta
@@ -3685,7 +3670,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             // state[k, v] += key[k] * delta (each thread owns its v)
                             for (int k = 0; k < hkd; ++k) {
                                 sh[k * hvd + v] +=
-                                    conv_out[k_key_offset + h_kq * hkd + k] * delta;
+                                    conv_out[k_key_offset + h * hkd + k] * delta;
                             }
 
                             // output[v] = sum_k(state[k, v] * query[k])
@@ -3693,7 +3678,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float out_v = 0.0f;
                             for (int k = 0; k < hkd; ++k) {
                                 out_v += sh[k * hvd + v]
-                                       * conv_out[q_key_offset + h_kq * hkd + k];
+                                       * conv_out[q_key_offset + h * hkd + k];
                             }
 
                             attn_scratch[h * hvd + v] = out_v;

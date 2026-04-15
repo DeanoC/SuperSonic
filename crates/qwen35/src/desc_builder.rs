@@ -45,7 +45,6 @@ pub fn build_layer_descs(
                 d.linear_out_proj_w = lin.out_proj_w.as_ptr();
                 d.linear_value_dim = config.linear_value_dim() as i32;
                 d.linear_num_v_heads = config.linear_num_value_heads as i32;
-                d.linear_num_k_heads = config.linear_num_key_heads as i32;
                 d.linear_head_k_dim = config.linear_key_head_dim as i32;
                 d.linear_head_v_dim = config.linear_value_head_dim as i32;
                 d.dt_bias_w = lin.dt_bias.as_ptr();

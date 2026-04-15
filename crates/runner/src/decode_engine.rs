@@ -24,16 +24,14 @@ pub struct DecodeEngine {
     matvec_counter: GpuBuffer,
     ordinal: usize,
     kv_chunk_size: usize,
-    proj_buf_floats: usize,
-    attn_scratch_floats: usize,
 }
 
 impl DecodeEngine {
     pub fn new(
         weights: Qwen35Weights,
         ordinal: usize,
-        proj_buf_floats: usize,
         attn_scratch_floats: usize,
+        saved_gate_floats: usize,
         kv_chunk_size: usize,
     ) -> Result<Self> {
         let config = &weights.config;
@@ -44,8 +42,8 @@ impl DecodeEngine {
             config.hidden_size,
             config.intermediate_size,
             config.num_hidden_layers,
-            proj_buf_floats,
             attn_scratch_floats,
+            saved_gate_floats,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
         let rotary =
@@ -72,8 +70,6 @@ impl DecodeEngine {
             matvec_counter,
             ordinal,
             kv_chunk_size,
-            proj_buf_floats,
-            attn_scratch_floats,
         })
     }
 
@@ -205,8 +201,6 @@ impl DecodeEngine {
             &self.rotary.cos,
             &self.rotary.sin,
             self.rotary.rotary_dim,
-            self.proj_buf_floats,
-            self.attn_scratch_floats,
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
 
