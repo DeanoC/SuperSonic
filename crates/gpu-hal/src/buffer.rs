@@ -133,7 +133,7 @@ impl GpuBuffer {
     }
 
     /// Grow the buffer along `seq_dim` from current capacity to `new_cap`.
-    /// Allocates a new zero-filled buffer and copies the old data prefix.
+    /// Allocates a new zero-filled buffer and copies old data with correct strides.
     /// Used for KV cache pre-allocation in chunks.
     pub fn grow_seq_dim(&self, seq_dim: usize, new_cap: usize) -> Result<Self> {
         if seq_dim >= self.shape.len() {
@@ -151,15 +151,26 @@ impl GpuBuffer {
         let mut new_shape = self.shape.clone();
         new_shape[seq_dim] = new_cap;
         let new_buf = Self::zeros(self.device_ordinal, self.dtype, &new_shape)?;
-        // Copy old data — the old buffer is a contiguous prefix of the new one
-        // because the sequence dimension is the only one that changed, and the
-        // old data occupies the first `old_cap` positions along that dim.
-        ops::copy_d2d(
-            self.device_ordinal,
-            new_buf.ptr.as_ptr(),
-            self.ptr.as_ptr() as *const c_void,
-            self.len_bytes,
-        )?;
+        let elem_size = self.dtype.size_in_bytes();
+
+        // Compute the number of "outer" slices (product of dims before seq_dim)
+        // and the "inner" size (product of dims after seq_dim, in bytes).
+        let outer: usize = self.shape[..seq_dim].iter().product();
+        let inner_elems: usize = self.shape[seq_dim + 1..].iter().product();
+        let inner_bytes = inner_elems * elem_size;
+
+        // Each outer slice has old_cap * inner_bytes in the old buffer
+        // and new_cap * inner_bytes in the new buffer.
+        let old_slice_bytes = old_cap * inner_bytes;
+        let new_slice_bytes = new_cap * inner_bytes;
+        let src_base = self.ptr.as_ptr() as *const u8;
+        let dst_base = new_buf.ptr.as_ptr() as *mut u8;
+
+        for i in 0..outer {
+            let src = unsafe { src_base.add(i * old_slice_bytes) } as *const c_void;
+            let dst = unsafe { dst_base.add(i * new_slice_bytes) } as *mut c_void;
+            ops::copy_d2d(self.device_ordinal, dst, src, old_slice_bytes)?;
+        }
         Ok(new_buf)
     }
 }
