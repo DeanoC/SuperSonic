@@ -8,6 +8,7 @@ pub enum ScalarType {
     U8,
     U32,
     I64,
+    F8E4M3,
 }
 
 impl ScalarType {
@@ -15,7 +16,7 @@ impl ScalarType {
         match self {
             Self::F16 | Self::BF16 => 2,
             Self::F32 | Self::U32 => 4,
-            Self::U8 => 1,
+            Self::U8 | Self::F8E4M3 => 1,
             Self::I64 => 8,
         }
     }
@@ -39,6 +40,7 @@ impl ScalarType {
             "u8" => Some(Self::U8),
             "u32" => Some(Self::U32),
             "i64" => Some(Self::I64),
+            "f8_e4m3" => Some(Self::F8E4M3),
             _ => None,
         }
     }
@@ -52,6 +54,7 @@ impl ScalarType {
             safetensors::Dtype::U8 => Some(Self::U8),
             safetensors::Dtype::U32 => Some(Self::U32),
             safetensors::Dtype::I64 => Some(Self::I64),
+            safetensors::Dtype::F8_E4M3 => Some(Self::F8E4M3),
             _ => None,
         }
     }

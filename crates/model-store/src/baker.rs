@@ -25,6 +25,7 @@ fn dtype_name(dt: safetensors::Dtype) -> Result<&'static str, Error> {
         safetensors::Dtype::U8 => Ok("u8"),
         safetensors::Dtype::U32 => Ok("u32"),
         safetensors::Dtype::I64 => Ok("i64"),
+        safetensors::Dtype::F8_E4M3 => Ok("f8_e4m3"),
         other => Err(Error::UnsupportedDtype(format!("{other:?}"))),
     }
 }
@@ -158,10 +159,14 @@ pub fn bake_qwen35(
     let mut cursor: u64 = 0;
     let mut entries: Vec<TensorMeta> = Vec::new();
 
-    // Collect and sort tensor names for deterministic output
+    // Collect and sort tensor names for deterministic output.
+    // Skip _scale_inv tensors (consumed during FP8 dequant, not stored separately).
     let mut names: Vec<String> = tensor_index
         .keys()
         .filter(|name| {
+            if name.ends_with("_scale_inv") {
+                return false; // consumed by FP8 dequant
+            }
             name.starts_with(&format!("{weight_prefix}.")) || *name == "lm_head.weight"
         })
         .cloned()
@@ -177,6 +182,44 @@ pub fn bake_qwen35(
         let shape: Vec<usize> = view.shape().to_vec();
         let raw_bytes = view.data();
         let raw_dtype = view.dtype();
+
+        // Check if this is an FP8 tensor that needs dequantization
+        if raw_dtype == safetensors::Dtype::F8_E4M3 && shape.len() == 2 {
+            let scale_name = format!("{name}_scale_inv");
+            if let Some(&scale_shard_idx) = tensor_index.get(&scale_name) {
+                let scale_st = SafeTensors::deserialize(&shards[scale_shard_idx])?;
+                let scale_view = scale_st.tensor(&scale_name)?;
+                let scale_shape: Vec<usize> = scale_view.shape().to_vec();
+                let scale_bytes = scale_view.data();
+
+                let block_size = if scale_shape.len() == 2 && scale_shape[0] > 0 {
+                    shape[0] / scale_shape[0]
+                } else {
+                    128
+                };
+
+                let (bytes, final_shape) = transforms::fp8_dequant_to_bf16(
+                    raw_bytes, &shape, scale_bytes, &scale_shape, block_size,
+                );
+
+                let offset = align_up(cursor, 4096);
+                weights_file.seek(SeekFrom::Start(offset))?;
+                weights_file.write_all(&bytes)?;
+                let byte_len = bytes.len() as u64;
+
+                entries.push(TensorMeta {
+                    name: name.clone(),
+                    shape: final_shape,
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Fp8Dequantized,
+                    offset,
+                    byte_len,
+                });
+                cursor = offset + byte_len;
+                continue;
+            }
+            // No scale tensor found — fall through to normal handling
+        }
 
         let layout = classify_tensor(name, &shape, layer_is_full, weight_prefix);
 
@@ -197,6 +240,9 @@ pub fn bake_qwen35(
                 // A_log is F32, output is BF16
                 let (b, s) = transforms::a_log_to_exp_bf16(raw_bytes, &shape);
                 (b, s, "bf16")
+            }
+            LayoutTag::Fp8Dequantized => {
+                unreachable!("FP8 tensors are handled before this match")
             }
         };
 
