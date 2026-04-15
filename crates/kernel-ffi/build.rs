@@ -46,7 +46,10 @@ fn main() {
     let bridge_src = kernel_dir.join("full_attention_bridge.cpp");
     let kernel_4b_src = kernel_dir.join("full_attention_4b.hip");
     let bridge_4b_src = kernel_dir.join("full_attention_bridge_4b.cpp");
-    for path in [&kernel_src, &bridge_src, &kernel_4b_src, &bridge_4b_src] {
+    let prefill_helpers_src = kernel_dir.join("prefill_helpers.hip");
+    let prefill_helpers_bridge_src = kernel_dir.join("prefill_helpers_bridge.cpp");
+    for path in [&kernel_src, &bridge_src, &kernel_4b_src, &bridge_4b_src,
+                 &prefill_helpers_src, &prefill_helpers_bridge_src] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -93,10 +96,30 @@ fn main() {
     }
     run(&mut hipcc_4b, "building qwen35-4b megakernel HIP bridge");
 
-    // Archive both into a single static library
+    // Compile prefill helpers (separate compilation unit)
+    let prefill_helpers_obj = out_dir.join("qwen35_prefill_helpers_hip.o");
+    let mut hipcc_pfx = Command::new("hipcc");
+    hipcc_pfx
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-fPIC")
+        .arg("-I")
+        .arg(&kernel_dir)
+        .arg("-x")
+        .arg("hip")
+        .arg("-c")
+        .arg(&prefill_helpers_bridge_src)
+        .arg("-o")
+        .arg(&prefill_helpers_obj);
+    if let Some(ref arch) = arch {
+        hipcc_pfx.arg(format!("--offload-arch={arch}"));
+    }
+    run(&mut hipcc_pfx, "building prefill helpers HIP bridge");
+
+    // Archive all into a single static library
     let bridge_lib = out_dir.join("libqwen35_megakernel_hip.a");
     let mut ar = Command::new("ar");
-    ar.arg("crus").arg(&bridge_lib).arg(&bridge_obj).arg(&bridge_4b_obj);
+    ar.arg("crus").arg(&bridge_lib).arg(&bridge_obj).arg(&bridge_4b_obj).arg(&prefill_helpers_obj);
     run(&mut ar, "archiving qwen35 megakernel HIP bridges");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

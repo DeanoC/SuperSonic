@@ -12,6 +12,7 @@ use qwen35::state::ModelState;
 use qwen35::weights::Qwen35Weights;
 
 use crate::oracle::OracleOutput;
+use crate::prefill_engine;
 
 pub struct DecodeEngine {
     weights: Qwen35Weights,
@@ -160,6 +161,26 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
 
         Ok(())
+    }
+
+    /// Run native GPU prefill on the prompt, returning logits for the last token.
+    /// Fills KV caches, conv states, and recurrent states for subsequent decode.
+    pub fn prefill_native(&mut self, prompt_ids: &[u32]) -> Result<Vec<f32>> {
+        let result = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+        )?;
+
+        // Reset sync counters for the decode kernel
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
+
+        Ok(result.logits)
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.

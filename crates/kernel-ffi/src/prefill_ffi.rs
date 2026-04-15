@@ -6,6 +6,84 @@ use std::ffi::{c_int, c_void};
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
 unsafe extern "C" {
+    // ---- Existing bridge functions (from full_attention_bridge.cpp) ----
+
+    fn dotcache_qwen35_hip_rms_norm(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        add_unit_offset: c_int,
+        xs: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_cast(
+        input_dtype: c_int,
+        output_dtype: c_int,
+        device_ordinal: usize,
+        total_elems: usize,
+        xs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    // ---- Prefill helper bridge functions (from prefill_helpers_bridge.cpp) ----
+
+    fn dotcache_qwen35_hip_element_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        total_elems: usize,
+        lhs: *const c_void,
+        rhs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_apply_rope_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rot: usize,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        data: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_transpose_shd_hsd(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        h: usize,
+        d: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_transpose_pad_conv(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        c: usize,
+        pad: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_extract_conv_state(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        c: usize,
+        kern_minus_1: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+    ) -> c_int;
+
+    // ---- Original prefill kernel declarations ----
+
     fn dotcache_qwen35_hip_embedding_lookup(
         dtype: c_int,
         index_dtype: c_int,
@@ -413,6 +491,210 @@ pub fn mul_scalar(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("mul_scalar failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Multi-row RMSNorm (for prefill — n_rows > 1) ----
+
+/// RMSNorm on multiple rows. Each row is independently normalized.
+/// Qwen3.5 uses add_unit_offset=1 (weight applied as (w + 1.0) * x).
+pub fn rms_norm_rows(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_rms_norm(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            1, // add_unit_offset
+            input.as_ptr(),
+            weight.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("rms_norm_rows failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Cast between dtypes ----
+
+/// Cast all elements from one dtype to another on GPU.
+pub fn cast(
+    ordinal: usize,
+    input_dtype: ScalarType,
+    output_dtype: ScalarType,
+    total_elems: usize,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_cast(
+            input_dtype.kernel_dtype_code(),
+            output_dtype.kernel_dtype_code(),
+            ordinal,
+            total_elems,
+            input.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("cast failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Element-wise add ----
+
+/// Element-wise addition: out[i] = lhs[i] + rhs[i].
+pub fn element_add(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_element_add(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            total_elems,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("element_add failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- RoPE for prefill ----
+
+/// Apply RoPE in-place on tensor [seq_len, num_heads, head_dim].
+/// Only the first rotary_dim dimensions of each head are rotated.
+pub fn apply_rope_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    data: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let half_rot = rotary_dim / 2;
+    let status = unsafe {
+        dotcache_qwen35_hip_apply_rope_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_heads,
+            head_dim,
+            half_rot,
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            data.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("apply_rope_prefill failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Transpose [S,H,D] <-> [H,S,D] ----
+
+/// Transpose tensor from [S, H, D] layout to [H, S, D] layout.
+pub fn transpose_shd_hsd(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    h: usize,
+    d: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_transpose_shd_hsd(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s, h, d,
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("transpose_shd_hsd failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Transpose + pad for conv input ----
+
+/// Transpose [S, C] -> [C, pad + S] with zero-padding on the left.
+/// Used to prepare QKV projection output for causal conv1d.
+pub fn transpose_pad_conv(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    c: usize,
+    pad: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_transpose_pad_conv(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s, c, pad,
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("transpose_pad_conv failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Extract conv state after prefill ----
+
+/// Extract the last (kern-1) values per channel from [S, C] into [C, kern-1].
+pub fn extract_conv_state(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    c: usize,
+    kern_minus_1: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_extract_conv_state(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s, c, kern_minus_1,
+            src.as_ptr(),
+            dst.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("extract_conv_state failed: {status}")));
     }
     Ok(())
 }

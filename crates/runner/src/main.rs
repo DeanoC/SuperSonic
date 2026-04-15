@@ -200,37 +200,57 @@ fn main() -> Result<()> {
         params.use_4b_kernel,
     )?;
 
-    // Run oracle for prefill (and optionally validation)
-    let model_id = cli
-        .model_id
-        .clone()
-        .unwrap_or_else(|| model_variant.hf_model_id().to_string());
-    let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap()
-        .join("oracle/run_oracle.py");
+    // Run native GPU prefill
+    let prefill_start = Instant::now();
+    let prefill_logits = engine.prefill_native(&prompt_ids)?;
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("[prefill] native GPU prefill done in {prefill_ms:.0}ms");
 
-    let oracle_output = oracle::run_oracle(
-        &oracle_script,
-        &model_id,
-        &prompt_ids,
-        cli.max_new_tokens,
-        &cli.oracle_dtype,
-        true, // always emit state for prefill
-    )?;
+    // First token from prefill argmax
+    let mut next_token = DecodeEngine::greedy_sample(&prefill_logits);
 
-    // Load prefill state into GPU
-    engine.load_prefill_state(&oracle_output)?;
-    eprintln!("[engine] prefill state loaded to GPU");
+    // Optionally run oracle for validation
+    let oracle_output = if cli.validate {
+        let model_id = cli
+            .model_id
+            .clone()
+            .unwrap_or_else(|| model_variant.hf_model_id().to_string());
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/run_oracle.py");
+
+        let output = oracle::run_oracle(
+            &oracle_script,
+            &model_id,
+            &prompt_ids,
+            cli.max_new_tokens,
+            &cli.oracle_dtype,
+            false, // don't need state — just logits for comparison
+        )?;
+
+        // Compare prefill logits
+        let prefill_delta = validate::max_abs_delta(&prefill_logits, &output.prefill_logits);
+        eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
+
+        // Check if oracle and native agree on first token
+        let oracle_first = output.generated_token_ids[0];
+        if oracle_first != next_token {
+            eprintln!(
+                "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+            );
+        }
+
+        Some(output)
+    } else {
+        None
+    };
 
     // Decode loop
     let seqlen_start = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut max_delta = 0.0f32;
-
-    // First token comes from prefill argmax
-    let mut next_token = oracle_output.generated_token_ids[0];
 
     let decode_start = Instant::now();
     for step in 0..cli.max_new_tokens {
@@ -238,15 +258,17 @@ fn main() -> Result<()> {
         let logits = engine.decode_step(next_token, seqlen_offset)?;
 
         // Validate against oracle if available
-        if cli.validate && step < oracle_output.decode_logits.len() {
-            let oracle_logits = &oracle_output.decode_logits[step];
-            let delta = validate::max_abs_delta(&logits, oracle_logits);
-            if delta > max_delta {
-                max_delta = delta;
+        if let Some(ref oracle) = oracle_output {
+            if step < oracle.decode_logits.len() {
+                let oracle_logits = &oracle.decode_logits[step];
+                let delta = validate::max_abs_delta(&logits, oracle_logits);
+                if delta > max_delta {
+                    max_delta = delta;
+                }
+                eprintln!(
+                    "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
+                );
             }
-            eprintln!(
-                "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
-            );
         }
 
         let sampled = DecodeEngine::greedy_sample(&logits);
