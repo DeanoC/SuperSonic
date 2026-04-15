@@ -57,9 +57,14 @@ pub struct FullWeights {
 
 impl Qwen35Weights {
     /// Load all weights from a HuggingFace model directory.
-    pub fn load(model_dir: &Path, config: &TextConfig, ordinal: usize) -> Result<Self, LoadError> {
+    pub fn load(
+        model_dir: &Path,
+        config: &TextConfig,
+        ordinal: usize,
+        weight_prefix: &str,
+    ) -> Result<Self, LoadError> {
         let loader = WeightLoader::from_dir(model_dir)?;
-        let prefix = "model.language_model";
+        let prefix = weight_prefix;
 
         let embed_tokens = Arc::new(loader.load_to_gpu(
             &format!("{prefix}.embed_tokens.weight"),

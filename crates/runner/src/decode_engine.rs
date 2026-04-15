@@ -23,10 +23,17 @@ pub struct DecodeEngine {
     logits_buf: GpuBuffer,
     matvec_counter: GpuBuffer,
     ordinal: usize,
+    kv_chunk_size: usize,
 }
 
 impl DecodeEngine {
-    pub fn new(weights: Qwen35Weights, ordinal: usize) -> Result<Self> {
+    pub fn new(
+        weights: Qwen35Weights,
+        ordinal: usize,
+        attn_scratch_floats: usize,
+        saved_gate_floats: usize,
+        kv_chunk_size: usize,
+    ) -> Result<Self> {
         let config = &weights.config;
         let state = ModelState::new(config, ordinal)
             .map_err(|e| anyhow::anyhow!("model state init: {e}"))?;
@@ -35,6 +42,8 @@ impl DecodeEngine {
             config.hidden_size,
             config.intermediate_size,
             config.num_hidden_layers,
+            attn_scratch_floats,
+            saved_gate_floats,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
         let rotary =
@@ -60,6 +69,7 @@ impl DecodeEngine {
             logits_buf,
             matvec_counter,
             ordinal,
+            kv_chunk_size,
         })
     }
 
@@ -163,7 +173,7 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for full-attention layers
         for (i, ls) in self.state.layers.iter_mut().enumerate() {
             if config.is_full_attention(i) {
-                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config)
+                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size)
                     .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }

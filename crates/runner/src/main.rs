@@ -1,18 +1,24 @@
 mod decode_engine;
 mod oracle;
+mod registry;
 mod validate;
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
 
 use decode_engine::DecodeEngine;
+use registry::{Backend, GpuArch, ModelVariant};
 
 #[derive(Parser)]
-#[command(name = "qwen35-decode", about = "Persistent decode megakernel runner")]
+#[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
 struct Cli {
+    /// Model variant (e.g. "qwen3.5-0.8b")
+    #[arg(long, default_value = "qwen3.5-0.8b")]
+    model: String,
+
     /// Path to HuggingFace model directory (containing config.json + safetensors)
     #[arg(long)]
     model_dir: PathBuf,
@@ -24,6 +30,11 @@ struct Cli {
     /// Maximum tokens to generate
     #[arg(long, default_value = "8")]
     max_new_tokens: usize,
+
+    /// Maximum context size in tokens (prompt + generated). Used for VRAM estimation.
+    /// Defaults to prompt length + max_new_tokens if not specified.
+    #[arg(long)]
+    context_size: Option<usize>,
 
     /// HIP device ordinal
     #[arg(long, default_value = "0")]
@@ -37,7 +48,7 @@ struct Cli {
     #[arg(long, default_value = "bf16")]
     oracle_dtype: String,
 
-    /// HuggingFace model ID (for oracle; defaults to model_dir basename)
+    /// HuggingFace model ID (for oracle; defaults based on model variant)
     #[arg(long)]
     model_id: Option<String>,
 }
@@ -45,6 +56,37 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ordinal = cli.device;
+
+    // 1. Parse model variant
+    let model_variant = ModelVariant::from_cli_str(&cli.model).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown model '{}'. Supported models: {}",
+            cli.model,
+            registry::supported_models_list().join(", ")
+        )
+    })?;
+
+    // 2. Detect GPU
+    let (arch_name, total_vram) = kernel_ffi::query_gpu_info(ordinal)
+        .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
+    let gpu_arch = GpuArch::from_rocm_name(&arch_name);
+    eprintln!(
+        "[gpu] device={ordinal} arch={arch_name} vram={:.1}GiB",
+        total_vram as f64 / (1024.0 * 1024.0 * 1024.0)
+    );
+
+    // 3. Registry lookup
+    let backend = Backend::Hip;
+    let entry = registry::lookup(&model_variant, &backend, &gpu_arch).ok_or_else(|| {
+        let supported_archs = registry::supported_archs_for(&model_variant, &backend);
+        anyhow::anyhow!(
+            "No optimized kernel for model={model_variant} backend={backend} arch={gpu_arch}. \
+             Supported GPU architectures for this model: [{}]",
+            supported_archs.join(", ")
+        )
+    })?;
+
+    let params = &entry.params;
 
     // Load config
     let config = qwen35::config::load_config(&cli.model_dir)
@@ -70,20 +112,58 @@ fn main() -> Result<()> {
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
 
+    // 4. VRAM check (needs config + prompt length for KV cache estimation)
+    let context_tokens = cli
+        .context_size
+        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
+    let kv_per_token = text_config.kv_bytes_per_token(gpu_hal::ScalarType::BF16.size_in_bytes());
+    let estimated_vram = entry.vram.estimate_total(context_tokens, kv_per_token);
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "[vram] estimated={:.2}GiB (weights={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        gib(estimated_vram),
+        gib(entry.vram.fixed_bytes),
+        gib(kv_per_token * context_tokens as u64),
+        context_tokens,
+        gib(total_vram),
+    );
+    if estimated_vram > total_vram {
+        anyhow::bail!(
+            "Insufficient VRAM for {context_tokens}-token context: \
+             need ~{:.2}GiB (weights {:.2}GiB + KV cache {:.2}GiB), \
+             GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
+            gib(estimated_vram),
+            gib(entry.vram.fixed_bytes),
+            gib(kv_per_token * context_tokens as u64),
+            gib(total_vram),
+        );
+    }
+
     // Load weights
     let t0 = Instant::now();
-    let weights = qwen35::weights::Qwen35Weights::load(&cli.model_dir, &text_config, ordinal)
-        .map_err(|e| anyhow::anyhow!("load weights: {e}"))?;
+    let weights = qwen35::weights::Qwen35Weights::load(
+        &cli.model_dir,
+        &text_config,
+        ordinal,
+        params.weight_prefix,
+    )
+    .map_err(|e| anyhow::anyhow!("load weights: {e}"))?;
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     // Create decode engine
-    let mut engine = DecodeEngine::new(weights, ordinal)?;
+    let mut engine = DecodeEngine::new(
+        weights,
+        ordinal,
+        params.attn_scratch_floats,
+        params.saved_gate_floats,
+        params.kv_chunk_size,
+    )?;
 
     // Run oracle for prefill (and optionally validation)
     let model_id = cli
         .model_id
         .clone()
-        .unwrap_or_else(|| format!("Qwen/Qwen3.5-0.8B"));
+        .unwrap_or_else(|| model_variant.hf_model_id().to_string());
     let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(|p| p.parent())

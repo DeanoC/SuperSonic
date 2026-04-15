@@ -57,28 +57,28 @@ impl LayerState {
     }
 
     /// Ensure KV cache has capacity for `needed` positions.
-    /// Pre-allocates in chunks of 256.
+    /// Pre-allocates in chunks of `kv_chunk_size`.
     pub fn ensure_kv_capacity(
         &mut self,
         needed: usize,
         ordinal: usize,
         config: &TextConfig,
+        kv_chunk_size: usize,
     ) -> Result<(), GpuError> {
-        const CHUNK: usize = 256;
         let needed = needed + 1; // need room for position `seqlen_offset`
         if let (Some(ref k), Some(ref v)) = (&self.kv_cache_k, &self.kv_cache_v) {
             let current_cap = k.shape()[2]; // [1, nkv, seq, hd]
             if current_cap >= needed {
                 return Ok(());
             }
-            let new_cap = ((needed + CHUNK - 1) / CHUNK) * CHUNK;
+            let new_cap = ((needed + kv_chunk_size - 1) / kv_chunk_size) * kv_chunk_size;
             let new_k = k.grow_seq_dim(2, new_cap)?;
             let new_v = v.grow_seq_dim(2, new_cap)?;
             self.kv_cache_k = Some(new_k);
             self.kv_cache_v = Some(new_v);
         } else {
             // First allocation: create cache with chunked capacity
-            let cap = ((needed + CHUNK - 1) / CHUNK) * CHUNK;
+            let cap = ((needed + kv_chunk_size - 1) / kv_chunk_size) * kv_chunk_size;
             let nkv = config.num_key_value_heads;
             let hd = config.head_dim;
             self.kv_cache_k =

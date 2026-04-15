@@ -4475,3 +4475,18 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
         return 256;
     }
 }
+
+int dotcache_query_gpu_info(
+    int device_ordinal,
+    char* arch_name_out,
+    size_t arch_name_len,
+    uint64_t* total_vram_out) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_ordinal);
+    if (err != hipSuccess) {
+        return static_cast<int>(err);
+    }
+    snprintf(arch_name_out, arch_name_len, "%s", props.gcnArchName);
+    *total_vram_out = static_cast<uint64_t>(props.totalGlobalMem);
+    return 0;
+}

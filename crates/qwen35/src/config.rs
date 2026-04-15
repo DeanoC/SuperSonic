@@ -117,6 +117,20 @@ impl TextConfig {
     pub fn linear_value_dim(&self) -> usize {
         self.linear_num_value_heads * self.linear_value_head_dim
     }
+
+    /// Number of full-attention layers in the model.
+    pub fn num_full_attention_layers(&self) -> usize {
+        (0..self.num_hidden_layers)
+            .filter(|&i| self.is_full_attention(i))
+            .count()
+    }
+
+    /// KV cache bytes per token across all full-attention layers.
+    /// Each full-attention layer stores K and V: 2 × num_kv_heads × head_dim × dtype_bytes.
+    pub fn kv_bytes_per_token(&self, dtype_bytes: usize) -> u64 {
+        let per_layer = 2 * self.num_key_value_heads * self.head_dim * dtype_bytes;
+        (self.num_full_attention_layers() * per_layer) as u64
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

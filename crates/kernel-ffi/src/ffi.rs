@@ -43,6 +43,13 @@ unsafe extern "C" {
         output: *mut c_void,
         row_counter: *mut c_uint,
     ) -> c_int;
+
+    fn dotcache_query_gpu_info(
+        device_ordinal: c_int,
+        arch_name_out: *mut u8,
+        arch_name_len: usize,
+        total_vram_out: *mut u64,
+    ) -> c_int;
 }
 
 /// Safe wrapper around the persistent decode kernel.
@@ -158,4 +165,28 @@ pub fn standalone_matvec(
         )));
     }
     Ok(())
+}
+
+/// Query GPU architecture name and total VRAM for a given device ordinal.
+pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
+    let mut arch_buf = [0u8; 64];
+    let mut total_vram: u64 = 0;
+    let status = unsafe {
+        dotcache_query_gpu_info(
+            ordinal as c_int,
+            arch_buf.as_mut_ptr(),
+            arch_buf.len(),
+            &mut total_vram,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "query_gpu_info failed with status {status}"
+        )));
+    }
+    let arch_name = std::ffi::CStr::from_bytes_until_nul(&arch_buf)
+        .map_err(|_| GpuError::Hip("query_gpu_info: arch name not null-terminated".into()))?
+        .to_string_lossy()
+        .into_owned();
+    Ok((arch_name, total_vram))
 }
