@@ -1,5 +1,6 @@
 mod decode_engine;
 mod oracle;
+mod prefill_engine;
 mod registry;
 mod validate;
 
