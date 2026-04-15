@@ -127,6 +127,121 @@ int extract_conv_state_device(int device_ordinal,
     return 0;
 }
 
+// ---- sigmoid_mul ----
+
+template <typename T>
+int sigmoid_mul_device(int device_ordinal, size_t total_elems,
+                       const void* data, const void* gate, void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total_elems + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_sigmoid_mul_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        total_elems,
+        static_cast<const T*>(data),
+        static_cast<const T*>(gate),
+        static_cast<T*>(out));
+    if (hipGetLastError() != hipSuccess) return 351;
+    if (hipDeviceSynchronize() != hipSuccess) return 352;
+    return 0;
+}
+
+// ---- compute_beta_g ----
+
+template <typename T>
+int compute_beta_g_device(int device_ordinal,
+                          int seq_len, int nv,
+                          const void* B, const void* A,
+                          const void* dt_bias, const void* a_log_exp,
+                          void* beta, void* g) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(seq_len) * nv;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_compute_beta_g_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        seq_len, nv,
+        static_cast<const T*>(B),
+        static_cast<const T*>(A),
+        static_cast<const T*>(dt_bias),
+        static_cast<const T*>(a_log_exp),
+        static_cast<T*>(beta),
+        static_cast<T*>(g));
+    if (hipGetLastError() != hipSuccess) return 361;
+    if (hipDeviceSynchronize() != hipSuccess) return 362;
+    return 0;
+}
+
+// ---- split_qgate ----
+
+template <typename T>
+int split_qgate_device(int device_ordinal,
+                       int S, int num_heads, int head_dim,
+                       const void* src, void* query_out, void* gate_out) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(S) * num_heads * head_dim;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_split_qgate_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        S, num_heads, head_dim,
+        static_cast<const T*>(src),
+        static_cast<T*>(query_out),
+        static_cast<T*>(gate_out));
+    if (hipGetLastError() != hipSuccess) return 371;
+    if (hipDeviceSynchronize() != hipSuccess) return 372;
+    return 0;
+}
+
+// ---- split_qkv ----
+
+template <typename T>
+int split_qkv_device(int device_ordinal,
+                     int S, int key_dim, int val_dim,
+                     const void* src, void* Q, void* K, void* V) {
+    ScopedHipDevice scoped(device_ordinal);
+    const int qkv_dim = key_dim * 2 + val_dim;
+    const size_t total = static_cast<size_t>(S) * qkv_dim;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_split_qkv_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        S, key_dim, val_dim,
+        static_cast<const T*>(src),
+        static_cast<T*>(Q),
+        static_cast<T*>(K),
+        static_cast<T*>(V));
+    if (hipGetLastError() != hipSuccess) return 381;
+    if (hipDeviceSynchronize() != hipSuccess) return 382;
+    return 0;
+}
+
+// ---- repeat_interleave heads ----
+
+template <typename T>
+int repeat_interleave_heads_device(int device_ordinal,
+                                   int S, int n_heads, int head_dim, int repeats,
+                                   const void* src, void* dst) {
+    ScopedHipDevice scoped(device_ordinal);
+    const int out_heads = n_heads * repeats;
+    const size_t total = static_cast<size_t>(S) * out_heads * head_dim;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_repeat_interleave_heads_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        S, n_heads, head_dim, repeats,
+        static_cast<const T*>(src),
+        static_cast<T*>(dst));
+    if (hipGetLastError() != hipSuccess) return 391;
+    if (hipDeviceSynchronize() != hipSuccess) return 392;
+    return 0;
+}
+
 } // namespace
 
 // ---- extern "C" wrappers ----
@@ -210,5 +325,86 @@ extern "C" int dotcache_qwen35_hip_extract_conv_state(
     case 2: return extract_conv_state_device<hip_bfloat16>(static_cast<int>(device_ordinal),
                 static_cast<int>(S), static_cast<int>(C), static_cast<int>(kern_minus_1), src, dst);
     default: return 340;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_sigmoid_mul(
+    int dtype, size_t device_ordinal, size_t total_elems,
+    const void* data, const void* gate, void* out
+) {
+    switch (dtype) {
+    case 0: return sigmoid_mul_device<half>(static_cast<int>(device_ordinal), total_elems, data, gate, out);
+    case 1: return sigmoid_mul_device<float>(static_cast<int>(device_ordinal), total_elems, data, gate, out);
+    case 2: return sigmoid_mul_device<hip_bfloat16>(static_cast<int>(device_ordinal), total_elems, data, gate, out);
+    default: return 350;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_compute_beta_g(
+    int dtype, size_t device_ordinal,
+    size_t seq_len, size_t nv,
+    const void* B, const void* A,
+    const void* dt_bias, const void* a_log_exp,
+    void* beta, void* g
+) {
+    switch (dtype) {
+    case 0: return compute_beta_g_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(nv), B, A, dt_bias, a_log_exp, beta, g);
+    case 1: return compute_beta_g_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(nv), B, A, dt_bias, a_log_exp, beta, g);
+    case 2: return compute_beta_g_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(nv), B, A, dt_bias, a_log_exp, beta, g);
+    default: return 360;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_split_qgate(
+    int dtype, size_t device_ordinal,
+    size_t S, size_t num_heads, size_t head_dim,
+    const void* src, void* query_out, void* gate_out
+) {
+    switch (dtype) {
+    case 0: return split_qgate_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(num_heads), static_cast<int>(head_dim), src, query_out, gate_out);
+    case 1: return split_qgate_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(num_heads), static_cast<int>(head_dim), src, query_out, gate_out);
+    case 2: return split_qgate_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(num_heads), static_cast<int>(head_dim), src, query_out, gate_out);
+    default: return 370;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_split_qkv(
+    int dtype, size_t device_ordinal,
+    size_t S, size_t key_dim, size_t val_dim,
+    const void* src, void* Q, void* K, void* V
+) {
+    switch (dtype) {
+    case 0: return split_qkv_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(key_dim), static_cast<int>(val_dim), src, Q, K, V);
+    case 1: return split_qkv_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(key_dim), static_cast<int>(val_dim), src, Q, K, V);
+    case 2: return split_qkv_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(key_dim), static_cast<int>(val_dim), src, Q, K, V);
+    default: return 380;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_repeat_interleave_heads(
+    int dtype, size_t device_ordinal,
+    size_t S, size_t n_heads, size_t head_dim, size_t repeats,
+    const void* src, void* dst
+) {
+    switch (dtype) {
+    case 0: return repeat_interleave_heads_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(n_heads), static_cast<int>(head_dim),
+                static_cast<int>(repeats), src, dst);
+    case 1: return repeat_interleave_heads_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(n_heads), static_cast<int>(head_dim),
+                static_cast<int>(repeats), src, dst);
+    case 2: return repeat_interleave_heads_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(n_heads), static_cast<int>(head_dim),
+                static_cast<int>(repeats), src, dst);
+    default: return 390;
     }
 }

@@ -228,6 +228,7 @@ pub fn prefill(
         // MLP: gate_proj + up_proj → SwiGLU → down_proj → residual add
         prefill_mlp_layer(weights, &mut scratch, config, idx, seq_len, ordinal)?;
 
+
     }
 
     // 3. Final RMSNorm on last token only
@@ -321,32 +322,12 @@ fn prefill_full_attention_layer(
     )?;
 
     // 2. Split Q into query [seq, q_dim] and gate [seq, q_dim]
-    //    Q layout: [seq, num_heads, 2*head_dim] → split each head's [2*head_dim] into [query(hd), gate(hd)]
     let mut query_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_dim])
         .map_err(|e| anyhow::anyhow!("query_buf alloc: {e}"))?;
     let mut gate_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_dim])
         .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
-    for s in 0..seq_len {
-        for h in 0..num_q_heads {
-            let src_off = (s * q_proj_dim + h * head_dim * 2) * elem_bytes;
-            let q_dst_off = (s * q_dim + h * head_dim) * elem_bytes;
-            let g_dst_off = q_dst_off;
-            // Copy query portion (first head_dim)
-            gpu_hal::copy_d2d(
-                ordinal,
-                query_buf.offset_ptr(q_dst_off) as *mut c_void,
-                q_full.offset_ptr(src_off),
-                head_dim * elem_bytes,
-            ).map_err(|e| anyhow::anyhow!("layer {idx} Q split query s={s} h={h}: {e}"))?;
-            // Copy gate portion (second head_dim)
-            gpu_hal::copy_d2d(
-                ordinal,
-                gate_buf.offset_ptr(g_dst_off) as *mut c_void,
-                q_full.offset_ptr(src_off + head_dim * elem_bytes),
-                head_dim * elem_bytes,
-            ).map_err(|e| anyhow::anyhow!("layer {idx} Q split gate s={s} h={h}: {e}"))?;
-        }
-    }
+    prefill_ffi::split_qgate(ordinal, ScalarType::BF16, seq_len, num_q_heads, head_dim, &q_full, &mut query_buf, &mut gate_buf)
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
 
     // 3. K projection
     prefill_ffi::matmul_rhs_transposed(
@@ -421,26 +402,13 @@ fn prefill_full_attention_layer(
     prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, num_q_heads, seq_len, head_dim, &scratch.attn_q, &mut scratch.proj_buf)
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
-    // 12. Apply gate: attn_out *= sigmoid(gate)
-    //     gate_buf is [seq, q_dim], proj_buf is [seq, q_dim]
-    //     Compute sigmoid(gate) then element-wise multiply
-    //     We can reuse element_add infrastructure — but we need sigmoid + mul.
-    //     For now, do it on CPU (small: seq_len * q_dim values)
+    // 12. Apply gate: proj_buf = proj_buf * sigmoid(gate_buf)
     {
-        let attn_bytes = scratch.proj_buf.to_host_bytes().map_err(|e| anyhow::anyhow!("attn D2H: {e}"))?;
-        let gate_bytes = gate_buf.to_host_bytes().map_err(|e| anyhow::anyhow!("gate D2H: {e}"))?;
-        let gated_elems = seq_len * q_dim;
-        let mut gated_bf16 = Vec::with_capacity(gated_elems * 2);
-        for i in 0..gated_elems {
-            let a = half::bf16::from_le_bytes([attn_bytes[i*2], attn_bytes[i*2+1]]).to_f32();
-            let g = half::bf16::from_le_bytes([gate_bytes[i*2], gate_bytes[i*2+1]]).to_f32();
-            let sigmoid_g = 1.0 / (1.0 + (-g).exp());
-            let gated = a * sigmoid_g;
-            gated_bf16.extend_from_slice(&half::bf16::from_f32(gated).to_le_bytes());
-        }
-        let gated_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[seq_len, q_dim], &gated_bf16)
-            .map_err(|e| anyhow::anyhow!("gated upload: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, scratch.proj_buf.as_ptr() as *mut c_void, gated_gpu.as_ptr(), gated_elems * elem_bytes)
+        let mut gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, q_dim])
+            .map_err(|e| anyhow::anyhow!("gated alloc: {e}"))?;
+        prefill_ffi::sigmoid_mul(ordinal, ScalarType::BF16, seq_len * q_dim, &scratch.proj_buf, &gate_buf, &mut gated)
+            .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;
+        gpu_hal::copy_d2d(ordinal, scratch.proj_buf.as_ptr() as *mut c_void, gated.as_ptr(), seq_len * q_dim * elem_bytes)
             .map_err(|e| anyhow::anyhow!("gated copy: {e}"))?;
     }
 
@@ -643,37 +611,16 @@ fn prefill_linear_attention_layer(
     //
     //    Strategy: normalize both Q and K via l2norm, then scale Q by rsqrt(khd).
 
-    // We need to work with sub-regions of proj_buf.
-    // Q is at offset 0, K at offset key_dim, V at offset key_dim*2 in each row.
-    // Since l2norm operates on contiguous [n_rows, n_cols], and the Q/K/V data is
-    // interleaved across rows, we need to extract them first.
-
-    let mut q_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * nk, khd])
-        .map_err(|e| anyhow::anyhow!("q_linear alloc: {e}"))?;
-    let k_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * nk, khd])
-        .map_err(|e| anyhow::anyhow!("k_linear alloc: {e}"))?;
-    let v_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * nv, vhd])
-        .map_err(|e| anyhow::anyhow!("v_linear alloc: {e}"))?;
-
-    // Extract Q, K, V from interleaved [S, qkv_dim] rows
+    // Split interleaved QKV [S, qkv_dim] → Q [S, key_dim], K [S, key_dim], V [S, val_dim]
     let elem_bytes = ScalarType::BF16.size_in_bytes();
-    for s in 0..seq_len {
-        let row_base = s * qkv_dim * elem_bytes;
-        let q_src = scratch.proj_buf.offset_ptr(row_base);
-        let k_src = scratch.proj_buf.offset_ptr(row_base + key_dim * elem_bytes);
-        let v_src = scratch.proj_buf.offset_ptr(row_base + key_dim * 2 * elem_bytes);
-
-        let q_dst_off = s * key_dim * elem_bytes;
-        let k_dst_off = s * key_dim * elem_bytes;
-        let v_dst_off = s * val_dim * elem_bytes;
-
-        gpu_hal::copy_d2d(ordinal, q_linear.offset_ptr(q_dst_off) as *mut c_void, q_src, key_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q extract s={s}: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, k_linear.offset_ptr(k_dst_off) as *mut c_void, k_src, key_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} K extract s={s}: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, v_linear.offset_ptr(v_dst_off) as *mut c_void, v_src, val_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} V extract s={s}: {e}"))?;
-    }
+    let mut q_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, key_dim])
+        .map_err(|e| anyhow::anyhow!("q_linear alloc: {e}"))?;
+    let mut k_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, key_dim])
+        .map_err(|e| anyhow::anyhow!("k_linear alloc: {e}"))?;
+    let mut v_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, val_dim])
+        .map_err(|e| anyhow::anyhow!("v_linear alloc: {e}"))?;
+    prefill_ffi::split_qkv(ordinal, ScalarType::BF16, seq_len, key_dim, val_dim, &scratch.proj_buf, &mut q_linear, &mut k_linear, &mut v_linear)
+        .map_err(|e| anyhow::anyhow!("layer {idx} QKV split: {e}"))?;
 
     // L2-normalize Q [S*nk, khd] and K [S*nk, khd]
     let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len * nk, khd])
@@ -691,78 +638,68 @@ fn prefill_linear_attention_layer(
     prefill_ffi::l2norm(ordinal, ScalarType::BF16, seq_len * nk, khd, 1e-6, &k_linear, &mut k_normed)
         .map_err(|e| anyhow::anyhow!("layer {idx} K l2norm: {e}"))?;
 
-    // 9. Compute beta and g on CPU (small: seq_len × nv values)
-    //    beta[h, t] = sigmoid(B[t, h])
-    //    g[h, t] = -softplus(A[t, h] + dt_bias[h]) * a_log_exp[h]
-
-    let b_host = b_buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("B D2H: {e}"))?;
-    let a_host = a_buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("A D2H: {e}"))?;
-    let dt_bias_host = lw
-        .dt_bias
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("dt_bias D2H: {e}"))?;
-    let a_log_exp_host = lw
-        .a_log_exp
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("a_log_exp D2H: {e}"))?;
-
-    // dt_bias and a_log_exp are BF16 [nv] (after bake-time transform)
-    let dt_bias_f32: Vec<f32> = dt_bias_host
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-        .collect();
-    let a_log_exp_f32: Vec<f32> = a_log_exp_host
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-        .collect();
-
-    // beta: [nv, seq_len] — transposed from B [seq_len, nv]
-    let mut beta_bf16 = Vec::with_capacity(nv * seq_len * 2);
-    // g: [nv, seq_len]
-    let mut g_bf16 = Vec::with_capacity(nv * seq_len * 2);
-
-    for h in 0..nv {
-        for t in 0..seq_len {
-            // B[t, h]
-            let b_val = {
-                let off = (t * nv + h) * 2;
-                half::bf16::from_le_bytes([b_host[off], b_host[off + 1]]).to_f32()
-            };
-            let beta = 1.0 / (1.0 + (-b_val).exp());
-            beta_bf16.extend_from_slice(&half::bf16::from_f32(beta).to_le_bytes());
-
-            // A[t, h]
-            let a_val = {
-                let off = (t * nv + h) * 2;
-                half::bf16::from_le_bytes([a_host[off], a_host[off + 1]]).to_f32()
-            };
-            // g = -softplus(A + dt_bias) * a_log_exp
-            let sp = (1.0 + (a_val + dt_bias_f32[h]).exp()).ln();
-            let g_val = -sp * a_log_exp_f32[h];
-            g_bf16.extend_from_slice(&half::bf16::from_f32(g_val).to_le_bytes());
-        }
-    }
-
-    let beta_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[nv, seq_len], &beta_bf16)
-        .map_err(|e| anyhow::anyhow!("beta upload: {e}"))?;
-    let g_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[nv, seq_len], &g_bf16)
-        .map_err(|e| anyhow::anyhow!("g upload: {e}"))?;
+    // 9. Compute beta and g on GPU
+    //    beta[h, t] = sigmoid(B[t, h]) → [nv, seq_len]
+    //    g[h, t] = -softplus(A[t, h] + dt_bias[h]) * a_log_exp[h] → [nv, seq_len]
+    let mut beta_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, seq_len])
+        .map_err(|e| anyhow::anyhow!("beta alloc: {e}"))?;
+    let mut g_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, seq_len])
+        .map_err(|e| anyhow::anyhow!("g alloc: {e}"))?;
+    prefill_ffi::compute_beta_g(
+        ordinal, ScalarType::BF16, seq_len, nv,
+        &b_buf, &a_buf, &lw.dt_bias, &lw.a_log_exp,
+        &mut beta_gpu, &mut g_gpu,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} beta/g: {e}"))?;
 
     // 10. Transpose Q [S, nk, khd] → [nk, S, khd] and K, V similarly
-    //     q_linear is [S*nk, khd] = [S, nk, khd] contiguous
-    let mut q_trans = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
-        .map_err(|e| anyhow::anyhow!("q_trans alloc: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &q_linear, &mut q_trans)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q linear transpose: {e}"))?;
+    //     If nk != nv, repeat Q and K heads to match nv (like GQA head expansion)
+    let head_repeat = nv / nk;
 
-    let mut k_trans = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
-        .map_err(|e| anyhow::anyhow!("k_trans alloc: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &k_normed, &mut k_trans)
-        .map_err(|e| anyhow::anyhow!("layer {idx} K linear transpose: {e}"))?;
+    let q_trans = if head_repeat == 1 {
+        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("q_trans alloc: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &q_linear, &mut buf)
+            .map_err(|e| anyhow::anyhow!("layer {idx} Q linear transpose: {e}"))?;
+        buf
+    } else {
+        // Transpose to [nk, S, khd] first, then repeat to [nv, S, khd]
+        let mut tmp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("q_trans_tmp alloc: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &q_linear, &mut tmp)
+            .map_err(|e| anyhow::anyhow!("layer {idx} Q linear transpose: {e}"))?;
+        // Reshape [nk, S, khd] → [nk, S*khd] for repeat_interleave, then reshape back
+        // Actually repeat_interleave works on [S, n_heads, dim] so: transpose to [S, nk, khd] → repeat → [S, nv, khd] → transpose to [nv, S, khd]
+        // Simpler: work with [nk, S*khd] as [n_heads, total_dim] and repeat
+        let mut expanded = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("q_expanded alloc: {e}"))?;
+        // repeat_interleave_heads expects [S, n_heads, head_dim], so use seq_len=1, n_heads=nk, head_dim=seq_len*khd...
+        // Actually that's hacky. Let me just use the kernel with correct dims:
+        // We want: for each position in [nv, S, khd], read from [nk, S, khd] with head mapping oh/repeat
+        // This IS repeat_interleave on the first (head) dim: [nk, S*khd] → [nv, S*khd]
+        prefill_ffi::repeat_interleave_heads(ordinal, ScalarType::BF16, 1, nk, seq_len * khd, head_repeat, &tmp, &mut expanded)
+            .map_err(|e| anyhow::anyhow!("layer {idx} Q repeat: {e}"))?;
+        expanded
+    };
+
+    let k_trans = if head_repeat == 1 {
+        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("k_trans alloc: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &k_normed, &mut buf)
+            .map_err(|e| anyhow::anyhow!("layer {idx} K linear transpose: {e}"))?;
+        buf
+    } else {
+        let mut tmp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("k_trans_tmp alloc: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, seq_len, nk, khd, &k_normed, &mut tmp)
+            .map_err(|e| anyhow::anyhow!("layer {idx} K linear transpose: {e}"))?;
+        let mut expanded = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, seq_len, khd])
+            .map_err(|e| anyhow::anyhow!("k_expanded alloc: {e}"))?;
+        prefill_ffi::repeat_interleave_heads(ordinal, ScalarType::BF16, 1, nk, seq_len * khd, head_repeat, &tmp, &mut expanded)
+            .map_err(|e| anyhow::anyhow!("layer {idx} K repeat: {e}"))?;
+        expanded
+    };
+
+    let k_trans_mut = k_trans;
 
     let mut v_trans = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, seq_len, vhd])
         .map_err(|e| anyhow::anyhow!("v_trans alloc: {e}"))?;
@@ -792,7 +729,7 @@ fn prefill_linear_attention_layer(
         vhd,
         recurrent_state,
         &q_trans,
-        &k_trans,
+        &k_trans_mut,
         &v_trans,
         &beta_gpu,
         &g_gpu,

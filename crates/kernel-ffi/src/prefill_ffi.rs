@@ -62,6 +62,62 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_hip_sigmoid_mul(
+        dtype: c_int,
+        device_ordinal: usize,
+        total_elems: usize,
+        data: *const c_void,
+        gate: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_compute_beta_g(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        nv: usize,
+        b: *const c_void,
+        a: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        beta: *mut c_void,
+        g: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_split_qgate(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        num_heads: usize,
+        head_dim: usize,
+        src: *const c_void,
+        query_out: *mut c_void,
+        gate_out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_split_qkv(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        key_dim: usize,
+        val_dim: usize,
+        src: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_repeat_interleave_heads(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        n_heads: usize,
+        head_dim: usize,
+        repeats: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_hip_transpose_pad_conv(
         dtype: c_int,
         device_ordinal: usize,
@@ -759,6 +815,138 @@ pub fn extract_conv_state(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("extract_conv_state failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Sigmoid-gate multiply ----
+
+/// out[i] = data[i] * sigmoid(gate[i]). Fused for gated attention.
+pub fn sigmoid_mul(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    data: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_sigmoid_mul(
+            dtype.kernel_dtype_code(), ordinal, total_elems,
+            data.as_ptr(), gate.as_ptr(), out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("sigmoid_mul failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Compute beta/g for delta recurrent ----
+
+/// Compute beta = sigmoid(B) and g = -softplus(A + dt_bias) * a_log_exp.
+/// Inputs: B [S, nv], A [S, nv] in dtype; dt_bias [nv], a_log_exp [nv] in dtype.
+/// Outputs: beta [nv, S], g [nv, S] in dtype (transposed for delta recurrent).
+pub fn compute_beta_g(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    nv: usize,
+    b: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    beta: &mut GpuBuffer,
+    g: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_compute_beta_g(
+            dtype.kernel_dtype_code(), ordinal, seq_len, nv,
+            b.as_ptr(), a.as_ptr(), dt_bias.as_ptr(), a_log_exp.as_ptr(),
+            beta.as_mut_ptr(), g.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("compute_beta_g failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Split gated Q projection ----
+
+/// Split [S, num_heads, 2*head_dim] into query [S, num_heads, head_dim] and gate [S, num_heads, head_dim].
+pub fn split_qgate(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    num_heads: usize,
+    head_dim: usize,
+    src: &GpuBuffer,
+    query_out: &mut GpuBuffer,
+    gate_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_split_qgate(
+            dtype.kernel_dtype_code(), ordinal, s, num_heads, head_dim,
+            src.as_ptr(), query_out.as_mut_ptr(), gate_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("split_qgate failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Split interleaved QKV ----
+
+/// Split [S, qkv_dim] where qkv_dim = [Q(key_dim) | K(key_dim) | V(val_dim)]
+/// into separate Q [S, key_dim], K [S, key_dim], V [S, val_dim].
+pub fn split_qkv(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    key_dim: usize,
+    val_dim: usize,
+    src: &GpuBuffer,
+    q: &mut GpuBuffer,
+    k: &mut GpuBuffer,
+    v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_split_qkv(
+            dtype.kernel_dtype_code(), ordinal, s, key_dim, val_dim,
+            src.as_ptr(), q.as_mut_ptr(), k.as_mut_ptr(), v.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("split_qkv failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Repeat interleave heads ----
+
+/// Repeat each head `repeats` times: [S, n_heads, head_dim] → [S, n_heads * repeats, head_dim].
+/// Used for GQA-style head expansion in linear attention when nk != nv.
+pub fn repeat_interleave_heads(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    n_heads: usize,
+    head_dim: usize,
+    repeats: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_repeat_interleave_heads(
+            dtype.kernel_dtype_code(), ordinal,
+            s, n_heads, head_dim, repeats,
+            src.as_ptr(), dst.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("repeat_interleave_heads failed: {status}")));
     }
     Ok(())
 }

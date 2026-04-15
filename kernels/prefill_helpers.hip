@@ -166,3 +166,139 @@ __global__ void pfx_extract_conv_state_kernel(
     const size_t dst_off = static_cast<size_t>(c) * kern_minus_1 + t;
     dst[dst_off] = src[src_off];
 }
+
+// ---- Kernel 6: Fused sigmoid-gate multiply ----
+// out[i] = data[i] * sigmoid(gate[i])
+
+template <typename T>
+__global__ void pfx_sigmoid_mul_kernel(
+    size_t total_elems,
+    const T* data,
+    const T* gate,
+    T* out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx >= total_elems) return;
+    const float g = pfx_to_float(gate[idx]);
+    const float sigmoid_g = 1.0f / (1.0f + expf(-g));
+    out[idx] = pfx_from_float<T>(pfx_to_float(data[idx]) * sigmoid_g);
+}
+
+// ---- Kernel 7: Compute beta and g for delta recurrent ----
+// beta[h, t] = sigmoid(B[t, h])
+// g[h, t] = -softplus(A[t, h] + dt_bias[h]) * a_log_exp[h]
+// Inputs: B [S, nv], A [S, nv] in BF16; dt_bias [nv], a_log_exp [nv] in BF16
+// Outputs: beta [nv, S], g [nv, S] in BF16 (transposed)
+
+template <typename T>
+__global__ void pfx_compute_beta_g_kernel(
+    int seq_len,
+    int nv,
+    const T* B,          // [seq_len, nv]
+    const T* A,          // [seq_len, nv]
+    const T* dt_bias,    // [nv]
+    const T* a_log_exp,  // [nv]
+    T* beta,             // [nv, seq_len]
+    T* g                 // [nv, seq_len]
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(seq_len) * nv;
+    if (idx >= total) return;
+
+    const int t = static_cast<int>(idx / nv);
+    const int h = static_cast<int>(idx % nv);
+
+    // B[t, h] → sigmoid → beta[h, t]
+    const float b_val = pfx_to_float(B[idx]);
+    const float beta_val = 1.0f / (1.0f + expf(-b_val));
+    beta[static_cast<size_t>(h) * seq_len + t] = pfx_from_float<T>(beta_val);
+
+    // A[t, h] + dt_bias[h] → softplus → * a_log_exp[h] → negate → g[h, t]
+    const float a_val = pfx_to_float(A[idx]);
+    const float dt = pfx_to_float(dt_bias[h]);
+    const float ale = pfx_to_float(a_log_exp[h]);
+    const float sp = logf(1.0f + expf(a_val + dt));
+    g[static_cast<size_t>(h) * seq_len + t] = pfx_from_float<T>(-sp * ale);
+}
+
+// ---- Kernel 8: Split gated Q projection ----
+// src: [S, num_heads, 2*head_dim] — each head has [query(hd) | gate(hd)]
+// query_out: [S, num_heads, head_dim]
+// gate_out:  [S, num_heads, head_dim]
+
+template <typename T>
+__global__ void pfx_split_qgate_kernel(
+    int S, int num_heads, int head_dim,
+    const T* src,
+    T* query_out,
+    T* gate_out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(S) * num_heads * head_dim;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % head_dim);
+    const int h = static_cast<int>((idx / head_dim) % num_heads);
+    const int s = static_cast<int>(idx / (static_cast<size_t>(head_dim) * num_heads));
+
+    const size_t src_base = static_cast<size_t>(s) * num_heads * head_dim * 2
+                          + static_cast<size_t>(h) * head_dim * 2;
+    query_out[idx] = src[src_base + d];
+    gate_out[idx] = src[src_base + head_dim + d];
+}
+
+// ---- Kernel 9: Split interleaved QKV ----
+// src: [S, qkv_dim] where qkv_dim = [Q(key_dim) | K(key_dim) | V(val_dim)]
+// Splits into separate contiguous Q, K, V buffers.
+// Q_out: [S, key_dim], K_out: [S, key_dim], V_out: [S, val_dim]
+
+template <typename T>
+__global__ void pfx_split_qkv_kernel(
+    int S, int key_dim, int val_dim,
+    const T* src,
+    T* Q_out,
+    T* K_out,
+    T* V_out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int qkv_dim = key_dim * 2 + val_dim;
+    const size_t total = static_cast<size_t>(S) * qkv_dim;
+    if (idx >= total) return;
+
+    const int s = static_cast<int>(idx / qkv_dim);
+    const int c = static_cast<int>(idx % qkv_dim);
+    const T val = src[idx];
+
+    if (c < key_dim) {
+        Q_out[static_cast<size_t>(s) * key_dim + c] = val;
+    } else if (c < key_dim * 2) {
+        K_out[static_cast<size_t>(s) * key_dim + (c - key_dim)] = val;
+    } else {
+        V_out[static_cast<size_t>(s) * val_dim + (c - key_dim * 2)] = val;
+    }
+}
+
+// ---- Kernel 10: Repeat interleave along head dimension ----
+// src: [S, n_heads, head_dim] → dst: [S, n_heads * repeats, head_dim]
+// Each head is repeated 'repeats' times consecutively.
+
+template <typename T>
+__global__ void pfx_repeat_interleave_heads_kernel(
+    int S, int n_heads, int head_dim, int repeats,
+    const T* src,
+    T* dst
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int out_heads = n_heads * repeats;
+    const size_t total = static_cast<size_t>(S) * out_heads * head_dim;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % head_dim);
+    const int oh = static_cast<int>((idx / head_dim) % out_heads);
+    const int s = static_cast<int>(idx / (static_cast<size_t>(head_dim) * out_heads));
+    const int src_h = oh / repeats;
+
+    const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
+                         + static_cast<size_t>(src_h) * head_dim + d;
+    dst[idx] = src[src_off];
+}
