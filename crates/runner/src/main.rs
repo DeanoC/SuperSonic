@@ -56,6 +56,10 @@ struct Cli {
     /// Skip baked format and load directly from safetensors (for debugging)
     #[arg(long)]
     no_bake: bool,
+
+    /// Use oracle (Python) for prefill instead of native GPU prefill
+    #[arg(long)]
+    oracle_prefill: bool,
 }
 
 fn main() -> Result<()> {
@@ -200,14 +204,32 @@ fn main() -> Result<()> {
         params.use_4b_kernel,
     )?;
 
-    // Run native GPU prefill
+    // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
-    let prefill_logits = engine.prefill_native(&prompt_ids)?;
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-    eprintln!("[prefill] native GPU prefill done in {prefill_ms:.0}ms");
-
-    // First token from prefill argmax
-    let mut next_token = DecodeEngine::greedy_sample(&prefill_logits);
+    let (prefill_logits, mut next_token) = if cli.oracle_prefill {
+        let model_id = cli
+            .model_id
+            .clone()
+            .unwrap_or_else(|| model_variant.hf_model_id().to_string());
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/run_oracle.py");
+        let output = oracle::run_oracle(
+            &oracle_script, &model_id, &prompt_ids, cli.max_new_tokens,
+            &cli.oracle_dtype, true,
+        )?;
+        engine.load_prefill_state(&output)?;
+        let first = output.generated_token_ids[0];
+        eprintln!("[prefill] oracle prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
+        (output.prefill_logits, first)
+    } else {
+        let logits = engine.prefill_native(&prompt_ids)?;
+        let first = DecodeEngine::greedy_sample(&logits);
+        eprintln!("[prefill] native GPU prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
+        (logits, first)
+    };
 
     // Optionally run oracle for validation
     let oracle_output = if cli.validate {

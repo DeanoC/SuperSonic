@@ -138,6 +138,19 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_hip_fused_rms_norm_linear(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_dim: usize,
+        out_dim: usize,
+        eps: f32,
+        add_unit_offset: c_int,
+        hidden: *const c_void,
+        norm_weight: *const c_void,
+        proj_weight: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_hip_batched_matmul_view(
         dtype: c_int,
         device_ordinal: usize,
@@ -567,6 +580,50 @@ pub fn mul_scalar(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("mul_scalar failed: {status}")));
+    }
+    Ok(())
+}
+
+// ---- Fused RMSNorm + linear projection (F32 intermediate) ----
+
+/// Fused RMSNorm → linear projection for multiple rows.
+/// Keeps normed intermediate in F32 to avoid BF16 precision loss.
+/// hidden: [n_rows, hidden_dim], norm_weight: [hidden_dim], proj_weight: [out_dim, hidden_dim]
+/// out: [n_rows, out_dim]
+pub fn fused_rms_norm_linear_rows(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    hidden_dim: usize,
+    out_dim: usize,
+    eps: f32,
+    hidden: &GpuBuffer,
+    norm_weight: &GpuBuffer,
+    proj_weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let row_bytes = hidden_dim * dtype.size_in_bytes();
+    let out_row_bytes = out_dim * dtype.size_in_bytes();
+    for row in 0..n_rows {
+        let hidden_ptr = hidden.offset_ptr(row * row_bytes);
+        let out_ptr = unsafe { (out.as_mut_ptr() as *mut u8).add(row * out_row_bytes) as *mut std::ffi::c_void };
+        let status = unsafe {
+            dotcache_qwen35_hip_fused_rms_norm_linear(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                hidden_dim,
+                out_dim,
+                eps,
+                1, // add_unit_offset (Qwen3.5 uses w + 1.0)
+                hidden_ptr,
+                norm_weight.as_ptr(),
+                proj_weight.as_ptr(),
+                out_ptr,
+            )
+        };
+        if status != 0 {
+            return Err(GpuError::Hip(format!("fused_rms_norm_linear row {row} failed: {status}")));
+        }
     }
     Ok(())
 }

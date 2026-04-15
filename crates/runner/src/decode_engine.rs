@@ -99,11 +99,19 @@ impl DecodeEngine {
             .prefill_hidden_shape
             .as_ref()
             .context("missing prefill_hidden_shape")?;
+        // Oracle's tensor_to_b64 may return the full underlying storage (all tokens)
+        // instead of just the last token. Take only the last token's worth of bytes.
+        let expected_bytes: usize = hidden_shape.iter().product::<usize>() * ScalarType::BF16.size_in_bytes();
+        let actual_hidden = if hidden_bytes.len() > expected_bytes {
+            &hidden_bytes[hidden_bytes.len() - expected_bytes..]
+        } else {
+            &hidden_bytes
+        };
         self.hidden_io = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             hidden_shape,
-            &hidden_bytes,
+            actual_hidden,
         )
         .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
 

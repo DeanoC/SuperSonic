@@ -214,16 +214,10 @@ pub fn prefill(
 
         // Post-attention RMSNorm (multi-row)
         prefill_ffi::rms_norm_rows(
-            ordinal,
-            ScalarType::BF16,
-            seq_len,
-            hidden_dim,
+            ordinal, ScalarType::BF16, seq_len, hidden_dim,
             config.rms_norm_eps as f32,
-            &scratch.hidden,
-            &weights.layers[idx].post_attn_norm_w,
-            &mut scratch.normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} post-attn norm: {e}"))?;
+            &scratch.hidden, &weights.layers[idx].post_attn_norm_w, &mut scratch.normed,
+        ).map_err(|e| anyhow::anyhow!("layer {idx} post-attn norm: {e}"))?;
 
         // MLP: gate_proj + up_proj → SwiGLU → down_proj → residual add
         prefill_mlp_layer(weights, &mut scratch, config, idx, seq_len, ordinal)?;
@@ -860,28 +854,14 @@ fn prefill_mlp_layer(
 
     // gate_proj: normed [seq, hidden] × gate_w [intermediate, hidden]^T → [seq, intermediate]
     prefill_ffi::matmul_rhs_transposed(
-        ordinal,
-        ScalarType::BF16,
-        1, // batch=1
-        seq_len,       // m = seq_len
-        intermediate,  // n = intermediate_size
-        hidden_dim,    // k = hidden_dim
-        &scratch.normed,
-        &lw.gate_proj_w,
-        &mut scratch.proj_buf,
+        ordinal, ScalarType::BF16, 1, seq_len, intermediate, hidden_dim,
+        &scratch.normed, &lw.gate_proj_w, &mut scratch.proj_buf,
     )?;
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
     prefill_ffi::matmul_rhs_transposed(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        seq_len,
-        intermediate,
-        hidden_dim,
-        &scratch.normed,
-        &lw.up_proj_w,
-        &mut scratch.proj_buf2,
+        ordinal, ScalarType::BF16, 1, seq_len, intermediate, hidden_dim,
+        &scratch.normed, &lw.up_proj_w, &mut scratch.proj_buf2,
     )?;
 
     // SwiGLU: out = silu(gate) * up
