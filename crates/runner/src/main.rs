@@ -196,6 +196,7 @@ fn main() -> Result<()> {
         params.proj_buf_floats,
         params.attn_scratch_floats,
         params.kv_chunk_size,
+        params.use_4b_kernel,
     )?;
 
     // Run oracle for prefill (and optionally validation)

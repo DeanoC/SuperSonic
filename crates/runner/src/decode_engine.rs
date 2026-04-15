@@ -24,15 +24,19 @@ pub struct DecodeEngine {
     matvec_counter: GpuBuffer,
     ordinal: usize,
     kv_chunk_size: usize,
+    use_4b_kernel: bool,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
 }
 
 impl DecodeEngine {
     pub fn new(
         weights: Qwen35Weights,
         ordinal: usize,
+        proj_buf_floats: usize,
         attn_scratch_floats: usize,
-        saved_gate_floats: usize,
         kv_chunk_size: usize,
+        use_4b_kernel: bool,
     ) -> Result<Self> {
         let config = &weights.config;
         let state = ModelState::new(config, ordinal)
@@ -42,8 +46,8 @@ impl DecodeEngine {
             config.hidden_size,
             config.intermediate_size,
             config.num_hidden_layers,
+            proj_buf_floats,
             attn_scratch_floats,
-            saved_gate_floats,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
         let rotary =
@@ -70,6 +74,9 @@ impl DecodeEngine {
             matvec_counter,
             ordinal,
             kv_chunk_size,
+            use_4b_kernel,
+            proj_buf_floats,
+            attn_scratch_floats,
         })
     }
 
@@ -186,23 +193,44 @@ impl DecodeEngine {
             .upload_descs(&descs)
             .map_err(|e| anyhow::anyhow!("upload descs: {e}"))?;
 
-        // 5. Launch persistent decode kernel
-        kernel_ffi::persistent_decode(
-            self.ordinal,
-            ScalarType::BF16,
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-            seqlen_offset,
-            &self.scratch.desc_device,
-            &mut self.hidden_io,
-            &mut self.scratch.workspace,
-            &mut self.scratch.sync_buf,
-            &self.rotary.cos,
-            &self.rotary.sin,
-            self.rotary.rotary_dim,
-        )
-        .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
+        // 5. Launch persistent decode kernel (dispatch by model variant)
+        if self.use_4b_kernel {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+            )
+            .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
+        } else {
+            kernel_ffi::persistent_decode(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+            )
+            .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
+        }
 
         // 6. Update KV filled counts
         let filled = seqlen_offset + 1;
@@ -213,7 +241,8 @@ impl DecodeEngine {
         }
 
         // 7. Final RMSNorm
-        kernel_ffi::rms_norm(
+        let rms_norm_fn = if self.use_4b_kernel { kernel_ffi::rms_norm_4b } else { kernel_ffi::rms_norm };
+        rms_norm_fn(
             self.ordinal,
             ScalarType::BF16,
             &mut self.normed_buf,
@@ -225,7 +254,8 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
 
         // 8. lm_head projection → logits (work-stealing matvec)
-        kernel_ffi::standalone_matvec(
+        let matvec_fn = if self.use_4b_kernel { kernel_ffi::standalone_matvec_4b } else { kernel_ffi::standalone_matvec };
+        matvec_fn(
             self.ordinal,
             ScalarType::BF16,
             &mut self.logits_buf,

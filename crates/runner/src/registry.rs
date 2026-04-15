@@ -83,6 +83,8 @@ pub struct KernelParams {
     pub attn_scratch_floats: usize,
     pub weight_prefix: &'static str,
     pub kv_chunk_size: usize,
+    /// Use the 4B kernel variant (separate compilation for hipcc compatibility).
+    pub use_4b_kernel: bool,
 }
 
 /// VRAM budget for a specific (model, backend, arch) combination.
@@ -130,6 +132,7 @@ static REGISTRY: &[RegistryEntry] = &[
             attn_scratch_floats: 2048,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
+            use_4b_kernel: false,
         },
     },
     RegistryEntry {
@@ -146,6 +149,7 @@ static REGISTRY: &[RegistryEntry] = &[
             attn_scratch_floats: 4096,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
+            use_4b_kernel: true,
         },
     },
 ];

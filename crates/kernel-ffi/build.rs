@@ -44,14 +44,17 @@ fn main() {
         .join("kernels");
     let kernel_src = kernel_dir.join("full_attention.hip");
     let bridge_src = kernel_dir.join("full_attention_bridge.cpp");
-    for path in [&kernel_src, &bridge_src] {
+    let kernel_4b_src = kernel_dir.join("full_attention_4b.hip");
+    let bridge_4b_src = kernel_dir.join("full_attention_bridge_4b.cpp");
+    for path in [&kernel_src, &bridge_src, &kernel_4b_src, &bridge_4b_src] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let bridge_obj = out_dir.join("qwen35_megakernel_hip.o");
-    let bridge_lib = out_dir.join("libqwen35_megakernel_hip.a");
+    let arch = detect_hip_arch();
 
+    // Compile 0.8B kernel
+    let bridge_obj = out_dir.join("qwen35_megakernel_hip.o");
     let mut hipcc = Command::new("hipcc");
     hipcc
         .arg("-std=c++17")
@@ -65,14 +68,36 @@ fn main() {
         .arg(&bridge_src)
         .arg("-o")
         .arg(&bridge_obj);
-    if let Some(arch) = detect_hip_arch() {
+    if let Some(ref arch) = arch {
         hipcc.arg(format!("--offload-arch={arch}"));
     }
     run(&mut hipcc, "building qwen35 megakernel HIP bridge");
 
+    // Compile 4B kernel
+    let bridge_4b_obj = out_dir.join("qwen35_4b_megakernel_hip.o");
+    let mut hipcc_4b = Command::new("hipcc");
+    hipcc_4b
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-fPIC")
+        .arg("-I")
+        .arg(&kernel_dir)
+        .arg("-x")
+        .arg("hip")
+        .arg("-c")
+        .arg(&bridge_4b_src)
+        .arg("-o")
+        .arg(&bridge_4b_obj);
+    if let Some(ref arch) = arch {
+        hipcc_4b.arg(format!("--offload-arch={arch}"));
+    }
+    run(&mut hipcc_4b, "building qwen35-4b megakernel HIP bridge");
+
+    // Archive both into a single static library
+    let bridge_lib = out_dir.join("libqwen35_megakernel_hip.a");
     let mut ar = Command::new("ar");
-    ar.arg("crus").arg(&bridge_lib).arg(&bridge_obj);
-    run(&mut ar, "archiving qwen35 megakernel HIP bridge");
+    ar.arg("crus").arg(&bridge_lib).arg(&bridge_obj).arg(&bridge_4b_obj);
+    run(&mut ar, "archiving qwen35 megakernel HIP bridges");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=qwen35_megakernel_hip");
