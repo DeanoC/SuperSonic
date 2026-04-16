@@ -7,6 +7,14 @@ edition = "2021"
 name = "supersonic"
 path = "src/main.rs"
 
+[[bin]]
+name = "int4_test"
+path = "src/bin/int4_test.rs"
+
+[[bin]]
+name = "int4_real_test"
+path = "src/bin/int4_real_test.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

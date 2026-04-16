@@ -217,33 +217,33 @@ fn main() -> Result<()> {
             model_store::bake_dir(&cli.model_dir)
         };
         if !model_store::version_ok(&bake_dir) {
-            let mode_str = if cli.int4 { " (INT4)" } else if cli.fp8_runtime { " (FP8 native)" } else { "" };
+            if cli.int4 {
+                anyhow::bail!(
+                    "no INT4 baked package found at {}\n\n\
+                     INT4 baking requires a GPTQ calibration pass in Python. \
+                     Run:\n  python oracle/bake_int4.py --model-dir {}\n\n\
+                     This is a one-time developer step (requires torch, transformers, \
+                     and datasets — installs via `pip install torch transformers datasets`). \
+                     Calibration takes ~5-30 min depending on model size and GPU.",
+                    bake_dir.display(),
+                    cli.model_dir.display(),
+                );
+            }
+            let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
             eprintln!("[bake] no baked package found — baking weights{mode_str} (one-time)...");
             let bake_start = Instant::now();
             let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
                 .map(|i| text_config.is_full_attention(i))
                 .collect();
-            if cli.int4 {
-                model_store::bake_qwen35_int4(
-                    &cli.model_dir,
-                    params.weight_prefix,
-                    text_config.num_hidden_layers,
-                    &layer_is_full,
-                    128, // group_size
-                    &|msg| eprintln!("{msg}"),
-                )
-                .map_err(|e| anyhow::anyhow!("bake int4 weights: {e}"))?;
-            } else {
-                model_store::bake_qwen35(
-                    &cli.model_dir,
-                    params.weight_prefix,
-                    text_config.num_hidden_layers,
-                    &layer_is_full,
-                    cli.fp8_runtime,
-                    &|msg| eprintln!("{msg}"),
-                )
-                .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
-            }
+            model_store::bake_qwen35(
+                &cli.model_dir,
+                params.weight_prefix,
+                text_config.num_hidden_layers,
+                &layer_is_full,
+                cli.fp8_runtime,
+                &|msg| eprintln!("{msg}"),
+            )
+            .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
             eprintln!(
                 "[bake] done in {:.1}s",
                 bake_start.elapsed().as_secs_f64()
@@ -479,6 +479,14 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
 
     println!("{text}");
+    println!(
+        "[tokens] {}",
+        generated_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     eprintln!(
         "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4} gpu_oracle_max_delta={gpu_max_delta:.4} batch_size={}",
         prompt_ids.len(),

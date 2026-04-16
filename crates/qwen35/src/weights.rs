@@ -1,10 +1,35 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use gpu_hal::GpuBuffer;
+use gpu_hal::{GpuBuffer, ScalarType};
 
 use crate::config::TextConfig;
 use crate::loader::{LoadError, WeightLoader};
+
+/// Ensure a small 1D tensor is stored as F32 on the GPU.
+/// Kernels for `linear_attn.norm.weight` read it as `float*`, but some bakes
+/// (e.g. the GPTQ INT4 bake) can store it as BF16. Upcast when needed so
+/// every backend sees the same F32 layout.
+fn ensure_f32_on_gpu(
+    buf: GpuBuffer,
+    ordinal: usize,
+) -> Result<GpuBuffer, model_store::Error> {
+    if buf.dtype() == ScalarType::F32 {
+        return Ok(buf);
+    }
+    if buf.dtype() != ScalarType::BF16 {
+        return Err(model_store::Error::Other(format!(
+            "norm.weight: unsupported dtype {:?} (expected F32 or BF16)",
+            buf.dtype()
+        )));
+    }
+    let elems = buf.elem_count();
+    let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, buf.shape())
+        .map_err(|e| model_store::Error::Other(format!("norm_w upcast alloc: {e}")))?;
+    kernel_ffi::prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, elems, &buf, &mut out)
+        .map_err(|e| model_store::Error::Other(format!("norm_w bf16->f32 cast: {e}")))?;
+    Ok(out)
+}
 
 /// All immutable model weights on GPU.
 pub struct Qwen35Weights {
@@ -190,7 +215,10 @@ impl Qwen35Weights {
                     out_proj_w: loader.load_to_gpu(&format!("{la}.out_proj.weight"), ordinal)?,
                     dt_bias: loader.load_to_gpu(&format!("{la}.dt_bias"), ordinal)?,
                     a_log_exp,
-                    norm_w: loader.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                    norm_w: ensure_f32_on_gpu(
+                        loader.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                        ordinal,
+                    ).map_err(|e| LoadError::UnsupportedDtype(e.to_string()))?,
                     qkv_proj_scale: None, z_proj_scale: None, b_proj_scale: None,
                     a_proj_scale: None, out_proj_scale: None,
                     qkv_proj_int4_scale: None, qkv_proj_int4_zero: None,
@@ -386,7 +414,10 @@ impl Qwen35Weights {
                     out_proj_w: store.load_to_gpu(&out_name, ordinal)?,
                     dt_bias: store.load_to_gpu(&format!("{la}.dt_bias"), ordinal)?,
                     a_log_exp: store.load_to_gpu(&format!("{la}.A_log"), ordinal)?,
-                    norm_w: store.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                    norm_w: ensure_f32_on_gpu(
+                        store.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                        ordinal,
+                    )?,
                     qkv_proj_scale: load_scale(&qkv_name)?,
                     z_proj_scale: load_scale(&z_name)?,
                     b_proj_scale: load_scale(&b_name)?,
