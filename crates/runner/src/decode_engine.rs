@@ -5,7 +5,7 @@ use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
-use qwen35::desc_builder::build_layer_descs;
+use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs};
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::PersistentDecodeScratch;
 use qwen35::state::ModelState;
@@ -28,6 +28,8 @@ pub struct DecodeEngine {
     use_4b_kernel: bool,
     proj_buf_floats: usize,
     attn_scratch_floats: usize,
+    /// FP8 scale descriptors on GPU (None for BF16 weights).
+    fp8_scale_device: Option<GpuBuffer>,
 }
 
 impl DecodeEngine {
@@ -64,6 +66,26 @@ impl DecodeEngine {
         let matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("matvec_counter: {e}"))?;
 
+        // Build FP8 scale descriptors if weights are FP8
+        let fp8_scale_device = if let Some(fp8_descs) = build_fp8_scale_descs(&weights) {
+            let desc_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    fp8_descs.as_ptr() as *const u8,
+                    fp8_descs.len() * std::mem::size_of::<kernel_ffi::FP8ScaleDesc>(),
+                )
+            };
+            let buf = GpuBuffer::from_host_bytes(
+                ordinal,
+                ScalarType::U8,
+                &[desc_bytes.len()],
+                desc_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("upload fp8 scale descs: {e}"))?;
+            Some(buf)
+        } else {
+            None
+        };
+
         Ok(Self {
             weights,
             state,
@@ -78,6 +100,7 @@ impl DecodeEngine {
             use_4b_kernel,
             proj_buf_floats,
             attn_scratch_floats,
+            fp8_scale_device,
         })
     }
 
@@ -240,6 +263,7 @@ impl DecodeEngine {
                 self.rotary.rotary_dim,
                 self.proj_buf_floats,
                 self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
             )
             .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
         } else {

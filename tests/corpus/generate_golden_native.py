@@ -19,7 +19,7 @@ import subprocess
 import time
 
 
-def generate(binary, model, model_dir, test_defs_path, output_path):
+def generate(binary, model, model_dir, test_defs_path, output_path, extra_flags=None):
     with open(test_defs_path) as f:
         test_defs = json.load(f)
 
@@ -30,6 +30,8 @@ def generate(binary, model, model_dir, test_defs_path, output_path):
         "test_cases": [],
     }
 
+    extra = extra_flags or []
+
     for tc in test_defs["test_cases"]:
         name = tc["name"]
         prompt = tc["prompt"]
@@ -38,7 +40,7 @@ def generate(binary, model, model_dir, test_defs_path, output_path):
 
         proc = subprocess.run(
             [binary, "--model", model, "--model-dir", model_dir,
-             "--prompt", prompt, "--max-new-tokens", str(max_new)],
+             "--prompt", prompt, "--max-new-tokens", str(max_new)] + extra,
             capture_output=True, text=True, timeout=600,
         )
 
@@ -78,5 +80,6 @@ if __name__ == "__main__":
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--test-defs", required=True, help="Existing golden JSON to read test definitions from")
     parser.add_argument("--output", required=True)
+    parser.add_argument("extra_flags", nargs="*", help="Extra flags to pass to supersonic (e.g. --fp8-runtime)")
     args = parser.parse_args()
-    generate(args.binary, args.model, args.model_dir, args.test_defs, args.output)
+    generate(args.binary, args.model, args.model_dir, args.test_defs, args.output, args.extra_flags)

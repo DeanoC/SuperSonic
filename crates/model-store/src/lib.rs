@@ -36,6 +36,19 @@ pub fn bake_dir(model_dir: &Path) -> PathBuf {
         .join(format!("v{FORMAT_VERSION}"))
 }
 
+/// Return the bake directory for FP8 native mode (runtime dequant on GPU).
+/// Uses a separate directory so BF16 and FP8 baked packages coexist.
+pub fn bake_dir_fp8(model_dir: &Path) -> PathBuf {
+    model_dir
+        .join(".supersonic")
+        .join(format!("v{FORMAT_VERSION}-fp8"))
+}
+
+/// Check if a valid FP8-native baked package exists.
+pub fn version_ok_fp8(bake_dir: &Path) -> bool {
+    version_ok(bake_dir)
+}
+
 /// Path to manifest.json within a bake directory.
 pub fn manifest_path(bake_dir: &Path) -> PathBuf {
     bake_dir.join("manifest.json")

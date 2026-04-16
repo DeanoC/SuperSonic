@@ -1,4 +1,4 @@
-use kernel_ffi::DecodeLayerDesc;
+use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc};
 
 use crate::state::ModelState;
 use crate::weights::{Qwen35Weights, LayerKind};
@@ -87,4 +87,50 @@ pub fn build_layer_descs(
         descs.push(d);
     }
     descs
+}
+
+/// Build FP8 scale descriptors (parallel to layer descs) for runtime FP8 dequant.
+/// Returns None if weights are not FP8.
+pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc>> {
+    if !weights.is_fp8 {
+        return None;
+    }
+
+    let scale_ptr = |opt: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
+        opt.as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null())
+    };
+
+    let mut descs = Vec::with_capacity(weights.layers.len());
+    for lw in &weights.layers {
+        let mut d = FP8ScaleDesc::default();
+        d.block_size = weights.fp8_block_size as i32;
+
+        // Common MLP scales
+        d.gate_proj_scale = scale_ptr(&lw.gate_proj_scale);
+        d.up_proj_scale = scale_ptr(&lw.up_proj_scale);
+        d.down_proj_scale = scale_ptr(&lw.down_proj_scale);
+
+        match lw.kind {
+            LayerKind::Linear => {
+                let lin = lw.linear.as_ref().unwrap();
+                d.qkv_proj_scale = scale_ptr(&lin.qkv_proj_scale);
+                d.z_proj_scale = scale_ptr(&lin.z_proj_scale);
+                d.b_proj_scale = scale_ptr(&lin.b_proj_scale);
+                d.a_proj_scale = scale_ptr(&lin.a_proj_scale);
+                d.linear_out_proj_scale = scale_ptr(&lin.out_proj_scale);
+            }
+            LayerKind::Full => {
+                let fa = lw.full.as_ref().unwrap();
+                d.q_proj_scale = scale_ptr(&fa.q_proj_scale);
+                d.k_proj_scale = scale_ptr(&fa.k_proj_scale);
+                d.v_proj_scale = scale_ptr(&fa.v_proj_scale);
+                d.o_proj_scale = scale_ptr(&fa.o_proj_scale);
+            }
+        }
+
+        descs.push(d);
+    }
+    Some(descs)
 }

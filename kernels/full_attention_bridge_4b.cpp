@@ -3547,6 +3547,112 @@ extern "C" int dotcache_qwen35_4b_hip_batched_matmul_view(
     }
 }
 
+// Tiled BF16 matmul for prefill: out = lhs × rhs^T (rhs stored [n, k])
+template <typename T>
+int matmul_rhs_transposed_tiled_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = TILE_M * TILE_N;  // 256
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_matmul_rhs_transposed_tiled_kernel<T>),
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const T*>(lhs),
+        static_cast<const T*>(rhs),
+        static_cast<T*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 270;
+    if (sync_err != hipSuccess) return 271;
+    return 0;
+}
+
+extern "C" int dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs,
+    void* out) {
+    switch (dtype) {
+    case 2:
+        return matmul_rhs_transposed_tiled_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs, out);
+    default:
+        return 272;
+    }
+}
+
+// FP8 dequant matmul for prefill: out = lhs (BF16) × dequant(rhs_fp8)^T
+// Uses tiled kernel with 3D grid: (n_tiles, m_tiles, batch)
+template <typename T>
+int matmul_fp8_dequant_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_fp8,
+    const void* scale,
+    int block_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = TILE_M * TILE_N;  // 256
+    // Shared memory: s_lhs[16][32] + s_rhs[16][32] = 2 * 16 * 32 * 4 = 4096 bytes
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_matmul_fp8_dequant_kernel<T>),
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const T*>(lhs),
+        static_cast<const uint8_t*>(rhs_fp8),
+        static_cast<const T*>(scale),
+        block_size,
+        static_cast<T*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 260;
+    if (sync_err != hipSuccess) return 261;
+    return 0;
+}
+
+extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_fp8,
+    const void* scale,
+    int block_size,
+    void* out) {
+    switch (dtype) {
+    case 2:
+        return matmul_fp8_dequant_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_fp8, scale, block_size, out);
+    default:
+        return 262;
+    }
+}
+
 extern "C" int dotcache_qwen35_4b_hip_cast(
     int input_dtype,
     int output_dtype,
@@ -4404,7 +4510,8 @@ int persistent_decode_device(
     const void* sin_table,
     int rotary_dim,
     int proj_buf_floats,
-    int attn_scratch_floats
+    int attn_scratch_floats,
+    const void* fp8_scales
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4435,7 +4542,8 @@ int persistent_decode_device(
         static_cast<const T*>(sin_table),
         rotary_dim,
         proj_buf_floats,
-        attn_scratch_floats);
+        attn_scratch_floats,
+        static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4460,7 +4568,8 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     const void* sin_table,
     size_t rotary_dim,
     size_t proj_buf_floats,
-    size_t attn_scratch_floats) {
+    size_t attn_scratch_floats,
+    const void* fp8_scales) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4473,7 +4582,8 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             barrier_counter, barrier_flag,
             cos_table, sin_table, static_cast<int>(rotary_dim),
             static_cast<int>(proj_buf_floats),
-            static_cast<int>(attn_scratch_floats));
+            static_cast<int>(attn_scratch_floats),
+            fp8_scales);
     default:
         return 256;
     }

@@ -136,6 +136,7 @@ pub fn bake_qwen35(
     weight_prefix: &str,
     num_layers: usize,
     layer_is_full: &[bool],
+    fp8_native: bool,
     progress: &dyn Fn(&str),
 ) -> Result<(), Error> {
     assert_eq!(
@@ -144,7 +145,11 @@ pub fn bake_qwen35(
         "layer_is_full length must match num_layers"
     );
 
-    let bake_dir = crate::bake_dir(model_dir);
+    let bake_dir = if fp8_native {
+        crate::bake_dir_fp8(model_dir)
+    } else {
+        crate::bake_dir(model_dir)
+    };
     fs::create_dir_all(&bake_dir)?;
 
     let (shards, tensor_index) = open_shards(model_dir)?;
@@ -160,12 +165,13 @@ pub fn bake_qwen35(
     let mut entries: Vec<TensorMeta> = Vec::new();
 
     // Collect and sort tensor names for deterministic output.
-    // Skip _scale_inv tensors (consumed during FP8 dequant, not stored separately).
+    // In BF16-dequant mode, skip _scale_inv tensors (consumed during FP8 dequant).
+    // In FP8-native mode, keep them — they're stored as separate entries.
     let mut names: Vec<String> = tensor_index
         .keys()
         .filter(|name| {
             if name.ends_with("_scale_inv") {
-                return false; // consumed by FP8 dequant
+                return fp8_native; // keep scale tensors only in FP8-native mode
             }
             name.starts_with(&format!("{weight_prefix}.")) || *name == "lm_head.weight"
         })
@@ -183,10 +189,32 @@ pub fn bake_qwen35(
         let raw_bytes = view.data();
         let raw_dtype = view.dtype();
 
-        // Check if this is an FP8 tensor that needs dequantization
+        // Check if this is an FP8 tensor that needs dequantization (or native storage)
         if raw_dtype == safetensors::Dtype::F8_E4M3 && shape.len() == 2 {
             let scale_name = format!("{name}_scale_inv");
             if let Some(&scale_shard_idx) = tensor_index.get(&scale_name) {
+                if fp8_native {
+                    // FP8-native mode: store raw FP8 bytes as-is.
+                    // The companion _scale_inv tensor will be stored separately
+                    // when we encounter it in the sorted name list.
+                    let offset = align_up(cursor, 4096);
+                    weights_file.seek(SeekFrom::Start(offset))?;
+                    weights_file.write_all(raw_bytes)?;
+                    let byte_len = raw_bytes.len() as u64;
+
+                    entries.push(TensorMeta {
+                        name: name.clone(),
+                        shape: shape.clone(),
+                        dtype: "f8_e4m3".to_string(),
+                        layout: LayoutTag::Fp8Native,
+                        offset,
+                        byte_len,
+                    });
+                    cursor = offset + byte_len;
+                    continue;
+                }
+
+                // BF16-dequant mode: dequantize on CPU, store as BF16.
                 let scale_st = SafeTensors::deserialize(&shards[scale_shard_idx])?;
                 let scale_view = scale_st.tensor(&scale_name)?;
                 let scale_shape: Vec<usize> = scale_view.shape().to_vec();
@@ -241,7 +269,7 @@ pub fn bake_qwen35(
                 let (b, s) = transforms::a_log_to_exp_bf16(raw_bytes, &shape);
                 (b, s, "bf16")
             }
-            LayoutTag::Fp8Dequantized => {
+            LayoutTag::Fp8Dequantized | LayoutTag::Fp8Native => {
                 unreachable!("FP8 tensors are handled before this match")
             }
         };

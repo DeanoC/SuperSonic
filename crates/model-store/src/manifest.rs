@@ -16,6 +16,9 @@ pub enum LayoutTag {
     HeadExpReshaped,
     /// FP8 E4M3 weight dequantized to BF16 using block-wise scale_inv at bake time.
     Fp8Dequantized,
+    /// FP8 E4M3 weight stored natively (not dequantized). Companion _scale_inv tensor
+    /// is stored separately. Used for runtime FP8 dequant on GPU.
+    Fp8Native,
 }
 
 /// Metadata for a single tensor in the baked package.

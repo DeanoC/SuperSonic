@@ -56,6 +56,11 @@ impl BakedStore {
         self.index.contains_key(name)
     }
 
+    /// Get the shape of a tensor without loading it.
+    pub fn shape(&self, name: &str) -> Option<&[usize]> {
+        self.index.get(name).map(|m| m.shape.as_slice())
+    }
+
     /// Load a tensor from the baked store directly to GPU memory.
     /// One memcpy (H2D), zero parsing or transformation.
     pub fn load_to_gpu(&self, name: &str, ordinal: usize) -> Result<GpuBuffer, Error> {

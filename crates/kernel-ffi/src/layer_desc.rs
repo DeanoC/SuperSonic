@@ -66,3 +66,38 @@ impl Default for DecodeLayerDesc {
         unsafe { std::mem::zeroed() }
     }
 }
+
+/// FP8 scale_inv pointers for runtime dequantization.
+/// Parallel struct to DecodeLayerDesc — one per layer.
+/// Passed as a separate kernel argument to avoid modifying DecodeLayerDesc layout
+/// (which triggers hipcc codegen bugs on gfx1150).
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct FP8ScaleDesc {
+    // Common (all layer types) — MLP projections
+    pub gate_proj_scale: *const c_void,
+    pub up_proj_scale: *const c_void,
+    pub down_proj_scale: *const c_void,
+    // Linear attention projections
+    pub qkv_proj_scale: *const c_void,
+    pub z_proj_scale: *const c_void,
+    pub b_proj_scale: *const c_void,
+    pub a_proj_scale: *const c_void,
+    pub linear_out_proj_scale: *const c_void,
+    // Full attention projections
+    pub q_proj_scale: *const c_void,
+    pub k_proj_scale: *const c_void,
+    pub v_proj_scale: *const c_void,
+    pub o_proj_scale: *const c_void,
+    // Block size for scale_inv indexing (typically 128)
+    pub block_size: c_int,
+}
+
+unsafe impl Send for FP8ScaleDesc {}
+unsafe impl Sync for FP8ScaleDesc {}
+
+impl Default for FP8ScaleDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}

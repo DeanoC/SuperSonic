@@ -61,6 +61,71 @@ struct Qwen35DecodeLayerDesc {
     int kv_max_t;                      // allocated T dimension of KV cache
 };
 
+// =============================================================================
+// FP8 E4M3 runtime dequantization support
+// =============================================================================
+
+// FP8 scale_inv pointers for runtime dequantization.
+// One per decoder layer, passed as a separate kernel parameter.
+// Struct layout must match kernel_ffi::FP8ScaleDesc in Rust.
+struct Qwen35FP8ScaleDesc {
+    // Common MLP weights
+    const void* gate_proj_scale;
+    const void* up_proj_scale;
+    const void* down_proj_scale;
+    // Linear attention weights
+    const void* qkv_proj_scale;
+    const void* z_proj_scale;
+    const void* b_proj_scale;
+    const void* a_proj_scale;
+    const void* linear_out_proj_scale;
+    // Full attention weights
+    const void* q_proj_scale;
+    const void* k_proj_scale;
+    const void* v_proj_scale;
+    const void* o_proj_scale;
+    // Block size for scale_inv indexing (typically 128)
+    int block_size;
+};
+
+// Convert FP8 E4M3 byte to F32.
+// E4M3: 1 sign + 4 exponent + 3 mantissa, bias=7, no inf, NaN=0x7F/0xFF
+__device__ inline float fp8_e4m3_to_float(uint8_t byte) {
+    int sign = (byte >> 7) & 1;
+    int exp = (byte >> 3) & 0xF;
+    int mantissa = byte & 0x7;
+    if (byte == 0x7F || byte == 0xFF) return 0.0f;  // NaN → 0
+    float val;
+    if (exp == 0) {
+        // Subnormal: 2^(-6) * (mantissa / 8)
+        val = static_cast<float>(mantissa) / 8.0f * 1.52587890625e-2f;  // 2^(-6) = 1/64
+    } else {
+        // Normal: 2^(exp-7) * (1 + mantissa/8)
+        val = (1.0f + static_cast<float>(mantissa) / 8.0f) * exp2f(static_cast<float>(exp - 7));
+    }
+    return sign ? -val : val;
+}
+
+// Read one FP8 weight element with block-wise dequantization.
+// w_ptr: void pointer to FP8 weight data [out_dim, in_dim] stored as uint8_t
+// scale_ptr: void pointer to BF16 scale_inv [out_dim/block, in_dim/block]
+// row, col: element coordinates in the weight matrix
+// cols: number of columns (in_dim) in the weight matrix
+// block_size: FP8 quantization block size (typically 128)
+__device__ inline float fp8_dequant_weight(
+    const void* w_ptr, const void* scale_ptr,
+    int row, int col, int cols, int block_size
+) {
+    const uint8_t* fp8 = static_cast<const uint8_t*>(w_ptr);
+    float val = fp8_e4m3_to_float(fp8[static_cast<size_t>(row) * cols + col]);
+    const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    int scale_row = row / block_size;
+    int scale_col = col / block_size;
+    int scale_cols = (cols + block_size - 1) / block_size;
+    float scale = static_cast<float>(scales[scale_row * scale_cols + scale_col]);
+    return val * scale;
+}
+
 template <typename T>
 __device__ inline float dotcache_qwen35_to_float(T value);
 
@@ -2092,6 +2157,92 @@ __global__ void dotcache_qwen35_batched_matmul_kernel(
     out[idx] = dotcache_qwen35_from_float<T>(acc);
 }
 
+// =============================================================================
+// Tiled matmul kernel for prefill (BF16 weights, rhs transposed)
+//
+// Computes: out[batch, m, n] = lhs[batch, m, k] × rhs[batch, n, k]^T
+//
+// lhs: [batch, m, k] row-major
+// rhs: [batch, n, k] row-major (virtually transposed: reads rhs[col*k + kk])
+// out: [batch, m, n]
+//
+// Same tiling as FP8 kernel: TILE_M×TILE_N output tile, TILE_K reduction steps.
+// =============================================================================
+
+#define BF16_TILE_M 16
+#define BF16_TILE_N 16
+#define BF16_TILE_K 32
+
+template <typename T>
+__global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const T* __restrict__ lhs,   // [batch, m, k]
+    const T* __restrict__ rhs,   // [batch, n, k] (virtually transposed)
+    T* __restrict__ out          // [batch, m, n]
+) {
+    const int tx = threadIdx.x % BF16_TILE_N;
+    const int ty = threadIdx.x / BF16_TILE_N;
+
+    const int batch_idx = blockIdx.z;
+    const int tile_row = blockIdx.y * BF16_TILE_M;
+    const int tile_col = blockIdx.x * BF16_TILE_N;
+
+    const int row = tile_row + ty;
+    const int col = tile_col + tx;
+
+    const size_t lhs_base = static_cast<size_t>(batch_idx) * m * k;
+    const size_t rhs_base = static_cast<size_t>(batch_idx) * n * k;
+
+    __shared__ float s_lhs[BF16_TILE_M][BF16_TILE_K];
+    __shared__ float s_rhs[BF16_TILE_N][BF16_TILE_K];
+
+    float acc = 0.0f;
+
+    for (int kk_base = 0; kk_base < k; kk_base += BF16_TILE_K) {
+        // Cooperative load LHS tile [TILE_M, TILE_K]
+        for (int i = threadIdx.x; i < BF16_TILE_M * BF16_TILE_K; i += blockDim.x) {
+            int lr = i / BF16_TILE_K;
+            int lc = i % BF16_TILE_K;
+            int gr = tile_row + lr;
+            int gc = kk_base + lc;
+            if (gr < m && gc < k)
+                s_lhs[lr][lc] = dotcache_qwen35_to_float(lhs[lhs_base + static_cast<size_t>(gr) * k + gc]);
+            else
+                s_lhs[lr][lc] = 0.0f;
+        }
+
+        // Cooperative load RHS tile [TILE_N, TILE_K] (rhs is [n, k], virtual transpose)
+        for (int i = threadIdx.x; i < BF16_TILE_N * BF16_TILE_K; i += blockDim.x) {
+            int rr = i / BF16_TILE_K;
+            int rc = i % BF16_TILE_K;
+            int gn = tile_col + rr;
+            int gk = kk_base + rc;
+            if (gn < n && gk < k)
+                s_rhs[rr][rc] = dotcache_qwen35_to_float(rhs[rhs_base + static_cast<size_t>(gn) * k + gk]);
+            else
+                s_rhs[rr][rc] = 0.0f;
+        }
+
+        __syncthreads();
+
+        if (row < m && col < n) {
+            for (int kk = 0; kk < BF16_TILE_K; ++kk)
+                acc += s_lhs[ty][kk] * s_rhs[tx][kk];
+        }
+
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        size_t out_idx = static_cast<size_t>(batch_idx) * m * n +
+                         static_cast<size_t>(row) * n + col;
+        out[out_idx] = dotcache_qwen35_from_float<T>(acc);
+    }
+}
+
 template <typename T>
 __global__ void dotcache_qwen35_batched_matmul_view_kernel(
     int batch_rank,
@@ -2142,6 +2293,115 @@ __global__ void dotcache_qwen35_batched_matmul_view_kernel(
                        static_cast<size_t>(col) * static_cast<size_t>(rhs_col_stride)]);
     }
     out[idx] = dotcache_qwen35_from_float<T>(acc);
+}
+
+// =============================================================================
+// FP8 dequant matmul kernel for prefill (tiled version)
+//
+// Computes: out[batch, m, n] = lhs[batch, m, k] × dequant(rhs_fp8[batch, n, k])^T
+//
+// lhs: BF16 activations [batch, m, k] (row-major)
+// rhs: FP8 E4M3 weights [batch, n, k] (row-major, virtually transposed)
+// scale: BF16 scale_inv [n/block_size, k/block_size] (same for all batches)
+// out: BF16 [batch, m, n]
+//
+// Tiled approach: each thread block computes a TILE_M×TILE_N output tile.
+// Threads cooperate to load TILE_K slices into shared memory.
+// =============================================================================
+
+#define FP8_TILE_M 16
+#define FP8_TILE_N 16
+#define FP8_TILE_K 32
+
+template <typename T>
+__global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const T* __restrict__ lhs,          // [batch, m, k] BF16
+    const uint8_t* __restrict__ rhs,    // [batch, n, k] FP8 (virtually transposed)
+    const T* __restrict__ scale,        // [n/block_size, k/block_size] BF16
+    int block_size,
+    T* __restrict__ out                 // [batch, m, n] BF16
+) {
+    // Block computes output tile [TILE_M, TILE_N]
+    // Thread layout: 16×16 = 256 threads, each computes one output element
+    const int tx = threadIdx.x % FP8_TILE_N;
+    const int ty = threadIdx.x / FP8_TILE_N;
+
+    const int batch_idx = blockIdx.z;
+    const int tile_row = blockIdx.y * FP8_TILE_M;
+    const int tile_col = blockIdx.x * FP8_TILE_N;
+
+    const int row = tile_row + ty;
+    const int col = tile_col + tx;
+
+    const size_t lhs_base = static_cast<size_t>(batch_idx) * m * k;
+    const size_t rhs_base = static_cast<size_t>(batch_idx) * n * k;
+
+    const int scale_cols = (k + block_size - 1) / block_size;
+
+    // Shared memory for tiles
+    __shared__ float s_lhs[FP8_TILE_M][FP8_TILE_K];
+    __shared__ float s_rhs[FP8_TILE_N][FP8_TILE_K];
+
+    float acc = 0.0f;
+
+    // Iterate over K dimension in TILE_K chunks
+    for (int kk_base = 0; kk_base < k; kk_base += FP8_TILE_K) {
+        // Cooperative load: each thread loads multiple elements to fill the tiles
+        // LHS tile: [TILE_M, TILE_K] = 16×32 = 512 elements, 256 threads → 2 loads each
+        for (int i = threadIdx.x; i < FP8_TILE_M * FP8_TILE_K; i += blockDim.x) {
+            int lr = i / FP8_TILE_K;
+            int lc = i % FP8_TILE_K;
+            int global_r = tile_row + lr;
+            int global_c = kk_base + lc;
+            if (global_r < m && global_c < k) {
+                s_lhs[lr][lc] = dotcache_qwen35_to_float(
+                    lhs[lhs_base + static_cast<size_t>(global_r) * k + global_c]);
+            } else {
+                s_lhs[lr][lc] = 0.0f;
+            }
+        }
+
+        // RHS tile: [TILE_N, TILE_K] = 16×32 = 512 elements, 256 threads → 2 loads each
+        // rhs is [n, k], reading element [col, kk] for virtual transpose
+        for (int i = threadIdx.x; i < FP8_TILE_N * FP8_TILE_K; i += blockDim.x) {
+            int rr = i / FP8_TILE_K;  // which output column (= which weight row)
+            int rc = i % FP8_TILE_K;  // which k position
+            int global_n = tile_col + rr;
+            int global_k = kk_base + rc;
+            if (global_n < n && global_k < k) {
+                uint8_t fp8_byte = rhs[rhs_base + static_cast<size_t>(global_n) * k + global_k];
+                float fp8_val = fp8_e4m3_to_float(fp8_byte);
+                int sr = global_n / block_size;
+                int sc = global_k / block_size;
+                float s = dotcache_qwen35_to_float(scale[sr * scale_cols + sc]);
+                s_rhs[rr][rc] = fp8_val * s;
+            } else {
+                s_rhs[rr][rc] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        // Compute partial dot products from shared memory
+        if (row < m && col < n) {
+            for (int kk = 0; kk < FP8_TILE_K; ++kk) {
+                acc += s_lhs[ty][kk] * s_rhs[tx][kk];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    // Write result
+    if (row < m && col < n) {
+        size_t out_idx = static_cast<size_t>(batch_idx) * m * n +
+                         static_cast<size_t>(row) * n + col;
+        out[out_idx] = dotcache_qwen35_from_float<T>(acc);
+    }
 }
 
 template <typename T>
@@ -3139,7 +3399,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const T* __restrict__ sin_table,   // [max_positions, rotary_dim/2] RoPE sin
     int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
     int proj_buf_floats,                 // max projection output buffer size
-    int attn_scratch_floats              // attention/recurrent scratch buffer size
+    int attn_scratch_floats,             // attention/recurrent scratch buffer size
+    const Qwen35FP8ScaleDesc* __restrict__ fp8_scales  // nullptr for BF16, else [num_layers]
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3201,23 +3462,32 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
 
-                    const T* w;
+                    const void* w_raw;
+                    const void* w_scale = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.q_out_dim)) {
-                        w = static_cast<const T*>(L.q_proj_w);
+                        w_raw = L.q_proj_w;
                         row = sr;
+                        if (fp8_scales) w_scale = fp8_scales[layer].q_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.q_out_dim + L.k_out_dim)) {
-                        w = static_cast<const T*>(L.k_proj_w);
+                        w_raw = L.k_proj_w;
                         row = sr - L.q_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].k_proj_scale;
                     } else {
-                        w = static_cast<const T*>(L.v_proj_w);
+                        w_raw = L.v_proj_w;
                         row = sr - L.q_out_dim - L.k_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].v_proj_scale;
                     }
-                    const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
                     float p = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    if (fp8_scales != nullptr && w_scale != nullptr) {
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                    } else {
+                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    }
                     lds[tid] = p;
                     __syncthreads();
                     for (int s = bs/2; s > 0; s >>= 1) {
@@ -3429,8 +3699,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     lds_input[c] = proj_buf[c];
                 __syncthreads();
 
-                const T* ow = static_cast<const T*>(L.o_proj_w);
-
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -3440,10 +3708,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                     if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    const T* wr = ow + static_cast<size_t>(sr) * attn_size;
                     float p = 0.0f;
-                    for (int c = tid; c < attn_size; c += bs) {
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    if (fp8_scales != nullptr && fp8_scales[layer].o_proj_scale != nullptr) {
+                        for (int c = tid; c < attn_size; c += bs)
+                            p += fp8_dequant_weight(L.o_proj_w, fp8_scales[layer].o_proj_scale, sr, c, attn_size, fp8_scales[layer].block_size) * lds_input[c];
+                    } else {
+                        const T* wr = static_cast<const T*>(L.o_proj_w) + static_cast<size_t>(sr) * attn_size;
+                        for (int c = tid; c < attn_size; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
                     }
                     lds[tid] = p;
                     __syncthreads();
@@ -3473,27 +3745,36 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
 
-                    const T* w;
+                    const void* w_raw;
+                    const void* w_scale = nullptr;
                     int row;
-                    int offset = 0;
                     if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
-                        w = static_cast<const T*>(L.qkv_proj_w);
+                        w_raw = L.qkv_proj_w;
                         row = sr;
+                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
-                        w = static_cast<const T*>(L.z_proj_w);
+                        w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
-                        w = static_cast<const T*>(L.b_proj_w);
+                        w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
                     } else {
-                        w = static_cast<const T*>(L.a_proj_w);
+                        w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
                     }
-                    const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
                     float p = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    if (fp8_scales != nullptr && w_scale != nullptr) {
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                    } else {
+                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    }
                     lds[tid] = p;
                     __syncthreads();
                     for (int s = bs/2; s > 0; s >>= 1) {
@@ -3741,8 +4022,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     lds_input[c] = attn_scratch[c];
                 __syncthreads();
 
-                const T* ow = static_cast<const T*>(L.linear_out_proj_w);
-
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -3752,10 +4031,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                     if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    const T* wr = ow + static_cast<size_t>(sr) * vd;
                     float p = 0.0f;
-                    for (int c = tid; c < vd; c += bs) {
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
+                        for (int c = tid; c < vd; c += bs)
+                            p += fp8_dequant_weight(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size) * lds_input[c];
+                    } else {
+                        const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
+                        for (int c = tid; c < vd; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
                     }
                     lds[tid] = p;
                     __syncthreads();
@@ -3792,8 +4075,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         grid_barrier(barrier_counter, barrier_flag, nb);
 
         {
-            const T* gw = static_cast<const T*>(L.gate_proj_w);
-            const T* uw = static_cast<const T*>(L.up_proj_w);
+            const bool gate_fp8 = (fp8_scales != nullptr && fp8_scales[layer].gate_proj_scale != nullptr);
+            const bool up_fp8 = (fp8_scales != nullptr && fp8_scales[layer].up_proj_scale != nullptr);
             for (;;) {
                 __shared__ unsigned int sr;
                 if (tid == 0) sr = atomicAdd(&counters[0], 1u);
@@ -3801,10 +4084,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (sr >= static_cast<unsigned int>(L.intermediate_size)) break;
 
                 // gate_proj row (reads normed from LDS)
-                const T* gr = gw + static_cast<size_t>(sr) * hidden_dim;
                 float gp = 0.0f;
-                for (int c = tid; c < hidden_dim; c += bs)
-                    gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
+                if (gate_fp8) {
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        gp += fp8_dequant_weight(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                } else {
+                    const T* gr = static_cast<const T*>(L.gate_proj_w) + static_cast<size_t>(sr) * hidden_dim;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
+                }
                 lds[tid] = gp;
                 __syncthreads();
                 for (int s = bs/2; s > 0; s >>= 1) {
@@ -3814,10 +4102,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float gate_val = lds[0];
 
                 // up_proj row (reads normed from LDS)
-                const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
                 float up = 0.0f;
-                for (int c = tid; c < hidden_dim; c += bs)
-                    up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
+                if (up_fp8) {
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        up += fp8_dequant_weight(L.up_proj_w, fp8_scales[layer].up_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                } else {
+                    const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(sr) * hidden_dim;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
+                }
                 lds[tid] = up;
                 __syncthreads();
                 for (int s = bs/2; s > 0; s >>= 1) {
@@ -3846,17 +4139,22 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         grid_barrier(barrier_counter, barrier_flag, nb);
 
         {
-            const T* dw = static_cast<const T*>(L.down_proj_w);
+            const bool down_fp8 = (fp8_scales != nullptr && fp8_scales[layer].down_proj_scale != nullptr);
             for (;;) {
                 __shared__ unsigned int sr;
                 if (tid == 0) sr = atomicAdd(&counters[0], 1u);
                 __syncthreads();
                 if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
                 float p = 0.0f;
-                for (int c = tid; c < L.intermediate_size; c += bs)
-                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                if (down_fp8) {
+                    for (int c = tid; c < L.intermediate_size; c += bs)
+                        p += fp8_dequant_weight(L.down_proj_w, fp8_scales[layer].down_proj_scale, sr, c, L.intermediate_size, fp8_scales[layer].block_size) * lds_input[c];
+                } else {
+                    const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(sr) * L.intermediate_size;
+                    for (int c = tid; c < L.intermediate_size; c += bs)
+                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                }
                 lds[tid] = p;
                 __syncthreads();
                 for (int s = bs/2; s > 0; s >>= 1) {

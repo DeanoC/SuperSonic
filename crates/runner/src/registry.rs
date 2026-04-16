@@ -5,6 +5,7 @@ use std::fmt;
 pub enum ModelVariant {
     Qwen3_5_0_8B,
     Qwen3_5_4B,
+    Qwen3_5_9B,
 }
 
 impl ModelVariant {
@@ -13,6 +14,7 @@ impl ModelVariant {
         match s.to_ascii_lowercase().as_str() {
             "qwen3.5-0.8b" | "qwen35-0.8b" | "0.8b" => Some(Self::Qwen3_5_0_8B),
             "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
+            "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
             _ => None,
         }
     }
@@ -22,6 +24,7 @@ impl ModelVariant {
         match self {
             Self::Qwen3_5_0_8B => "Qwen/Qwen3.5-0.8B",
             Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
+            Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
         }
     }
 }
@@ -31,6 +34,7 @@ impl fmt::Display for ModelVariant {
         match self {
             Self::Qwen3_5_0_8B => write!(f, "qwen3.5-0.8b"),
             Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
+            Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
         }
     }
 }
@@ -152,6 +156,24 @@ static REGISTRY: &[RegistryEntry] = &[
             use_4b_kernel: true,
         },
     },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            // ~16.8 GiB weights (BF16) + scratch + activations + buffers
+            // Only fits with --fp8-runtime (~9.4 GiB effective)
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 4096,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        },
+    },
 ];
 
 /// Find a registry entry for the given combination. Returns None if unsupported.
@@ -173,6 +195,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
         .map(|e| match &e.model {
             ModelVariant::Qwen3_5_0_8B => "qwen3.5-0.8b",
             ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
+            ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
         })
         .collect();
     models.dedup();

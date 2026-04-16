@@ -171,6 +171,34 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    // Tiled BF16 matmul: out = lhs × rhs^T (rhs stored [n, k])
+    fn dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    // FP8 dequant matmul: out = lhs (BF16) × dequant(rhs_fp8)^T
+    fn dotcache_qwen35_4b_hip_matmul_fp8_dequant(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_fp8: *const c_void,
+        scale: *const c_void,
+        block_size: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
     // ---- Original prefill kernel declarations ----
 
     fn dotcache_qwen35_hip_embedding_lookup(
@@ -632,6 +660,7 @@ pub fn fused_rms_norm_linear_rows(
 
 /// Matrix multiply with transposed rhs: out [m, n] = lhs [m, k] × rhs^T where rhs is [n, k].
 /// This is the standard linear projection: y = x @ W.T where W is [out_dim, in_dim].
+/// Uses a tiled kernel for performance.
 pub fn matmul_rhs_transposed(
     ordinal: usize,
     dtype: ScalarType,
@@ -643,24 +672,14 @@ pub fn matmul_rhs_transposed(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    let batch_dims = [batch_elems as c_int];
-    let batch_strides = [1 as c_int]; // no batching
     let status = unsafe {
-        dotcache_qwen35_hip_batched_matmul_view(
+        dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             dtype.kernel_dtype_code(),
             ordinal,
-            1, // batch_rank
             batch_elems,
             m as c_int,
             n as c_int,
             k as c_int,
-            batch_strides.as_ptr(), // lhs_batch_strides
-            batch_strides.as_ptr(), // rhs_batch_strides
-            batch_dims.as_ptr(),    // out_batch_dims
-            k as c_int,            // lhs_row_stride = k (standard row-major)
-            1,                      // lhs_k_stride = 1 (contiguous)
-            1,                      // rhs_k_stride = 1 (k dim contiguous in rhs)
-            k as c_int,            // rhs_col_stride = k (virtually transpose: rhs[kk,col] reads rhs_data[col*k + kk])
             lhs.as_ptr(),
             rhs.as_ptr(),
             out.as_mut_ptr(),
@@ -668,6 +687,41 @@ pub fn matmul_rhs_transposed(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("matmul_rhs_transposed failed: {status}")));
+    }
+    Ok(())
+}
+
+/// FP8 dequant matmul: out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_fp8 [batch, n, k])^T
+/// rhs_fp8 is FP8 E4M3 weights, scale is BF16 scale_inv [n/block, k/block].
+pub fn matmul_rhs_transposed_fp8(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_fp8: &GpuBuffer,
+    scale: &GpuBuffer,
+    block_size: usize,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_matmul_fp8_dequant(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            lhs.as_ptr(),
+            rhs_fp8.as_ptr(),
+            scale.as_ptr(),
+            block_size as c_int,
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("matmul_rhs_transposed_fp8 failed: {status}")));
     }
     Ok(())
 }

@@ -60,6 +60,11 @@ struct Cli {
     /// Use oracle (Python) for prefill instead of native GPU prefill
     #[arg(long)]
     oracle_prefill: bool,
+
+    /// Keep FP8 weights in native format on GPU for runtime dequantization.
+    /// Halves weight VRAM (~8.8→4.8 GiB for 4B). Requires FP8 model weights.
+    #[arg(long)]
+    fp8_runtime: bool,
 }
 
 fn main() -> Result<()> {
@@ -126,12 +131,25 @@ fn main() -> Result<()> {
         .context_size
         .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
     let kv_per_token = text_config.kv_bytes_per_token(gpu_hal::ScalarType::BF16.size_in_bytes());
-    let estimated_vram = entry.vram.estimate_total(context_tokens, kv_per_token);
+    // FP8 runtime dequant halves weight VRAM. Estimate: fixed_bytes includes weights
+    // (~90% of total) + scratch/buffers (~10%). FP8 cuts weight portion in half.
+    let effective_fixed = if cli.fp8_runtime {
+        // weights ~= fixed * 0.9, scratch ~= fixed * 0.1
+        // FP8 weights = weights / 2
+        // total = weights/2 + scratch = fixed * 0.45 + fixed * 0.1 = fixed * 0.55
+        (entry.vram.fixed_bytes as f64 * 0.55) as u64
+    } else {
+        entry.vram.fixed_bytes
+    };
+    let estimated_vram = {
+        let kv_bytes = kv_per_token * context_tokens as u64;
+        ((effective_fixed + kv_bytes) as f64 * entry.vram.overhead_factor) as u64
+    };
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
         "[vram] estimated={:.2}GiB (weights={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
         gib(estimated_vram),
-        gib(entry.vram.fixed_bytes),
+        gib(effective_fixed),
         gib(kv_per_token * context_tokens as u64),
         context_tokens,
         gib(total_vram),
@@ -142,7 +160,7 @@ fn main() -> Result<()> {
              need ~{:.2}GiB (weights {:.2}GiB + KV cache {:.2}GiB), \
              GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
             gib(estimated_vram),
-            gib(entry.vram.fixed_bytes),
+            gib(effective_fixed),
             gib(kv_per_token * context_tokens as u64),
             gib(total_vram),
         );
@@ -160,9 +178,15 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
     } else {
-        let bake_dir = model_store::bake_dir(&cli.model_dir);
+        // Select bake directory: FP8-native mode uses a separate directory
+        let bake_dir = if cli.fp8_runtime {
+            model_store::bake_dir_fp8(&cli.model_dir)
+        } else {
+            model_store::bake_dir(&cli.model_dir)
+        };
         if !model_store::version_ok(&bake_dir) {
-            eprintln!("[bake] no baked package found — baking weights (one-time)...");
+            let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
+            eprintln!("[bake] no baked package found — baking weights{mode_str} (one-time)...");
             let bake_start = Instant::now();
             let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
                 .map(|i| text_config.is_full_attention(i))
@@ -172,6 +196,7 @@ fn main() -> Result<()> {
                 params.weight_prefix,
                 text_config.num_hidden_layers,
                 &layer_is_full,
+                cli.fp8_runtime,
                 &|msg| eprintln!("{msg}"),
             )
             .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
@@ -192,6 +217,12 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("load baked weights: {e}"))?
     };
+    if weights.is_fp8 {
+        eprintln!(
+            "[weights] FP8 runtime dequant active (block_size={})",
+            weights.fp8_block_size
+        );
+    }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     // Create decode engine
