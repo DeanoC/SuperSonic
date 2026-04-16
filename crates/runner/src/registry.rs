@@ -4,6 +4,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVariant {
     Qwen3_5_0_8B,
+    Qwen3_5_2B,
     Qwen3_5_4B,
     Qwen3_5_9B,
 }
@@ -13,6 +14,7 @@ impl ModelVariant {
     pub fn from_cli_str(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "qwen3.5-0.8b" | "qwen35-0.8b" | "0.8b" => Some(Self::Qwen3_5_0_8B),
+            "qwen3.5-2b" | "qwen35-2b" | "2b" => Some(Self::Qwen3_5_2B),
             "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
             "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
             _ => None,
@@ -23,6 +25,7 @@ impl ModelVariant {
     pub fn hf_model_id(&self) -> &'static str {
         match self {
             Self::Qwen3_5_0_8B => "Qwen/Qwen3.5-0.8B",
+            Self::Qwen3_5_2B => "Qwen/Qwen3.5-2B",
             Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
             Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
         }
@@ -33,6 +36,7 @@ impl fmt::Display for ModelVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Qwen3_5_0_8B => write!(f, "qwen3.5-0.8b"),
+            Self::Qwen3_5_2B => write!(f, "qwen3.5-2b"),
             Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
             Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
         }
@@ -140,6 +144,23 @@ static REGISTRY: &[RegistryEntry] = &[
         },
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            // ~3.7 GiB weights (BF16) + scratch + activations + buffers
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 2048,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        },
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_4B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx1150,
@@ -194,6 +215,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
         .iter()
         .map(|e| match &e.model {
             ModelVariant::Qwen3_5_0_8B => "qwen3.5-0.8b",
+            ModelVariant::Qwen3_5_2B => "qwen3.5-2b",
             ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
         })
