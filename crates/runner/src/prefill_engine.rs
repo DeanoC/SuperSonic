@@ -200,15 +200,28 @@ pub fn prefill(
     let seq_len = prompt_ids.len();
     let hidden_dim = config.hidden_size;
 
-    // Determine effective chunk size: 0 = no chunking (full seq_len)
+    // Determine effective chunk size: 0 = no chunking (full seq_len).
+    // Minimum chunk size is conv kernel size (typically 4) to ensure
+    // extract_conv_state has enough rows to read. We also ensure the
+    // last chunk won't be smaller than kern by absorbing remaining tokens.
+    let min_chunk = config.linear_conv_kernel_dim;
     let eff_chunk = if prefill_chunk_size == 0 || prefill_chunk_size >= seq_len {
         seq_len
     } else {
-        prefill_chunk_size
+        prefill_chunk_size.max(min_chunk)
     };
+    // Ensure the last chunk won't be too small: if remainder < min_chunk,
+    // the last chunk absorbs into the previous one. E.g., 10 tokens with chunk=4:
+    // remainder=2 < 4, so last chunk becomes 4+2=6 instead of 4,2.
+    // This is handled in the loop by making the second-to-last chunk larger.
 
-    // Allocate scratch buffers sized to chunk (or full seq_len if no chunking)
-    let mut scratch = PrefillScratch::new(config, eff_chunk, ordinal)?;
+    // Allocate scratch buffers sized to max possible chunk (may absorb up to min_chunk-1 extra)
+    let max_chunk = if eff_chunk < seq_len {
+        eff_chunk + min_chunk - 1
+    } else {
+        seq_len
+    };
+    let mut scratch = PrefillScratch::new(config, max_chunk, ordinal)?;
 
     // Per-layer inter-chunk state for linear attention layers
     let num_linear_layers = (0..config.num_hidden_layers)
@@ -254,7 +267,14 @@ pub fn prefill(
     let mut chunk_start = 0;
     let mut last_chunk_len = 0;
     while chunk_start < seq_len {
-        let chunk_len = std::cmp::min(eff_chunk, seq_len - chunk_start);
+        let remaining = seq_len - chunk_start;
+        // If the remaining tokens after this chunk would be too small (< kern),
+        // absorb them into this chunk to avoid the small-chunk edge case.
+        let chunk_len = if remaining > eff_chunk && remaining - eff_chunk < min_chunk {
+            remaining // absorb the small remainder
+        } else {
+            std::cmp::min(eff_chunk, remaining)
+        };
         let is_last_chunk = chunk_start + chunk_len >= seq_len;
         last_chunk_len = chunk_len;
 
@@ -502,16 +522,55 @@ fn prefill_full_attention_layer(
     prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &query_buf, &mut scratch.attn_q)
         .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
 
-    // 11. Causal attention
-    //     For the first chunk (chunk_start==0): use scratch K/V directly (contiguous [nkv, chunk_len, hd]).
-    //     For subsequent chunks: would need to read from KV cache which has capacity-strided layout.
-    //     TODO: For multi-chunk, need a contiguous KV assembly or strided attention kernel.
-    //     For now, the first chunk path covers the unchunked case (eff_chunk >= seq_len).
+    // 11. Causal attention — Q: [q_heads, chunk_len, hd], K/V: [kv_heads, kv_len, hd]
+    //     The KV cache has layout [1, nkv, capacity, hd] where capacity >= kv_len.
+    //     The attention kernel expects contiguous [nkv, kv_len, hd].
+    //     Assemble contiguous K/V from the KV cache (handles both single and multi-chunk).
     let scale = 1.0 / (head_dim as f32).sqrt();
+    let kv_k_contig;
+    let kv_v_contig;
+    let attn_k_ref;
+    let attn_v_ref;
+
+    let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+    let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+    let cap = cache_k_ref.shape()[2];
+
+    if cap == kv_len {
+        // No padding — cache is already contiguous, use directly
+        attn_k_ref = cache_k_ref;
+        attn_v_ref = cache_v_ref;
+    } else {
+        // Capacity > kv_len — copy each head's kv_len entries into contiguous buffers
+        kv_k_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+            .map_err(|e| anyhow::anyhow!("kv_k_contig alloc: {e}"))?;
+        kv_v_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+            .map_err(|e| anyhow::anyhow!("kv_v_contig alloc: {e}"))?;
+        let cap_stride = cap * head_dim * elem_bytes;
+        let contig_stride = kv_len * head_dim * elem_bytes;
+        let copy_bytes = kv_len * head_dim * elem_bytes;
+        for h in 0..num_kv_heads {
+            gpu_hal::copy_d2d(
+                ordinal,
+                kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                cache_k_ref.offset_ptr(h * cap_stride),
+                copy_bytes,
+            ).map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                cache_v_ref.offset_ptr(h * cap_stride),
+                copy_bytes,
+            ).map_err(|e| anyhow::anyhow!("layer {idx} KV assemble V h={h}: {e}"))?;
+        }
+        attn_k_ref = &kv_k_contig;
+        attn_v_ref = &kv_v_contig;
+    }
+
     prefill_ffi::full_attention_prefill(
         ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
         chunk_len, kv_len, head_dim, scale, chunk_start,
-        &scratch.attn_q, &scratch.attn_k, &scratch.attn_v, &mut scratch.attn_out_f32,
+        &scratch.attn_q, attn_k_ref, attn_v_ref, &mut scratch.attn_out_f32,
     ).map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
     // 12. Cast F32 → BF16
@@ -580,34 +639,73 @@ fn prefill_linear_attention_layer(
         &scratch.normed, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
     )?;
 
-    // Save last kern-1 rows of QKV for conv state — only on the LAST chunk
-    if is_last_chunk {
-        if let Some(ref mut conv_state) = state.layers[idx].conv_state {
-            prefill_ffi::extract_conv_state(
-                ordinal,
-                ScalarType::BF16,
-                chunk_len,
-                qkv_dim,
-                kern - 1,
-                &scratch.proj_buf,
-                conv_state,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} extract conv state: {e}"))?;
+    // Save last kern-1 QKV rows for conv state (inter-chunk or final decode state).
+    // When chunk_len >= kern-1, use extract_conv_state directly.
+    // When chunk_len < kern-1, assemble from conv_tail + current chunk's QKV.
+    let pad = kern - 1;
+    if chunk_len >= pad {
+        // Enough rows in this chunk to extract directly
+        if is_last_chunk {
+            if let Some(ref mut conv_state) = state.layers[idx].conv_state {
+                prefill_ffi::extract_conv_state(
+                    ordinal, ScalarType::BF16, chunk_len, qkv_dim, pad,
+                    &scratch.proj_buf, conv_state,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} extract conv state: {e}"))?;
+            }
         }
-    }
+        if !is_last_chunk {
+            prefill_ffi::extract_conv_state(
+                ordinal, ScalarType::BF16, chunk_len, qkv_dim, pad,
+                &scratch.proj_buf, chunk_conv_tail,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} extract conv tail: {e}"))?;
+        }
+    } else {
+        // chunk_len < pad — assemble from previous conv_tail + current chunk's QKV.
+        // Use a temp buffer to avoid aliasing issues.
+        let keep_old = pad - chunk_len;
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let tail_stride = pad * elem_bytes;
 
-    // Save last kern-1 rows of QKV into chunk_conv_tail for next chunk's conv padding
-    if !is_last_chunk {
-        prefill_ffi::extract_conv_state(
-            ordinal,
-            ScalarType::BF16,
-            chunk_len,
-            qkv_dim,
-            kern - 1,
-            &scratch.proj_buf,
-            chunk_conv_tail,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} extract conv tail: {e}"))?;
+        let mut new_tail = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, pad])
+            .map_err(|e| anyhow::anyhow!("new_tail alloc: {e}"))?;
+
+        for ch in 0..qkv_dim {
+            // Keep last keep_old entries from old tail
+            if keep_old > 0 && chunk_start > 0 {
+                let src_off = ch * tail_stride + chunk_len * elem_bytes;
+                let dst_off = ch * tail_stride;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    new_tail.offset_ptr(dst_off) as *mut c_void,
+                    chunk_conv_tail.offset_ptr(src_off),
+                    keep_old * elem_bytes,
+                ).map_err(|e| anyhow::anyhow!("layer {idx} conv tail shift ch={ch}: {e}"))?;
+            }
+            // Append new QKV values
+            for t in 0..chunk_len {
+                let src_off = t * qkv_dim * elem_bytes + ch * elem_bytes;
+                let dst_off = ch * tail_stride + (keep_old + t) * elem_bytes;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    new_tail.offset_ptr(dst_off) as *mut c_void,
+                    scratch.proj_buf.offset_ptr(src_off),
+                    elem_bytes,
+                ).map_err(|e| anyhow::anyhow!("layer {idx} conv tail append ch={ch} t={t}: {e}"))?;
+            }
+        }
+
+        // Copy assembled tail to destination
+        let total_bytes = qkv_dim * pad * elem_bytes;
+        if is_last_chunk {
+            if let Some(ref mut conv_state) = state.layers[idx].conv_state {
+                gpu_hal::copy_d2d(ordinal, conv_state.as_ptr() as *mut c_void, new_tail.as_ptr(), total_bytes)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} conv state final: {e}"))?;
+            }
+        }
+        gpu_hal::copy_d2d(ordinal, chunk_conv_tail.as_ptr() as *mut c_void, new_tail.as_ptr(), total_bytes)
+            .map_err(|e| anyhow::anyhow!("layer {idx} conv tail update: {e}"))?;
     }
 
     // 2. Z projection: normed [chunk, hidden] → [chunk, z_dim]
