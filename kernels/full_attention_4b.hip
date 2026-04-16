@@ -106,6 +106,42 @@ __device__ inline float fp8_e4m3_to_float(uint8_t byte) {
     return sign ? -val : val;
 }
 
+// KV cache FP8 scale pointers for dynamic quantization.
+// One per decoder layer, passed as a separate kernel parameter.
+// Struct layout must match kernel_ffi::KVCacheFp8Desc in Rust.
+struct KVCacheFp8Desc {
+    void* kv_scale_k;   // [num_kv_heads, max_T] F32 — per-head-per-position absmax scale
+    void* kv_scale_v;   // [num_kv_heads, max_T] F32
+};
+
+// Convert F32 to FP8 E4M3 byte (inverse of fp8_e4m3_to_float).
+// Clamps to representable range [-448, 448], rounds to nearest.
+__device__ inline uint8_t float_to_fp8_e4m3(float val) {
+    uint8_t sign = 0;
+    if (val < 0.0f) { sign = 0x80; val = -val; }
+    // Clamp to max representable E4M3 value
+    if (val >= 448.0f) return sign | 0x7E;  // max normal: exp=14, mantissa=6 → 2^7*(1+6/8)=448
+    if (val < 1.52587890625e-2f * 0.125f) return sign;  // too small → ±0
+    // Subnormal range: val < 2^(-6) = 0.015625
+    if (val < 0.015625f) {
+        int mantissa = __float2int_rn(val / 1.52587890625e-2f * 8.0f);
+        if (mantissa < 0) mantissa = 0;
+        if (mantissa > 7) mantissa = 7;
+        return sign | static_cast<uint8_t>(mantissa);
+    }
+    // Normal range
+    float log2_val = log2f(val);
+    int exp = static_cast<int>(floorf(log2_val)) + 7;
+    if (exp < 1) exp = 1;
+    if (exp > 14) exp = 14;  // would be NaN range — clamp
+    float pow2 = exp2f(static_cast<float>(exp - 7));
+    int mantissa = __float2int_rn((val / pow2 - 1.0f) * 8.0f);
+    if (mantissa < 0) mantissa = 0;
+    if (mantissa > 7) mantissa = 7;
+    // Check if rounding up mantissa gives a closer value
+    return sign | (static_cast<uint8_t>(exp) << 3) | static_cast<uint8_t>(mantissa);
+}
+
 // Read one FP8 weight element with block-wise dequantization.
 // w_ptr: void pointer to FP8 weight data [out_dim, in_dim] stored as uint8_t
 // scale_ptr: void pointer to BF16 scale_inv [out_dim/block, in_dim/block]
@@ -123,7 +159,11 @@ __device__ inline float fp8_dequant_weight(
     int scale_col = col / block_size;
     int scale_cols = (cols + block_size - 1) / block_size;
     float scale = static_cast<float>(scales[scale_row * scale_cols + scale_col]);
-    return val * scale;
+    // Truncate to BF16 precision to match PyTorch's dequant path (fp8→F32→BF16).
+    // Without this, F32 accumulation of F32-dequanted weights drifts from the
+    // BF16-truncated weights that PyTorch uses, causing token divergence on marginal
+    // argmax decisions after 32 layers of compounding.
+    return static_cast<float>(hip_bfloat16(val * scale));
 }
 
 template <typename T>
@@ -2378,7 +2418,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
                 int sr = global_n / block_size;
                 int sc = global_k / block_size;
                 float s = dotcache_qwen35_to_float(scale[sr * scale_cols + sc]);
-                s_rhs[rr][rc] = fp8_val * s;
+                s_rhs[rr][rc] = static_cast<float>(hip_bfloat16(fp8_val * s));
             } else {
                 s_rhs[rr][rc] = 0.0f;
             }
@@ -3383,6 +3423,58 @@ __device__ inline void block_rms_norm_global(
     __syncthreads();
 }
 
+// =============================================================================
+// KV cache BF16→FP8 quantization kernel (for prefill and oracle state loading)
+// =============================================================================
+// Each block handles one (head, position) pair: 256 threads for head_dim=256.
+// Input:  BF16 K or V tensor [num_kv_heads, seq_len, head_dim]
+// Output: FP8 cache [num_kv_heads, max_T, head_dim] (U8) + scale [num_kv_heads, max_T] (F32)
+template <typename T>
+__global__ void quantize_kv_to_fp8_kernel(
+    const T* __restrict__ src,       // [num_kv_heads, seq_len, head_dim] contiguous
+    uint8_t* __restrict__ dst_fp8,   // [num_kv_heads, max_T, head_dim] strided cache
+    float* __restrict__ dst_scale,   // [num_kv_heads, max_T]
+    int num_kv_heads,
+    int seq_len,
+    int head_dim,
+    int max_T,                       // allocated T dimension of cache
+    int pos_offset                   // starting position in cache
+) {
+    const int tid = threadIdx.x;
+    const int block_idx = blockIdx.x;
+    const int h = block_idx / seq_len;
+    const int t = block_idx % seq_len;
+    if (h >= num_kv_heads || t >= seq_len) return;
+
+    extern __shared__ float smem[];
+
+    // Load value
+    const size_t src_offset = static_cast<size_t>(h) * seq_len * head_dim +
+                              static_cast<size_t>(t) * head_dim + tid;
+    float val = (tid < head_dim) ? static_cast<float>(src[src_offset]) : 0.0f;
+
+    // Absmax reduction
+    smem[tid] = fabsf(val);
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float scale = fmaxf(smem[0] / 448.0f, 1e-12f);
+    float inv_scale = 1.0f / scale;
+
+    // Write scale
+    if (tid == 0)
+        dst_scale[h * max_T + (pos_offset + t)] = scale;
+
+    // Quantize and write FP8
+    if (tid < head_dim) {
+        const size_t dst_offset = static_cast<size_t>(h) * max_T * head_dim +
+                                  static_cast<size_t>(pos_offset + t) * head_dim + tid;
+        dst_fp8[dst_offset] = float_to_fp8_e4m3(val * inv_scale);
+    }
+}
+
 template <typename T>
 __global__ void dotcache_qwen35_persistent_decode_kernel(
     int num_layers,
@@ -3400,7 +3492,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
     int proj_buf_floats,                 // max projection output buffer size
     int attn_scratch_floats,             // attention/recurrent scratch buffer size
-    const Qwen35FP8ScaleDesc* __restrict__ fp8_scales  // nullptr for BF16, else [num_layers]
+    const Qwen35FP8ScaleDesc* __restrict__ fp8_scales,  // nullptr for BF16, else [num_layers]
+    const KVCacheFp8Desc* __restrict__ kv_fp8           // nullptr for BF16 KV, else [num_layers]
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3591,18 +3684,64 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
 
                 // Step D: KV cache append — write new K/V at seqlen_offset
+                // When kv_fp8 is set, quantize K/V to FP8 E4M3 with per-head absmax scale.
                 {
-                    T* cache_k = static_cast<T*>(L.kv_cache_k);
-                    T* cache_v = static_cast<T*>(L.kv_cache_v);
-                    // Cache layout: [num_kv_heads, max_T, head_dim] BF16
-                    // New K/V at position seqlen_offset
-                    for (int h = 0; h < nkv; ++h) {
-                        for (int d = tid; d < hd; d += bs) {
-                            const size_t offset =
-                                static_cast<size_t>(h) * L.kv_max_t * hd +
-                                static_cast<size_t>(seqlen_offset) * hd + d;
-                            cache_k[offset] = dotcache_qwen35_from_float<T>(k_f32[h * hd + d]);
-                            cache_v[offset] = dotcache_qwen35_from_float<T>(v_f32[h * hd + d]);
+                    const bool use_fp8_kv = (kv_fp8 != nullptr && kv_fp8[layer].kv_scale_k != nullptr);
+                    if (use_fp8_kv) {
+                        // FP8 KV cache path: absmax quantize per head
+                        uint8_t* fp8_k = static_cast<uint8_t*>(L.kv_cache_k);
+                        uint8_t* fp8_v = static_cast<uint8_t*>(L.kv_cache_v);
+                        float* scale_k_buf = static_cast<float*>(kv_fp8[layer].kv_scale_k);
+                        float* scale_v_buf = static_cast<float*>(kv_fp8[layer].kv_scale_v);
+
+                        for (int h = 0; h < nkv; ++h) {
+                            // Absmax reduction for K across head_dim using lds[bs]
+                            float my_k = (tid < hd) ? fabsf(k_f32[h * hd + tid]) : 0.0f;
+                            lds[tid] = my_k;
+                            __syncthreads();
+                            for (int s = bs / 2; s > 0; s >>= 1) {
+                                if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+                                __syncthreads();
+                            }
+                            float k_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
+                            float k_inv = 1.0f / k_scale;
+                            if (tid == 0)
+                                scale_k_buf[h * L.kv_max_t + seqlen_offset] = k_scale;
+
+                            // Absmax reduction for V
+                            float my_v = (tid < hd) ? fabsf(v_f32[h * hd + tid]) : 0.0f;
+                            lds[tid] = my_v;
+                            __syncthreads();
+                            for (int s = bs / 2; s > 0; s >>= 1) {
+                                if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+                                __syncthreads();
+                            }
+                            float v_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
+                            float v_inv = 1.0f / v_scale;
+                            if (tid == 0)
+                                scale_v_buf[h * L.kv_max_t + seqlen_offset] = v_scale;
+
+                            // Quantize and write FP8
+                            for (int d = tid; d < hd; d += bs) {
+                                const size_t offset =
+                                    static_cast<size_t>(h) * L.kv_max_t * hd +
+                                    static_cast<size_t>(seqlen_offset) * hd + d;
+                                fp8_k[offset] = float_to_fp8_e4m3(k_f32[h * hd + d] * k_inv);
+                                fp8_v[offset] = float_to_fp8_e4m3(v_f32[h * hd + d] * v_inv);
+                            }
+                        }
+                    } else {
+                        // BF16 KV cache path (original)
+                        T* cache_k = static_cast<T*>(L.kv_cache_k);
+                        T* cache_v = static_cast<T*>(L.kv_cache_v);
+                        for (int h = 0; h < nkv; ++h) {
+                            for (int d = tid; d < hd; d += bs) {
+                                const size_t offset =
+                                    static_cast<size_t>(h) * L.kv_max_t * hd +
+                                    static_cast<size_t>(seqlen_offset) * hd + d;
+                                cache_k[offset] = dotcache_qwen35_from_float<T>(k_f32[h * hd + d]);
+                                cache_v[offset] = dotcache_qwen35_from_float<T>(v_f32[h * hd + d]);
+                            }
                         }
                     }
                     __syncthreads();
@@ -3625,54 +3764,105 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 // hd == bs == 256, so thread tid owns dimension tid.
                 float* attn_flat = proj_buf;  // reuse projection buffer [8224] > 2048
 
-                const T* ck = static_cast<const T*>(L.kv_cache_k);
-                const T* cv = static_cast<const T*>(L.kv_cache_v);
+                const bool use_fp8_kv_attn = (kv_fp8 != nullptr && kv_fp8[layer].kv_scale_k != nullptr);
 
-                for (int qh = 0; qh < nh; ++qh) {
-                    const int kvh = qh / kv_groups;
-                    const float* q_head = q_f32 + qh * hd * 2;
+                if (use_fp8_kv_attn) {
+                    // FP8 KV cache attention path
+                    const uint8_t* fp8_ck = static_cast<const uint8_t*>(L.kv_cache_k);
+                    const uint8_t* fp8_cv = static_cast<const uint8_t*>(L.kv_cache_v);
+                    const float* scale_k_buf = static_cast<const float*>(kv_fp8[layer].kv_scale_k);
+                    const float* scale_v_buf = static_cast<const float*>(kv_fp8[layer].kv_scale_v);
 
-                    // Per-thread online softmax accumulators (one V dim each)
-                    float my_acc = 0.0f;
-                    float my_max = -1e30f;
-                    float my_sum = 0.0f;
+                    for (int qh = 0; qh < nh; ++qh) {
+                        const int kvh = qh / kv_groups;
+                        const float* q_head = q_f32 + qh * hd * 2;
 
-                    const float q_val = q_head[tid];
-                    const size_t kv_head_base =
-                        static_cast<size_t>(kvh) * L.kv_max_t * hd;
+                        float my_acc = 0.0f;
+                        float my_max = -1e30f;
+                        float my_sum = 0.0f;
 
-                    for (int t = 0; t < kv_len; ++t) {
-                        const size_t pos_base = kv_head_base +
-                            static_cast<size_t>(t) * hd;
+                        const float q_val = q_head[tid];
+                        const size_t kv_head_base =
+                            static_cast<size_t>(kvh) * L.kv_max_t * hd;
 
-                        // All 256 threads: partial Q·K dot product
-                        float partial = q_val *
-                            dotcache_qwen35_to_float(ck[pos_base + tid]);
-                        lds[tid] = partial;
-                        __syncthreads();
-                        for (int s = bs / 2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid + s];
+                        for (int t = 0; t < kv_len; ++t) {
+                            const size_t pos_base = kv_head_base +
+                                static_cast<size_t>(t) * hd;
+
+                            // Dequant FP8 K: fp8_val * scale
+                            float k_scale = scale_k_buf[kvh * L.kv_max_t + t];
+                            float k_val = fp8_e4m3_to_float(fp8_ck[pos_base + tid]) * k_scale;
+                            float partial = q_val * k_val;
+                            lds[tid] = partial;
                             __syncthreads();
+                            for (int s = bs / 2; s > 0; s >>= 1) {
+                                if (tid < s) lds[tid] += lds[tid + s];
+                                __syncthreads();
+                            }
+                            float score = lds[0] * scale;
+
+                            // Dequant FP8 V: fp8_val * scale
+                            float v_scale = scale_v_buf[kvh * L.kv_max_t + t];
+                            float v_val = fp8_e4m3_to_float(fp8_cv[pos_base + tid]) * v_scale;
+
+                            float old_max = my_max;
+                            my_max = fmaxf(my_max, score);
+                            float rescale = expf(old_max - my_max);
+                            float w = expf(score - my_max);
+                            my_acc = my_acc * rescale + w * v_val;
+                            my_sum = my_sum * rescale + w;
                         }
-                        float score = lds[0] * scale;
 
-                        // Load this thread's V dimension
-                        float v_val =
-                            dotcache_qwen35_to_float(cv[pos_base + tid]);
-
-                        // Online softmax + V accumulation
-                        float old_max = my_max;
-                        my_max = fmaxf(my_max, score);
-                        float rescale = expf(old_max - my_max);
-                        float w = expf(score - my_max);
-                        my_acc = my_acc * rescale + w * v_val;
-                        my_sum = my_sum * rescale + w;
+                        attn_flat[qh * hd + tid] =
+                            (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f;
+                        __syncthreads();
                     }
+                } else {
+                    // BF16 KV cache attention path (original)
+                    const T* ck = static_cast<const T*>(L.kv_cache_k);
+                    const T* cv = static_cast<const T*>(L.kv_cache_v);
 
-                    // Write normalized attention output
-                    attn_flat[qh * hd + tid] =
-                        (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f;
-                    __syncthreads();
+                    for (int qh = 0; qh < nh; ++qh) {
+                        const int kvh = qh / kv_groups;
+                        const float* q_head = q_f32 + qh * hd * 2;
+
+                        float my_acc = 0.0f;
+                        float my_max = -1e30f;
+                        float my_sum = 0.0f;
+
+                        const float q_val = q_head[tid];
+                        const size_t kv_head_base =
+                            static_cast<size_t>(kvh) * L.kv_max_t * hd;
+
+                        for (int t = 0; t < kv_len; ++t) {
+                            const size_t pos_base = kv_head_base +
+                                static_cast<size_t>(t) * hd;
+
+                            float partial = q_val *
+                                dotcache_qwen35_to_float(ck[pos_base + tid]);
+                            lds[tid] = partial;
+                            __syncthreads();
+                            for (int s = bs / 2; s > 0; s >>= 1) {
+                                if (tid < s) lds[tid] += lds[tid + s];
+                                __syncthreads();
+                            }
+                            float score = lds[0] * scale;
+
+                            float v_val =
+                                dotcache_qwen35_to_float(cv[pos_base + tid]);
+
+                            float old_max = my_max;
+                            my_max = fmaxf(my_max, score);
+                            float rescale = expf(old_max - my_max);
+                            float w = expf(score - my_max);
+                            my_acc = my_acc * rescale + w * v_val;
+                            my_sum = my_sum * rescale + w;
+                        }
+
+                        attn_flat[qh * hd + tid] =
+                            (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f;
+                        __syncthreads();
+                    }
                 }
 
                 // Step F: Gate — attn_flat[nh*hd] * sigmoid(gate[nh*hd])

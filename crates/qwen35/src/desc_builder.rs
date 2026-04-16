@@ -1,4 +1,4 @@
-use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc};
+use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, KVCacheFp8Desc};
 
 use crate::state::ModelState;
 use crate::weights::{Qwen35Weights, LayerKind};
@@ -130,6 +130,27 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
             }
         }
 
+        descs.push(d);
+    }
+    Some(descs)
+}
+
+/// Build KV cache FP8 scale descriptors (parallel to layer descs).
+/// Returns None if `kv_fp8` is false.
+pub fn build_kv_fp8_descs(state: &ModelState, kv_fp8: bool) -> Option<Vec<KVCacheFp8Desc>> {
+    if !kv_fp8 {
+        return None;
+    }
+
+    let mut descs = Vec::with_capacity(state.layers.len());
+    for ls in &state.layers {
+        let mut d = KVCacheFp8Desc::default();
+        if let Some(ref sk) = ls.kv_scale_k {
+            d.kv_scale_k = sk.as_ptr() as *mut _;
+        }
+        if let Some(ref sv) = ls.kv_scale_v {
+            d.kv_scale_v = sv.as_ptr() as *mut _;
+        }
         descs.push(d);
     }
     Some(descs)

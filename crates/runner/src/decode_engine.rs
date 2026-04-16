@@ -5,7 +5,7 @@ use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
-use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs};
+use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_kv_fp8_descs};
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::PersistentDecodeScratch;
 use qwen35::state::ModelState;
@@ -32,6 +32,8 @@ pub struct DecodeEngine {
     fp8_scale_device: Option<GpuBuffer>,
     /// Prefill chunk size (0 = no chunking).
     prefill_chunk_size: usize,
+    /// Use FP8 E4M3 KV cache with dynamic per-head scaling.
+    kv_fp8: bool,
 }
 
 impl DecodeEngine {
@@ -43,6 +45,7 @@ impl DecodeEngine {
         kv_chunk_size: usize,
         use_4b_kernel: bool,
         prefill_chunk_size: usize,
+        kv_fp8: bool,
     ) -> Result<Self> {
         let config = &weights.config;
         let state = ModelState::new(config, ordinal)
@@ -105,11 +108,27 @@ impl DecodeEngine {
             attn_scratch_floats,
             fp8_scale_device,
             prefill_chunk_size,
+            kv_fp8,
         })
     }
 
     pub fn config(&self) -> &TextConfig {
         &self.weights.config
+    }
+
+    pub fn weights(&self) -> &Qwen35Weights {
+        &self.weights
+    }
+
+    pub fn rotary(&self) -> &RotaryTables {
+        &self.rotary
+    }
+
+    /// Clone the model state for GPU oracle validation.
+    pub fn clone_state(&self) -> Result<ModelState> {
+        self.state
+            .clone_gpu()
+            .map_err(|e| anyhow::anyhow!("clone model state: {e}"))
     }
 
     /// Load prefill state from oracle output into GPU buffers.
@@ -190,6 +209,13 @@ impl DecodeEngine {
             );
         }
 
+        // Convert BF16 KV caches to FP8 if requested
+        if self.kv_fp8 {
+            prefill_engine::convert_kv_caches_to_fp8(
+                &mut self.state, &self.weights.config, self.ordinal,
+            )?;
+        }
+
         // Reset sync counters for fresh kernel launch sequence
         self.scratch
             .reset_sync()
@@ -209,6 +235,7 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
             self.prefill_chunk_size,
+            self.kv_fp8,
         )?;
 
         // Reset sync counters for the decode kernel
@@ -217,6 +244,21 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
 
         Ok(result.logits)
+    }
+
+    /// Run one decode step on external state using the megakernel.
+    /// Used by the GPU oracle to validate against the main decode_step.
+    pub fn decode_step_on_state(
+        &mut self,
+        ext_state: &mut ModelState,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<Vec<f32>> {
+        // Swap in external state, run decode_step, swap back
+        std::mem::swap(&mut self.state, ext_state);
+        let result = self.decode_step(token_id, seqlen_offset);
+        std::mem::swap(&mut self.state, ext_state);
+        result
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
@@ -237,7 +279,7 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for full-attention layers
         for (i, ls) in self.state.layers.iter_mut().enumerate() {
             if config.is_full_attention(i) {
-                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size)
+                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
                     .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }
@@ -249,6 +291,13 @@ impl DecodeEngine {
         self.scratch
             .upload_descs(&descs)
             .map_err(|e| anyhow::anyhow!("upload descs: {e}"))?;
+
+        // 4b. Upload KV FP8 scale descriptors (pointers may change on KV cache growth)
+        if let Some(kv_fp8_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
+            self.scratch
+                .upload_kv_fp8_descs(&kv_fp8_descs)
+                .map_err(|e| anyhow::anyhow!("upload kv fp8 descs: {e}"))?;
+        }
 
         // 5. Launch persistent decode kernel (dispatch by model variant)
         if self.use_4b_kernel {
@@ -269,6 +318,7 @@ impl DecodeEngine {
                 self.proj_buf_floats,
                 self.attn_scratch_floats,
                 self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
             )
             .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
         } else {

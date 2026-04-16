@@ -70,6 +70,17 @@ struct Cli {
     /// Reduces activation VRAM for long prompts. Typical values: 128, 256, 512.
     #[arg(long, default_value = "0")]
     prefill_chunk_size: usize,
+
+    /// Store KV cache in FP8 E4M3 with dynamic per-head scaling.
+    /// Halves KV cache VRAM, nearly doubling max context length.
+    #[arg(long)]
+    kv_fp8: bool,
+
+    /// Validate megakernel decode against GPU component-kernel oracle.
+    /// Runs each decode step through both the megakernel and the prefill engine's
+    /// component kernels, comparing logits. No external oracle needed.
+    #[arg(long)]
+    gpu_validate: bool,
 }
 
 fn main() -> Result<()> {
@@ -135,7 +146,8 @@ fn main() -> Result<()> {
     let context_tokens = cli
         .context_size
         .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
-    let kv_per_token = text_config.kv_bytes_per_token(gpu_hal::ScalarType::BF16.size_in_bytes());
+    let kv_dtype_bytes = if cli.kv_fp8 { 1usize } else { gpu_hal::ScalarType::BF16.size_in_bytes() };
+    let kv_per_token = text_config.kv_bytes_per_token(kv_dtype_bytes);
     // FP8 runtime dequant halves weight VRAM. Estimate: fixed_bytes includes weights
     // (~90% of total) + scratch/buffers (~10%). FP8 cuts weight portion in half.
     let effective_fixed = if cli.fp8_runtime {
@@ -239,7 +251,16 @@ fn main() -> Result<()> {
         params.kv_chunk_size,
         params.use_4b_kernel,
         cli.prefill_chunk_size,
+        cli.kv_fp8,
     )?;
+
+    // When using FP8 runtime weights, tell the oracle to use the same FP8 weights
+    // (dequanted to BF16) so we compare apples-to-apples.
+    let fp8_oracle_dir = if cli.fp8_runtime {
+        Some(cli.model_dir.clone())
+    } else {
+        None
+    };
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
@@ -256,6 +277,7 @@ fn main() -> Result<()> {
         let output = oracle::run_oracle(
             &oracle_script, &model_id, &prompt_ids, cli.max_new_tokens,
             &cli.oracle_dtype, true,
+            fp8_oracle_dir.as_deref(),
         )?;
         engine.load_prefill_state(&output)?;
         let first = output.generated_token_ids[0];
@@ -287,6 +309,7 @@ fn main() -> Result<()> {
             cli.max_new_tokens,
             &cli.oracle_dtype,
             false, // only need logits for comparison
+            fp8_oracle_dir.as_deref(),
         )?;
 
         // Compare prefill logits
@@ -306,10 +329,19 @@ fn main() -> Result<()> {
         None
     };
 
+    // GPU oracle: clone model state for independent component-kernel decode
+    let mut gpu_oracle_state = if cli.gpu_validate {
+        eprintln!("[gpu-validate] cloning model state for GPU oracle...");
+        Some(engine.clone_state()?)
+    } else {
+        None
+    };
+
     // Decode loop
     let seqlen_start = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut max_delta = 0.0f32;
+    let mut gpu_max_delta = 0.0f32;
     let eos_ids = text_config.eos_token_ids();
 
     let decode_start = Instant::now();
@@ -322,7 +354,7 @@ fn main() -> Result<()> {
         let seqlen_offset = seqlen_start + step;
         let logits = engine.decode_step(next_token, seqlen_offset)?;
 
-        // Validate against oracle if available
+        // Validate against external oracle if available
         if let Some(ref oracle) = oracle_output {
             if step < oracle.decode_logits.len() {
                 let oracle_logits = &oracle.decode_logits[step];
@@ -334,6 +366,22 @@ fn main() -> Result<()> {
                     "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
                 );
             }
+        }
+
+        // Validate: run megakernel on cloned state for self-consistency
+        if let Some(ref mut oracle_state) = gpu_oracle_state {
+            let gpu_logits = engine.decode_step_on_state(
+                oracle_state, next_token, seqlen_offset,
+            )?;
+            let delta = validate::max_abs_delta(&logits, &gpu_logits);
+            let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
+            let token_match = if gpu_token == DecodeEngine::greedy_sample(&logits) { "" } else { " MISMATCH" };
+            if delta > gpu_max_delta {
+                gpu_max_delta = delta;
+            }
+            eprintln!(
+                "[gpu-validate] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} gpu_token={gpu_token}{token_match}"
+            );
         }
 
         let sampled = DecodeEngine::greedy_sample(&logits);
@@ -354,7 +402,7 @@ fn main() -> Result<()> {
 
     println!("{text}");
     eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4}",
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4} gpu_oracle_max_delta={gpu_max_delta:.4}",
         prompt_ids.len(),
         generated_ids.len(),
         decode_ms / generated_ids.len() as f64,

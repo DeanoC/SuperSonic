@@ -46,6 +46,7 @@ pub fn run_oracle(
     max_new_tokens: usize,
     dtype: &str,
     emit_state: bool,
+    fp8_model_dir: Option<&Path>,
 ) -> Result<OracleOutput> {
     let ids_str = prompt_ids
         .iter()
@@ -62,8 +63,12 @@ pub fn run_oracle(
     if emit_state {
         cmd.arg("--emit-state");
     }
+    if let Some(dir) = fp8_model_dir {
+        cmd.arg("--fp8-model-dir").arg(dir);
+    }
 
-    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype}{}",
+    let fp8_flag = fp8_model_dir.map(|d| format!(" --fp8-model-dir {}", d.display())).unwrap_or_default();
+    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype}{}{fp8_flag}",
         oracle_script.display(),
         if emit_state { " --emit-state" } else { "" }
     );

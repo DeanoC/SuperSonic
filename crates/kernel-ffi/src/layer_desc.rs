@@ -101,3 +101,25 @@ impl Default for FP8ScaleDesc {
         unsafe { std::mem::zeroed() }
     }
 }
+
+/// Per-layer KV cache FP8 scale pointers for dynamic quantization.
+/// Parallel struct to DecodeLayerDesc — one per layer, passed as a separate
+/// kernel argument (same pattern as FP8ScaleDesc).
+/// Only meaningful for full-attention layers; linear-attention layers use null pointers.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct KVCacheFp8Desc {
+    /// Per-head-per-position absmax scale for K cache: [num_kv_heads, max_T] F32
+    pub kv_scale_k: *mut c_void,
+    /// Per-head-per-position absmax scale for V cache: [num_kv_heads, max_T] F32
+    pub kv_scale_v: *mut c_void,
+}
+
+unsafe impl Send for KVCacheFp8Desc {}
+unsafe impl Sync for KVCacheFp8Desc {}
+
+impl Default for KVCacheFp8Desc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}

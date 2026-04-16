@@ -64,6 +64,7 @@ unsafe extern "C" {
         proj_buf_floats: usize,
         attn_scratch_floats: usize,
         fp8_scales: *const c_void,  // nullptr for BF16, pointer to FP8ScaleDesc[] for FP8
+        kv_fp8_descs: *const c_void,  // nullptr for BF16 KV, pointer to KVCacheFp8Desc[] for FP8 KV
     ) -> c_int;
 
     fn dotcache_qwen35_4b_hip_rms_norm(
@@ -147,6 +148,7 @@ pub fn persistent_decode(
 
 /// Safe wrapper around the 4B persistent decode kernel (separate compilation).
 /// `fp8_scale_descs`: when Some, contains FP8ScaleDesc array on GPU for runtime FP8 dequant.
+/// `kv_fp8_descs`: when Some, contains KVCacheFp8Desc array on GPU for FP8 KV cache.
 pub fn persistent_decode_4b(
     ordinal: usize,
     dtype: ScalarType,
@@ -164,12 +166,17 @@ pub fn persistent_decode_4b(
     proj_buf_floats: usize,
     attn_scratch_floats: usize,
     fp8_scale_descs: Option<&GpuBuffer>,
+    kv_fp8_descs: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
 
     let fp8_scales_ptr = fp8_scale_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+
+    let kv_fp8_ptr = kv_fp8_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
 
@@ -193,6 +200,7 @@ pub fn persistent_decode_4b(
             proj_buf_floats,
             attn_scratch_floats,
             fp8_scales_ptr,
+            kv_fp8_ptr,
         )
     };
     if status != 0 {

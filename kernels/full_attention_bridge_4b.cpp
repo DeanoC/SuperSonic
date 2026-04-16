@@ -4511,7 +4511,8 @@ int persistent_decode_device(
     int rotary_dim,
     int proj_buf_floats,
     int attn_scratch_floats,
-    const void* fp8_scales
+    const void* fp8_scales,
+    const void* kv_fp8_descs
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4543,7 +4544,8 @@ int persistent_decode_device(
         rotary_dim,
         proj_buf_floats,
         attn_scratch_floats,
-        static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales));
+        static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+        static_cast<const KVCacheFp8Desc*>(kv_fp8_descs));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4569,7 +4571,8 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     size_t rotary_dim,
     size_t proj_buf_floats,
     size_t attn_scratch_floats,
-    const void* fp8_scales) {
+    const void* fp8_scales,
+    const void* kv_fp8_descs) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4583,10 +4586,52 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             cos_table, sin_table, static_cast<int>(rotary_dim),
             static_cast<int>(proj_buf_floats),
             static_cast<int>(attn_scratch_floats),
-            fp8_scales);
+            fp8_scales,
+            kv_fp8_descs);
     default:
         return 256;
     }
+}
+
+// BF16→FP8 KV cache quantization bridge
+extern "C" int dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
+    int dtype,
+    size_t device_ordinal,
+    const void* src,
+    void* dst_fp8,
+    float* dst_scale,
+    int num_kv_heads,
+    int seq_len,
+    int head_dim,
+    int max_T,
+    int pos_offset) {
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    const int num_blocks = num_kv_heads * seq_len;
+    constexpr int block_size = 256;
+    const size_t shared_bytes = block_size * sizeof(float);
+
+    switch (dtype) {
+    case 2:
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(quantize_kv_to_fp8_kernel<hip_bfloat16>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            shared_bytes,
+            0,
+            static_cast<const hip_bfloat16*>(src),
+            static_cast<uint8_t*>(dst_fp8),
+            dst_scale,
+            num_kv_heads, seq_len, head_dim, max_T, pos_offset);
+        break;
+    default:
+        return 256;
+    }
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
 }
 
 // dotcache_query_gpu_info is in the 0.8B bridge, not duplicated here

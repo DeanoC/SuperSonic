@@ -132,6 +132,18 @@ impl GpuBuffer {
         Ok(buf)
     }
 
+    /// Create a deep copy of this buffer on the same device.
+    pub fn clone_device(&self) -> Result<Self> {
+        let new_buf = Self::alloc(self.device_ordinal, self.dtype, &self.shape)?;
+        ops::copy_d2d(
+            self.device_ordinal,
+            new_buf.ptr.as_ptr(),
+            self.ptr.as_ptr() as *const c_void,
+            self.len_bytes,
+        )?;
+        Ok(new_buf)
+    }
+
     /// Grow the buffer along `seq_dim` from current capacity to `new_cap`.
     /// Allocates a new zero-filled buffer and copies old data with correct strides.
     /// Used for KV cache pre-allocation in chunks.

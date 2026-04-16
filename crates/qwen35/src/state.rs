@@ -10,6 +10,9 @@ pub struct LayerState {
     pub kv_cache_k: Option<GpuBuffer>,
     pub kv_cache_v: Option<GpuBuffer>,
     pub kv_filled: usize,
+    // FP8 KV cache scales (per-head-per-position absmax)
+    pub kv_scale_k: Option<GpuBuffer>,
+    pub kv_scale_v: Option<GpuBuffer>,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -40,6 +43,8 @@ impl LayerState {
             kv_cache_k: None,
             kv_cache_v: None,
             kv_filled: 0,
+            kv_scale_k: None,
+            kv_scale_v: None,
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -51,6 +56,8 @@ impl LayerState {
             kv_cache_k: None,
             kv_cache_v: None,
             kv_filled: 0,
+            kv_scale_k: None,
+            kv_scale_v: None,
             conv_state: None,
             recurrent_state: None,
         }
@@ -58,14 +65,18 @@ impl LayerState {
 
     /// Ensure KV cache has capacity for `needed` positions.
     /// Pre-allocates in chunks of `kv_chunk_size`.
+    /// When `kv_fp8` is true, KV caches use FP8 E4M3 (U8) with per-head-per-position
+    /// F32 absmax scale buffers, halving KV cache VRAM.
     pub fn ensure_kv_capacity(
         &mut self,
         needed: usize,
         ordinal: usize,
         config: &TextConfig,
         kv_chunk_size: usize,
+        kv_fp8: bool,
     ) -> Result<(), GpuError> {
         let needed = needed + 1; // need room for position `seqlen_offset`
+        let kv_dtype = if kv_fp8 { ScalarType::U8 } else { ScalarType::BF16 };
         if let (Some(ref k), Some(ref v)) = (&self.kv_cache_k, &self.kv_cache_v) {
             let current_cap = k.shape()[2]; // [1, nkv, seq, hd]
             if current_cap >= needed {
@@ -76,15 +87,31 @@ impl LayerState {
             let new_v = v.grow_seq_dim(2, new_cap)?;
             self.kv_cache_k = Some(new_k);
             self.kv_cache_v = Some(new_v);
+            // Grow scale buffers alongside KV caches
+            if kv_fp8 {
+                if let (Some(ref sk), Some(ref sv)) = (&self.kv_scale_k, &self.kv_scale_v) {
+                    let new_sk = sk.grow_seq_dim(1, new_cap)?;
+                    let new_sv = sv.grow_seq_dim(1, new_cap)?;
+                    self.kv_scale_k = Some(new_sk);
+                    self.kv_scale_v = Some(new_sv);
+                }
+            }
         } else {
             // First allocation: create cache with chunked capacity
             let cap = ((needed + kv_chunk_size - 1) / kv_chunk_size) * kv_chunk_size;
             let nkv = config.num_key_value_heads;
             let hd = config.head_dim;
             self.kv_cache_k =
-                Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
             self.kv_cache_v =
-                Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
+            if kv_fp8 {
+                // Scale buffers: [nkv, cap] of F32 — one scale per head per position
+                self.kv_scale_k =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
+                self.kv_scale_v =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
+            }
         }
         Ok(())
     }
@@ -103,6 +130,28 @@ impl LayerState {
     }
 }
 
+impl LayerState {
+    /// Deep-copy all GPU buffers to create an independent clone.
+    pub fn clone_gpu(&self) -> Result<Self, GpuError> {
+        let clone_opt = |opt: &Option<GpuBuffer>| -> Result<Option<GpuBuffer>, GpuError> {
+            match opt {
+                Some(buf) => Ok(Some(buf.clone_device()?)),
+                None => Ok(None),
+            }
+        };
+        Ok(Self {
+            kind: self.kind,
+            kv_cache_k: clone_opt(&self.kv_cache_k)?,
+            kv_cache_v: clone_opt(&self.kv_cache_v)?,
+            kv_filled: self.kv_filled,
+            kv_scale_k: clone_opt(&self.kv_scale_k)?,
+            kv_scale_v: clone_opt(&self.kv_scale_v)?,
+            conv_state: clone_opt(&self.conv_state)?,
+            recurrent_state: clone_opt(&self.recurrent_state)?,
+        })
+    }
+}
+
 /// All mutable state for the model.
 pub struct ModelState {
     pub layers: Vec<LayerState>,
@@ -117,6 +166,15 @@ impl ModelState {
             } else {
                 layers.push(LayerState::new_linear(ordinal, config)?);
             }
+        }
+        Ok(Self { layers })
+    }
+
+    /// Deep-copy all layer states to create an independent clone.
+    pub fn clone_gpu(&self) -> Result<Self, GpuError> {
+        let mut layers = Vec::with_capacity(self.layers.len());
+        for ls in &self.layers {
+            layers.push(ls.clone_gpu()?);
         }
         Ok(Self { layers })
     }

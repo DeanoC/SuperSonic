@@ -19,17 +19,71 @@ Outputs JSON with:
 
 import argparse
 import base64
+import gc
+import glob
 import json
+import os
 import time
 
 import torch
 from transformers import AutoModelForCausalLM
+
+import safetensors.torch
 
 
 def tensor_to_b64(t: torch.Tensor) -> str:
     # Use torch's raw bytes — numpy doesn't support BF16
     raw = bytes(t.contiguous().cpu().untyped_storage())
     return base64.b64encode(raw).decode("ascii")
+
+
+def _load_fp8_model(bf16_model_id, fp8_model_dir, torch_dtype, block_size=128):
+    """Load model structure with random init, then fill from FP8-dequanted values.
+
+    FP8 E4M3 weights are dequanted via: bf16(fp8.float() * scale_inv.float())
+    This matches the precision level our GPU kernel uses.
+
+    Uses low_cpu_mem_usage + ignore_mismatched_sizes to avoid downloading BF16
+    checkpoint weights. Peak RAM ≈ 1x model size.
+    """
+    import sys
+    from transformers import AutoConfig
+
+    # Load config, create model with random weights (no checkpoint download)
+    config = AutoConfig.from_pretrained(bf16_model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(
+        config.text_config if hasattr(config, "text_config") else config,
+        torch_dtype=torch_dtype,
+    )
+
+    sd = model.state_dict()
+    replaced = 0
+    for sf in sorted(glob.glob(os.path.join(fp8_model_dir, "*.safetensors"))):
+        tensors = safetensors.torch.load_file(sf, device="cpu")
+        scales = {n.replace("_scale_inv", ""): t
+                  for n, t in tensors.items() if "scale_inv" in n}
+        for name, t in tensors.items():
+            if "scale_inv" in name:
+                continue
+            hf_name = name.replace("model.language_model.", "model.")
+            if hf_name not in sd:
+                continue
+            if t.dtype == torch.float8_e4m3fn and name in scales:
+                s = scales[name].float()
+                w = t.float()
+                rows, cols = w.shape
+                se = s.repeat_interleave(block_size, 0)[:rows] \
+                      .repeat_interleave(block_size, 1)[:, :cols]
+                sd[hf_name].copy_((w * se).to(torch_dtype))
+                replaced += 1
+            elif sd[hf_name].shape == t.shape:
+                sd[hf_name].copy_(t.to(torch_dtype))
+                replaced += 1
+        del tensors, scales
+        gc.collect()
+
+    print(f"[oracle-fp8] replaced {replaced}/{len(sd)} weights", file=sys.stderr)
+    return model
 
 
 def main():
@@ -41,15 +95,21 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--emit-state", action="store_true",
                         help="Emit prefill hidden + layer states for Rust decode engine")
+    parser.add_argument("--fp8-model-dir",
+                        help="Path to FP8 safetensors dir. Weights are dequanted to BF16 "
+                             "and injected into --model-id's architecture.")
     args = parser.parse_args()
 
     prompt_ids = [int(x) for x in args.prompt_ids.split(",") if x]
     torch_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
     t0 = time.perf_counter()
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id, torch_dtype=torch_dtype, trust_remote_code=True,
-    )
+    if args.fp8_model_dir:
+        model = _load_fp8_model(args.model_id, args.fp8_model_dir, torch_dtype)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id, torch_dtype=torch_dtype, trust_remote_code=True,
+        )
     model.eval()
     if args.device != "cpu":
         model = model.to(args.device)

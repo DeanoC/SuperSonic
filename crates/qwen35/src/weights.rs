@@ -20,6 +20,7 @@ pub struct Qwen35Weights {
     pub fp8_block_size: usize,
 }
 
+#[derive(Clone, Copy)]
 pub enum LayerKind {
     Linear,
     Full,
