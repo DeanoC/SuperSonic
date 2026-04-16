@@ -1,6 +1,6 @@
 {
   "model_id": "Qwen/Qwen3.5-4B",
-  "generated_at": "2026-04-16 10:08:06",
+  "generated_at": "2026-04-16 14:51:03",
   "device": "native_gpu",
   "test_cases": [
     {
@@ -334,7 +334,7 @@
         1740,
         369
       ],
-      "expected_text": " 2000‑year‑",
+      "expected_text": " 2005 Chevrolet Silverado",
       "prefill_top5": [
         {
           "token_id": 220,

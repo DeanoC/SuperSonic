@@ -1,6 +1,6 @@
 {
   "model_id": "Qwen/Qwen3.5-4B",
-  "generated_at": "2026-04-16 09:11:52",
+  "generated_at": "2026-04-16 15:00:42",
   "device": "native_gpu",
   "test_cases": [
     {
