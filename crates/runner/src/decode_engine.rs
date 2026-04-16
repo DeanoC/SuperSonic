@@ -30,6 +30,8 @@ pub struct DecodeEngine {
     attn_scratch_floats: usize,
     /// FP8 scale descriptors on GPU (None for BF16 weights).
     fp8_scale_device: Option<GpuBuffer>,
+    /// Prefill chunk size (0 = no chunking).
+    prefill_chunk_size: usize,
 }
 
 impl DecodeEngine {
@@ -40,6 +42,7 @@ impl DecodeEngine {
         attn_scratch_floats: usize,
         kv_chunk_size: usize,
         use_4b_kernel: bool,
+        prefill_chunk_size: usize,
     ) -> Result<Self> {
         let config = &weights.config;
         let state = ModelState::new(config, ordinal)
@@ -101,6 +104,7 @@ impl DecodeEngine {
             proj_buf_floats,
             attn_scratch_floats,
             fp8_scale_device,
+            prefill_chunk_size,
         })
     }
 
@@ -204,6 +208,7 @@ impl DecodeEngine {
             prompt_ids,
             self.ordinal,
             self.kv_chunk_size,
+            self.prefill_chunk_size,
         )?;
 
         // Reset sync counters for the decode kernel

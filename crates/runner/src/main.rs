@@ -65,6 +65,11 @@ struct Cli {
     /// Halves weight VRAM (~8.8→4.8 GiB for 4B). Requires FP8 model weights.
     #[arg(long)]
     fp8_runtime: bool,
+
+    /// Process prompt in chunks of this size (0 = no chunking, process entire prompt at once).
+    /// Reduces activation VRAM for long prompts. Typical values: 128, 256, 512.
+    #[arg(long, default_value = "0")]
+    prefill_chunk_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -233,6 +238,7 @@ fn main() -> Result<()> {
         params.attn_scratch_floats,
         params.kv_chunk_size,
         params.use_4b_kernel,
+        cli.prefill_chunk_size,
     )?;
 
     // Run prefill (native GPU or oracle)

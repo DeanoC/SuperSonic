@@ -817,6 +817,9 @@ pub fn element_add(
 
 /// Apply RoPE in-place on tensor [seq_len, num_heads, head_dim].
 /// Only the first rotary_dim dimensions of each head are rotated.
+/// Apply rotary position embeddings to data in-place.
+/// `pos_offset`: starting position index (0 for first chunk, chunk_start for subsequent chunks).
+/// The kernel reads cos/sin from position pos_offset..pos_offset+seq_len.
 pub fn apply_rope_prefill(
     ordinal: usize,
     dtype: ScalarType,
@@ -826,9 +829,15 @@ pub fn apply_rope_prefill(
     rotary_dim: usize,
     cos_table: &GpuBuffer,
     sin_table: &GpuBuffer,
+    pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let half_rot = rotary_dim / 2;
+    // Offset cos/sin table pointers by pos_offset positions.
+    // Table layout: [max_positions, half_rot] BF16 → stride = half_rot * 2 bytes per position
+    let table_byte_offset = pos_offset * half_rot * dtype.size_in_bytes();
+    let cos_ptr = cos_table.offset_ptr(table_byte_offset);
+    let sin_ptr = sin_table.offset_ptr(table_byte_offset);
     let status = unsafe {
         dotcache_qwen35_hip_apply_rope_prefill(
             dtype.kernel_dtype_code(),
@@ -837,8 +846,8 @@ pub fn apply_rope_prefill(
             num_heads,
             head_dim,
             half_rot,
-            cos_table.as_ptr(),
-            sin_table.as_ptr(),
+            cos_ptr,
+            sin_ptr,
             data.as_mut_ptr(),
         )
     };
