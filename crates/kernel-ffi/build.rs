@@ -2,22 +2,33 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-fn detect_hip_arch() -> Option<String> {
+/// Return one or more GPU archs to target. `HIP_ARCH` may be comma-separated
+/// (e.g. `gfx1150,gfx1100`) to produce a multi-arch fat binary. Without the
+/// env var, falls back to auto-detection via `rocminfo`.
+fn detect_hip_archs() -> Vec<String> {
     if let Ok(arch) = env::var("HIP_ARCH") {
-        let trimmed = arch.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_owned());
+        let list: Vec<String> = arch
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !list.is_empty() {
+            return list;
         }
     }
-    let output = Command::new("rocminfo").output().ok()?;
+    let Ok(output) = Command::new("rocminfo").output() else {
+        return Vec::new();
+    };
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     stdout
         .split_whitespace()
         .find(|token| token.starts_with("gfx"))
-        .map(ToOwned::to_owned)
+        .map(|s| vec![s.to_owned()])
+        .unwrap_or_default()
 }
 
 fn run(cmd: &mut Command, context: &str) {
@@ -33,6 +44,7 @@ fn run(cmd: &mut Command, context: &str) {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=HIP_ARCH");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -54,7 +66,12 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
-    let arch = detect_hip_arch();
+    let archs = detect_hip_archs();
+    if archs.is_empty() {
+        println!("cargo:warning=no HIP arch detected (set HIP_ARCH or install rocminfo); kernel binary may not run on the target GPU");
+    } else {
+        println!("cargo:warning=building HIP kernels for arch(es): {}", archs.join(", "));
+    }
 
     // Compile 0.8B kernel
     let bridge_obj = out_dir.join("qwen35_megakernel_hip.o");
@@ -71,7 +88,7 @@ fn main() {
         .arg(&bridge_src)
         .arg("-o")
         .arg(&bridge_obj);
-    if let Some(ref arch) = arch {
+    for arch in &archs {
         hipcc.arg(format!("--offload-arch={arch}"));
     }
     run(&mut hipcc, "building qwen35 megakernel HIP bridge");
@@ -91,7 +108,7 @@ fn main() {
         .arg(&bridge_4b_src)
         .arg("-o")
         .arg(&bridge_4b_obj);
-    if let Some(ref arch) = arch {
+    for arch in &archs {
         hipcc_4b.arg(format!("--offload-arch={arch}"));
     }
     run(&mut hipcc_4b, "building qwen35-4b megakernel HIP bridge");
@@ -111,7 +128,7 @@ fn main() {
         .arg(&prefill_helpers_bridge_src)
         .arg("-o")
         .arg(&prefill_helpers_obj);
-    if let Some(ref arch) = arch {
+    for arch in &archs {
         hipcc_pfx.arg(format!("--offload-arch={arch}"));
     }
     run(&mut hipcc_pfx, "building prefill helpers HIP bridge");

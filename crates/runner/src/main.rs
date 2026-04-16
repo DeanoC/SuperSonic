@@ -92,6 +92,14 @@ struct Cli {
     /// Requires 4B kernel (2B/4B/9B models).
     #[arg(long, default_value = "1")]
     batch_size: usize,
+
+    /// Run on an arch without a registry entry by reusing another arch's kernel.
+    /// Pass the arch name whose kernel you want to reuse (e.g. "gfx1150"). Emits
+    /// a loud warning — correctness is not guaranteed. Intended for archs that
+    /// are binary-compatible (same wavefront size, similar CU/LDS) but haven't
+    /// been explicitly tuned.
+    #[arg(long)]
+    allow_untested_gpu: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -118,14 +126,37 @@ fn main() -> Result<()> {
 
     // 3. Registry lookup
     let backend = Backend::Hip;
-    let entry = registry::lookup(&model_variant, &backend, &gpu_arch).ok_or_else(|| {
-        let supported_archs = registry::supported_archs_for(&model_variant, &backend);
-        anyhow::anyhow!(
-            "No optimized kernel for model={model_variant} backend={backend} arch={gpu_arch}. \
-             Supported GPU architectures for this model: [{}]",
-            supported_archs.join(", ")
-        )
-    })?;
+    let entry = match registry::lookup(&model_variant, &backend, &gpu_arch) {
+        Some(e) => e,
+        None => {
+            if let Some(override_arch) = cli.allow_untested_gpu.as_deref() {
+                let reuse_arch = GpuArch::from_rocm_name(override_arch);
+                let e = registry::lookup(&model_variant, &backend, &reuse_arch).ok_or_else(|| {
+                    let supported_archs = registry::supported_archs_for(&model_variant, &backend);
+                    anyhow::anyhow!(
+                        "--allow-untested-gpu={override_arch}: no registry entry for \
+                         model={model_variant} backend={backend} arch={reuse_arch}. \
+                         Pass one of: [{}]",
+                        supported_archs.join(", ")
+                    )
+                })?;
+                eprintln!(
+                    "[gpu] WARNING: detected arch={gpu_arch} has no registry entry; \
+                     reusing {reuse_arch} kernel as requested by --allow-untested-gpu. \
+                     Correctness is not guaranteed."
+                );
+                e
+            } else {
+                let supported_archs = registry::supported_archs_for(&model_variant, &backend);
+                anyhow::bail!(
+                    "No optimized kernel for model={model_variant} backend={backend} arch={gpu_arch}. \
+                     Supported GPU architectures for this model: [{}]. \
+                     To force-reuse another arch's kernel, pass --allow-untested-gpu=<arch>.",
+                    supported_archs.join(", ")
+                );
+            }
+        }
+    };
 
     let params = &entry.params;
 
