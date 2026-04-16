@@ -269,8 +269,8 @@ pub fn bake_qwen35(
                 let (b, s) = transforms::a_log_to_exp_bf16(raw_bytes, &shape);
                 (b, s, "bf16")
             }
-            LayoutTag::Fp8Dequantized | LayoutTag::Fp8Native => {
-                unreachable!("FP8 tensors are handled before this match")
+            LayoutTag::Fp8Dequantized | LayoutTag::Fp8Native | LayoutTag::Int4Quantized => {
+                unreachable!("FP8/INT4 tensors are handled before this match")
             }
         };
 
@@ -311,5 +311,220 @@ pub fn bake_qwen35(
     fs::write(crate::manifest_path(&bake_dir), manifest_json)?;
 
     progress(&format!("[bake] manifest written to {}", bake_dir.display()));
+    Ok(())
+}
+
+/// Check if a weight tensor name is a projection weight that should be INT4-quantized.
+/// Excludes: norm weights, biases, conv1d, A_log, dt_bias, embed_tokens,
+///           b_proj and a_proj (only 16 rows — too small for INT4).
+fn is_int4_target(name: &str) -> bool {
+    // Must be a 2D weight (projections)
+    if !name.ends_with(".weight") {
+        return false;
+    }
+    // Exclude norms, embeddings
+    if name.contains("layernorm") || name.contains("norm.weight")
+        || name.contains("embed_tokens") || name.contains("conv1d")
+    {
+        return false;
+    }
+    // Exclude b_proj and a_proj (only 16 rows)
+    if name.contains("in_proj_b.weight") || name.contains("in_proj_a.weight") {
+        return false;
+    }
+    // Include: gate_proj, up_proj, down_proj, q_proj, k_proj, v_proj, o_proj,
+    //          in_proj_qkv, in_proj_z, out_proj
+    // Exclude lm_head: used via standalone_matvec which doesn't have INT4 dequant.
+    if name.contains("lm_head") {
+        return false;
+    }
+    name.contains("_proj")
+}
+
+/// Bake HuggingFace safetensors into INT4-quantized SuperSonic binary package.
+/// BF16 projection weights are quantized to INT4 with group_size group quantization.
+/// Non-projection weights (norms, biases, small projections) are kept in BF16.
+/// FP8 source weights are first dequanted to BF16, then quantized to INT4.
+pub fn bake_qwen35_int4(
+    model_dir: &Path,
+    weight_prefix: &str,
+    num_layers: usize,
+    layer_is_full: &[bool],
+    group_size: usize,
+    progress: &dyn Fn(&str),
+) -> Result<(), Error> {
+    assert_eq!(layer_is_full.len(), num_layers);
+
+    let bake_dir = crate::bake_dir_int4(model_dir);
+    fs::create_dir_all(&bake_dir)?;
+
+    let (shards, tensor_index) = open_shards(model_dir)?;
+    progress(&format!(
+        "[bake-int4] opened {} safetensors shard(s), {} tensors",
+        shards.len(), tensor_index.len()
+    ));
+
+    let weights_path = crate::weights_bin_path(&bake_dir);
+    let mut weights_file = File::create(&weights_path)?;
+    let mut cursor: u64 = 0;
+    let mut entries: Vec<TensorMeta> = Vec::new();
+
+    // Collect tensor names, skip _scale_inv (we'll consume them inline for FP8→BF16 dequant)
+    let mut names: Vec<String> = tensor_index
+        .keys()
+        .filter(|name| {
+            if name.ends_with("_scale_inv") { return false; }
+            name.starts_with(&format!("{weight_prefix}.")) || *name == "lm_head.weight"
+        })
+        .cloned()
+        .collect();
+    names.sort();
+
+    progress(&format!("[bake-int4] baking {} tensors (group_size={group_size})...", names.len()));
+
+    for name in &names {
+        let &shard_idx = tensor_index.get(name).unwrap();
+        let st = SafeTensors::deserialize(&shards[shard_idx])?;
+        let view = st.tensor(name)?;
+        let shape: Vec<usize> = view.shape().to_vec();
+        let raw_bytes = view.data();
+        let raw_dtype = view.dtype();
+
+        // Step 1: Get BF16 bytes for this tensor (dequant FP8 if needed)
+        let (bf16_bytes, bf16_shape) = if raw_dtype == safetensors::Dtype::F8_E4M3 && shape.len() == 2 {
+            let scale_name = format!("{name}_scale_inv");
+            if let Some(&scale_shard_idx) = tensor_index.get(&scale_name) {
+                let scale_st = SafeTensors::deserialize(&shards[scale_shard_idx])?;
+                let scale_view = scale_st.tensor(&scale_name)?;
+                let scale_shape: Vec<usize> = scale_view.shape().to_vec();
+                let scale_bytes = scale_view.data();
+                let block_sz = if scale_shape.len() == 2 && scale_shape[0] > 0 {
+                    shape[0] / scale_shape[0]
+                } else { 128 };
+                transforms::fp8_dequant_to_bf16(raw_bytes, &shape, scale_bytes, &scale_shape, block_sz)
+            } else {
+                (raw_bytes.to_vec(), shape.clone())
+            }
+        } else if raw_dtype == safetensors::Dtype::BF16 {
+            (raw_bytes.to_vec(), shape.clone())
+        } else {
+            // Non-BF16/FP8 tensor — store as-is (norms, biases, etc.)
+            let layout = classify_tensor(name, &shape, layer_is_full, weight_prefix);
+            let (bytes, final_shape, final_dtype_name) = match layout {
+                LayoutTag::Raw => {
+                    let dt = dtype_name(raw_dtype)?;
+                    (raw_bytes.to_vec(), shape, dt)
+                }
+                LayoutTag::DepthwiseConvSqueezed => {
+                    let (b, s) = transforms::squeeze_dim1(raw_bytes, &shape);
+                    (b, s, dtype_name(raw_dtype)?)
+                }
+                LayoutTag::HeadBiasReshaped => {
+                    let (b, s) = transforms::head_bias_reshape(raw_bytes, &shape);
+                    (b, s, dtype_name(raw_dtype)?)
+                }
+                LayoutTag::HeadExpReshaped => {
+                    let (b, s) = transforms::a_log_to_exp_bf16(raw_bytes, &shape);
+                    (b, s, "bf16")
+                }
+                _ => unreachable!(),
+            };
+            let offset = align_up(cursor, 4096);
+            weights_file.seek(SeekFrom::Start(offset))?;
+            weights_file.write_all(&bytes)?;
+            let byte_len = bytes.len() as u64;
+            entries.push(TensorMeta {
+                name: name.clone(), shape: final_shape,
+                dtype: final_dtype_name.to_string(), layout, offset, byte_len,
+            });
+            cursor = offset + byte_len;
+            continue;
+        };
+
+        // Step 2: Check if this tensor should be INT4-quantized
+        if is_int4_target(name) && bf16_shape.len() == 2 && bf16_shape[1] % 2 == 0 {
+            let (packed, scale_bytes, zero_bytes, packed_shape) =
+                transforms::bf16_to_int4(&bf16_bytes, &bf16_shape, group_size);
+
+            // Write packed INT4 weights
+            let offset = align_up(cursor, 4096);
+            weights_file.seek(SeekFrom::Start(offset))?;
+            weights_file.write_all(&packed)?;
+            let byte_len = packed.len() as u64;
+            entries.push(TensorMeta {
+                name: name.clone(),
+                shape: packed_shape,
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset,
+                byte_len,
+            });
+            cursor = offset + byte_len;
+
+            // Write scale tensor
+            let scale_rows = (bf16_shape[0] + group_size - 1) / group_size;
+            let scale_cols = (bf16_shape[1] + group_size - 1) / group_size;
+            let scale_name = format!("{name}_int4_scale");
+            let offset = align_up(cursor, 4096);
+            weights_file.seek(SeekFrom::Start(offset))?;
+            weights_file.write_all(&scale_bytes)?;
+            let byte_len = scale_bytes.len() as u64;
+            entries.push(TensorMeta {
+                name: scale_name, shape: vec![scale_rows, scale_cols],
+                dtype: "bf16".to_string(), layout: LayoutTag::Raw, offset, byte_len,
+            });
+            cursor = offset + byte_len;
+
+            // Write zero tensor
+            let zero_name = format!("{name}_int4_zero");
+            let offset = align_up(cursor, 4096);
+            weights_file.seek(SeekFrom::Start(offset))?;
+            weights_file.write_all(&zero_bytes)?;
+            let byte_len = zero_bytes.len() as u64;
+            entries.push(TensorMeta {
+                name: zero_name, shape: vec![scale_rows, scale_cols],
+                dtype: "bf16".to_string(), layout: LayoutTag::Raw, offset, byte_len,
+            });
+            cursor = offset + byte_len;
+        } else {
+            // Store as BF16 (norms, small projections, etc.)
+            let layout = classify_tensor(name, &bf16_shape, layer_is_full, weight_prefix);
+            let (bytes, final_shape) = match layout {
+                LayoutTag::Raw => (bf16_bytes, bf16_shape),
+                LayoutTag::DepthwiseConvSqueezed => transforms::squeeze_dim1(&bf16_bytes, &bf16_shape),
+                LayoutTag::HeadBiasReshaped => transforms::head_bias_reshape(&bf16_bytes, &bf16_shape),
+                LayoutTag::HeadExpReshaped => transforms::a_log_to_exp_bf16(&bf16_bytes, &bf16_shape),
+                _ => unreachable!(),
+            };
+            let offset = align_up(cursor, 4096);
+            weights_file.seek(SeekFrom::Start(offset))?;
+            weights_file.write_all(&bytes)?;
+            let byte_len = bytes.len() as u64;
+            entries.push(TensorMeta {
+                name: name.clone(), shape: final_shape,
+                dtype: "bf16".to_string(), layout, offset, byte_len,
+            });
+            cursor = offset + byte_len;
+        }
+    }
+
+    weights_file.flush()?;
+    drop(weights_file);
+
+    progress(&format!(
+        "[bake-int4] wrote {:.1}MiB to weights.bin",
+        cursor as f64 / (1024.0 * 1024.0)
+    ));
+
+    let manifest = Manifest {
+        format_version: FORMAT_VERSION,
+        converter_version: CONVERTER_VERSION,
+        model_family: "qwen35".to_string(),
+        tensors: entries,
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(crate::manifest_path(&bake_dir), manifest_json)?;
+
+    progress(&format!("[bake-int4] manifest written to {}", bake_dir.display()));
     Ok(())
 }

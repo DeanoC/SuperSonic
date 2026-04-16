@@ -17,6 +17,8 @@ use kernel_ffi::prefill_ffi;
 
 /// Dispatch matmul to either BF16 or FP8 dequant path.
 /// When `scale` is Some, uses FP8 dequant matmul; otherwise standard BF16 matmul.
+/// Projection matmul with INT4, FP8, or BF16 dispatch.
+/// Priority: INT4 > FP8 > BF16.
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -28,16 +30,26 @@ fn matmul_proj(
     scale: Option<&GpuBuffer>,
     block_size: usize,
     out: &mut GpuBuffer,
+    int4_scale: Option<&GpuBuffer>,
+    int4_zero: Option<&GpuBuffer>,
+    int4_group_size: usize,
 ) -> Result<()> {
-    match scale {
-        Some(s) => prefill_ffi::matmul_rhs_transposed_fp8(
-            ordinal, batch, m, n, k, lhs, weight, s, block_size, out,
+    if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
         )
-        .map_err(|e| anyhow::anyhow!("matmul_fp8: {e}")),
-        None => prefill_ffi::matmul_rhs_transposed(
-            ordinal, ScalarType::BF16, batch, m, n, k, lhs, weight, out,
-        )
-        .map_err(|e| anyhow::anyhow!("matmul: {e}")),
+        .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
+    } else {
+        match scale {
+            Some(s) => prefill_ffi::matmul_rhs_transposed_fp8(
+                ordinal, batch, m, n, k, lhs, weight, s, block_size, out,
+            )
+            .map_err(|e| anyhow::anyhow!("matmul_fp8: {e}")),
+            None => prefill_ffi::matmul_rhs_transposed(
+                ordinal, ScalarType::BF16, batch, m, n, k, lhs, weight, out,
+            )
+            .map_err(|e| anyhow::anyhow!("matmul: {e}")),
+        }
     }
 }
 
@@ -689,6 +701,7 @@ fn prefill_full_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, q_proj_dim, hidden_dim,
         &scratch.normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), weights.fp8_block_size, &mut q_full,
+        fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // 2. Split Q into query and gate
@@ -703,6 +716,7 @@ fn prefill_full_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, kv_dim, hidden_dim,
         &scratch.normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // 4. Q normalization
@@ -745,6 +759,7 @@ fn prefill_full_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, kv_dim, hidden_dim,
         &scratch.normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), weights.fp8_block_size, &mut v_buf,
+        fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // 8. Transpose K and V to [H, chunk_len, D] for KV cache write
@@ -871,6 +886,7 @@ fn prefill_full_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, hidden_dim, q_dim,
         &scratch.proj_buf, &fw.o_proj_w, fw.o_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // 16. Residual
@@ -913,6 +929,7 @@ fn prefill_linear_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, qkv_dim, hidden_dim,
         &scratch.normed, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // Save last kern-1 QKV rows for conv state (inter-chunk or final decode state).
@@ -988,22 +1005,25 @@ fn prefill_linear_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, z_dim, hidden_dim,
         &scratch.normed, &lw.z_proj_w, lw.z_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
-    // 3. B projection: normed [chunk, hidden] → [chunk, nv]
+    // 3. B projection: normed [chunk, hidden] → [chunk, nv] (kept BF16, too small for INT4)
     let mut b_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, nv])
         .map_err(|e| anyhow::anyhow!("b_buf alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, nv, hidden_dim,
         &scratch.normed, &lw.b_proj_w, lw.b_proj_scale.as_ref(), weights.fp8_block_size, &mut b_buf,
+        None, None, 0,
     )?;
 
-    // 4. A projection: normed [chunk, hidden] → [chunk, nv]
+    // 4. A projection: normed [chunk, hidden] → [chunk, nv] (kept BF16, too small for INT4)
     let mut a_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, nv])
         .map_err(|e| anyhow::anyhow!("a_buf alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, nv, hidden_dim,
         &scratch.normed, &lw.a_proj_w, lw.a_proj_scale.as_ref(), weights.fp8_block_size, &mut a_buf,
+        None, None, 0,
     )?;
 
     // 5. Transpose QKV [chunk, qkv_dim] → [qkv_dim, pad+chunk] for conv input
@@ -1292,6 +1312,7 @@ fn prefill_linear_attention_layer(
     matmul_proj(
         ordinal, 1, chunk_len, hidden_dim, val_dim,
         &gated_s_first, &lw.out_proj_w, lw.out_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // 17. Residual: hidden += O projection output
@@ -1317,12 +1338,14 @@ fn prefill_mlp_layer(
     matmul_proj(
         ordinal, 1, seq_len, intermediate, hidden_dim,
         &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
     matmul_proj(
         ordinal, 1, seq_len, intermediate, hidden_dim,
         &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // SwiGLU: out = silu(gate) * up
@@ -1339,6 +1362,7 @@ fn prefill_mlp_layer(
     matmul_proj(
         ordinal, 1, seq_len, hidden_dim, intermediate,
         &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // Residual: hidden += down_proj output

@@ -3653,6 +3653,64 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
     }
 }
 
+// INT4 dequant matmul bridge.
+template <typename T>
+int matmul_int4_dequant_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    int group_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = TILE_M * TILE_N;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_matmul_int4_dequant_kernel<T>),
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const T*>(lhs),
+        static_cast<const uint8_t*>(rhs_int4),
+        static_cast<const T*>(scale),
+        static_cast<const T*>(zero),
+        group_size,
+        static_cast<T*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 270;
+    if (sync_err != hipSuccess) return 271;
+    return 0;
+}
+
+extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    int group_size,
+    void* out) {
+    switch (dtype) {
+    case 2:
+        return matmul_int4_dequant_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_int4, scale, zero, group_size, out);
+    default:
+        return 272;
+    }
+}
+
 extern "C" int dotcache_qwen35_4b_hip_cast(
     int input_dtype,
     int output_dtype,
@@ -4514,7 +4572,8 @@ int persistent_decode_device(
     const void* fp8_scales,
     const void* kv_fp8_descs,
     int batch_size,
-    const void* batch_descs
+    const void* batch_descs,
+    const void* int4_scales
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4524,10 +4583,12 @@ int persistent_decode_device(
     const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
+    //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
     const size_t input_cache = static_cast<size_t>(hidden_dim) * batch_size > static_cast<size_t>(intermediate_size)
         ? static_cast<size_t>(hidden_dim) * batch_size
         : static_cast<size_t>(intermediate_size);
-    const size_t shared_bytes = (block_size + input_cache) * sizeof(float);
+    const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
+    const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
@@ -4553,7 +4614,8 @@ int persistent_decode_device(
         static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
         static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
         batch_size,
-        static_cast<const BatchSeqDesc*>(batch_descs));
+        static_cast<const BatchSeqDesc*>(batch_descs),
+        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4582,7 +4644,8 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     const void* fp8_scales,
     const void* kv_fp8_descs,
     size_t batch_size,
-    const void* batch_descs) {
+    const void* batch_descs,
+    const void* int4_scales) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4599,7 +4662,8 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             fp8_scales,
             kv_fp8_descs,
             static_cast<int>(batch_size),
-            batch_descs);
+            batch_descs,
+            int4_scales);
     default:
         return 256;
     }

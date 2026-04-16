@@ -199,6 +199,22 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    // INT4 dequant matmul: out = lhs (BF16) × dequant(rhs_int4)^T
+    fn dotcache_qwen35_4b_hip_matmul_int4_dequant(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_int4: *const c_void,
+        scale: *const c_void,
+        zero: *const c_void,
+        group_size: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
     // BF16 → FP8 KV cache quantization
     fn dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
@@ -736,6 +752,43 @@ pub fn matmul_rhs_transposed_fp8(
     };
     if status != 0 {
         return Err(GpuError::Hip(format!("matmul_rhs_transposed_fp8 failed: {status}")));
+    }
+    Ok(())
+}
+
+/// INT4 dequant matmul: out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_int4 [batch, n, k/2])^T
+/// rhs_int4 is packed INT4 (2 nibbles per byte), scale/zero are BF16 [n/group, k/group].
+pub fn matmul_rhs_transposed_int4(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    group_size: usize,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_matmul_int4_dequant(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            lhs.as_ptr(),
+            rhs_int4.as_ptr(),
+            scale.as_ptr(),
+            zero.as_ptr(),
+            group_size as c_int,
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!("matmul_rhs_transposed_int4 failed: {status}")));
     }
     Ok(())
 }

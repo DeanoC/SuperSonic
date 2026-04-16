@@ -1,4 +1,4 @@
-use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, KVCacheFp8Desc, BatchSeqDesc, MAX_BATCH_SIZE};
+use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, BatchSeqDesc, MAX_BATCH_SIZE};
 
 use crate::state::ModelState;
 use crate::weights::{Qwen35Weights, LayerKind};
@@ -127,6 +127,60 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
                 d.k_proj_scale = scale_ptr(&fa.k_proj_scale);
                 d.v_proj_scale = scale_ptr(&fa.v_proj_scale);
                 d.o_proj_scale = scale_ptr(&fa.o_proj_scale);
+            }
+        }
+
+        descs.push(d);
+    }
+    Some(descs)
+}
+
+/// Build INT4 scale descriptors (parallel to layer descs) for runtime INT4 dequant.
+/// Returns None if weights are not INT4.
+pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDesc>> {
+    if !weights.is_int4 {
+        return None;
+    }
+
+    let ptr = |opt: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
+        opt.as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null())
+    };
+
+    let mut descs = Vec::with_capacity(weights.layers.len());
+    for lw in &weights.layers {
+        let mut d = INT4ScaleDesc::default();
+        d.group_size = weights.int4_group_size as i32;
+
+        // Common MLP scales/zeros
+        d.gate_proj_scale = ptr(&lw.gate_proj_int4_scale);
+        d.gate_proj_zero = ptr(&lw.gate_proj_int4_zero);
+        d.up_proj_scale = ptr(&lw.up_proj_int4_scale);
+        d.up_proj_zero = ptr(&lw.up_proj_int4_zero);
+        d.down_proj_scale = ptr(&lw.down_proj_int4_scale);
+        d.down_proj_zero = ptr(&lw.down_proj_int4_zero);
+
+        match lw.kind {
+            LayerKind::Linear => {
+                let lin = lw.linear.as_ref().unwrap();
+                d.qkv_proj_scale = ptr(&lin.qkv_proj_int4_scale);
+                d.qkv_proj_zero = ptr(&lin.qkv_proj_int4_zero);
+                d.z_proj_scale = ptr(&lin.z_proj_int4_scale);
+                d.z_proj_zero = ptr(&lin.z_proj_int4_zero);
+                d.linear_out_proj_scale = ptr(&lin.out_proj_int4_scale);
+                d.linear_out_proj_zero = ptr(&lin.out_proj_int4_zero);
+            }
+            LayerKind::Full => {
+                let fa = lw.full.as_ref().unwrap();
+                d.q_proj_scale = ptr(&fa.q_proj_int4_scale);
+                d.q_proj_zero = ptr(&fa.q_proj_int4_zero);
+                d.k_proj_scale = ptr(&fa.k_proj_int4_scale);
+                d.k_proj_zero = ptr(&fa.k_proj_int4_zero);
+                d.v_proj_scale = ptr(&fa.v_proj_int4_scale);
+                d.v_proj_zero = ptr(&fa.v_proj_int4_zero);
+                d.o_proj_scale = ptr(&fa.o_proj_int4_scale);
+                d.o_proj_zero = ptr(&fa.o_proj_int4_zero);
             }
         }
 

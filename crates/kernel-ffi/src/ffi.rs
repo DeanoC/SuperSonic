@@ -67,6 +67,7 @@ unsafe extern "C" {
         kv_fp8_descs: *const c_void,  // nullptr for BF16 KV, pointer to KVCacheFp8Desc[] for FP8 KV
         batch_size: usize,            // 1 for single-sequence (default), >1 for batched
         batch_descs: *const c_void,   // nullptr for single-sequence, BatchSeqDesc[] for batched
+        int4_scales: *const c_void,   // nullptr for non-INT4, pointer to INT4ScaleDesc[] for INT4
     ) -> c_int;
 
     fn dotcache_qwen35_4b_hip_rms_norm(
@@ -153,6 +154,7 @@ pub fn persistent_decode(
 /// `kv_fp8_descs`: when Some, contains KVCacheFp8Desc array on GPU for FP8 KV cache.
 /// `batch_size`: number of sequences (1 = single-sequence, default).
 /// `batch_descs`: when Some, contains BatchSeqDesc array on GPU for per-sequence state.
+/// `int4_scale_descs`: when Some, contains INT4ScaleDesc array on GPU for INT4 dequant.
 pub fn persistent_decode_4b(
     ordinal: usize,
     dtype: ScalarType,
@@ -173,6 +175,7 @@ pub fn persistent_decode_4b(
     kv_fp8_descs: Option<&GpuBuffer>,
     batch_size: usize,
     batch_descs: Option<&GpuBuffer>,
+    int4_scale_descs: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
@@ -187,6 +190,10 @@ pub fn persistent_decode_4b(
         .unwrap_or(std::ptr::null());
 
     let batch_descs_ptr = batch_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+
+    let int4_scales_ptr = int4_scale_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
 
@@ -213,6 +220,7 @@ pub fn persistent_decode_4b(
             kv_fp8_ptr,
             batch_size,
             batch_descs_ptr,
+            int4_scales_ptr,
         )
     };
     if status != 0 {

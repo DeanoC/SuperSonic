@@ -5,7 +5,7 @@ use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
-use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_kv_fp8_descs, build_batch_seq_descs};
+use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs, build_batch_seq_descs};
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::PersistentDecodeScratch;
 use qwen35::state::ModelState;
@@ -32,6 +32,8 @@ pub struct DecodeEngine {
     attn_scratch_floats: usize,
     /// FP8 scale descriptors on GPU (None for BF16 weights).
     fp8_scale_device: Option<GpuBuffer>,
+    /// INT4 scale descriptors on GPU (None for non-INT4 weights).
+    int4_scale_device: Option<GpuBuffer>,
     /// Prefill chunk size (0 = no chunking).
     prefill_chunk_size: usize,
     /// Use FP8 E4M3 KV cache with dynamic per-head scaling.
@@ -106,6 +108,25 @@ impl DecodeEngine {
             None
         };
 
+        let int4_scale_device = if let Some(int4_descs) = build_int4_scale_descs(&weights) {
+            let desc_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    int4_descs.as_ptr() as *const u8,
+                    int4_descs.len() * std::mem::size_of::<kernel_ffi::INT4ScaleDesc>(),
+                )
+            };
+            let buf = GpuBuffer::from_host_bytes(
+                ordinal,
+                ScalarType::U8,
+                &[desc_bytes.len()],
+                desc_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("upload int4 scale descs: {e}"))?;
+            Some(buf)
+        } else {
+            None
+        };
+
         Ok(Self {
             weights,
             state,
@@ -122,6 +143,7 @@ impl DecodeEngine {
             proj_buf_floats,
             attn_scratch_floats,
             fp8_scale_device,
+            int4_scale_device,
             prefill_chunk_size,
             kv_fp8,
             batch_size,
@@ -337,6 +359,7 @@ impl DecodeEngine {
                 self.scratch.kv_fp8_desc_device.as_ref(),
                 1, // batch_size=1 for single-sequence decode
                 None,
+                self.int4_scale_device.as_ref(),
             )
             .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
         } else {
@@ -514,6 +537,7 @@ impl DecodeEngine {
             self.scratch.kv_fp8_desc_device.as_ref(),
             b,
             self.scratch.batch_seq_desc_device.as_ref(),
+            self.int4_scale_device.as_ref(),
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
 

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use manifest::{CONVERTER_VERSION, FORMAT_VERSION, Manifest};
 
-pub use baker::bake_qwen35;
+pub use baker::{bake_qwen35, bake_qwen35_int4};
 pub use store::BakedStore;
 
 /// Error type for bake and load operations.
@@ -47,6 +47,14 @@ pub fn bake_dir_fp8(model_dir: &Path) -> PathBuf {
 /// Check if a valid FP8-native baked package exists.
 pub fn version_ok_fp8(bake_dir: &Path) -> bool {
     version_ok(bake_dir)
+}
+
+/// Return the bake directory for INT4 quantized mode.
+/// Uses a separate directory so BF16/FP8/INT4 baked packages coexist.
+pub fn bake_dir_int4(model_dir: &Path) -> PathBuf {
+    model_dir
+        .join(".supersonic")
+        .join(format!("v{FORMAT_VERSION}-int4"))
 }
 
 /// Path to manifest.json within a bake directory.

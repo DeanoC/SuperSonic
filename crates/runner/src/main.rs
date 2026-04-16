@@ -66,6 +66,11 @@ struct Cli {
     #[arg(long)]
     fp8_runtime: bool,
 
+    /// Quantize weights to INT4 (4-bit) with group quantization for ~4x weight compression.
+    /// Bakes BF16→INT4 on first run. Targets ~200 ms/tok on bandwidth-limited GPUs.
+    #[arg(long)]
+    int4: bool,
+
     /// Process prompt in chunks of this size (0 = no chunking, process entire prompt at once).
     /// Reduces activation VRAM for long prompts. Typical values: 128, 256, 512.
     #[arg(long, default_value = "0")]
@@ -154,12 +159,14 @@ fn main() -> Result<()> {
         .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
     let kv_dtype_bytes = if cli.kv_fp8 { 1usize } else { gpu_hal::ScalarType::BF16.size_in_bytes() };
     let kv_per_token = text_config.kv_bytes_per_token(kv_dtype_bytes);
-    // FP8 runtime dequant halves weight VRAM. Estimate: fixed_bytes includes weights
-    // (~90% of total) + scratch/buffers (~10%). FP8 cuts weight portion in half.
-    let effective_fixed = if cli.fp8_runtime {
-        // weights ~= fixed * 0.9, scratch ~= fixed * 0.1
-        // FP8 weights = weights / 2
-        // total = weights/2 + scratch = fixed * 0.45 + fixed * 0.1 = fixed * 0.55
+    // FP8 runtime dequant halves weight VRAM; INT4 quarters it.
+    let effective_fixed = if cli.int4 {
+        // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1
+        // INT4 weights = weights / 4 + ~5% scale/zero overhead
+        // total ≈ fixed * 0.9 * 0.3 + fixed * 0.1 = fixed * 0.37
+        (entry.vram.fixed_bytes as f64 * 0.37) as u64
+    } else if cli.fp8_runtime {
+        // FP8: weights / 2
         (entry.vram.fixed_bytes as f64 * 0.55) as u64
     } else {
         entry.vram.fixed_bytes
@@ -201,28 +208,42 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
     } else {
-        // Select bake directory: FP8-native mode uses a separate directory
-        let bake_dir = if cli.fp8_runtime {
+        // Select bake directory: INT4 > FP8-native > BF16 (priority order)
+        let bake_dir = if cli.int4 {
+            model_store::bake_dir_int4(&cli.model_dir)
+        } else if cli.fp8_runtime {
             model_store::bake_dir_fp8(&cli.model_dir)
         } else {
             model_store::bake_dir(&cli.model_dir)
         };
         if !model_store::version_ok(&bake_dir) {
-            let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
+            let mode_str = if cli.int4 { " (INT4)" } else if cli.fp8_runtime { " (FP8 native)" } else { "" };
             eprintln!("[bake] no baked package found — baking weights{mode_str} (one-time)...");
             let bake_start = Instant::now();
             let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
                 .map(|i| text_config.is_full_attention(i))
                 .collect();
-            model_store::bake_qwen35(
-                &cli.model_dir,
-                params.weight_prefix,
-                text_config.num_hidden_layers,
-                &layer_is_full,
-                cli.fp8_runtime,
-                &|msg| eprintln!("{msg}"),
-            )
-            .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+            if cli.int4 {
+                model_store::bake_qwen35_int4(
+                    &cli.model_dir,
+                    params.weight_prefix,
+                    text_config.num_hidden_layers,
+                    &layer_is_full,
+                    128, // group_size
+                    &|msg| eprintln!("{msg}"),
+                )
+                .map_err(|e| anyhow::anyhow!("bake int4 weights: {e}"))?;
+            } else {
+                model_store::bake_qwen35(
+                    &cli.model_dir,
+                    params.weight_prefix,
+                    text_config.num_hidden_layers,
+                    &layer_is_full,
+                    cli.fp8_runtime,
+                    &|msg| eprintln!("{msg}"),
+                )
+                .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+            }
             eprintln!(
                 "[bake] done in {:.1}s",
                 bake_start.elapsed().as_secs_f64()
@@ -244,6 +265,12 @@ fn main() -> Result<()> {
         eprintln!(
             "[weights] FP8 runtime dequant active (block_size={})",
             weights.fp8_block_size
+        );
+    }
+    if weights.is_int4 {
+        eprintln!(
+            "[weights] INT4 runtime dequant active (group_size={})",
+            weights.int4_group_size
         );
     }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());

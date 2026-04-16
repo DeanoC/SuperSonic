@@ -128,6 +128,50 @@ impl Default for KVCacheFp8Desc {
     }
 }
 
+/// INT4 weight quantization descriptors for runtime dequantization.
+/// Parallel struct to DecodeLayerDesc — one per layer.
+/// Passed as a separate kernel argument (same pattern as FP8ScaleDesc).
+/// Each weight has a scale and zero_point pointer (BF16) for asymmetric group quantization.
+/// Weights are packed as 2×INT4 per byte (low nibble = even col, high nibble = odd col).
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct INT4ScaleDesc {
+    // Common MLP weights
+    pub gate_proj_scale: *const c_void,
+    pub gate_proj_zero: *const c_void,
+    pub up_proj_scale: *const c_void,
+    pub up_proj_zero: *const c_void,
+    pub down_proj_scale: *const c_void,
+    pub down_proj_zero: *const c_void,
+    // Linear attention weights
+    pub qkv_proj_scale: *const c_void,
+    pub qkv_proj_zero: *const c_void,
+    pub z_proj_scale: *const c_void,
+    pub z_proj_zero: *const c_void,
+    pub linear_out_proj_scale: *const c_void,
+    pub linear_out_proj_zero: *const c_void,
+    // Full attention weights
+    pub q_proj_scale: *const c_void,
+    pub q_proj_zero: *const c_void,
+    pub k_proj_scale: *const c_void,
+    pub k_proj_zero: *const c_void,
+    pub v_proj_scale: *const c_void,
+    pub v_proj_zero: *const c_void,
+    pub o_proj_scale: *const c_void,
+    pub o_proj_zero: *const c_void,
+    // Group size for INT4 quantization (typically 128)
+    pub group_size: c_int,
+}
+
+unsafe impl Send for INT4ScaleDesc {}
+unsafe impl Sync for INT4ScaleDesc {}
+
+impl Default for INT4ScaleDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Per-sequence state pointers for batched decode.
 /// One BatchSeqDesc per layer (parallel to DecodeLayerDesc), containing
 /// per-sequence mutable state for up to MAX_BATCH_SIZE sequences.
