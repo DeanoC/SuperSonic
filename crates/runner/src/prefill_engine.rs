@@ -236,13 +236,13 @@ pub fn prefill(
 
     // Allocate inter-chunk recurrent states (one per linear layer)
     // These carry the delta recurrent state between chunks.
+    // Must be BF16 because the delta_recurrent_prefill kernel reads initial_state as T (BF16).
     let mut chunk_recurrent: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
         .map(|i| {
             if config.is_full_attention(i) {
                 Ok(None)
             } else {
-                // [nv, khd, vhd] F32 — initialized to zeros
-                GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, khd, vhd])
                     .map(Some)
                     .map_err(|e| anyhow::anyhow!("chunk recurrent alloc: {e}"))
             }
@@ -331,6 +331,7 @@ pub fn prefill(
 
             // MLP
             prefill_mlp_layer(weights, &mut scratch, config, idx, chunk_len, ordinal)?;
+
         }
 
         chunk_start += chunk_len;
@@ -936,20 +937,20 @@ fn prefill_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state extract h={h}: {e}"))?;
         }
 
-        // Always update chunk_recurrent for next chunk
-        prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, state_elems, &state_bf16, chunk_recurrent)
-            .map_err(|e| anyhow::anyhow!("layer {idx} chunk recurrent update: {e}"))?;
+        // Always update chunk_recurrent (BF16) for next chunk — direct copy, same dtype
+        gpu_hal::copy_d2d(
+            ordinal,
+            chunk_recurrent.as_ptr() as *mut c_void,
+            state_bf16.as_ptr(),
+            state_elems * ScalarType::BF16.size_in_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} chunk recurrent update: {e}"))?;
 
-        // On last chunk, also copy to state for decode
+        // On last chunk, cast BF16 → F32 into state.recurrent_state for decode
         if is_last_chunk {
             if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
-                gpu_hal::copy_d2d(
-                    ordinal,
-                    rec_state.as_ptr() as *mut c_void,
-                    chunk_recurrent.as_ptr(),
-                    state_elems * ScalarType::F32.size_in_bytes(),
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state final copy: {e}"))?;
+                prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, state_elems, &state_bf16, rec_state)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state final cast: {e}"))?;
             }
         }
     }
