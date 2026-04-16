@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::mem;
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
-use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc};
+use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
 
 /// Pre-allocated device scratch buffers for the persistent decode kernel.
 /// Avoids per-token hipMalloc/hipFree overhead.
@@ -18,6 +18,9 @@ pub struct PersistentDecodeScratch {
     /// Device copy of Vec<KVCacheFp8Desc> (if FP8 KV enabled).
     pub kv_fp8_desc_device: Option<GpuBuffer>,
     kv_fp8_desc_capacity_bytes: usize,
+    /// Device copy of Vec<BatchSeqDesc> (if batch_size > 1).
+    pub batch_seq_desc_device: Option<GpuBuffer>,
+    batch_seq_desc_capacity_bytes: usize,
 }
 
 impl PersistentDecodeScratch {
@@ -28,17 +31,18 @@ impl PersistentDecodeScratch {
         num_layers: usize,
         attn_scratch_floats: usize,
         saved_gate_floats: usize,
+        batch_size: usize,
     ) -> Result<Self, GpuError> {
-        // Workspace layout matches the kernel expectation:
-        // normed[hidden] + proj_buf[hidden + hidden + intermediate*2] +
-        // post_norm[hidden] + residual[hidden] + attn_scratch + saved_gate
-        let workspace_floats = hidden_dim
+        // Workspace layout matches the kernel expectation.
+        // Each section is multiplied by batch_size for batched decode.
+        let b = batch_size;
+        let workspace_floats = (hidden_dim
             + hidden_dim
             + intermediate_size * 2
             + hidden_dim
             + hidden_dim
             + attn_scratch_floats
-            + saved_gate_floats;
+            + saved_gate_floats) * b;
         let workspace = GpuBuffer::zeros(
             ordinal,
             ScalarType::F32,
@@ -58,6 +62,8 @@ impl PersistentDecodeScratch {
             desc_capacity_bytes: desc_bytes,
             kv_fp8_desc_device: None,
             kv_fp8_desc_capacity_bytes: 0,
+            batch_seq_desc_device: None,
+            batch_seq_desc_capacity_bytes: 0,
         })
     }
 
@@ -90,6 +96,26 @@ impl PersistentDecodeScratch {
                 self.ordinal,
                 buf.as_ptr() as *mut c_void,
                 descs.as_ptr() as *const c_void,
+                bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Upload batch sequence descriptors to device memory.
+    /// Must be re-uploaded each step since per-sequence state pointers may change.
+    pub fn upload_batch_seq_descs(&mut self, descs: &[BatchSeqDesc]) -> Result<(), GpuError> {
+        let bytes = descs.len() * mem::size_of::<BatchSeqDesc>();
+        if bytes > self.batch_seq_desc_capacity_bytes {
+            self.batch_seq_desc_device =
+                Some(GpuBuffer::zeros(self.ordinal, ScalarType::U8, &[bytes])?);
+            self.batch_seq_desc_capacity_bytes = bytes;
+        }
+        if let Some(ref buf) = self.batch_seq_desc_device {
+            gpu_hal::copy_h2d(
+                self.ordinal,
+                buf.as_ptr() as *mut std::ffi::c_void,
+                descs.as_ptr() as *const std::ffi::c_void,
                 bytes,
             )?;
         }

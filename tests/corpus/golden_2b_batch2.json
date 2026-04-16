@@ -1,0 +1,459 @@
+{
+  "model_id": "Qwen/Qwen3.5-4B",
+  "generated_at": "2026-04-16 16:01:09",
+  "device": "native_gpu",
+  "test_cases": [
+    {
+      "name": "hello_world",
+      "type": "exact_prefix",
+      "description": "Basic greeting completion",
+      "prompt": "Hello, world",
+      "prompt_tokens": 3,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        0,
+        271,
+        2,
+        220,
+        16,
+        13,
+        27416,
+        271
+      ],
+      "expected_text": "!\n\nHello, world!\n\nHello",
+      "prefill_top5": [
+        {
+          "token_id": 0,
+          "logit": 18.5,
+          "text": "!"
+        },
+        {
+          "token_id": 13,
+          "logit": 16.875,
+          "text": "."
+        },
+        {
+          "token_id": 271,
+          "logit": 15.625,
+          "text": "\n\n"
+        },
+        {
+          "token_id": 198,
+          "logit": 15.375,
+          "text": "\n"
+        },
+        {
+          "token_id": 11,
+          "logit": 14.8125,
+          "text": ","
+        }
+      ]
+    },
+    {
+      "name": "capital_france",
+      "type": "exact_prefix",
+      "description": "Simple factual completion",
+      "prompt": "The capital of France is",
+      "prompt_tokens": 5,
+      "max_new_tokens": 4,
+      "expected_token_ids": [
+        11751,
+        13,
+        198,
+        32
+      ],
+      "expected_text": " Paris.\nA",
+      "prefill_top5": [
+        {
+          "token_id": 11751,
+          "logit": 18.375,
+          "text": " Paris"
+        },
+        {
+          "token_id": 7172,
+          "logit": 16.25,
+          "text": " located"
+        },
+        {
+          "token_id": 264,
+          "logit": 15.8125,
+          "text": " a"
+        },
+        {
+          "token_id": 3750,
+          "logit": 15.5625,
+          "text": " known"
+        },
+        {
+          "token_id": 279,
+          "logit": 15.375,
+          "text": " the"
+        }
+      ]
+    },
+    {
+      "name": "arithmetic",
+      "type": "exact_prefix",
+      "description": "Simple arithmetic",
+      "prompt": "2 + 2 =",
+      "prompt_tokens": 5,
+      "max_new_tokens": 4,
+      "expected_token_ids": [
+        220,
+        19,
+        13,
+        198
+      ],
+      "expected_text": " 4\n2",
+      "prefill_top5": [
+        {
+          "token_id": 220,
+          "logit": 18.25,
+          "text": " "
+        },
+        {
+          "token_id": 907,
+          "logit": 17.625,
+          "text": " ?"
+        },
+        {
+          "token_id": 30,
+          "logit": 14.3125,
+          "text": "?"
+        },
+        {
+          "token_id": 198,
+          "logit": 14.3125,
+          "text": "\n"
+        },
+        {
+          "token_id": 318,
+          "logit": 14.25,
+          "text": " ("
+        }
+      ]
+    },
+    {
+      "name": "counting",
+      "type": "exact_prefix",
+      "description": "Sequence continuation",
+      "prompt": "1, 2, 3, 4,",
+      "prompt_tokens": 11,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        220,
+        20,
+        11,
+        220,
+        21,
+        11,
+        220,
+        22
+      ],
+      "expected_text": " 5, 6, 7",
+      "prefill_top5": [
+        {
+          "token_id": 220,
+          "logit": 20.625,
+          "text": " "
+        },
+        {
+          "token_id": 321,
+          "logit": 16.625,
+          "text": " and"
+        },
+        {
+          "token_id": 2423,
+          "logit": 15.6875,
+          "text": " ..."
+        },
+        {
+          "token_id": 58317,
+          "logit": 14.8125,
+          "text": " ...,"
+        },
+        {
+          "token_id": 466,
+          "logit": 14.375,
+          "text": " or"
+        }
+      ]
+    },
+    {
+      "name": "medium_context",
+      "type": "exact_prefix",
+      "description": "Medium-length context with question",
+      "prompt": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. What animal jumps?",
+      "prompt_tokens": 24,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        248068,
+        198,
+        90700,
+        8340,
+        25,
+        271,
+        16
+      ],
+      "expected_text": "\n\n<think>\n\n</think>\n\nBased on the",
+      "prefill_top5": [
+        {
+          "token_id": 271,
+          "logit": 20.25,
+          "text": "\n\n"
+        },
+        {
+          "token_id": 198,
+          "logit": 18.875,
+          "text": "\n"
+        },
+        {
+          "token_id": 3437,
+          "logit": 17.125,
+          "text": " What"
+        },
+        {
+          "token_id": 561,
+          "logit": 15.75,
+          "text": " The"
+        },
+        {
+          "token_id": 248046,
+          "logit": 15.25,
+          "text": "<|im_end|>"
+        }
+      ]
+    },
+    {
+      "name": "niah_short",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from short context",
+      "prompt": "Random text here. Random text here. The secret code is 42. Random text here. Random text here. What is the secret code?",
+      "prompt_tokens": 30,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        248068,
+        198,
+        90700,
+        8340,
+        25,
+        271,
+        16
+      ],
+      "expected_text": "\n\n<think>\nThinking Process:\n\n1",
+      "prefill_top5": [
+        {
+          "token_id": 271,
+          "logit": 19.125,
+          "text": "\n\n"
+        },
+        {
+          "token_id": 198,
+          "logit": 18.375,
+          "text": "\n"
+        },
+        {
+          "token_id": 561,
+          "logit": 17.0,
+          "text": " The"
+        },
+        {
+          "token_id": 3437,
+          "logit": 16.375,
+          "text": " What"
+        },
+        {
+          "token_id": 220,
+          "logit": 16.375,
+          "text": " "
+        }
+      ]
+    },
+    {
+      "name": "niah_medium",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from medium context",
+      "prompt": "The weather today is sunny. Birds are singing in the trees. The river flows gently through the valley. Mountains rise in the distance. The password to the vault is diamond. Clouds drift lazily across the blue sky. Flowers bloom in the meadow. Children play in the park nearby. The wind whispers through the leaves. What is the password to the vault?",
+      "prompt_tokens": 74,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        248068,
+        198,
+        90700,
+        8340,
+        25,
+        271,
+        16
+      ],
+      "expected_text": "\n\n<think>\n\n</think>\n\nBased on the",
+      "prefill_top5": [
+        {
+          "token_id": 271,
+          "logit": 21.0,
+          "text": "\n\n"
+        },
+        {
+          "token_id": 198,
+          "logit": 18.625,
+          "text": "\n"
+        },
+        {
+          "token_id": 3437,
+          "logit": 16.75,
+          "text": " What"
+        },
+        {
+          "token_id": 561,
+          "logit": 16.75,
+          "text": " The"
+        },
+        {
+          "token_id": 248046,
+          "logit": 15.375,
+          "text": "<|im_end|>"
+        }
+      ]
+    },
+    {
+      "name": "single_token",
+      "type": "exact_prefix",
+      "description": "Single token prompt",
+      "prompt": "A",
+      "prompt_tokens": 1,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        220,
+        16,
+        15,
+        15,
+        15,
+        20332,
+        1740,
+        369
+      ],
+      "expected_text": " 2005 Chevrolet Silverado",
+      "prefill_top5": [
+        {
+          "token_id": 220,
+          "logit": 11.1875,
+          "text": " "
+        },
+        {
+          "token_id": 8455,
+          "logit": 10.3125,
+          "text": " patient"
+        },
+        {
+          "token_id": 18223,
+          "logit": 10.1875,
+          "text": " particle"
+        },
+        {
+          "token_id": 1740,
+          "logit": 10.1875,
+          "text": " car"
+        },
+        {
+          "token_id": 2724,
+          "logit": 10.0625,
+          "text": " company"
+        }
+      ]
+    },
+    {
+      "name": "long_prompt",
+      "type": "exact_prefix",
+      "description": "Long repetitive prompt (50+ tokens)",
+      "prompt": "The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The end.",
+      "prompt_tokens": 52,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        760,
+        561,
+        561,
+        561,
+        561,
+        561,
+        561
+      ],
+      "expected_text": " The The The The The The The The",
+      "prefill_top5": [
+        {
+          "token_id": 271,
+          "logit": 16.875,
+          "text": "\n\n"
+        },
+        {
+          "token_id": 198,
+          "logit": 15.9375,
+          "text": "\n"
+        },
+        {
+          "token_id": 561,
+          "logit": 15.375,
+          "text": " The"
+        },
+        {
+          "token_id": 353,
+          "logit": 13.5625,
+          "text": " I"
+        },
+        {
+          "token_id": 1049,
+          "logit": 13.0,
+          "text": " It"
+        }
+      ]
+    },
+    {
+      "name": "chinese_prompt",
+      "type": "exact_prefix",
+      "description": "Chinese factual completion (capital of China)",
+      "prompt": "中国的首都是",
+      "prompt_tokens": 3,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        98116,
+        3709,
+        96051,
+        98116,
+        100542,
+        108733,
+        109349,
+        1710
+      ],
+      "expected_text": "北京，位于中国北方。\nA",
+      "prefill_top5": [
+        {
+          "token_id": 98116,
+          "logit": 16.5,
+          "text": "北京"
+        },
+        {
+          "token_id": 99549,
+          "logit": 15.8125,
+          "text": "哪里"
+        },
+        {
+          "token_id": 101857,
+          "logit": 15.3125,
+          "text": "哪个"
+        },
+        {
+          "token_id": 2062,
+          "logit": 13.9375,
+          "text": "____"
+        },
+        {
+          "token_id": 96795,
+          "logit": 13.4375,
+          "text": "哪"
+        }
+      ]
+    }
+  ]
+}

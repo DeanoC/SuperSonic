@@ -1,5 +1,9 @@
 use std::ffi::{c_int, c_void};
 
+/// Maximum batch size supported by the batched decode kernel.
+/// Struct arrays in BatchSeqDesc are fixed to this size.
+pub const MAX_BATCH_SIZE: usize = 8;
+
 /// Rust mirror of `Qwen35DecodeLayerDesc` in full_attention.hip.
 /// Describes one decoder layer for the persistent decode megakernel.
 #[repr(C)]
@@ -119,6 +123,39 @@ unsafe impl Send for KVCacheFp8Desc {}
 unsafe impl Sync for KVCacheFp8Desc {}
 
 impl Default for KVCacheFp8Desc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Per-sequence state pointers for batched decode.
+/// One BatchSeqDesc per layer (parallel to DecodeLayerDesc), containing
+/// per-sequence mutable state for up to MAX_BATCH_SIZE sequences.
+/// When batch_size == 1, this struct is not used (nullptr passed to kernel).
+/// When batch_size > 1, the kernel reads per-sequence state from here
+/// instead of from DecodeLayerDesc.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct BatchSeqDesc {
+    /// Per-sequence position in the sequence (for RoPE table lookup).
+    pub seqlen_offset: [c_int; MAX_BATCH_SIZE],
+    // --- Full attention per-sequence state ---
+    pub kv_cache_k: [*mut c_void; MAX_BATCH_SIZE],
+    pub kv_cache_v: [*mut c_void; MAX_BATCH_SIZE],
+    pub kv_len: [c_int; MAX_BATCH_SIZE],
+    pub kv_max_t: [c_int; MAX_BATCH_SIZE],
+    // --- Linear attention per-sequence state ---
+    pub conv_state: [*mut c_void; MAX_BATCH_SIZE],
+    pub recurrent_state: [*mut c_void; MAX_BATCH_SIZE],
+    // --- FP8 KV cache per-sequence scale buffers ---
+    pub kv_scale_k: [*mut c_void; MAX_BATCH_SIZE],
+    pub kv_scale_v: [*mut c_void; MAX_BATCH_SIZE],
+}
+
+unsafe impl Send for BatchSeqDesc {}
+unsafe impl Sync for BatchSeqDesc {}
+
+impl Default for BatchSeqDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }

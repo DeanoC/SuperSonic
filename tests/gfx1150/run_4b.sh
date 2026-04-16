@@ -96,4 +96,10 @@ if [ -f "$GOLDEN" ]; then
     CORPUS_TIMEOUT=600 "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-4b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC" --no-bake
 fi
 
+# Test 5: Golden corpus — batched decode (batch_size=2)
+GOLDEN_BATCH="$REPO_ROOT/tests/corpus/golden_4b_batch2.json"
+if [ -f "$GOLDEN_BATCH" ]; then
+    CORPUS_TIMEOUT=600 "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-4b "$MODEL_DIR" "$GOLDEN_BATCH" "$SUPERSONIC" --batch-size 2
+fi
+
 echo "=== All tests passed ==="

@@ -114,6 +114,27 @@ struct KVCacheFp8Desc {
     void* kv_scale_v;   // [num_kv_heads, max_T] F32
 };
 
+// Per-sequence state pointers for batched decode.
+// One per layer (parallel to Qwen35DecodeLayerDesc).
+// When batch_size > 1, the kernel reads per-sequence state from here
+// instead of from Qwen35DecodeLayerDesc.
+// Struct layout must match kernel_ffi::BatchSeqDesc in Rust.
+#define MAX_BATCH_SIZE 8
+struct BatchSeqDesc {
+    int seqlen_offset[MAX_BATCH_SIZE];
+    // Full attention per-sequence
+    void* kv_cache_k[MAX_BATCH_SIZE];
+    void* kv_cache_v[MAX_BATCH_SIZE];
+    int kv_len[MAX_BATCH_SIZE];
+    int kv_max_t[MAX_BATCH_SIZE];
+    // Linear attention per-sequence
+    void* conv_state[MAX_BATCH_SIZE];
+    void* recurrent_state[MAX_BATCH_SIZE];
+    // FP8 KV scales per-sequence
+    void* kv_scale_k[MAX_BATCH_SIZE];
+    void* kv_scale_v[MAX_BATCH_SIZE];
+};
+
 // Convert F32 to FP8 E4M3 byte (inverse of fp8_e4m3_to_float).
 // Clamps to representable range [-448, 448], rounds to nearest.
 __device__ inline uint8_t float_to_fp8_e4m3(float val) {
@@ -3493,50 +3514,57 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     int proj_buf_floats,                 // max projection output buffer size
     int attn_scratch_floats,             // attention/recurrent scratch buffer size
     const Qwen35FP8ScaleDesc* __restrict__ fp8_scales,  // nullptr for BF16, else [num_layers]
-    const KVCacheFp8Desc* __restrict__ kv_fp8           // nullptr for BF16 KV, else [num_layers]
+    const KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
+    int batch_size,                      // 1 for single-sequence, >1 for batched
+    const BatchSeqDesc* __restrict__ batch_descs  // nullptr for single, else [num_layers]
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
     const int nb = gridDim.x;
+    const int B = batch_size;
 
-    // Workspace layout (F32 unless noted):
-    // Section 1: persistent state
-    float* hidden_f32 = workspace;                              // [hidden_dim]
-    float* normed     = hidden_f32 + hidden_dim;                // [hidden_dim]
-    // Section 2: MLP scratch
-    float* gate_up    = normed + hidden_dim;                    // [intermediate_size * 2]
-    float* mlp_out    = gate_up + intermediate_size * 2;        // [hidden_dim]
-    // Section 3: token mixer scratch
-    float* token_out  = mlp_out + hidden_dim;                   // [hidden_dim]
-    float* proj_buf   = token_out + hidden_dim;                 // [proj_buf_floats]
-    float* attn_scratch = proj_buf + proj_buf_floats;           // [attn_scratch_floats]
-    // proj_buf holds projection results as F32 for all layer types
-    // attn_scratch holds intermediate attention or recurrent output
+    // Workspace layout (F32 unless noted).
+    // Each section is multiplied by batch_size. Per-batch offset: section + b * section_size.
+    // Total floats per batch item:
+    const int per_batch = hidden_dim + hidden_dim + intermediate_size * 2
+                        + hidden_dim + hidden_dim + proj_buf_floats + attn_scratch_floats;
+    float* hidden_f32   = workspace;                                     // [B * hidden_dim]
+    float* normed       = hidden_f32 + B * hidden_dim;                   // [B * hidden_dim]
+    float* gate_up      = normed + B * hidden_dim;                       // [B * intermediate_size * 2]
+    float* mlp_out      = gate_up + B * intermediate_size * 2;           // [B * hidden_dim]
+    float* token_out    = mlp_out + B * hidden_dim;                      // [B * hidden_dim]
+    float* proj_buf     = token_out + B * hidden_dim;                    // [B * proj_buf_floats]
+    float* attn_scratch = proj_buf + B * proj_buf_floats;                // [B * attn_scratch_floats]
 
     extern __shared__ float lds[];
     // LDS layout: lds[0..bs-1] = reduction scratch, lds[bs..] = input vector cache
     float* lds_input = lds + bs;  // LDS-resident copy of input vectors for matvecs
 
-    // Load hidden BF16 → F32
-    for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-        hidden_f32[c] = dotcache_qwen35_to_float(hidden_io[c]);
+    // Load hidden BF16 → F32 for all batch items
+    for (int b = 0; b < B; b++) {
+        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+            hidden_f32[b * hidden_dim + c] = dotcache_qwen35_to_float(hidden_io[b * hidden_dim + c]);
+        }
     }
     grid_barrier(barrier_counter, barrier_flag, nb);
 
     for (int layer = 0; layer < num_layers; ++layer) {
         const Qwen35DecodeLayerDesc& L = layers[layer];
 
-        // === Input RMSNorm (block 0 only) ===
+        // === Input RMSNorm (block 0 only, B sequences) ===
         if (blockIdx.x == 0) {
-            block_rms_norm_global<T>(normed, hidden_f32,
-                static_cast<const T*>(L.input_norm_w),
-                hidden_dim, L.input_norm_eps, lds);
+            for (int b = 0; b < B; b++) {
+                block_rms_norm_global<T>(normed + b * hidden_dim, hidden_f32 + b * hidden_dim,
+                    static_cast<const T*>(L.input_norm_w),
+                    hidden_dim, L.input_norm_eps, lds);
+            }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
-        // All blocks: cache normed vector in LDS for fast projection reads
-        for (int c = tid; c < hidden_dim; c += bs)
-            lds_input[c] = normed[c];
+        // All blocks: cache B normed vectors in LDS for fast projection reads
+        for (int b = 0; b < B; b++)
+            for (int c = tid; c < hidden_dim; c += bs)
+                lds_input[b * hidden_dim + c] = normed[b * hidden_dim + c];
         __syncthreads();
 
         // === Token mixer: projections + core ===
@@ -3572,47 +3600,70 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (fp8_scales) w_scale = fp8_scales[layer].v_proj_scale;
                     }
 
-                    float p = 0.0f;
+                    // Batched dot product: load weight once, B dot products from LDS
+                    float p[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) p[b] = 0.0f;
                     if (fp8_scales != nullptr && w_scale != nullptr) {
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                        for (int c = tid; c < hidden_dim; c += bs) {
+                            float w = fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
                     } else {
                         const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        for (int c = tid; c < hidden_dim; c += bs) {
+                            float w = dotcache_qwen35_to_float(wr[c]);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
                     }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
+                    // Reduce and write for each batch item
+                    for (int b = 0; b < B; b++) {
+                        lds[tid] = p[b];
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[b * proj_buf_floats + sr] = lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) proj_buf[sr] = lds[0];
-                    __syncthreads();
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step B-G: QK-norm, RoPE, KV cache, attention, gating, o_proj
-            // Block 0 handles the per-head sequential ops.
-            // O_proj uses all blocks via work-stealing.
-            if (blockIdx.x == 0) {
-                float* q_f32 = proj_buf;
-                float* k_f32 = proj_buf + L.q_out_dim;
-                float* v_f32 = proj_buf + L.q_out_dim + L.k_out_dim;
-
+            // Block 0 handles per-head sequential ops (per-sequence loop).
+            // O_proj uses all blocks via work-stealing (per-sequence loop).
+            {
                 const int hd = L.attn_head_dim;       // 256
                 const int nh = L.attn_num_heads;       // 8
                 const int nkv = L.attn_num_kv_heads;   // 2
                 const int kv_groups = nh / nkv;         // 4
                 const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-                const int rotary_dim = hd / 4;          // 64 (partial_rotary_factor=0.25)
-                const int kv_len = L.kv_len + 1;       // includes this new token
-                // q_f32 layout: [nh * hd * 2] = per head: [query(hd) | gate(hd)]
+                const int rot_dim = hd / 4;             // 64 (partial_rotary_factor=0.25)
+                const int attn_size = nh * hd;          // 2048
+
+            for (int b = 0; b < B; b++) {
+                // Per-sequence state: read from batch_descs when batched, else from L/seqlen_offset
+                const int seq_off_b  = batch_descs ? batch_descs[layer].seqlen_offset[b] : seqlen_offset;
+                void* kv_k_b         = batch_descs ? batch_descs[layer].kv_cache_k[b]    : L.kv_cache_k;
+                void* kv_v_b         = batch_descs ? batch_descs[layer].kv_cache_v[b]    : L.kv_cache_v;
+                const int kv_len_b   = (batch_descs ? batch_descs[layer].kv_len[b]       : L.kv_len) + 1;
+                const int kv_max_b   = batch_descs ? batch_descs[layer].kv_max_t[b]      : L.kv_max_t;
+                void* kv_scale_k_b   = (batch_descs && kv_fp8) ? batch_descs[layer].kv_scale_k[b] : (kv_fp8 ? kv_fp8[layer].kv_scale_k : nullptr);
+                void* kv_scale_v_b   = (batch_descs && kv_fp8) ? batch_descs[layer].kv_scale_v[b] : (kv_fp8 ? kv_fp8[layer].kv_scale_v : nullptr);
+
+                float* proj_b = proj_buf + b * proj_buf_floats;
+
+                if (blockIdx.x == 0) {
+                float* q_f32 = proj_b;
+                float* k_f32 = proj_b + L.q_out_dim;
+                float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
 
                 // Step B: QK-norm — RMSNorm per head on head_dim
                 for (int h = 0; h < nh; ++h) {
-                    float* qh = q_f32 + h * hd * 2;  // query portion
+                    float* qh = q_f32 + h * hd * 2;
                     float sq = 0.0f;
                     for (int d = tid; d < hd; d += bs) sq += qh[d] * qh[d];
                     lds[tid] = sq;
@@ -3646,15 +3697,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                 }
 
-                // Step C: RoPE (partial, first rotary_dim dims of head_dim)
-                // Standard half-rotation: new[2i] = old[2i]*cos[i] - old[2i+1]*sin[i]
-                //                         new[2i+1] = old[2i]*sin[i] + old[2i+1]*cos[i]
-                if (cos_table != nullptr && rotary_dim > 0) {
-                    const int half_rot = rotary_dim / 2;
+                // Step C: RoPE (partial, first rot_dim dims of head_dim)
+                if (cos_table != nullptr && rot_dim > 0) {
+                    const int half_rot = rot_dim / 2;
                     const size_t cos_off =
-                        static_cast<size_t>(seqlen_offset) * half_rot;
+                        static_cast<size_t>(seq_off_b) * half_rot;
 
-                    // Apply to all Q heads in parallel (nh * half_rot <= 256)
                     if (tid < nh * half_rot) {
                         const int h = tid / half_rot;
                         const int i = tid % half_rot;
@@ -3668,7 +3716,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    // Apply to all K heads (nkv * half_rot threads)
                     if (tid < nkv * half_rot) {
                         const int h = tid / half_rot;
                         const int i = tid % half_rot;
@@ -3683,19 +3730,16 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                 }
 
-                // Step D: KV cache append — write new K/V at seqlen_offset
-                // When kv_fp8 is set, quantize K/V to FP8 E4M3 with per-head absmax scale.
+                // Step D: KV cache append — write new K/V at seq_off_b
                 {
-                    const bool use_fp8_kv = (kv_fp8 != nullptr && kv_fp8[layer].kv_scale_k != nullptr);
+                    const bool use_fp8_kv = (kv_scale_k_b != nullptr);
                     if (use_fp8_kv) {
-                        // FP8 KV cache path: absmax quantize per head
-                        uint8_t* fp8_k = static_cast<uint8_t*>(L.kv_cache_k);
-                        uint8_t* fp8_v = static_cast<uint8_t*>(L.kv_cache_v);
-                        float* scale_k_buf = static_cast<float*>(kv_fp8[layer].kv_scale_k);
-                        float* scale_v_buf = static_cast<float*>(kv_fp8[layer].kv_scale_v);
+                        uint8_t* fp8_k = static_cast<uint8_t*>(kv_k_b);
+                        uint8_t* fp8_v = static_cast<uint8_t*>(kv_v_b);
+                        float* scale_k_buf = static_cast<float*>(kv_scale_k_b);
+                        float* scale_v_buf = static_cast<float*>(kv_scale_v_b);
 
                         for (int h = 0; h < nkv; ++h) {
-                            // Absmax reduction for K across head_dim using lds[bs]
                             float my_k = (tid < hd) ? fabsf(k_f32[h * hd + tid]) : 0.0f;
                             lds[tid] = my_k;
                             __syncthreads();
@@ -3706,9 +3750,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float k_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
                             float k_inv = 1.0f / k_scale;
                             if (tid == 0)
-                                scale_k_buf[h * L.kv_max_t + seqlen_offset] = k_scale;
+                                scale_k_buf[h * kv_max_b + seq_off_b] = k_scale;
 
-                            // Absmax reduction for V
                             float my_v = (tid < hd) ? fabsf(v_f32[h * hd + tid]) : 0.0f;
                             lds[tid] = my_v;
                             __syncthreads();
@@ -3719,26 +3762,24 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float v_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
                             float v_inv = 1.0f / v_scale;
                             if (tid == 0)
-                                scale_v_buf[h * L.kv_max_t + seqlen_offset] = v_scale;
+                                scale_v_buf[h * kv_max_b + seq_off_b] = v_scale;
 
-                            // Quantize and write FP8
                             for (int d = tid; d < hd; d += bs) {
                                 const size_t offset =
-                                    static_cast<size_t>(h) * L.kv_max_t * hd +
-                                    static_cast<size_t>(seqlen_offset) * hd + d;
+                                    static_cast<size_t>(h) * kv_max_b * hd +
+                                    static_cast<size_t>(seq_off_b) * hd + d;
                                 fp8_k[offset] = float_to_fp8_e4m3(k_f32[h * hd + d] * k_inv);
                                 fp8_v[offset] = float_to_fp8_e4m3(v_f32[h * hd + d] * v_inv);
                             }
                         }
                     } else {
-                        // BF16 KV cache path (original)
-                        T* cache_k = static_cast<T*>(L.kv_cache_k);
-                        T* cache_v = static_cast<T*>(L.kv_cache_v);
+                        T* cache_k = static_cast<T*>(kv_k_b);
+                        T* cache_v = static_cast<T*>(kv_v_b);
                         for (int h = 0; h < nkv; ++h) {
                             for (int d = tid; d < hd; d += bs) {
                                 const size_t offset =
-                                    static_cast<size_t>(h) * L.kv_max_t * hd +
-                                    static_cast<size_t>(seqlen_offset) * hd + d;
+                                    static_cast<size_t>(h) * kv_max_b * hd +
+                                    static_cast<size_t>(seq_off_b) * hd + d;
                                 cache_k[offset] = dotcache_qwen35_from_float<T>(k_f32[h * hd + d]);
                                 cache_v[offset] = dotcache_qwen35_from_float<T>(v_f32[h * hd + d]);
                             }
@@ -3748,9 +3789,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
 
                 // Save gate values before attention overwrites proj_buf.
-                // Gate is at q_f32[h*hd*2 + hd .. h*hd*2 + 2*hd-1] for each head.
-                // Attention writes to proj_buf[0..nh*hd-1] which overlaps gates.
-                float* saved_gate = attn_scratch;  // [2048] scratch
+                float* saved_gate = attn_scratch + b * attn_scratch_floats;
                 for (int i = tid; i < nh * hd; i += bs) {
                     const int h = i / hd;
                     const int d = i % hd;
@@ -3759,19 +3798,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
 
                 // Step E: Parallel attention — Flash-style online softmax
-                // All 256 threads cooperate per head: parallel Q·K reduction,
-                // each thread accumulates one V dimension with running max/sum.
-                // hd == bs == 256, so thread tid owns dimension tid.
-                float* attn_flat = proj_buf;  // reuse projection buffer [8224] > 2048
+                float* attn_flat = proj_b;  // reuse projection buffer
 
-                const bool use_fp8_kv_attn = (kv_fp8 != nullptr && kv_fp8[layer].kv_scale_k != nullptr);
+                const bool use_fp8_kv_attn = (kv_scale_k_b != nullptr);
 
                 if (use_fp8_kv_attn) {
-                    // FP8 KV cache attention path
-                    const uint8_t* fp8_ck = static_cast<const uint8_t*>(L.kv_cache_k);
-                    const uint8_t* fp8_cv = static_cast<const uint8_t*>(L.kv_cache_v);
-                    const float* scale_k_buf = static_cast<const float*>(kv_fp8[layer].kv_scale_k);
-                    const float* scale_v_buf = static_cast<const float*>(kv_fp8[layer].kv_scale_v);
+                    const uint8_t* fp8_ck = static_cast<const uint8_t*>(kv_k_b);
+                    const uint8_t* fp8_cv = static_cast<const uint8_t*>(kv_v_b);
+                    const float* scale_k_buf = static_cast<const float*>(kv_scale_k_b);
+                    const float* scale_v_buf = static_cast<const float*>(kv_scale_v_b);
 
                     for (int qh = 0; qh < nh; ++qh) {
                         const int kvh = qh / kv_groups;
@@ -3783,15 +3818,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                         const float q_val = q_head[tid];
                         const size_t kv_head_base =
-                            static_cast<size_t>(kvh) * L.kv_max_t * hd;
+                            static_cast<size_t>(kvh) * kv_max_b * hd;
 
-                        for (int t = 0; t < kv_len; ++t) {
+                        for (int t = 0; t < kv_len_b; ++t) {
                             const size_t pos_base = kv_head_base +
                                 static_cast<size_t>(t) * hd;
 
-                            // Dequant FP8 K: fp8_val * scale
-                            float k_scale = scale_k_buf[kvh * L.kv_max_t + t];
-                            float k_val = fp8_e4m3_to_float(fp8_ck[pos_base + tid]) * k_scale;
+                            float k_scale_val = scale_k_buf[kvh * kv_max_b + t];
+                            float k_val = fp8_e4m3_to_float(fp8_ck[pos_base + tid]) * k_scale_val;
                             float partial = q_val * k_val;
                             lds[tid] = partial;
                             __syncthreads();
@@ -3799,16 +3833,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 if (tid < s) lds[tid] += lds[tid + s];
                                 __syncthreads();
                             }
-                            float score = lds[0] * scale;
+                            float score_val = lds[0] * scale;
 
-                            // Dequant FP8 V: fp8_val * scale
-                            float v_scale = scale_v_buf[kvh * L.kv_max_t + t];
-                            float v_val = fp8_e4m3_to_float(fp8_cv[pos_base + tid]) * v_scale;
+                            float v_scale_val = scale_v_buf[kvh * kv_max_b + t];
+                            float v_val = fp8_e4m3_to_float(fp8_cv[pos_base + tid]) * v_scale_val;
 
                             float old_max = my_max;
-                            my_max = fmaxf(my_max, score);
+                            my_max = fmaxf(my_max, score_val);
                             float rescale = expf(old_max - my_max);
-                            float w = expf(score - my_max);
+                            float w = expf(score_val - my_max);
                             my_acc = my_acc * rescale + w * v_val;
                             my_sum = my_sum * rescale + w;
                         }
@@ -3818,9 +3851,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         __syncthreads();
                     }
                 } else {
-                    // BF16 KV cache attention path (original)
-                    const T* ck = static_cast<const T*>(L.kv_cache_k);
-                    const T* cv = static_cast<const T*>(L.kv_cache_v);
+                    const T* ck = static_cast<const T*>(kv_k_b);
+                    const T* cv = static_cast<const T*>(kv_v_b);
 
                     for (int qh = 0; qh < nh; ++qh) {
                         const int kvh = qh / kv_groups;
@@ -3832,9 +3864,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                         const float q_val = q_head[tid];
                         const size_t kv_head_base =
-                            static_cast<size_t>(kvh) * L.kv_max_t * hd;
+                            static_cast<size_t>(kvh) * kv_max_b * hd;
 
-                        for (int t = 0; t < kv_len; ++t) {
+                        for (int t = 0; t < kv_len_b; ++t) {
                             const size_t pos_base = kv_head_base +
                                 static_cast<size_t>(t) * hd;
 
@@ -3846,15 +3878,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 if (tid < s) lds[tid] += lds[tid + s];
                                 __syncthreads();
                             }
-                            float score = lds[0] * scale;
+                            float score_val = lds[0] * scale;
 
                             float v_val =
                                 dotcache_qwen35_to_float(cv[pos_base + tid]);
 
                             float old_max = my_max;
-                            my_max = fmaxf(my_max, score);
+                            my_max = fmaxf(my_max, score_val);
                             float rescale = expf(old_max - my_max);
-                            float w = expf(score - my_max);
+                            float w = expf(score_val - my_max);
                             my_acc = my_acc * rescale + w * v_val;
                             my_sum = my_sum * rescale + w;
                         }
@@ -3865,9 +3897,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                 }
 
-                // Step F: Gate — attn_flat[nh*hd] * sigmoid(gate[nh*hd])
-                // Gate was saved to saved_gate before attention overwrote proj_buf.
-                // Output: gated_output[nh*hd = 2048] stored back in attn_flat
+                // Step F: Gate
                 for (int i = tid; i < nh * hd; i += bs) {
                     float gate_val = saved_gate[i];
                     float sigmoid_gate = 1.0f / (1.0f + expf(-gate_val));
@@ -3875,49 +3905,48 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
                 __syncthreads();
 
-            }
-            // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
-            // Step G: o_proj [hidden_dim, attn_size] × attn_flat → hidden_f32 (fused residual)
-            // ALL blocks work-steal rows; result added directly to hidden_f32
-            {
-                const int attn_size = L.attn_num_heads * L.attn_head_dim;  // 2048
-
-                // Cache attn_flat in LDS for fast o_proj reads
-                for (int c = tid; c < attn_size; c += bs)
-                    lds_input[c] = proj_buf[c];
-                __syncthreads();
-
-                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                } // end if (blockIdx.x == 0)
+                // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
-                for (;;) {
-                    __shared__ unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                // Step G: o_proj [hidden_dim, attn_size] × attn_flat → hidden_f32 (fused residual)
+                // Per-sequence: cache batch b's attn output in LDS, work-steal hidden_dim rows
+                {
+                    for (int c = tid; c < attn_size; c += bs)
+                        lds_input[c] = proj_b[c];  // attn_flat = proj_b after attention
                     __syncthreads();
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    float p = 0.0f;
-                    if (fp8_scales != nullptr && fp8_scales[layer].o_proj_scale != nullptr) {
-                        for (int c = tid; c < attn_size; c += bs)
-                            p += fp8_dequant_weight(L.o_proj_w, fp8_scales[layer].o_proj_scale, sr, c, attn_size, fp8_scales[layer].block_size) * lds_input[c];
-                    } else {
-                        const T* wr = static_cast<const T*>(L.o_proj_w) + static_cast<size_t>(sr) * attn_size;
-                        for (int c = tid; c < attn_size; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs / 2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid + s];
+                    if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                    grid_barrier(barrier_counter, barrier_flag, nb);
+
+                    for (;;) {
+                        __shared__ unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        float p = 0.0f;
+                        if (fp8_scales != nullptr && fp8_scales[layer].o_proj_scale != nullptr) {
+                            for (int c = tid; c < attn_size; c += bs)
+                                p += fp8_dequant_weight(L.o_proj_w, fp8_scales[layer].o_proj_scale, sr, c, attn_size, fp8_scales[layer].block_size) * lds_input[c];
+                        } else {
+                            const T* wr = static_cast<const T*>(L.o_proj_w) + static_cast<size_t>(sr) * attn_size;
+                            for (int c = tid; c < attn_size; c += bs)
+                                p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs / 2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid + s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) hidden_f32[b * hidden_dim + sr] += lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
-                    __syncthreads();
                 }
-            }
-            grid_barrier(barrier_counter, barrier_flag, nb);
+                grid_barrier(barrier_counter, barrier_flag, nb);
+            } // end for (b) batch loop
+            } // end full attention scope
 
         } else {
             // ---- LINEAR ATTENTION ----
@@ -3956,35 +3985,55 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
                     }
 
-                    float p = 0.0f;
+                    // Batched dot product: load weight once, B dot products from LDS
+                    float p[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) p[b] = 0.0f;
                     if (fp8_scales != nullptr && w_scale != nullptr) {
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                        for (int c = tid; c < hidden_dim; c += bs) {
+                            float w = fp8_dequant_weight(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
                     } else {
                         const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        for (int c = tid; c < hidden_dim; c += bs) {
+                            float w = dotcache_qwen35_to_float(wr[c]);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
                     }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
+                    for (int b = 0; b < B; b++) {
+                        lds[tid] = p[b];
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[b * proj_buf_floats + sr] = lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) proj_buf[sr] = lds[0];
-                    __syncthreads();
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step B-E: conv1d, recurrent state, gated norm, out_proj
-            // Block 0 handles sequential recurrent operations.
-            // O_proj uses all blocks via work-stealing.
+            // Block 0 handles sequential recurrent operations (per-sequence loop).
+            // O_proj uses all blocks via work-stealing (per-sequence loop).
+            for (int b = 0; b < B; b++) {
+            // Per-sequence state
+            void* conv_b = batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state;
+            void* rec_b  = batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state;
+            float* proj_b = proj_buf + b * proj_buf_floats;
+
             if (blockIdx.x == 0) {
-                float* qkv_f32 = proj_buf;
-                float* z_f32 = proj_buf + L.qkv_out_dim;
-                float* b_f32 = proj_buf + L.qkv_out_dim + L.z_out_dim;
+                float* qkv_f32 = proj_b;
+                float* z_f32 = proj_b + L.qkv_out_dim;
+                float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
                 float* a_f32 = b_f32 + nv_heads;
+                // Batch-strided scratch aliases
+                float* gate_up_b = gate_up + b * intermediate_size * 2;
+                float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
+                float* mlp_out_b = mlp_out + b * hidden_dim;
 
                 const int conv_dim = L.qkv_out_dim;
                 const int kern = L.conv_kernel_size;
@@ -4001,12 +4050,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 // Conv: for each channel c, output = sum(conv_state[c,t] * weight[c,t]) + qkv[c] * weight[c,kern-1]
                 // Then update conv_state: shift left, append new value
                 {
-                    T* cs = static_cast<T*>(L.conv_state);
+                    T* cs = static_cast<T*>(conv_b);
                     const T* cw = static_cast<const T*>(L.conv1d_w);
                     // cw layout: [conv_dim, 1, kern] — depthwise conv weight
                     // We treat it as [conv_dim, kern]
 
-                    float* conv_out = gate_up;  // reuse MLP scratch for conv output
+                    float* conv_out = gate_up_b;  // reuse MLP scratch for conv output
                     for (int c = tid; c < conv_dim; c += bs) {
                         // Depthwise conv: sum(state[t] * weight[t]) + new_value * weight[kern-1]
                         // Match standard path: convert new value to BF16 for consistency
@@ -4048,14 +4097,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
 
                 // Debug: dump conv_out[0..3] and state[0..3] before normalization
-                if (blockIdx.x == 0 && tid == 0 && layer == 0) {
-                    float* dbg = mlp_out;  // reuse unused workspace for debug
-                    dbg[0] = gate_up[0];     // conv_out Q head0 dim0
-                    dbg[1] = gate_up[1];     // conv_out Q head0 dim1
-                    dbg[2] = gate_up[2048];  // conv_out K head0 dim0
-                    dbg[3] = gate_up[4096];  // conv_out V head0 dim0
-                    dbg[4] = static_cast<float*>(L.recurrent_state)[0]; // state[0,0,0]
-                    dbg[5] = static_cast<float*>(L.recurrent_state)[1]; // state[0,0,1]
+                if (blockIdx.x == 0 && tid == 0 && layer == 0 && b == 0) {
+                    float* dbg = mlp_out_b;  // reuse unused workspace for debug
+                    dbg[0] = gate_up_b[0];     // conv_out Q head0 dim0
+                    dbg[1] = gate_up_b[1];     // conv_out Q head0 dim1
+                    dbg[2] = gate_up_b[2048];  // conv_out K head0 dim0
+                    dbg[3] = gate_up_b[4096];  // conv_out V head0 dim0
+                    dbg[4] = static_cast<float*>(rec_b)[0]; // state[0,0,0]
+                    dbg[5] = static_cast<float*>(rec_b)[1]; // state[0,0,1]
                 }
                 __syncthreads();
 
@@ -4063,7 +4112,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 // Q_norm = Q / ||Q|| * rsqrt(k_head_dim)
                 // K_norm = K / ||K||
                 {
-                    float* conv_out = gate_up;  // reused
+                    float* conv_out = gate_up_b;  // reused
                     // nk already derived above from qkv_out_dim
                     // Q layout: conv_out[k_head * hkd .. (k_head+1) * hkd]
                     // K layout: conv_out[key_dim + k_head * hkd .. key_dim + (k_head+1) * hkd]
@@ -4099,8 +4148,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
                 //           state += outer(key, delta), output = state @ query
                 {
-                    float* conv_out = gate_up;  // reused
-                    float* state = static_cast<float*>(L.recurrent_state);
+                    float* conv_out = gate_up_b;  // reused
+                    float* state = static_cast<float*>(rec_b);
 
                     const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
                     const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
@@ -4158,7 +4207,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                        * conv_out[q_key_offset + h_k * hkd + k];
                             }
 
-                            attn_scratch[h * hvd + v] = out_v;
+                            attn_scratch_b[h * hvd + v] = out_v;
                         }
                         __syncthreads();
                     }
@@ -4167,49 +4216,40 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
 
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
-                // Single-threaded to avoid LDS reduction issues (will parallelize once correct)
                 {
-                    // Norm weight is F32 (not BF16) — matches the standard path's dtype
                     const float* nw = static_cast<const float*>(L.linear_norm_w);
-                    // Per-head RMSNorm: weight is [hvd] shared across all heads
-                    // Two-pass to avoid data race (read RMS → barrier → write normalized)
-                    // Pass 1: compute per-head rms_inv, store in lds[h]
-                    // With nv=16 heads, use threads 0..15 to compute each head's RMS
                     if (tid < nv) {
                         const int h = tid;
-                        const float* ho = attn_scratch + h * hvd;
+                        const float* ho = attn_scratch_b + h * hvd;
                         float sq = 0.0f;
                         for (int j = 0; j < hvd; ++j)
                             sq += ho[j] * ho[j];
                         lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
                     }
                     __syncthreads();
-                    // Pass 2: normalize + weight + gate
                     for (int d = tid; d < val_dim; d += bs) {
                         const int h = d / hvd;
                         const int hd_idx = d % hvd;
                         float rms_inv = lds[h];
-                        float n = attn_scratch[d] * rms_inv;
+                        float n = attn_scratch_b[d] * rms_inv;
                         float w = (nw != nullptr) ? nw[hd_idx] : 1.0f;
                         float zv = z_f32[d];
-                        attn_scratch[d] = n * w * (zv / (1.0f + expf(-zv)));
+                        attn_scratch_b[d] = n * w * (zv / (1.0f + expf(-zv)));
                     }
                     __syncthreads();
                 }
 
-            }
-
-            // Grid barrier: block 0 wrote attn_scratch, all blocks need it for out_proj
+            } // end if (blockIdx.x == 0) for linear attention core
+            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step E: out_proj [hidden_dim, val_dim] × attn_scratch → hidden_f32 (fused residual)
-            // ALL blocks work-steal rows; result added directly to hidden_f32
+            // Per-sequence: cache batch b's output in LDS, work-steal hidden_dim rows
             {
                 const int vd = L.linear_value_dim;  // 2048
 
-                // Cache attn_scratch in LDS for fast out_proj reads
                 for (int c = tid; c < vd; c += bs)
-                    lds_input[c] = attn_scratch[c];
+                    lds_input[c] = attn_scratch[b * attn_scratch_floats + c];
                 __syncthreads();
 
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
@@ -4236,31 +4276,35 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (tid < s) lds[tid] += lds[tid + s];
                         __syncthreads();
                     }
-                    if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
+                    if (tid == 0) hidden_f32[b * hidden_dim + sr] += lds[0];
                     __syncthreads();
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
+            } // end for (b) batch loop for linear attention
 
         }
 
         // Residual add for token mixer is fused into o_proj/out_proj above.
-        // === Post-attention RMSNorm (block 0 only) ===
+        // === Post-attention RMSNorm (block 0 only, B sequences) ===
         if (blockIdx.x == 0) {
-            block_rms_norm_global<T>(normed, hidden_f32,
-                static_cast<const T*>(L.post_attn_norm_w),
-                hidden_dim, L.post_attn_norm_eps, lds);
+            for (int b = 0; b < B; b++) {
+                block_rms_norm_global<T>(normed + b * hidden_dim, hidden_f32 + b * hidden_dim,
+                    static_cast<const T*>(L.post_attn_norm_w),
+                    hidden_dim, L.post_attn_norm_eps, lds);
+            }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
-        // All blocks: cache normed vector in LDS for fast MLP projection reads
-        for (int c = tid; c < hidden_dim; c += bs)
-            lds_input[c] = normed[c];
+        // All blocks: cache B normed vectors in LDS for fast MLP projection reads
+        for (int b = 0; b < B; b++)
+            for (int c = tid; c < hidden_dim; c += bs)
+                lds_input[b * hidden_dim + c] = normed[b * hidden_dim + c];
         __syncthreads();
 
-        // === Fused MLP gate+up+SwiGLU (all blocks work-steal) ===
-        // Each work unit computes gate[i] AND up[i], applies SwiGLU, writes result.
-        // Removes 2 barriers vs. separate gate+up → SwiGLU phases.
+        // === Fused MLP gate+up+SwiGLU (all blocks work-steal, BATCHED) ===
+        // Each work unit computes gate[i] AND up[i] for all B sequences,
+        // applies SwiGLU per-batch, writes results.
         if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4273,95 +4317,121 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
                 if (sr >= static_cast<unsigned int>(L.intermediate_size)) break;
 
-                // gate_proj row (reads normed from LDS)
-                float gp = 0.0f;
+                // Batched gate_proj: load weight once, B dot products from LDS
+                float gp[MAX_BATCH_SIZE];
+                for (int b = 0; b < B; b++) gp[b] = 0.0f;
                 if (gate_fp8) {
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        gp += fp8_dequant_weight(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        float w = fp8_dequant_weight(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size);
+                        for (int b = 0; b < B; b++)
+                            gp[b] += w * lds_input[b * hidden_dim + c];
+                    }
                 } else {
                     const T* gr = static_cast<const T*>(L.gate_proj_w) + static_cast<size_t>(sr) * hidden_dim;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        float w = dotcache_qwen35_to_float(gr[c]);
+                        for (int b = 0; b < B; b++)
+                            gp[b] += w * lds_input[b * hidden_dim + c];
+                    }
                 }
-                lds[tid] = gp;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+                float gate_vals[MAX_BATCH_SIZE];
+                for (int b = 0; b < B; b++) {
+                    lds[tid] = gp[b];
                     __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    gate_vals[b] = lds[0];
                 }
-                float gate_val = lds[0];
 
-                // up_proj row (reads normed from LDS)
-                float up = 0.0f;
+                // Batched up_proj: load weight once, B dot products from LDS
+                float up[MAX_BATCH_SIZE];
+                for (int b = 0; b < B; b++) up[b] = 0.0f;
                 if (up_fp8) {
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        up += fp8_dequant_weight(L.up_proj_w, fp8_scales[layer].up_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size) * lds_input[c];
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        float w = fp8_dequant_weight(L.up_proj_w, fp8_scales[layer].up_proj_scale, sr, c, hidden_dim, fp8_scales[layer].block_size);
+                        for (int b = 0; b < B; b++)
+                            up[b] += w * lds_input[b * hidden_dim + c];
+                    }
                 } else {
                     const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(sr) * hidden_dim;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        float w = dotcache_qwen35_to_float(ur[c]);
+                        for (int b = 0; b < B; b++)
+                            up[b] += w * lds_input[b * hidden_dim + c];
+                    }
                 }
-                lds[tid] = up;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+                float up_vals[MAX_BATCH_SIZE];
+                for (int b = 0; b < B; b++) {
+                    lds[tid] = up[b];
                     __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    up_vals[b] = lds[0];
                 }
-                float up_val = lds[0];
 
-                // SwiGLU: silu(gate) * up
+                // SwiGLU per batch
                 if (tid == 0) {
-                    float silu = gate_val / (1.0f + expf(-gate_val));
-                    gate_up[sr] = silu * up_val;
+                    for (int b = 0; b < B; b++) {
+                        float silu = gate_vals[b] / (1.0f + expf(-gate_vals[b]));
+                        gate_up[b * intermediate_size * 2 + sr] = silu * up_vals[b];
+                    }
                 }
                 __syncthreads();
             }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
-        // === MLP down_proj (all blocks work-steal) ===
-        // Cache SwiGLU output in LDS for fast down_proj reads
-        for (int c = tid; c < L.intermediate_size; c += bs)
-            lds_input[c] = gate_up[c];
-        __syncthreads();
+        // === MLP down_proj (all blocks work-steal, per-sequence) ===
+        // Process one batch item at a time: cache SwiGLU output in LDS, work-steal
+        for (int b = 0; b < B; b++) {
+            for (int c = tid; c < L.intermediate_size; c += bs)
+                lds_input[c] = gate_up[b * intermediate_size * 2 + c];
+            __syncthreads();
 
-        if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-        grid_barrier(barrier_counter, barrier_flag, nb);
+            if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-        {
-            const bool down_fp8 = (fp8_scales != nullptr && fp8_scales[layer].down_proj_scale != nullptr);
-            for (;;) {
-                __shared__ unsigned int sr;
-                if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                __syncthreads();
-                if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+            {
+                const bool down_fp8 = (fp8_scales != nullptr && fp8_scales[layer].down_proj_scale != nullptr);
+                for (;;) {
+                    __shared__ unsigned int sr;
+                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                    __syncthreads();
+                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                float p = 0.0f;
-                if (down_fp8) {
-                    for (int c = tid; c < L.intermediate_size; c += bs)
-                        p += fp8_dequant_weight(L.down_proj_w, fp8_scales[layer].down_proj_scale, sr, c, L.intermediate_size, fp8_scales[layer].block_size) * lds_input[c];
-                } else {
-                    const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(sr) * L.intermediate_size;
-                    for (int c = tid; c < L.intermediate_size; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                }
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+                    float p = 0.0f;
+                    if (down_fp8) {
+                        for (int c = tid; c < L.intermediate_size; c += bs)
+                            p += fp8_dequant_weight(L.down_proj_w, fp8_scales[layer].down_proj_scale, sr, c, L.intermediate_size, fp8_scales[layer].block_size) * lds_input[c];
+                    } else {
+                        const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(sr) * L.intermediate_size;
+                        for (int c = tid; c < L.intermediate_size; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    }
+                    lds[tid] = p;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    if (tid == 0) hidden_f32[b * hidden_dim + sr] += lds[0];
                     __syncthreads();
                 }
-                if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
-                __syncthreads();
             }
-        }
-        grid_barrier(barrier_counter, barrier_flag, nb);
+            grid_barrier(barrier_counter, barrier_flag, nb);
+        } // end for (b) down_proj batch loop
 
         // Residual add for MLP is fused into down_proj above.
     }
 
-    // Write back F32 → BF16
-    for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-        hidden_io[c] = dotcache_qwen35_from_float<T>(hidden_f32[c]);
+    // Write back F32 → BF16 for all batch items
+    for (int b = 0; b < B; b++) {
+        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+            hidden_io[b * hidden_dim + c] = dotcache_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
+        }
     }
 }

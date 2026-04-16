@@ -81,6 +81,12 @@ struct Cli {
     /// component kernels, comparing logits. No external oracle needed.
     #[arg(long)]
     gpu_validate: bool,
+
+    /// Batch size for decode (number of sequences decoded in parallel).
+    /// Default 1. B=2 amortizes weight loading for ~1.8x throughput.
+    /// Requires 4B kernel (2B/4B/9B models).
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
 }
 
 fn main() -> Result<()> {
@@ -242,6 +248,14 @@ fn main() -> Result<()> {
     }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
+    // Validate batch_size
+    if cli.batch_size > 1 && !params.use_4b_kernel {
+        anyhow::bail!("--batch-size > 1 requires 4B kernel (2B/4B/9B models)");
+    }
+    if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
+        anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
+    }
+
     // Create decode engine
     let mut engine = DecodeEngine::new(
         weights,
@@ -252,6 +266,7 @@ fn main() -> Result<()> {
         params.use_4b_kernel,
         cli.prefill_chunk_size,
         cli.kv_fp8,
+        cli.batch_size,
     )?;
 
     // When using FP8 runtime weights, tell the oracle to use the same FP8 weights
@@ -329,11 +344,20 @@ fn main() -> Result<()> {
         None
     };
 
+    // Replicate prefill state to batch items if batch_size > 1
+    if cli.batch_size > 1 {
+        eprintln!("[batch] replicating prefill state to {} sequences", cli.batch_size);
+        engine.replicate_state_to_batch()?;
+    }
+
     // GPU oracle: clone model state for independent component-kernel decode
-    let mut gpu_oracle_state = if cli.gpu_validate {
+    let mut gpu_oracle_state = if cli.gpu_validate && cli.batch_size == 1 {
         eprintln!("[gpu-validate] cloning model state for GPU oracle...");
         Some(engine.clone_state()?)
     } else {
+        if cli.gpu_validate && cli.batch_size > 1 {
+            eprintln!("[gpu-validate] GPU oracle disabled for batch_size > 1");
+        }
         None
     };
 
@@ -344,49 +368,76 @@ fn main() -> Result<()> {
     let mut gpu_max_delta = 0.0f32;
     let eos_ids = text_config.eos_token_ids();
 
+    // For batched decode, track per-sequence tokens
+    let mut batch_next_tokens: Vec<u32> = vec![next_token; cli.batch_size];
+
     let decode_start = Instant::now();
     for step in 0..cli.max_new_tokens {
-        // Stop on EOS token
+        // Stop on EOS token (sequence 0 drives the output)
         if eos_ids.contains(&next_token) {
             break;
         }
 
         let seqlen_offset = seqlen_start + step;
-        let logits = engine.decode_step(next_token, seqlen_offset)?;
 
-        // Validate against external oracle if available
-        if let Some(ref oracle) = oracle_output {
-            if step < oracle.decode_logits.len() {
-                let oracle_logits = &oracle.decode_logits[step];
-                let delta = validate::max_abs_delta(&logits, oracle_logits);
-                if delta > max_delta {
-                    max_delta = delta;
+        if cli.batch_size > 1 {
+            // Batched decode
+            let batch_logits = engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?;
+
+            // Use sequence 0's logits for output and validation
+            let logits = &batch_logits[0];
+
+            if let Some(ref oracle) = oracle_output {
+                if step < oracle.decode_logits.len() {
+                    let oracle_logits = &oracle.decode_logits[step];
+                    let delta = validate::max_abs_delta(logits, oracle_logits);
+                    if delta > max_delta { max_delta = delta; }
+                    eprintln!(
+                        "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} batch_size={}",
+                        cli.batch_size
+                    );
                 }
+            }
+
+            // Sample next tokens for all sequences
+            for (bi, seq_logits) in batch_logits.iter().enumerate() {
+                batch_next_tokens[bi] = DecodeEngine::greedy_sample(seq_logits);
+            }
+
+            generated_ids.push(next_token);
+            next_token = batch_next_tokens[0];
+        } else {
+            // Single-sequence decode (original path)
+            let logits = engine.decode_step(next_token, seqlen_offset)?;
+
+            if let Some(ref oracle) = oracle_output {
+                if step < oracle.decode_logits.len() {
+                    let oracle_logits = &oracle.decode_logits[step];
+                    let delta = validate::max_abs_delta(&logits, oracle_logits);
+                    if delta > max_delta { max_delta = delta; }
+                    eprintln!(
+                        "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
+                    );
+                }
+            }
+
+            if let Some(ref mut oracle_state) = gpu_oracle_state {
+                let gpu_logits = engine.decode_step_on_state(
+                    oracle_state, next_token, seqlen_offset,
+                )?;
+                let delta = validate::max_abs_delta(&logits, &gpu_logits);
+                let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
+                let token_match = if gpu_token == DecodeEngine::greedy_sample(&logits) { "" } else { " MISMATCH" };
+                if delta > gpu_max_delta { gpu_max_delta = delta; }
                 eprintln!(
-                    "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
+                    "[gpu-validate] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} gpu_token={gpu_token}{token_match}"
                 );
             }
-        }
 
-        // Validate: run megakernel on cloned state for self-consistency
-        if let Some(ref mut oracle_state) = gpu_oracle_state {
-            let gpu_logits = engine.decode_step_on_state(
-                oracle_state, next_token, seqlen_offset,
-            )?;
-            let delta = validate::max_abs_delta(&logits, &gpu_logits);
-            let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
-            let token_match = if gpu_token == DecodeEngine::greedy_sample(&logits) { "" } else { " MISMATCH" };
-            if delta > gpu_max_delta {
-                gpu_max_delta = delta;
-            }
-            eprintln!(
-                "[gpu-validate] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} gpu_token={gpu_token}{token_match}"
-            );
+            let sampled = DecodeEngine::greedy_sample(&logits);
+            generated_ids.push(next_token);
+            next_token = sampled;
         }
-
-        let sampled = DecodeEngine::greedy_sample(&logits);
-        generated_ids.push(next_token);
-        next_token = sampled;
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -402,10 +453,11 @@ fn main() -> Result<()> {
 
     println!("{text}");
     eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4} gpu_oracle_max_delta={gpu_max_delta:.4}",
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4} gpu_oracle_max_delta={gpu_max_delta:.4} batch_size={}",
         prompt_ids.len(),
         generated_ids.len(),
-        decode_ms / generated_ids.len() as f64,
+        if generated_ids.is_empty() { 0.0 } else { decode_ms / generated_ids.len() as f64 },
+        cli.batch_size,
     );
 
     Ok(())

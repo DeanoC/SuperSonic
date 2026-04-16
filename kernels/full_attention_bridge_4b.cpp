@@ -4512,7 +4512,9 @@ int persistent_decode_device(
     int proj_buf_floats,
     int attn_scratch_floats,
     const void* fp8_scales,
-    const void* kv_fp8_descs
+    const void* kv_fp8_descs,
+    int batch_size,
+    const void* batch_descs
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4521,7 +4523,11 @@ int persistent_decode_device(
 
     const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
-    const size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
+    // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
+    const size_t input_cache = static_cast<size_t>(hidden_dim) * batch_size > static_cast<size_t>(intermediate_size)
+        ? static_cast<size_t>(hidden_dim) * batch_size
+        : static_cast<size_t>(intermediate_size);
+    const size_t shared_bytes = (block_size + input_cache) * sizeof(float);
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
@@ -4545,7 +4551,9 @@ int persistent_decode_device(
         proj_buf_floats,
         attn_scratch_floats,
         static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
-        static_cast<const KVCacheFp8Desc*>(kv_fp8_descs));
+        static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+        batch_size,
+        static_cast<const BatchSeqDesc*>(batch_descs));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4572,7 +4580,9 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     size_t proj_buf_floats,
     size_t attn_scratch_floats,
     const void* fp8_scales,
-    const void* kv_fp8_descs) {
+    const void* kv_fp8_descs,
+    size_t batch_size,
+    const void* batch_descs) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4587,7 +4597,9 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             static_cast<int>(proj_buf_floats),
             static_cast<int>(attn_scratch_floats),
             fp8_scales,
-            kv_fp8_descs);
+            kv_fp8_descs,
+            static_cast<int>(batch_size),
+            batch_descs);
     default:
         return 256;
     }

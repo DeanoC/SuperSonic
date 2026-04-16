@@ -1,4 +1,4 @@
-use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, KVCacheFp8Desc};
+use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, KVCacheFp8Desc, BatchSeqDesc, MAX_BATCH_SIZE};
 
 use crate::state::ModelState;
 use crate::weights::{Qwen35Weights, LayerKind};
@@ -130,6 +130,65 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
             }
         }
 
+        descs.push(d);
+    }
+    Some(descs)
+}
+
+/// Build batch sequence descriptors for batched decode.
+/// One BatchSeqDesc per layer, containing per-sequence state pointers for all batch items.
+/// `states`: slice of ModelStates (one per batch item).
+/// `seqlen_offsets`: per-sequence position offsets.
+/// Returns None if batch_size <= 1.
+pub fn build_batch_seq_descs(
+    states: &[&ModelState],
+    seqlen_offsets: &[usize],
+    kv_fp8: bool,
+) -> Option<Vec<BatchSeqDesc>> {
+    let batch_size = states.len();
+    if batch_size <= 1 {
+        return None;
+    }
+    assert!(batch_size <= MAX_BATCH_SIZE, "batch_size {} exceeds MAX_BATCH_SIZE {}", batch_size, MAX_BATCH_SIZE);
+    assert_eq!(states.len(), seqlen_offsets.len());
+
+    let num_layers = states[0].layers.len();
+    let mut descs = Vec::with_capacity(num_layers);
+
+    for layer_idx in 0..num_layers {
+        let mut d = BatchSeqDesc::default();
+        for b in 0..batch_size {
+            d.seqlen_offset[b] = seqlen_offsets[b] as i32;
+            let ls = &states[b].layers[layer_idx];
+            match ls.kind {
+                LayerKind::Full => {
+                    if let Some(ref k) = ls.kv_cache_k {
+                        d.kv_cache_k[b] = k.as_ptr() as *mut _;
+                        d.kv_max_t[b] = k.shape()[2] as i32;
+                    }
+                    if let Some(ref v) = ls.kv_cache_v {
+                        d.kv_cache_v[b] = v.as_ptr() as *mut _;
+                    }
+                    d.kv_len[b] = seqlen_offsets[b] as i32;
+                    if kv_fp8 {
+                        if let Some(ref sk) = ls.kv_scale_k {
+                            d.kv_scale_k[b] = sk.as_ptr() as *mut _;
+                        }
+                        if let Some(ref sv) = ls.kv_scale_v {
+                            d.kv_scale_v[b] = sv.as_ptr() as *mut _;
+                        }
+                    }
+                }
+                LayerKind::Linear => {
+                    if let Some(ref cs) = ls.conv_state {
+                        d.conv_state[b] = cs.as_ptr() as *mut _;
+                    }
+                    if let Some(ref rs) = ls.recurrent_state {
+                        d.recurrent_state[b] = rs.as_ptr() as *mut _;
+                    }
+                }
+            }
+        }
         descs.push(d);
     }
     Some(descs)
