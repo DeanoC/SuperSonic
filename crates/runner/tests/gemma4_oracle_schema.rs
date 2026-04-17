@@ -34,6 +34,8 @@ fn gemma4_oracle_json_deserializes_into_oracle_output() {
     assert!(parsed.kv_caches.is_none());
     assert!(parsed.conv_states.is_none());
     assert!(parsed.recurrent_states.is_none());
+    assert!(parsed.prefill_per_layer_hidden.is_none());
+    assert!(parsed.prefill_per_layer_hidden_shape.is_none());
 }
 
 #[test]
@@ -77,4 +79,17 @@ fn gemma4_oracle_state_json_deserializes_and_layout_matches_e2b() {
     // Gemma 4 has no linear attention — conv/recurrent must remain absent.
     assert!(parsed.conv_states.is_none());
     assert!(parsed.recurrent_states.is_none());
+
+    // Per-layer post-block hidden states: one per transformer layer.
+    // E2B has 35 layers; shape per entry is [1, 1, hidden_dim=1536].
+    let per_layer = parsed
+        .prefill_per_layer_hidden
+        .as_ref()
+        .expect("prefill_per_layer_hidden missing from state dump");
+    assert_eq!(per_layer.len(), 35, "E2B has 35 transformer layers");
+    let per_layer_shape = parsed
+        .prefill_per_layer_hidden_shape
+        .as_ref()
+        .expect("prefill_per_layer_hidden_shape missing");
+    assert_eq!(per_layer_shape, &vec![1, 1, 1536]);
 }

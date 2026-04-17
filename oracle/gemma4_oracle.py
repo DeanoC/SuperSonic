@@ -22,6 +22,12 @@ With --emit-state, additionally:
   prefill_hidden                       (base64 BF16, shape [1, 1, hidden])
   prefill_hidden_shape                 (Vec<usize>)
   kv_caches                            (Vec<KvCacheDump>, 15 entries for E2B)
+  prefill_per_layer_hidden             (Vec<base64 BF16>, 35 entries for E2B — post-
+                                        decoder-block hidden state at last prompt
+                                        token, one per layer. Drives Rust layer-by-
+                                        layer kernel validation.)
+  prefill_per_layer_hidden_shape       (Vec<usize>, shape of each entry — always
+                                        [1, 1, hidden])
 
 Usage:
     python3 gemma4_oracle.py \
@@ -104,6 +110,27 @@ def main() -> None:
         last_hidden = inner.last_hidden_state[:, -1:, :]  # [1, 1, hidden]
         state_payload["prefill_hidden"] = tensor_to_b64(last_hidden.to(torch_dtype))
         state_payload["prefill_hidden_shape"] = list(last_hidden.shape)
+
+        # HuggingFace returns `hidden_states` as a tuple of length num_layers+1:
+        # index 0 is the input embedding (pre-layer-0), indices 1..=N are the
+        # post-decoder-block outputs for layers 0..N-1. We want per-layer POST-block
+        # outputs, so skip index 0 and take the last token of each remaining entry.
+        # Each slice has shape [1, seq_len, hidden] — we save [1, 1, hidden] at
+        # position -1 so Rust can compare against its own single-token kernel
+        # output. Note: these are pre-final-norm; `prefill_hidden` above is
+        # post-final-norm and comes from the same forward pass.
+        hidden_tuple = inner.hidden_states
+        if hidden_tuple is None:
+            raise RuntimeError("output_hidden_states=True did not populate hidden_states")
+        per_layer: list[str] = []
+        per_layer_shape: list[int] = []
+        for layer_h in hidden_tuple[1:]:
+            last = layer_h[:, -1:, :].to(torch_dtype)
+            per_layer.append(tensor_to_b64(last))
+            if not per_layer_shape:
+                per_layer_shape = list(last.shape)
+        state_payload["prefill_per_layer_hidden"] = per_layer
+        state_payload["prefill_per_layer_hidden_shape"] = per_layer_shape
 
         # 15 cache entries for E2B (35 layers - 20 shared). SWA layers store
         # k/v at head_dim=256, full layers at head_dim=512. We preserve HF's

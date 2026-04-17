@@ -324,5 +324,47 @@
         512
       ]
     }
+  ],
+  "prefill_per_layer_hidden": [
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA=",
+    "AAA="
+  ],
+  "prefill_per_layer_hidden_shape": [
+    1,
+    1,
+    1536
   ]
 }

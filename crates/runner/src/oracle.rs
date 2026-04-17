@@ -20,6 +20,12 @@ pub struct OracleOutput {
     pub kv_caches: Option<Vec<KvCacheDump>>,
     pub conv_states: Option<Vec<StateDump>>,
     pub recurrent_states: Option<Vec<StateDump>>,
+    /// Per-layer post-decoder-block hidden state at the last prompt token.
+    /// Each entry is base64-encoded BF16 with shape `prefill_per_layer_hidden_shape`
+    /// (typically `[1, 1, hidden]`). Used to validate a single Gemma 4 layer's
+    /// kernel output against PyTorch.
+    pub prefill_per_layer_hidden: Option<Vec<String>>,
+    pub prefill_per_layer_hidden_shape: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Deserialize)]
