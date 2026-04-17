@@ -1,9 +1,38 @@
 mod decode_engine;
 mod gemma4_engine;
+mod gemma4_int4_engine;
 mod oracle;
 mod prefill_engine;
 mod registry;
 mod validate;
+
+/// Dispatcher over Gemma 4 runtime engines. BF16 runs through the persistent
+/// megakernel; INT4 runs through the primitive chain backed by the GPTQ bake.
+enum Gemma4Runtime {
+    Bf16(gemma4_engine::Gemma4Engine),
+    Int4(gemma4_int4_engine::Gemma4Int4Engine),
+}
+
+impl Gemma4Runtime {
+    fn prefill(&mut self, prompt_token_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.prefill(prompt_token_ids),
+            Self::Int4(e) => e.prefill(prompt_token_ids),
+        }
+    }
+
+    fn decode_step(&mut self, token: u32, pos: usize) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.decode_step(token, pos),
+            Self::Int4(e) => e.decode_step(token, pos),
+        }
+    }
+
+    fn greedy_sample(logits: &[f32]) -> u32 {
+        // Sampling is engine-independent; delegate to the BF16 engine's impl.
+        gemma4_engine::Gemma4Engine::greedy_sample(logits)
+    }
+}
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -554,10 +583,9 @@ fn run_gemma4(
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
-    if cli.int4 || cli.fp8_runtime || cli.kv_fp8 {
+    if cli.fp8_runtime || cli.kv_fp8 {
         anyhow::bail!(
-            "Gemma 4 does not yet support --int4 / --fp8-runtime / --kv-fp8 \
-             (only BF16 weights + BF16 KV cache supported today)"
+            "Gemma 4 does not yet support --fp8-runtime / --kv-fp8"
         );
     }
     if cli.batch_size != 1 {
@@ -573,9 +601,9 @@ fn run_gemma4(
             "Gemma 4 does not yet support --prefill-chunk-size (single-shot prefill only)"
         );
     }
-    if cli.no_bake {
+    if cli.no_bake && !cli.int4 {
         eprintln!(
-            "[gemma4] note: --no-bake is implied (Gemma 4 has no bake format yet). \
+            "[gemma4] note: --no-bake is implied for BF16 (Gemma 4 has no BF16 bake format). \
              Loading directly from safetensors."
         );
     }
@@ -661,14 +689,34 @@ fn run_gemma4(
         );
     }
 
-    // Load weights + build engine.
+    // Load weights + build engine. INT4 uses a different loader path (reads
+    // the GPTQ bake under .supersonic/v1-int4-gptq/) and runs the primitive
+    // chain for decode instead of the persistent megakernel.
     let t0 = Instant::now();
-    let mut engine = gemma4_engine::Gemma4Engine::load(
-        &cli.model_dir,
-        params.weight_prefix,
-        context_tokens,
-        ordinal,
-    )?;
+    let mut engine: Gemma4Runtime = if cli.int4 {
+        if !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
+            anyhow::bail!(
+                "No INT4 bake at {}. Run first:\n  \
+                 python oracle/bake_int4_gemma4.py --model-dir {}",
+                gemma4_int4_engine::int4_bake_dir(&cli.model_dir).display(),
+                cli.model_dir.display()
+            );
+        }
+        eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
+        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load(
+            &cli.model_dir,
+            params.weight_prefix,
+            context_tokens,
+            ordinal,
+        )?)
+    } else {
+        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load(
+            &cli.model_dir,
+            params.weight_prefix,
+            context_tokens,
+            ordinal,
+        )?)
+    };
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     // Optional oracle (runs BEFORE prefill so we can compare every step).
@@ -705,7 +753,7 @@ fn run_gemma4(
     // Native prefill.
     let prefill_start = Instant::now();
     let prefill_logits = engine.prefill(&prompt_ids)?;
-    let mut next_token = gemma4_engine::Gemma4Engine::greedy_sample(&prefill_logits);
+    let mut next_token = Gemma4Runtime::greedy_sample(&prefill_logits);
     eprintln!(
         "[prefill] native GPU prefill done in {:.0}ms",
         prefill_start.elapsed().as_millis()

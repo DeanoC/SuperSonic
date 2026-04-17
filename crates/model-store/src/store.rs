@@ -61,6 +61,23 @@ impl BakedStore {
         self.index.get(name).map(|m| m.shape.as_slice())
     }
 
+    /// Return the raw mmap-backed bytes of a tensor. Useful for tensors that
+    /// are too large to upload to GPU in full (e.g. Gemma 4's
+    /// `embed_tokens_per_layer`, which is row-accessed per-token). The slice
+    /// lives as long as the `BakedStore`'s mmap.
+    pub fn raw_bytes(&self, name: &str) -> Option<&[u8]> {
+        let meta = self.index.get(name)?;
+        let start = meta.offset as usize;
+        let end = start + meta.byte_len as usize;
+        if end > self.data_len {
+            return None;
+        }
+        let slice = unsafe {
+            std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize)
+        };
+        Some(slice)
+    }
+
     /// Load a tensor from the baked store directly to GPU memory.
     /// One memcpy (H2D), zero parsing or transformation.
     pub fn load_to_gpu(&self, name: &str, ordinal: usize) -> Result<GpuBuffer, Error> {
