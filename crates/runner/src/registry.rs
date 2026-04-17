@@ -1,5 +1,22 @@
 use std::fmt;
 
+/// Family of architectures handled by the same code path.
+/// Used to dispatch between per-family config parsers, weight loaders, and kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelFamily {
+    Qwen35,
+    Gemma4,
+}
+
+impl fmt::Display for ModelFamily {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Qwen35 => write!(f, "qwen3.5"),
+            Self::Gemma4 => write!(f, "gemma4"),
+        }
+    }
+}
+
 /// Identifies a specific model variant with a known optimized megakernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVariant {
@@ -7,6 +24,8 @@ pub enum ModelVariant {
     Qwen3_5_2B,
     Qwen3_5_4B,
     Qwen3_5_9B,
+    Gemma4_E2B,
+    Gemma4_E4B,
 }
 
 impl ModelVariant {
@@ -17,6 +36,8 @@ impl ModelVariant {
             "qwen3.5-2b" | "qwen35-2b" | "2b" => Some(Self::Qwen3_5_2B),
             "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
             "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
+            "gemma4-e2b" | "gemma-4-e2b" | "e2b" => Some(Self::Gemma4_E2B),
+            "gemma4-e4b" | "gemma-4-e4b" | "e4b" => Some(Self::Gemma4_E4B),
             _ => None,
         }
     }
@@ -28,6 +49,18 @@ impl ModelVariant {
             Self::Qwen3_5_2B => "Qwen/Qwen3.5-2B",
             Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
             Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
+            Self::Gemma4_E2B => "google/gemma-4-E2B",
+            Self::Gemma4_E4B => "google/gemma-4-E4B",
+        }
+    }
+
+    /// Which family this variant belongs to.
+    pub fn family(&self) -> ModelFamily {
+        match self {
+            Self::Qwen3_5_0_8B | Self::Qwen3_5_2B | Self::Qwen3_5_4B | Self::Qwen3_5_9B => {
+                ModelFamily::Qwen35
+            }
+            Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
         }
     }
 }
@@ -39,6 +72,8 @@ impl fmt::Display for ModelVariant {
             Self::Qwen3_5_2B => write!(f, "qwen3.5-2b"),
             Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
             Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
+            Self::Gemma4_E2B => write!(f, "gemma4-e2b"),
+            Self::Gemma4_E4B => write!(f, "gemma4-e4b"),
         }
     }
 }
@@ -83,8 +118,8 @@ impl fmt::Display for GpuArch {
     }
 }
 
-/// Kernel-specific parameters tied to a (model, backend, arch) combination.
-pub struct KernelParams {
+/// Kernel-specific parameters for Qwen3.5-family variants.
+pub struct Qwen35KernelParams {
     /// Max projection output buffer size in floats (kernel: proj_buf).
     pub proj_buf_floats: usize,
     /// Attention/recurrent scratch buffer size in floats (kernel: attn_scratch).
@@ -93,6 +128,21 @@ pub struct KernelParams {
     pub kv_chunk_size: usize,
     /// Use the 4B kernel variant (separate compilation for hipcc compatibility).
     pub use_4b_kernel: bool,
+}
+
+/// Kernel-specific parameters for Gemma 4 dense variants (E2B, E4B).
+/// Fields will grow as the kernel design stabilizes; for scaffolding we carry
+/// only what the weight loader and (future) bake path will need.
+pub struct Gemma4KernelParams {
+    pub weight_prefix: &'static str,
+    pub kv_chunk_size: usize,
+}
+
+/// Per-family parameter bundle. Code paths downstream match on the variant
+/// and extract only the parameters relevant to their family.
+pub enum FamilyParams {
+    Qwen35(Qwen35KernelParams),
+    Gemma4(Gemma4KernelParams),
 }
 
 /// VRAM budget for a specific (model, backend, arch) combination.
@@ -120,7 +170,7 @@ pub struct RegistryEntry {
     pub backend: Backend,
     pub arch: GpuArch,
     pub vram: VramBudget,
-    pub params: KernelParams,
+    pub params: FamilyParams,
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -135,13 +185,13 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 2 * GIB,
             overhead_factor: 1.1,
         },
-        params: KernelParams {
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 8224,
             attn_scratch_floats: 2048,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
-        },
+        }),
     },
     RegistryEntry {
         model: ModelVariant::Qwen3_5_2B,
@@ -152,13 +202,13 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 5 * GIB,
             overhead_factor: 1.1,
         },
-        params: KernelParams {
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 8224,
             attn_scratch_floats: 2048,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-        },
+        }),
     },
     RegistryEntry {
         model: ModelVariant::Qwen3_5_4B,
@@ -169,13 +219,13 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 10 * GIB,
             overhead_factor: 1.1,
         },
-        params: KernelParams {
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 12352,
             attn_scratch_floats: 4096,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-        },
+        }),
     },
     RegistryEntry {
         model: ModelVariant::Qwen3_5_9B,
@@ -187,13 +237,49 @@ static REGISTRY: &[RegistryEntry] = &[
             fixed_bytes: 18 * GIB,
             overhead_factor: 1.1,
         },
-        params: KernelParams {
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 12352,
             attn_scratch_floats: 4096,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+        }),
+    },
+    // --- Gemma 4 ---
+    // Scaffolding-only: kernel not yet implemented. Registry entry exists so
+    // the CLI can parse the variant, config loading can be exercised, and
+    // VRAM bookkeeping has a place to live when the kernel lands.
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            // ~10 GiB weights (BF16, includes ~4.7 GiB PLE pathway) + scratch + activations
+            fixed_bytes: 11 * GIB,
+            overhead_factor: 1.1,
         },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            // Safetensors are ~16 GiB, but the ~5.6 GiB `embed_tokens_per_layer`
+            // table is mmap-sliced per token and never uploaded to GPU. Actual
+            // uploaded BF16 weights: ~9.2 GiB (per-layer ~7.8 GiB + tied embed
+            // 1.3 GiB + projection/norms ~0.06 GiB). Adding scratch + activations
+            // lands around 10 GiB fixed; KV cache + overhead_factor handle the rest.
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
     },
 ];
 
@@ -218,6 +304,8 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_2B => "qwen3.5-2b",
             ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
+            ModelVariant::Gemma4_E2B => "gemma4-e2b",
+            ModelVariant::Gemma4_E4B => "gemma4-e4b",
         })
         .collect();
     models.dedup();

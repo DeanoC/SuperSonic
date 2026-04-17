@@ -1,8 +1,38 @@
 mod decode_engine;
+mod gemma4_engine;
+mod gemma4_int4_engine;
 mod oracle;
 mod prefill_engine;
 mod registry;
 mod validate;
+
+/// Dispatcher over Gemma 4 runtime engines. BF16 runs through the persistent
+/// megakernel; INT4 runs through the primitive chain backed by the GPTQ bake.
+enum Gemma4Runtime {
+    Bf16(gemma4_engine::Gemma4Engine),
+    Int4(gemma4_int4_engine::Gemma4Int4Engine),
+}
+
+impl Gemma4Runtime {
+    fn prefill(&mut self, prompt_token_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.prefill(prompt_token_ids),
+            Self::Int4(e) => e.prefill(prompt_token_ids),
+        }
+    }
+
+    fn decode_step(&mut self, token: u32, pos: usize) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.decode_step(token, pos),
+            Self::Int4(e) => e.decode_step(token, pos),
+        }
+    }
+
+    fn greedy_sample(logits: &[f32]) -> u32 {
+        // Sampling is engine-independent; delegate to the BF16 engine's impl.
+        gemma4_engine::Gemma4Engine::greedy_sample(logits)
+    }
+}
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -11,7 +41,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use decode_engine::DecodeEngine;
-use registry::{Backend, GpuArch, ModelVariant};
+use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
@@ -158,7 +188,16 @@ fn main() -> Result<()> {
         }
     };
 
-    let params = &entry.params;
+    // Dispatch on family. Gemma 4 has its own load/prefill/decode pipeline via
+    // the persistent megakernel; return early before the Qwen-shaped path.
+    if model_variant.family() == ModelFamily::Gemma4 {
+        return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
+    }
+
+    let params = match &entry.params {
+        FamilyParams::Qwen35(p) => p,
+        FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+    };
 
     // Load config
     let config = qwen35::config::load_config(&cli.model_dir)
@@ -526,5 +565,302 @@ fn main() -> Result<()> {
         cli.batch_size,
     );
 
+    Ok(())
+}
+
+/// Gemma 4 end-to-end decode: tokenize → native prefill → megakernel decode
+/// → detokenize. Rejects unsupported flags (INT4, FP8, KV-FP8, batch>1) with
+/// clear errors — the Qwen-family flags do not plumb through yet.
+fn run_gemma4(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    entry: &registry::RegistryEntry,
+    ordinal: usize,
+    total_vram: u64,
+) -> Result<()> {
+    let params = match &entry.params {
+        FamilyParams::Gemma4(p) => p,
+        FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+    };
+
+    if cli.fp8_runtime || cli.kv_fp8 {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --fp8-runtime / --kv-fp8"
+        );
+    }
+    if cli.batch_size != 1 {
+        anyhow::bail!("Gemma 4 does not yet support --batch-size > 1");
+    }
+    if cli.oracle_prefill || cli.gpu_validate {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --oracle-prefill / --gpu-validate"
+        );
+    }
+    if cli.prefill_chunk_size != 0 {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --prefill-chunk-size (single-shot prefill only)"
+        );
+    }
+    if cli.no_bake && !cli.int4 {
+        eprintln!(
+            "[gemma4] note: --no-bake is implied for BF16 (Gemma 4 has no BF16 bake format). \
+             Loading directly from safetensors."
+        );
+    }
+
+    // Load config for a config summary + VRAM / context bookkeeping.
+    let cfg = gemma4::config::load_config(&cli.model_dir)
+        .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
+    let t = &cfg.text_config;
+    eprintln!(
+        "[gemma4] variant={model_variant} weight_prefix={} kv_chunk={}",
+        params.weight_prefix, params.kv_chunk_size
+    );
+    eprintln!(
+        "[gemma4] hidden={} layers={} vocab={} heads={}/{} head_dim={}/{} window={} kv_shared_layers={} softcap={:?} ple_dim={} tied_lm_head={}",
+        t.hidden_size,
+        t.num_hidden_layers,
+        t.vocab_size,
+        t.num_attention_heads,
+        t.num_key_value_heads,
+        t.head_dim,
+        t.global_head_dim,
+        t.sliding_window,
+        t.num_kv_shared_layers,
+        t.final_logit_softcapping,
+        t.hidden_size_per_layer_input,
+        cfg.tie_word_embeddings || t.tie_word_embeddings,
+    );
+
+    // Tokenize
+    let tokenizer_path = cli.model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
+    if prompt_ids.is_empty() {
+        anyhow::bail!("empty prompt after tokenization");
+    }
+
+    let context_tokens = cli
+        .context_size
+        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
+    if context_tokens < prompt_ids.len() + cli.max_new_tokens {
+        anyhow::bail!(
+            "--context-size {context_tokens} < prompt_tokens {} + max_new_tokens {}",
+            prompt_ids.len(),
+            cli.max_new_tokens,
+        );
+    }
+
+    // VRAM estimate — Gemma 4 BF16 KV cache: owning layers only (shared layers
+    // alias the source), each layer's slot is `num_kv_heads * head_dim * 2`
+    // elements (×2 for K + V tensors). Multiply by the BF16 byte size to get
+    // actual bytes.
+    const BF16_BYTES: u64 = 2;
+    let mut kv_per_token: u64 = 0;
+    for l in 0..t.num_hidden_layers {
+        if t.kv_source_layer(l).is_none() {
+            let kind = t
+                .attn_kind(l)
+                .ok_or_else(|| anyhow::anyhow!("layer {l}: no attention kind"))?;
+            let hd = t.head_dim_for(kind);
+            kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
+        }
+    }
+    let kv_bytes = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    let estimated_vram =
+        ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        gib(estimated_vram),
+        gib(entry.vram.fixed_bytes),
+        gib(kv_bytes),
+        context_tokens,
+        gib(total_vram),
+    );
+    if estimated_vram > total_vram {
+        anyhow::bail!(
+            "Insufficient VRAM for {context_tokens}-token context: need ~{:.2}GiB, \
+             GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
+            gib(estimated_vram),
+            gib(total_vram),
+        );
+    }
+
+    // Load weights + build engine. INT4 uses a different loader path (reads
+    // the GPTQ bake under .supersonic/v1-int4-gptq/) and runs the primitive
+    // chain for decode instead of the persistent megakernel.
+    let t0 = Instant::now();
+    let mut engine: Gemma4Runtime = if cli.int4 {
+        if !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
+            anyhow::bail!(
+                "No INT4 bake at {}. Run first:\n  \
+                 python oracle/bake_int4_gemma4.py --model-dir {}",
+                gemma4_int4_engine::int4_bake_dir(&cli.model_dir).display(),
+                cli.model_dir.display()
+            );
+        }
+        eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
+        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load(
+            &cli.model_dir,
+            params.weight_prefix,
+            context_tokens,
+            ordinal,
+        )?)
+    } else {
+        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load(
+            &cli.model_dir,
+            params.weight_prefix,
+            context_tokens,
+            ordinal,
+        )?)
+    };
+    eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
+
+    // Optional oracle (runs BEFORE prefill so we can compare every step).
+    // The Gemma 4 oracle does its own CPU forward pass — expensive (~seconds to
+    // minutes depending on prompt length) but fully self-consistent with HF.
+    let oracle_output = if cli.validate {
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/gemma4_oracle.py");
+        let oracle = oracle::run_gemma4_oracle(
+            &oracle_script,
+            &cli.model_dir,
+            &cli.prompt,
+            cli.max_new_tokens,
+            &cli.oracle_dtype,
+        )?;
+        // Cross-check tokenization — if the Python tokenizer disagrees with
+        // ours, logit comparison is meaningless, so fail loudly.
+        if let Some(ref oracle_ids) = oracle.prompt_token_ids {
+            if oracle_ids != &prompt_ids {
+                anyhow::bail!(
+                    "tokenizer mismatch between Rust and Python oracle: \
+                     rust={prompt_ids:?} oracle={oracle_ids:?}"
+                );
+            }
+        }
+        Some(oracle)
+    } else {
+        None
+    };
+
+    // Native prefill.
+    let prefill_start = Instant::now();
+    let prefill_logits = engine.prefill(&prompt_ids)?;
+    let mut next_token = Gemma4Runtime::greedy_sample(&prefill_logits);
+    eprintln!(
+        "[prefill] native GPU prefill done in {:.0}ms",
+        prefill_start.elapsed().as_millis()
+    );
+
+    // Prefill delta vs oracle (if --validate).
+    if let Some(ref oracle) = oracle_output {
+        let prefill_delta = validate::max_abs_delta(&prefill_logits, &oracle.prefill_logits);
+        eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
+        // Oracle may return an empty generation when --max-new-tokens 0 was
+        // requested; only compare the first token when the oracle actually
+        // produced one.
+        if let Some(&oracle_first) = oracle.generated_token_ids.first() {
+            if oracle_first != next_token {
+                eprintln!(
+                    "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+                );
+            }
+        }
+    }
+
+    // Decode loop.
+    let seqlen_start = prompt_ids.len();
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let eos_ids = t.eos_token_ids();
+    let mut max_delta = 0.0f32;
+    let mut token_mismatches = 0usize;
+
+    let decode_start = Instant::now();
+    for step in 0..cli.max_new_tokens {
+        if eos_ids.contains(&next_token) {
+            break;
+        }
+        let pos = seqlen_start + step;
+        let logits = engine.decode_step(next_token, pos)?;
+
+        if let Some(ref oracle) = oracle_output {
+            if step < oracle.decode_logits.len() {
+                let oracle_logits = &oracle.decode_logits[step];
+                let delta = validate::max_abs_delta(&logits, oracle_logits);
+                if delta > max_delta {
+                    max_delta = delta;
+                }
+                // Step k's input token is the one we just sampled at the end
+                // of step k-1 (or prefill for step 0). The oracle picks the
+                // same input greedy path, so generated_token_ids[step+1] is
+                // the oracle's next-output for this step's logits.
+                let oracle_next = if step + 1 < oracle.generated_token_ids.len() {
+                    Some(oracle.generated_token_ids[step + 1])
+                } else {
+                    None
+                };
+                let rust_next = gemma4_engine::Gemma4Engine::greedy_sample(&logits);
+                let mismatch_tag = match oracle_next {
+                    Some(ot) if ot != rust_next => {
+                        token_mismatches += 1;
+                        format!(" MISMATCH (oracle_next={ot})")
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[validate] step={step} pos={pos} delta={delta:.4} input_tok={next_token} rust_next={rust_next}{mismatch_tag}"
+                );
+            }
+        }
+
+        let sampled = gemma4_engine::Gemma4Engine::greedy_sample(&logits);
+        generated_ids.push(next_token);
+        next_token = sampled;
+    }
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+    let all_ids: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(generated_ids.iter().copied())
+        .collect();
+    let text = tokenizer
+        .decode(&all_ids, true)
+        .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+
+    println!("{text}");
+    println!(
+        "[tokens] {}",
+        generated_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0}{}",
+        prompt_ids.len(),
+        generated_ids.len(),
+        if generated_ids.is_empty() {
+            0.0
+        } else {
+            decode_ms / generated_ids.len() as f64
+        },
+        if oracle_output.is_some() {
+            format!(" decode_max_delta={max_delta:.4} token_mismatches={token_mismatches}")
+        } else {
+            String::new()
+        },
+    );
     Ok(())
 }

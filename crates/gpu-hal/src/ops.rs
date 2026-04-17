@@ -147,6 +147,74 @@ pub fn sync(ordinal: usize) -> Result<()> {
     })
 }
 
+/// RAII wrapper around `hipEvent_t`. Records and measures GPU wall time.
+pub struct GpuEvent {
+    ordinal: usize,
+    raw: *mut c_void,
+}
+
+impl GpuEvent {
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        with_device(ordinal, || {
+            let status = unsafe { hipEventCreate(&mut raw) };
+            if status != 0 {
+                return Err(hip_error("hipEventCreate", status));
+            }
+            Ok(())
+        })?;
+        Ok(Self { ordinal, raw })
+    }
+
+    pub fn record(&self) -> Result<()> {
+        with_device(self.ordinal, || {
+            let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
+            if status != 0 {
+                return Err(hip_error("hipEventRecord", status));
+            }
+            Ok(())
+        })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        with_device(self.ordinal, || {
+            let status = unsafe { hipEventSynchronize(self.raw) };
+            if status != 0 {
+                return Err(hip_error("hipEventSynchronize", status));
+            }
+            Ok(())
+        })
+    }
+
+    /// Elapsed milliseconds between `start` and `end`. Both events must have
+    /// been recorded and `end` must have been synchronized first.
+    pub fn elapsed_ms(start: &GpuEvent, end: &GpuEvent) -> Result<f32> {
+        let mut ms: f32 = 0.0;
+        with_device(start.ordinal, || {
+            let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
+            if status != 0 {
+                return Err(hip_error("hipEventElapsedTime", status));
+            }
+            Ok(())
+        })?;
+        Ok(ms)
+    }
+}
+
+impl Drop for GpuEvent {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            let _ = with_device(self.ordinal, || {
+                let status = unsafe { hipEventDestroy(self.raw) };
+                if status != 0 {
+                    return Err(hip_error("hipEventDestroy", status));
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
 /// Dtype-aware element count from shape.
 pub fn elem_count(shape: &[usize]) -> usize {
     shape.iter().product()

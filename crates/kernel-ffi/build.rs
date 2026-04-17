@@ -60,8 +60,11 @@ fn main() {
     let bridge_4b_src = kernel_dir.join("full_attention_bridge_4b.cpp");
     let prefill_helpers_src = kernel_dir.join("prefill_helpers.hip");
     let prefill_helpers_bridge_src = kernel_dir.join("prefill_helpers_bridge.cpp");
+    let gemma4_src = kernel_dir.join("gemma4.hip");
+    let gemma4_bridge_src = kernel_dir.join("gemma4_bridge.cpp");
     for path in [&kernel_src, &bridge_src, &kernel_4b_src, &bridge_4b_src,
-                 &prefill_helpers_src, &prefill_helpers_bridge_src] {
+                 &prefill_helpers_src, &prefill_helpers_bridge_src,
+                 &gemma4_src, &gemma4_bridge_src] {
         println!("cargo:rerun-if-changed={}", path.display());
     }
 
@@ -133,10 +136,34 @@ fn main() {
     }
     run(&mut hipcc_pfx, "building prefill helpers HIP bridge");
 
+    // Compile Gemma 4 decode primitives (separate compilation unit — hipcc
+    // codegen is fragile and Gemma 4 lives alongside but must not touch the
+    // Qwen megakernels).
+    let gemma4_obj = out_dir.join("gemma4_hip.o");
+    let mut hipcc_g4 = Command::new("hipcc");
+    hipcc_g4
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("-fPIC")
+        .arg("-I")
+        .arg(&kernel_dir)
+        .arg("-x")
+        .arg("hip")
+        .arg("-c")
+        .arg(&gemma4_bridge_src)
+        .arg("-o")
+        .arg(&gemma4_obj);
+    for arch in &archs {
+        hipcc_g4.arg(format!("--offload-arch={arch}"));
+    }
+    run(&mut hipcc_g4, "building Gemma 4 HIP bridge");
+
     // Archive all into a single static library
     let bridge_lib = out_dir.join("libqwen35_megakernel_hip.a");
     let mut ar = Command::new("ar");
-    ar.arg("crus").arg(&bridge_lib).arg(&bridge_obj).arg(&bridge_4b_obj).arg(&prefill_helpers_obj);
+    ar.arg("crus").arg(&bridge_lib)
+        .arg(&bridge_obj).arg(&bridge_4b_obj)
+        .arg(&prefill_helpers_obj).arg(&gemma4_obj);
     run(&mut ar, "archiving qwen35 megakernel HIP bridges");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());

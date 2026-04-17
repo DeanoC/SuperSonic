@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/gemma4",
     "crates/gpu-hal",
     "crates/kernel-ffi",
     "crates/model-store",
