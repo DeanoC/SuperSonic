@@ -180,6 +180,40 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_fused_attn_block(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: usize,
+        max_t: usize,
+        sliding_window: c_int,
+        shared_kv: c_int,
+        eps: f32,
+        scale: f32,
+        hidden_in: *const c_void,
+        hidden_out: *mut c_void,
+        input_norm_w: *const c_void,
+        q_proj_w: *const c_void,
+        k_proj_w: *const c_void,
+        v_proj_w: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        o_proj_w: *const c_void,
+        post_attn_norm_w: *const c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_gather_layer_slice(
         dtype: c_int,
         device_ordinal: usize,
@@ -758,6 +792,111 @@ pub fn scalar_mul_inplace(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 scalar_mul_inplace failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Required F32 workspace (elements) for `fused_attn_block`. Layout matches
+/// the kernel: hidden + normed + proj (q+2kv) + scores (nq*max_t) + attn_out
+/// (q_dim) + oproj + oproj_normed.
+pub fn fused_attn_block_workspace_elems(
+    hidden_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_t: usize,
+) -> usize {
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    2 * hidden_size + q_dim + 2 * kv_dim + num_q_heads * max_t + q_dim + 2 * hidden_size
+}
+
+/// Run one Gemma 4 decoder layer's attention half (input_norm → QKV → qk/v
+/// norm → RoPE → kv_append → SWA/full attention → o_proj → post_attn_norm
+/// → residual) in a single kernel launch. `shared_kv` skips K/V generation
+/// and assumes the cache at slot `position` already holds the inherited K/V.
+///
+/// `workspace` must be at least `fused_attn_block_workspace_elems(...) * 4`
+/// bytes (F32). The three counter buffers are each ≥4 bytes of U32 storage;
+/// the kernel clears the barrier pair before launch and reuses
+/// `matvec_counter` internally between the QKV and o_proj phases.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attn_block(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden_in: &GpuBuffer,
+    hidden_out: &mut GpuBuffer,
+    input_norm_w: &GpuBuffer,
+    q_proj_w: &GpuBuffer,
+    k_proj_w: Option<&GpuBuffer>,
+    v_proj_w: Option<&GpuBuffer>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: Option<&GpuBuffer>,
+    o_proj_w: &GpuBuffer,
+    post_attn_norm_w: &GpuBuffer,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    k_cache: &mut GpuBuffer,
+    v_cache: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    hidden_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    sliding_window: i32,
+    position: usize,
+    max_t: usize,
+    shared_kv: bool,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let null = std::ptr::null();
+    let k_proj_ptr = k_proj_w.map(|b| b.as_ptr()).unwrap_or(null);
+    let v_proj_ptr = v_proj_w.map(|b| b.as_ptr()).unwrap_or(null);
+    let k_norm_ptr = k_norm_w.map(|b| b.as_ptr()).unwrap_or(null);
+    let status = unsafe {
+        dotcache_gemma4_hip_fused_attn_block(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            max_t,
+            sliding_window as c_int,
+            if shared_kv { 1 } else { 0 },
+            eps,
+            scale,
+            hidden_in.as_ptr(),
+            hidden_out.as_mut_ptr(),
+            input_norm_w.as_ptr(),
+            q_proj_w.as_ptr(),
+            k_proj_ptr,
+            v_proj_ptr,
+            q_norm_w.as_ptr(),
+            k_norm_ptr,
+            o_proj_w.as_ptr(),
+            post_attn_norm_w.as_ptr(),
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            k_cache.as_mut_ptr(),
+            v_cache.as_mut_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 fused_attn_block failed with status {status}"
         )));
     }
     Ok(())

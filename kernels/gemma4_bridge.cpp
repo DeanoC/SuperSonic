@@ -397,6 +397,68 @@ int scalar_mul_inplace_device(int device_ordinal, size_t n, float scalar, void* 
 }
 
 template <typename T>
+int fused_attn_block_device(int device_ordinal,
+                            int hidden_size, int num_q_heads, int num_kv_heads,
+                            int head_dim, int rotary_dim, int sliding_window,
+                            int position, int max_T, int shared_kv,
+                            float eps, float scale,
+                            const void* hidden_in, void* hidden_out,
+                            const void* input_norm_w,
+                            const void* q_proj_w, const void* k_proj_w,
+                            const void* v_proj_w,
+                            const void* q_norm_w, const void* k_norm_w,
+                            const void* o_proj_w, const void* post_attn_norm_w,
+                            const void* cos_table, const void* sin_table,
+                            void* k_cache, void* v_cache,
+                            void* workspace,
+                            unsigned int* matvec_counter,
+                            unsigned int* barrier_counter,
+                            unsigned int* barrier_flag) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 601;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+
+    // LDS: bs slots for reduction scratch (shared with softmax/matmul). Single
+    // scratch pool — the kernel reuses it across phases.
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    // Zero the barrier counter / flag before launch. We leave matvec_counter
+    // to be reset by the kernel itself (it's cleared twice during execution).
+    if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 602;
+    if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 603;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_fused_attn_block_kernel<T>),
+        dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
+        hidden_size, num_q_heads, num_kv_heads, head_dim,
+        rotary_dim, sliding_window, position, max_T, shared_kv,
+        eps, scale,
+        static_cast<const T*>(hidden_in),
+        static_cast<T*>(hidden_out),
+        static_cast<const T*>(input_norm_w),
+        static_cast<const T*>(q_proj_w),
+        static_cast<const T*>(k_proj_w),
+        static_cast<const T*>(v_proj_w),
+        static_cast<const T*>(q_norm_w),
+        static_cast<const T*>(k_norm_w),
+        static_cast<const T*>(o_proj_w),
+        static_cast<const T*>(post_attn_norm_w),
+        static_cast<const T*>(cos_table),
+        static_cast<const T*>(sin_table),
+        static_cast<T*>(k_cache),
+        static_cast<T*>(v_cache),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag);
+    if (hipGetLastError() != hipSuccess) return 604;
+    if (hipDeviceSynchronize() != hipSuccess) return 605;
+    return 0;
+}
+
+template <typename T>
 int gather_layer_slice_device(int device_ordinal,
                               int seq_len, int num_layers, int ple_hidden,
                               int layer_idx, const void* src, void* out) {
@@ -720,6 +782,44 @@ extern "C" int dotcache_gemma4_hip_scalar_mul_inplace(
                 n, scalar, x);
     default: return 540;
     }
+}
+
+extern "C" int dotcache_gemma4_hip_fused_attn_block(
+    int dtype, size_t device_ordinal,
+    size_t hidden_size, size_t num_q_heads, size_t num_kv_heads,
+    size_t head_dim, size_t rotary_dim, size_t position, size_t max_T,
+    int sliding_window, int shared_kv, float eps, float scale,
+    const void* hidden_in, void* hidden_out,
+    const void* input_norm_w,
+    const void* q_proj_w, const void* k_proj_w, const void* v_proj_w,
+    const void* q_norm_w, const void* k_norm_w,
+    const void* o_proj_w, const void* post_attn_norm_w,
+    const void* cos_table, const void* sin_table,
+    void* k_cache, void* v_cache,
+    void* workspace,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_FUSED_ARGS                                                      \
+        static_cast<int>(device_ordinal),                                      \
+        static_cast<int>(hidden_size), static_cast<int>(num_q_heads),          \
+        static_cast<int>(num_kv_heads), static_cast<int>(head_dim),            \
+        static_cast<int>(rotary_dim), sliding_window,                          \
+        static_cast<int>(position), static_cast<int>(max_T), shared_kv,        \
+        eps, scale,                                                             \
+        hidden_in, hidden_out, input_norm_w,                                   \
+        q_proj_w, k_proj_w, v_proj_w, q_norm_w, k_norm_w,                      \
+        o_proj_w, post_attn_norm_w, cos_table, sin_table,                      \
+        k_cache, v_cache, workspace,                                           \
+        matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return fused_attn_block_device<__half>(G4_FUSED_ARGS);
+    case 1: return fused_attn_block_device<float>(G4_FUSED_ARGS);
+    case 2: return fused_attn_block_device<hip_bfloat16>(G4_FUSED_ARGS);
+    default: return 600;
+    }
+    #undef G4_FUSED_ARGS
 }
 
 extern "C" int dotcache_gemma4_hip_gather_layer_slice(
