@@ -214,6 +214,31 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_fused_mlp_ple(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        ple_hidden: usize,
+        eps: f32,
+        layer_scalar: f32,
+        hidden_in: *const c_void,
+        hidden_out: *mut c_void,
+        pre_ff_norm_w: *const c_void,
+        gate_proj_w: *const c_void,
+        up_proj_w: *const c_void,
+        down_proj_w: *const c_void,
+        post_ff_norm_w: *const c_void,
+        per_layer_input: *const c_void,
+        per_layer_input_gate_w: *const c_void,
+        per_layer_projection_w: *const c_void,
+        post_per_layer_input_norm_w: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_gather_layer_slice(
         dtype: c_int,
         device_ordinal: usize,
@@ -897,6 +922,80 @@ pub fn fused_attn_block(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 fused_attn_block failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Required F32 workspace (elements) for `fused_mlp_ple`. Matches the
+/// kernel's layout: 7 * hidden + 3 * intermediate + 2 * ple_hidden.
+pub fn fused_mlp_ple_workspace_elems(
+    hidden_size: usize,
+    intermediate_size: usize,
+    ple_hidden: usize,
+) -> usize {
+    7 * hidden_size + 3 * intermediate_size + 2 * ple_hidden
+}
+
+/// Run one Gemma 4 decoder layer's MLP + PLE half (pre_ff_norm → gate/up
+/// proj → gelu*up → down_proj → post_ff_norm → residual → per_layer_input_gate
+/// → gelu*per_layer_input → per_layer_projection → post_per_layer_input_norm
+/// → (+)*layer_scalar) in a single kernel launch. `hidden_in` is `h_mid`
+/// (output of `fused_attn_block`); `hidden_out` is the new `h_running`.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_mlp_ple(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden_in: &GpuBuffer,
+    hidden_out: &mut GpuBuffer,
+    pre_ff_norm_w: &GpuBuffer,
+    gate_proj_w: &GpuBuffer,
+    up_proj_w: &GpuBuffer,
+    down_proj_w: &GpuBuffer,
+    post_ff_norm_w: &GpuBuffer,
+    per_layer_input: &GpuBuffer,
+    per_layer_input_gate_w: &GpuBuffer,
+    per_layer_projection_w: &GpuBuffer,
+    post_per_layer_input_norm_w: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    hidden_size: usize,
+    intermediate_size: usize,
+    ple_hidden: usize,
+    eps: f32,
+    layer_scalar: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_fused_mlp_ple(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            hidden_size,
+            intermediate_size,
+            ple_hidden,
+            eps,
+            layer_scalar,
+            hidden_in.as_ptr(),
+            hidden_out.as_mut_ptr(),
+            pre_ff_norm_w.as_ptr(),
+            gate_proj_w.as_ptr(),
+            up_proj_w.as_ptr(),
+            down_proj_w.as_ptr(),
+            post_ff_norm_w.as_ptr(),
+            per_layer_input.as_ptr(),
+            per_layer_input_gate_w.as_ptr(),
+            per_layer_projection_w.as_ptr(),
+            post_per_layer_input_norm_w.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 fused_mlp_ple failed with status {status}"
         )));
     }
     Ok(())

@@ -647,6 +647,21 @@ fn main() -> Result<()> {
     let mut fused_barrier_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut fused_barrier_flag = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
 
+    // Fused MLP+PLE scratch, sized for the largest intermediate
+    // (`double_wide_mlp` layers at intermediate=12288).
+    let max_intermediate = (0..num_layers)
+        .map(|l| g4_spec::mlp_intermediate(tcfg, l))
+        .max()
+        .unwrap_or(tcfg.intermediate_size);
+    let mlp_workspace_elems = g4::fused_mlp_ple_workspace_elems(
+        hidden_size, max_intermediate, ple_hidden,
+    );
+    let mut fused_mlp_workspace =
+        GpuBuffer::zeros(0, ScalarType::F32, &[mlp_workspace_elems])?;
+    // Per-layer PLI slot (single layer's [ple_hidden] BF16 vector). Populated
+    // via D2D copy from the full pli_gpu table each layer.
+    let mut pli_slot = GpuBuffer::zeros(0, ScalarType::BF16, &[ple_hidden])?;
+
     println!(
         "[cfg] prompt_tokens={prompt_tokens} last_token_id={last_token_id} \
          max_new_tokens={max_new_tokens} max_t={max_t} num_layers={num_layers} \
@@ -773,6 +788,12 @@ fn main() -> Result<()> {
             );
         }
 
+        // Upload the full PLI table once per step; per-layer slices are
+        // copied into `pli_slot` inside the loop with a small D2D.
+        let pli_gpu = GpuBuffer::from_host_bytes(
+            0, dtype, &[num_layers, ple_hidden], &pli_bytes,
+        )?;
+
         for layer_idx in 0..num_layers {
             let w = &layers[layer_idx];
             let head_dim = w.head_dim;
@@ -834,66 +855,44 @@ fn main() -> Result<()> {
                 }
             }
 
-            let residual2 = h_mid.clone_device()?;
+            // Fused MLP + PLE half: pre_ff_norm → gate/up → gelu*up → down →
+            // post_ff_norm → residual → per_layer_input_gate → gelu*pli →
+            // per_layer_projection → post_per_layer_input_norm →
+            // (+)*layer_scalar, all in one kernel launch. Reads the
+            // per-layer-input slice straight from `pli_gpu` at the correct
+            // offset — no host-side reupload per layer.
+            let pli_byte_off = layer_idx * ple_hidden * 2;
+            let pli_slice_ptr = pli_gpu.offset_ptr(pli_byte_off);
+            // Build a thin borrowed GpuBuffer view via from_host_bytes is
+            // awkward; instead, expose the underlying pointer to the FFI by
+            // constructing a temporary GpuBuffer whose ptr aliases the right
+            // offset. Simpler: copy the slice into a dedicated scratch buffer
+            // owned at outer scope and pass that.
+            unsafe {
+                gpu_hal::copy_d2d(
+                    0,
+                    pli_slot.as_mut_ptr(),
+                    pli_slice_ptr,
+                    ple_hidden * 2,
+                ).map_err(|e| anyhow!("copy pli slice: {e}"))?;
+            }
 
-            let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm), eps, hidden_size)?;
-
-            let mut gate = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::matvec(0, dtype, &mut gate, &x3, &w.gate_proj, hidden_size, w.intermediate_size, &mut counter)?;
-            let mut up_buf = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::matvec(0, dtype, &mut up_buf, &x3, &w.up_proj, hidden_size, w.intermediate_size, &mut counter)?;
-            let mut y = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, w.intermediate_size)?;
-
-            let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::matvec(0, dtype, &mut m, &y, &w.down_proj, w.intermediate_size, hidden_size, &mut counter)?;
-
-            let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(0, dtype, &mut x4, &m, Some(&w.post_ff_norm), eps, hidden_size)?;
-            let residual2_h = download_bf16(&residual2)?;
-            let x4_h = download_bf16(&x4)?;
-            let h_pre_ple: Vec<f32> =
-                residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
-
-            // PLE branch
-            let bytes_per_layer = ple_hidden * 2;
-            let pli_off = layer_idx * bytes_per_layer;
-            let pli_slice = &pli_bytes[pli_off..pli_off + bytes_per_layer];
-            let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
-            let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
-
-            let ple_residual = upload_bf16(&[hidden_size], &h_pre_ple)?;
-            let h_in_ple = ple_residual.clone_device()?;
-
-            let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-            g4::matvec(
-                0, dtype, &mut gated, &h_in_ple, &w.per_layer_input_gate_w,
-                hidden_size, ple_hidden, &mut counter,
+            let mut h_new = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::fused_mlp_ple(
+                0, dtype,
+                &h_mid, &mut h_new,
+                &w.pre_ff_norm,
+                &w.gate_proj, &w.up_proj, &w.down_proj, &w.post_ff_norm,
+                &pli_slot,
+                &w.per_layer_input_gate_w, &w.per_layer_projection_w,
+                &w.post_per_layer_input_norm_w,
+                &mut fused_mlp_workspace,
+                &mut fused_matvec_counter,
+                &mut fused_barrier_counter, &mut fused_barrier_flag,
+                hidden_size, w.intermediate_size, ple_hidden,
+                eps, w.layer_scalar,
             )?;
-            let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-            g4::gelu_tanh_gate_mul(
-                0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
-            )?;
-            let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::matvec(
-                0, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
-                ple_hidden, hidden_size, &mut counter,
-            )?;
-            let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(
-                0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
-                eps, hidden_size,
-            )?;
-            let ple_residual_h = download_bf16(&ple_residual)?;
-            let normed_h = download_bf16(&normed)?;
-            let h_post_ple: Vec<f32> = ple_residual_h
-                .iter()
-                .zip(normed_h.iter())
-                .map(|(a, b)| (a + b) * w.layer_scalar)
-                .collect();
-
-            h_running = upload_bf16(&[hidden_size], &h_post_ple)?;
+            h_running = h_new;
         }
 
         // --- Final norm + tied lm_head + softcap ---

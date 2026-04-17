@@ -459,6 +459,57 @@ int fused_attn_block_device(int device_ordinal,
 }
 
 template <typename T>
+int fused_mlp_ple_device(int device_ordinal,
+                         int hidden_size, int intermediate_size, int ple_hidden,
+                         float eps, float layer_scalar,
+                         const void* hidden_in, void* hidden_out,
+                         const void* pre_ff_norm_w,
+                         const void* gate_proj_w, const void* up_proj_w,
+                         const void* down_proj_w, const void* post_ff_norm_w,
+                         const void* per_layer_input,
+                         const void* per_layer_input_gate_w,
+                         const void* per_layer_projection_w,
+                         const void* post_per_layer_input_norm_w,
+                         void* workspace,
+                         unsigned int* matvec_counter,
+                         unsigned int* barrier_counter,
+                         unsigned int* barrier_flag) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 611;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 612;
+    if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 613;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_fused_mlp_ple_kernel<T>),
+        dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
+        hidden_size, intermediate_size, ple_hidden,
+        eps, layer_scalar,
+        static_cast<const T*>(hidden_in),
+        static_cast<T*>(hidden_out),
+        static_cast<const T*>(pre_ff_norm_w),
+        static_cast<const T*>(gate_proj_w),
+        static_cast<const T*>(up_proj_w),
+        static_cast<const T*>(down_proj_w),
+        static_cast<const T*>(post_ff_norm_w),
+        static_cast<const T*>(per_layer_input),
+        static_cast<const T*>(per_layer_input_gate_w),
+        static_cast<const T*>(per_layer_projection_w),
+        static_cast<const T*>(post_per_layer_input_norm_w),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag);
+    if (hipGetLastError() != hipSuccess) return 614;
+    if (hipDeviceSynchronize() != hipSuccess) return 615;
+    return 0;
+}
+
+template <typename T>
 int gather_layer_slice_device(int device_ordinal,
                               int seq_len, int num_layers, int ple_hidden,
                               int layer_idx, const void* src, void* out) {
@@ -820,6 +871,41 @@ extern "C" int dotcache_gemma4_hip_fused_attn_block(
     default: return 600;
     }
     #undef G4_FUSED_ARGS
+}
+
+extern "C" int dotcache_gemma4_hip_fused_mlp_ple(
+    int dtype, size_t device_ordinal,
+    size_t hidden_size, size_t intermediate_size, size_t ple_hidden,
+    float eps, float layer_scalar,
+    const void* hidden_in, void* hidden_out,
+    const void* pre_ff_norm_w,
+    const void* gate_proj_w, const void* up_proj_w,
+    const void* down_proj_w, const void* post_ff_norm_w,
+    const void* per_layer_input,
+    const void* per_layer_input_gate_w,
+    const void* per_layer_projection_w,
+    const void* post_per_layer_input_norm_w,
+    void* workspace,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_MLP_PLE_ARGS                                                    \
+        static_cast<int>(device_ordinal),                                      \
+        static_cast<int>(hidden_size), static_cast<int>(intermediate_size),    \
+        static_cast<int>(ple_hidden), eps, layer_scalar,                       \
+        hidden_in, hidden_out, pre_ff_norm_w, gate_proj_w, up_proj_w,          \
+        down_proj_w, post_ff_norm_w, per_layer_input,                          \
+        per_layer_input_gate_w, per_layer_projection_w,                        \
+        post_per_layer_input_norm_w, workspace,                                \
+        matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return fused_mlp_ple_device<__half>(G4_MLP_PLE_ARGS);
+    case 1: return fused_mlp_ple_device<float>(G4_MLP_PLE_ARGS);
+    case 2: return fused_mlp_ple_device<hip_bfloat16>(G4_MLP_PLE_ARGS);
+    default: return 610;
+    }
+    #undef G4_MLP_PLE_ARGS
 }
 
 extern "C" int dotcache_gemma4_hip_gather_layer_slice(
