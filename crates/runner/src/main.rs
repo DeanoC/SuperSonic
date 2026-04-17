@@ -11,7 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 
 use decode_engine::DecodeEngine;
-use registry::{Backend, GpuArch, ModelVariant};
+use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
@@ -158,7 +158,16 @@ fn main() -> Result<()> {
         }
     };
 
-    let params = &entry.params;
+    // Dispatch on family. Gemma4 is scaffolding-only today; it parses config
+    // and exits cleanly before touching the (Qwen-shaped) decode pipeline.
+    if model_variant.family() == ModelFamily::Gemma4 {
+        return run_gemma4_scaffolding(&cli, &model_variant, entry);
+    }
+
+    let params = match &entry.params {
+        FamilyParams::Qwen35(p) => p,
+        FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+    };
 
     // Load config
     let config = qwen35::config::load_config(&cli.model_dir)
@@ -527,4 +536,98 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Gemma 4 scaffolding path: load config, print a summary, exit.
+/// No kernel runs. This exercises the config parser and registry dispatch so
+/// downstream work (weight loader, oracle, kernel) can be added incrementally.
+fn run_gemma4_scaffolding(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    entry: &registry::RegistryEntry,
+) -> Result<()> {
+    let params = match &entry.params {
+        FamilyParams::Gemma4(p) => p,
+        FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+    };
+    let cfg = gemma4::config::load_config(&cli.model_dir)
+        .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
+    let t = &cfg.text_config;
+    eprintln!(
+        "[gemma4] variant={model_variant} weight_prefix={} kv_chunk={}",
+        params.weight_prefix, params.kv_chunk_size
+    );
+    eprintln!(
+        "[gemma4] arch={} model_type={} hidden={} layers={} vocab={} heads={}/{} head_dim={}/{} window={} kv_shared_layers={} softcap={:?} ple_dim={} double_wide_mlp={} tied_lm_head={}",
+        cfg.architectures.as_deref().and_then(|a| a.first().map(String::as_str)).unwrap_or("?"),
+        cfg.model_type.as_deref().unwrap_or("?"),
+        t.hidden_size,
+        t.num_hidden_layers,
+        t.vocab_size,
+        t.num_attention_heads,
+        t.num_key_value_heads,
+        t.head_dim,
+        t.global_head_dim,
+        t.sliding_window,
+        t.num_kv_shared_layers,
+        t.final_logit_softcapping,
+        t.hidden_size_per_layer_input,
+        t.use_double_wide_mlp,
+        cfg.tie_word_embeddings || t.tie_word_embeddings,
+    );
+    eprintln!(
+        "[gemma4] layers: full={} sliding={} kv_owning={} act={}",
+        t.num_full_attention_layers(),
+        t.num_sliding_attention_layers(),
+        t.num_kv_owning_layers(),
+        t.hidden_activation,
+    );
+
+    // Dry-run weight probe: match tensor spec against the actual safetensors
+    // headers. No GPU allocation, no tensor data copied — metadata only.
+    eprintln!("[gemma4] probing safetensors against spec...");
+    let probe_t0 = Instant::now();
+    let report = gemma4::probe::probe(&cli.model_dir, t, params.weight_prefix)
+        .map_err(|e| anyhow::anyhow!("probing weights: {e}"))?;
+    eprintln!(
+        "[gemma4] probe: expected={} actual_under_prefix={} missing={} shape_mismatch={} dtype_mismatch={} extras={} ({:.2}s)",
+        report.expected,
+        report.actual_under_prefix,
+        report.missing.len(),
+        report.shape_mismatches.len(),
+        report.dtype_mismatches.len(),
+        report.extras_under_prefix.len(),
+        probe_t0.elapsed().as_secs_f64(),
+    );
+    const SHOW: usize = 5;
+    for name in report.missing.iter().take(SHOW) {
+        eprintln!("[gemma4]   missing: {name}");
+    }
+    for m in report.shape_mismatches.iter().take(SHOW) {
+        eprintln!(
+            "[gemma4]   shape: {} expected={:?} actual={:?}",
+            m.name, m.expected, m.actual
+        );
+    }
+    for m in report.dtype_mismatches.iter().take(SHOW) {
+        eprintln!("[gemma4]   dtype: {} actual={}", m.name, m.actual_dtype);
+    }
+    for name in report.extras_under_prefix.iter().take(SHOW) {
+        eprintln!("[gemma4]   extra: {name}");
+    }
+    if !report.is_clean() {
+        anyhow::bail!(
+            "weight probe failed: {} missing / {} shape / {} dtype / {} extras. \
+             Fix the tensor spec before proceeding.",
+            report.missing.len(),
+            report.shape_mismatches.len(),
+            report.dtype_mismatches.len(),
+            report.extras_under_prefix.len(),
+        );
+    }
+
+    anyhow::bail!(
+        "Gemma 4 decode path is not implemented yet (scaffolding only). \
+         Config parsed + weight spec matches checkpoint; kernel coming next."
+    );
 }
