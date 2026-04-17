@@ -20,4 +20,13 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
     pub(crate) fn hipDeviceSynchronize() -> c_int;
+    pub(crate) fn hipEventCreate(event: *mut *mut c_void) -> c_int;
+    pub(crate) fn hipEventDestroy(event: *mut c_void) -> c_int;
+    pub(crate) fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
+    pub(crate) fn hipEventSynchronize(event: *mut c_void) -> c_int;
+    pub(crate) fn hipEventElapsedTime(
+        ms: *mut f32,
+        start: *mut c_void,
+        end: *mut c_void,
+    ) -> c_int;
 }
