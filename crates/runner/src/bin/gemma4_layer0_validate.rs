@@ -57,9 +57,15 @@ struct Cli {
     /// Oracle JSON file produced by `oracle/gemma4_oracle.py --emit-state`.
     #[arg(long)]
     oracle_json: PathBuf,
-    /// Layer index to validate (must be a sliding-attention layer; default 0).
+    /// Layer index to validate (0..num_hidden_layers). Default 0.
     #[arg(long, default_value_t = 0)]
     layer: usize,
+    /// If set, chain layers 0..=layer end-to-end starting from the scaled
+    /// embed_tokens lookup (no oracle seeding between layers). Otherwise the
+    /// binary only runs the target layer and seeds its input hidden from the
+    /// oracle's `prefill_per_layer_hidden[layer-1]` (or embed_tokens for layer 0).
+    #[arg(long)]
+    chain: bool,
 }
 
 // -----------------------------------------------------------------------------
@@ -409,9 +415,6 @@ fn main() -> Result<()> {
     if cli.layer >= tcfg.num_hidden_layers {
         bail!("--layer {} >= num_hidden_layers {}", cli.layer, tcfg.num_hidden_layers);
     }
-    let kind = tcfg
-        .attn_kind(cli.layer)
-        .ok_or_else(|| anyhow!("layer {} has no attention kind", cli.layer))?;
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
@@ -449,24 +452,6 @@ fn main() -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing per_layer_inputs_shape"))?;
 
-    // For E2B, HF's DynamicCache exposes 15 slots keyed by layer index; layer 0
-    // maps to slot 0 directly.
-    let layer_slot = cli.layer;
-    if layer_slot >= kv_caches.len() {
-        bail!(
-            "oracle kv_caches has {} slots but layer {} requires slot {}",
-            kv_caches.len(),
-            cli.layer,
-            layer_slot
-        );
-    }
-    let kv = &kv_caches[layer_slot];
-    if kv.layer != layer_slot {
-        bail!(
-            "oracle kv_caches[{layer_slot}].layer = {} != {layer_slot}; cache layout changed?",
-            kv.layer
-        );
-    }
     if cli.layer >= pre_ple.len() {
         bail!("prefill_per_layer_pre_ple has only {} entries", pre_ple.len());
     }
@@ -476,242 +461,12 @@ fn main() -> Result<()> {
         .last()
         .ok_or_else(|| anyhow!("prompt_tokens == 0"))?;
     let pos = prompt_tokens - 1;
-
-    // --- Model geometry for this layer ---
     let hidden_size = tcfg.hidden_size;
-    let head_dim = tcfg.head_dim_for(kind);
-    // We always pass rotary_dim = head_dim to the kernel. Gemma 4's RoPE
-    // applies rotate_half at head_dim/2 granularity (not rotary_dim/2); when
-    // partial_rotary_factor < 1 the "nope" frequency slots simply carry
-    // cos=1, sin=0, so those lanes pass through unchanged. This avoids the
-    // mismatch that would arise if we set rotary_dim < head_dim (kernel would
-    // then rotate at rotary_dim/2, disagreeing with HF's apply_rotary_pos_emb).
-    let rotary_dim = head_dim;
-    let num_q_heads = tcfg.num_attention_heads;
-    let num_kv_heads = tcfg.num_key_value_heads;
-    let q_dim = num_q_heads * head_dim;
-    let kv_dim = num_kv_heads * head_dim;
-    let intermediate_size = g4_spec::mlp_intermediate(tcfg, cli.layer);
     let eps = tcfg.rms_norm_eps as f32;
-    let rope = tcfg.rope_for(kind);
-    let rope_theta = rope.rope_theta;
-    let partial_rotary_factor = rope.partial_rotary_factor;
-    // sliding_window <= 0 disables the mask inside swa_attn_decode, turning
-    // it into full attention.
-    let sliding_window = match kind {
-        AttnKind::Sliding => tcfg.sliding_window as i32,
-        AttnKind::Full => 0,
-    };
-    let max_t = prompt_tokens; // tight fit
-
-    println!(
-        "[layer{}] kind={:?} prompt_tokens={prompt_tokens} last_token_id={last_token_id} head_dim={head_dim} rotary_dim={rotary_dim} q_dim={q_dim} kv_dim={kv_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor}",
-        cli.layer, kind,
-    );
-
-    // --- Load layer-0 safetensors weights ---
-    let loader = UnbakedLoader::open(&cli.model_dir)?;
-    let weight_prefix = "model.language_model";
-    // Use the existing expected-tensor spec to ensure we stay in sync with the
-    // probe logic, but we only load the 13 tensors the kernel path actually
-    // needs (skipping PLE weights + layer_scalar, which the pre-PLE checkpoint
-    // doesn't consume).
-    let layer_spec = g4_spec::layer_tensors(tcfg, weight_prefix, cli.layer);
-    let want = |short: &str| {
-        layer_spec
-            .iter()
-            .find(|s| s.name.ends_with(short))
-            .map(|s| s.name.clone())
-            .ok_or_else(|| anyhow!("no tensor spec matching *.{short}"))
-    };
-    let input_norm = loader.load_bf16_to_gpu(&want("input_layernorm.weight")?)?;
-    let q_proj = loader.load_bf16_to_gpu(&want("self_attn.q_proj.weight")?)?;
-    let k_proj = loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?;
-    let v_proj = loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?;
-    let o_proj = loader.load_bf16_to_gpu(&want("self_attn.o_proj.weight")?)?;
-    let q_norm = loader.load_bf16_to_gpu(&want("self_attn.q_norm.weight")?)?;
-    let k_norm = loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?;
-    let post_attn_norm = loader.load_bf16_to_gpu(&want("post_attention_layernorm.weight")?)?;
-    let pre_ff_norm = loader.load_bf16_to_gpu(&want("pre_feedforward_layernorm.weight")?)?;
-    let post_ff_norm = loader.load_bf16_to_gpu(&want("post_feedforward_layernorm.weight")?)?;
-    let gate_proj = loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?;
-    let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
-    let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
-
-    // --- PLE branch weights ---
-    let per_layer_input_gate_w = loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?;
-    let per_layer_projection_w = loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?;
-    let post_per_layer_input_norm_w =
-        loader.load_bf16_to_gpu(&want("post_per_layer_input_norm.weight")?)?;
-    // layer_scalar is a [1]-shape BF16 weight — load to host and multiply on CPU
-    // at the end of the layer.
-    let layer_scalar_value: f32 = {
-        let (shape, bytes) = loader.tensor_bytes(&want("layer_scalar")?)?;
-        if shape != [1] {
-            bail!("layer_scalar shape {:?} != [1]", shape);
-        }
-        bf16_bytes_to_f32(bytes)[0]
-    };
     let ple_hidden = tcfg.hidden_size_per_layer_input;
-
-    // --- Input hidden for this layer ---
-    // For layer 0 the input is just the scaled embedding; for layer N > 0 we
-    // side-step PLE plumbing by reading layer N-1's post-block output straight
-    // from the oracle (which already includes the PLE + layer_scalar that HF
-    // applies before feeding into layer N).
-    let h_in_host: Vec<f32> = if cli.layer == 0 {
-        load_scaled_embed_row(
-            &loader,
-            &format!("{weight_prefix}.embed_tokens.weight"),
-            last_token_id,
-            hidden_size,
-        )?
-    } else {
-        let b64 = &per_layer_hidden[cli.layer - 1];
-        let bytes = B64.decode(b64).context("decode prefill_per_layer_hidden base64")?;
-        let full = bf16_bytes_to_f32(&bytes);
-        if full.len() != hidden_size {
-            bail!(
-                "prefill_per_layer_hidden[{}] len {} != hidden_size {}",
-                cli.layer - 1,
-                full.len(),
-                hidden_size
-            );
-        }
-        full
-    };
-    let mut h_in = upload_bf16(&[hidden_size], &h_in_host)?;
-
-    // --- RoPE tables: sliding uses default RoPE with full rotation;
-    //     full-attn uses proportional RoPE with partial_rotary_factor=0.25 ---
-    let (cos_host, sin_host) = match kind {
-        AttnKind::Sliding => build_sliding_rope_table(head_dim, rope_theta, prompt_tokens),
-        AttnKind::Full => build_proportional_rope_table(
-            head_dim, rope_theta, partial_rotary_factor, prompt_tokens,
-        ),
-    };
-    let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
-    let sin_table = upload_bf16(&[prompt_tokens, head_dim], &sin_host)?;
-
-    // --- KV caches seeded from oracle (last position left empty) ---
-    let k_oracle_bytes = B64.decode(&kv.k).context("decode kv_caches[0].k base64")?;
-    let v_oracle_bytes = B64.decode(&kv.v).context("decode kv_caches[0].v base64")?;
-    let mut k_cache = seed_kv_cache_from_oracle(
-        &k_oracle_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
-    )?;
-    let mut v_cache = seed_kv_cache_from_oracle(
-        &v_oracle_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
-    )?;
-
-    // --- Scratch buffers ---
-    let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
+    let max_t = prompt_tokens;
     let dtype = ScalarType::BF16;
 
-    // --- Forward pass ---
-
-    // residual = h_in
-    let residual = h_in.clone_device()?;
-
-    // x = rms_norm(h_in, input_layernorm.weight)
-    let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(0, dtype, &mut x, &h_in, Some(&input_norm), eps, hidden_size)?;
-
-    // Q = matvec(q_proj, x); K = matvec(k_proj, x); V = matvec(v_proj, x)
-    let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-    g4::matvec(0, dtype, &mut q, &x, &q_proj, hidden_size, q_dim, &mut counter)?;
-    let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-    g4::matvec(0, dtype, &mut k, &x, &k_proj, hidden_size, kv_dim, &mut counter)?;
-    let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-    g4::matvec(0, dtype, &mut v, &x, &v_proj, hidden_size, kv_dim, &mut counter)?;
-
-    // Per-head Q_norm / K_norm (weight per head_dim). v_norm is with_scale=False.
-    let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-    g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&q_norm), eps, num_q_heads, head_dim)?;
-    let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-    g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(&k_norm), eps, num_kv_heads, head_dim)?;
-    let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-    g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
-
-    // RoPE for Q and K (no RoPE for V).
-    g4::rope_decode(0, dtype, &mut q_normed, &cos_table, &sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
-    g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
-
-    // kv_append → k_cache/v_cache now contain `prompt_tokens` valid entries.
-    g4::kv_append(
-        0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
-        num_kv_heads, head_dim, pos, max_t,
-    )?;
-
-    // Attention
-    let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-    let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q_heads, max_t])?;
-    g4::swa_attn_decode(
-        0, dtype, &q_normed, &k_cache, &v_cache, &mut scores, &mut attn_out,
-        num_q_heads, num_kv_heads, head_dim, prompt_tokens, max_t, sliding_window, 1.0,
-    )?;
-
-    // o = o_proj @ attn_out.flatten
-    let attn_flat_shape = [q_dim];
-    // Reinterpret attn_out as [q_dim] — it's already the same bytes.
-    let mut attn_flat = GpuBuffer::zeros(0, dtype, &attn_flat_shape)?;
-    {
-        // D→D copy into the flat buffer; simpler than reshape gymnastics.
-        let bytes = attn_out.to_host_bytes()?;
-        attn_flat = GpuBuffer::from_host_bytes(0, dtype, &attn_flat_shape, &bytes)?;
-    }
-    let mut o = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::matvec(0, dtype, &mut o, &attn_flat, &o_proj, q_dim, hidden_size, &mut counter)?;
-
-    // x2 = rms_norm(o, post_attention_layernorm.weight); h = residual + x2
-    let mut x2 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(0, dtype, &mut x2, &o, Some(&post_attn_norm), eps, hidden_size)?;
-    let residual_h = download_bf16(&residual)?;
-    let x2_h = download_bf16(&x2)?;
-    let h1_h: Vec<f32> = residual_h.iter().zip(x2_h.iter()).map(|(a, b)| a + b).collect();
-    h_in = upload_bf16(&[hidden_size], &h1_h)?; // re-use h_in as the current hidden
-
-    // residual = h
-    let residual2 = h_in.clone_device()?;
-
-    // x = rms_norm(h, pre_feedforward_layernorm.weight)
-    let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(0, dtype, &mut x3, &h_in, Some(&pre_ff_norm), eps, hidden_size)?;
-
-    // gate = gate_proj @ x; up = up_proj @ x; y = gelu_tanh(gate) * up
-    let mut gate = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
-    g4::matvec(0, dtype, &mut gate, &x3, &gate_proj, hidden_size, intermediate_size, &mut counter)?;
-    let mut up = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
-    g4::matvec(0, dtype, &mut up, &x3, &up_proj, hidden_size, intermediate_size, &mut counter)?;
-    let mut y = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
-    g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up, intermediate_size)?;
-
-    // m = down_proj @ y
-    let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::matvec(0, dtype, &mut m, &y, &down_proj, intermediate_size, hidden_size, &mut counter)?;
-
-    // x2 = rms_norm(m, post_feedforward_layernorm.weight); h_out = residual + x2
-    let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(0, dtype, &mut x4, &m, Some(&post_ff_norm), eps, hidden_size)?;
-    let residual2_h = download_bf16(&residual2)?;
-    let x4_h = download_bf16(&x4)?;
-    let h_out: Vec<f32> = residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
-
-    // --- Compare pre-PLE hidden against oracle as a diagnostic checkpoint ---
-    let pre_ple_want_bytes = B64
-        .decode(&pre_ple[cli.layer])
-        .context("decode prefill_per_layer_pre_ple base64")?;
-    let pre_ple_want = bf16_bytes_to_f32(&pre_ple_want_bytes);
-    if pre_ple_want.len() != hidden_size {
-        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, pre_ple_want.len(), hidden_size);
-    }
-    let pre_ple_stats = compare_vectors(&h_out, &pre_ple_want)?;
-    println!(
-        "[layer{} pre-PLE] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}",
-        cli.layer, pre_ple_stats.cos_sim, pre_ple_stats.max_abs, pre_ple_stats.rel_err_norm
-    );
-
-    // --- PLE branch: gate → gelu_tanh → * per_layer_input[N] → projection →
-    //     post_per_layer_input_norm → residual add → * layer_scalar ---
     if per_layer_inputs_shape.len() != 2
         || per_layer_inputs_shape[0] != tcfg.num_hidden_layers
         || per_layer_inputs_shape[1] != ple_hidden
@@ -724,52 +479,297 @@ fn main() -> Result<()> {
     let all_pli_bytes = B64
         .decode(per_layer_inputs_b64)
         .context("decode per_layer_inputs base64")?;
-    let bytes_per_layer = ple_hidden * 2;
-    let pli_off = cli.layer * bytes_per_layer;
-    let pli_slice = &all_pli_bytes[pli_off..pli_off + bytes_per_layer];
-    let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
-    let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
 
-    let ple_residual = upload_bf16(&[hidden_size], &h_out)?;
-    let h_in_ple = ple_residual.clone_device()?;
+    let loader = UnbakedLoader::open(&cli.model_dir)?;
+    let weight_prefix = "model.language_model";
+    let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
 
-    // gated = per_layer_input_gate @ h_out   [hidden → ple_hidden]
-    let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-    g4::matvec(
-        0, dtype, &mut gated, &h_in_ple, &per_layer_input_gate_w,
-        hidden_size, ple_hidden, &mut counter,
-    )?;
+    // --- Determine chain range and seed h_in ---
+    // --chain runs layers [0, target] starting from the scaled embedding.
+    // Without --chain, we only run the target layer, seeded from either the
+    // scaled embedding (layer 0) or the oracle's post-PLE output of layer-1.
+    let start_layer = if cli.chain { 0 } else { cli.layer };
+    let h_in_seed_host: Vec<f32> = if start_layer == 0 {
+        load_scaled_embed_row(
+            &loader,
+            &format!("{weight_prefix}.embed_tokens.weight"),
+            last_token_id,
+            hidden_size,
+        )?
+    } else {
+        let b64 = &per_layer_hidden[start_layer - 1];
+        let bytes = B64.decode(b64).context("decode prefill_per_layer_hidden base64")?;
+        let full = bf16_bytes_to_f32(&bytes);
+        if full.len() != hidden_size {
+            bail!(
+                "prefill_per_layer_hidden[{}] len {} != hidden_size {}",
+                start_layer - 1,
+                full.len(),
+                hidden_size
+            );
+        }
+        full
+    };
+    let mut h_running_host = h_in_seed_host;
 
-    // gated_act[i] = gelu_tanh(gated[i]) * per_layer_input[i]
-    let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-    g4::gelu_tanh_gate_mul(
-        0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
-    )?;
+    println!(
+        "[run] prompt_tokens={prompt_tokens} last_token_id={last_token_id} target_layer={} chain={} (start_layer={})",
+        cli.layer, cli.chain, start_layer,
+    );
 
-    // projected = per_layer_projection @ gated_act  [ple_hidden → hidden]
-    let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::matvec(
-        0, dtype, &mut projected, &gated_act, &per_layer_projection_w,
-        ple_hidden, hidden_size, &mut counter,
-    )?;
+    let mut final_pre_ple: Option<Vec<f32>> = None;
+    let mut final_post_ple: Option<Vec<f32>> = None;
+    let mut final_layer_scalar: f32 = 1.0;
 
-    // normed = RMSNorm(projected, post_per_layer_input_norm.weight)
-    let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(
-        0, dtype, &mut normed, &projected, Some(&post_per_layer_input_norm_w),
-        eps, hidden_size,
-    )?;
+    for layer in start_layer..=cli.layer {
+        let kind = tcfg
+            .attn_kind(layer)
+            .ok_or_else(|| anyhow!("layer {} has no attention kind", layer))?;
+        let head_dim = tcfg.head_dim_for(kind);
+        let rotary_dim = head_dim;
+        let num_q_heads = tcfg.num_attention_heads;
+        let num_kv_heads = tcfg.num_key_value_heads;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let intermediate_size = g4_spec::mlp_intermediate(tcfg, layer);
+        let rope = tcfg.rope_for(kind);
+        let rope_theta = rope.rope_theta;
+        let partial_rotary_factor = rope.partial_rotary_factor;
+        let sliding_window = match kind {
+            AttnKind::Sliding => tcfg.sliding_window as i32,
+            AttnKind::Full => 0,
+        };
 
-    // h_post_ple = ple_residual + normed, then multiplied by layer_scalar.
-    let residual_h = download_bf16(&ple_residual)?;
-    let normed_h = download_bf16(&normed)?;
-    let h_post_ple: Vec<f32> = residual_h
-        .iter()
-        .zip(normed_h.iter())
-        .map(|(a, b)| (a + b) * layer_scalar_value)
-        .collect();
+        if layer >= kv_caches.len() {
+            bail!(
+                "oracle kv_caches has {} slots but layer {} requires slot {}",
+                kv_caches.len(),
+                layer,
+                layer,
+            );
+        }
+        let kv = &kv_caches[layer];
+        if kv.layer != layer {
+            bail!(
+                "oracle kv_caches[{layer}].layer = {} != {layer}; cache layout changed?",
+                kv.layer
+            );
+        }
 
-    // --- Compare against oracle post-PLE for this layer ---
+        // --- Per-layer weight loading ---
+        let layer_spec = g4_spec::layer_tensors(tcfg, weight_prefix, layer);
+        let want = |short: &str| {
+            layer_spec
+                .iter()
+                .find(|s| s.name.ends_with(short))
+                .map(|s| s.name.clone())
+                .ok_or_else(|| anyhow!("no tensor spec matching *.{short}"))
+        };
+        let input_norm = loader.load_bf16_to_gpu(&want("input_layernorm.weight")?)?;
+        let q_proj = loader.load_bf16_to_gpu(&want("self_attn.q_proj.weight")?)?;
+        let k_proj = loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?;
+        let v_proj = loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?;
+        let o_proj = loader.load_bf16_to_gpu(&want("self_attn.o_proj.weight")?)?;
+        let q_norm = loader.load_bf16_to_gpu(&want("self_attn.q_norm.weight")?)?;
+        let k_norm = loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?;
+        let post_attn_norm = loader.load_bf16_to_gpu(&want("post_attention_layernorm.weight")?)?;
+        let pre_ff_norm = loader.load_bf16_to_gpu(&want("pre_feedforward_layernorm.weight")?)?;
+        let post_ff_norm = loader.load_bf16_to_gpu(&want("post_feedforward_layernorm.weight")?)?;
+        let gate_proj = loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?;
+        let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
+        let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
+        let per_layer_input_gate_w = loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?;
+        let per_layer_projection_w = loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?;
+        let post_per_layer_input_norm_w =
+            loader.load_bf16_to_gpu(&want("post_per_layer_input_norm.weight")?)?;
+        let layer_scalar_value: f32 = {
+            let (shape, bytes) = loader.tensor_bytes(&want("layer_scalar")?)?;
+            if shape != [1] {
+                bail!("layer_scalar shape {:?} != [1]", shape);
+            }
+            bf16_bytes_to_f32(bytes)[0]
+        };
+
+        let mut h_in = upload_bf16(&[hidden_size], &h_running_host)?;
+
+        println!(
+            "  [layer{}] kind={:?} head_dim={head_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor} layer_scalar={layer_scalar_value:.4}",
+            layer, kind,
+        );
+
+        // --- RoPE tables: sliding uses default RoPE with full rotation;
+        //     full-attn uses proportional RoPE with partial_rotary_factor=0.25 ---
+        let (cos_host, sin_host) = match kind {
+            AttnKind::Sliding => build_sliding_rope_table(head_dim, rope_theta, prompt_tokens),
+            AttnKind::Full => build_proportional_rope_table(
+                head_dim, rope_theta, partial_rotary_factor, prompt_tokens,
+            ),
+        };
+        let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
+        let sin_table = upload_bf16(&[prompt_tokens, head_dim], &sin_host)?;
+
+        // --- KV caches seeded from oracle (last position left empty) ---
+        let k_oracle_bytes = B64.decode(&kv.k).context("decode kv.k base64")?;
+        let v_oracle_bytes = B64.decode(&kv.v).context("decode kv.v base64")?;
+        let mut k_cache = seed_kv_cache_from_oracle(
+            &k_oracle_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+        )?;
+        let mut v_cache = seed_kv_cache_from_oracle(
+            &v_oracle_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+        )?;
+
+        // --- Forward pass ---
+        // residual = h_in
+        let residual = h_in.clone_device()?;
+
+        // x = rms_norm(h_in, input_layernorm.weight)
+        let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut x, &h_in, Some(&input_norm), eps, hidden_size)?;
+
+        // Q = matvec(q_proj, x); K = matvec(k_proj, x); V = matvec(v_proj, x)
+        let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+        g4::matvec(0, dtype, &mut q, &x, &q_proj, hidden_size, q_dim, &mut counter)?;
+        let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+        g4::matvec(0, dtype, &mut k, &x, &k_proj, hidden_size, kv_dim, &mut counter)?;
+        let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+        g4::matvec(0, dtype, &mut v, &x, &v_proj, hidden_size, kv_dim, &mut counter)?;
+
+        // Per-head Q_norm / K_norm (weight per head_dim). v_norm is with_scale=False.
+        let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+        g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&q_norm), eps, num_q_heads, head_dim)?;
+        let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+        g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(&k_norm), eps, num_kv_heads, head_dim)?;
+        let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+        g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
+
+        // RoPE for Q and K (no RoPE for V).
+        g4::rope_decode(0, dtype, &mut q_normed, &cos_table, &sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
+        g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
+
+        g4::kv_append(
+            0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
+            num_kv_heads, head_dim, pos, max_t,
+        )?;
+
+        // Attention
+        let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+        let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q_heads, max_t])?;
+        g4::swa_attn_decode(
+            0, dtype, &q_normed, &k_cache, &v_cache, &mut scores, &mut attn_out,
+            num_q_heads, num_kv_heads, head_dim, prompt_tokens, max_t, sliding_window, 1.0,
+        )?;
+
+        // o = o_proj @ attn_out.flatten
+        let attn_flat_shape = [q_dim];
+        let attn_flat = {
+            let bytes = attn_out.to_host_bytes()?;
+            GpuBuffer::from_host_bytes(0, dtype, &attn_flat_shape, &bytes)?
+        };
+        let mut o = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::matvec(0, dtype, &mut o, &attn_flat, &o_proj, q_dim, hidden_size, &mut counter)?;
+
+        // x2 = rms_norm(o, post_attention_layernorm.weight); h = residual + x2
+        let mut x2 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut x2, &o, Some(&post_attn_norm), eps, hidden_size)?;
+        let residual_h = download_bf16(&residual)?;
+        let x2_h = download_bf16(&x2)?;
+        let h1_h: Vec<f32> = residual_h.iter().zip(x2_h.iter()).map(|(a, b)| a + b).collect();
+        let h_mid = upload_bf16(&[hidden_size], &h1_h)?;
+
+        let residual2 = h_mid.clone_device()?;
+
+        let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&pre_ff_norm), eps, hidden_size)?;
+
+        let mut gate = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+        g4::matvec(0, dtype, &mut gate, &x3, &gate_proj, hidden_size, intermediate_size, &mut counter)?;
+        let mut up_buf = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+        g4::matvec(0, dtype, &mut up_buf, &x3, &up_proj, hidden_size, intermediate_size, &mut counter)?;
+        let mut y = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+        g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, intermediate_size)?;
+
+        let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::matvec(0, dtype, &mut m, &y, &down_proj, intermediate_size, hidden_size, &mut counter)?;
+
+        let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut x4, &m, Some(&post_ff_norm), eps, hidden_size)?;
+        let residual2_h = download_bf16(&residual2)?;
+        let x4_h = download_bf16(&x4)?;
+        let h_pre_ple: Vec<f32> = residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
+
+        // --- PLE branch: gate → gelu_tanh → * per_layer_input[N] → projection →
+        //     post_per_layer_input_norm → residual add → * layer_scalar ---
+        let bytes_per_layer = ple_hidden * 2;
+        let pli_off = layer * bytes_per_layer;
+        let pli_slice = &all_pli_bytes[pli_off..pli_off + bytes_per_layer];
+        let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
+        let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
+
+        let ple_residual = upload_bf16(&[hidden_size], &h_pre_ple)?;
+        let h_in_ple = ple_residual.clone_device()?;
+
+        let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+        g4::matvec(
+            0, dtype, &mut gated, &h_in_ple, &per_layer_input_gate_w,
+            hidden_size, ple_hidden, &mut counter,
+        )?;
+
+        let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+        g4::gelu_tanh_gate_mul(
+            0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
+        )?;
+
+        let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::matvec(
+            0, dtype, &mut projected, &gated_act, &per_layer_projection_w,
+            ple_hidden, hidden_size, &mut counter,
+        )?;
+
+        let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(
+            0, dtype, &mut normed, &projected, Some(&post_per_layer_input_norm_w),
+            eps, hidden_size,
+        )?;
+
+        let ple_residual_h = download_bf16(&ple_residual)?;
+        let normed_h = download_bf16(&normed)?;
+        let h_post_ple: Vec<f32> = ple_residual_h
+            .iter()
+            .zip(normed_h.iter())
+            .map(|(a, b)| (a + b) * layer_scalar_value)
+            .collect();
+
+        if layer == cli.layer {
+            final_pre_ple = Some(h_pre_ple.clone());
+            final_post_ple = Some(h_post_ple.clone());
+            final_layer_scalar = layer_scalar_value;
+        }
+
+        // Feed this layer's post-PLE into the next iteration.
+        h_running_host = h_post_ple;
+
+        // Suppress unused warning; reserved for future diagnostic use.
+        let _ = (q_proj.as_ptr(), k_proj.as_ptr(), v_proj.as_ptr(), o_proj.as_ptr());
+        let _: *const c_void = gate_proj.as_ptr();
+    }
+
+    // --- Compare final-layer outputs against oracle ---
+    let final_pre_ple = final_pre_ple.ok_or_else(|| anyhow!("no layers were run"))?;
+    let final_post_ple = final_post_ple.ok_or_else(|| anyhow!("no layers were run"))?;
+
+    let pre_ple_want_bytes = B64
+        .decode(&pre_ple[cli.layer])
+        .context("decode prefill_per_layer_pre_ple base64")?;
+    let pre_ple_want = bf16_bytes_to_f32(&pre_ple_want_bytes);
+    if pre_ple_want.len() != hidden_size {
+        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, pre_ple_want.len(), hidden_size);
+    }
+    let pre_ple_stats = compare_vectors(&final_pre_ple, &pre_ple_want)?;
+    println!(
+        "[layer{} pre-PLE]  cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}",
+        cli.layer, pre_ple_stats.cos_sim, pre_ple_stats.max_abs, pre_ple_stats.rel_err_norm
+    );
+
     let post_ple_want_bytes = B64
         .decode(&per_layer_hidden[cli.layer])
         .context("decode prefill_per_layer_hidden base64")?;
@@ -780,20 +780,16 @@ fn main() -> Result<()> {
             cli.layer, post_ple_want.len(), hidden_size
         );
     }
-    let post_ple_stats = compare_vectors(&h_post_ple, &post_ple_want)?;
+    let post_ple_stats = compare_vectors(&final_post_ple, &post_ple_want)?;
     println!(
         "[layer{} post-PLE] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6} (layer_scalar={:.4})",
         cli.layer, post_ple_stats.cos_sim, post_ple_stats.max_abs,
-        post_ple_stats.rel_err_norm, layer_scalar_value,
+        post_ple_stats.rel_err_norm, final_layer_scalar,
     );
-    let first: Vec<String> = h_post_ple.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    let first: Vec<String> = final_post_ple.iter().take(6).map(|v| format!("{v:+.4}")).collect();
     let want_first: Vec<String> = post_ple_want.iter().take(6).map(|v| format!("{v:+.4}")).collect();
     println!("  got[..6]  = [{}]", first.join(", "));
     println!("  want[..6] = [{}]", want_first.join(", "));
-
-    // Suppress unused warning; reserved for future diagnostic use.
-    let _ = (q_proj.as_ptr(), k_proj.as_ptr(), v_proj.as_ptr(), o_proj.as_ptr());
-    let _: *const c_void = gate_proj.as_ptr();
 
     if post_ple_stats.cos_sim < 0.999 {
         bail!(
