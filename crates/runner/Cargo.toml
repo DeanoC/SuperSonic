@@ -43,6 +43,10 @@ path = "src/bin/gemma4_mega_decode_validate.rs"
 name = "gemma4_bench"
 path = "src/bin/gemma4_bench.rs"
 
+[[bin]]
+name = "gemma4_corpus_test"
+path = "src/bin/gemma4_corpus_test.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

@@ -70,13 +70,25 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--model-dir", required=True,
                    help="Path to local Gemma 4 snapshot dir (config.json + safetensors + tokenizer.json)")
-    p.add_argument("--prompt", required=True, help="Plain text prompt")
-    p.add_argument("--max-new-tokens", type=int, default=4)
+    p.add_argument("--prompt", help="Plain text prompt (single-prompt mode)")
+    p.add_argument("--prompts-file",
+                   help="JSONL file with one {\"name\", \"prompt\", \"max_new_tokens\", ...} per line "
+                        "(corpus mode). Emits a compact sidecar JSON with expected "
+                        "generated_token_ids per entry. Ignores --emit-state.")
+    p.add_argument("--output-file",
+                   help="Required with --prompts-file: path to write the corpus sidecar JSON")
+    p.add_argument("--max-new-tokens", type=int, default=4,
+                   help="Default max_new_tokens if not set in a corpus entry")
     p.add_argument("--dtype", choices=["fp32", "bf16"], default="bf16")
     p.add_argument("--device", default="cpu", help="cpu, cuda:0, etc.")
     p.add_argument("--emit-state", action="store_true",
-                   help="Also emit prefill_hidden + kv_caches for Rust decode bootstrap")
-    return p.parse_args()
+                   help="Single-prompt mode: also emit prefill_hidden + kv_caches for Rust decode bootstrap")
+    args = p.parse_args()
+    if args.prompts_file is None and args.prompt is None:
+        p.error("one of --prompt or --prompts-file is required")
+    if args.prompts_file is not None and args.output_file is None:
+        p.error("--prompts-file requires --output-file")
+    return args
 
 
 def tensor_to_b64(t: torch.Tensor) -> str:
@@ -86,6 +98,116 @@ def tensor_to_b64(t: torch.Tensor) -> str:
     # `untyped_storage()` returns the parent's bytes, not the slice's.
     flat = t.detach().cpu().contiguous().clone()
     return base64.b64encode(bytes(flat.untyped_storage())).decode("ascii")
+
+
+def generate_greedy(
+    model,
+    device,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+) -> tuple[list[int], list[list[float]], list[int], int]:
+    """Run prefill + `max_new_tokens` greedy decode steps.
+
+    Returns (prefill_last_logits, decode_logits, generated_ids, prefill_next_token).
+    No EOS stopping — callers comparing against a fixed-length Rust run need
+    deterministic lengths regardless of token content.
+    """
+    with torch.no_grad():
+        out = model(input_ids=input_ids, use_cache=True)
+    prefill_last_logits = out.logits[0, -1, :].float().cpu().tolist()
+    past = out.past_key_values
+    next_token = int(out.logits[0, -1, :].argmax())
+
+    decode_logits: list[list[float]] = []
+    generated_ids: list[int] = []
+    for _ in range(max_new_tokens):
+        generated_ids.append(next_token)
+        token_input = torch.tensor([[next_token]], dtype=torch.long, device=device)
+        with torch.no_grad():
+            step_out = model(input_ids=token_input, past_key_values=past, use_cache=True)
+        past = step_out.past_key_values
+        decode_logits.append(step_out.logits[0, -1, :].float().cpu().tolist())
+        next_token = int(step_out.logits[0, -1, :].argmax())
+    return prefill_last_logits, decode_logits, generated_ids, next_token
+
+
+def run_corpus_mode(
+    args: argparse.Namespace,
+    tokenizer,
+    model,
+    device,
+    load_ms: float,
+) -> None:
+    """Corpus mode: iterate every JSONL entry, emit a compact sidecar JSON with
+    `expected_generated_token_ids` per prompt. No KV/logits dumps — the Rust
+    corpus test only needs tokens for exact-match comparison.
+
+    JSONL entry schema (one per line):
+      {
+        "name": "...",              # optional label
+        "prompt": "...",            # required (unless expect_error)
+        "max_new_tokens": N,        # optional, defaults to --max-new-tokens
+        "expect_error": bool,       # optional, if true Rust side must error; oracle skips run
+      }
+    """
+    entries: list[dict] = []
+    with open(args.prompts_file, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    f"{args.prompts_file}:{line_num}: invalid JSON: {exc}"
+                ) from exc
+            entries.append(entry)
+
+    results: list[dict] = []
+    for entry in entries:
+        name = entry.get("name", entry.get("prompt", "")[:32])
+        max_new = int(entry.get("max_new_tokens", args.max_new_tokens))
+        expect_error = bool(entry.get("expect_error", False))
+
+        record: dict = {"name": name, "max_new_tokens": max_new}
+        if "prompt" in entry:
+            record["prompt"] = entry["prompt"]
+        if expect_error:
+            record["expect_error"] = True
+            results.append(record)
+            print(f"[corpus] {name}: expect_error (skipping oracle)", flush=True)
+            continue
+
+        prompt = entry["prompt"]
+        encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        input_ids = encoded["input_ids"].to(device)
+        prompt_tokens = int(input_ids.shape[1])
+
+        t0 = time.perf_counter()
+        _, _, generated_ids, _ = generate_greedy(model, device, input_ids, max_new)
+        gen_ms = (time.perf_counter() - t0) * 1000.0
+
+        record["prompt_token_ids"] = [int(x) for x in input_ids[0].cpu().tolist()]
+        record["prompt_tokens"] = prompt_tokens
+        record["expected_generated_token_ids"] = generated_ids
+        record["oracle_ms"] = gen_ms
+        results.append(record)
+        print(
+            f"[corpus] {name}: prompt_tokens={prompt_tokens} "
+            f"max_new={max_new} tokens={generated_ids} ({gen_ms:.0f} ms)",
+            flush=True,
+        )
+
+    payload = {
+        "model_dir": args.model_dir,
+        "dtype": args.dtype,
+        "load_ms": load_ms,
+        "entries": results,
+    }
+    with open(args.output_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    print(f"[corpus] wrote {len(results)} entries to {args.output_file}", flush=True)
 
 
 def main() -> None:
@@ -103,6 +225,12 @@ def main() -> None:
     load_ms = (time.perf_counter() - t0) * 1000.0
 
     device = next(model.parameters()).device
+
+    # Corpus mode: iterate prompts, emit compact sidecar, skip state dumps.
+    if args.prompts_file is not None:
+        run_corpus_mode(args, tokenizer, model, device, load_ms)
+        return
+
     encoded = tokenizer(args.prompt, return_tensors="pt", add_special_tokens=True)
     input_ids = encoded["input_ids"].to(device)
 
