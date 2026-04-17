@@ -647,6 +647,80 @@ int fused_mlp_ple_device(int device_ordinal,
 }
 
 template <typename T>
+int fused_mlp_ple_int4_device(int device_ordinal,
+                              int hidden_size, int intermediate_size, int ple_hidden,
+                              int gsz,
+                              float eps, float layer_scalar,
+                              const void* hidden_in, void* hidden_out,
+                              const void* pre_ff_norm_w,
+                              const void* gate_proj_packed,
+                              const void* gate_proj_scale,
+                              const void* gate_proj_zero,
+                              const void* up_proj_packed,
+                              const void* up_proj_scale,
+                              const void* up_proj_zero,
+                              const void* down_proj_packed,
+                              const void* down_proj_scale,
+                              const void* down_proj_zero,
+                              const void* post_ff_norm_w,
+                              const void* per_layer_input,
+                              const void* per_layer_input_gate_packed,
+                              const void* per_layer_input_gate_scale,
+                              const void* per_layer_input_gate_zero,
+                              const void* per_layer_projection_packed,
+                              const void* per_layer_projection_scale,
+                              const void* per_layer_projection_zero,
+                              const void* post_per_layer_input_norm_w,
+                              void* workspace,
+                              unsigned int* matvec_counter,
+                              unsigned int* barrier_counter,
+                              unsigned int* barrier_flag) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 631;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 632;
+    if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 633;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_fused_mlp_ple_int4_kernel<T>),
+        dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
+        hidden_size, intermediate_size, ple_hidden, gsz,
+        eps, layer_scalar,
+        static_cast<const T*>(hidden_in),
+        static_cast<T*>(hidden_out),
+        static_cast<const T*>(pre_ff_norm_w),
+        static_cast<const uint8_t*>(gate_proj_packed),
+        static_cast<const hip_bfloat16*>(gate_proj_scale),
+        static_cast<const hip_bfloat16*>(gate_proj_zero),
+        static_cast<const uint8_t*>(up_proj_packed),
+        static_cast<const hip_bfloat16*>(up_proj_scale),
+        static_cast<const hip_bfloat16*>(up_proj_zero),
+        static_cast<const uint8_t*>(down_proj_packed),
+        static_cast<const hip_bfloat16*>(down_proj_scale),
+        static_cast<const hip_bfloat16*>(down_proj_zero),
+        static_cast<const T*>(post_ff_norm_w),
+        static_cast<const T*>(per_layer_input),
+        static_cast<const uint8_t*>(per_layer_input_gate_packed),
+        static_cast<const hip_bfloat16*>(per_layer_input_gate_scale),
+        static_cast<const hip_bfloat16*>(per_layer_input_gate_zero),
+        static_cast<const uint8_t*>(per_layer_projection_packed),
+        static_cast<const hip_bfloat16*>(per_layer_projection_scale),
+        static_cast<const hip_bfloat16*>(per_layer_projection_zero),
+        static_cast<const T*>(post_per_layer_input_norm_w),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag);
+    if (hipGetLastError() != hipSuccess) return 634;
+    if (hipDeviceSynchronize() != hipSuccess) return 635;
+    return 0;
+}
+
+template <typename T>
 int persistent_decode_device(int device_ordinal,
                              int num_layers, int hidden_size, int ple_hidden,
                              int position, float eps, float scale,
@@ -1124,6 +1198,52 @@ extern "C" int dotcache_gemma4_hip_fused_mlp_ple(
     default: return 610;
     }
     #undef G4_MLP_PLE_ARGS
+}
+
+extern "C" int dotcache_gemma4_hip_fused_mlp_ple_int4(
+    int dtype, size_t device_ordinal,
+    size_t hidden_size, size_t intermediate_size, size_t ple_hidden,
+    int group_size,
+    float eps, float layer_scalar,
+    const void* hidden_in, void* hidden_out,
+    const void* pre_ff_norm_w,
+    const void* gate_proj_packed, const void* gate_proj_scale, const void* gate_proj_zero,
+    const void* up_proj_packed, const void* up_proj_scale, const void* up_proj_zero,
+    const void* down_proj_packed, const void* down_proj_scale, const void* down_proj_zero,
+    const void* post_ff_norm_w,
+    const void* per_layer_input,
+    const void* per_layer_input_gate_packed,
+    const void* per_layer_input_gate_scale,
+    const void* per_layer_input_gate_zero,
+    const void* per_layer_projection_packed,
+    const void* per_layer_projection_scale,
+    const void* per_layer_projection_zero,
+    const void* post_per_layer_input_norm_w,
+    void* workspace,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_MLP_PLE_INT4_ARGS                                                 \
+        static_cast<int>(device_ordinal),                                        \
+        static_cast<int>(hidden_size), static_cast<int>(intermediate_size),      \
+        static_cast<int>(ple_hidden), group_size, eps, layer_scalar,             \
+        hidden_in, hidden_out, pre_ff_norm_w,                                    \
+        gate_proj_packed, gate_proj_scale, gate_proj_zero,                       \
+        up_proj_packed, up_proj_scale, up_proj_zero,                             \
+        down_proj_packed, down_proj_scale, down_proj_zero,                       \
+        post_ff_norm_w, per_layer_input,                                         \
+        per_layer_input_gate_packed, per_layer_input_gate_scale, per_layer_input_gate_zero, \
+        per_layer_projection_packed, per_layer_projection_scale, per_layer_projection_zero, \
+        post_per_layer_input_norm_w,                                             \
+        workspace, matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return fused_mlp_ple_int4_device<__half>(G4_MLP_PLE_INT4_ARGS);
+    case 1: return fused_mlp_ple_int4_device<float>(G4_MLP_PLE_INT4_ARGS);
+    case 2: return fused_mlp_ple_int4_device<hip_bfloat16>(G4_MLP_PLE_INT4_ARGS);
+    default: return 630;
+    }
+    #undef G4_MLP_PLE_INT4_ARGS
 }
 
 extern "C" int dotcache_gemma4_hip_gather_layer_slice(

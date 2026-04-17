@@ -336,14 +336,15 @@ pub struct Gemma4Int4Engine {
 
     counter: GpuBuffer,
 
-    // Fused attention-block INT4 scratch (Step 28). Sized once at `load()` to
-    // the max of every layer's workspace need; layers with smaller head_dim /
-    // fewer heads simply under-use the buffer. `matvec_counter` + barrier
-    // pair are cleared by the bridge/kernel before each launch.
-    attn_workspace: GpuBuffer,
-    attn_matvec_counter: GpuBuffer,
-    attn_barrier_counter: GpuBuffer,
-    attn_barrier_flag: GpuBuffer,
+    // Fused-kernel scratch (Step 29 attention-block INT4 + Step 30 MLP+PLE
+    // INT4). Single workspace sized to `max(attn, mlp)` elements; attention
+    // and MLP run sequentially within a layer and share the F32 buffer.
+    // Matvec/barrier counters are cleared by each kernel launch so one pair
+    // covers both phases safely.
+    fused_workspace: GpuBuffer,
+    fused_matvec_counter: GpuBuffer,
+    fused_barrier_counter: GpuBuffer,
+    fused_barrier_flag: GpuBuffer,
 }
 
 impl Gemma4Int4Engine {
@@ -426,19 +427,27 @@ impl Gemma4Int4Engine {
 
         let counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
-        // Workspace for `fused_attn_block_int4` — sized to the max across layers.
-        // Full-attention layers dominate both num_q_heads*max_t and head_dim.
+        // Workspace for the two fused INT4 kernels — sized to the max across
+        // layers. Attention dominates on scores (num_q_heads * max_t); MLP+PLE
+        // dominates on intermediate_size (up to 12288 on E2B double-wide,
+        // 10240 on E4B). Single buffer holds whichever is bigger; attention
+        // and MLP run sequentially within each layer so no overlap.
         let num_q_heads = tcfg.num_attention_heads;
         let num_kv_heads = tcfg.num_key_value_heads;
         let head_dim_max = full_head_dim.max(sliding_head_dim);
         let attn_workspace_elems = g4::fused_attn_block_workspace_elems(
             tcfg.hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
         );
-        let attn_workspace =
-            GpuBuffer::zeros(device, ScalarType::F32, &[attn_workspace_elems])?;
-        let attn_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
-        let attn_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
-        let attn_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let intermediate_max = layers.iter().map(|l| l.intermediate_size).max().unwrap_or(0);
+        let mlp_workspace_elems = g4::fused_mlp_ple_workspace_elems(
+            tcfg.hidden_size, intermediate_max, tcfg.hidden_size_per_layer_input,
+        );
+        let fused_workspace_elems = attn_workspace_elems.max(mlp_workspace_elems);
+        let fused_workspace =
+            GpuBuffer::zeros(device, ScalarType::F32, &[fused_workspace_elems])?;
+        let fused_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let fused_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let fused_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
         Ok(Self {
             tcfg,
@@ -458,10 +467,10 @@ impl Gemma4Int4Engine {
             k_caches,
             v_caches,
             counter,
-            attn_workspace,
-            attn_matvec_counter,
-            attn_barrier_counter,
-            attn_barrier_flag,
+            fused_workspace,
+            fused_matvec_counter,
+            fused_barrier_counter,
+            fused_barrier_flag,
         })
     }
 
@@ -1035,10 +1044,10 @@ impl Gemma4Int4Engine {
                 &w.post_attn_norm,
                 cos_table, sin_table,
                 &mut k_caches_src[layer_idx], &mut v_caches_src[layer_idx],
-                &mut self.attn_workspace,
-                &mut self.attn_matvec_counter,
-                &mut self.attn_barrier_counter,
-                &mut self.attn_barrier_flag,
+                &mut self.fused_workspace,
+                &mut self.fused_matvec_counter,
+                &mut self.fused_barrier_counter,
+                &mut self.fused_barrier_flag,
                 hidden_size, num_q_heads, num_kv_heads, head_dim, rotary_dim,
                 sliding_window, pos, max_t,
                 w.shared_kv,
@@ -1046,89 +1055,38 @@ impl Gemma4Int4Engine {
                 eps, 1.0,
             )?;
 
-            let residual2 = h_mid.clone_device()?;
-
-            let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm), eps, hidden_size)?;
-
-            let mut gate = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::matvec_int4(
-                0, dtype, &mut gate, &x3,
-                &w.gate_proj.packed, &w.gate_proj.scale, &w.gate_proj.zero,
-                hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
-            )?;
-            let mut up_buf = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::matvec_int4(
-                0, dtype, &mut up_buf, &x3,
-                &w.up_proj.packed, &w.up_proj.scale, &w.up_proj.zero,
-                hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
-            )?;
-            let mut y = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-            g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, w.intermediate_size)?;
-
-            let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::matvec_int4(
-                0, dtype, &mut m, &y,
-                &w.down_proj.packed, &w.down_proj.scale, &w.down_proj.zero,
-                w.intermediate_size, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
-            )?;
-
-            let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(0, dtype, &mut x4, &m, Some(&w.post_ff_norm), eps, hidden_size)?;
-            let residual2_h = download_bf16(&residual2)?;
-            let x4_h = download_bf16(&x4)?;
-            let h_pre_ple: Vec<f32> =
-                residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
-
-            // PLE branch
             let bytes_per_layer = ple_hidden * 2;
             let pli_off = layer_idx * bytes_per_layer;
             let pli_slice = &pli_bytes[pli_off..pli_off + bytes_per_layer];
-            let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
-            let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
+            let per_layer_input_gpu =
+                upload_bf16(&[ple_hidden], &bf16_bytes_to_f32(pli_slice))?;
 
-            let ple_residual = upload_bf16(&[hidden_size], &h_pre_ple)?;
-            let h_in_ple = ple_residual.clone_device()?;
-
-            let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-            g4::matvec_int4(
-                0, dtype, &mut gated, &h_in_ple,
+            let mut h_new = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::fused_mlp_ple_int4(
+                0, dtype,
+                &h_mid, &mut h_new,
+                &w.pre_ff_norm,
+                &w.gate_proj.packed, &w.gate_proj.scale, &w.gate_proj.zero,
+                &w.up_proj.packed, &w.up_proj.scale, &w.up_proj.zero,
+                &w.down_proj.packed, &w.down_proj.scale, &w.down_proj.zero,
+                &w.post_ff_norm,
+                &per_layer_input_gpu,
                 &w.per_layer_input_gate.packed,
                 &w.per_layer_input_gate.scale,
                 &w.per_layer_input_gate.zero,
-                hidden_size, ple_hidden,
-                INT4_GROUP_SIZE, &mut self.counter,
-            )?;
-            let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
-            g4::gelu_tanh_gate_mul(
-                0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
-            )?;
-            let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::matvec_int4(
-                0, dtype, &mut projected, &gated_act,
                 &w.per_layer_projection.packed,
                 &w.per_layer_projection.scale,
                 &w.per_layer_projection.zero,
-                ple_hidden, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                &w.post_per_layer_input_norm,
+                &mut self.fused_workspace,
+                &mut self.fused_matvec_counter,
+                &mut self.fused_barrier_counter,
+                &mut self.fused_barrier_flag,
+                hidden_size, w.intermediate_size, ple_hidden,
+                INT4_GROUP_SIZE,
+                eps, w.layer_scalar,
             )?;
-            let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-            g4::rms_norm(
-                0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm),
-                eps, hidden_size,
-            )?;
-            let ple_residual_h = download_bf16(&ple_residual)?;
-            let normed_h = download_bf16(&normed)?;
-            let h_post_ple: Vec<f32> = ple_residual_h
-                .iter()
-                .zip(normed_h.iter())
-                .map(|(a, b)| (a + b) * w.layer_scalar)
-                .collect();
-
-            h_running = upload_bf16(&[hidden_size], &h_post_ple)?;
+            h_running = h_new;
         }
 
         let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;

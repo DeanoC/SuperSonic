@@ -286,6 +286,42 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_fused_mlp_ple_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_size: usize,
+        intermediate_size: usize,
+        ple_hidden: usize,
+        group_size: c_int,
+        eps: f32,
+        layer_scalar: f32,
+        hidden_in: *const c_void,
+        hidden_out: *mut c_void,
+        pre_ff_norm_w: *const c_void,
+        gate_proj_packed: *const c_void,
+        gate_proj_scale: *const c_void,
+        gate_proj_zero: *const c_void,
+        up_proj_packed: *const c_void,
+        up_proj_scale: *const c_void,
+        up_proj_zero: *const c_void,
+        down_proj_packed: *const c_void,
+        down_proj_scale: *const c_void,
+        down_proj_zero: *const c_void,
+        post_ff_norm_w: *const c_void,
+        per_layer_input: *const c_void,
+        per_layer_input_gate_packed: *const c_void,
+        per_layer_input_gate_scale: *const c_void,
+        per_layer_input_gate_zero: *const c_void,
+        per_layer_projection_packed: *const c_void,
+        per_layer_projection_scale: *const c_void,
+        per_layer_projection_zero: *const c_void,
+        post_per_layer_input_norm_w: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_fused_mlp_ple(
         dtype: c_int,
         device_ordinal: usize,
@@ -1220,6 +1256,99 @@ pub fn fused_attn_block_int4(
     Ok(())
 }
 
+/// INT4 version of [`fused_mlp_ple`]. Runs the second half of a Gemma 4
+/// decoder layer (pre_ff_norm → gate/up INT4 → gelu*up → down INT4 →
+/// post_ff_norm → residual → per_layer_input_gate INT4 → gelu*ple →
+/// per_layer_projection INT4 → post_per_layer_input_norm → (+)*layer_scalar)
+/// in a single kernel launch. All 5 projections (`gate`, `up`, `down`,
+/// `per_layer_input_gate`, `per_layer_projection`) are INT4-dequantized via
+/// the same `(packed u8, BF16 scale, BF16 zero)` / group_size=128 format the
+/// attention-block INT4 kernel uses.
+///
+/// Workspace sizing identical to [`fused_mlp_ple`] — call
+/// [`fused_mlp_ple_workspace_elems`] with the layer's `intermediate_size`
+/// and `ple_hidden`. Counter/barrier semantics match the BF16 kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_mlp_ple_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden_in: &GpuBuffer,
+    hidden_out: &mut GpuBuffer,
+    pre_ff_norm_w: &GpuBuffer,
+    gate_proj_packed: &GpuBuffer,
+    gate_proj_scale: &GpuBuffer,
+    gate_proj_zero: &GpuBuffer,
+    up_proj_packed: &GpuBuffer,
+    up_proj_scale: &GpuBuffer,
+    up_proj_zero: &GpuBuffer,
+    down_proj_packed: &GpuBuffer,
+    down_proj_scale: &GpuBuffer,
+    down_proj_zero: &GpuBuffer,
+    post_ff_norm_w: &GpuBuffer,
+    per_layer_input: &GpuBuffer,
+    per_layer_input_gate_packed: &GpuBuffer,
+    per_layer_input_gate_scale: &GpuBuffer,
+    per_layer_input_gate_zero: &GpuBuffer,
+    per_layer_projection_packed: &GpuBuffer,
+    per_layer_projection_scale: &GpuBuffer,
+    per_layer_projection_zero: &GpuBuffer,
+    post_per_layer_input_norm_w: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    hidden_size: usize,
+    intermediate_size: usize,
+    ple_hidden: usize,
+    group_size: usize,
+    eps: f32,
+    layer_scalar: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_fused_mlp_ple_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            hidden_size,
+            intermediate_size,
+            ple_hidden,
+            group_size as c_int,
+            eps,
+            layer_scalar,
+            hidden_in.as_ptr(),
+            hidden_out.as_mut_ptr(),
+            pre_ff_norm_w.as_ptr(),
+            gate_proj_packed.as_ptr(),
+            gate_proj_scale.as_ptr(),
+            gate_proj_zero.as_ptr(),
+            up_proj_packed.as_ptr(),
+            up_proj_scale.as_ptr(),
+            up_proj_zero.as_ptr(),
+            down_proj_packed.as_ptr(),
+            down_proj_scale.as_ptr(),
+            down_proj_zero.as_ptr(),
+            post_ff_norm_w.as_ptr(),
+            per_layer_input.as_ptr(),
+            per_layer_input_gate_packed.as_ptr(),
+            per_layer_input_gate_scale.as_ptr(),
+            per_layer_input_gate_zero.as_ptr(),
+            per_layer_projection_packed.as_ptr(),
+            per_layer_projection_scale.as_ptr(),
+            per_layer_projection_zero.as_ptr(),
+            post_per_layer_input_norm_w.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 fused_mlp_ple_int4 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 /// Required F32 workspace (elements) for `fused_mlp_ple`. Matches the
 /// kernel's layout: 7 * hidden + 3 * intermediate + 2 * ple_hidden.
 pub fn fused_mlp_ple_workspace_elems(
@@ -1444,21 +1573,24 @@ impl Default for Gemma4DecodeLayerDesc {
     }
 }
 
-/// INT4 scale/zero tensors for one Gemma 4 decoder layer's attention block.
+/// INT4 scale/zero tensors for one Gemma 4 decoder layer.
 ///
-/// Parallel-struct to [`Gemma4DecodeLayerDesc`] — the main desc's `q/k/v/o_proj_w`
-/// slots hold packed-u8 INT4 weights (reinterpreted at the kernel site) and
-/// this struct carries the matching BF16 scale/zero tables. Mirrors Qwen's
+/// Parallel-struct to [`Gemma4DecodeLayerDesc`] — the main desc's projection
+/// weight slots (`q/k/v/o_proj_w`, `gate/up/down_proj_w`,
+/// `per_layer_input_gate_w`, `per_layer_projection_w`) hold packed-u8 INT4
+/// weights (reinterpreted at the kernel site) and this struct carries the
+/// matching BF16 scale/zero tables. Mirrors Qwen's
 /// [`INT4ScaleDesc`](crate::layer_desc::INT4ScaleDesc) pattern.
 ///
-/// For Step 28 (fused attention-block INT4) only these 8 pointers + group_size
-/// are needed; MLP/PLE projections are still routed through the primitive-
-/// chain INT4 matvec and don't go through this struct. Extending Step 29
-/// (persistent decode INT4) adds `gate/up/down/per_layer_input_gate/
-/// per_layer_projection` fields here — not yet wired.
+/// Step 29 (attention-block INT4) consumes the Q/K/V/O fields; Step 30
+/// (MLP+PLE INT4) adds the gate/up/down + per_layer_input_gate +
+/// per_layer_projection fields. Scaffolding for Step 31 INT4 persistent
+/// megakernel which will pass this struct as a parallel array alongside
+/// `Gemma4DecodeLayerDesc`.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Gemma4Int4ScaleDesc {
+    // --- Attention projections (Step 29) ---
     pub q_proj_scale: *const c_void,
     pub q_proj_zero: *const c_void,
     pub k_proj_scale: *const c_void,
@@ -1467,6 +1599,18 @@ pub struct Gemma4Int4ScaleDesc {
     pub v_proj_zero: *const c_void,
     pub o_proj_scale: *const c_void,
     pub o_proj_zero: *const c_void,
+    // --- MLP projections (Step 30) ---
+    pub gate_proj_scale: *const c_void,
+    pub gate_proj_zero: *const c_void,
+    pub up_proj_scale: *const c_void,
+    pub up_proj_zero: *const c_void,
+    pub down_proj_scale: *const c_void,
+    pub down_proj_zero: *const c_void,
+    // --- PLE projections (Step 30) ---
+    pub per_layer_input_gate_scale: *const c_void,
+    pub per_layer_input_gate_zero: *const c_void,
+    pub per_layer_projection_scale: *const c_void,
+    pub per_layer_projection_zero: *const c_void,
     /// Quantization group size (bake format fixes this at 128).
     pub group_size: c_int,
 }

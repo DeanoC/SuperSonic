@@ -2013,6 +2013,333 @@ __global__ void g4_fused_mlp_ple_kernel(
     }
 }
 
+// =============================================================================
+// Fused MLP + PLE kernel — INT4 variant (Step 30).
+//
+// Structural clone of `g4_fused_mlp_ple_kernel` above with the four matmul
+// phases (gate+up concat, down, per_layer_input_gate, per_layer_projection)
+// retargeted to INT4 work-stealing via `g4_int4_dequant_8`. Every non-matmul
+// phase (norms, gelu*up, residuals, post_ple_norm, layer_scalar multiply,
+// BF16 store) is byte-for-byte identical to the BF16 kernel — intentional
+// duplication per `feedback_hipcc_codegen`.
+//
+// Weight format:
+//   gate/up/down/ple_gate/ple_proj_packed : uint8_t [out, in/2]
+//   gate/up/down/ple_gate/ple_proj_scale  : bf16   [out/gsz, in/gsz]
+//   gate/up/down/ple_gate/ple_proj_zero   : bf16   [out/gsz, in/gsz]
+//
+// Dimensions per projection (Gemma 4 E2B / E4B):
+//   gate_proj, up_proj           : in=hidden, out=intermediate
+//   down_proj                    : in=intermediate, out=hidden
+//   per_layer_input_gate         : in=hidden, out=ple_hidden
+//   per_layer_projection         : in=ple_hidden, out=hidden
+// All multiples of group_size=128.
+//
+// Workspace layout matches the BF16 kernel bit-for-bit
+// (`g4::fused_mlp_ple_workspace_elems` is reused to size the scratch).
+// =============================================================================
+
+template <typename T>
+__global__ void g4_fused_mlp_ple_int4_kernel(
+    int hidden_size, int intermediate_size, int ple_hidden,
+    int gsz,
+    float eps, float layer_scalar,
+    const T* __restrict__ hidden_in,
+    T* __restrict__ hidden_out,
+    const T* __restrict__ pre_ff_norm_w,
+    const uint8_t*       __restrict__ gate_proj_packed,
+    const hip_bfloat16*  __restrict__ gate_proj_scale,
+    const hip_bfloat16*  __restrict__ gate_proj_zero,
+    const uint8_t*       __restrict__ up_proj_packed,
+    const hip_bfloat16*  __restrict__ up_proj_scale,
+    const hip_bfloat16*  __restrict__ up_proj_zero,
+    const uint8_t*       __restrict__ down_proj_packed,
+    const hip_bfloat16*  __restrict__ down_proj_scale,
+    const hip_bfloat16*  __restrict__ down_proj_zero,
+    const T* __restrict__ post_ff_norm_w,
+    const T* __restrict__ per_layer_input,
+    const uint8_t*       __restrict__ per_layer_input_gate_packed,
+    const hip_bfloat16*  __restrict__ per_layer_input_gate_scale,
+    const hip_bfloat16*  __restrict__ per_layer_input_gate_zero,
+    const uint8_t*       __restrict__ per_layer_projection_packed,
+    const hip_bfloat16*  __restrict__ per_layer_projection_scale,
+    const hip_bfloat16*  __restrict__ per_layer_projection_zero,
+    const T* __restrict__ post_per_layer_input_norm_w,
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ matvec_counter,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __attribute__((launch_bounds(256, 1))) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+
+    // Workspace slots — identical layout to the BF16 kernel.
+    float* hidden_f32      = workspace;
+    float* normed_ff       = hidden_f32 + hidden_size;
+    float* gate_up_f32     = normed_ff + hidden_size;
+    float* gated_proj_f32  = gate_up_f32 + 2 * intermediate_size;
+    float* down_out_f32    = gated_proj_f32 + intermediate_size;
+    float* normed_down_f32 = down_out_f32 + hidden_size;
+    float* h_pre_ple_f32   = normed_down_f32 + hidden_size;
+    float* gated_ple_f32   = h_pre_ple_f32 + hidden_size;
+    float* gated_act_ple   = gated_ple_f32 + ple_hidden;
+    float* projected_ple   = gated_act_ple + ple_hidden;
+    float* normed_ple_f32  = projected_ple + hidden_size;
+
+    extern __shared__ float lds[];
+
+    // Phase 0: load h_mid BF16 → hidden_f32.
+    for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+        hidden_f32[c] = g4_to_float(hidden_in[c]);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 1: pre_ff_norm on block 0.
+    if (blockIdx.x == 0) {
+        g4_block_rms_norm_f32<T>(normed_ff, hidden_f32, pre_ff_norm_w,
+                                  hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 2: work-stealing gate+up INT4 matmul (concatenated as [0, intermediate)
+    // = gate, [intermediate, 2*intermediate) = up). in_dim = hidden_size for both.
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const int scale_cols_h = (hidden_size + gsz - 1) / gsz;
+    const int byte_cols_h  = hidden_size / 2;
+
+    const int total_mlp1 = 2 * intermediate_size;
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(total_mlp1)) break;
+
+        const uint8_t*      w_packed_base;
+        const hip_bfloat16* w_scale_base;
+        const hip_bfloat16* w_zero_base;
+        int weight_row;
+        if (row < static_cast<unsigned int>(intermediate_size)) {
+            w_packed_base = gate_proj_packed;
+            w_scale_base  = gate_proj_scale;
+            w_zero_base   = gate_proj_zero;
+            weight_row    = static_cast<int>(row);
+        } else {
+            w_packed_base = up_proj_packed;
+            w_scale_base  = up_proj_scale;
+            w_zero_base   = up_proj_zero;
+            weight_row    = static_cast<int>(row - intermediate_size);
+        }
+        const int scale_row = weight_row / gsz;
+        const uint8_t* w_row_bytes =
+            w_packed_base + static_cast<size_t>(weight_row) * byte_cols_h;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, w_scale_base, w_zero_base,
+                              scale_row, c0, scale_cols_h, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * normed_ff[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) gate_up_f32[row] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 3: gated_proj[i] = gelu(gate[i]) * up[i].
+    {
+        const float* gate_slot = gate_up_f32;
+        const float* up_slot   = gate_up_f32 + intermediate_size;
+        for (int i = tid + blockIdx.x * bs; i < intermediate_size; i += bs * nb) {
+            gated_proj_f32[i] = g4_gelu_tanh_scalar(gate_slot[i]) * up_slot[i];
+        }
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 4: work-stealing down_proj INT4 matmul.
+    //   in_dim = intermediate_size, out_dim = hidden_size.
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const int scale_cols_i = (intermediate_size + gsz - 1) / gsz;
+    const int byte_cols_i  = intermediate_size / 2;
+
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(hidden_size)) break;
+
+        const int scale_row = static_cast<int>(row) / gsz;
+        const uint8_t* w_row_bytes =
+            down_proj_packed + static_cast<size_t>(row) * byte_cols_i;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < intermediate_size; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, down_proj_scale, down_proj_zero,
+                              scale_row, c0, scale_cols_i, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * gated_proj_f32[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) down_out_f32[row] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 5: post_ff_norm on block 0.
+    if (blockIdx.x == 0) {
+        g4_block_rms_norm_f32<T>(normed_down_f32, down_out_f32, post_ff_norm_w,
+                                  hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 6: h_pre_ple = hidden_f32 + normed_down.
+    for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+        h_pre_ple_f32[c] = hidden_f32[c] + normed_down_f32[c];
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 7: work-stealing per_layer_input_gate INT4 matmul.
+    //   in_dim = hidden_size, out_dim = ple_hidden.
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(ple_hidden)) break;
+
+        const int scale_row = static_cast<int>(row) / gsz;
+        const uint8_t* w_row_bytes =
+            per_layer_input_gate_packed + static_cast<size_t>(row) * byte_cols_h;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed,
+                              per_layer_input_gate_scale,
+                              per_layer_input_gate_zero,
+                              scale_row, c0, scale_cols_h, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * h_pre_ple_f32[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) gated_ple_f32[row] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 8: gated_act_ple[i] = gelu(gated_ple[i]) * per_layer_input[i].
+    for (int i = tid + blockIdx.x * bs; i < ple_hidden; i += bs * nb) {
+        const float g = g4_gelu_tanh_scalar(gated_ple_f32[i]);
+        gated_act_ple[i] = g * g4_to_float(per_layer_input[i]);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 9: work-stealing per_layer_projection INT4 matmul.
+    //   in_dim = ple_hidden, out_dim = hidden_size.
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const int scale_cols_ple = (ple_hidden + gsz - 1) / gsz;
+    const int byte_cols_ple  = ple_hidden / 2;
+
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(hidden_size)) break;
+
+        const int scale_row = static_cast<int>(row) / gsz;
+        const uint8_t* w_row_bytes =
+            per_layer_projection_packed + static_cast<size_t>(row) * byte_cols_ple;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < ple_hidden; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed,
+                              per_layer_projection_scale,
+                              per_layer_projection_zero,
+                              scale_row, c0, scale_cols_ple, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * gated_act_ple[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) projected_ple[row] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 10: post_per_layer_input_norm on block 0.
+    if (blockIdx.x == 0) {
+        g4_block_rms_norm_f32<T>(normed_ple_f32, projected_ple,
+                                  post_per_layer_input_norm_w,
+                                  hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 11: hidden_out = (h_pre_ple + normed_ple) * layer_scalar, BF16 store.
+    for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+        const float v = (h_pre_ple_f32[c] + normed_ple_f32[c]) * layer_scalar;
+        hidden_out[c] = g4_from_float<T>(v);
+    }
+}
+
 // Gather one layer's per-layer-input slice from a batched PLI table. Input is
 // `[seq_len, num_layers, ple_hidden]` layout (tokens outermost); output is
 // `[seq_len, ple_hidden]` contiguous for the requested `layer_idx`. Used in
