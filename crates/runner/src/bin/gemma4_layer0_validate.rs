@@ -852,6 +852,97 @@ fn main() -> Result<()> {
             post_ple_stats.cos_sim
         );
     }
+
+    // --- Step 10: logits check (only at the last layer) ---
+    // lm_head is tied to embed_tokens on Gemma 4 E2B (tie_word_embeddings=true);
+    // there is no separate lm_head.weight tensor. Reuse post_ple_got (post-
+    // final-norm hidden at the last prompt position) as the matvec input.
+    // HF applies `final_logit_softcapping` (30.0) inside the model forward, so
+    // the oracle's `prefill_logits` are already softcapped — we must mirror
+    // that on the host after downloading the raw matvec result.
+    if is_last_layer {
+        if !cli.chain {
+            println!("[logits] skipped (last-layer logit check requires --chain for an end-to-end input)");
+        } else {
+            let vocab_size = tcfg.vocab_size;
+            let lm_head_w =
+                loader.load_bf16_to_gpu(&format!("{weight_prefix}.embed_tokens.weight"))?;
+            let normed_hidden = upload_bf16(&[hidden_size], &post_ple_got)?;
+            let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+            g4::matvec(
+                0, dtype, &mut logits_gpu, &normed_hidden, &lm_head_w,
+                hidden_size, vocab_size, &mut counter,
+            )?;
+            let mut logits_host = download_bf16(&logits_gpu)?;
+            let cap = tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
+            for v in logits_host.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+
+            if oracle.prefill_logits.len() != vocab_size {
+                bail!(
+                    "oracle.prefill_logits len {} != vocab_size {}",
+                    oracle.prefill_logits.len(), vocab_size
+                );
+            }
+            let logit_stats = compare_vectors(&logits_host, &oracle.prefill_logits)?;
+
+            let argmax_got = argmax(&logits_host);
+            let argmax_want = argmax(&oracle.prefill_logits);
+            let top5_got = top_k_indices(&logits_host, 5);
+            let top5_want = top_k_indices(&oracle.prefill_logits, 5);
+            let top5_overlap = top5_got.iter().filter(|i| top5_want.contains(*i)).count();
+
+            println!(
+                "[logits] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}  softcap={}",
+                logit_stats.cos_sim, logit_stats.max_abs, logit_stats.rel_err_norm, cap
+            );
+            let got_val = logits_host[argmax_got];
+            let want_val = oracle.prefill_logits[argmax_want];
+            println!(
+                "  argmax got={} ({:+.4})  want={} ({:+.4})  {}",
+                argmax_got, got_val, argmax_want, want_val,
+                if argmax_got == argmax_want { "MATCH" } else { "MISMATCH" }
+            );
+            println!(
+                "  top5 got={:?}  want={:?}  overlap={}/5",
+                top5_got, top5_want, top5_overlap
+            );
+
+            if logit_stats.cos_sim < 0.999 {
+                bail!(
+                    "logit cosine similarity {:.6} below acceptance threshold 0.999",
+                    logit_stats.cos_sim
+                );
+            }
+            if argmax_got != argmax_want {
+                bail!(
+                    "argmax mismatch: got {} want {}",
+                    argmax_got, argmax_want
+                );
+            }
+        }
+    }
+
     println!("PASS");
     Ok(())
+}
+
+fn argmax(v: &[f32]) -> usize {
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &x) in v.iter().enumerate() {
+        if x > best_val {
+            best_val = x;
+            best = i;
+        }
+    }
+    best
+}
+
+fn top_k_indices(v: &[f32], k: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_unstable_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idx.truncate(k);
+    idx
 }
