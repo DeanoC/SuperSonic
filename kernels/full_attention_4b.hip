@@ -3879,8 +3879,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const int lds_input_size = (B * hidden_dim > intermediate_size) ? B * hidden_dim : intermediate_size;
     float* fp8_lut = lds + bs + lds_input_size;
 
-    // Populate FP8 LUT: thread i fills entry i (256 threads → 256 entries, one pass)
-    if (fp8_scales != nullptr) {
+    // Populate FP8 LUT: thread i fills entry i (256 threads → 256 entries, one pass).
+    // Required whenever ANY FP8 dequant runs — weight dequant (fp8_scales) OR
+    // KV-cache dequant in attention (kv_fp8). Previously gated on fp8_scales
+    // alone, which left the LUT uninitialized for --kv-fp8 without
+    // --fp8-runtime (and for --int4 --kv-fp8), producing gibberish from step 2
+    // onward as attention read garbage floats for K/V.
+    if (fp8_scales != nullptr || kv_fp8 != nullptr) {
         fp8_lut[tid] = fp8_e4m3_to_float(static_cast<uint8_t>(tid));
     }
     __syncthreads();
