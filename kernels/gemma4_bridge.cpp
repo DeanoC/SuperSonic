@@ -131,6 +131,64 @@ int kv_append_device(int device_ordinal,
     return 0;
 }
 
+// ---- SWA (or full) attention for one decode token ----
+
+template <typename T>
+int swa_attn_decode_device(int device_ordinal,
+                           int num_q_heads, int num_kv_heads,
+                           int head_dim, int kv_len, int max_T,
+                           int sliding_window, float scale,
+                           const void* q, const void* k_cache, const void* v_cache,
+                           void* scores_scratch, void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (kv_len <= 0) return 450;
+
+    constexpr int BLOCK = 256;
+    // Phase 1: per-(q_head, t) score computation.
+    {
+        dim3 grid(num_q_heads, (kv_len + BLOCK - 1) / BLOCK, 1);
+        dim3 block(BLOCK, 1, 1);
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(g4_attn_scores_kernel<T>),
+            grid, block, 0, 0,
+            num_q_heads, num_kv_heads, head_dim, kv_len, max_T,
+            sliding_window, scale,
+            static_cast<const T*>(q),
+            static_cast<const T*>(k_cache),
+            static_cast<float*>(scores_scratch));
+        if (hipGetLastError() != hipSuccess) return 451;
+    }
+
+    // Phase 2: per-q_head softmax.
+    {
+        dim3 grid(num_q_heads, 1, 1);
+        dim3 block(BLOCK, 1, 1);
+        hipLaunchKernelGGL(
+            g4_attn_softmax_kernel,
+            grid, block, 0, 0,
+            num_q_heads, kv_len, max_T,
+            static_cast<float*>(scores_scratch));
+        if (hipGetLastError() != hipSuccess) return 452;
+    }
+
+    // Phase 3: value aggregation per (q_head, head_dim col).
+    {
+        dim3 grid(num_q_heads, (head_dim + BLOCK - 1) / BLOCK, 1);
+        dim3 block(BLOCK, 1, 1);
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(g4_attn_value_aggregate_kernel<T>),
+            grid, block, 0, 0,
+            num_q_heads, num_kv_heads, head_dim, kv_len, max_T,
+            static_cast<const float*>(scores_scratch),
+            static_cast<const T*>(v_cache),
+            static_cast<T*>(out));
+        if (hipGetLastError() != hipSuccess) return 453;
+    }
+
+    if (hipDeviceSynchronize() != hipSuccess) return 454;
+    return 0;
+}
+
 }  // namespace
 
 // -----------------------------------------------------------------------------
@@ -202,6 +260,34 @@ extern "C" int dotcache_gemma4_hip_rope_decode(
                 static_cast<int>(rotary_dim), static_cast<int>(position),
                 cos_table, sin_table, x);
     default: return 430;
+    }
+}
+
+extern "C" int dotcache_gemma4_hip_swa_attn_decode(
+    int dtype, size_t device_ordinal,
+    size_t num_q_heads, size_t num_kv_heads,
+    size_t head_dim, size_t kv_len, size_t max_T,
+    int sliding_window, float scale,
+    const void* q, const void* k_cache, const void* v_cache,
+    void* scores_scratch, void* out
+) {
+    switch (dtype) {
+    case 0: return swa_attn_decode_device<__half>(static_cast<int>(device_ordinal),
+                static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads),
+                static_cast<int>(head_dim), static_cast<int>(kv_len),
+                static_cast<int>(max_T), sliding_window, scale,
+                q, k_cache, v_cache, scores_scratch, out);
+    case 1: return swa_attn_decode_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads),
+                static_cast<int>(head_dim), static_cast<int>(kv_len),
+                static_cast<int>(max_T), sliding_window, scale,
+                q, k_cache, v_cache, scores_scratch, out);
+    case 2: return swa_attn_decode_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(num_q_heads), static_cast<int>(num_kv_heads),
+                static_cast<int>(head_dim), static_cast<int>(kv_len),
+                static_cast<int>(max_T), sliding_window, scale,
+                q, k_cache, v_cache, scores_scratch, out);
+    default: return 449;
     }
 }
 

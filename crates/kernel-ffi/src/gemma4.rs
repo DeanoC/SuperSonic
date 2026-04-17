@@ -55,6 +55,23 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_swa_attn_decode(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        max_t: usize,
+        sliding_window: c_int,
+        scale: f32,
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        scores_scratch: *mut c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_kv_append(
         dtype: c_int,
         device_ordinal: usize,
@@ -193,6 +210,59 @@ pub fn rope_decode(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 rope_decode failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Run sliding-window attention for one decode token.
+///
+/// The caller is responsible for having already appended the current token's
+/// K and V into the caches (see [`kv_append`]) so that `kv_len` entries are
+/// valid. `scores_scratch` must hold at least `num_q_heads * max_t * 4` bytes
+/// of F32 storage; it is written and read inside the kernel but its contents
+/// are not meaningful to the caller afterwards.
+///
+/// Pass `sliding_window <= 0` to attend over the whole cache (behaves as full
+/// attention). Gemma 4 uses `scale = 1.0` (no 1/sqrt(d_k)).
+#[allow(clippy::too_many_arguments)]
+pub fn swa_attn_decode(
+    ordinal: usize,
+    dtype: ScalarType,
+    q: &GpuBuffer,
+    k_cache: &GpuBuffer,
+    v_cache: &GpuBuffer,
+    scores_scratch: &mut GpuBuffer,
+    out: &mut GpuBuffer,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    max_t: usize,
+    sliding_window: i32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_swa_attn_decode(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            max_t,
+            sliding_window as c_int,
+            scale,
+            q.as_ptr(),
+            k_cache.as_ptr(),
+            v_cache.as_ptr(),
+            scores_scratch.as_mut_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 swa_attn_decode failed with status {status}"
         )));
     }
     Ok(())

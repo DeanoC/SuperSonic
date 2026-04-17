@@ -237,6 +237,146 @@ __global__ void g4_rope_split_half_decode_kernel(
 // One thread per element of K and V independently.
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Sliding-Window Attention for a single decode token (Gemma 4).
+//
+// Inputs (all post-norm, post-RoPE, and with KV already appended at position
+// `kv_len - 1`, so the cache holds `kv_len` valid entries):
+//   Q          [num_q_heads, head_dim]
+//   K_cache    [num_kv_heads, max_T, head_dim]
+//   V_cache    [num_kv_heads, max_T, head_dim]
+//
+// Output:
+//   out        [num_q_heads, head_dim]
+//
+// Scratch (caller-allocated, F32):
+//   scores     [num_q_heads, max_T]
+//
+// Gemma 4 uses `scaling = 1.0` (no 1/sqrt(d_k)); the caller passes that scalar.
+// If `sliding_window <= 0` the entire cache is attended (behaves as full attn).
+// If `num_kv_heads < num_q_heads`, GQA is applied (one KV head services
+// `num_q_heads / num_kv_heads` consecutive Q heads).
+//
+// The three kernels are launched in sequence from the bridge; no cross-kernel
+// synchronization is needed beyond hipDeviceSynchronize inside the caller.
+// -----------------------------------------------------------------------------
+
+template <typename T>
+__global__ void g4_attn_scores_kernel(
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int kv_len,           // number of valid tokens currently in the cache
+    int max_T,
+    int sliding_window,   // <= 0 means no window
+    float scale,          // Gemma 4 passes 1.0
+    const T* __restrict__ Q,
+    const T* __restrict__ K_cache,
+    float* __restrict__ scores
+) {
+    const int q_h = blockIdx.x;
+    const int t = blockIdx.y * blockDim.x + threadIdx.x;
+    if (q_h >= num_q_heads || t >= kv_len) return;
+
+    // SWA mask: last valid token is at kv_len-1. Window includes tokens
+    // within `sliding_window - 1` positions before last (and last itself).
+    const int last = kv_len - 1;
+    const int min_t = (sliding_window > 0) ? max(0, last - sliding_window + 1) : 0;
+    if (t < min_t) {
+        scores[static_cast<size_t>(q_h) * max_T + t] = -INFINITY;
+        return;
+    }
+
+    const int num_q_per_kv = num_q_heads / num_kv_heads;
+    const int kv_h = q_h / num_q_per_kv;
+
+    const T* q_row = Q + static_cast<size_t>(q_h) * head_dim;
+    const T* k_row = K_cache + (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+
+    float acc = 0.0f;
+    for (int d = 0; d < head_dim; ++d) {
+        acc += g4_to_float(q_row[d]) * g4_to_float(k_row[d]);
+    }
+    scores[static_cast<size_t>(q_h) * max_T + t] = acc * scale;
+}
+
+__global__ void g4_attn_softmax_kernel(
+    int num_q_heads,
+    int kv_len,
+    int max_T,
+    float* __restrict__ scores
+) {
+    const int q_h = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (q_h >= num_q_heads) return;
+
+    float* row = scores + static_cast<size_t>(q_h) * max_T;
+
+    // Pass 1: block-wide max (stabilizer).
+    __shared__ float s_red[256];
+    float partial_max = -INFINITY;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        partial_max = fmaxf(partial_max, row[t]);
+    }
+    s_red[tid] = partial_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] = fmaxf(s_red[tid], s_red[tid + stride]);
+        __syncthreads();
+    }
+    const float mx = s_red[0];
+    __syncthreads();
+
+    // Pass 2: exp + block-wide sum.
+    float partial_sum = 0.0f;
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        const float v = expf(row[t] - mx);
+        row[t] = v;
+        partial_sum += v;
+    }
+    s_red[tid] = partial_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) s_red[tid] += s_red[tid + stride];
+        __syncthreads();
+    }
+    const float inv_sum = 1.0f / s_red[0];
+    __syncthreads();
+
+    // Pass 3: normalize.
+    for (int t = tid; t < kv_len; t += blockDim.x) {
+        row[t] *= inv_sum;
+    }
+}
+
+template <typename T>
+__global__ void g4_attn_value_aggregate_kernel(
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    int kv_len,
+    int max_T,
+    const float* __restrict__ scores,
+    const T* __restrict__ V_cache,
+    T* __restrict__ out
+) {
+    const int q_h = blockIdx.x;
+    const int d = blockIdx.y * blockDim.x + threadIdx.x;
+    if (q_h >= num_q_heads || d >= head_dim) return;
+
+    const int num_q_per_kv = num_q_heads / num_kv_heads;
+    const int kv_h = q_h / num_q_per_kv;
+
+    float acc = 0.0f;
+    const float* p_row = scores + static_cast<size_t>(q_h) * max_T;
+    for (int t = 0; t < kv_len; ++t) {
+        const float p = p_row[t];
+        const T* v_row = V_cache + (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+        acc += p * g4_to_float(v_row[d]);
+    }
+    out[static_cast<size_t>(q_h) * head_dim + d] = g4_from_float<T>(acc);
+}
+
 template <typename T>
 __global__ void g4_kv_append_decode_kernel(
     int num_kv_heads,
