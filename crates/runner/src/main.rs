@@ -1,4 +1,5 @@
 mod decode_engine;
+mod gemma4_engine;
 mod oracle;
 mod prefill_engine;
 mod registry;
@@ -158,10 +159,10 @@ fn main() -> Result<()> {
         }
     };
 
-    // Dispatch on family. Gemma4 is scaffolding-only today; it parses config
-    // and exits cleanly before touching the (Qwen-shaped) decode pipeline.
+    // Dispatch on family. Gemma 4 has its own load/prefill/decode pipeline via
+    // the persistent megakernel; return early before the Qwen-shaped path.
     if model_variant.family() == ModelFamily::Gemma4 {
-        return run_gemma4_scaffolding(&cli, &model_variant, entry);
+        return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
     }
 
     let params = match &entry.params {
@@ -538,18 +539,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Gemma 4 scaffolding path: load config, print a summary, exit.
-/// No kernel runs. This exercises the config parser and registry dispatch so
-/// downstream work (weight loader, oracle, kernel) can be added incrementally.
-fn run_gemma4_scaffolding(
+/// Gemma 4 end-to-end decode: tokenize → native prefill → megakernel decode
+/// → detokenize. Rejects unsupported flags (INT4, FP8, KV-FP8, batch>1) with
+/// clear errors — the Qwen-family flags do not plumb through yet.
+fn run_gemma4(
     cli: &Cli,
     model_variant: &ModelVariant,
     entry: &registry::RegistryEntry,
+    ordinal: usize,
+    total_vram: u64,
 ) -> Result<()> {
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
     };
+
+    if cli.int4 || cli.fp8_runtime || cli.kv_fp8 {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --int4 / --fp8-runtime / --kv-fp8 \
+             (only BF16 weights + BF16 KV cache supported today)"
+        );
+    }
+    if cli.batch_size != 1 {
+        anyhow::bail!("Gemma 4 does not yet support --batch-size > 1");
+    }
+    if cli.oracle_prefill || cli.gpu_validate {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --oracle-prefill / --gpu-validate"
+        );
+    }
+    if cli.prefill_chunk_size != 0 {
+        anyhow::bail!(
+            "Gemma 4 does not yet support --prefill-chunk-size (single-shot prefill only)"
+        );
+    }
+    if cli.no_bake {
+        eprintln!(
+            "[gemma4] note: --no-bake is implied (Gemma 4 has no bake format yet). \
+             Loading directly from safetensors."
+        );
+    }
+
+    // Load config for a config summary + VRAM / context bookkeeping.
     let cfg = gemma4::config::load_config(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
     let t = &cfg.text_config;
@@ -558,9 +589,7 @@ fn run_gemma4_scaffolding(
         params.weight_prefix, params.kv_chunk_size
     );
     eprintln!(
-        "[gemma4] arch={} model_type={} hidden={} layers={} vocab={} heads={}/{} head_dim={}/{} window={} kv_shared_layers={} softcap={:?} ple_dim={} double_wide_mlp={} tied_lm_head={}",
-        cfg.architectures.as_deref().and_then(|a| a.first().map(String::as_str)).unwrap_or("?"),
-        cfg.model_type.as_deref().unwrap_or("?"),
+        "[gemma4] hidden={} layers={} vocab={} heads={}/{} head_dim={}/{} window={} kv_shared_layers={} softcap={:?} ple_dim={} tied_lm_head={}",
         t.hidden_size,
         t.num_hidden_layers,
         t.vocab_size,
@@ -572,62 +601,138 @@ fn run_gemma4_scaffolding(
         t.num_kv_shared_layers,
         t.final_logit_softcapping,
         t.hidden_size_per_layer_input,
-        t.use_double_wide_mlp,
         cfg.tie_word_embeddings || t.tie_word_embeddings,
     );
-    eprintln!(
-        "[gemma4] layers: full={} sliding={} kv_owning={} act={}",
-        t.num_full_attention_layers(),
-        t.num_sliding_attention_layers(),
-        t.num_kv_owning_layers(),
-        t.hidden_activation,
-    );
 
-    // Dry-run weight probe: match tensor spec against the actual safetensors
-    // headers. No GPU allocation, no tensor data copied — metadata only.
-    eprintln!("[gemma4] probing safetensors against spec...");
-    let probe_t0 = Instant::now();
-    let report = gemma4::probe::probe(&cli.model_dir, t, params.weight_prefix)
-        .map_err(|e| anyhow::anyhow!("probing weights: {e}"))?;
-    eprintln!(
-        "[gemma4] probe: expected={} actual_under_prefix={} missing={} shape_mismatch={} dtype_mismatch={} extras={} ({:.2}s)",
-        report.expected,
-        report.actual_under_prefix,
-        report.missing.len(),
-        report.shape_mismatches.len(),
-        report.dtype_mismatches.len(),
-        report.extras_under_prefix.len(),
-        probe_t0.elapsed().as_secs_f64(),
-    );
-    const SHOW: usize = 5;
-    for name in report.missing.iter().take(SHOW) {
-        eprintln!("[gemma4]   missing: {name}");
+    // Tokenize
+    let tokenizer_path = cli.model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
+    if prompt_ids.is_empty() {
+        anyhow::bail!("empty prompt after tokenization");
     }
-    for m in report.shape_mismatches.iter().take(SHOW) {
-        eprintln!(
-            "[gemma4]   shape: {} expected={:?} actual={:?}",
-            m.name, m.expected, m.actual
-        );
-    }
-    for m in report.dtype_mismatches.iter().take(SHOW) {
-        eprintln!("[gemma4]   dtype: {} actual={}", m.name, m.actual_dtype);
-    }
-    for name in report.extras_under_prefix.iter().take(SHOW) {
-        eprintln!("[gemma4]   extra: {name}");
-    }
-    if !report.is_clean() {
+
+    let context_tokens = cli
+        .context_size
+        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
+    if context_tokens < prompt_ids.len() + cli.max_new_tokens {
         anyhow::bail!(
-            "weight probe failed: {} missing / {} shape / {} dtype / {} extras. \
-             Fix the tensor spec before proceeding.",
-            report.missing.len(),
-            report.shape_mismatches.len(),
-            report.dtype_mismatches.len(),
-            report.extras_under_prefix.len(),
+            "--context-size {context_tokens} < prompt_tokens {} + max_new_tokens {}",
+            prompt_ids.len(),
+            cli.max_new_tokens,
         );
     }
 
-    anyhow::bail!(
-        "Gemma 4 decode path is not implemented yet (scaffolding only). \
-         Config parsed + weight spec matches checkpoint; kernel coming next."
+    // VRAM estimate — Gemma 4 BF16 KV cache: owning layers only (shared layers
+    // alias the source), each layer's slot is num_kv_heads * head_dim * 2.
+    let mut kv_per_token: u64 = 0;
+    for l in 0..t.num_hidden_layers {
+        if t.kv_source_layer(l).is_none() {
+            let kind = t
+                .attn_kind(l)
+                .ok_or_else(|| anyhow::anyhow!("layer {l}: no attention kind"))?;
+            let hd = t.head_dim_for(kind);
+            kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
+        }
+    }
+    let kv_bytes = kv_per_token * context_tokens as u64;
+    let estimated_vram =
+        ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
+    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    eprintln!(
+        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        gib(estimated_vram),
+        gib(entry.vram.fixed_bytes),
+        gib(kv_bytes),
+        context_tokens,
+        gib(total_vram),
     );
+    if estimated_vram > total_vram {
+        anyhow::bail!(
+            "Insufficient VRAM for {context_tokens}-token context: need ~{:.2}GiB, \
+             GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
+            gib(estimated_vram),
+            gib(total_vram),
+        );
+    }
+
+    // Load weights + build engine.
+    let t0 = Instant::now();
+    let mut engine = gemma4_engine::Gemma4Engine::load(
+        &cli.model_dir,
+        params.weight_prefix,
+        context_tokens,
+        ordinal,
+    )?;
+    eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
+
+    // Native prefill.
+    let prefill_start = Instant::now();
+    let prefill_logits = engine.prefill(&prompt_ids)?;
+    let mut next_token = gemma4_engine::Gemma4Engine::greedy_sample(&prefill_logits);
+    eprintln!(
+        "[prefill] native GPU prefill done in {:.0}ms",
+        prefill_start.elapsed().as_millis()
+    );
+
+    // Decode loop.
+    let seqlen_start = prompt_ids.len();
+    let mut generated_ids: Vec<u32> = Vec::new();
+    let eos_ids = t.eos_token_ids();
+
+    let decode_start = Instant::now();
+    for step in 0..cli.max_new_tokens {
+        if eos_ids.contains(&next_token) {
+            break;
+        }
+        let pos = seqlen_start + step;
+        let logits = engine.decode_step(next_token, pos)?;
+        let sampled = gemma4_engine::Gemma4Engine::greedy_sample(&logits);
+        generated_ids.push(next_token);
+        next_token = sampled;
+    }
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+    let all_ids: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(generated_ids.iter().copied())
+        .collect();
+    let text = tokenizer
+        .decode(&all_ids, true)
+        .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+
+    println!("{text}");
+    println!(
+        "[tokens] {}",
+        generated_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0}",
+        prompt_ids.len(),
+        generated_ids.len(),
+        if generated_ids.is_empty() {
+            0.0
+        } else {
+            decode_ms / generated_ids.len() as f64
+        },
+    );
+
+    // --validate not yet plumbed for Gemma 4.
+    if cli.validate {
+        eprintln!(
+            "[validate] --validate is not yet wired for Gemma 4; \
+             use `cargo run --bin gemma4_e2e_validate` for oracle comparison."
+        );
+    }
+    Ok(())
 }
