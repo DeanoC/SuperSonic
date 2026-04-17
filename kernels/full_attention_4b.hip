@@ -127,6 +127,22 @@ __device__ __forceinline__ float bf16_round_rne_f32(float x) {
     return y;
 }
 
+// Same semantics as bf16_round_rne_f32 for finite inputs — no NaN-preservation
+// branch. Use in weight-dequant hot paths where inputs are provably finite
+// (INT4: nibble∈[0,15] × finite bf16 scale − finite bf16 zero-scale;
+// FP8: finite e4m3 value × finite bf16 scale). The NaN branch was measurable
+// on the 890M iGPU where int4_dequant_8 runs it 8× per packed u32.
+__device__ __forceinline__ float bf16_round_rne_f32_finite(float x) {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, 4);
+    uint32_t rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    float y;
+    __builtin_memcpy(&y, &bits, 4);
+    return y;
+}
+
 // KV cache FP8 scale pointers for dynamic quantization.
 // One per decoder layer, passed as a separate kernel parameter.
 // Struct layout must match kernel_ffi::KVCacheFp8Desc in Rust.
@@ -205,7 +221,7 @@ __device__ inline float fp8_dequant_weight(
     // Without this, F32 accumulation of F32-dequanted weights drifts from the
     // BF16-truncated weights that PyTorch uses, causing token divergence on marginal
     // argmax decisions after 32 layers of compounding.
-    return bf16_round_rne_f32((val * scale));
+    return bf16_round_rne_f32_finite((val * scale));
 }
 
 // Fast FP8 dequant using LDS lookup table.
@@ -223,7 +239,7 @@ __device__ inline float fp8_dequant_weight_lut(
     int scale_col = col / block_size;
     int scale_cols = (cols + block_size - 1) / block_size;
     float scale = static_cast<float>(scales[scale_row * scale_cols + scale_col]);
-    return bf16_round_rne_f32((val * scale));
+    return bf16_round_rne_f32_finite((val * scale));
 }
 
 // =============================================================================
@@ -302,14 +318,14 @@ __device__ inline void int4_dequant_8(
         // Fast path: all 8 elements in same group — 1 scale + 1 zero load
         float s = static_cast<float>(scales[sb + g0]);
         float zs = static_cast<float>(zeros[sb + g0]) * s;  // precompute zero*scale
-        out[0] = bf16_round_rne_f32(static_cast<float>(n0) * s - zs);
-        out[1] = bf16_round_rne_f32(static_cast<float>(n1) * s - zs);
-        out[2] = bf16_round_rne_f32(static_cast<float>(n2) * s - zs);
-        out[3] = bf16_round_rne_f32(static_cast<float>(n3) * s - zs);
-        out[4] = bf16_round_rne_f32(static_cast<float>(n4) * s - zs);
-        out[5] = bf16_round_rne_f32(static_cast<float>(n5) * s - zs);
-        out[6] = bf16_round_rne_f32(static_cast<float>(n6) * s - zs);
-        out[7] = bf16_round_rne_f32(static_cast<float>(n7) * s - zs);
+        out[0] = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+        out[1] = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+        out[2] = bf16_round_rne_f32_finite(static_cast<float>(n2) * s - zs);
+        out[3] = bf16_round_rne_f32_finite(static_cast<float>(n3) * s - zs);
+        out[4] = bf16_round_rne_f32_finite(static_cast<float>(n4) * s - zs);
+        out[5] = bf16_round_rne_f32_finite(static_cast<float>(n5) * s - zs);
+        out[6] = bf16_round_rne_f32_finite(static_cast<float>(n6) * s - zs);
+        out[7] = bf16_round_rne_f32_finite(static_cast<float>(n7) * s - zs);
     } else {
         // Slow path: group boundary crossing — per-element lookup
         float s0 = static_cast<float>(scales[sb + g0]);
@@ -321,7 +337,7 @@ __device__ inline void int4_dequant_8(
             int gi = (col + idx) / gsz; \
             float si = (gi == g0) ? s0 : s1; \
             float zsi = (gi == g0) ? zs0 : zs1; \
-            out[idx] = bf16_round_rne_f32(static_cast<float>(ni) * si - zsi); \
+            out[idx] = bf16_round_rne_f32_finite(static_cast<float>(ni) * si - zsi); \
         } while(0)
         I4DQ(0, n0); I4DQ(1, n1); I4DQ(2, n2); I4DQ(3, n3);
         I4DQ(4, n4); I4DQ(5, n5); I4DQ(6, n6); I4DQ(7, n7);
@@ -343,7 +359,7 @@ __device__ inline float int4_dequant_scalar(
     int si = (row / group_size) * ((cols + group_size - 1) / group_size) + col / group_size;
     float s = static_cast<float>(scales[si]);
     // Round through BF16 so reconstruction matches Python's bf16-stored Q_dq.
-    return bf16_round_rne_f32(
+    return bf16_round_rne_f32_finite(
         static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
 }
 
@@ -2599,7 +2615,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
                 int sr = global_n / block_size;
                 int sc = global_k / block_size;
                 float s = dotcache_qwen35_to_float(scale[sr * scale_cols + sc]);
-                s_rhs[rr][rc] = bf16_round_rne_f32((fp8_val * s));
+                s_rhs[rr][rc] = bf16_round_rne_f32_finite((fp8_val * s));
             } else {
                 s_rhs[rr][rc] = 0.0f;
             }
@@ -2700,7 +2716,7 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
                 float z = dotcache_qwen35_to_float(zero[si]);
                 // Round through BF16 so prefill matches the decode megakernel's
                 // dequant path and the Python GPTQ reference (`bf16(q*s - zf*s)`).
-                s_rhs[rr][rc] = bf16_round_rne_f32(static_cast<float>(nibble) * s - z * s);
+                s_rhs[rr][rc] = bf16_round_rne_f32_finite(static_cast<float>(nibble) * s - z * s);
             } else {
                 s_rhs[rr][rc] = 0.0f;
             }
@@ -4016,10 +4032,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float w2 = fp8_lut[(packed >> 16) & 0xFF];
                             float w3 = fp8_lut[(packed >> 24) & 0xFF];
                             const int sb = scale_row * scale_cols;
-                            w0 = bf16_round_rne_f32((w0 * static_cast<float>(scales[sb + c / bsz])));
-                            w1 = bf16_round_rne_f32((w1 * static_cast<float>(scales[sb + (c+1) / bsz])));
-                            w2 = bf16_round_rne_f32((w2 * static_cast<float>(scales[sb + (c+2) / bsz])));
-                            w3 = bf16_round_rne_f32((w3 * static_cast<float>(scales[sb + (c+3) / bsz])));
+                            w0 = bf16_round_rne_f32_finite((w0 * static_cast<float>(scales[sb + c / bsz])));
+                            w1 = bf16_round_rne_f32_finite((w1 * static_cast<float>(scales[sb + (c+1) / bsz])));
+                            w2 = bf16_round_rne_f32_finite((w2 * static_cast<float>(scales[sb + (c+2) / bsz])));
+                            w3 = bf16_round_rne_f32_finite((w3 * static_cast<float>(scales[sb + (c+3) / bsz])));
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
@@ -4956,14 +4972,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         float us1 = static_cast<float>(u_scales[sb + (c+1) / bsz]);
                         float us2 = static_cast<float>(u_scales[sb + (c+2) / bsz]);
                         float us3 = static_cast<float>(u_scales[sb + (c+3) / bsz]);
-                        float gw0 = bf16_round_rne_f32((fp8_lut[gp4 & 0xFF] * gs0));
-                        float gw1 = bf16_round_rne_f32((fp8_lut[(gp4>>8) & 0xFF] * gs1));
-                        float gw2 = bf16_round_rne_f32((fp8_lut[(gp4>>16) & 0xFF] * gs2));
-                        float gw3 = bf16_round_rne_f32((fp8_lut[(gp4>>24)] * gs3));
-                        float uw0 = bf16_round_rne_f32((fp8_lut[up4 & 0xFF] * us0));
-                        float uw1 = bf16_round_rne_f32((fp8_lut[(up4>>8) & 0xFF] * us1));
-                        float uw2 = bf16_round_rne_f32((fp8_lut[(up4>>16) & 0xFF] * us2));
-                        float uw3 = bf16_round_rne_f32((fp8_lut[(up4>>24)] * us3));
+                        float gw0 = bf16_round_rne_f32_finite((fp8_lut[gp4 & 0xFF] * gs0));
+                        float gw1 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>8) & 0xFF] * gs1));
+                        float gw2 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>16) & 0xFF] * gs2));
+                        float gw3 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>24)] * gs3));
+                        float uw0 = bf16_round_rne_f32_finite((fp8_lut[up4 & 0xFF] * us0));
+                        float uw1 = bf16_round_rne_f32_finite((fp8_lut[(up4>>8) & 0xFF] * us1));
+                        float uw2 = bf16_round_rne_f32_finite((fp8_lut[(up4>>16) & 0xFF] * us2));
+                        float uw3 = bf16_round_rne_f32_finite((fp8_lut[(up4>>24)] * us3));
                         for (int b = 0; b < B; b++) {
                             const float* inp = lds_input + b * hidden_dim + c;
                             gp[b] += gw0*inp[0] + gw1*inp[1] + gw2*inp[2] + gw3*inp[3];
@@ -5073,10 +5089,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         for (int c = lane_d * 4; c < is4; c += warpSize * 4) {
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&d_fp8[c]);
                             const int sb = d_scale_row * d_scale_cols;
-                            float w0 = bf16_round_rne_f32((fp8_lut[pk & 0xFF] * static_cast<float>(d_scales[sb + c / bsz])));
-                            float w1 = bf16_round_rne_f32((fp8_lut[(pk>>8) & 0xFF] * static_cast<float>(d_scales[sb + (c+1) / bsz])));
-                            float w2 = bf16_round_rne_f32((fp8_lut[(pk>>16) & 0xFF] * static_cast<float>(d_scales[sb + (c+2) / bsz])));
-                            float w3 = bf16_round_rne_f32((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
+                            float w0 = bf16_round_rne_f32_finite((fp8_lut[pk & 0xFF] * static_cast<float>(d_scales[sb + c / bsz])));
+                            float w1 = bf16_round_rne_f32_finite((fp8_lut[(pk>>8) & 0xFF] * static_cast<float>(d_scales[sb + (c+1) / bsz])));
+                            float w2 = bf16_round_rne_f32_finite((fp8_lut[(pk>>16) & 0xFF] * static_cast<float>(d_scales[sb + (c+2) / bsz])));
+                            float w3 = bf16_round_rne_f32_finite((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
                             p += w0*lds_input[c] + w1*lds_input[c+1] + w2*lds_input[c+2] + w3*lds_input[c+3];
                         }
                         for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
