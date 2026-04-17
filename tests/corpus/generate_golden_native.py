@@ -48,7 +48,10 @@ def generate(binary, model, model_dir, test_defs_path, output_path, extra_flags=
             print(f"FAILED (exit {proc.returncode})")
             continue
 
-        full_output = proc.stdout.strip()
+        # Strip supersonic's trailing debug lines ([tokens] ... / [result] ...)
+        # so the golden records only the generated text.
+        lines = [ln for ln in proc.stdout.splitlines() if not ln.startswith("[")]
+        full_output = "\n".join(lines).strip()
         if full_output.startswith(prompt):
             generated = full_output[len(prompt):]
         else:

@@ -102,4 +102,7 @@ if [ -f "$GOLDEN_BATCH" ]; then
     CORPUS_TIMEOUT=600 "$REPO_ROOT/tests/corpus/run_golden.sh" qwen3.5-4b "$MODEL_DIR" "$GOLDEN_BATCH" "$SUPERSONIC" --batch-size 2
 fi
 
+# Test 6: Quant-path regression canary (--int4 / --kv-fp8 / combined)
+MODEL_DIR_4B="$MODEL_DIR" bash "$REPO_ROOT/tests/gfx1150/run_quant_regression.sh"
+
 echo "=== All tests passed ==="
