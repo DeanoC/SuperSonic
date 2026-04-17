@@ -15,6 +15,10 @@ path = "src/bin/int4_test.rs"
 name = "int4_real_test"
 path = "src/bin/int4_real_test.rs"
 
+[[bin]]
+name = "gemma4_primitive_test"
+path = "src/bin/gemma4_primitive_test.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
