@@ -33,6 +33,12 @@ With --emit-state, additionally:
                                         Embeddings (PLE) branch and layer_scalar
                                         multiply. Useful for Rust kernels that do
                                         not yet plumb PLE.)
+  per_layer_inputs                     (base64 BF16, shape
+                                        [num_hidden_layers, hidden_size_per_layer_input]).
+                                        Per-layer conditioning vector at the last
+                                        prompt token. Used inside each layer's PLE
+                                        branch: gelu_tanh(gate(hidden)) * per_layer_inputs[i].
+  per_layer_inputs_shape               (Vec<usize>)
 
 Usage:
     python3 gemma4_oracle.py \
@@ -205,6 +211,26 @@ def main() -> None:
                 "v_shape": list(v.shape),
             })
         state_payload["kv_caches"] = kv_caches
+
+        # Per-layer-input tensor consumed by each decoder layer's PLE branch.
+        # HF computes this once per forward by combining the raw per-layer
+        # embedding table lookup with a projection of the main embedding:
+        #   per_layer_inputs_raw = embed_tokens_per_layer(input_ids)
+        #       .reshape(..., num_layers, hidden_size_per_layer_input)
+        #   per_layer_projection = per_layer_model_projection(embed_tokens(ids)
+        #       * hidden_size**0.5) * hidden_size**-0.5
+        #   per_layer_projection = per_layer_projection_norm(per_layer_projection)
+        #   per_layer_inputs = (per_layer_projection + per_layer_inputs_raw)
+        #                       * per_layer_input_scale   (scale = 2**-0.5)
+        # We dump only the last prompt token's slice: shape
+        # [num_hidden_layers, hidden_size_per_layer_input].
+        with torch.no_grad():
+            pli_raw = language_model.get_per_layer_inputs(input_ids, None)
+            embeds_main = language_model.embed_tokens(input_ids)
+            pli_full = language_model.project_per_layer_inputs(embeds_main, pli_raw)
+        last_pli = pli_full[0, -1, :, :].to(torch_dtype)
+        state_payload["per_layer_inputs"] = tensor_to_b64(last_pli)
+        state_payload["per_layer_inputs_shape"] = list(last_pli.shape)
 
     decode_logits: list[list[float]] = []
     generated_ids: list[int] = []

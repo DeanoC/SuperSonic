@@ -36,6 +36,13 @@ pub struct OracleOutput {
     /// can recover the layer-0 input embedding without re-tokenizing.
     #[serde(default)]
     pub prompt_token_ids: Option<Vec<u32>>,
+    /// Per-layer conditioning vector at the last prompt token (Gemma 4 PLE).
+    /// Base64-encoded BF16 with shape `[num_hidden_layers, hidden_size_per_layer_input]`
+    /// (35x256 for E2B).
+    #[serde(default)]
+    pub per_layer_inputs: Option<String>,
+    #[serde(default)]
+    pub per_layer_inputs_shape: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -440,6 +440,14 @@ fn main() -> Result<()> {
         .prefill_per_layer_hidden
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing prefill_per_layer_hidden"))?;
+    let per_layer_inputs_b64 = oracle
+        .per_layer_inputs
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing per_layer_inputs; re-run gemma4_oracle.py"))?;
+    let per_layer_inputs_shape = oracle
+        .per_layer_inputs_shape
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing per_layer_inputs_shape"))?;
 
     // For E2B, HF's DynamicCache exposes 15 slots keyed by layer index; layer 0
     // maps to slot 0 directly.
@@ -529,6 +537,22 @@ fn main() -> Result<()> {
     let gate_proj = loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?;
     let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
     let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
+
+    // --- PLE branch weights ---
+    let per_layer_input_gate_w = loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?;
+    let per_layer_projection_w = loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?;
+    let post_per_layer_input_norm_w =
+        loader.load_bf16_to_gpu(&want("post_per_layer_input_norm.weight")?)?;
+    // layer_scalar is a [1]-shape BF16 weight — load to host and multiply on CPU
+    // at the end of the layer.
+    let layer_scalar_value: f32 = {
+        let (shape, bytes) = loader.tensor_bytes(&want("layer_scalar")?)?;
+        if shape != [1] {
+            bail!("layer_scalar shape {:?} != [1]", shape);
+        }
+        bf16_bytes_to_f32(bytes)[0]
+    };
+    let ple_hidden = tcfg.hidden_size_per_layer_input;
 
     // --- Input hidden for this layer ---
     // For layer 0 the input is just the scaled embedding; for layer N > 0 we
@@ -672,22 +696,98 @@ fn main() -> Result<()> {
     let x4_h = download_bf16(&x4)?;
     let h_out: Vec<f32> = residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
 
-    // --- Compare against oracle pre-PLE for this layer ---
-    let want_bytes = B64
+    // --- Compare pre-PLE hidden against oracle as a diagnostic checkpoint ---
+    let pre_ple_want_bytes = B64
         .decode(&pre_ple[cli.layer])
         .context("decode prefill_per_layer_pre_ple base64")?;
-    let want_f32 = bf16_bytes_to_f32(&want_bytes);
-    if want_f32.len() != hidden_size {
-        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, want_f32.len(), hidden_size);
+    let pre_ple_want = bf16_bytes_to_f32(&pre_ple_want_bytes);
+    if pre_ple_want.len() != hidden_size {
+        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, pre_ple_want.len(), hidden_size);
     }
-
-    let stats = compare_vectors(&h_out, &want_f32)?;
+    let pre_ple_stats = compare_vectors(&h_out, &pre_ple_want)?;
     println!(
-        "[layer{}] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}",
-        cli.layer, stats.cos_sim, stats.max_abs, stats.rel_err_norm
+        "[layer{} pre-PLE] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}",
+        cli.layer, pre_ple_stats.cos_sim, pre_ple_stats.max_abs, pre_ple_stats.rel_err_norm
     );
-    let first: Vec<String> = h_out.iter().take(6).map(|v| format!("{v:+.4}")).collect();
-    let want_first: Vec<String> = want_f32.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+
+    // --- PLE branch: gate → gelu_tanh → * per_layer_input[N] → projection →
+    //     post_per_layer_input_norm → residual add → * layer_scalar ---
+    if per_layer_inputs_shape.len() != 2
+        || per_layer_inputs_shape[0] != tcfg.num_hidden_layers
+        || per_layer_inputs_shape[1] != ple_hidden
+    {
+        bail!(
+            "per_layer_inputs shape {:?} != [{}, {}]",
+            per_layer_inputs_shape, tcfg.num_hidden_layers, ple_hidden
+        );
+    }
+    let all_pli_bytes = B64
+        .decode(per_layer_inputs_b64)
+        .context("decode per_layer_inputs base64")?;
+    let bytes_per_layer = ple_hidden * 2;
+    let pli_off = cli.layer * bytes_per_layer;
+    let pli_slice = &all_pli_bytes[pli_off..pli_off + bytes_per_layer];
+    let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
+    let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
+
+    let ple_residual = upload_bf16(&[hidden_size], &h_out)?;
+    let h_in_ple = ple_residual.clone_device()?;
+
+    // gated = per_layer_input_gate @ h_out   [hidden → ple_hidden]
+    let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+    g4::matvec(
+        0, dtype, &mut gated, &h_in_ple, &per_layer_input_gate_w,
+        hidden_size, ple_hidden, &mut counter,
+    )?;
+
+    // gated_act[i] = gelu_tanh(gated[i]) * per_layer_input[i]
+    let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+    g4::gelu_tanh_gate_mul(
+        0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
+    )?;
+
+    // projected = per_layer_projection @ gated_act  [ple_hidden → hidden]
+    let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::matvec(
+        0, dtype, &mut projected, &gated_act, &per_layer_projection_w,
+        ple_hidden, hidden_size, &mut counter,
+    )?;
+
+    // normed = RMSNorm(projected, post_per_layer_input_norm.weight)
+    let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(
+        0, dtype, &mut normed, &projected, Some(&post_per_layer_input_norm_w),
+        eps, hidden_size,
+    )?;
+
+    // h_post_ple = ple_residual + normed, then multiplied by layer_scalar.
+    let residual_h = download_bf16(&ple_residual)?;
+    let normed_h = download_bf16(&normed)?;
+    let h_post_ple: Vec<f32> = residual_h
+        .iter()
+        .zip(normed_h.iter())
+        .map(|(a, b)| (a + b) * layer_scalar_value)
+        .collect();
+
+    // --- Compare against oracle post-PLE for this layer ---
+    let post_ple_want_bytes = B64
+        .decode(&per_layer_hidden[cli.layer])
+        .context("decode prefill_per_layer_hidden base64")?;
+    let post_ple_want = bf16_bytes_to_f32(&post_ple_want_bytes);
+    if post_ple_want.len() != hidden_size {
+        bail!(
+            "per_layer_hidden[{}] len {} != hidden_size {}",
+            cli.layer, post_ple_want.len(), hidden_size
+        );
+    }
+    let post_ple_stats = compare_vectors(&h_post_ple, &post_ple_want)?;
+    println!(
+        "[layer{} post-PLE] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6} (layer_scalar={:.4})",
+        cli.layer, post_ple_stats.cos_sim, post_ple_stats.max_abs,
+        post_ple_stats.rel_err_norm, layer_scalar_value,
+    );
+    let first: Vec<String> = h_post_ple.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    let want_first: Vec<String> = post_ple_want.iter().take(6).map(|v| format!("{v:+.4}")).collect();
     println!("  got[..6]  = [{}]", first.join(", "));
     println!("  want[..6] = [{}]", want_first.join(", "));
 
@@ -695,10 +795,10 @@ fn main() -> Result<()> {
     let _ = (q_proj.as_ptr(), k_proj.as_ptr(), v_proj.as_ptr(), o_proj.as_ptr());
     let _: *const c_void = gate_proj.as_ptr();
 
-    if stats.cos_sim < 0.999 {
+    if post_ple_stats.cos_sim < 0.999 {
         bail!(
-            "cosine similarity {:.6} below acceptance threshold 0.999",
-            stats.cos_sim
+            "post-PLE cosine similarity {:.6} below acceptance threshold 0.999",
+            post_ple_stats.cos_sim
         );
     }
     println!("PASS");
