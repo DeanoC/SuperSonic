@@ -1,29 +1,32 @@
-//! End-to-end single-layer correctness check for the Gemma 4 SWA decode path.
+//! End-to-end single-layer correctness check for the Gemma 4 decode path.
 //!
 //! Given a Gemma 4 E2B checkpoint directory and an oracle JSON produced with
-//! `oracle/gemma4_oracle.py --emit-state`, this binary runs layer 0 (sliding-
-//! window attention) through the Rust-side primitive kernels and compares the
-//! resulting *pre-PLE* hidden state against the oracle's snapshot. Layer 0 is
-//! always SWA for E2B; the task description in the session kickoff commits to
-//! validating SWA first and deferring full-attention / PLE / shared-KV.
+//! `oracle/gemma4_oracle.py --emit-state`, this binary runs a single
+//! transformer layer through the Rust-side primitive kernels and compares the
+//! resulting *pre-PLE* hidden state against the oracle's snapshot. Works for
+//! both sliding-window (SWA) layers and full-attention layers.
 //!
-//! The layer-0 input hidden is reconstructed from the tokenizer-output prompt
-//! IDs (emitted by the oracle as `prompt_token_ids`) by looking up the last
+//! Layer 0 input is reconstructed from the tokenizer-output prompt IDs
+//! (emitted by the oracle as `prompt_token_ids`) by looking up the last
 //! token's row in `embed_tokens.weight` and scaling by `sqrt(hidden_size)` —
 //! Gemma 4's `Gemma4TextScaledWordEmbedding` multiplies by embed_scale at
-//! lookup time.
+//! lookup time. For layer N > 0, the input hidden is sourced from the
+//! oracle's `prefill_per_layer_hidden[N-1]` (layer N-1's post-block,
+//! post-PLE+layer_scalar output) — this side-steps PLE plumbing entirely
+//! so the full-attention path can be validated in isolation.
 //!
-//! The K/V cache is seeded from the oracle's `kv_caches[0]` (layer 0 is the
-//! first SWA slot). The last entry is truncated before our kernel runs, then
-//! re-appended via `g4::kv_append` after the current-token K/V are
-//! computed — this exercises the full K/V path end-to-end.
+//! The K/V cache is seeded from the oracle's `kv_caches[layer]`. The last
+//! entry is truncated before our kernel runs, then re-appended via
+//! `g4::kv_append` after the current-token K/V are computed — this exercises
+//! the full K/V path end-to-end.
 //!
 //! Usage:
 //!   cargo run --release --bin gemma4_layer0_validate -- \
-//!     --model-dir <checkpoint> --oracle-json <oracle_state.json> [--layer 0]
+//!     --model-dir <checkpoint> --oracle-json <oracle_state.json> [--layer N]
 //!
 //! Expected outcome: cosine similarity ≥ 0.999 between our Rust kernel's
-//! pre-PLE hidden state at the last prompt token and `prefill_per_layer_pre_ple[0]`.
+//! pre-PLE hidden state at the last prompt token and
+//! `prefill_per_layer_pre_ple[layer]`.
 
 use std::ffi::c_void;
 use std::fs::File;
@@ -169,26 +172,29 @@ impl UnbakedLoader {
 }
 
 // -----------------------------------------------------------------------------
-// Build a sliding-attn RoPE table (theta=10000, partial_rotary_factor=1.0)
-// matching HF's `emb = cat((freqs, freqs), dim=-1)` layout. Only the first
-// `half` values per row are read by the kernel; the second half is filled
-// with the same values so the table is a faithful mirror of HF's emb.
+// Build a Gemma 4 RoPE cos/sin table of shape [max_pos, head_dim] matching
+// HF's `emb = cat((freqs, freqs), dim=-1)` layout.
+//
+// Given an inv_freq vector of length head_dim/2 (possibly zero-padded for the
+// "nope" portion of proportional RoPE), produce:
+//   cos[p, i]        = cos(p * inv_freq[i])         for i in 0..half
+//   sin[p, i]        = sin(p * inv_freq[i])         for i in 0..half
+//   cos[p, i+half]   = cos[p, i]                    (duplicate per HF cat)
+//   sin[p, i+half]   = sin[p, i]                    (duplicate per HF cat)
+//
+// `attention_scaling` multiplies both cos and sin (HF applies this
+// post-emb). For Gemma 4 proportional RoPE attention_factor == 1.0.
 // -----------------------------------------------------------------------------
 
-fn build_sliding_rope_table(
+fn build_rope_table_from_inv_freq(
+    inv_freq: &[f32],
     head_dim: usize,
-    rope_theta: f64,
     max_pos: usize,
+    attention_scaling: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     assert!(head_dim % 2 == 0);
     let half = head_dim / 2;
-
-    // inv_freq[i] = 1 / theta^(2i/head_dim), i in 0..half
-    let mut inv_freq = Vec::with_capacity(half);
-    for i in 0..half {
-        let exponent = (2 * i) as f64 / head_dim as f64;
-        inv_freq.push((1.0 / rope_theta.powf(exponent)) as f32);
-    }
+    assert_eq!(inv_freq.len(), half);
 
     let mut cos = vec![0.0f32; max_pos * head_dim];
     let mut sin = vec![0.0f32; max_pos * head_dim];
@@ -196,15 +202,60 @@ fn build_sliding_rope_table(
         for i in 0..half {
             let theta = (p as f32) * inv_freq[i];
             let (s, c) = theta.sin_cos();
-            // First half: cos[p, i] / sin[p, i]
+            let c = c * attention_scaling;
+            let s = s * attention_scaling;
             cos[p * head_dim + i] = c;
             sin[p * head_dim + i] = s;
-            // Second half: duplicated (matches HF cat((freqs, freqs), dim=-1))
             cos[p * head_dim + i + half] = c;
             sin[p * head_dim + i + half] = s;
         }
     }
     (cos, sin)
+}
+
+/// Sliding-attention RoPE (rope_type="default"). Applies to all head_dim/2
+/// frequency slots (partial_rotary_factor=1.0 on E2B sliding layers).
+fn build_sliding_rope_table(
+    head_dim: usize,
+    rope_theta: f64,
+    max_pos: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let mut inv_freq = Vec::with_capacity(half);
+    for i in 0..half {
+        let exponent = (2 * i) as f64 / head_dim as f64;
+        inv_freq.push((1.0 / rope_theta.powf(exponent)) as f32);
+    }
+    build_rope_table_from_inv_freq(&inv_freq, head_dim, max_pos, 1.0)
+}
+
+/// Full-attention RoPE for Gemma 4 (rope_type="proportional"). Mirrors HF's
+/// `_compute_proportional_rope_parameters` in `modeling_rope_utils.py`.
+///
+/// Differences from default RoPE:
+///   * Only the first `rope_angles = floor(partial_rotary_factor * head_dim / 2)`
+///     frequency slots are populated; the rest are zero ("nope" positions).
+///   * inv_freq[j] = 1 / rope_theta^(2j / head_dim) — note the denominator is
+///     `head_dim`, not `dim = head_dim * partial_rotary_factor` as in default.
+///   * attention_factor is always 1.0 per HF's implementation (and the
+///     kernel is called with `rotary_dim = head_dim` so the nope slots simply
+///     pass through via cos=1, sin=0).
+fn build_proportional_rope_table(
+    head_dim: usize,
+    rope_theta: f64,
+    partial_rotary_factor: f64,
+    max_pos: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let half = head_dim / 2;
+    let rope_angles = (partial_rotary_factor * (head_dim as f64) / 2.0) as usize;
+    assert!(rope_angles <= half, "rope_angles {rope_angles} > head_dim/2 {half}");
+
+    let mut inv_freq = vec![0.0f32; half];
+    for j in 0..rope_angles {
+        let exponent = (2 * j) as f64 / head_dim as f64;
+        inv_freq[j] = (1.0 / rope_theta.powf(exponent)) as f32;
+    }
+    build_rope_table_from_inv_freq(&inv_freq, head_dim, max_pos, 1.0)
 }
 
 // -----------------------------------------------------------------------------
@@ -244,11 +295,12 @@ fn load_scaled_embed_row(
 }
 
 // -----------------------------------------------------------------------------
-// KV cache setup: oracle stores [1, 1, prompt_tokens, 256] (batch, kv_heads,
-// seq, head_dim) BF16. Our kernel layout is [num_kv_heads=1, max_T, head_dim].
-// With `num_kv_heads=1` and `max_T = prompt_tokens`, the byte layout is the
-// same as the oracle dump for positions 0..prompt_tokens — we pre-fill all
-// positions except the last, then let `kv_append` write the last slot.
+// KV cache setup: oracle stores [1, num_kv_heads, prompt_tokens, head_dim]
+// (BF16). Our kernel layout is [num_kv_heads, max_T, head_dim]. With
+// `max_T = prompt_tokens`, the byte layout matches the oracle for positions
+// 0..prompt_tokens — we pre-fill all positions except the last, then let
+// `kv_append` write the last slot. head_dim is 256 for SWA layers and 512
+// for full-attention layers on E2B.
 // -----------------------------------------------------------------------------
 
 fn seed_kv_cache_from_oracle(
@@ -360,13 +412,6 @@ fn main() -> Result<()> {
     let kind = tcfg
         .attn_kind(cli.layer)
         .ok_or_else(|| anyhow!("layer {} has no attention kind", cli.layer))?;
-    if kind != AttnKind::Sliding {
-        bail!(
-            "layer {} is {:?}; this binary only validates sliding_attention layers",
-            cli.layer,
-            kind
-        );
-    }
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
@@ -391,6 +436,10 @@ fn main() -> Result<()> {
         .prefill_per_layer_pre_ple
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing prefill_per_layer_pre_ple"))?;
+    let per_layer_hidden = oracle
+        .prefill_per_layer_hidden
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing prefill_per_layer_hidden"))?;
 
     // For E2B, HF's DynamicCache exposes 15 slots keyed by layer index; layer 0
     // maps to slot 0 directly.
@@ -420,22 +469,36 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("prompt_tokens == 0"))?;
     let pos = prompt_tokens - 1;
 
-    // --- Model geometry for layer 0 ---
+    // --- Model geometry for this layer ---
     let hidden_size = tcfg.hidden_size;
     let head_dim = tcfg.head_dim_for(kind);
-    let rotary_dim = head_dim; // sliding: partial_rotary_factor = 1.0
+    // We always pass rotary_dim = head_dim to the kernel. Gemma 4's RoPE
+    // applies rotate_half at head_dim/2 granularity (not rotary_dim/2); when
+    // partial_rotary_factor < 1 the "nope" frequency slots simply carry
+    // cos=1, sin=0, so those lanes pass through unchanged. This avoids the
+    // mismatch that would arise if we set rotary_dim < head_dim (kernel would
+    // then rotate at rotary_dim/2, disagreeing with HF's apply_rotary_pos_emb).
+    let rotary_dim = head_dim;
     let num_q_heads = tcfg.num_attention_heads;
     let num_kv_heads = tcfg.num_key_value_heads;
     let q_dim = num_q_heads * head_dim;
     let kv_dim = num_kv_heads * head_dim;
     let intermediate_size = g4_spec::mlp_intermediate(tcfg, cli.layer);
     let eps = tcfg.rms_norm_eps as f32;
-    let sliding_window = tcfg.sliding_window as i32;
-    let rope_theta = tcfg.rope_for(kind).rope_theta;
+    let rope = tcfg.rope_for(kind);
+    let rope_theta = rope.rope_theta;
+    let partial_rotary_factor = rope.partial_rotary_factor;
+    // sliding_window <= 0 disables the mask inside swa_attn_decode, turning
+    // it into full attention.
+    let sliding_window = match kind {
+        AttnKind::Sliding => tcfg.sliding_window as i32,
+        AttnKind::Full => 0,
+    };
     let max_t = prompt_tokens; // tight fit
 
     println!(
-        "[layer0] prompt_tokens={prompt_tokens} last_token_id={last_token_id} head_dim={head_dim} q_dim={q_dim} kv_dim={kv_dim} imm={intermediate_size}"
+        "[layer{}] kind={:?} prompt_tokens={prompt_tokens} last_token_id={last_token_id} head_dim={head_dim} rotary_dim={rotary_dim} q_dim={q_dim} kv_dim={kv_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor}",
+        cli.layer, kind,
     );
 
     // --- Load layer-0 safetensors weights ---
@@ -467,13 +530,42 @@ fn main() -> Result<()> {
     let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
     let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
 
-    // --- Layer-0 input hidden: embed_tokens[last] * sqrt(hidden) ---
-    let h_in_host =
-        load_scaled_embed_row(&loader, &format!("{weight_prefix}.embed_tokens.weight"), last_token_id, hidden_size)?;
+    // --- Input hidden for this layer ---
+    // For layer 0 the input is just the scaled embedding; for layer N > 0 we
+    // side-step PLE plumbing by reading layer N-1's post-block output straight
+    // from the oracle (which already includes the PLE + layer_scalar that HF
+    // applies before feeding into layer N).
+    let h_in_host: Vec<f32> = if cli.layer == 0 {
+        load_scaled_embed_row(
+            &loader,
+            &format!("{weight_prefix}.embed_tokens.weight"),
+            last_token_id,
+            hidden_size,
+        )?
+    } else {
+        let b64 = &per_layer_hidden[cli.layer - 1];
+        let bytes = B64.decode(b64).context("decode prefill_per_layer_hidden base64")?;
+        let full = bf16_bytes_to_f32(&bytes);
+        if full.len() != hidden_size {
+            bail!(
+                "prefill_per_layer_hidden[{}] len {} != hidden_size {}",
+                cli.layer - 1,
+                full.len(),
+                hidden_size
+            );
+        }
+        full
+    };
     let mut h_in = upload_bf16(&[hidden_size], &h_in_host)?;
 
-    // --- RoPE tables (sliding layer) ---
-    let (cos_host, sin_host) = build_sliding_rope_table(head_dim, rope_theta, prompt_tokens);
+    // --- RoPE tables: sliding uses default RoPE with full rotation;
+    //     full-attn uses proportional RoPE with partial_rotary_factor=0.25 ---
+    let (cos_host, sin_host) = match kind {
+        AttnKind::Sliding => build_sliding_rope_table(head_dim, rope_theta, prompt_tokens),
+        AttnKind::Full => build_proportional_rope_table(
+            head_dim, rope_theta, partial_rotary_factor, prompt_tokens,
+        ),
+    };
     let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
     let sin_table = upload_bf16(&[prompt_tokens, head_dim], &sin_host)?;
 
