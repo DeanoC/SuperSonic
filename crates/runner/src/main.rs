@@ -671,6 +671,37 @@ fn run_gemma4(
     )?;
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
+    // Optional oracle (runs BEFORE prefill so we can compare every step).
+    // The Gemma 4 oracle does its own CPU forward pass — expensive (~seconds to
+    // minutes depending on prompt length) but fully self-consistent with HF.
+    let oracle_output = if cli.validate {
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/gemma4_oracle.py");
+        let oracle = oracle::run_gemma4_oracle(
+            &oracle_script,
+            &cli.model_dir,
+            &cli.prompt,
+            cli.max_new_tokens,
+            &cli.oracle_dtype,
+        )?;
+        // Cross-check tokenization — if the Python tokenizer disagrees with
+        // ours, logit comparison is meaningless, so fail loudly.
+        if let Some(ref oracle_ids) = oracle.prompt_token_ids {
+            if oracle_ids != &prompt_ids {
+                anyhow::bail!(
+                    "tokenizer mismatch between Rust and Python oracle: \
+                     rust={prompt_ids:?} oracle={oracle_ids:?}"
+                );
+            }
+        }
+        Some(oracle)
+    } else {
+        None
+    };
+
     // Native prefill.
     let prefill_start = Instant::now();
     let prefill_logits = engine.prefill(&prompt_ids)?;
@@ -680,10 +711,24 @@ fn run_gemma4(
         prefill_start.elapsed().as_millis()
     );
 
+    // Prefill delta vs oracle (if --validate).
+    if let Some(ref oracle) = oracle_output {
+        let prefill_delta = validate::max_abs_delta(&prefill_logits, &oracle.prefill_logits);
+        eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
+        let oracle_first = oracle.generated_token_ids[0];
+        if oracle_first != next_token {
+            eprintln!(
+                "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+            );
+        }
+    }
+
     // Decode loop.
     let seqlen_start = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let eos_ids = t.eos_token_ids();
+    let mut max_delta = 0.0f32;
+    let mut token_mismatches = 0usize;
 
     let decode_start = Instant::now();
     for step in 0..cli.max_new_tokens {
@@ -692,6 +737,37 @@ fn run_gemma4(
         }
         let pos = seqlen_start + step;
         let logits = engine.decode_step(next_token, pos)?;
+
+        if let Some(ref oracle) = oracle_output {
+            if step < oracle.decode_logits.len() {
+                let oracle_logits = &oracle.decode_logits[step];
+                let delta = validate::max_abs_delta(&logits, oracle_logits);
+                if delta > max_delta {
+                    max_delta = delta;
+                }
+                // Step k's input token is the one we just sampled at the end
+                // of step k-1 (or prefill for step 0). The oracle picks the
+                // same input greedy path, so generated_token_ids[step+1] is
+                // the oracle's next-output for this step's logits.
+                let oracle_next = if step + 1 < oracle.generated_token_ids.len() {
+                    Some(oracle.generated_token_ids[step + 1])
+                } else {
+                    None
+                };
+                let rust_next = gemma4_engine::Gemma4Engine::greedy_sample(&logits);
+                let mismatch_tag = match oracle_next {
+                    Some(ot) if ot != rust_next => {
+                        token_mismatches += 1;
+                        format!(" MISMATCH (oracle_next={ot})")
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[validate] step={step} pos={pos} delta={delta:.4} input_tok={next_token} rust_next={rust_next}{mismatch_tag}"
+                );
+            }
+        }
+
         let sampled = gemma4_engine::Gemma4Engine::greedy_sample(&logits);
         generated_ids.push(next_token);
         next_token = sampled;
@@ -717,7 +793,7 @@ fn run_gemma4(
             .join(" ")
     );
     eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0}",
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0}{}",
         prompt_ids.len(),
         generated_ids.len(),
         if generated_ids.is_empty() {
@@ -725,14 +801,11 @@ fn run_gemma4(
         } else {
             decode_ms / generated_ids.len() as f64
         },
+        if oracle_output.is_some() {
+            format!(" decode_max_delta={max_delta:.4} token_mismatches={token_mismatches}")
+        } else {
+            String::new()
+        },
     );
-
-    // --validate not yet plumbed for Gemma 4.
-    if cli.validate {
-        eprintln!(
-            "[validate] --validate is not yet wired for Gemma 4; \
-             use `cargo run --bin gemma4_e2e_validate` for oracle comparison."
-        );
-    }
     Ok(())
 }

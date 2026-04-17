@@ -118,3 +118,43 @@ pub fn run_oracle(
     );
     Ok(oracle)
 }
+
+/// Run the Gemma 4 oracle (`oracle/gemma4_oracle.py`) for a single prompt.
+/// Unlike the Qwen oracle, this one loads weights directly from `model_dir`
+/// and tokenizes the prompt string Python-side. Caller should verify
+/// `output.prompt_token_ids` matches its own tokenization.
+pub fn run_gemma4_oracle(
+    oracle_script: &Path,
+    model_dir: &Path,
+    prompt: &str,
+    max_new_tokens: usize,
+    dtype: &str,
+) -> Result<OracleOutput> {
+    let mut cmd = Command::new("python3");
+    cmd.arg(oracle_script)
+        .arg("--model-dir").arg(model_dir)
+        .arg("--prompt").arg(prompt)
+        .arg("--max-new-tokens").arg(max_new_tokens.to_string())
+        .arg("--dtype").arg(dtype);
+
+    eprintln!(
+        "[oracle] running: python3 {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype}",
+        oracle_script.display(),
+        model_dir.display(),
+    );
+
+    let output = cmd.output().context("failed to start gemma4 oracle process")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("gemma4 oracle failed (exit {}): {stderr}", output.status);
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("gemma4 oracle stdout not UTF-8")?;
+    let oracle: OracleOutput = serde_json::from_str(&stdout)
+        .context("failed to parse gemma4 oracle JSON output")?;
+    eprintln!(
+        "[oracle] done: load={:.0}ms prefill={:.0}ms decode={:.0}ms tokens={}",
+        oracle.load_ms, oracle.prefill_ms, oracle.decode_ms, oracle.generated_tokens
+    );
+    Ok(oracle)
+}
