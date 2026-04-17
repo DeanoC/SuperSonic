@@ -26,6 +26,11 @@ pub struct OracleOutput {
     /// kernel output against PyTorch.
     pub prefill_per_layer_hidden: Option<Vec<String>>,
     pub prefill_per_layer_hidden_shape: Option<Vec<usize>>,
+    /// Per-layer hidden state snapshot taken just BEFORE the Per-Layer-Embeddings
+    /// (PLE) branch and `layer_scalar` multiply — i.e. right after
+    /// `residual + post_feedforward_layernorm(mlp_out)`. This is the checkpoint
+    /// a Rust kernel can hit without implementing PLE yet.
+    pub prefill_per_layer_pre_ple: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]

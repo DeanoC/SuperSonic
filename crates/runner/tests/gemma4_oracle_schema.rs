@@ -36,6 +36,7 @@ fn gemma4_oracle_json_deserializes_into_oracle_output() {
     assert!(parsed.recurrent_states.is_none());
     assert!(parsed.prefill_per_layer_hidden.is_none());
     assert!(parsed.prefill_per_layer_hidden_shape.is_none());
+    assert!(parsed.prefill_per_layer_pre_ple.is_none());
 }
 
 #[test]
@@ -92,4 +93,12 @@ fn gemma4_oracle_state_json_deserializes_and_layout_matches_e2b() {
         .as_ref()
         .expect("prefill_per_layer_hidden_shape missing");
     assert_eq!(per_layer_shape, &vec![1, 1, 1536]);
+
+    // Pre-PLE snapshot: same count, same implicit shape. Same-length base64
+    // stub assertion is sufficient schema-level coverage.
+    let pre_ple = parsed
+        .prefill_per_layer_pre_ple
+        .as_ref()
+        .expect("prefill_per_layer_pre_ple missing");
+    assert_eq!(pre_ple.len(), 35);
 }

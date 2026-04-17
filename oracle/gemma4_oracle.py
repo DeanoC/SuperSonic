@@ -28,6 +28,11 @@ With --emit-state, additionally:
                                         layer kernel validation.)
   prefill_per_layer_hidden_shape       (Vec<usize>, shape of each entry — always
                                         [1, 1, hidden])
+  prefill_per_layer_pre_ple            (Vec<base64 BF16>, 35 entries — hidden state
+                                        at the same checkpoint BEFORE the Per-Layer-
+                                        Embeddings (PLE) branch and layer_scalar
+                                        multiply. Useful for Rust kernels that do
+                                        not yet plumb PLE.)
 
 Usage:
     python3 gemma4_oracle.py \
@@ -100,13 +105,37 @@ def main() -> None:
 
     state_payload: dict = {}
     if args.emit_state:
+        # Install forward pre-hooks on each decoder layer's `per_layer_input_gate`
+        # to snapshot the hidden state right BEFORE the PLE branch runs (which is
+        # the checkpoint our Rust kernel can reach without plumbing PLE). The
+        # hook fires with a 1-tuple `(hidden_states,)` matching the gate's
+        # forward signature.
+        pre_ple_snapshots: dict[int, torch.Tensor] = {}
+        hook_handles: list = []
+        language_model = model.model if hasattr(model, "model") else model
+        for layer_idx, layer in enumerate(language_model.layers):
+            if not getattr(layer, "hidden_size_per_layer_input", 0):
+                continue
+            gate = layer.per_layer_input_gate
+
+            def make_hook(idx: int):
+                def hook(_module, inputs):
+                    pre_ple_snapshots[idx] = inputs[0].detach().clone()
+                return hook
+
+            hook_handles.append(gate.register_forward_pre_hook(make_hook(layer_idx)))
+
         # Re-run the language stack with output_hidden_states=True to grab the
         # post-final-norm hidden state at the last prompt token. Keep use_cache=False
         # to avoid mutating `past` (we keep the prefill cache from the call above).
-        with torch.no_grad():
-            inner = model.model(
-                input_ids=input_ids, use_cache=False, output_hidden_states=True,
-            )
+        try:
+            with torch.no_grad():
+                inner = model.model(
+                    input_ids=input_ids, use_cache=False, output_hidden_states=True,
+                )
+        finally:
+            for h in hook_handles:
+                h.remove()
         last_hidden = inner.last_hidden_state[:, -1:, :]  # [1, 1, hidden]
         state_payload["prefill_hidden"] = tensor_to_b64(last_hidden.to(torch_dtype))
         state_payload["prefill_hidden_shape"] = list(last_hidden.shape)
@@ -131,6 +160,21 @@ def main() -> None:
                 per_layer_shape = list(last.shape)
         state_payload["prefill_per_layer_hidden"] = per_layer
         state_payload["prefill_per_layer_hidden_shape"] = per_layer_shape
+
+        # Drain pre-PLE snapshots collected via the forward pre-hooks on the
+        # second forward pass above. Each snapshot has shape [1, seq_len, hidden];
+        # take the last prompt token, same slicing convention as the post-layer dump.
+        pre_ple_entries: list[str] = []
+        for i in range(len(hidden_tuple) - 1):
+            snap = pre_ple_snapshots.get(i)
+            if snap is None:
+                raise RuntimeError(
+                    f"pre-PLE hook fired no snapshot for layer {i}; does this layer "
+                    "have hidden_size_per_layer_input=0?"
+                )
+            last = snap[:, -1:, :].to(torch_dtype)
+            pre_ple_entries.append(tensor_to_b64(last))
+        state_payload["prefill_per_layer_pre_ple"] = pre_ple_entries
 
         # 15 cache entries for E2B (35 layers - 20 shared). SWA layers store
         # k/v at head_dim=256, full layers at head_dim=512. We preserve HF's
