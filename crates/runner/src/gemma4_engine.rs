@@ -41,9 +41,9 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
     out
 }
 
-fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
+fn upload_bf16(device: usize, shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(device, ScalarType::BF16, shape, &bytes)?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -119,9 +119,9 @@ impl UnbakedLoader {
         Ok((view.shape().to_vec(), view.data()))
     }
 
-    fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
+    fn load_bf16_to_gpu(&self, device: usize, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(device, ScalarType::BF16, &shape, bytes)?)
     }
 }
 
@@ -258,6 +258,7 @@ fn gather_ple_raw_batch(
 }
 
 fn copy_kv_slots_range(
+    device: usize,
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
     num_kv_heads: usize,
@@ -272,7 +273,7 @@ fn copy_kv_slots_range(
         let bytes = count * row_bytes;
         let src_ptr = src.offset_ptr(byte_off);
         let dst_ptr = unsafe { (dst.as_mut_ptr() as *mut u8).add(byte_off) as *mut c_void };
-        gpu_hal::copy_d2d(0, dst_ptr, src_ptr, bytes)
+        gpu_hal::copy_d2d(device, dst_ptr, src_ptr, bytes)
             .map_err(|e| anyhow!("copy_kv_slots_range: {e}"))?;
     }
     Ok(())
@@ -306,6 +307,7 @@ struct LayerWeights {
 
 fn load_layer_weights(
     loader: &UnbakedLoader,
+    device: usize,
     tcfg: &TextConfig,
     weight_prefix: &str,
     layer_idx: usize,
@@ -340,9 +342,9 @@ fn load_layer_weights(
         (None, None, None)
     } else {
         (
-            Some(loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?),
+            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_proj.weight")?)?),
+            Some(loader.load_bf16_to_gpu(device, &want("self_attn.v_proj.weight")?)?),
+            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_norm.weight")?)?),
         )
     };
 
@@ -353,23 +355,23 @@ fn load_layer_weights(
         shared_kv,
         kv_source,
         layer_scalar: layer_scalar_value,
-        input_norm: loader.load_bf16_to_gpu(&want("input_layernorm.weight")?)?,
-        q_proj: loader.load_bf16_to_gpu(&want("self_attn.q_proj.weight")?)?,
-        q_norm: loader.load_bf16_to_gpu(&want("self_attn.q_norm.weight")?)?,
+        input_norm: loader.load_bf16_to_gpu(device, &want("input_layernorm.weight")?)?,
+        q_proj: loader.load_bf16_to_gpu(device, &want("self_attn.q_proj.weight")?)?,
+        q_norm: loader.load_bf16_to_gpu(device, &want("self_attn.q_norm.weight")?)?,
         k_proj,
         v_proj,
         k_norm,
-        o_proj: loader.load_bf16_to_gpu(&want("self_attn.o_proj.weight")?)?,
-        post_attn_norm: loader.load_bf16_to_gpu(&want("post_attention_layernorm.weight")?)?,
-        pre_ff_norm: loader.load_bf16_to_gpu(&want("pre_feedforward_layernorm.weight")?)?,
-        post_ff_norm: loader.load_bf16_to_gpu(&want("post_feedforward_layernorm.weight")?)?,
-        gate_proj: loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?,
-        up_proj: loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?,
-        down_proj: loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?,
-        per_layer_input_gate_w: loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?,
-        per_layer_projection_w: loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?,
+        o_proj: loader.load_bf16_to_gpu(device, &want("self_attn.o_proj.weight")?)?,
+        post_attn_norm: loader.load_bf16_to_gpu(device, &want("post_attention_layernorm.weight")?)?,
+        pre_ff_norm: loader.load_bf16_to_gpu(device, &want("pre_feedforward_layernorm.weight")?)?,
+        post_ff_norm: loader.load_bf16_to_gpu(device, &want("post_feedforward_layernorm.weight")?)?,
+        gate_proj: loader.load_bf16_to_gpu(device, &want("mlp.gate_proj.weight")?)?,
+        up_proj: loader.load_bf16_to_gpu(device, &want("mlp.up_proj.weight")?)?,
+        down_proj: loader.load_bf16_to_gpu(device, &want("mlp.down_proj.weight")?)?,
+        per_layer_input_gate_w: loader.load_bf16_to_gpu(device, &want("per_layer_input_gate.weight")?)?,
+        per_layer_projection_w: loader.load_bf16_to_gpu(device, &want("per_layer_projection.weight")?)?,
         post_per_layer_input_norm_w: loader
-            .load_bf16_to_gpu(&want("post_per_layer_input_norm.weight")?)?,
+            .load_bf16_to_gpu(device, &want("post_per_layer_input_norm.weight")?)?,
     })
 }
 
@@ -428,15 +430,15 @@ impl Gemma4Engine {
 
         let mut layers: Vec<LayerWeights> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
-            layers.push(load_layer_weights(&loader, &tcfg, weight_prefix, i)?);
+            layers.push(load_layer_weights(&loader, device, &tcfg, weight_prefix, i)?);
         }
 
-        let lm_head_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.embed_tokens.weight"))?;
-        let final_norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
+        let lm_head_w = loader.load_bf16_to_gpu(device, &format!("{weight_prefix}.embed_tokens.weight"))?;
+        let final_norm_w = loader.load_bf16_to_gpu(device, &format!("{weight_prefix}.norm.weight"))?;
         let per_layer_model_projection_w = loader
-            .load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+            .load_bf16_to_gpu(device, &format!("{weight_prefix}.per_layer_model_projection.weight"))?;
         let per_layer_projection_norm_w = loader
-            .load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
+            .load_bf16_to_gpu(device, &format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
 
         let num_kv_heads = tcfg.num_key_value_heads;
         let num_q_heads = tcfg.num_attention_heads;
@@ -447,8 +449,8 @@ impl Gemma4Engine {
         let mut v_caches: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
         for l in 0..num_layers {
             let hd = layers[l].head_dim;
-            k_caches.push(GpuBuffer::zeros(0, dtype, &[num_kv_heads, max_t, hd])?);
-            v_caches.push(GpuBuffer::zeros(0, dtype, &[num_kv_heads, max_t, hd])?);
+            k_caches.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+            v_caches.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
         }
 
         let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
@@ -463,10 +465,10 @@ impl Gemma4Engine {
             full_rope.partial_rotary_factor,
             max_t,
         );
-        let sliding_cos = upload_bf16(&[max_t, sliding_head_dim], &scos_h)?;
-        let sliding_sin = upload_bf16(&[max_t, sliding_head_dim], &ssin_h)?;
-        let full_cos = upload_bf16(&[max_t, full_head_dim], &fcos_h)?;
-        let full_sin = upload_bf16(&[max_t, full_head_dim], &fsin_h)?;
+        let sliding_cos = upload_bf16(device, &[max_t, sliding_head_dim], &scos_h)?;
+        let sliding_sin = upload_bf16(device, &[max_t, sliding_head_dim], &ssin_h)?;
+        let full_cos = upload_bf16(device, &[max_t, full_head_dim], &fcos_h)?;
+        let full_sin = upload_bf16(device, &[max_t, full_head_dim], &fsin_h)?;
 
         // --- Persistent-decode descriptor array. Shared layers alias their
         //     source's K/V cache pointers so the megakernel sees a single
@@ -549,11 +551,11 @@ impl Gemma4Engine {
             tcfg.hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
             max_intermediate, ple_hidden,
         );
-        let mega_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[workspace_elems])?;
-        let mega_matvec_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
-        let mega_barrier_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
-        let mega_barrier_flag = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
-        let counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
+        let mega_workspace = GpuBuffer::zeros(device, ScalarType::F32, &[workspace_elems])?;
+        let mega_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let mega_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let mega_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
         Ok(Self {
             tcfg,
@@ -602,6 +604,7 @@ impl Gemma4Engine {
         if seq_len > self.max_t {
             bail!("prefill: prompt_len {seq_len} > max_t {}", self.max_t);
         }
+        let device = self.device;
         let dtype = ScalarType::BF16;
         let hidden_size = self.tcfg.hidden_size;
         let num_q_heads = self.tcfg.num_attention_heads;
@@ -617,12 +620,12 @@ impl Gemma4Engine {
             id_bytes.extend_from_slice(&id.to_le_bytes());
         }
         let token_ids_gpu =
-            GpuBuffer::from_host_bytes(0, ScalarType::U32, &[seq_len], &id_bytes)?;
+            GpuBuffer::from_host_bytes(device, ScalarType::U32, &[seq_len], &id_bytes)?;
 
         let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
-        let mut h_running = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        let mut h_running = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
         g4::embed_gather_scaled(
-            0, dtype, &mut h_running, &token_ids_gpu, &self.lm_head_w,
+            device, dtype, &mut h_running, &token_ids_gpu, &self.lm_head_w,
             seq_len, hidden_size, vocab_size, embed_scale,
         )?;
 
@@ -645,25 +648,25 @@ impl Gemma4Engine {
 
             let residual = h_running.clone_device()?;
 
-            let mut x = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut x = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
-                0, dtype, &mut x, &h_running, Some(&w.input_norm),
+                device, dtype, &mut x, &h_running, Some(&w.input_norm),
                 eps, seq_len, hidden_size,
             )?;
 
-            let mut q = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+            let mut q = GpuBuffer::zeros(device, dtype, &[seq_len, num_q_heads, head_dim])?;
             g4::matvec_batched(
-                0, dtype, &mut q, &x, &w.q_proj,
+                device, dtype, &mut q, &x, &w.q_proj,
                 seq_len, hidden_size, q_dim, &mut self.counter,
             )?;
             let mut q_normed =
-                GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+                GpuBuffer::zeros(device, dtype, &[seq_len, num_q_heads, head_dim])?;
             g4::rms_norm_rows(
-                0, dtype, &mut q_normed, &q, Some(&w.q_norm),
+                device, dtype, &mut q_normed, &q, Some(&w.q_norm),
                 eps, seq_len * num_q_heads, head_dim,
             )?;
             g4::rope_prefill(
-                0, dtype, &mut q_normed, cos_table, sin_table,
+                device, dtype, &mut q_normed, cos_table, sin_table,
                 seq_len, num_q_heads, head_dim, rotary_dim, 0,
             )?;
 
@@ -672,37 +675,37 @@ impl Gemma4Engine {
                 let v_proj = w.v_proj.as_ref().expect("v_proj on non-shared layer");
                 let k_norm = w.k_norm.as_ref().expect("k_norm on non-shared layer");
 
-                let mut k = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+                let mut k = GpuBuffer::zeros(device, dtype, &[seq_len, num_kv_heads, head_dim])?;
                 g4::matvec_batched(
-                    0, dtype, &mut k, &x, k_proj,
+                    device, dtype, &mut k, &x, k_proj,
                     seq_len, hidden_size, kv_dim, &mut self.counter,
                 )?;
-                let mut v = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+                let mut v = GpuBuffer::zeros(device, dtype, &[seq_len, num_kv_heads, head_dim])?;
                 g4::matvec_batched(
-                    0, dtype, &mut v, &x, v_proj,
+                    device, dtype, &mut v, &x, v_proj,
                     seq_len, hidden_size, kv_dim, &mut self.counter,
                 )?;
 
                 let mut k_normed =
-                    GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+                    GpuBuffer::zeros(device, dtype, &[seq_len, num_kv_heads, head_dim])?;
                 g4::rms_norm_rows(
-                    0, dtype, &mut k_normed, &k, Some(k_norm),
+                    device, dtype, &mut k_normed, &k, Some(k_norm),
                     eps, seq_len * num_kv_heads, head_dim,
                 )?;
                 let mut v_normed =
-                    GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+                    GpuBuffer::zeros(device, dtype, &[seq_len, num_kv_heads, head_dim])?;
                 g4::rms_norm_rows(
-                    0, dtype, &mut v_normed, &v, None,
+                    device, dtype, &mut v_normed, &v, None,
                     eps, seq_len * num_kv_heads, head_dim,
                 )?;
 
                 g4::rope_prefill(
-                    0, dtype, &mut k_normed, cos_table, sin_table,
+                    device, dtype, &mut k_normed, cos_table, sin_table,
                     seq_len, num_kv_heads, head_dim, rotary_dim, 0,
                 )?;
 
                 g4::kv_append_prefill(
-                    0, dtype, &k_normed, &v_normed,
+                    device, dtype, &k_normed, &v_normed,
                     &mut self.k_caches[layer_idx], &mut self.v_caches[layer_idx],
                     seq_len, num_kv_heads, head_dim, 0, max_t,
                 )?;
@@ -712,12 +715,12 @@ impl Gemma4Engine {
                     let s = &self.layers[shared_layer];
                     if s.shared_kv && s.kv_source == layer_idx {
                         let (lo, hi) = self.k_caches.split_at_mut(shared_layer);
-                        copy_kv_slots_range(
+                        copy_kv_slots_range(device,
                             &lo[layer_idx], &mut hi[0],
                             num_kv_heads, max_t, head_dim, 0, seq_len,
                         )?;
                         let (lo, hi) = self.v_caches.split_at_mut(shared_layer);
-                        copy_kv_slots_range(
+                        copy_kv_slots_range(device,
                             &lo[layer_idx], &mut hi[0],
                             num_kv_heads, max_t, head_dim, 0, seq_len,
                         )?;
@@ -726,100 +729,100 @@ impl Gemma4Engine {
             }
 
             let mut attn_out =
-                GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+                GpuBuffer::zeros(device, dtype, &[seq_len, num_q_heads, head_dim])?;
             let mut scores =
-                GpuBuffer::zeros(0, ScalarType::F32, &[seq_len, num_q_heads, max_t])?;
+                GpuBuffer::zeros(device, ScalarType::F32, &[seq_len, num_q_heads, max_t])?;
             g4::attn_prefill(
-                0, dtype, &q_normed,
+                device, dtype, &q_normed,
                 &self.k_caches[layer_idx], &self.v_caches[layer_idx],
                 &mut scores, &mut attn_out,
                 seq_len, num_q_heads, num_kv_heads, head_dim, 0, max_t,
                 sliding_window, 1.0,
             )?;
 
-            let mut o = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut o = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::matvec_batched(
-                0, dtype, &mut o, &attn_out, &w.o_proj,
+                device, dtype, &mut o, &attn_out, &w.o_proj,
                 seq_len, q_dim, hidden_size, &mut self.counter,
             )?;
 
-            let mut x2 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut x2 = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
-                0, dtype, &mut x2, &o, Some(&w.post_attn_norm),
+                device, dtype, &mut x2, &o, Some(&w.post_attn_norm),
                 eps, seq_len, hidden_size,
             )?;
-            let mut h_mid = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut h_mid = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::add_residual(
-                0, dtype, &mut h_mid, &residual, &x2, seq_len * hidden_size,
+                device, dtype, &mut h_mid, &residual, &x2, seq_len * hidden_size,
             )?;
 
             let residual2 = h_mid.clone_device()?;
 
-            let mut x3 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut x3 = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
-                0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm),
+                device, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm),
                 eps, seq_len, hidden_size,
             )?;
 
-            let mut gate = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+            let mut gate = GpuBuffer::zeros(device, dtype, &[seq_len, w.intermediate_size])?;
             g4::matvec_batched(
-                0, dtype, &mut gate, &x3, &w.gate_proj,
+                device, dtype, &mut gate, &x3, &w.gate_proj,
                 seq_len, hidden_size, w.intermediate_size, &mut self.counter,
             )?;
-            let mut up_buf = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+            let mut up_buf = GpuBuffer::zeros(device, dtype, &[seq_len, w.intermediate_size])?;
             g4::matvec_batched(
-                0, dtype, &mut up_buf, &x3, &w.up_proj,
+                device, dtype, &mut up_buf, &x3, &w.up_proj,
                 seq_len, hidden_size, w.intermediate_size, &mut self.counter,
             )?;
-            let mut y = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+            let mut y = GpuBuffer::zeros(device, dtype, &[seq_len, w.intermediate_size])?;
             g4::gelu_tanh_gate_mul(
-                0, dtype, &mut y, &gate, &up_buf, seq_len * w.intermediate_size,
+                device, dtype, &mut y, &gate, &up_buf, seq_len * w.intermediate_size,
             )?;
 
-            let mut m = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut m = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::matvec_batched(
-                0, dtype, &mut m, &y, &w.down_proj,
+                device, dtype, &mut m, &y, &w.down_proj,
                 seq_len, w.intermediate_size, hidden_size, &mut self.counter,
             )?;
 
-            let mut x4 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut x4 = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
-                0, dtype, &mut x4, &m, Some(&w.post_ff_norm),
+                device, dtype, &mut x4, &m, Some(&w.post_ff_norm),
                 eps, seq_len, hidden_size,
             )?;
-            let mut h_pre_ple = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut h_pre_ple = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::add_residual(
-                0, dtype, &mut h_pre_ple, &residual2, &x4, seq_len * hidden_size,
+                device, dtype, &mut h_pre_ple, &residual2, &x4, seq_len * hidden_size,
             )?;
 
-            let mut pli_slice = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+            let mut pli_slice = GpuBuffer::zeros(device, dtype, &[seq_len, ple_hidden])?;
             g4::gather_layer_slice(
-                0, dtype, &mut pli_slice, &pli,
+                device, dtype, &mut pli_slice, &pli,
                 seq_len, num_layers, ple_hidden, layer_idx,
             )?;
 
-            let mut gated = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+            let mut gated = GpuBuffer::zeros(device, dtype, &[seq_len, ple_hidden])?;
             g4::matvec_batched(
-                0, dtype, &mut gated, &h_pre_ple, &w.per_layer_input_gate_w,
+                device, dtype, &mut gated, &h_pre_ple, &w.per_layer_input_gate_w,
                 seq_len, hidden_size, ple_hidden, &mut self.counter,
             )?;
-            let mut gated_act = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+            let mut gated_act = GpuBuffer::zeros(device, dtype, &[seq_len, ple_hidden])?;
             g4::gelu_tanh_gate_mul(
-                0, dtype, &mut gated_act, &gated, &pli_slice, seq_len * ple_hidden,
+                device, dtype, &mut gated_act, &gated, &pli_slice, seq_len * ple_hidden,
             )?;
-            let mut projected = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut projected = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::matvec_batched(
-                0, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
+                device, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
                 seq_len, ple_hidden, hidden_size, &mut self.counter,
             )?;
-            let mut normed = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut normed = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
-                0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
+                device, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
                 eps, seq_len, hidden_size,
             )?;
-            let mut h_new = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+            let mut h_new = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::add_scaled_residual(
-                0, dtype, &mut h_new, &h_pre_ple, &normed,
+                device, dtype, &mut h_new, &h_pre_ple, &normed,
                 w.layer_scalar, seq_len * hidden_size,
             )?;
             h_running = h_new;
@@ -827,20 +830,20 @@ impl Gemma4Engine {
 
         // Last-position hidden → final norm + lm_head + softcap.
         let last_byte_off = (seq_len - 1) * hidden_size * 2;
-        let mut last_hidden = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        let mut last_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
         unsafe {
             let src_ptr = h_running.offset_ptr(last_byte_off);
-            gpu_hal::copy_d2d(0, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+            gpu_hal::copy_d2d(device, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
                 .map_err(|e| anyhow!("copy last hidden: {e}"))?;
         }
-        let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
         g4::rms_norm(
-            0, dtype, &mut post_norm, &last_hidden, Some(&self.final_norm_w),
+            device, dtype, &mut post_norm, &last_hidden, Some(&self.final_norm_w),
             eps, hidden_size,
         )?;
-        let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+        let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
-            0, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+            device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
             hidden_size, vocab_size, &mut self.counter,
         )?;
         let mut logits_host = download_bf16(&logits_gpu)?;
@@ -859,6 +862,7 @@ impl Gemma4Engine {
         if pos >= self.max_t {
             bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
         }
+        let device = self.device;
         let dtype = ScalarType::BF16;
         let hidden_size = self.tcfg.hidden_size;
         let eps = self.tcfg.rms_norm_eps as f32;
@@ -872,7 +876,7 @@ impl Gemma4Engine {
             input_token_id,
             hidden_size,
         )?;
-        let mut h_running = upload_bf16(&[hidden_size], &h_in_host)?;
+        let mut h_running = upload_bf16(device, &[hidden_size], &h_in_host)?;
 
         let pli_bytes = self.compute_per_layer_inputs_single(input_token_id)?;
         let expected_pli_bytes = num_layers * ple_hidden * 2;
@@ -883,11 +887,11 @@ impl Gemma4Engine {
             );
         }
         let pli_gpu = GpuBuffer::from_host_bytes(
-            0, dtype, &[num_layers, ple_hidden], &pli_bytes,
+            device, dtype, &[num_layers, ple_hidden], &pli_bytes,
         )?;
 
         g4::persistent_decode(
-            0, dtype,
+            device, dtype,
             &self.layers_gpu,
             &mut h_running,
             &pli_gpu,
@@ -898,14 +902,14 @@ impl Gemma4Engine {
             num_layers, hidden_size, ple_hidden, pos, eps, 1.0f32,
         )?;
 
-        let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
         g4::rms_norm(
-            0, dtype, &mut post_norm, &h_running, Some(&self.final_norm_w),
+            device, dtype, &mut post_norm, &h_running, Some(&self.final_norm_w),
             eps, hidden_size,
         )?;
-        let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+        let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
-            0, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+            device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
             hidden_size, vocab_size, &mut self.counter,
         )?;
         let mut logits_host = download_bf16(&logits_gpu)?;
@@ -930,6 +934,7 @@ impl Gemma4Engine {
     }
 
     fn compute_per_layer_inputs_single(&mut self, token_id: u32) -> Result<Vec<u8>> {
+        let device = self.device;
         let hidden_size = self.tcfg.hidden_size;
         let num_layers = self.tcfg.num_hidden_layers;
         let ple_hidden = self.tcfg.hidden_size_per_layer_input;
@@ -943,11 +948,11 @@ impl Gemma4Engine {
             token_id,
             hidden_size,
         )?;
-        let main_embed_gpu = upload_bf16(&[hidden_size], &main_embed_host)?;
+        let main_embed_gpu = upload_bf16(device, &[hidden_size], &main_embed_host)?;
 
-        let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
+        let mut proj = GpuBuffer::zeros(device, dtype, &[total])?;
         g4::matvec(
-            0, dtype, &mut proj, &main_embed_gpu, &self.per_layer_model_projection_w,
+            device, dtype, &mut proj, &main_embed_gpu, &self.per_layer_model_projection_w,
             hidden_size, total, &mut self.counter,
         )?;
 
@@ -957,10 +962,10 @@ impl Gemma4Engine {
             *v *= proj_scale;
         }
 
-        let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
-        let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
+        let proj_reshaped = upload_bf16(device, &[num_layers, ple_hidden], &proj_host)?;
+        let mut proj_normed = GpuBuffer::zeros(device, dtype, &[num_layers, ple_hidden])?;
         g4::rms_norm_per_row(
-            0, dtype, &mut proj_normed, &proj_reshaped,
+            device, dtype, &mut proj_normed, &proj_reshaped,
             Some(&self.per_layer_projection_norm_w), eps, num_layers, ple_hidden,
         )?;
         let proj_normed_host = download_bf16(&proj_normed)?;
@@ -987,6 +992,7 @@ impl Gemma4Engine {
         token_ids_gpu: &GpuBuffer,
         prompt_token_ids: &[u32],
     ) -> Result<GpuBuffer> {
+        let device = self.device;
         let dtype = ScalarType::BF16;
         let seq_len = prompt_token_ids.len();
         let hidden_size = self.tcfg.hidden_size;
@@ -997,25 +1003,25 @@ impl Gemma4Engine {
         let total = num_layers * ple_hidden;
 
         let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
-        let mut main_embed_batch = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        let mut main_embed_batch = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
         g4::embed_gather_scaled(
-            0, dtype, &mut main_embed_batch, token_ids_gpu, &self.lm_head_w,
+            device, dtype, &mut main_embed_batch, token_ids_gpu, &self.lm_head_w,
             seq_len, hidden_size, vocab_size, embed_scale,
         )?;
 
-        let mut proj = GpuBuffer::zeros(0, dtype, &[seq_len, total])?;
+        let mut proj = GpuBuffer::zeros(device, dtype, &[seq_len, total])?;
         g4::matvec_batched(
-            0, dtype, &mut proj, &main_embed_batch, &self.per_layer_model_projection_w,
+            device, dtype, &mut proj, &main_embed_batch, &self.per_layer_model_projection_w,
             seq_len, hidden_size, total, &mut self.counter,
         )?;
 
         let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
-        g4::scalar_mul_inplace(0, dtype, &mut proj, proj_scale, seq_len * total)?;
+        g4::scalar_mul_inplace(device, dtype, &mut proj, proj_scale, seq_len * total)?;
 
         let mut proj_normed =
-            GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
+            GpuBuffer::zeros(device, dtype, &[seq_len, num_layers, ple_hidden])?;
         g4::rms_norm_rows(
-            0, dtype, &mut proj_normed, &proj, Some(&self.per_layer_projection_norm_w),
+            device, dtype, &mut proj_normed, &proj, Some(&self.per_layer_projection_norm_w),
             eps, seq_len * num_layers, ple_hidden,
         )?;
 
@@ -1026,12 +1032,12 @@ impl Gemma4Engine {
             total,
             ple_hidden,
         )?;
-        let ple_raw_gpu = upload_bf16(&[seq_len, num_layers, ple_hidden], &ple_raw_host)?;
+        let ple_raw_gpu = upload_bf16(device, &[seq_len, num_layers, ple_hidden], &ple_raw_host)?;
 
         let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
-        let mut pli = GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
+        let mut pli = GpuBuffer::zeros(device, dtype, &[seq_len, num_layers, ple_hidden])?;
         g4::add_scaled_residual(
-            0, dtype, &mut pli, &proj_normed, &ple_raw_gpu,
+            device, dtype, &mut pli, &proj_normed, &ple_raw_gpu,
             combine_scale, seq_len * num_layers * ple_hidden,
         )?;
         Ok(pli)

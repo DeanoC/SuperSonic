@@ -657,7 +657,10 @@ fn run_gemma4(
     }
 
     // VRAM estimate — Gemma 4 BF16 KV cache: owning layers only (shared layers
-    // alias the source), each layer's slot is num_kv_heads * head_dim * 2.
+    // alias the source), each layer's slot is `num_kv_heads * head_dim * 2`
+    // elements (×2 for K + V tensors). Multiply by the BF16 byte size to get
+    // actual bytes.
+    const BF16_BYTES: u64 = 2;
     let mut kv_per_token: u64 = 0;
     for l in 0..t.num_hidden_layers {
         if t.kv_source_layer(l).is_none() {
@@ -668,7 +671,7 @@ fn run_gemma4(
             kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
         }
     }
-    let kv_bytes = kv_per_token * context_tokens as u64;
+    let kv_bytes = kv_per_token * context_tokens as u64 * BF16_BYTES;
     let estimated_vram =
         ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
