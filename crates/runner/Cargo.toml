@@ -47,6 +47,10 @@ path = "src/bin/gemma4_bench.rs"
 name = "gemma4_corpus_test"
 path = "src/bin/gemma4_corpus_test.rs"
 
+[[bin]]
+name = "gemma4_int4_matvec_test"
+path = "src/bin/gemma4_int4_matvec_test.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

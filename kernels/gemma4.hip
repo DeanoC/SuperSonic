@@ -61,6 +61,104 @@ __device__ inline hip_bfloat16 g4_from_float<hip_bfloat16>(float value) {
 }
 
 // -----------------------------------------------------------------------------
+// INT4 dequant helpers.
+//
+// Runtime format matches the Qwen35 INT4 bake (intentional — see
+// feedback_hipcc_codegen about not touching the Qwen kernels directly):
+//   - Weights packed 2 nibbles per byte: W[row, col]
+//     lives in byte `byte_cols * row + col/2`, low nibble for even col,
+//     high nibble for odd col.
+//   - BF16 scale + BF16 zero per `gs × gs` tile.
+//     tile coords: (row / gs, col / gs); shape [out/gs, in/gs].
+//   - Dequant per element: `q * scale - zero * scale`, rounded through
+//     BF16 (matches Python's bf16-stored `Q_dq` in bake_int4_gemma4.py).
+//
+// `g4_bf16_round_rne_f32_finite` is a NaN-check-free BF16-round that's
+// safe here because inputs are `nibble × bf16 scale − bf16 zero_scale`
+// with all factors finite. Same math as the Qwen `bf16_round_rne_f32_finite`
+// helper — duplicated here to keep gemma4.hip a standalone TU.
+// -----------------------------------------------------------------------------
+
+__device__ __forceinline__ float g4_bf16_round_rne_f32_finite(float x) {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, 4);
+    uint32_t rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    float y;
+    __builtin_memcpy(&y, &bits, 4);
+    return y;
+}
+
+// Dequantize 8 INT4 weights from 4 packed bytes = 1 packed uint32.
+// `col` is the starting weight column (must be 2-aligned; always is since
+// we step by 8 across a row whose byte stride is `in_dim/2`).
+__device__ inline void g4_int4_dequant_8(
+    uint32_t packed,
+    const hip_bfloat16* __restrict__ scales,
+    const hip_bfloat16* __restrict__ zeros,
+    int scale_row, int col, int scale_cols, int gsz,
+    float out[8]
+) {
+    const int sb = scale_row * scale_cols;
+    int n0 = (packed >>  0) & 0xF;
+    int n1 = (packed >>  4) & 0xF;
+    int n2 = (packed >>  8) & 0xF;
+    int n3 = (packed >> 12) & 0xF;
+    int n4 = (packed >> 16) & 0xF;
+    int n5 = (packed >> 20) & 0xF;
+    int n6 = (packed >> 24) & 0xF;
+    int n7 = (packed >> 28) & 0xF;
+
+    const int g0 = col / gsz;
+    const int g7 = (col + 7) / gsz;
+    if (g0 == g7) {
+        const float s = static_cast<float>(scales[sb + g0]);
+        const float zs = static_cast<float>(zeros[sb + g0]) * s;
+        out[0] = g4_bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+        out[1] = g4_bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+        out[2] = g4_bf16_round_rne_f32_finite(static_cast<float>(n2) * s - zs);
+        out[3] = g4_bf16_round_rne_f32_finite(static_cast<float>(n3) * s - zs);
+        out[4] = g4_bf16_round_rne_f32_finite(static_cast<float>(n4) * s - zs);
+        out[5] = g4_bf16_round_rne_f32_finite(static_cast<float>(n5) * s - zs);
+        out[6] = g4_bf16_round_rne_f32_finite(static_cast<float>(n6) * s - zs);
+        out[7] = g4_bf16_round_rne_f32_finite(static_cast<float>(n7) * s - zs);
+    } else {
+        const float s0 = static_cast<float>(scales[sb + g0]);
+        const float zs0 = static_cast<float>(zeros[sb + g0]) * s0;
+        const float s1 = static_cast<float>(scales[sb + g7]);
+        const float zs1 = static_cast<float>(zeros[sb + g7]) * s1;
+        #define G4_I4DQ(idx, ni) do { \
+            const int gi = (col + idx) / gsz; \
+            const float si = (gi == g0) ? s0 : s1; \
+            const float zsi = (gi == g0) ? zs0 : zs1; \
+            out[idx] = g4_bf16_round_rne_f32_finite(static_cast<float>(ni) * si - zsi); \
+        } while (0)
+        G4_I4DQ(0, n0); G4_I4DQ(1, n1); G4_I4DQ(2, n2); G4_I4DQ(3, n3);
+        G4_I4DQ(4, n4); G4_I4DQ(5, n5); G4_I4DQ(6, n6); G4_I4DQ(7, n7);
+        #undef G4_I4DQ
+    }
+}
+
+// Scalar INT4 dequant at (row, col). Used by unit tests and for tail handling;
+// the hot paths use `g4_int4_dequant_8` for 8-wide vectorization.
+__device__ inline float g4_int4_dequant_scalar(
+    const uint8_t* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ scales,
+    const hip_bfloat16* __restrict__ zeros,
+    int row, int col, int cols, int gsz
+) {
+    const int byte_cols = cols / 2;
+    const uint8_t byte = W_packed[static_cast<size_t>(row) * byte_cols + col / 2];
+    const int nibble = (col & 1) ? ((byte >> 4) & 0xF) : (byte & 0xF);
+    const int scale_cols = (cols + gsz - 1) / gsz;
+    const int si = (row / gsz) * scale_cols + col / gsz;
+    const float s = static_cast<float>(scales[si]);
+    const float zs = static_cast<float>(zeros[si]) * s;
+    return g4_bf16_round_rne_f32_finite(static_cast<float>(nibble) * s - zs);
+}
+
+// -----------------------------------------------------------------------------
 // RMSNorm (Gemma 4 variant — plain `weight * normed`, NO (w + 1) offset).
 // Single-row single-block launch: grid=(1,1,1), block=(256,1,1).
 // -----------------------------------------------------------------------------
@@ -142,6 +240,72 @@ __global__ void g4_matvec_workstealing_kernel(
         const T* w_row = W + static_cast<size_t>(row) * static_cast<size_t>(in_dim);
         for (int i = tid; i < in_dim; i += block_size) {
             partial += g4_to_float(w_row[i]) * g4_to_float(x[i]);
+        }
+
+        __shared__ float shared_sum[256];
+        shared_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[row] = g4_from_float<T>(shared_sum[0]);
+        }
+        __syncthreads();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// INT4 work-stealing matrix-vector multiply (single-token).
+// Computes `out[r] = dot(dequant(W[r, :]), x)` using the same runtime format
+// as Qwen's INT4 path: packed bytes [out_dim, in_dim/2], BF16 scale + zero
+// [out_dim/gsz, in_dim/gsz]. Dequant round-through-BF16 matches the Python
+// bake (see oracle/bake_int4_gemma4.py). Caller zeroes `row_counter` before
+// launch; device-side loop claims one output row per iteration.
+// -----------------------------------------------------------------------------
+
+template <typename T>
+__global__ void g4_matvec_int4_workstealing_kernel(
+    int in_dim,
+    int out_dim,
+    int gsz,
+    const T* __restrict__ x,                      // [in_dim]
+    const uint8_t* __restrict__ W_packed,         // [out_dim, in_dim/2]
+    const hip_bfloat16* __restrict__ W_scale,     // [out_dim/gsz, in_dim/gsz]
+    const hip_bfloat16* __restrict__ W_zero,      // [out_dim/gsz, in_dim/gsz]
+    T* __restrict__ out,                          // [out_dim]
+    unsigned int* __restrict__ row_counter
+) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int scale_cols = (in_dim + gsz - 1) / gsz;
+    const int byte_cols = in_dim / 2;
+
+    while (true) {
+        int row;
+        if (tid == 0) row = static_cast<int>(atomicAdd(row_counter, 1u));
+        __shared__ int shared_row;
+        if (tid == 0) shared_row = row;
+        __syncthreads();
+        row = shared_row;
+        if (row >= out_dim) return;
+
+        const int scale_row = row / gsz;
+        const uint8_t* w_row_bytes = W_packed + static_cast<size_t>(row) * byte_cols;
+
+        float partial = 0.0f;
+        // Each thread processes 8 consecutive columns per step.
+        for (int c0 = tid * 8; c0 < in_dim; c0 += block_size * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, W_scale, W_zero,
+                              scale_row, c0, scale_cols, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                partial += w[k] * g4_to_float(x[c0 + k]);
+            }
         }
 
         __shared__ float shared_sum[256];
@@ -501,6 +665,71 @@ __global__ void g4_matvec_batched_kernel(
         const T* x_row = x + static_cast<size_t>(s) * in_dim;
         for (int i = tid; i < in_dim; i += block_size) {
             partial += g4_to_float(w_row[i]) * g4_to_float(x_row[i]);
+        }
+
+        __shared__ float shared_sum[256];
+        shared_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = block_size / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out[static_cast<size_t>(s) * out_dim + r] = g4_from_float<T>(shared_sum[0]);
+        }
+        __syncthreads();
+    }
+}
+
+// Batched INT4 matvec. Computes `out[s, r] = dot(dequant(W[r, :]), x[s, :])`
+// for every (s, r) pair. Work-stealing block claims one (s, r) item at a time
+// from `counter`. Same runtime format as the single-token INT4 kernel.
+template <typename T>
+__global__ void g4_matvec_batched_int4_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    int gsz,
+    const T* __restrict__ x,                      // [seq_len, in_dim]
+    const uint8_t* __restrict__ W_packed,         // [out_dim, in_dim/2]
+    const hip_bfloat16* __restrict__ W_scale,     // [out_dim/gsz, in_dim/gsz]
+    const hip_bfloat16* __restrict__ W_zero,      // [out_dim/gsz, in_dim/gsz]
+    T* __restrict__ out,                          // [seq_len, out_dim]
+    unsigned int* __restrict__ counter
+) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    const int scale_cols = (in_dim + gsz - 1) / gsz;
+    const int byte_cols = in_dim / 2;
+    const size_t total = static_cast<size_t>(seq_len) * out_dim;
+
+    while (true) {
+        int idx;
+        if (tid == 0) idx = static_cast<int>(atomicAdd(counter, 1u));
+        __shared__ int shared_idx;
+        if (tid == 0) shared_idx = idx;
+        __syncthreads();
+        idx = shared_idx;
+        if (static_cast<size_t>(idx) >= total) return;
+
+        const int s = idx / out_dim;
+        const int r = idx % out_dim;
+
+        const int scale_row = r / gsz;
+        const uint8_t* w_row_bytes = W_packed + static_cast<size_t>(r) * byte_cols;
+        const T* x_row = x + static_cast<size_t>(s) * in_dim;
+
+        float partial = 0.0f;
+        for (int c0 = tid * 8; c0 < in_dim; c0 += block_size * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, W_scale, W_zero,
+                              scale_row, c0, scale_cols, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                partial += w[k] * g4_to_float(x_row[c0 + k]);
+            }
         }
 
         __shared__ float shared_sum[256];

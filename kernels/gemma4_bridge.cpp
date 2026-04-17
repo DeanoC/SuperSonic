@@ -241,6 +241,68 @@ int matvec_batched_device(int device_ordinal,
     return 0;
 }
 
+// ---- INT4 matvec (single-token, work-stealing on output rows) ----
+
+template <typename T>
+int matvec_int4_device(int device_ordinal, int in_dim, int out_dim, int gsz,
+                       const void* x, const void* W_packed,
+                       const void* W_scale, const void* W_zero,
+                       void* out, unsigned int* row_counter) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (hipMemset(row_counter, 0, sizeof(unsigned int)) != hipSuccess) return 480;
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 481;
+    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int block = 256;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_matvec_int4_workstealing_kernel<T>),
+        dim3(num_blocks), dim3(block), 0, 0,
+        in_dim, out_dim, gsz,
+        static_cast<const T*>(x),
+        static_cast<const uint8_t*>(W_packed),
+        static_cast<const hip_bfloat16*>(W_scale),
+        static_cast<const hip_bfloat16*>(W_zero),
+        static_cast<T*>(out),
+        row_counter);
+    if (hipGetLastError() != hipSuccess) return 482;
+    if (hipDeviceSynchronize() != hipSuccess) return 483;
+    return 0;
+}
+
+// ---- INT4 batched matvec ----
+
+template <typename T>
+int matvec_batched_int4_device(int device_ordinal,
+                               int seq_len, int in_dim, int out_dim, int gsz,
+                               const void* x, const void* W_packed,
+                               const void* W_scale, const void* W_zero,
+                               void* out, unsigned int* counter) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (seq_len <= 0) return 0;
+    if (hipMemset(counter, 0, sizeof(unsigned int)) != hipSuccess) return 490;
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 491;
+    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int block = 256;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_matvec_batched_int4_kernel<T>),
+        dim3(num_blocks), dim3(block), 0, 0,
+        seq_len, in_dim, out_dim, gsz,
+        static_cast<const T*>(x),
+        static_cast<const uint8_t*>(W_packed),
+        static_cast<const hip_bfloat16*>(W_scale),
+        static_cast<const hip_bfloat16*>(W_zero),
+        static_cast<T*>(out),
+        counter);
+    if (hipGetLastError() != hipSuccess) return 492;
+    if (hipDeviceSynchronize() != hipSuccess) return 493;
+    return 0;
+}
+
 template <typename T>
 int rope_prefill_device(int device_ordinal,
                         int seq_len, int num_heads, int head_dim,
@@ -1008,4 +1070,60 @@ extern "C" int dotcache_gemma4_hip_persistent_decode(
     default: return 700;
     }
     #undef G4_PERSIST_ARGS
+}
+
+// INT4 matvec (single-token). Activation dtype is controlled by `dtype`;
+// weight format is always (packed u8, bf16 scale, bf16 zero).
+extern "C" int dotcache_gemma4_hip_matvec_int4(
+    int dtype, size_t device_ordinal,
+    size_t in_dim, size_t out_dim, size_t group_size,
+    const void* x,
+    const void* W_packed, const void* W_scale, const void* W_zero,
+    void* out, unsigned int* row_counter
+) {
+    switch (dtype) {
+    case 0: return matvec_int4_device<__half>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(in_dim), static_cast<int>(out_dim),
+                static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, row_counter);
+    case 1: return matvec_int4_device<float>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(in_dim), static_cast<int>(out_dim),
+                static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, row_counter);
+    case 2: return matvec_int4_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(in_dim), static_cast<int>(out_dim),
+                static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, row_counter);
+    default: return 489;
+    }
+}
+
+extern "C" int dotcache_gemma4_hip_matvec_batched_int4(
+    int dtype, size_t device_ordinal,
+    size_t seq_len, size_t in_dim, size_t out_dim, size_t group_size,
+    const void* x,
+    const void* W_packed, const void* W_scale, const void* W_zero,
+    void* out, unsigned int* counter
+) {
+    switch (dtype) {
+    case 0: return matvec_batched_int4_device<__half>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(in_dim),
+                static_cast<int>(out_dim), static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, counter);
+    case 1: return matvec_batched_int4_device<float>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(in_dim),
+                static_cast<int>(out_dim), static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, counter);
+    case 2: return matvec_batched_int4_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(in_dim),
+                static_cast<int>(out_dim), static_cast<int>(group_size),
+                x, W_packed, W_scale, W_zero, out, counter);
+    default: return 499;
+    }
 }

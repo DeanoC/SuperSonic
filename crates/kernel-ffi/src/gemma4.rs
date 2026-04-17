@@ -108,6 +108,35 @@ unsafe extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_matvec_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        in_dim: usize,
+        out_dim: usize,
+        group_size: usize,
+        x: *const c_void,
+        w_packed: *const c_void,
+        w_scale: *const c_void,
+        w_zero: *const c_void,
+        out: *mut c_void,
+        row_counter: *mut c_uint,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_matvec_batched_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        in_dim: usize,
+        out_dim: usize,
+        group_size: usize,
+        x: *const c_void,
+        w_packed: *const c_void,
+        w_scale: *const c_void,
+        w_zero: *const c_void,
+        out: *mut c_void,
+        counter: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -388,6 +417,87 @@ pub fn matvec(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 matvec failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// INT4 matvec: `out = dequant(W_packed, W_scale, W_zero) @ input`. The weight
+/// format matches the Gemma 4 GPTQ bake (packed u8 [out_dim, in_dim/2], bf16
+/// scale/zero [out_dim/group_size, in_dim/group_size]). `input` and `output`
+/// use `dtype` (typically BF16). Work-stealing across output rows is driven by
+/// `counter_buf` — the kernel zeroes it before the launch.
+pub fn matvec_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    w_packed: &GpuBuffer,
+    w_scale: &GpuBuffer,
+    w_zero: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    counter_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_matvec_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            in_dim,
+            out_dim,
+            group_size,
+            input.as_ptr(),
+            w_packed.as_ptr(),
+            w_scale.as_ptr(),
+            w_zero.as_ptr(),
+            output.as_mut_ptr(),
+            counter_buf.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 matvec_int4 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Batched INT4 matvec: `out[s, r] = dequant(W[r, :]) · input[s, :]` for every
+/// (s, r) pair, with work-stealing over (s, r) items via `counter_buf`.
+pub fn matvec_batched_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    w_packed: &GpuBuffer,
+    w_scale: &GpuBuffer,
+    w_zero: &GpuBuffer,
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_size: usize,
+    counter_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_matvec_batched_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            in_dim,
+            out_dim,
+            group_size,
+            input.as_ptr(),
+            w_packed.as_ptr(),
+            w_scale.as_ptr(),
+            w_zero.as_ptr(),
+            output.as_mut_ptr(),
+            counter_buf.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 matvec_batched_int4 failed with status {status}"
         )));
     }
     Ok(())
