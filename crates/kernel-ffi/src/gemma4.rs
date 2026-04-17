@@ -261,6 +261,24 @@ unsafe extern "C" {
         table: *const c_void,
         out: *mut c_void,
     ) -> c_int;
+
+    fn dotcache_gemma4_hip_persistent_decode(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_size: usize,
+        ple_hidden: usize,
+        position: usize,
+        eps: f32,
+        scale: f32,
+        layers: *const c_void,
+        hidden_io: *mut c_void,
+        per_layer_inputs: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Gemma-variant RMSNorm — plain `weight * (x / sqrt(mean(x^2) + eps))` with
@@ -1073,62 +1091,73 @@ pub fn embed_gather_scaled(
 }
 
 // -----------------------------------------------------------------------------
-// Gemma4DecodeLayerDesc — a Rust-side descriptor of one decoder layer's
-// weight pointers + per-layer state. Kept as plain data (no lifetimes) and
-// `#[repr(C)]` so that when a future persistent megakernel wants to consume
-// an array of these from the device, the Rust and HIP sides agree on layout.
+// Gemma4DecodeLayerDesc — one decoder layer's weight pointers + per-layer
+// state. Consumed by the persistent decode megakernel
+// (`g4_persistent_decode_kernel`), which takes a contiguous `[num_layers]`
+// array and loops over layers inside a single kernel launch. `#[repr(C)]`
+// with explicit field order so the HIP-side struct in `kernels/gemma4.hip`
+// stays binary-compatible.
 //
-// For this session the descriptor is populated by the caller and its fields
-// are passed one primitive at a time to the single-kernel FFI above; no
-// kernel consumes the struct yet.
+// Shared-KV layers set `shared_kv = 1` and alias `kv_cache_k` / `kv_cache_v`
+// to their source layer's pointers — no intra-kernel replication needed.
 // -----------------------------------------------------------------------------
 
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Gemma4DecodeLayerDesc {
-    /// 0 = sliding_attention, 1 = full_attention.
+    /// 0 = sliding_attention, 1 = full_attention. Controls sliding-window
+    /// masking only; kernel plumbing is identical for both kinds.
     pub layer_type: c_int,
-    /// MLP intermediate size (`intermediate_size` for dense layers, or
-    /// `2 * intermediate_size` on `use_double_wide_mlp` variants).
-    pub intermediate_size: c_int,
-    /// `hidden_size` of the model (for convenience at kernel-call time).
-    pub hidden_size: c_int,
-    /// `head_dim` for this layer (256 for SWA, 512 for full on E2B).
-    pub head_dim: c_int,
+    /// 1 when this layer reuses a source layer's KV cache (k/v_proj + k_norm
+    /// skipped, cache pointers aliased). 0 for layers that own their cache.
+    pub shared_kv: c_int,
     pub num_q_heads: c_int,
     pub num_kv_heads: c_int,
-    /// Number of `head_dim` columns that receive rotary (== head_dim for
-    /// sliding layers, 0.25 * head_dim for full layers on E2B).
+    /// Attention `head_dim` (256 for SWA, 512 for full on E2B).
+    pub head_dim: c_int,
+    /// Columns of Q/K that receive rotary. `head_dim` for sliding layers;
+    /// also `head_dim` for full layers (the "nope" tail is handled by
+    /// zero-filling the inv_freq tail at table-build time).
     pub rotary_dim: c_int,
-    /// Sliding window size in tokens (only used for sliding layers).
+    /// Sliding-window size in tokens, or 0 for full attention.
     pub sliding_window: c_int,
+    /// MLP intermediate size (6144 for dense layers 0–14; 12288 for the
+    /// double-wide layers 15–34 on E2B).
+    pub intermediate_size: c_int,
+    /// Allocated `T` dimension of the KV cache.
+    pub kv_max_t: c_int,
+    /// Per-layer output scale (`layer_scalar[N]`, applied in PLE phase 11).
+    pub layer_scalar: f32,
 
-    // --- Norms (all plain-Gemma, no `(w+1)` offset) ---
+    // --- Attention weights ---
     pub input_norm_w: *const c_void,
+    pub q_proj_w: *const c_void,
+    pub k_proj_w: *const c_void,       // null when `shared_kv`
+    pub v_proj_w: *const c_void,       // null when `shared_kv`
+    pub q_norm_w: *const c_void,
+    pub k_norm_w: *const c_void,       // null when `shared_kv`
+    pub o_proj_w: *const c_void,
     pub post_attn_norm_w: *const c_void,
+
+    // --- MLP weights ---
     pub pre_ff_norm_w: *const c_void,
+    pub gate_proj_w: *const c_void,
+    pub up_proj_w: *const c_void,
+    pub down_proj_w: *const c_void,
     pub post_ff_norm_w: *const c_void,
-    pub q_norm_w: *const c_void,       // [head_dim]
-    pub k_norm_w: *const c_void,       // [head_dim]
-    // `v_norm` has no weight parameter (with_scale=False); caller passes null.
-    pub norm_eps: f32,
 
-    // --- Attention projections ---
-    pub q_proj_w: *const c_void,       // [num_q_heads*head_dim, hidden]
-    pub k_proj_w: *const c_void,       // [num_kv_heads*head_dim, hidden]
-    pub v_proj_w: *const c_void,       // [num_kv_heads*head_dim, hidden]
-    pub o_proj_w: *const c_void,       // [hidden, num_q_heads*head_dim]
+    // --- PLE weights ---
+    pub per_layer_input_gate_w: *const c_void,
+    pub per_layer_projection_w: *const c_void,
+    pub post_per_layer_input_norm_w: *const c_void,
 
-    // --- MLP projections ---
-    pub gate_proj_w: *const c_void,    // [intermediate_size, hidden]
-    pub up_proj_w: *const c_void,      // [intermediate_size, hidden]
-    pub down_proj_w: *const c_void,    // [hidden, intermediate_size]
+    // --- RoPE tables for this layer's kind (sliding vs. proportional) ---
+    pub cos_table: *const c_void,
+    pub sin_table: *const c_void,
 
-    // --- KV cache state ---
-    pub kv_cache_k: *mut c_void,       // [num_kv_heads, max_T, head_dim]
+    // --- KV cache (shared-KV layers alias source layer's pointers) ---
+    pub kv_cache_k: *mut c_void,
     pub kv_cache_v: *mut c_void,
-    pub kv_len: c_int,                 // current cache length (pre-append)
-    pub kv_max_t: c_int,               // allocated T dimension
 }
 
 unsafe impl Send for Gemma4DecodeLayerDesc {}
@@ -1138,4 +1167,77 @@ impl Default for Gemma4DecodeLayerDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
+}
+
+/// Required F32 workspace (elements) for the persistent decode megakernel.
+/// Sized to the max of (fused_attn_block, fused_mlp_ple) needs across all
+/// layers — phase A and phase B run sequentially within each layer and share
+/// the buffer from offset 0.
+pub fn persistent_decode_workspace_elems(
+    hidden_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim_max: usize,
+    max_t: usize,
+    intermediate_size_max: usize,
+    ple_hidden: usize,
+) -> usize {
+    let attn = fused_attn_block_workspace_elems(
+        hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
+    );
+    let mlp = fused_mlp_ple_workspace_elems(hidden_size, intermediate_size_max, ple_hidden);
+    attn.max(mlp)
+}
+
+/// Run a full Gemma 4 forward pass for one decode token in a single kernel
+/// launch. The `layers` buffer holds a contiguous `[num_layers]` array of
+/// `Gemma4DecodeLayerDesc` (uploaded by the caller). `hidden_io` is the
+/// token's BF16 hidden state on entry and exit (`[hidden_size]`).
+///
+/// Shared-KV layers must have their `kv_cache_k` / `kv_cache_v` pointers
+/// aliased to the source layer's cache buffers — no replication is performed
+/// inside the kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode(
+    ordinal: usize,
+    dtype: ScalarType,
+    layers: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    per_layer_inputs: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    num_layers: usize,
+    hidden_size: usize,
+    ple_hidden: usize,
+    position: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_persistent_decode(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            position,
+            eps,
+            scale,
+            layers.as_ptr(),
+            hidden_io.as_mut_ptr(),
+            per_layer_inputs.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode failed with status {status}"
+        )));
+    }
+    Ok(())
 }

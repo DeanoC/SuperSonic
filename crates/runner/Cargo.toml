@@ -35,6 +35,10 @@ path = "src/bin/gemma4_e2e_validate.rs"
 name = "gemma4_fused_decode_validate"
 path = "src/bin/gemma4_fused_decode_validate.rs"
 
+[[bin]]
+name = "gemma4_mega_decode_validate"
+path = "src/bin/gemma4_mega_decode_validate.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

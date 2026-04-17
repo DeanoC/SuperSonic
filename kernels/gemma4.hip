@@ -1515,3 +1515,560 @@ __global__ void g4_embed_gather_scaled_kernel(
     const float v = g4_to_float(table[src_off]) * scale;
     out[static_cast<size_t>(s) * hidden_size + d] = g4_from_float<T>(v);
 }
+
+// =============================================================================
+// Persistent decode megakernel — one launch runs the entire Gemma 4 forward
+// pass for a single decode token across all `num_layers` decoder layers.
+// Matches the layer-by-layer dispatch pattern of Qwen's
+// `dotcache_qwen35_persistent_decode_kernel` but with Gemma 4's dual attention
+// shapes (sliding vs. full) and the PLE branch after the MLP.
+//
+// Per-layer work copies the phase sequence from `g4_fused_attn_block_kernel`
+// followed by `g4_fused_mlp_ple_kernel`. The existing fused kernels remain
+// untouched — this kernel is a standalone __global__ body to avoid any
+// codegen perturbation of the already-validated primitives.
+//
+// Layer-array descriptor — binary-compatible with
+// `Gemma4DecodeLayerDesc` in `crates/kernel-ffi/src/gemma4.rs`. Field order
+// must match exactly.
+struct Gemma4DecodeLayerDesc {
+    int   layer_type;            // 0 = sliding, 1 = full
+    int   shared_kv;             // 0 = owns cache; 1 = aliases source layer
+    int   num_q_heads;
+    int   num_kv_heads;
+    int   head_dim;
+    int   rotary_dim;
+    int   sliding_window;
+    int   intermediate_size;
+    int   kv_max_t;
+    float layer_scalar;
+    const void* input_norm_w;
+    const void* q_proj_w;
+    const void* k_proj_w;
+    const void* v_proj_w;
+    const void* q_norm_w;
+    const void* k_norm_w;
+    const void* o_proj_w;
+    const void* post_attn_norm_w;
+    const void* pre_ff_norm_w;
+    const void* gate_proj_w;
+    const void* up_proj_w;
+    const void* down_proj_w;
+    const void* post_ff_norm_w;
+    const void* per_layer_input_gate_w;
+    const void* per_layer_projection_w;
+    const void* post_per_layer_input_norm_w;
+    const void* cos_table;
+    const void* sin_table;
+    void* kv_cache_k;
+    void* kv_cache_v;
+};
+
+template <typename T>
+__global__ void g4_persistent_decode_kernel(
+    int num_layers,
+    int hidden_size,
+    int ple_hidden,
+    int position,
+    float eps,
+    float scale,
+    const Gemma4DecodeLayerDesc* __restrict__ layers,
+    T* __restrict__ hidden_io,                          // [hidden_size] BF16 in/out
+    const T* __restrict__ per_layer_inputs,              // [num_layers, ple_hidden] BF16
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ matvec_counter,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __attribute__((launch_bounds(256, 1))) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+
+    extern __shared__ float lds[];
+
+    for (int layer = 0; layer < num_layers; ++layer) {
+        const Gemma4DecodeLayerDesc L = layers[layer];
+        const int num_q_heads = L.num_q_heads;
+        const int num_kv_heads = L.num_kv_heads;
+        const int head_dim = L.head_dim;
+        const int rotary_dim = L.rotary_dim;
+        const int sliding_window = L.sliding_window;
+        const int shared_kv = L.shared_kv;
+        const int max_T = L.kv_max_t;
+        const int q_dim = num_q_heads * head_dim;
+        const int kv_dim = num_kv_heads * head_dim;
+
+        const T* input_norm_w = static_cast<const T*>(L.input_norm_w);
+        const T* q_proj_w = static_cast<const T*>(L.q_proj_w);
+        const T* k_proj_w = static_cast<const T*>(L.k_proj_w);
+        const T* v_proj_w = static_cast<const T*>(L.v_proj_w);
+        const T* q_norm_w = static_cast<const T*>(L.q_norm_w);
+        const T* k_norm_w = static_cast<const T*>(L.k_norm_w);
+        const T* o_proj_w = static_cast<const T*>(L.o_proj_w);
+        const T* post_attn_norm_w = static_cast<const T*>(L.post_attn_norm_w);
+        const T* cos_table = static_cast<const T*>(L.cos_table);
+        const T* sin_table = static_cast<const T*>(L.sin_table);
+        T* k_cache = static_cast<T*>(L.kv_cache_k);
+        T* v_cache = static_cast<T*>(L.kv_cache_v);
+
+        // =========================================================
+        // Phase A — attention block. Mirrors g4_fused_attn_block_kernel.
+        // Workspace layout (from offset 0):
+        //   hidden_f32 [hidden]
+        //   normed_f32 [hidden]
+        //   proj_f32   [q_dim + 2*kv_dim]
+        //   scores_f32 [num_q_heads * max_T]
+        //   attn_out   [q_dim]
+        //   oproj_f32  [hidden]
+        //   oproj_norm [hidden]
+        // =========================================================
+        float* hidden_f32   = workspace;
+        float* normed_f32   = hidden_f32 + hidden_size;
+        float* proj_f32     = normed_f32 + hidden_size;
+        float* scores_f32   = proj_f32 + (q_dim + 2 * kv_dim);
+        float* attn_out_f32 = scores_f32 + num_q_heads * max_T;
+        float* oproj_f32    = attn_out_f32 + q_dim;
+        float* oproj_normed = oproj_f32 + hidden_size;
+
+        // A0: load hidden_io BF16 → hidden_f32 (residual).
+        for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+            hidden_f32[c] = g4_to_float(hidden_io[c]);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A1: input_norm on block 0.
+        if (blockIdx.x == 0) {
+            g4_block_rms_norm_f32<T>(normed_f32, hidden_f32, input_norm_w,
+                                      hidden_size, eps, lds);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A2: work-stealing QKV matmul (reset counter first).
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        {
+            const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
+            while (true) {
+                __shared__ unsigned int claimed;
+                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+                __syncthreads();
+                const unsigned int row = claimed;
+                if (row >= static_cast<unsigned int>(total_qkv)) break;
+
+                const T* w;
+                int weight_row;
+                if (row < static_cast<unsigned int>(q_dim)) {
+                    w = q_proj_w;
+                    weight_row = static_cast<int>(row);
+                } else if (row < static_cast<unsigned int>(q_dim + kv_dim)) {
+                    w = k_proj_w;
+                    weight_row = static_cast<int>(row - q_dim);
+                } else {
+                    w = v_proj_w;
+                    weight_row = static_cast<int>(row - q_dim - kv_dim);
+                }
+                const T* w_row =
+                    w + static_cast<size_t>(weight_row) * hidden_size;
+
+                float p = 0.0f;
+                for (int c = tid; c < hidden_size; c += bs) {
+                    p += g4_to_float(w_row[c]) * normed_f32[c];
+                }
+                lds[tid] = p;
+                __syncthreads();
+                for (int s = bs / 2; s > 0; s >>= 1) {
+                    if (tid < s) lds[tid] += lds[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) proj_f32[row] = lds[0];
+                __syncthreads();
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        float* q_f32 = proj_f32;
+        float* k_f32 = proj_f32 + q_dim;
+        float* v_f32 = proj_f32 + q_dim + kv_dim;
+
+        // A3: q/k/v norms + RoPE + KV append (block 0 only).
+        if (!shared_kv && blockIdx.x == 0) {
+            g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
+                num_q_heads, head_dim, eps, lds);
+            g4_block_rms_norm_per_head_f32<T>(k_f32, k_norm_w,
+                num_kv_heads, head_dim, eps, lds);
+            g4_block_rms_norm_per_head_f32<T>(v_f32, (const T*)nullptr,
+                num_kv_heads, head_dim, eps, lds);
+            g4_block_rope_f32<T>(q_f32, cos_table, sin_table,
+                num_q_heads, head_dim, rotary_dim, position);
+            g4_block_rope_f32<T>(k_f32, cos_table, sin_table,
+                num_kv_heads, head_dim, rotary_dim, position);
+            g4_block_kv_append_f32_to_bf16<T>(k_f32, v_f32, k_cache, v_cache,
+                num_kv_heads, head_dim, position, max_T);
+        } else if (shared_kv && blockIdx.x == 0) {
+            g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
+                num_q_heads, head_dim, eps, lds);
+            g4_block_rope_f32<T>(q_f32, cos_table, sin_table,
+                num_q_heads, head_dim, rotary_dim, position);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A4: attention scores.
+        const int kv_len = position + 1;
+        const int last = kv_len - 1;
+        const int min_t = (sliding_window > 0) ? max(0, last - sliding_window + 1) : 0;
+        const int num_q_per_kv = num_q_heads / num_kv_heads;
+        {
+            const int total_items = num_q_heads * kv_len;
+            for (int item = blockIdx.x * bs + tid;
+                 item < total_items; item += nb * bs) {
+                const int t = item % kv_len;
+                const int q_h = item / kv_len;
+                float val;
+                if (t < min_t) {
+                    val = -INFINITY;
+                } else {
+                    const int kv_h = q_h / num_q_per_kv;
+                    const float* qr = q_f32 +
+                        static_cast<size_t>(q_h) * head_dim;
+                    const T* kr = k_cache +
+                        (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                    float acc = 0.0f;
+                    for (int d = 0; d < head_dim; ++d) {
+                        acc += qr[d] * g4_to_float(kr[d]);
+                    }
+                    val = acc * scale;
+                }
+                scores_f32[static_cast<size_t>(q_h) * max_T + t] = val;
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A5: softmax per q head.
+        for (int q_h = blockIdx.x; q_h < num_q_heads; q_h += nb) {
+            float* row = scores_f32 + static_cast<size_t>(q_h) * max_T;
+            float pm = -INFINITY;
+            for (int t = tid; t < kv_len; t += bs) pm = fmaxf(pm, row[t]);
+            lds[tid] = pm;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+                __syncthreads();
+            }
+            const float mx = lds[0];
+            __syncthreads();
+            float ps = 0.0f;
+            for (int t = tid; t < kv_len; t += bs) {
+                const float e = expf(row[t] - mx);
+                row[t] = e;
+                ps += e;
+            }
+            lds[tid] = ps;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            const float inv_sum = 1.0f / lds[0];
+            __syncthreads();
+            for (int t = tid; t < kv_len; t += bs) row[t] *= inv_sum;
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A6: value aggregation.
+        {
+            const int total_items = num_q_heads * head_dim;
+            for (int item = blockIdx.x * bs + tid;
+                 item < total_items; item += nb * bs) {
+                const int d = item % head_dim;
+                const int q_h = item / head_dim;
+                const int kv_h = q_h / num_q_per_kv;
+                const float* pr = scores_f32 +
+                    static_cast<size_t>(q_h) * max_T;
+                float acc = 0.0f;
+                for (int t = 0; t < kv_len; ++t) {
+                    const T* vr = v_cache +
+                        (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                    acc += pr[t] * g4_to_float(vr[d]);
+                }
+                attn_out_f32[static_cast<size_t>(q_h) * head_dim + d] = acc;
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A7: work-stealing o_proj.
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        while (true) {
+            __shared__ unsigned int claimed;
+            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+            __syncthreads();
+            const unsigned int row = claimed;
+            if (row >= static_cast<unsigned int>(hidden_size)) break;
+            const T* wr = o_proj_w + static_cast<size_t>(row) * q_dim;
+            float p = 0.0f;
+            for (int c = tid; c < q_dim; c += bs) {
+                p += g4_to_float(wr[c]) * attn_out_f32[c];
+            }
+            lds[tid] = p;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) oproj_f32[row] = lds[0];
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A8: post_attn_norm on block 0.
+        if (blockIdx.x == 0) {
+            g4_block_rms_norm_f32<T>(oproj_normed, oproj_f32, post_attn_norm_w,
+                                      hidden_size, eps, lds);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // A9: residual add + BF16 store → hidden_io (= h_mid).
+        for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+            hidden_io[c] = g4_from_float<T>(hidden_f32[c] + oproj_normed[c]);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // =========================================================
+        // Phase B — MLP + PLE. Mirrors g4_fused_mlp_ple_kernel.
+        // Workspace (from offset 0):
+        //   hidden_f32 [hidden]
+        //   normed_ff  [hidden]
+        //   gate_up    [2*intermediate]
+        //   gated_proj [intermediate]
+        //   down_out   [hidden]
+        //   normed_down[hidden]
+        //   h_pre_ple  [hidden]
+        //   gated_ple  [ple_hidden]
+        //   gated_act  [ple_hidden]
+        //   proj_ple   [hidden]
+        //   normed_ple [hidden]
+        // =========================================================
+        const int intermediate_size = L.intermediate_size;
+        const float layer_scalar = L.layer_scalar;
+        const T* pre_ff_norm_w = static_cast<const T*>(L.pre_ff_norm_w);
+        const T* gate_proj_w = static_cast<const T*>(L.gate_proj_w);
+        const T* up_proj_w = static_cast<const T*>(L.up_proj_w);
+        const T* down_proj_w = static_cast<const T*>(L.down_proj_w);
+        const T* post_ff_norm_w = static_cast<const T*>(L.post_ff_norm_w);
+        const T* pli_gate_w =
+            static_cast<const T*>(L.per_layer_input_gate_w);
+        const T* pli_proj_w =
+            static_cast<const T*>(L.per_layer_projection_w);
+        const T* pli_post_norm_w =
+            static_cast<const T*>(L.post_per_layer_input_norm_w);
+        const T* per_layer_input =
+            per_layer_inputs + static_cast<size_t>(layer) * ple_hidden;
+
+        float* b_hidden_f32   = workspace;
+        float* b_normed_ff    = b_hidden_f32 + hidden_size;
+        float* b_gate_up      = b_normed_ff + hidden_size;
+        float* b_gated_proj   = b_gate_up + 2 * intermediate_size;
+        float* b_down_out     = b_gated_proj + intermediate_size;
+        float* b_normed_down  = b_down_out + hidden_size;
+        float* b_h_pre_ple    = b_normed_down + hidden_size;
+        float* b_gated_ple    = b_h_pre_ple + hidden_size;
+        float* b_gated_act    = b_gated_ple + ple_hidden;
+        float* b_projected    = b_gated_act + ple_hidden;
+        float* b_normed_ple   = b_projected + hidden_size;
+
+        // B0: load h_mid BF16 → b_hidden_f32.
+        for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+            b_hidden_f32[c] = g4_to_float(hidden_io[c]);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B1: pre_ff_norm on block 0.
+        if (blockIdx.x == 0) {
+            g4_block_rms_norm_f32<T>(b_normed_ff, b_hidden_f32, pre_ff_norm_w,
+                                      hidden_size, eps, lds);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B2: work-stealing gate+up matmul.
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        {
+            const int total_mlp1 = 2 * intermediate_size;
+            while (true) {
+                __shared__ unsigned int claimed;
+                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+                __syncthreads();
+                const unsigned int row = claimed;
+                if (row >= static_cast<unsigned int>(total_mlp1)) break;
+
+                const T* w = (row < static_cast<unsigned int>(intermediate_size))
+                    ? gate_proj_w : up_proj_w;
+                const int weight_row =
+                    (row < static_cast<unsigned int>(intermediate_size))
+                        ? static_cast<int>(row)
+                        : static_cast<int>(row - intermediate_size);
+                const T* wr = w + static_cast<size_t>(weight_row) * hidden_size;
+
+                float p = 0.0f;
+                for (int c = tid; c < hidden_size; c += bs) {
+                    p += g4_to_float(wr[c]) * b_normed_ff[c];
+                }
+                lds[tid] = p;
+                __syncthreads();
+                for (int s = bs / 2; s > 0; s >>= 1) {
+                    if (tid < s) lds[tid] += lds[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) b_gate_up[row] = lds[0];
+                __syncthreads();
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B3: gated_proj[i] = gelu(gate[i]) * up[i].
+        {
+            const float* gate_slot = b_gate_up;
+            const float* up_slot = b_gate_up + intermediate_size;
+            for (int i = tid + blockIdx.x * bs;
+                 i < intermediate_size; i += bs * nb) {
+                b_gated_proj[i] = g4_gelu_tanh_scalar(gate_slot[i]) * up_slot[i];
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B4: work-stealing down_proj.
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        while (true) {
+            __shared__ unsigned int claimed;
+            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+            __syncthreads();
+            const unsigned int row = claimed;
+            if (row >= static_cast<unsigned int>(hidden_size)) break;
+
+            const T* wr = down_proj_w +
+                static_cast<size_t>(row) * intermediate_size;
+            float p = 0.0f;
+            for (int c = tid; c < intermediate_size; c += bs) {
+                p += g4_to_float(wr[c]) * b_gated_proj[c];
+            }
+            lds[tid] = p;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) b_down_out[row] = lds[0];
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B5: post_ff_norm on block 0.
+        if (blockIdx.x == 0) {
+            g4_block_rms_norm_f32<T>(b_normed_down, b_down_out, post_ff_norm_w,
+                                      hidden_size, eps, lds);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B6: h_pre_ple = b_hidden_f32 + b_normed_down.
+        for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+            b_h_pre_ple[c] = b_hidden_f32[c] + b_normed_down[c];
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B7: work-stealing per_layer_input_gate matvec.
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        while (true) {
+            __shared__ unsigned int claimed;
+            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+            __syncthreads();
+            const unsigned int row = claimed;
+            if (row >= static_cast<unsigned int>(ple_hidden)) break;
+
+            const T* wr = pli_gate_w +
+                static_cast<size_t>(row) * hidden_size;
+            float p = 0.0f;
+            for (int c = tid; c < hidden_size; c += bs) {
+                p += g4_to_float(wr[c]) * b_h_pre_ple[c];
+            }
+            lds[tid] = p;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) b_gated_ple[row] = lds[0];
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B8: gated_act = gelu(gated_ple) * per_layer_input.
+        for (int i = tid + blockIdx.x * bs; i < ple_hidden; i += bs * nb) {
+            const float g = g4_gelu_tanh_scalar(b_gated_ple[i]);
+            b_gated_act[i] = g * g4_to_float(per_layer_input[i]);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B9: work-stealing per_layer_projection matvec.
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        while (true) {
+            __shared__ unsigned int claimed;
+            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+            __syncthreads();
+            const unsigned int row = claimed;
+            if (row >= static_cast<unsigned int>(hidden_size)) break;
+
+            const T* wr = pli_proj_w +
+                static_cast<size_t>(row) * ple_hidden;
+            float p = 0.0f;
+            for (int c = tid; c < ple_hidden; c += bs) {
+                p += g4_to_float(wr[c]) * b_gated_act[c];
+            }
+            lds[tid] = p;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) b_projected[row] = lds[0];
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B10: post_per_layer_input_norm on block 0.
+        if (blockIdx.x == 0) {
+            g4_block_rms_norm_f32<T>(b_normed_ple, b_projected,
+                                      pli_post_norm_w,
+                                      hidden_size, eps, lds);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        // B11: hidden_io = bf16((h_pre_ple + normed_ple) * layer_scalar).
+        for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+            const float v = (b_h_pre_ple[c] + b_normed_ple[c]) * layer_scalar;
+            hidden_io[c] = g4_from_float<T>(v);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+    }
+}
