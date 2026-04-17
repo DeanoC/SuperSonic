@@ -39,6 +39,14 @@ With --emit-state, additionally:
                                         prompt token. Used inside each layer's PLE
                                         branch: gelu_tanh(gate(hidden)) * per_layer_inputs[i].
   per_layer_inputs_shape               (Vec<usize>)
+  per_layer_inputs_by_step             (Vec<base64 BF16>, one entry per decode step.
+                                        Entry k's input token is `last_prompt_token`
+                                        for k==0 and `generated_token_ids[k-1]` for
+                                        k > 0. Each entry is shape
+                                        [num_hidden_layers, hidden_size_per_layer_input]
+                                        and is consumed by the Rust decode validator
+                                        so it does not need to implement
+                                        `project_per_layer_inputs` itself.)
 
 Usage:
     python3 gemma4_oracle.py \
@@ -244,6 +252,24 @@ def main() -> None:
         decode_logits.append(out.logits[0, -1, :].float().cpu().tolist())
         next_token = int(out.logits[0, -1, :].argmax())
     decode_ms = (time.perf_counter() - t0) * 1000.0
+
+    if args.emit_state:
+        # Per-step per_layer_inputs for decode validation. Each step feeds a
+        # single token through get_per_layer_inputs + project_per_layer_inputs.
+        # Both calls are position-independent (pure embedding table lookups +
+        # elementwise math), so running them on a 1-token batch reproduces the
+        # value HF would see mid-decode.
+        last_prompt_token = int(input_ids[0, -1])
+        step_input_ids: list[int] = [last_prompt_token] + generated_ids[:-1]
+        pli_by_step: list[str] = []
+        for tok_id in step_input_ids:
+            tok_tensor = torch.tensor([[tok_id]], dtype=torch.long, device=device)
+            with torch.no_grad():
+                raw = language_model.get_per_layer_inputs(tok_tensor, None)
+                main = language_model.embed_tokens(tok_tensor)
+                full = language_model.project_per_layer_inputs(main, raw)
+            pli_by_step.append(tensor_to_b64(full[0, 0, :, :].to(torch_dtype)))
+        state_payload["per_layer_inputs_by_step"] = pli_by_step
 
     payload = {
         "load_ms": load_ms,

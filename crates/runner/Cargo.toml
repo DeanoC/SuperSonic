@@ -23,6 +23,10 @@ path = "src/bin/gemma4_primitive_test.rs"
 name = "gemma4_layer0_validate"
 path = "src/bin/gemma4_layer0_validate.rs"
 
+[[bin]]
+name = "gemma4_decode_validate"
+path = "src/bin/gemma4_decode_validate.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

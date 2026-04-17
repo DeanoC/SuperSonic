@@ -43,6 +43,13 @@ pub struct OracleOutput {
     pub per_layer_inputs: Option<String>,
     #[serde(default)]
     pub per_layer_inputs_shape: Option<Vec<usize>>,
+    /// Per decode-step PLE conditioning. Entry k corresponds to the input token
+    /// at Rust decode step k: `last_prompt_token` for k==0, else
+    /// `generated_token_ids[k-1]`. Each entry is base64-encoded BF16 with shape
+    /// `[num_hidden_layers, hidden_size_per_layer_input]`. Lets the Rust decode
+    /// validator skip implementing `project_per_layer_inputs` itself.
+    #[serde(default)]
+    pub per_layer_inputs_by_step: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
