@@ -794,12 +794,19 @@ def main() -> None:
     log(f"[bake-int4] loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
     log(f"[bake-int4] loading model (bf16) from {model_dir}")
+    # On shared-memory APUs we can't afford the CPU→GPU staging spike that
+    # `from_pretrained(...).to(device)` causes (peak = 2× model size). Use
+    # `device_map` so HF loads each tensor straight to the target device via
+    # meta-tensor init + per-shard materialization. For CPU bakes the
+    # `device_map="cpu"` path is equivalent to the legacy load.
+    device_map = str(device) if device.type != "cpu" else "cpu"
     model = AutoModelForImageTextToText.from_pretrained(
-        str(model_dir), torch_dtype=torch.bfloat16
+        str(model_dir),
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map=device_map,
     )
     model.eval()
-    if device.type != "cpu":
-        model = model.to(device)
 
     # Navigate to the text language model — that's what our decoder layers live in.
     if hasattr(model, "model") and hasattr(model.model, "language_model"):
