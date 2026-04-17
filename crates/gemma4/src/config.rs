@@ -173,6 +173,21 @@ impl TextConfig {
         self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers)
     }
 
+    /// For shared-KV layers (the last `num_kv_shared_layers`), return the
+    /// source layer index whose K/V cache this layer reuses at runtime.
+    /// Matches HF's pattern: scan the leading `num_kv_owning_layers` entries in
+    /// reverse for the first entry whose attention kind matches this layer's.
+    /// Non-shared layers return `None`. Layers whose kind never appears in the
+    /// non-shared prefix also return `None` (misconfigured).
+    pub fn kv_source_layer(&self, layer_idx: usize) -> Option<usize> {
+        let first_kv_shared = self.num_kv_owning_layers();
+        if layer_idx < first_kv_shared {
+            return None;
+        }
+        let my_kind = self.attn_kind(layer_idx)?;
+        (0..first_kv_shared).rev().find(|&j| self.attn_kind(j) == Some(my_kind))
+    }
+
     /// EOS token IDs (may be a single ID or a list, matching Qwen's config shape).
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match &self.eos_token_id {
@@ -298,6 +313,38 @@ mod tests {
         let slide_rope = t.rope_for(AttnKind::Sliding);
         assert_eq!(slide_rope.rope_type, "default");
         assert_eq!(t.eos_token_ids(), vec![1]);
+    }
+
+    #[test]
+    fn kv_source_layer_matches_e2b_pattern() {
+        // Build a synthetic 35-layer TextConfig with the real E2B layer_types
+        // pattern `[SWA*4, FULL]*7` and num_kv_shared_layers=20.
+        let mut types: Vec<String> = Vec::with_capacity(35);
+        for _ in 0..7 {
+            for _ in 0..4 {
+                types.push("sliding_attention".to_string());
+            }
+            types.push("full_attention".to_string());
+        }
+        let mut v: serde_json::Value = serde_json::from_str(E2B_CONFIG).unwrap();
+        v["text_config"]["num_hidden_layers"] = serde_json::json!(35);
+        v["text_config"]["num_kv_shared_layers"] = serde_json::json!(20);
+        v["text_config"]["layer_types"] = serde_json::Value::Array(
+            types.into_iter().map(serde_json::Value::String).collect(),
+        );
+        let cfg: Config = serde_json::from_value(v).unwrap();
+        let t = &cfg.text_config;
+        // Non-shared layers (0..15) return None.
+        for i in 0..15 {
+            assert_eq!(t.kv_source_layer(i), None, "layer {i}");
+        }
+        // Shared SWA layers reuse layer 13 (last non-shared SWA);
+        // shared FULL layers reuse layer 14 (last non-shared FULL).
+        let full_layers = [19usize, 24, 29, 34];
+        for i in 15..35 {
+            let expected = if full_layers.contains(&i) { 14 } else { 13 };
+            assert_eq!(t.kv_source_layer(i), Some(expected), "layer {i}");
+        }
     }
 
     #[test]

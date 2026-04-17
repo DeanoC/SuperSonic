@@ -316,6 +316,7 @@ fn seed_kv_cache_from_oracle(
     prompt_tokens: usize,
     head_dim: usize,
     max_t: usize,
+    positions_to_copy: usize,
 ) -> Result<GpuBuffer> {
     if oracle_k_shape != [1, num_kv_heads, prompt_tokens, head_dim] {
         bail!(
@@ -323,14 +324,14 @@ fn seed_kv_cache_from_oracle(
             oracle_k_shape
         );
     }
+    if positions_to_copy > prompt_tokens {
+        bail!(
+            "positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",
+        );
+    }
     let bf16_sz = 2;
-    let elems_per_pos = num_kv_heads * head_dim;
-    // Build cache bytes [num_kv_heads, max_T, head_dim], prefilled zeros.
     let total_bytes = num_kv_heads * max_t * head_dim * bf16_sz;
     let mut buf = vec![0u8; total_bytes];
-    // Copy oracle positions 0..prompt_tokens-1 (we intentionally leave the
-    // last position empty and let the Rust-side kernel re-append it).
-    //
     // Oracle layout: [1, num_kv_heads, prompt_tokens, head_dim] row-major,
     //   offset(h, t, d) = (h * prompt_tokens + t) * head_dim + d
     // Our layout:     [num_kv_heads, max_T, head_dim] row-major,
@@ -339,14 +340,13 @@ fn seed_kv_cache_from_oracle(
     // != max_T. Copy a head-row at a time per timestep.
     let row_bytes = head_dim * bf16_sz;
     for h in 0..num_kv_heads {
-        for t in 0..(prompt_tokens.saturating_sub(1)) {
+        for t in 0..positions_to_copy {
             let src_off = ((h * prompt_tokens) + t) * row_bytes;
             let dst_off = ((h * max_t) + t) * row_bytes;
             buf[dst_off..dst_off + row_bytes]
                 .copy_from_slice(&oracle_k[src_off..src_off + row_bytes]);
         }
     }
-    let _ = elems_per_pos;
     Ok(GpuBuffer::from_host_bytes(
         0,
         ScalarType::BF16,
@@ -540,18 +540,26 @@ fn main() -> Result<()> {
             AttnKind::Full => 0,
         };
 
-        if layer >= kv_caches.len() {
+        // Shared-KV: layers in the tail (last num_kv_shared_layers) reuse the
+        // K/V cache of an earlier non-shared layer of the same attention kind.
+        // They don't project their own K/V at runtime — HF slots 0..14 already
+        // contain all prompt positions for those caches.
+        let kv_source = tcfg.kv_source_layer(layer);
+        let shared_kv = kv_source.is_some();
+        let kv_slot = kv_source.unwrap_or(layer);
+        if kv_slot >= kv_caches.len() {
             bail!(
-                "oracle kv_caches has {} slots but layer {} requires slot {}",
+                "oracle kv_caches has {} slots but layer {} needs slot {} (shared={})",
                 kv_caches.len(),
                 layer,
-                layer,
+                kv_slot,
+                shared_kv,
             );
         }
-        let kv = &kv_caches[layer];
-        if kv.layer != layer {
+        let kv = &kv_caches[kv_slot];
+        if kv.layer != kv_slot {
             bail!(
-                "oracle kv_caches[{layer}].layer = {} != {layer}; cache layout changed?",
+                "oracle kv_caches[{kv_slot}].layer = {} != {kv_slot}; cache layout changed?",
                 kv.layer
             );
         }
@@ -567,11 +575,19 @@ fn main() -> Result<()> {
         };
         let input_norm = loader.load_bf16_to_gpu(&want("input_layernorm.weight")?)?;
         let q_proj = loader.load_bf16_to_gpu(&want("self_attn.q_proj.weight")?)?;
-        let k_proj = loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?;
-        let v_proj = loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?;
         let o_proj = loader.load_bf16_to_gpu(&want("self_attn.o_proj.weight")?)?;
         let q_norm = loader.load_bf16_to_gpu(&want("self_attn.q_norm.weight")?)?;
-        let k_norm = loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?;
+        // K/V projections and K-norm are only needed on non-shared layers.
+        // Shared layers pull K/V verbatim from the source layer's oracle dump.
+        let (k_proj, v_proj, k_norm) = if shared_kv {
+            (None, None, None)
+        } else {
+            (
+                Some(loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?),
+                Some(loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?),
+                Some(loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?),
+            )
+        };
         let post_attn_norm = loader.load_bf16_to_gpu(&want("post_attention_layernorm.weight")?)?;
         let pre_ff_norm = loader.load_bf16_to_gpu(&want("pre_feedforward_layernorm.weight")?)?;
         let post_ff_norm = loader.load_bf16_to_gpu(&want("post_feedforward_layernorm.weight")?)?;
@@ -593,8 +609,8 @@ fn main() -> Result<()> {
         let mut h_in = upload_bf16(&[hidden_size], &h_running_host)?;
 
         println!(
-            "  [layer{}] kind={:?} head_dim={head_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor} layer_scalar={layer_scalar_value:.4}",
-            layer, kind,
+            "  [layer{}] kind={:?} head_dim={head_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor} layer_scalar={layer_scalar_value:.4} shared_kv={} kv_slot={kv_slot}",
+            layer, kind, shared_kv,
         );
 
         // --- RoPE tables: sliding uses default RoPE with full rotation;
@@ -608,14 +624,25 @@ fn main() -> Result<()> {
         let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
         let sin_table = upload_bf16(&[prompt_tokens, head_dim], &sin_host)?;
 
-        // --- KV caches seeded from oracle (last position left empty) ---
+        // --- KV caches seeded from oracle ---
+        // Non-shared layers: copy positions 0..prompt_tokens-1 and let the
+        // kernel re-append the last slot via kv_append (exercises the K/V path).
+        // Shared layers: copy all prompt_tokens positions from the source
+        // layer's oracle dump; no kernel K/V compute, no kv_append.
+        let positions_to_copy = if shared_kv {
+            prompt_tokens
+        } else {
+            prompt_tokens.saturating_sub(1)
+        };
         let k_oracle_bytes = B64.decode(&kv.k).context("decode kv.k base64")?;
         let v_oracle_bytes = B64.decode(&kv.v).context("decode kv.v base64")?;
-        let mut k_cache = seed_kv_cache_from_oracle(
+        let k_cache = seed_kv_cache_from_oracle(
             &k_oracle_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+            positions_to_copy,
         )?;
-        let mut v_cache = seed_kv_cache_from_oracle(
+        let v_cache = seed_kv_cache_from_oracle(
             &v_oracle_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+            positions_to_copy,
         )?;
 
         // --- Forward pass ---
@@ -626,30 +653,41 @@ fn main() -> Result<()> {
         let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::rms_norm(0, dtype, &mut x, &h_in, Some(&input_norm), eps, hidden_size)?;
 
-        // Q = matvec(q_proj, x); K = matvec(k_proj, x); V = matvec(v_proj, x)
+        // Q = matvec(q_proj, x) always; K/V skipped on shared layers.
         let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
         g4::matvec(0, dtype, &mut q, &x, &q_proj, hidden_size, q_dim, &mut counter)?;
-        let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-        g4::matvec(0, dtype, &mut k, &x, &k_proj, hidden_size, kv_dim, &mut counter)?;
-        let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-        g4::matvec(0, dtype, &mut v, &x, &v_proj, hidden_size, kv_dim, &mut counter)?;
 
-        // Per-head Q_norm / K_norm (weight per head_dim). v_norm is with_scale=False.
+        // Per-head Q_norm (weight per head_dim).
         let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
         g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&q_norm), eps, num_q_heads, head_dim)?;
-        let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-        g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(&k_norm), eps, num_kv_heads, head_dim)?;
-        let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-        g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
 
-        // RoPE for Q and K (no RoPE for V).
+        // RoPE on Q (always).
         g4::rope_decode(0, dtype, &mut q_normed, &cos_table, &sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
-        g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
 
-        g4::kv_append(
-            0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
-            num_kv_heads, head_dim, pos, max_t,
-        )?;
+        // K/V compute, norm, RoPE-on-K, and kv_append only on non-shared layers.
+        let (mut k_cache, mut v_cache) = (k_cache, v_cache);
+        if !shared_kv {
+            let k_proj = k_proj.as_ref().expect("k_proj must be loaded on non-shared layers");
+            let v_proj = v_proj.as_ref().expect("v_proj must be loaded on non-shared layers");
+            let k_norm = k_norm.as_ref().expect("k_norm must be loaded on non-shared layers");
+
+            let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+            g4::matvec(0, dtype, &mut k, &x, k_proj, hidden_size, kv_dim, &mut counter)?;
+            let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+            g4::matvec(0, dtype, &mut v, &x, v_proj, hidden_size, kv_dim, &mut counter)?;
+
+            let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+            g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(k_norm), eps, num_kv_heads, head_dim)?;
+            let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+            g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
+
+            g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
+
+            g4::kv_append(
+                0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
+                num_kv_heads, head_dim, pos, max_t,
+            )?;
+        }
 
         // Attention
         let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
@@ -749,7 +787,7 @@ fn main() -> Result<()> {
         h_running_host = h_post_ple;
 
         // Suppress unused warning; reserved for future diagnostic use.
-        let _ = (q_proj.as_ptr(), k_proj.as_ptr(), v_proj.as_ptr(), o_proj.as_ptr());
+        let _ = (q_proj.as_ptr(), o_proj.as_ptr());
         let _: *const c_void = gate_proj.as_ptr();
     }
 
@@ -780,13 +818,30 @@ fn main() -> Result<()> {
             cli.layer, post_ple_want.len(), hidden_size
         );
     }
-    let post_ple_stats = compare_vectors(&final_post_ple, &post_ple_want)?;
+
+    // HF's `capture_outputs(tie_last_hidden_states=True)` overwrites
+    // `hidden_states[-1]` with the post-final-norm `last_hidden_state`, so
+    // `prefill_per_layer_hidden[N-1]` is not pre-norm like layers 0..N-2 —
+    // it's already been passed through `model.norm`. Apply final norm to
+    // our output before comparing so the stages line up.
+    let is_last_layer = cli.layer + 1 == tcfg.num_hidden_layers;
+    let (post_ple_got, compare_tag): (Vec<f32>, &str) = if is_last_layer {
+        let norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
+        let in_gpu = upload_bf16(&[hidden_size], &final_post_ple)?;
+        let mut out_gpu = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut out_gpu, &in_gpu, Some(&norm_w), eps, hidden_size)?;
+        (download_bf16(&out_gpu)?, "post-PLE+final-norm")
+    } else {
+        (final_post_ple.clone(), "post-PLE")
+    };
+    let post_ple_stats = compare_vectors(&post_ple_got, &post_ple_want)?;
     println!(
-        "[layer{} post-PLE] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6} (layer_scalar={:.4})",
-        cli.layer, post_ple_stats.cos_sim, post_ple_stats.max_abs,
+        "[layer{} {}] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6} (layer_scalar={:.4})",
+        cli.layer, compare_tag,
+        post_ple_stats.cos_sim, post_ple_stats.max_abs,
         post_ple_stats.rel_err_norm, final_layer_scalar,
     );
-    let first: Vec<String> = final_post_ple.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    let first: Vec<String> = post_ple_got.iter().take(6).map(|v| format!("{v:+.4}")).collect();
     let want_first: Vec<String> = post_ple_want.iter().take(6).map(|v| format!("{v:+.4}")).collect();
     println!("  got[..6]  = [{}]", first.join(", "));
     println!("  want[..6] = [{}]", want_first.join(", "));
