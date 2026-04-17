@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 .env
 .supersonic/
+.claude/scheduled_tasks.lock
