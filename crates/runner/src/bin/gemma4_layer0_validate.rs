@@ -1,0 +1,614 @@
+//! End-to-end single-layer correctness check for the Gemma 4 SWA decode path.
+//!
+//! Given a Gemma 4 E2B checkpoint directory and an oracle JSON produced with
+//! `oracle/gemma4_oracle.py --emit-state`, this binary runs layer 0 (sliding-
+//! window attention) through the Rust-side primitive kernels and compares the
+//! resulting *pre-PLE* hidden state against the oracle's snapshot. Layer 0 is
+//! always SWA for E2B; the task description in the session kickoff commits to
+//! validating SWA first and deferring full-attention / PLE / shared-KV.
+//!
+//! The layer-0 input hidden is reconstructed from the tokenizer-output prompt
+//! IDs (emitted by the oracle as `prompt_token_ids`) by looking up the last
+//! token's row in `embed_tokens.weight` and scaling by `sqrt(hidden_size)` —
+//! Gemma 4's `Gemma4TextScaledWordEmbedding` multiplies by embed_scale at
+//! lookup time.
+//!
+//! The K/V cache is seeded from the oracle's `kv_caches[0]` (layer 0 is the
+//! first SWA slot). The last entry is truncated before our kernel runs, then
+//! re-appended via `g4::kv_append` after the current-token K/V are
+//! computed — this exercises the full K/V path end-to-end.
+//!
+//! Usage:
+//!   cargo run --release --bin gemma4_layer0_validate -- \
+//!     --model-dir <checkpoint> --oracle-json <oracle_state.json> [--layer 0]
+//!
+//! Expected outcome: cosine similarity ≥ 0.999 between our Rust kernel's
+//! pre-PLE hidden state at the last prompt token and `prefill_per_layer_pre_ple[0]`.
+
+use std::ffi::c_void;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+
+use anyhow::{anyhow, bail, Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
+use clap::Parser;
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
+use gpu_hal::{GpuBuffer, ScalarType};
+use half::bf16;
+use kernel_ffi::gemma4 as g4;
+use memmap2::Mmap;
+use safetensors::SafeTensors;
+
+#[path = "../oracle.rs"]
+mod oracle;
+use oracle::OracleOutput;
+
+#[derive(Parser, Debug)]
+#[command(about = "Validate a single Gemma 4 SWA layer against the PyTorch oracle")]
+struct Cli {
+    /// Path to a local Gemma 4 checkpoint directory (config.json + safetensors).
+    #[arg(long)]
+    model_dir: PathBuf,
+    /// Oracle JSON file produced by `oracle/gemma4_oracle.py --emit-state`.
+    #[arg(long)]
+    oracle_json: PathBuf,
+    /// Layer index to validate (must be a sliding-attention layer; default 0).
+    #[arg(long, default_value_t = 0)]
+    layer: usize,
+}
+
+// -----------------------------------------------------------------------------
+// BF16 byte helpers
+// -----------------------------------------------------------------------------
+
+fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect()
+}
+
+fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vals.len() * 2);
+    for &v in vals {
+        out.extend_from_slice(&bf16::from_f32(v).to_bits().to_le_bytes());
+    }
+    out
+}
+
+fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
+    let bytes = f32_to_bf16_bytes(host);
+    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+}
+
+fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
+    Ok(bf16_bytes_to_f32(&buf.to_host_bytes()?))
+}
+
+// -----------------------------------------------------------------------------
+// Safetensors loader (unbaked): memmap every shard once, load tensors by name
+// -----------------------------------------------------------------------------
+
+struct UnbakedLoader {
+    shards: Vec<Mmap>,
+    /// Tensor name → index into `shards`.
+    index: std::collections::BTreeMap<String, usize>,
+}
+
+impl UnbakedLoader {
+    fn open(dir: &Path) -> Result<Self> {
+        let index_path = dir.join("model.safetensors.index.json");
+        if index_path.exists() {
+            let raw: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+            let weight_map = raw["weight_map"]
+                .as_object()
+                .ok_or_else(|| anyhow!("weight_map missing in {}", index_path.display()))?;
+            let mut shard_files: Vec<String> = Vec::new();
+            let mut shard_idx_map: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for v in weight_map.values() {
+                let filename = v.as_str().unwrap_or("").to_string();
+                if !shard_idx_map.contains_key(&filename) {
+                    shard_idx_map.insert(filename.clone(), shard_files.len());
+                    shard_files.push(filename);
+                }
+            }
+            let mut shards = Vec::with_capacity(shard_files.len());
+            for filename in &shard_files {
+                let path = dir.join(filename);
+                let file = File::open(&path)
+                    .with_context(|| format!("open shard {}", path.display()))?;
+                shards.push(unsafe { Mmap::map(&file)? });
+            }
+            let mut index = std::collections::BTreeMap::new();
+            for (tensor_name, filename) in weight_map {
+                let filename = filename.as_str().unwrap_or("");
+                if let Some(&shard_idx) = shard_idx_map.get(filename) {
+                    index.insert(tensor_name.clone(), shard_idx);
+                }
+            }
+            Ok(Self { shards, index })
+        } else {
+            let single = dir.join("model.safetensors");
+            if !single.exists() {
+                bail!("no safetensors found in {}", dir.display());
+            }
+            let file = File::open(&single)
+                .with_context(|| format!("open {}", single.display()))?;
+            let mmap = unsafe { Mmap::map(&file)? };
+            let st = SafeTensors::deserialize(&mmap)?;
+            let mut index = std::collections::BTreeMap::new();
+            for name in st.names() {
+                index.insert(name.to_string(), 0);
+            }
+            Ok(Self { shards: vec![mmap], index })
+        }
+    }
+
+    /// Return the raw BF16 byte view of a tensor in its original on-disk layout.
+    fn tensor_bytes<'a>(&'a self, name: &str) -> Result<(Vec<usize>, &'a [u8])> {
+        let &shard_idx = self
+            .index
+            .get(name)
+            .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
+        let st = SafeTensors::deserialize(&self.shards[shard_idx])?;
+        let view = st.tensor(name)?;
+        if view.dtype() != safetensors::Dtype::BF16 {
+            bail!("tensor {name} is {:?}, expected BF16", view.dtype());
+        }
+        Ok((view.shape().to_vec(), view.data()))
+    }
+
+    fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
+        let (shape, bytes) = self.tensor_bytes(name)?;
+        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Build a sliding-attn RoPE table (theta=10000, partial_rotary_factor=1.0)
+// matching HF's `emb = cat((freqs, freqs), dim=-1)` layout. Only the first
+// `half` values per row are read by the kernel; the second half is filled
+// with the same values so the table is a faithful mirror of HF's emb.
+// -----------------------------------------------------------------------------
+
+fn build_sliding_rope_table(
+    head_dim: usize,
+    rope_theta: f64,
+    max_pos: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(head_dim % 2 == 0);
+    let half = head_dim / 2;
+
+    // inv_freq[i] = 1 / theta^(2i/head_dim), i in 0..half
+    let mut inv_freq = Vec::with_capacity(half);
+    for i in 0..half {
+        let exponent = (2 * i) as f64 / head_dim as f64;
+        inv_freq.push((1.0 / rope_theta.powf(exponent)) as f32);
+    }
+
+    let mut cos = vec![0.0f32; max_pos * head_dim];
+    let mut sin = vec![0.0f32; max_pos * head_dim];
+    for p in 0..max_pos {
+        for i in 0..half {
+            let theta = (p as f32) * inv_freq[i];
+            let (s, c) = theta.sin_cos();
+            // First half: cos[p, i] / sin[p, i]
+            cos[p * head_dim + i] = c;
+            sin[p * head_dim + i] = s;
+            // Second half: duplicated (matches HF cat((freqs, freqs), dim=-1))
+            cos[p * head_dim + i + half] = c;
+            sin[p * head_dim + i + half] = s;
+        }
+    }
+    (cos, sin)
+}
+
+// -----------------------------------------------------------------------------
+// Extract the last prompt token's embedding row from `embed_tokens.weight`
+// without allocating the full embedding table on the GPU. Applies Gemma 4's
+// `embed_scale = sqrt(hidden_size)` scaling.
+// -----------------------------------------------------------------------------
+
+fn load_scaled_embed_row(
+    loader: &UnbakedLoader,
+    weight_name: &str,
+    token_id: u32,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let (shape, bytes) = loader.tensor_bytes(weight_name)?;
+    if shape.len() != 2 || shape[1] != hidden_size {
+        bail!(
+            "{weight_name} shape {:?} does not match expected [vocab, {hidden_size}]",
+            shape
+        );
+    }
+    let vocab = shape[0];
+    if (token_id as usize) >= vocab {
+        bail!("token id {token_id} out of range (vocab={vocab})");
+    }
+    let row_bytes = hidden_size * 2;
+    let off = token_id as usize * row_bytes;
+    let slice = &bytes[off..off + row_bytes];
+    let row = bf16_bytes_to_f32(slice);
+    // HF stores `embed_scale` as a BF16 scalar (`self.embed_scale.to(self.weight.dtype)`),
+    // so the round-to-nearest step from sqrt(hidden_size) happens before the multiply.
+    // Mirror that precision exactly so our layer-0 input matches HF bit-for-bit at
+    // BF16 resolution.
+    let scale_bf16 = bf16::from_f32((hidden_size as f32).sqrt());
+    let scale = scale_bf16.to_f32();
+    Ok(row.iter().map(|v| v * scale).collect())
+}
+
+// -----------------------------------------------------------------------------
+// KV cache setup: oracle stores [1, 1, prompt_tokens, 256] (batch, kv_heads,
+// seq, head_dim) BF16. Our kernel layout is [num_kv_heads=1, max_T, head_dim].
+// With `num_kv_heads=1` and `max_T = prompt_tokens`, the byte layout is the
+// same as the oracle dump for positions 0..prompt_tokens — we pre-fill all
+// positions except the last, then let `kv_append` write the last slot.
+// -----------------------------------------------------------------------------
+
+fn seed_kv_cache_from_oracle(
+    oracle_k: &[u8],
+    oracle_k_shape: &[usize],
+    num_kv_heads: usize,
+    prompt_tokens: usize,
+    head_dim: usize,
+    max_t: usize,
+) -> Result<GpuBuffer> {
+    if oracle_k_shape != [1, num_kv_heads, prompt_tokens, head_dim] {
+        bail!(
+            "oracle KV shape {:?} != expected [1, {num_kv_heads}, {prompt_tokens}, {head_dim}]",
+            oracle_k_shape
+        );
+    }
+    let bf16_sz = 2;
+    let elems_per_pos = num_kv_heads * head_dim;
+    // Build cache bytes [num_kv_heads, max_T, head_dim], prefilled zeros.
+    let total_bytes = num_kv_heads * max_t * head_dim * bf16_sz;
+    let mut buf = vec![0u8; total_bytes];
+    // Copy oracle positions 0..prompt_tokens-1 (we intentionally leave the
+    // last position empty and let the Rust-side kernel re-append it).
+    //
+    // Oracle layout: [1, num_kv_heads, prompt_tokens, head_dim] row-major,
+    //   offset(h, t, d) = (h * prompt_tokens + t) * head_dim + d
+    // Our layout:     [num_kv_heads, max_T, head_dim] row-major,
+    //   offset(h, t, d) = (h * max_T + t) * head_dim + d
+    // Both iterate d contiguously, but the t-stride differs when prompt_tokens
+    // != max_T. Copy a head-row at a time per timestep.
+    let row_bytes = head_dim * bf16_sz;
+    for h in 0..num_kv_heads {
+        for t in 0..(prompt_tokens.saturating_sub(1)) {
+            let src_off = ((h * prompt_tokens) + t) * row_bytes;
+            let dst_off = ((h * max_t) + t) * row_bytes;
+            buf[dst_off..dst_off + row_bytes]
+                .copy_from_slice(&oracle_k[src_off..src_off + row_bytes]);
+        }
+    }
+    let _ = elems_per_pos;
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        &[num_kv_heads, max_t, head_dim],
+        &buf,
+    )?)
+}
+
+// -----------------------------------------------------------------------------
+// Vector stats: cosine similarity and max abs diff
+// -----------------------------------------------------------------------------
+
+struct CompareStats {
+    cos_sim: f32,
+    max_abs: f32,
+    rel_err_norm: f32,
+}
+
+fn compare_vectors(got: &[f32], want: &[f32]) -> Result<CompareStats> {
+    if got.len() != want.len() {
+        bail!("length mismatch got={} want={}", got.len(), want.len());
+    }
+    let mut dot = 0.0f64;
+    let mut ng = 0.0f64;
+    let mut nw = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut diff_sq = 0.0f64;
+    let mut want_sq = 0.0f64;
+    for (&g, &w) in got.iter().zip(want.iter()) {
+        dot += g as f64 * w as f64;
+        ng += g as f64 * g as f64;
+        nw += w as f64 * w as f64;
+        let d = (g - w).abs();
+        if d > max_abs {
+            max_abs = d;
+        }
+        diff_sq += (g - w) as f64 * (g - w) as f64;
+        want_sq += w as f64 * w as f64;
+    }
+    let cos_sim = if ng > 0.0 && nw > 0.0 {
+        (dot / (ng.sqrt() * nw.sqrt())) as f32
+    } else {
+        0.0
+    };
+    let rel_err_norm = if want_sq > 0.0 {
+        (diff_sq.sqrt() / want_sq.sqrt()) as f32
+    } else {
+        0.0
+    };
+    Ok(CompareStats { cos_sim, max_abs, rel_err_norm })
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
+
+    // --- Config + oracle ---
+    let config: Config = g4_config::load_config(&cli.model_dir)
+        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let tcfg: &TextConfig = &config.text_config;
+
+    if cli.layer >= tcfg.num_hidden_layers {
+        bail!("--layer {} >= num_hidden_layers {}", cli.layer, tcfg.num_hidden_layers);
+    }
+    let kind = tcfg
+        .attn_kind(cli.layer)
+        .ok_or_else(|| anyhow!("layer {} has no attention kind", cli.layer))?;
+    if kind != AttnKind::Sliding {
+        bail!(
+            "layer {} is {:?}; this binary only validates sliding_attention layers",
+            cli.layer,
+            kind
+        );
+    }
+
+    let oracle_bytes = std::fs::read(&cli.oracle_json)
+        .with_context(|| format!("read {}", cli.oracle_json.display()))?;
+    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
+        .context("parse oracle JSON")?;
+    let prompt_token_ids = oracle
+        .prompt_token_ids
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing prompt_token_ids; re-run gemma4_oracle.py"))?;
+    if prompt_token_ids.len() != oracle.prompt_tokens {
+        bail!(
+            "prompt_token_ids length {} != prompt_tokens {}",
+            prompt_token_ids.len(),
+            oracle.prompt_tokens
+        );
+    }
+    let kv_caches = oracle
+        .kv_caches
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing kv_caches (need --emit-state)"))?;
+    let pre_ple = oracle
+        .prefill_per_layer_pre_ple
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle JSON missing prefill_per_layer_pre_ple"))?;
+
+    // For E2B, HF's DynamicCache exposes 15 slots keyed by layer index; layer 0
+    // maps to slot 0 directly.
+    let layer_slot = cli.layer;
+    if layer_slot >= kv_caches.len() {
+        bail!(
+            "oracle kv_caches has {} slots but layer {} requires slot {}",
+            kv_caches.len(),
+            cli.layer,
+            layer_slot
+        );
+    }
+    let kv = &kv_caches[layer_slot];
+    if kv.layer != layer_slot {
+        bail!(
+            "oracle kv_caches[{layer_slot}].layer = {} != {layer_slot}; cache layout changed?",
+            kv.layer
+        );
+    }
+    if cli.layer >= pre_ple.len() {
+        bail!("prefill_per_layer_pre_ple has only {} entries", pre_ple.len());
+    }
+
+    let prompt_tokens = oracle.prompt_tokens;
+    let last_token_id = *prompt_token_ids
+        .last()
+        .ok_or_else(|| anyhow!("prompt_tokens == 0"))?;
+    let pos = prompt_tokens - 1;
+
+    // --- Model geometry for layer 0 ---
+    let hidden_size = tcfg.hidden_size;
+    let head_dim = tcfg.head_dim_for(kind);
+    let rotary_dim = head_dim; // sliding: partial_rotary_factor = 1.0
+    let num_q_heads = tcfg.num_attention_heads;
+    let num_kv_heads = tcfg.num_key_value_heads;
+    let q_dim = num_q_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let intermediate_size = g4_spec::mlp_intermediate(tcfg, cli.layer);
+    let eps = tcfg.rms_norm_eps as f32;
+    let sliding_window = tcfg.sliding_window as i32;
+    let rope_theta = tcfg.rope_for(kind).rope_theta;
+    let max_t = prompt_tokens; // tight fit
+
+    println!(
+        "[layer0] prompt_tokens={prompt_tokens} last_token_id={last_token_id} head_dim={head_dim} q_dim={q_dim} kv_dim={kv_dim} imm={intermediate_size}"
+    );
+
+    // --- Load layer-0 safetensors weights ---
+    let loader = UnbakedLoader::open(&cli.model_dir)?;
+    let weight_prefix = "model.language_model";
+    // Use the existing expected-tensor spec to ensure we stay in sync with the
+    // probe logic, but we only load the 13 tensors the kernel path actually
+    // needs (skipping PLE weights + layer_scalar, which the pre-PLE checkpoint
+    // doesn't consume).
+    let layer_spec = g4_spec::layer_tensors(tcfg, weight_prefix, cli.layer);
+    let want = |short: &str| {
+        layer_spec
+            .iter()
+            .find(|s| s.name.ends_with(short))
+            .map(|s| s.name.clone())
+            .ok_or_else(|| anyhow!("no tensor spec matching *.{short}"))
+    };
+    let input_norm = loader.load_bf16_to_gpu(&want("input_layernorm.weight")?)?;
+    let q_proj = loader.load_bf16_to_gpu(&want("self_attn.q_proj.weight")?)?;
+    let k_proj = loader.load_bf16_to_gpu(&want("self_attn.k_proj.weight")?)?;
+    let v_proj = loader.load_bf16_to_gpu(&want("self_attn.v_proj.weight")?)?;
+    let o_proj = loader.load_bf16_to_gpu(&want("self_attn.o_proj.weight")?)?;
+    let q_norm = loader.load_bf16_to_gpu(&want("self_attn.q_norm.weight")?)?;
+    let k_norm = loader.load_bf16_to_gpu(&want("self_attn.k_norm.weight")?)?;
+    let post_attn_norm = loader.load_bf16_to_gpu(&want("post_attention_layernorm.weight")?)?;
+    let pre_ff_norm = loader.load_bf16_to_gpu(&want("pre_feedforward_layernorm.weight")?)?;
+    let post_ff_norm = loader.load_bf16_to_gpu(&want("post_feedforward_layernorm.weight")?)?;
+    let gate_proj = loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?;
+    let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
+    let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
+
+    // --- Layer-0 input hidden: embed_tokens[last] * sqrt(hidden) ---
+    let h_in_host =
+        load_scaled_embed_row(&loader, &format!("{weight_prefix}.embed_tokens.weight"), last_token_id, hidden_size)?;
+    let mut h_in = upload_bf16(&[hidden_size], &h_in_host)?;
+
+    // --- RoPE tables (sliding layer) ---
+    let (cos_host, sin_host) = build_sliding_rope_table(head_dim, rope_theta, prompt_tokens);
+    let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
+    let sin_table = upload_bf16(&[prompt_tokens, head_dim], &sin_host)?;
+
+    // --- KV caches seeded from oracle (last position left empty) ---
+    let k_oracle_bytes = B64.decode(&kv.k).context("decode kv_caches[0].k base64")?;
+    let v_oracle_bytes = B64.decode(&kv.v).context("decode kv_caches[0].v base64")?;
+    let mut k_cache = seed_kv_cache_from_oracle(
+        &k_oracle_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+    )?;
+    let mut v_cache = seed_kv_cache_from_oracle(
+        &v_oracle_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+    )?;
+
+    // --- Scratch buffers ---
+    let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
+    let dtype = ScalarType::BF16;
+
+    // --- Forward pass ---
+
+    // residual = h_in
+    let residual = h_in.clone_device()?;
+
+    // x = rms_norm(h_in, input_layernorm.weight)
+    let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(0, dtype, &mut x, &h_in, Some(&input_norm), eps, hidden_size)?;
+
+    // Q = matvec(q_proj, x); K = matvec(k_proj, x); V = matvec(v_proj, x)
+    let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+    g4::matvec(0, dtype, &mut q, &x, &q_proj, hidden_size, q_dim, &mut counter)?;
+    let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+    g4::matvec(0, dtype, &mut k, &x, &k_proj, hidden_size, kv_dim, &mut counter)?;
+    let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+    g4::matvec(0, dtype, &mut v, &x, &v_proj, hidden_size, kv_dim, &mut counter)?;
+
+    // Per-head Q_norm / K_norm (weight per head_dim). v_norm is with_scale=False.
+    let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+    g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&q_norm), eps, num_q_heads, head_dim)?;
+    let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+    g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(&k_norm), eps, num_kv_heads, head_dim)?;
+    let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+    g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
+
+    // RoPE for Q and K (no RoPE for V).
+    g4::rope_decode(0, dtype, &mut q_normed, &cos_table, &sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
+    g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
+
+    // kv_append → k_cache/v_cache now contain `prompt_tokens` valid entries.
+    g4::kv_append(
+        0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
+        num_kv_heads, head_dim, pos, max_t,
+    )?;
+
+    // Attention
+    let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
+    let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q_heads, max_t])?;
+    g4::swa_attn_decode(
+        0, dtype, &q_normed, &k_cache, &v_cache, &mut scores, &mut attn_out,
+        num_q_heads, num_kv_heads, head_dim, prompt_tokens, max_t, sliding_window, 1.0,
+    )?;
+
+    // o = o_proj @ attn_out.flatten
+    let attn_flat_shape = [q_dim];
+    // Reinterpret attn_out as [q_dim] — it's already the same bytes.
+    let mut attn_flat = GpuBuffer::zeros(0, dtype, &attn_flat_shape)?;
+    {
+        // D→D copy into the flat buffer; simpler than reshape gymnastics.
+        let bytes = attn_out.to_host_bytes()?;
+        attn_flat = GpuBuffer::from_host_bytes(0, dtype, &attn_flat_shape, &bytes)?;
+    }
+    let mut o = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::matvec(0, dtype, &mut o, &attn_flat, &o_proj, q_dim, hidden_size, &mut counter)?;
+
+    // x2 = rms_norm(o, post_attention_layernorm.weight); h = residual + x2
+    let mut x2 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(0, dtype, &mut x2, &o, Some(&post_attn_norm), eps, hidden_size)?;
+    let residual_h = download_bf16(&residual)?;
+    let x2_h = download_bf16(&x2)?;
+    let h1_h: Vec<f32> = residual_h.iter().zip(x2_h.iter()).map(|(a, b)| a + b).collect();
+    h_in = upload_bf16(&[hidden_size], &h1_h)?; // re-use h_in as the current hidden
+
+    // residual = h
+    let residual2 = h_in.clone_device()?;
+
+    // x = rms_norm(h, pre_feedforward_layernorm.weight)
+    let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(0, dtype, &mut x3, &h_in, Some(&pre_ff_norm), eps, hidden_size)?;
+
+    // gate = gate_proj @ x; up = up_proj @ x; y = gelu_tanh(gate) * up
+    let mut gate = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+    g4::matvec(0, dtype, &mut gate, &x3, &gate_proj, hidden_size, intermediate_size, &mut counter)?;
+    let mut up = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+    g4::matvec(0, dtype, &mut up, &x3, &up_proj, hidden_size, intermediate_size, &mut counter)?;
+    let mut y = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
+    g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up, intermediate_size)?;
+
+    // m = down_proj @ y
+    let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::matvec(0, dtype, &mut m, &y, &down_proj, intermediate_size, hidden_size, &mut counter)?;
+
+    // x2 = rms_norm(m, post_feedforward_layernorm.weight); h_out = residual + x2
+    let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(0, dtype, &mut x4, &m, Some(&post_ff_norm), eps, hidden_size)?;
+    let residual2_h = download_bf16(&residual2)?;
+    let x4_h = download_bf16(&x4)?;
+    let h_out: Vec<f32> = residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
+
+    // --- Compare against oracle pre-PLE for this layer ---
+    let want_bytes = B64
+        .decode(&pre_ple[cli.layer])
+        .context("decode prefill_per_layer_pre_ple base64")?;
+    let want_f32 = bf16_bytes_to_f32(&want_bytes);
+    if want_f32.len() != hidden_size {
+        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, want_f32.len(), hidden_size);
+    }
+
+    let stats = compare_vectors(&h_out, &want_f32)?;
+    println!(
+        "[layer{}] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6}",
+        cli.layer, stats.cos_sim, stats.max_abs, stats.rel_err_norm
+    );
+    let first: Vec<String> = h_out.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    let want_first: Vec<String> = want_f32.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    println!("  got[..6]  = [{}]", first.join(", "));
+    println!("  want[..6] = [{}]", want_first.join(", "));
+
+    // Suppress unused warning; reserved for future diagnostic use.
+    let _ = (q_proj.as_ptr(), k_proj.as_ptr(), v_proj.as_ptr(), o_proj.as_ptr());
+    let _: *const c_void = gate_proj.as_ptr();
+
+    if stats.cos_sim < 0.999 {
+        bail!(
+            "cosine similarity {:.6} below acceptance threshold 0.999",
+            stats.cos_sim
+        );
+    }
+    println!("PASS");
+    Ok(())
+}

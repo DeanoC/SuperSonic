@@ -112,7 +112,16 @@ def main() -> None:
         # forward signature.
         pre_ple_snapshots: dict[int, torch.Tensor] = {}
         hook_handles: list = []
-        language_model = model.model if hasattr(model, "model") else model
+        # AutoModelForImageTextToText returns Gemma4ForConditionalGeneration whose
+        # `.model` attribute is a Gemma4Model multimodal wrapper; the text stack
+        # with `.layers` lives under `model.model.language_model` (see HF's
+        # Gemma4Model.__init__: `self.language_model = AutoModel.from_config(...)`).
+        if hasattr(model, "model") and hasattr(model.model, "language_model"):
+            language_model = model.model.language_model
+        elif hasattr(model, "model"):
+            language_model = model.model
+        else:
+            language_model = model
         for layer_idx, layer in enumerate(language_model.layers):
             if not getattr(layer, "hidden_size_per_layer_input", 0):
                 continue
@@ -128,9 +137,12 @@ def main() -> None:
         # Re-run the language stack with output_hidden_states=True to grab the
         # post-final-norm hidden state at the last prompt token. Keep use_cache=False
         # to avoid mutating `past` (we keep the prefill cache from the call above).
+        # Call the text model directly (`Gemma4TextModel`) so we get a clean
+        # `BaseModelOutputWithPast` with `.last_hidden_state` + `.hidden_states`,
+        # rather than the multimodal wrapper's aggregated output.
         try:
             with torch.no_grad():
-                inner = model.model(
+                inner = language_model(
                     input_ids=input_ids, use_cache=False, output_hidden_states=True,
                 )
         finally:
@@ -216,6 +228,10 @@ def main() -> None:
         "prefill_logits": prefill_last_logits,
         "decode_logits": decode_logits,
         "generated_token_ids": generated_ids,
+        # Prompt token IDs (including any special tokens the tokenizer added).
+        # Needed by the Rust single-layer validator so it can reconstruct the
+        # layer-0 input hidden = embed_tokens[last_prompt_token] * sqrt(hidden).
+        "prompt_token_ids": [int(x) for x in input_ids[0].cpu().tolist()],
     }
     payload.update(state_payload)
     print(json.dumps(payload))

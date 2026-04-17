@@ -118,6 +118,53 @@ pub fn rms_norm(
     Ok(())
 }
 
+/// Apply the Gemma RMSNorm to each of `num_rows` rows of a packed
+/// `[num_rows, n_cols]` tensor independently, using the same `weight` vector
+/// (or `None` for with_scale=False) for every row.
+///
+/// Implemented as a serial launch loop — one kernel launch per row, each
+/// handling `n_cols` scalars. The underlying kernel is a single-block launch
+/// that normalizes exactly one row, so this helper advances the input/output
+/// pointers by `n_cols * sizeof(T)` bytes per iteration. Fine for the Gemma
+/// 4 layer-0 validator (num_heads ≤ 8, n_cols=256), correctness before fusion.
+pub fn rms_norm_per_row(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    weight: Option<&GpuBuffer>,
+    eps: f32,
+    num_rows: usize,
+    n_cols: usize,
+) -> Result<(), GpuError> {
+    let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    let row_bytes = n_cols * dtype.size_in_bytes();
+    let in_base = input.as_ptr() as *const u8;
+    let out_base = output.as_mut_ptr() as *mut u8;
+    for row in 0..num_rows {
+        let offset = row * row_bytes;
+        let in_ptr = unsafe { in_base.add(offset) as *const c_void };
+        let out_ptr = unsafe { out_base.add(offset) as *mut c_void };
+        let status = unsafe {
+            dotcache_gemma4_hip_rms_norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_cols,
+                eps,
+                in_ptr,
+                weight_ptr,
+                out_ptr,
+            )
+        };
+        if status != 0 {
+            return Err(GpuError::Hip(format!(
+                "gemma4 rms_norm_per_row failed at row {row} with status {status}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Single-token matvec: `out = W @ x` where `W` is `[out_dim, in_dim]` row-major.
 /// `counter_buf` must hold ≥4 mutable bytes — it's reset to 0 inside the call
 /// and drives the work-stealing row assignment.

@@ -31,6 +31,11 @@ pub struct OracleOutput {
     /// `residual + post_feedforward_layernorm(mlp_out)`. This is the checkpoint
     /// a Rust kernel can hit without implementing PLE yet.
     pub prefill_per_layer_pre_ple: Option<Vec<String>>,
+    /// Prompt token IDs, including any special tokens the tokenizer added.
+    /// Emitted by `oracle/gemma4_oracle.py` so Rust single-layer validators
+    /// can recover the layer-0 input embedding without re-tokenizing.
+    #[serde(default)]
+    pub prompt_token_ids: Option<Vec<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
