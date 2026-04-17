@@ -1432,6 +1432,325 @@ __global__ void g4_fused_attn_block_kernel(
 }
 
 // =============================================================================
+// Fused attention-block kernel — INT4 variant (Step 28).
+//
+// Structurally identical to `g4_fused_attn_block_kernel` above: same phase
+// order, same workspace layout, same F32 intermediates, same grid_barrier
+// synchronization. The only behavioral difference is that Phase 2 (Q/K/V
+// work-stealing matmul) and Phase 7 (o_proj work-stealing matmul) route
+// their inner column-reduction loops through `g4_int4_dequant_8` instead of
+// the direct `bf16 -> float` load. All other phases (norms, RoPE, KV append,
+// SWA/full attention, post_attn_norm, residual) are byte-for-byte copies of
+// the BF16 kernel's phases — duplicated intentionally per the feedback rule
+// about not touching already-validated kernels (see feedback_hipcc_codegen).
+//
+// Weight format:
+//   q/k/v/o_proj_packed : uint8_t [out, in/2]    (2 nibbles per byte)
+//   q/k/v/o_proj_scale  : bf16   [out/gsz, in/gsz]
+//   q/k/v/o_proj_zero   : bf16   [out/gsz, in/gsz]
+// Dequant math: `bf16_round_rne(nibble * scale - zero_scale)` via
+// `g4_int4_dequant_8` — 8 weights per 4-byte packed load. Hot-path guaranteed
+// when `gsz | in_dim` and columns are 8-aligned (always true for the Gemma 4
+// projection shapes: hidden_size=1536/2560, intermediate=6144/10240/12288, q_dim
+// multiples of 256 — all multiples of 128).
+// =============================================================================
+
+template <typename T>
+__global__ void g4_fused_attn_block_int4_kernel(
+    int hidden_size, int num_q_heads, int num_kv_heads, int head_dim,
+    int rotary_dim, int sliding_window, int position, int max_T,
+    int shared_kv,              // 0 = compute+store K/V; non-zero = inherit cache
+    int gsz,                    // INT4 group size (bake fixes this at 128)
+    float eps, float scale,
+    const T* __restrict__ hidden_in,
+    T* __restrict__ hidden_out,
+    const T* __restrict__ input_norm_w,
+    const uint8_t*       __restrict__ q_proj_packed,
+    const hip_bfloat16*  __restrict__ q_proj_scale,
+    const hip_bfloat16*  __restrict__ q_proj_zero,
+    const uint8_t*       __restrict__ k_proj_packed,
+    const hip_bfloat16*  __restrict__ k_proj_scale,
+    const hip_bfloat16*  __restrict__ k_proj_zero,
+    const uint8_t*       __restrict__ v_proj_packed,
+    const hip_bfloat16*  __restrict__ v_proj_scale,
+    const hip_bfloat16*  __restrict__ v_proj_zero,
+    const T* __restrict__ q_norm_w,
+    const T* __restrict__ k_norm_w,
+    const uint8_t*       __restrict__ o_proj_packed,
+    const hip_bfloat16*  __restrict__ o_proj_scale,
+    const hip_bfloat16*  __restrict__ o_proj_zero,
+    const T* __restrict__ post_attn_norm_w,
+    const T* __restrict__ cos_table,
+    const T* __restrict__ sin_table,
+    T* __restrict__ k_cache,
+    T* __restrict__ v_cache,
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ matvec_counter,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __attribute__((launch_bounds(256, 1))) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+
+    const int q_dim = num_q_heads * head_dim;
+    const int kv_dim = num_kv_heads * head_dim;
+
+    // Workspace slots (same layout as BF16 kernel).
+    float* hidden_f32     = workspace;
+    float* normed_f32     = hidden_f32 + hidden_size;
+    float* proj_f32       = normed_f32 + hidden_size;
+    float* scores_f32     = proj_f32 + (q_dim + 2 * kv_dim);
+    float* attn_out_f32   = scores_f32 + num_q_heads * max_T;
+    float* oproj_f32      = attn_out_f32 + q_dim;
+    float* oproj_normed   = oproj_f32 + hidden_size;
+
+    extern __shared__ float lds[];
+
+    // Phase 0: hidden BF16 → F32 (residual copy).
+    for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+        hidden_f32[c] = g4_to_float(hidden_in[c]);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 1: input_norm on block 0.
+    if (blockIdx.x == 0) {
+        g4_block_rms_norm_f32<T>(normed_f32, hidden_f32, input_norm_w,
+                                  hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 2: work-stealing Q/K/V matmul with INT4 dequant.
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const int scale_cols_in = (hidden_size + gsz - 1) / gsz;
+    const int byte_cols_in = hidden_size / 2;
+
+    const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(total_qkv)) break;
+
+        const uint8_t*      w_packed_base;
+        const hip_bfloat16* w_scale_base;
+        const hip_bfloat16* w_zero_base;
+        int weight_row;
+        int dst_off;
+        if (row < static_cast<unsigned int>(q_dim)) {
+            w_packed_base = q_proj_packed;
+            w_scale_base  = q_proj_scale;
+            w_zero_base   = q_proj_zero;
+            weight_row    = static_cast<int>(row);
+            dst_off       = static_cast<int>(row);
+        } else if (row < static_cast<unsigned int>(q_dim + kv_dim)) {
+            w_packed_base = k_proj_packed;
+            w_scale_base  = k_proj_scale;
+            w_zero_base   = k_proj_zero;
+            weight_row    = static_cast<int>(row - q_dim);
+            dst_off       = static_cast<int>(row);
+        } else {
+            w_packed_base = v_proj_packed;
+            w_scale_base  = v_proj_scale;
+            w_zero_base   = v_proj_zero;
+            weight_row    = static_cast<int>(row - q_dim - kv_dim);
+            dst_off       = static_cast<int>(row);
+        }
+        const int scale_row = weight_row / gsz;
+        const uint8_t* w_row_bytes =
+            w_packed_base + static_cast<size_t>(weight_row) * byte_cols_in;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, w_scale_base, w_zero_base,
+                              scale_row, c0, scale_cols_in, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * normed_f32[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) proj_f32[dst_off] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    float* q_f32 = proj_f32;
+    float* k_f32 = proj_f32 + q_dim;
+    float* v_f32 = proj_f32 + q_dim + kv_dim;
+
+    // Phase 3: q/k/v norms + RoPE + KV append (block 0 serializes).
+    if (!shared_kv && blockIdx.x == 0) {
+        g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
+            num_q_heads, head_dim, eps, lds);
+        g4_block_rms_norm_per_head_f32<T>(k_f32, k_norm_w,
+            num_kv_heads, head_dim, eps, lds);
+        g4_block_rms_norm_per_head_f32<T>(v_f32, (const T*)nullptr,
+            num_kv_heads, head_dim, eps, lds);
+        g4_block_rope_f32<T>(q_f32, cos_table, sin_table,
+            num_q_heads, head_dim, rotary_dim, position);
+        g4_block_rope_f32<T>(k_f32, cos_table, sin_table,
+            num_kv_heads, head_dim, rotary_dim, position);
+        g4_block_kv_append_f32_to_bf16<T>(k_f32, v_f32, k_cache, v_cache,
+            num_kv_heads, head_dim, position, max_T);
+    } else if (shared_kv && blockIdx.x == 0) {
+        g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
+            num_q_heads, head_dim, eps, lds);
+        g4_block_rope_f32<T>(q_f32, cos_table, sin_table,
+            num_q_heads, head_dim, rotary_dim, position);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 4: attention scores (SWA or full).
+    const int kv_len = position + 1;
+    const int last = kv_len - 1;
+    const int min_t = (sliding_window > 0) ? max(0, last - sliding_window + 1) : 0;
+    const int num_q_per_kv = num_q_heads / num_kv_heads;
+    {
+        const int total_items = num_q_heads * kv_len;
+        for (int item = blockIdx.x * bs + tid; item < total_items; item += nb * bs) {
+            const int t = item % kv_len;
+            const int q_h = item / kv_len;
+            float val;
+            if (t < min_t) {
+                val = -INFINITY;
+            } else {
+                const int kv_h = q_h / num_q_per_kv;
+                const float* qr = q_f32 + static_cast<size_t>(q_h) * head_dim;
+                const T* kr = k_cache + (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                float acc = 0.0f;
+                for (int d = 0; d < head_dim; ++d) {
+                    acc += qr[d] * g4_to_float(kr[d]);
+                }
+                val = acc * scale;
+            }
+            scores_f32[static_cast<size_t>(q_h) * max_T + t] = val;
+        }
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 5: softmax (one block per q-head).
+    for (int q_h = blockIdx.x; q_h < num_q_heads; q_h += nb) {
+        float* row = scores_f32 + static_cast<size_t>(q_h) * max_T;
+        float pm = -INFINITY;
+        for (int t = tid; t < kv_len; t += bs) pm = fmaxf(pm, row[t]);
+        lds[tid] = pm;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+            __syncthreads();
+        }
+        const float mx = lds[0];
+        __syncthreads();
+        float ps = 0.0f;
+        for (int t = tid; t < kv_len; t += bs) {
+            const float e = expf(row[t] - mx);
+            row[t] = e;
+            ps += e;
+        }
+        lds[tid] = ps;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        const float inv_sum = 1.0f / lds[0];
+        __syncthreads();
+        for (int t = tid; t < kv_len; t += bs) row[t] *= inv_sum;
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 6: value aggregation.
+    {
+        const int total_items = num_q_heads * head_dim;
+        for (int item = blockIdx.x * bs + tid; item < total_items; item += nb * bs) {
+            const int d = item % head_dim;
+            const int q_h = item / head_dim;
+            const int kv_h = q_h / num_q_per_kv;
+            const float* pr = scores_f32 + static_cast<size_t>(q_h) * max_T;
+            float acc = 0.0f;
+            for (int t = 0; t < kv_len; ++t) {
+                const T* vr = v_cache + (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                acc += pr[t] * g4_to_float(vr[d]);
+            }
+            attn_out_f32[static_cast<size_t>(q_h) * head_dim + d] = acc;
+        }
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 7: work-stealing o_proj with INT4 dequant.
+    //   in_dim  = q_dim
+    //   out_dim = hidden_size
+    if (blockIdx.x == 0 && tid == 0) {
+        __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const int scale_cols_o = (q_dim + gsz - 1) / gsz;
+    const int byte_cols_o = q_dim / 2;
+
+    while (true) {
+        __shared__ unsigned int claimed;
+        if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
+        __syncthreads();
+        const unsigned int row = claimed;
+        if (row >= static_cast<unsigned int>(hidden_size)) break;
+
+        const int scale_row = static_cast<int>(row) / gsz;
+        const uint8_t* w_row_bytes =
+            o_proj_packed + static_cast<size_t>(row) * byte_cols_o;
+
+        float p = 0.0f;
+        for (int c0 = tid * 8; c0 < q_dim; c0 += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+            float w[8];
+            g4_int4_dequant_8(packed, o_proj_scale, o_proj_zero,
+                              scale_row, c0, scale_cols_o, gsz, w);
+            #pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                p += w[k] * attn_out_f32[c0 + k];
+            }
+        }
+        lds[tid] = p;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) oproj_f32[row] = lds[0];
+        __syncthreads();
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 8: post_attn_norm.
+    if (blockIdx.x == 0) {
+        g4_block_rms_norm_f32<T>(oproj_normed, oproj_f32, post_attn_norm_w,
+                                  hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    // Phase 9: residual add + BF16 store.
+    for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
+        hidden_out[c] = g4_from_float<T>(hidden_f32[c] + oproj_normed[c]);
+    }
+}
+
+// =============================================================================
 // Fused MLP + PLE kernel — the second half of a Gemma 4 decoder layer in one
 // kernel launch. Pairs with `g4_fused_attn_block_kernel` so each layer can be
 // executed as exactly two kernel launches (attention block + MLP/PLE block)

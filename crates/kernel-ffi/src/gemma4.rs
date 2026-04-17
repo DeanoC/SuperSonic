@@ -243,6 +243,49 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_fused_attn_block_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_size: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        position: usize,
+        max_t: usize,
+        sliding_window: c_int,
+        shared_kv: c_int,
+        group_size: c_int,
+        eps: f32,
+        scale: f32,
+        hidden_in: *const c_void,
+        hidden_out: *mut c_void,
+        input_norm_w: *const c_void,
+        q_proj_packed: *const c_void,
+        q_proj_scale: *const c_void,
+        q_proj_zero: *const c_void,
+        k_proj_packed: *const c_void,
+        k_proj_scale: *const c_void,
+        k_proj_zero: *const c_void,
+        v_proj_packed: *const c_void,
+        v_proj_scale: *const c_void,
+        v_proj_zero: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        o_proj_packed: *const c_void,
+        o_proj_scale: *const c_void,
+        o_proj_zero: *const c_void,
+        post_attn_norm_w: *const c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_fused_mlp_ple(
         dtype: c_int,
         device_ordinal: usize,
@@ -1055,6 +1098,128 @@ pub fn fused_attn_block(
     Ok(())
 }
 
+/// INT4 version of [`fused_attn_block`]. Same orchestration as the BF16 path
+/// (input_norm → QKV → qk/v norm → RoPE → kv_append → SWA/full attention →
+/// o_proj → post_attn_norm → residual) but the four projections (Q, K, V, O)
+/// are INT4-dequantized on the fly from `(packed u8, BF16 scale, BF16 zero)`
+/// triples at `group_size=128` (the only size the Gemma 4 GPTQ bake emits).
+///
+/// Shape invariants:
+///   - `q_proj_packed`  shape `[num_q_heads * head_dim, hidden_size / 2]`
+///   - `k_proj_packed` / `v_proj_packed` shape `[num_kv_heads * head_dim, hidden_size / 2]`
+///   - `o_proj_packed` shape `[hidden_size, (num_q_heads * head_dim) / 2]`
+///   - Every scale/zero tensor shape `[out_dim / group_size, in_dim / group_size]`
+///
+/// `k_proj_*`, `v_proj_*`, and `k_norm_w` must be `Some` unless `shared_kv` is
+/// true — shared-KV layers skip K/V computation and inherit from the source
+/// layer's cache, same as the BF16 path.
+///
+/// Workspace sizing, counter/barrier semantics, and the `shared_kv` toggle are
+/// identical to [`fused_attn_block`]. This wrapper exists solely to route the
+/// Q/K/V/O matmuls through the INT4 work-stealing inner loop.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_attn_block_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden_in: &GpuBuffer,
+    hidden_out: &mut GpuBuffer,
+    input_norm_w: &GpuBuffer,
+    q_proj_packed: &GpuBuffer,
+    q_proj_scale: &GpuBuffer,
+    q_proj_zero: &GpuBuffer,
+    k_proj_packed: Option<&GpuBuffer>,
+    k_proj_scale: Option<&GpuBuffer>,
+    k_proj_zero: Option<&GpuBuffer>,
+    v_proj_packed: Option<&GpuBuffer>,
+    v_proj_scale: Option<&GpuBuffer>,
+    v_proj_zero: Option<&GpuBuffer>,
+    q_norm_w: &GpuBuffer,
+    k_norm_w: Option<&GpuBuffer>,
+    o_proj_packed: &GpuBuffer,
+    o_proj_scale: &GpuBuffer,
+    o_proj_zero: &GpuBuffer,
+    post_attn_norm_w: &GpuBuffer,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    k_cache: &mut GpuBuffer,
+    v_cache: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    hidden_size: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    sliding_window: i32,
+    position: usize,
+    max_t: usize,
+    shared_kv: bool,
+    group_size: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let null = std::ptr::null();
+    let k_packed_ptr = k_proj_packed.map(|b| b.as_ptr()).unwrap_or(null);
+    let k_scale_ptr = k_proj_scale.map(|b| b.as_ptr()).unwrap_or(null);
+    let k_zero_ptr = k_proj_zero.map(|b| b.as_ptr()).unwrap_or(null);
+    let v_packed_ptr = v_proj_packed.map(|b| b.as_ptr()).unwrap_or(null);
+    let v_scale_ptr = v_proj_scale.map(|b| b.as_ptr()).unwrap_or(null);
+    let v_zero_ptr = v_proj_zero.map(|b| b.as_ptr()).unwrap_or(null);
+    let k_norm_ptr = k_norm_w.map(|b| b.as_ptr()).unwrap_or(null);
+    let status = unsafe {
+        dotcache_gemma4_hip_fused_attn_block_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            hidden_size,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            position,
+            max_t,
+            sliding_window as c_int,
+            if shared_kv { 1 } else { 0 },
+            group_size as c_int,
+            eps,
+            scale,
+            hidden_in.as_ptr(),
+            hidden_out.as_mut_ptr(),
+            input_norm_w.as_ptr(),
+            q_proj_packed.as_ptr(),
+            q_proj_scale.as_ptr(),
+            q_proj_zero.as_ptr(),
+            k_packed_ptr,
+            k_scale_ptr,
+            k_zero_ptr,
+            v_packed_ptr,
+            v_scale_ptr,
+            v_zero_ptr,
+            q_norm_w.as_ptr(),
+            k_norm_ptr,
+            o_proj_packed.as_ptr(),
+            o_proj_scale.as_ptr(),
+            o_proj_zero.as_ptr(),
+            post_attn_norm_w.as_ptr(),
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            k_cache.as_mut_ptr(),
+            v_cache.as_mut_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 fused_attn_block_int4 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 /// Required F32 workspace (elements) for `fused_mlp_ple`. Matches the
 /// kernel's layout: 7 * hidden + 3 * intermediate + 2 * ple_hidden.
 pub fn fused_mlp_ple_workspace_elems(
@@ -1274,6 +1439,42 @@ unsafe impl Send for Gemma4DecodeLayerDesc {}
 unsafe impl Sync for Gemma4DecodeLayerDesc {}
 
 impl Default for Gemma4DecodeLayerDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// INT4 scale/zero tensors for one Gemma 4 decoder layer's attention block.
+///
+/// Parallel-struct to [`Gemma4DecodeLayerDesc`] — the main desc's `q/k/v/o_proj_w`
+/// slots hold packed-u8 INT4 weights (reinterpreted at the kernel site) and
+/// this struct carries the matching BF16 scale/zero tables. Mirrors Qwen's
+/// [`INT4ScaleDesc`](crate::layer_desc::INT4ScaleDesc) pattern.
+///
+/// For Step 28 (fused attention-block INT4) only these 8 pointers + group_size
+/// are needed; MLP/PLE projections are still routed through the primitive-
+/// chain INT4 matvec and don't go through this struct. Extending Step 29
+/// (persistent decode INT4) adds `gate/up/down/per_layer_input_gate/
+/// per_layer_projection` fields here — not yet wired.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Gemma4Int4ScaleDesc {
+    pub q_proj_scale: *const c_void,
+    pub q_proj_zero: *const c_void,
+    pub k_proj_scale: *const c_void,
+    pub k_proj_zero: *const c_void,
+    pub v_proj_scale: *const c_void,
+    pub v_proj_zero: *const c_void,
+    pub o_proj_scale: *const c_void,
+    pub o_proj_zero: *const c_void,
+    /// Quantization group size (bake format fixes this at 128).
+    pub group_size: c_int,
+}
+
+unsafe impl Send for Gemma4Int4ScaleDesc {}
+unsafe impl Sync for Gemma4Int4ScaleDesc {}
+
+impl Default for Gemma4Int4ScaleDesc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }

@@ -335,6 +335,15 @@ pub struct Gemma4Int4Engine {
     v_caches: Vec<GpuBuffer>,
 
     counter: GpuBuffer,
+
+    // Fused attention-block INT4 scratch (Step 28). Sized once at `load()` to
+    // the max of every layer's workspace need; layers with smaller head_dim /
+    // fewer heads simply under-use the buffer. `matvec_counter` + barrier
+    // pair are cleared by the bridge/kernel before each launch.
+    attn_workspace: GpuBuffer,
+    attn_matvec_counter: GpuBuffer,
+    attn_barrier_counter: GpuBuffer,
+    attn_barrier_flag: GpuBuffer,
 }
 
 impl Gemma4Int4Engine {
@@ -417,6 +426,20 @@ impl Gemma4Int4Engine {
 
         let counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
+        // Workspace for `fused_attn_block_int4` — sized to the max across layers.
+        // Full-attention layers dominate both num_q_heads*max_t and head_dim.
+        let num_q_heads = tcfg.num_attention_heads;
+        let num_kv_heads = tcfg.num_key_value_heads;
+        let head_dim_max = full_head_dim.max(sliding_head_dim);
+        let attn_workspace_elems = g4::fused_attn_block_workspace_elems(
+            tcfg.hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
+        );
+        let attn_workspace =
+            GpuBuffer::zeros(device, ScalarType::F32, &[attn_workspace_elems])?;
+        let attn_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let attn_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let attn_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+
         Ok(Self {
             tcfg,
             store,
@@ -435,6 +458,10 @@ impl Gemma4Int4Engine {
             k_caches,
             v_caches,
             counter,
+            attn_workspace,
+            attn_matvec_counter,
+            attn_barrier_counter,
+            attn_barrier_flag,
         })
     }
 
@@ -891,12 +918,246 @@ impl Gemma4Int4Engine {
         Ok(logits_host)
     }
 
-    /// Single decode step via INT4 primitive chain. Writes a new K/V slot at
-    /// `pos` in every non-shared layer's cache (shared layers get their slot
-    /// copied from the source layer). Returns softcapped logits.
+    /// Single INT4 decode step. Each layer's attention block runs as one
+    /// fused `g4::fused_attn_block_int4` launch (input_norm → QKV → q/k/v
+    /// norm → RoPE → kv_append → SWA/full attention → o_proj → post_attn_norm
+    /// → residual); MLP+PLE remain primitive-chain. Non-shared-KV layers
+    /// still compute+store K/V before entering the fused block so shared
+    /// dependents find their cache populated. Returns softcapped logits.
     pub fn decode_step(&mut self, input_token_id: u32, pos: usize) -> Result<Vec<f32>> {
         if pos >= self.max_t {
             bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
+        }
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let num_q_heads = self.tcfg.num_attention_heads;
+        let num_kv_heads = self.tcfg.num_key_value_heads;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+        let num_layers = self.tcfg.num_hidden_layers;
+        let max_t = self.max_t;
+        let vocab_size = self.tcfg.vocab_size;
+
+        let h_in_host = self.load_scaled_embed_row(input_token_id)?;
+        let mut h_running = upload_bf16(&[hidden_size], &h_in_host)?;
+
+        let pli_bytes = self.compute_per_layer_inputs_single(input_token_id)?;
+
+        for layer_idx in 0..num_layers {
+            let w = &self.layers[layer_idx];
+            let head_dim = w.head_dim;
+            let rotary_dim = head_dim;
+            let sliding_window = match w.kind {
+                AttnKind::Sliding => self.tcfg.sliding_window as i32,
+                AttnKind::Full => 0,
+            };
+            let (cos_table, sin_table) = match w.kind {
+                AttnKind::Sliding => (&self.sliding_cos, &self.sliding_sin),
+                AttnKind::Full => (&self.full_cos, &self.full_sin),
+            };
+
+            // Non-shared-KV source layers must publish their K/V to every
+            // dependent shared layer *before* those layers execute their own
+            // fused_attn_block_int4 (which reads the cache). Produce K/V into
+            // this layer's cache first.
+            if !w.shared_kv {
+                let k_proj = w.k_proj.as_ref().expect("k_proj on non-shared layer");
+                let v_proj = w.v_proj.as_ref().expect("v_proj on non-shared layer");
+                let k_norm = w.k_norm.as_ref().expect("k_norm on non-shared layer");
+                let kv_dim = num_kv_heads * head_dim;
+
+                let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+                g4::rms_norm(0, dtype, &mut x, &h_running, Some(&w.input_norm), eps, hidden_size)?;
+
+                let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+                g4::matvec_int4(
+                    0, dtype, &mut k, &x,
+                    &k_proj.packed, &k_proj.scale, &k_proj.zero,
+                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                )?;
+                let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+                g4::matvec_int4(
+                    0, dtype, &mut v, &x,
+                    &v_proj.packed, &v_proj.scale, &v_proj.zero,
+                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                )?;
+
+                let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+                g4::rms_norm_per_row(
+                    0, dtype, &mut k_normed, &k, Some(k_norm),
+                    eps, num_kv_heads, head_dim,
+                )?;
+                let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
+                g4::rms_norm_per_row(
+                    0, dtype, &mut v_normed, &v, None,
+                    eps, num_kv_heads, head_dim,
+                )?;
+
+                g4::rope_decode(
+                    0, dtype, &mut k_normed, cos_table, sin_table,
+                    num_kv_heads, head_dim, rotary_dim, pos,
+                )?;
+
+                g4::kv_append(
+                    0, dtype, &k_normed, &v_normed,
+                    &mut self.k_caches[layer_idx], &mut self.v_caches[layer_idx],
+                    num_kv_heads, head_dim, pos, max_t,
+                )?;
+
+                for shared_layer in (layer_idx + 1)..num_layers {
+                    let s = &self.layers[shared_layer];
+                    if s.shared_kv && s.kv_source == layer_idx {
+                        let (lo, hi) = self.k_caches.split_at_mut(shared_layer);
+                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                        let (lo, hi) = self.v_caches.split_at_mut(shared_layer);
+                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                    }
+                }
+            }
+
+            let (k_caches_src, v_caches_src) =
+                (self.k_caches.as_mut_slice(), self.v_caches.as_mut_slice());
+            let mut h_mid = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::fused_attn_block_int4(
+                0, dtype,
+                &h_running, &mut h_mid,
+                &w.input_norm,
+                &w.q_proj.packed, &w.q_proj.scale, &w.q_proj.zero,
+                w.k_proj.as_ref().map(|p| &p.packed),
+                w.k_proj.as_ref().map(|p| &p.scale),
+                w.k_proj.as_ref().map(|p| &p.zero),
+                w.v_proj.as_ref().map(|p| &p.packed),
+                w.v_proj.as_ref().map(|p| &p.scale),
+                w.v_proj.as_ref().map(|p| &p.zero),
+                &w.q_norm,
+                w.k_norm.as_ref(),
+                &w.o_proj.packed, &w.o_proj.scale, &w.o_proj.zero,
+                &w.post_attn_norm,
+                cos_table, sin_table,
+                &mut k_caches_src[layer_idx], &mut v_caches_src[layer_idx],
+                &mut self.attn_workspace,
+                &mut self.attn_matvec_counter,
+                &mut self.attn_barrier_counter,
+                &mut self.attn_barrier_flag,
+                hidden_size, num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                sliding_window, pos, max_t,
+                w.shared_kv,
+                INT4_GROUP_SIZE,
+                eps, 1.0,
+            )?;
+
+            let residual2 = h_mid.clone_device()?;
+
+            let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm), eps, hidden_size)?;
+
+            let mut gate = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
+            g4::matvec_int4(
+                0, dtype, &mut gate, &x3,
+                &w.gate_proj.packed, &w.gate_proj.scale, &w.gate_proj.zero,
+                hidden_size, w.intermediate_size,
+                INT4_GROUP_SIZE, &mut self.counter,
+            )?;
+            let mut up_buf = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
+            g4::matvec_int4(
+                0, dtype, &mut up_buf, &x3,
+                &w.up_proj.packed, &w.up_proj.scale, &w.up_proj.zero,
+                hidden_size, w.intermediate_size,
+                INT4_GROUP_SIZE, &mut self.counter,
+            )?;
+            let mut y = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
+            g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, w.intermediate_size)?;
+
+            let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::matvec_int4(
+                0, dtype, &mut m, &y,
+                &w.down_proj.packed, &w.down_proj.scale, &w.down_proj.zero,
+                w.intermediate_size, hidden_size,
+                INT4_GROUP_SIZE, &mut self.counter,
+            )?;
+
+            let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::rms_norm(0, dtype, &mut x4, &m, Some(&w.post_ff_norm), eps, hidden_size)?;
+            let residual2_h = download_bf16(&residual2)?;
+            let x4_h = download_bf16(&x4)?;
+            let h_pre_ple: Vec<f32> =
+                residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
+
+            // PLE branch
+            let bytes_per_layer = ple_hidden * 2;
+            let pli_off = layer_idx * bytes_per_layer;
+            let pli_slice = &pli_bytes[pli_off..pli_off + bytes_per_layer];
+            let per_layer_input_f32 = bf16_bytes_to_f32(pli_slice);
+            let per_layer_input_gpu = upload_bf16(&[ple_hidden], &per_layer_input_f32)?;
+
+            let ple_residual = upload_bf16(&[hidden_size], &h_pre_ple)?;
+            let h_in_ple = ple_residual.clone_device()?;
+
+            let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+            g4::matvec_int4(
+                0, dtype, &mut gated, &h_in_ple,
+                &w.per_layer_input_gate.packed,
+                &w.per_layer_input_gate.scale,
+                &w.per_layer_input_gate.zero,
+                hidden_size, ple_hidden,
+                INT4_GROUP_SIZE, &mut self.counter,
+            )?;
+            let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
+            g4::gelu_tanh_gate_mul(
+                0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
+            )?;
+            let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::matvec_int4(
+                0, dtype, &mut projected, &gated_act,
+                &w.per_layer_projection.packed,
+                &w.per_layer_projection.scale,
+                &w.per_layer_projection.zero,
+                ple_hidden, hidden_size,
+                INT4_GROUP_SIZE, &mut self.counter,
+            )?;
+            let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+            g4::rms_norm(
+                0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm),
+                eps, hidden_size,
+            )?;
+            let ple_residual_h = download_bf16(&ple_residual)?;
+            let normed_h = download_bf16(&normed)?;
+            let h_post_ple: Vec<f32> = ple_residual_h
+                .iter()
+                .zip(normed_h.iter())
+                .map(|(a, b)| (a + b) * w.layer_scalar)
+                .collect();
+
+            h_running = upload_bf16(&[hidden_size], &h_post_ple)?;
+        }
+
+        let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut post_norm, &h_running, Some(&self.final_norm_w), eps, hidden_size)?;
+
+        let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+        g4::matvec(
+            0, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+            hidden_size, vocab_size, &mut self.counter,
+        )?;
+        let mut logits_host = download_bf16(&logits_gpu)?;
+        let cap = self.tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
+        for v in logits_host.iter_mut() {
+            *v = cap * (*v / cap).tanh();
+        }
+        Ok(logits_host)
+    }
+
+    /// Reference INT4 decode step that runs the attention block as the
+    /// pre-Step-28 primitive chain (10 launches per layer instead of one
+    /// fused call). Used only by `gemma4_fused_int4_validate` to confirm
+    /// that fusing launches changes nothing numerically. MLP+PLE is
+    /// identical between the two paths, so any divergence is localized to
+    /// the attention block.
+    pub fn decode_step_primitive(
+        &mut self, input_token_id: u32, pos: usize,
+    ) -> Result<Vec<f32>> {
+        if pos >= self.max_t {
+            bail!("decode_step_primitive: pos {pos} >= max_t {}", self.max_t);
         }
         let dtype = ScalarType::BF16;
         let hidden_size = self.tcfg.hidden_size;
@@ -1064,7 +1325,6 @@ impl Gemma4Int4Engine {
             let h_pre_ple: Vec<f32> =
                 residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
 
-            // PLE branch
             let bytes_per_layer = ple_hidden * 2;
             let pli_off = layer_idx * bytes_per_layer;
             let pli_slice = &pli_bytes[pli_off..pli_off + bytes_per_layer];
