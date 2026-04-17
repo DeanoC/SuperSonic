@@ -15,7 +15,7 @@
 //! `decode_step(token, pos) -> logits`, `greedy_sample`. Intended to be a
 //! drop-in for `run_gemma4` when `--int4` is set.
 
-use std::ffi::c_void;
+use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -24,6 +24,7 @@ use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
+use kernel_ffi::gemma4::{Gemma4DecodeLayerDesc, Gemma4Int4ScaleDesc};
 use model_store::BakedStore;
 
 const INT4_GROUP_SIZE: usize = 128;
@@ -336,15 +337,25 @@ pub struct Gemma4Int4Engine {
 
     counter: GpuBuffer,
 
-    // Fused-kernel scratch (Step 29 attention-block INT4 + Step 30 MLP+PLE
-    // INT4). Single workspace sized to `max(attn, mlp)` elements; attention
-    // and MLP run sequentially within a layer and share the F32 buffer.
-    // Matvec/barrier counters are cleared by each kernel launch so one pair
-    // covers both phases safely.
+    // Fused-kernel scratch. Single F32 workspace sized via
+    // `persistent_decode_workspace_elems` (max of attn + mlp across layers).
+    // Used by both the Step-29/30 two-launch path (still callable via
+    // `decode_step_primitive`'s primitive-chain reference doesn't touch it)
+    // and the Step-31 single-launch megakernel. Matvec/barrier counters are
+    // cleared by each kernel launch so one pair covers every phase safely.
     fused_workspace: GpuBuffer,
     fused_matvec_counter: GpuBuffer,
     fused_barrier_counter: GpuBuffer,
     fused_barrier_flag: GpuBuffer,
+
+    // Persistent-decode megakernel descriptor arrays — populated once at
+    // `load()`. Shared-KV layers alias their source layer's K/V cache
+    // pointers so the megakernel sees a single coherent cache buffer for
+    // the source→shared dependency (identical aliasing as BF16 megakernel).
+    layer_descs: Vec<Gemma4DecodeLayerDesc>,
+    layers_gpu: GpuBuffer,
+    int4_scale_descs: Vec<Gemma4Int4ScaleDesc>,
+    int4_scales_gpu: GpuBuffer,
 }
 
 impl Gemma4Int4Engine {
@@ -427,27 +438,133 @@ impl Gemma4Int4Engine {
 
         let counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
-        // Workspace for the two fused INT4 kernels — sized to the max across
-        // layers. Attention dominates on scores (num_q_heads * max_t); MLP+PLE
-        // dominates on intermediate_size (up to 12288 on E2B double-wide,
-        // 10240 on E4B). Single buffer holds whichever is bigger; attention
-        // and MLP run sequentially within each layer so no overlap.
+        // Workspace for the fused INT4 kernels — sized to the max across
+        // layers via `persistent_decode_workspace_elems`, which takes the
+        // max of (fused_attn_block_workspace_elems, fused_mlp_ple_workspace_elems).
+        // Same buffer serves both the single-launch persistent-decode path
+        // and the Step-29/30 per-layer fused calls (sequential within a layer).
         let num_q_heads = tcfg.num_attention_heads;
         let num_kv_heads = tcfg.num_key_value_heads;
         let head_dim_max = full_head_dim.max(sliding_head_dim);
-        let attn_workspace_elems = g4::fused_attn_block_workspace_elems(
-            tcfg.hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
-        );
         let intermediate_max = layers.iter().map(|l| l.intermediate_size).max().unwrap_or(0);
-        let mlp_workspace_elems = g4::fused_mlp_ple_workspace_elems(
-            tcfg.hidden_size, intermediate_max, tcfg.hidden_size_per_layer_input,
+        let ple_hidden = tcfg.hidden_size_per_layer_input;
+        let fused_workspace_elems = g4::persistent_decode_workspace_elems(
+            tcfg.hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
+            intermediate_max, ple_hidden,
         );
-        let fused_workspace_elems = attn_workspace_elems.max(mlp_workspace_elems);
         let fused_workspace =
             GpuBuffer::zeros(device, ScalarType::F32, &[fused_workspace_elems])?;
         let fused_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let fused_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let fused_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+
+        // Persistent-decode megakernel descriptor arrays. For each layer we
+        // populate one Gemma4DecodeLayerDesc (norms + packed-INT4 weight
+        // pointers + RoPE + KV cache) and one parallel Gemma4Int4ScaleDesc
+        // (scale/zero tables + group_size). Shared-KV layers alias the
+        // source layer's K/V cache pointer so a single write-read dependency
+        // lives in one buffer and the megakernel finds the populated slot
+        // without any intra-kernel replication.
+        let mut layer_descs: Vec<Gemma4DecodeLayerDesc> = Vec::with_capacity(num_layers);
+        let mut int4_scale_descs: Vec<Gemma4Int4ScaleDesc> = Vec::with_capacity(num_layers);
+        for l in 0..num_layers {
+            let w = &layers[l];
+            let kind_code: c_int = match w.kind {
+                AttnKind::Sliding => 0,
+                AttnKind::Full => 1,
+            };
+            let sliding_window_c: c_int = match w.kind {
+                AttnKind::Sliding => tcfg.sliding_window as c_int,
+                AttnKind::Full => 0,
+            };
+            let (cos_buf, sin_buf) = match w.kind {
+                AttnKind::Sliding => (&sliding_cos, &sliding_sin),
+                AttnKind::Full => (&full_cos, &full_sin),
+            };
+            let src_idx = if w.shared_kv { w.kv_source } else { l };
+            let k_buf = &k_caches[src_idx];
+            let v_buf = &v_caches[src_idx];
+
+            let k_proj_ptr = w.k_proj.as_ref().map(|p| p.packed.as_ptr()).unwrap_or(std::ptr::null());
+            let v_proj_ptr = w.v_proj.as_ref().map(|p| p.packed.as_ptr()).unwrap_or(std::ptr::null());
+            let k_norm_ptr = w.k_norm.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+            let k_scale_ptr = w.k_proj.as_ref().map(|p| p.scale.as_ptr()).unwrap_or(std::ptr::null());
+            let k_zero_ptr = w.k_proj.as_ref().map(|p| p.zero.as_ptr()).unwrap_or(std::ptr::null());
+            let v_scale_ptr = w.v_proj.as_ref().map(|p| p.scale.as_ptr()).unwrap_or(std::ptr::null());
+            let v_zero_ptr = w.v_proj.as_ref().map(|p| p.zero.as_ptr()).unwrap_or(std::ptr::null());
+
+            layer_descs.push(Gemma4DecodeLayerDesc {
+                layer_type: kind_code,
+                shared_kv: if w.shared_kv { 1 } else { 0 },
+                num_q_heads: num_q_heads as c_int,
+                num_kv_heads: num_kv_heads as c_int,
+                head_dim: w.head_dim as c_int,
+                rotary_dim: w.head_dim as c_int,
+                sliding_window: sliding_window_c,
+                intermediate_size: w.intermediate_size as c_int,
+                kv_max_t: max_t as c_int,
+                layer_scalar: w.layer_scalar,
+                input_norm_w: w.input_norm.as_ptr(),
+                q_proj_w: w.q_proj.packed.as_ptr(),
+                k_proj_w: k_proj_ptr,
+                v_proj_w: v_proj_ptr,
+                q_norm_w: w.q_norm.as_ptr(),
+                k_norm_w: k_norm_ptr,
+                o_proj_w: w.o_proj.packed.as_ptr(),
+                post_attn_norm_w: w.post_attn_norm.as_ptr(),
+                pre_ff_norm_w: w.pre_ff_norm.as_ptr(),
+                gate_proj_w: w.gate_proj.packed.as_ptr(),
+                up_proj_w: w.up_proj.packed.as_ptr(),
+                down_proj_w: w.down_proj.packed.as_ptr(),
+                post_ff_norm_w: w.post_ff_norm.as_ptr(),
+                per_layer_input_gate_w: w.per_layer_input_gate.packed.as_ptr(),
+                per_layer_projection_w: w.per_layer_projection.packed.as_ptr(),
+                post_per_layer_input_norm_w: w.post_per_layer_input_norm.as_ptr(),
+                cos_table: cos_buf.as_ptr(),
+                sin_table: sin_buf.as_ptr(),
+                kv_cache_k: k_buf.as_ptr() as *mut c_void,
+                kv_cache_v: v_buf.as_ptr() as *mut c_void,
+            });
+            int4_scale_descs.push(Gemma4Int4ScaleDesc {
+                q_proj_scale: w.q_proj.scale.as_ptr(),
+                q_proj_zero: w.q_proj.zero.as_ptr(),
+                k_proj_scale: k_scale_ptr,
+                k_proj_zero: k_zero_ptr,
+                v_proj_scale: v_scale_ptr,
+                v_proj_zero: v_zero_ptr,
+                o_proj_scale: w.o_proj.scale.as_ptr(),
+                o_proj_zero: w.o_proj.zero.as_ptr(),
+                gate_proj_scale: w.gate_proj.scale.as_ptr(),
+                gate_proj_zero: w.gate_proj.zero.as_ptr(),
+                up_proj_scale: w.up_proj.scale.as_ptr(),
+                up_proj_zero: w.up_proj.zero.as_ptr(),
+                down_proj_scale: w.down_proj.scale.as_ptr(),
+                down_proj_zero: w.down_proj.zero.as_ptr(),
+                per_layer_input_gate_scale: w.per_layer_input_gate.scale.as_ptr(),
+                per_layer_input_gate_zero: w.per_layer_input_gate.zero.as_ptr(),
+                per_layer_projection_scale: w.per_layer_projection.scale.as_ptr(),
+                per_layer_projection_zero: w.per_layer_projection.zero.as_ptr(),
+                group_size: INT4_GROUP_SIZE as c_int,
+            });
+        }
+        let layers_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                layer_descs.as_ptr() as *const u8,
+                layer_descs.len() * std::mem::size_of::<Gemma4DecodeLayerDesc>(),
+            )
+        };
+        let layers_gpu = GpuBuffer::from_host_bytes(
+            device, ScalarType::U8, &[layers_bytes.len()], layers_bytes,
+        )?;
+        let int4_scales_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                int4_scale_descs.as_ptr() as *const u8,
+                int4_scale_descs.len() * std::mem::size_of::<Gemma4Int4ScaleDesc>(),
+            )
+        };
+        let int4_scales_gpu = GpuBuffer::from_host_bytes(
+            device, ScalarType::U8, &[int4_scales_bytes.len()], int4_scales_bytes,
+        )?;
 
         Ok(Self {
             tcfg,
@@ -471,6 +588,10 @@ impl Gemma4Int4Engine {
             fused_matvec_counter,
             fused_barrier_counter,
             fused_barrier_flag,
+            layer_descs,
+            layers_gpu,
+            int4_scale_descs,
+            int4_scales_gpu,
         })
     }
 
@@ -927,13 +1048,69 @@ impl Gemma4Int4Engine {
         Ok(logits_host)
     }
 
-    /// Single INT4 decode step. Each layer's attention block runs as one
-    /// fused `g4::fused_attn_block_int4` launch (input_norm → QKV → q/k/v
-    /// norm → RoPE → kv_append → SWA/full attention → o_proj → post_attn_norm
-    /// → residual); MLP+PLE remain primitive-chain. Non-shared-KV layers
-    /// still compute+store K/V before entering the fused block so shared
-    /// dependents find their cache populated. Returns softcapped logits.
+    /// Single INT4 decode step — full 35-layer forward pass in ONE kernel
+    /// launch via `g4::persistent_decode_int4`. Every matmul (Q/K/V/O/
+    /// gate/up/down/per_layer_input_gate/per_layer_projection) is
+    /// INT4-dequantized inline. Shared-KV layers see their source layer's
+    /// cache via pointer aliasing in the descriptor array — no intra-kernel
+    /// replication needed. The only pre-kernel work is the PLI compute
+    /// (small matmul + norm over the token's row) and the lm-head epilogue
+    /// runs after. Returns softcapped logits.
     pub fn decode_step(&mut self, input_token_id: u32, pos: usize) -> Result<Vec<f32>> {
+        if pos >= self.max_t {
+            bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
+        }
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+        let num_layers = self.tcfg.num_hidden_layers;
+        let vocab_size = self.tcfg.vocab_size;
+
+        let h_in_host = self.load_scaled_embed_row(input_token_id)?;
+        let mut h_running = upload_bf16(&[hidden_size], &h_in_host)?;
+
+        let pli_bytes = self.compute_per_layer_inputs_single(input_token_id)?;
+        let pli_gpu = GpuBuffer::from_host_bytes(
+            0, dtype, &[num_layers, ple_hidden], &pli_bytes,
+        )?;
+
+        g4::persistent_decode_int4(
+            0, dtype,
+            &self.layers_gpu,
+            &self.int4_scales_gpu,
+            &mut h_running,
+            &pli_gpu,
+            &mut self.fused_workspace,
+            &mut self.fused_matvec_counter,
+            &mut self.fused_barrier_counter,
+            &mut self.fused_barrier_flag,
+            num_layers, hidden_size, ple_hidden, pos, eps, 1.0f32,
+        )?;
+
+        let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+        g4::rms_norm(0, dtype, &mut post_norm, &h_running, Some(&self.final_norm_w), eps, hidden_size)?;
+        let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+        g4::matvec(
+            0, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+            hidden_size, vocab_size, &mut self.counter,
+        )?;
+        let mut logits_host = download_bf16(&logits_gpu)?;
+        let cap = self.tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
+        for v in logits_host.iter_mut() {
+            *v = cap * (*v / cap).tanh();
+        }
+        Ok(logits_host)
+    }
+
+    /// Per-layer fused INT4 decode step (Step 29/30 path) — retained for
+    /// benchmarking the megakernel's launch-overhead savings. Runs each
+    /// layer as two fused launches (attn + mlp/ple) plus host-side PLI
+    /// slicing. Uses the same K/V caches as `decode_step`; shared-KV layers
+    /// get source writes replicated via D2D `copy_kv_slot` calls because
+    /// the fused kernel doesn't alias pointers.
+    #[allow(dead_code)]
+    fn _decode_step_fused_per_layer(&mut self, input_token_id: u32, pos: usize) -> Result<Vec<f32>> {
         if pos >= self.max_t {
             bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
         }

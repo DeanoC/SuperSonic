@@ -370,6 +370,25 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_gemma4_hip_persistent_decode_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_size: usize,
+        ple_hidden: usize,
+        position: usize,
+        eps: f32,
+        scale: f32,
+        layers: *const c_void,
+        int4_scales: *const c_void,
+        hidden_io: *mut c_void,
+        per_layer_inputs: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     fn dotcache_gemma4_hip_persistent_decode(
         dtype: c_int,
         device_ordinal: usize,
@@ -1692,6 +1711,67 @@ pub fn persistent_decode(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 persistent_decode failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// INT4 version of [`persistent_decode`]. Runs a full Gemma 4 forward pass
+/// for one decode token in a single kernel launch with all Q/K/V/O/gate/up/
+/// down/per_layer_input_gate/per_layer_projection matmuls INT4-dequantized
+/// inline via the same `(packed u8, BF16 scale, BF16 zero)` format the
+/// Step-29/30 fused kernels use. Same workspace sizing as the BF16 variant
+/// ([`persistent_decode_workspace_elems`]).
+///
+/// The `layers` buffer holds a contiguous `[num_layers]` array of
+/// [`Gemma4DecodeLayerDesc`] with its projection weight slots pointing at
+/// packed-u8 INT4 tensors (reinterpreted at the kernel site). The
+/// `int4_scales` buffer holds the matching `[num_layers]` array of
+/// [`Gemma4Int4ScaleDesc`] entries. Shared-KV layers must have their
+/// `kv_cache_k` / `kv_cache_v` pointers aliased to the source layer's cache
+/// buffers — no replication is performed inside the kernel.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    layers: &GpuBuffer,
+    int4_scales: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    per_layer_inputs: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    num_layers: usize,
+    hidden_size: usize,
+    ple_hidden: usize,
+    position: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_persistent_decode_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            position,
+            eps,
+            scale,
+            layers.as_ptr(),
+            int4_scales.as_ptr(),
+            hidden_io.as_mut_ptr(),
+            per_layer_inputs.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode_int4 failed with status {status}"
         )));
     }
     Ok(())
