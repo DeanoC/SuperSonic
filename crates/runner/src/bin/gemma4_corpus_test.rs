@@ -30,7 +30,34 @@ use serde::Deserialize;
 
 #[path = "../gemma4_engine.rs"]
 mod gemma4_engine;
+#[path = "../gemma4_int4_engine.rs"]
+mod gemma4_int4_engine;
 use gemma4_engine::Gemma4Engine;
+use gemma4_int4_engine::Gemma4Int4Engine;
+
+/// BF16 (default megakernel) or INT4 (GPTQ bake + primitive chain). Mirrors the
+/// dispatcher in `crates/runner/src/main.rs` but kept local so this harness
+/// doesn't need to pull in the full runner crate.
+enum Runtime {
+    Bf16(Gemma4Engine),
+    Int4(Gemma4Int4Engine),
+}
+
+impl Runtime {
+    fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.prefill(prompt_token_ids),
+            Self::Int4(e) => e.prefill(prompt_token_ids),
+        }
+    }
+
+    fn decode_step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.decode_step(token, pos),
+            Self::Int4(e) => e.decode_step(token, pos),
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(about = "Gemma 4 multi-prompt exact-match corpus regression")]
@@ -53,6 +80,11 @@ struct Cli {
     /// Stop at the first failing entry instead of running the full corpus.
     #[arg(long, default_value_t = false)]
     fail_fast: bool,
+    /// Run with INT4 GPTQ bake instead of BF16 weights. Requires a prior
+    /// `python oracle/bake_int4_gemma4.py --model-dir <dir>` to have produced
+    /// `.supersonic/v1-int4-gptq/`.
+    #[arg(long, default_value_t = false)]
+    int4: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,12 +237,29 @@ fn main() -> Result<()> {
 
     // Load the engine once — weight load dominates cost (~5-10s on iGPU).
     let t0 = Instant::now();
-    let mut engine = Gemma4Engine::load(
-        &cli.model_dir,
-        weight_prefix,
-        max_needed_t,
-        cli.device,
-    )?;
+    let mut engine: Runtime = if cli.int4 {
+        if !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
+            bail!(
+                "No INT4 bake at {}. Run: python oracle/bake_int4_gemma4.py --model-dir {}",
+                gemma4_int4_engine::int4_bake_dir(&cli.model_dir).display(),
+                cli.model_dir.display()
+            );
+        }
+        eprintln!("[engine] loading INT4 GPTQ bake");
+        Runtime::Int4(Gemma4Int4Engine::load(
+            &cli.model_dir,
+            weight_prefix,
+            max_needed_t,
+            cli.device,
+        )?)
+    } else {
+        Runtime::Bf16(Gemma4Engine::load(
+            &cli.model_dir,
+            weight_prefix,
+            max_needed_t,
+            cli.device,
+        )?)
+    };
     eprintln!("[engine] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     let mut pass = 0usize;

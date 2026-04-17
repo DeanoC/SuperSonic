@@ -357,10 +357,19 @@ def quantize_gemma4(
     device: torch.device,
     group_size: int,
     damp: float,
+    ckpt_path: Path | None = None,
+    fresh: bool = False,
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     """
     Sequential GPTQ over Gemma 4 text layers. Returns
     {tensor_name: (nibbles, scale_f32, zero_f32)}.
+
+    When `ckpt_path` is set, saves a full-state checkpoint (quantized tensors
+    so far, per-sample hiddens, per-sample shared_kv_states) atomically after
+    every layer. If the checkpoint file already exists and `fresh` is False,
+    loads it and resumes from the last completed layer — the already-quantized
+    layers' weights are reconstructed (dequant) and copied back into the live
+    model before the GPTQ loop restarts. Skips all layers < ckpt.layer_idx.
     """
     language_model.eval()
     config = language_model.config
@@ -370,30 +379,49 @@ def quantize_gemma4(
 
     # Map nn.Linear -> state-dict weight name (scoped to the language_model subtree).
     module_to_name: dict[int, str] = {}
+    module_by_name: dict[str, nn.Module] = {}
     for name, mod in language_model.named_modules():
         if isinstance(mod, nn.Linear):
             module_to_name[id(mod)] = name + ".weight"
+            module_by_name[name] = mod
 
     # --- Capture pre-layer state per sample ---
+    # Per-sample caches hold only the token-dependent tensors: `hiddens[s]` and
+    # `per_layer_inputs_list[s]`. Attention masks, RoPE position embeddings, and
+    # `position_ids` are functions of `seq_len` only (all samples share it),
+    # so capture them once from sample 0 and reuse. On a shared-memory APU this
+    # avoids a multi-GB host-side duplication that previously OOM-killed the
+    # bake at 128×2048.
+    # `per_layer_inputs_list` is the biggest host-side cache at large
+    # calibrations: [1, S, num_layers, ple_hidden] BF16 per sample. At 128×2048
+    # on E2B that's ~4.5 GiB. On a shared-memory APU we can't afford to keep
+    # it resident — spill to /tmp and reload the current layer's slice on demand.
+    import tempfile
+    pli_cache_dir = Path(tempfile.mkdtemp(prefix="gemma4_int4_pli_"))
+    log(f"[gptq] spilling per_layer_inputs cache to {pli_cache_dir}")
     log(f"[gptq] capturing pre-layer state for {num_samples} samples...")
     hiddens: list[torch.Tensor] = []
-    per_layer_inputs_list: list[torch.Tensor] = []
-    pos_emb_list: list[dict] = []
-    mask_list: list[dict] = []
-    pos_ids_list: list[torch.Tensor] = []
+    pli_paths: list[Path | None] = []
+    shared_pos_emb: dict = {}
+    shared_mask: dict = {}
+    shared_pos_ids: torch.Tensor | None = None
 
     for s in range(num_samples):
         ids = calib_ids[s:s + 1].to(device)
         with torch.no_grad():
             h, pli, pe, am, pid = compute_pre_layer_state(language_model, ids)
         hiddens.append(h.detach().cpu())
-        per_layer_inputs_list.append(
-            pli.detach().cpu() if pli is not None else None
-        )
-        # Keep masks/pos_embs/pos_ids on CPU to avoid OOM; move to device per-layer.
-        pos_emb_list.append({k: (v[0].detach().cpu(), v[1].detach().cpu()) for k, v in pe.items()})
-        mask_list.append({k: (v.detach().cpu() if v is not None else None) for k, v in am.items()})
-        pos_ids_list.append(pid.detach().cpu())
+        if pli is not None:
+            pli_path = pli_cache_dir / f"pli_{s:05d}.pt"
+            torch.save(pli.detach().cpu(), pli_path)
+            pli_paths.append(pli_path)
+            del pli
+        else:
+            pli_paths.append(None)
+        if s == 0:
+            shared_pos_emb = {k: (v[0].detach().cpu(), v[1].detach().cpu()) for k, v in pe.items()}
+            shared_mask = {k: (v.detach().cpu() if v is not None else None) for k, v in am.items()}
+            shared_pos_ids = pid.detach().cpu()
 
     # shared_kv_states carries across layers within one sample, so allocate one
     # dict per sample. Python dicts are live references — layers mutate them.
@@ -401,7 +429,51 @@ def quantize_gemma4(
 
     quantized: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
-    for layer_idx in range(num_layers):
+    # --- Resume from checkpoint if available ---
+    start_layer = 0
+    if ckpt_path is not None and ckpt_path.exists() and not fresh:
+        log(f"[resume] loading checkpoint from {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        start_layer = int(ckpt["layer_idx"])
+        quantized = ckpt["quantized"]
+        hiddens = ckpt["hiddens"]
+        kv_dicts = ckpt["kv_dicts"]
+        # Re-apply quantized weights to the live model so subsequent layer
+        # forwards see post-quant activations (matches the sequential invariant
+        # that a fresh run maintains via the `mod.weight.data.copy_(...)` step).
+        for tensor_name, (nibbles_s, scale_s, zero_s) in quantized.items():
+            mod_name = tensor_name[: -len(".weight")]
+            mod = module_by_name.get(mod_name)
+            if mod is None:
+                continue
+            rows, cols = nibbles_s.shape
+            row_gr = torch.arange(rows) // group_size
+            col_gc = torch.arange(cols) // group_size
+            sc_full = scale_s[row_gr][:, col_gc]
+            zf_full = zero_s[row_gr][:, col_gc]
+            recon = nibbles_s.float() * sc_full - zf_full * sc_full
+            recon = recon.to(torch.bfloat16)
+            mod.weight.data.copy_(recon.to(mod.weight.dtype).to(mod.weight.device))
+        log(
+            f"[resume] restored layer_idx={start_layer}, "
+            f"{len(quantized)} quantized tensors re-applied, {len(hiddens)} hiddens, "
+            f"{sum(len(d) for d in kv_dicts)} total kv entries"
+        )
+
+    def save_checkpoint(next_layer: int) -> None:
+        if ckpt_path is None:
+            return
+        tmp = ckpt_path.with_suffix(ckpt_path.suffix + ".new")
+        torch.save({
+            "layer_idx": next_layer,
+            "quantized": quantized,
+            "hiddens": hiddens,
+            "kv_dicts": kv_dicts,
+        }, tmp)
+        tmp.replace(ckpt_path)
+        log(f"[ckpt] saved at layer {next_layer}/{num_layers} -> {ckpt_path}")
+
+    for layer_idx in range(start_layer, num_layers):
         layer = layers[layer_idx]
         layer_type = config.layer_types[layer_idx]
 
@@ -421,26 +493,29 @@ def quantize_gemma4(
 
         hooks = {name: HessianHook(mod) for name, mod in targets}
 
+        # Move the (shared) pos_emb + attention_mask + position_ids for this
+        # layer_type to device once — they don't change across samples.
+        pe_shared = shared_pos_emb[layer_type]
+        pe_dev = (pe_shared[0].to(device), pe_shared[1].to(device))
+        am_shared = shared_mask[layer_type]
+        am_dev = am_shared.to(device) if am_shared is not None else None
+        pid_dev = shared_pos_ids.to(device)
+
         with torch.no_grad():
             for s in range(num_samples):
                 h = hiddens[s].to(device)
-                pli_slice = (
-                    per_layer_inputs_list[s][:, :, layer_idx, :].to(device)
-                    if per_layer_inputs_list[s] is not None
-                    else None
-                )
-                pe = pos_emb_list[s][layer_type]
-                pe_dev = (pe[0].to(device), pe[1].to(device))
-                am = mask_list[s][layer_type]
-                am_dev = am.to(device) if am is not None else None
-                pid = pos_ids_list[s].to(device)
+                pli_slice = None
+                if pli_paths[s] is not None:
+                    pli_full = torch.load(pli_paths[s], weights_only=True, map_location="cpu")
+                    pli_slice = pli_full[:, :, layer_idx, :].to(device)
+                    del pli_full
                 _ = layer(
                     h,
                     pli_slice,
                     shared_kv_states=kv_dicts[s],
                     position_embeddings=pe_dev,
                     attention_mask=am_dev,
-                    position_ids=pid,
+                    position_ids=pid_dev,
                     past_key_values=None,
                 )
             if device.type == "cuda":
@@ -467,27 +542,24 @@ def quantize_gemma4(
             del W, Q_dq, nibbles, scale_t, zero_t, H
 
         # Re-run with quantized weights so layer N+1 sees post-quant activations.
+        # pe_dev / am_dev / pid_dev are already staged on device above and are
+        # reused here without re-uploading.
         new_hiddens: list[torch.Tensor] = []
         with torch.no_grad():
             for s in range(num_samples):
                 h = hiddens[s].to(device)
-                pli_slice = (
-                    per_layer_inputs_list[s][:, :, layer_idx, :].to(device)
-                    if per_layer_inputs_list[s] is not None
-                    else None
-                )
-                pe = pos_emb_list[s][layer_type]
-                pe_dev = (pe[0].to(device), pe[1].to(device))
-                am = mask_list[s][layer_type]
-                am_dev = am.to(device) if am is not None else None
-                pid = pos_ids_list[s].to(device)
+                pli_slice = None
+                if pli_paths[s] is not None:
+                    pli_full = torch.load(pli_paths[s], weights_only=True, map_location="cpu")
+                    pli_slice = pli_full[:, :, layer_idx, :].to(device)
+                    del pli_full
                 out = layer(
                     h,
                     pli_slice,
                     shared_kv_states=kv_dicts[s],
                     position_embeddings=pe_dev,
                     attention_mask=am_dev,
-                    position_ids=pid,
+                    position_ids=pid_dev,
                     past_key_values=None,
                 )
                 if isinstance(out, tuple):
@@ -496,6 +568,26 @@ def quantize_gemma4(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
         hiddens = new_hiddens
+
+        # Atomic-rename checkpoint after each completed layer. On the next run,
+        # passing the same ckpt_path will resume from layer_idx+1.
+        save_checkpoint(layer_idx + 1)
+
+        # Force Python GC + CUDA caching-allocator release at layer boundary.
+        # With double-wide layers (15+ on E2B) each Hessian alone is 604 MB
+        # F32, and Python's allocator fragments across layers. On a shared-
+        # memory APU we need the freed blocks back in the common pool.
+        import gc
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Clean up the per_layer_inputs spill directory + checkpoint now that the
+    # bake has completed successfully.
+    import shutil
+    shutil.rmtree(pli_cache_dir, ignore_errors=True)
+    if ckpt_path is not None and ckpt_path.exists():
+        ckpt_path.unlink()
 
     return quantized
 
@@ -671,6 +763,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ppl-chunks", type=int, default=16)
     p.add_argument("--out-dir", default=None, type=Path,
                    help="Default: {model-dir}/.supersonic/v{FORMAT_VERSION}-int4-gptq")
+    p.add_argument("--ckpt-path", default=None, type=Path,
+                   help="Path to a layer-level checkpoint file. If the file "
+                        "exists, the bake resumes from the last completed "
+                        "layer (skipping earlier GPTQ work) unless --fresh is "
+                        "set. Default: {out-dir}/bake_ckpt.pt")
+    p.add_argument("--fresh", action="store_true",
+                   help="Ignore any existing checkpoint at --ckpt-path and "
+                        "start the GPTQ sweep from layer 0.")
     return p.parse_args()
 
 
@@ -755,11 +855,27 @@ def main() -> None:
     log(f"[bake-int4] calibration batch: {tuple(calib.shape)}")
 
     # --- GPTQ ---
+    # Resolve the checkpoint path. Default: next to the output bake dir so
+    # reruns with the same `--out-dir` automatically share one checkpoint.
+    out_dir = args.out_dir or (
+        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
+    )
+    ckpt_path: Path = args.ckpt_path or (out_dir / "bake_ckpt.pt")
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.fresh and ckpt_path.exists():
+        log(f"[bake-int4] --fresh: removing existing checkpoint {ckpt_path}")
+        ckpt_path.unlink()
+    elif ckpt_path.exists():
+        log(f"[bake-int4] resuming from checkpoint {ckpt_path} "
+            "(pass --fresh to restart from layer 0)")
+
     t0 = time.perf_counter()
     quantized = quantize_gemma4(
         language_model, calib, device,
         group_size=args.group_size,
         damp=args.damp,
+        ckpt_path=ckpt_path,
+        fresh=args.fresh,
     )
     elapsed = time.perf_counter() - t0
     log(f"[bake-int4] GPTQ done in {elapsed / 60.0:.1f} min "
