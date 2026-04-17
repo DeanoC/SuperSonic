@@ -247,6 +247,112 @@ fn load_scaled_embed_row(
     Ok(row.iter().map(|v| v * scale).collect())
 }
 
+/// Read one row from `embed_tokens_per_layer.weight` and apply the
+/// `Gemma4TextScaledWordEmbedding` scale for the PLE table: `sqrt(ple_hidden)`.
+/// For Gemma 4 E2B `ple_hidden = 256` so the scale is 16.0, which is exact in
+/// BF16 — multiplication by a power of two just shifts the exponent and
+/// introduces no rounding. Returned length is `num_layers * ple_hidden`.
+fn load_ple_raw_row(
+    loader: &UnbakedLoader,
+    weight_name: &str,
+    token_id: u32,
+    expected_row_dim: usize,
+    ple_hidden: usize,
+) -> Result<Vec<f32>> {
+    let (shape, bytes) = loader.tensor_bytes(weight_name)?;
+    if shape.len() != 2 || shape[1] != expected_row_dim {
+        bail!(
+            "{weight_name} shape {:?} does not match expected [vocab, {expected_row_dim}]",
+            shape
+        );
+    }
+    let vocab = shape[0];
+    if (token_id as usize) >= vocab {
+        bail!("token id {token_id} out of range (vocab={vocab})");
+    }
+    let row_bytes = expected_row_dim * 2;
+    let off = token_id as usize * row_bytes;
+    let raw = bf16_bytes_to_f32(&bytes[off..off + row_bytes]);
+    let scale = (ple_hidden as f32).sqrt();
+    Ok(raw.iter().map(|v| v * scale).collect())
+}
+
+/// Compute `per_layer_inputs` for a single decode-step input token, mirroring
+/// HF's `Gemma4TextModel.project_per_layer_inputs` + `get_per_layer_inputs`.
+///
+/// Formula (all BF16-resident, f32 accumulations internally):
+///   main_embed_scaled = embed_tokens[tok] * bf16(sqrt(hidden_size))
+///   proj = per_layer_model_projection @ main_embed_scaled           // [num_layers * ple]
+///   proj = proj * bf16(hidden_size^-0.5)                            // scalar-cast mul
+///   proj = proj.reshape(num_layers, ple)
+///   proj = per_layer_projection_norm(proj)                          // per-row RMSNorm
+///   ple_raw = embed_tokens_per_layer[tok] * sqrt(ple)               // 16.0, exact in BF16
+///   out = (proj + ple_raw) * bf16(2^-0.5)
+///
+/// Returns the combined `out` as BF16 bytes, shape `[num_layers, ple]`.
+fn compute_per_layer_inputs(
+    loader: &UnbakedLoader,
+    weight_prefix: &str,
+    tcfg: &TextConfig,
+    token_id: u32,
+    per_layer_model_projection_w: &GpuBuffer,
+    per_layer_projection_norm_w: &GpuBuffer,
+    counter: &mut GpuBuffer,
+) -> Result<Vec<u8>> {
+    let hidden_size = tcfg.hidden_size;
+    let num_layers = tcfg.num_hidden_layers;
+    let ple_hidden = tcfg.hidden_size_per_layer_input;
+    let eps = tcfg.rms_norm_eps as f32;
+    let dtype = ScalarType::BF16;
+    let total = num_layers * ple_hidden;
+
+    let main_embed_host = load_scaled_embed_row(
+        loader,
+        &format!("{weight_prefix}.embed_tokens.weight"),
+        token_id,
+        hidden_size,
+    )?;
+    let main_embed_gpu = upload_bf16(&[hidden_size], &main_embed_host)?;
+
+    let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
+    g4::matvec(
+        0, dtype, &mut proj, &main_embed_gpu, per_layer_model_projection_w,
+        hidden_size, total, counter,
+    )?;
+
+    // HF applies the scale as a Python float against a BF16 tensor, so the
+    // effective multiplier is `bf16(hidden_size^-0.5)`. Mirror that rounding.
+    let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
+    let mut proj_host = download_bf16(&proj)?;
+    for v in proj_host.iter_mut() {
+        *v *= proj_scale;
+    }
+
+    let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
+    let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
+    g4::rms_norm_per_row(
+        0, dtype, &mut proj_normed, &proj_reshaped,
+        Some(per_layer_projection_norm_w), eps, num_layers, ple_hidden,
+    )?;
+    let proj_normed_host = download_bf16(&proj_normed)?;
+
+    let ple_raw = load_ple_raw_row(
+        loader,
+        &format!("{weight_prefix}.embed_tokens_per_layer.weight"),
+        token_id,
+        total,
+        ple_hidden,
+    )?;
+
+    let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
+    let combined: Vec<f32> = proj_normed_host
+        .iter()
+        .zip(ple_raw.iter())
+        .map(|(p, r)| (p + r) * combine_scale)
+        .collect();
+    Ok(f32_to_bf16_bytes(&combined))
+}
+
 fn seed_kv_cache_from_oracle(
     oracle_k: &[u8],
     oracle_k_shape: &[usize],
@@ -493,12 +599,9 @@ fn main() -> Result<()> {
         .kv_caches
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing kv_caches (need --emit-state)"))?;
-    let pli_by_step = oracle
-        .per_layer_inputs_by_step
-        .as_ref()
-        .ok_or_else(|| anyhow!(
-            "oracle JSON missing per_layer_inputs_by_step; re-run gemma4_oracle.py"
-        ))?;
+    // PLE is now computed in Rust via `compute_per_layer_inputs`. When the
+    // oracle also dumped `per_layer_inputs_by_step`, cross-check per step.
+    let pli_by_step_oracle = oracle.per_layer_inputs_by_step.as_ref();
 
     let prompt_tokens = oracle.prompt_tokens;
     let last_token_id = *prompt_token_ids
@@ -523,11 +626,13 @@ fn main() -> Result<()> {
             max_new_tokens, oracle.generated_tokens
         );
     }
-    if pli_by_step.len() < max_new_tokens {
-        bail!(
-            "oracle per_layer_inputs_by_step has {} entries, need {}",
-            pli_by_step.len(), max_new_tokens
-        );
+    if let Some(pli) = pli_by_step_oracle {
+        if pli.len() < max_new_tokens {
+            bail!(
+                "oracle per_layer_inputs_by_step has {} entries, need {}",
+                pli.len(), max_new_tokens
+            );
+        }
     }
     if oracle.decode_logits.len() < max_new_tokens.saturating_sub(1) {
         bail!(
@@ -558,6 +663,12 @@ fn main() -> Result<()> {
     // --- lm_head is tied to embed_tokens on E2B (tie_word_embeddings=true) ---
     let lm_head_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.embed_tokens.weight"))?;
     let final_norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
+
+    // --- Global PLE projection weights for Rust-side `project_per_layer_inputs`. ---
+    let per_layer_model_projection_w =
+        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+    let per_layer_projection_norm_w =
+        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
 
     // --- Preallocate K/V caches for every layer, seed from the oracle's
     //     prefill dump. Shared layers mirror their source layer's oracle dump
@@ -633,15 +744,32 @@ fn main() -> Result<()> {
         )?;
         let mut h_running = upload_bf16(&[hidden_size], &h_in_host)?;
 
-        // Decode this step's per_layer_inputs: shape [num_layers, ple_hidden].
-        let pli_bytes = B64
-            .decode(&pli_by_step[step])
-            .with_context(|| format!("decode per_layer_inputs_by_step[{step}] base64"))?;
+        // Compute this step's per_layer_inputs in Rust, mirroring HF's
+        // `project_per_layer_inputs`. Shape: [num_layers, ple_hidden] BF16.
+        let pli_bytes = compute_per_layer_inputs(
+            &loader, weight_prefix, tcfg, input_token_id,
+            &per_layer_model_projection_w, &per_layer_projection_norm_w,
+            &mut counter,
+        )?;
         let expected_pli_bytes = num_layers * ple_hidden * 2;
         if pli_bytes.len() != expected_pli_bytes {
             bail!(
-                "per_layer_inputs_by_step[{step}] has {} bytes, expected {}",
+                "compute_per_layer_inputs returned {} bytes, expected {}",
                 pli_bytes.len(), expected_pli_bytes
+            );
+        }
+
+        // Cross-check against oracle PLE when available — pure diagnostic.
+        if let Some(oracle_pli) = pli_by_step_oracle {
+            let want_bytes = B64
+                .decode(&oracle_pli[step])
+                .with_context(|| format!("decode oracle per_layer_inputs_by_step[{step}]"))?;
+            let got_f32 = bf16_bytes_to_f32(&pli_bytes);
+            let want_f32 = bf16_bytes_to_f32(&want_bytes);
+            let stats = compare_vectors(&got_f32, &want_f32)?;
+            println!(
+                "[step{step}] pli_vs_oracle: cos_sim={:.6} max_abs={:.6} rel_err={:.6}",
+                stats.cos_sim, stats.max_abs, stats.rel_err_norm,
             );
         }
 
