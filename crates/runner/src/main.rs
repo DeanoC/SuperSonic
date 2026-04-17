@@ -766,11 +766,15 @@ fn run_gemma4(
     if let Some(ref oracle) = oracle_output {
         let prefill_delta = validate::max_abs_delta(&prefill_logits, &oracle.prefill_logits);
         eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
-        let oracle_first = oracle.generated_token_ids[0];
-        if oracle_first != next_token {
-            eprintln!(
-                "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
-            );
+        // Oracle may return an empty generation when --max-new-tokens 0 was
+        // requested; only compare the first token when the oracle actually
+        // produced one.
+        if let Some(&oracle_first) = oracle.generated_token_ids.first() {
+            if oracle_first != next_token {
+                eprintln!(
+                    "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+                );
+            }
         }
     }
 

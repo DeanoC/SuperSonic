@@ -536,7 +536,7 @@ impl Gemma4Engine {
             )
         };
         let layers_gpu = GpuBuffer::from_host_bytes(
-            0,
+            device,
             ScalarType::U8,
             &[desc_bytes.len()],
             desc_bytes,
