@@ -589,40 +589,62 @@ def _build_name_map(hf_keys: list[str], raw_keys: set[str]) -> dict[str, str]:
     return out
 
 
-def write_package(
-    out_dir: Path,
-    tensors: list[tuple[str, bytes, list[int], str, str]],
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    entries: list[dict] = []
-    cursor = 0
-    weights_path = out_dir / "weights.bin"
-    with open(weights_path, "wb") as f:
-        for (name, data, shape, dtype_str, layout) in tensors:
-            offset = align_up(cursor, 4096)
-            if offset > cursor:
-                f.write(b"\x00" * (offset - cursor))
-            f.write(data)
-            byte_len = len(data)
-            entries.append({
-                "name": name,
-                "shape": shape,
-                "dtype": dtype_str,
-                "layout": layout,
-                "offset": offset,
-                "byte_len": byte_len,
-            })
-            cursor = offset + byte_len
-    manifest = {
-        "format_version": FORMAT_VERSION,
-        "converter_version": CONVERTER_VERSION,
-        "model_family": "gemma4",
-        "tensors": entries,
-    }
-    with open(out_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    log(f"[bake-int4] wrote {cursor / (1024 * 1024):.1f} MiB to {weights_path}")
-    log(f"[bake-int4] manifest: {out_dir / 'manifest.json'}")
+class StreamingTensorWriter:
+    """Write tensors to `weights.bin` one at a time so we never hold more than
+    one tensor's bytes buffer in host memory at once. Entries accumulate into
+    a manifest that's written on `.close()`.
+
+    The prior implementation buffered every tensor's bytes in a list before
+    opening the output file — for a ~6 GiB Gemma 4 bake that spike collided
+    with the live model on GPU and OOM-killed the process on 15.2 GiB iGPUs.
+    Streaming keeps peak host memory tied to a single tensor.
+
+    Entries must be sorted by name externally (to match the earlier package
+    layout); this writer accepts them in whatever order the caller provides.
+    """
+
+    def __init__(self, out_dir: Path) -> None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.out_dir = out_dir
+        self.weights_path = out_dir / "weights.bin"
+        self.f = open(self.weights_path, "wb")
+        self.entries: list[dict] = []
+        self.cursor = 0
+
+    def add(self, name: str, data: bytes, shape: list[int],
+            dtype_str: str, layout: str) -> None:
+        offset = align_up(self.cursor, 4096)
+        if offset > self.cursor:
+            self.f.write(b"\x00" * (offset - self.cursor))
+        self.f.write(data)
+        byte_len = len(data)
+        self.entries.append({
+            "name": name,
+            "shape": shape,
+            "dtype": dtype_str,
+            "layout": layout,
+            "offset": offset,
+            "byte_len": byte_len,
+        })
+        self.cursor = offset + byte_len
+
+    def close(self, model_family: str = "gemma4") -> None:
+        self.f.close()
+        # Emit the manifest with tensors in sorted order so the bake on disk
+        # matches the pre-streaming convention — makes byte-comparing two
+        # bakes easier.
+        sorted_entries = sorted(self.entries, key=lambda e: e["name"])
+        manifest = {
+            "format_version": FORMAT_VERSION,
+            "converter_version": CONVERTER_VERSION,
+            "model_family": model_family,
+            "tensors": sorted_entries,
+        }
+        with open(self.out_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        log(f"[bake-int4] wrote {self.cursor / (1024 * 1024):.1f} MiB "
+            f"to {self.weights_path}")
+        log(f"[bake-int4] manifest: {self.out_dir / 'manifest.json'}")
 
 
 # ---------------------------------------------------------------------------
@@ -637,7 +659,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--damp", type=float, default=0.01)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--skip-ppl", action="store_true")
+    p.add_argument("--skip-ppl", action="store_true",
+                   help="Skip the WikiText-2 perplexity check "
+                        "(recommended on small-VRAM GPUs to avoid OOM).")
+    p.add_argument("--sanity-generate", action="store_true",
+                   help="Run a tiny `The quick brown fox` generation on the "
+                        "quantized model before serialising. Off by default; "
+                        "enabling it needs the model to stay on GPU until "
+                        "after serialisation on small-VRAM machines, which "
+                        "can OOM.")
     p.add_argument("--ppl-chunks", type=int, default=16)
     p.add_argument("--out-dir", default=None, type=Path,
                    help="Default: {model-dir}/.supersonic/v{FORMAT_VERSION}-int4-gptq")
@@ -736,16 +766,31 @@ def main() -> None:
         f"({len(quantized)} tensors quantized)")
 
     # --- Sample generation sanity check ---
-    try:
-        sample_ids = tokenizer("The quick brown fox", return_tensors="pt"
-                               ).input_ids.to(device)
-        with torch.no_grad():
-            gen = model.generate(sample_ids, max_new_tokens=12,
-                                 do_sample=False, use_cache=True)
-        log(f"[bake-int4] sample gen (post-quant): "
-            f"{tokenizer.decode(gen[0], skip_special_tokens=True)!r}")
-    except Exception as ex:
-        log(f"[bake-int4] sample gen failed: {ex}")
+    if args.sanity_generate:
+        try:
+            sample_ids = tokenizer("The quick brown fox", return_tensors="pt"
+                                   ).input_ids.to(device)
+            with torch.no_grad():
+                gen = model.generate(sample_ids, max_new_tokens=12,
+                                     do_sample=False, use_cache=True)
+            log(f"[bake-int4] sample gen (post-quant): "
+                f"{tokenizer.decode(gen[0], skip_special_tokens=True)!r}")
+        except Exception as ex:
+            log(f"[bake-int4] sample gen failed: {ex}")
+
+    # Move the live model to CPU before serialisation. On constrained iGPUs the
+    # BF16 model plus Python's per-tensor host buffers during serialisation can
+    # OOM-kill the process — moving to CPU frees ~model_size of VRAM and shifts
+    # the serialisation reads to host memory. The self-check below and the
+    # serialisation loop both only need CPU tensors.
+    if device.type != "cpu":
+        log("[bake-int4] moving model to CPU before serialisation")
+        model = model.to("cpu")
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # language_model is an attribute of model; it also moves with it.
 
     # --- Self-consistency check ---
     try:
@@ -779,11 +824,24 @@ def main() -> None:
 
     # --- Perplexity ---
     if not args.skip_ppl:
-        log("[bake-int4] running perplexity sanity check on WikiText-2 test...")
+        # PPL needs the model back on GPU. Only run if the caller explicitly
+        # opts in — it's the single biggest OOM risk on small-VRAM machines
+        # since model has to go back to device alongside long-sequence
+        # activations for the test corpus.
         try:
+            if device.type != "cpu":
+                log("[bake-int4] moving model back to GPU for PPL check")
+                model = model.to(device)
+            log("[bake-int4] running perplexity sanity check on WikiText-2 test...")
             ppl = compute_ppl(model, tokenizer, device,
                               seqlen=args.seqlen, n_chunks=args.ppl_chunks)
             log(f"[bake-int4] PPL: {ppl:.2f}")
+            if device.type != "cpu":
+                model = model.to("cpu")
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
         except Exception as ex:
             log(f"[bake-int4] PPL check failed: {ex}")
 
@@ -814,47 +872,56 @@ def main() -> None:
     # Build a reverse lookup from raw-name -> language_model-relative name.
     raw_to_lm: dict[str, str] = {v: k for k, v in lm_prefix_map.items()}
 
+    out_dir = args.out_dir or (
+        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
+    )
+    writer = StreamingTensorWriter(out_dir)
     sd = model.state_dict()
-    tensors_out: list[tuple[str, bytes, list[int], str, str]] = []
 
+    # Serialise in alphabetical order by raw name — matches the previous
+    # buffered-write convention, keeps manifest entries stable across runs.
     for hf_name in eligible:
         raw_name = hf_to_raw[hf_name]
         t = sd[hf_name]
         shape = list(t.shape)
-
         lm_name = raw_to_lm.get(raw_name)
         if lm_name is not None:
-            # INT4-quantized tensor: emit (packed, scale, zero) trio.
+            # INT4-quantized tensor: emit (packed, scale, zero) trio. Convert
+            # + write one tensor at a time and drop references so the bytes
+            # buffer is freed before the next tensor is materialised.
             nibbles, scale_t, zero_t = quantized[lm_name]
             packed = pack_nibbles(nibbles)
             packed_bytes = packed.numpy().tobytes()
-            tensors_out.append((
+            writer.add(
                 raw_name, packed_bytes,
                 [packed.shape[0], packed.shape[1]],
                 "u8", LAYOUT_INT4,
-            ))
-            tensors_out.append((
-                f"{raw_name}_int4_scale",
-                bf16_to_bytes(scale_t),
+            )
+            del packed, packed_bytes
+            scale_bytes = bf16_to_bytes(scale_t)
+            writer.add(
+                f"{raw_name}_int4_scale", scale_bytes,
                 list(scale_t.shape), "bf16", LAYOUT_RAW,
-            ))
-            tensors_out.append((
-                f"{raw_name}_int4_zero",
-                bf16_to_bytes(zero_t),
+            )
+            del scale_bytes
+            zero_bytes = bf16_to_bytes(zero_t)
+            writer.add(
+                f"{raw_name}_int4_zero", zero_bytes,
                 list(zero_t.shape), "bf16", LAYOUT_RAW,
-            ))
+            )
+            del zero_bytes
+            # Drop the GPTQ-side tensors now — they were cloned to CPU but
+            # they add up to hundreds of MB across the full sweep, and we
+            # still have all non-quantized tensors (norms/embeds) to dump.
+            quantized[lm_name] = None  # release references
         else:
             # Non-quantized tensor: store as-is (BF16 / F32 / scalar).
             dtype_str = torch_dtype_to_str(t.dtype)
             data = tensor_to_bytes(t, dtype_str)
-            tensors_out.append((raw_name, data, shape, dtype_str, LAYOUT_RAW))
+            writer.add(raw_name, data, shape, dtype_str, LAYOUT_RAW)
+            del data
 
-    tensors_out.sort(key=lambda x: x[0])
-
-    out_dir = args.out_dir or (
-        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
-    )
-    write_package(out_dir, tensors_out)
+    writer.close(model_family="gemma4")
     log(f"[bake-int4] done. Output: {out_dir}")
 
 
