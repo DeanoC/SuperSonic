@@ -357,6 +357,36 @@ fn copy_kv_slot(
     Ok(())
 }
 
+/// Replicate a contiguous range of KV-cache slots from `src` to `dst`. Layout
+/// is `[num_kv_heads, max_t, head_dim]`, so for each kv_head the `count`
+/// consecutive slots starting at `pos_base` are contiguous in memory
+/// (`count * head_dim * 2` bytes). Used by the prefill path to copy all
+/// prompt-token K/V slots into shared-KV layers in one pass per head.
+fn copy_kv_slots_range(
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+    num_kv_heads: usize,
+    max_t: usize,
+    head_dim: usize,
+    pos_base: usize,
+    count: usize,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    let elem_bytes = 2usize; // BF16
+    let bytes_per_head = count * head_dim * elem_bytes;
+    for h in 0..num_kv_heads {
+        let byte_off = ((h * max_t) + pos_base) * head_dim * elem_bytes;
+        let src_ptr = src.offset_ptr(byte_off);
+        let dst_ptr =
+            unsafe { (dst.as_mut_ptr() as *mut u8).add(byte_off) as *mut c_void };
+        gpu_hal::copy_d2d(0, dst_ptr, src_ptr, bytes_per_head)
+            .map_err(|e| anyhow!("copy_kv_slots_range: {e}"))?;
+    }
+    Ok(())
+}
+
 struct CompareStats {
     cos_sim: f32,
     max_abs: f32,
@@ -752,6 +782,377 @@ fn run_forward_pass(
     Ok(Some(logits_host))
 }
 
+/// Gather `embed_tokens_per_layer` rows for a batch of tokens and apply the
+/// `sqrt(ple_hidden)` scale on the host side (matches HF's
+/// `embed_tokens_per_layer[tok] * sqrt(hidden_size_per_layer_input)` cast).
+/// Returns a contiguous `[seq_len * row_dim]` f32 vector, ready to convert
+/// to BF16 and upload as a `[seq_len, row_dim]` device tensor.
+fn gather_ple_raw_batch(
+    loader: &UnbakedLoader,
+    weight_name: &str,
+    token_ids: &[u32],
+    row_dim: usize,
+    ple_hidden: usize,
+) -> Result<Vec<f32>> {
+    let (shape, bytes) = loader.tensor_bytes(weight_name)?;
+    if shape.len() != 2 || shape[1] != row_dim {
+        bail!(
+            "{weight_name} shape {:?} does not match expected [vocab, {row_dim}]",
+            shape
+        );
+    }
+    let vocab = shape[0];
+    let row_bytes = row_dim * 2;
+    let scale = (ple_hidden as f32).sqrt();
+    let mut out = Vec::with_capacity(token_ids.len() * row_dim);
+    for &tok in token_ids {
+        if (tok as usize) >= vocab {
+            bail!("token id {tok} out of range (vocab={vocab})");
+        }
+        let off = tok as usize * row_bytes;
+        let row = bf16_bytes_to_f32(&bytes[off..off + row_bytes]);
+        out.extend(row.iter().map(|v| v * scale));
+    }
+    Ok(out)
+}
+
+/// Compute per-layer inputs for the entire prompt in one shot.
+/// Produces a device tensor of shape `[seq_len, num_layers, ple_hidden]` where
+/// `pli[s, l, :]` is the per-layer-input for prompt token `s` at layer `l`.
+/// Mirrors HF's `Gemma4TextModel.{get,project}_per_layer_inputs` but uses
+/// batched primitives and one host-side gather of `embed_tokens_per_layer`
+/// (table is too large to upload in full).
+fn compute_per_layer_inputs_batched(
+    ctx: &ForwardCtx,
+    token_ids_gpu: &GpuBuffer,
+    prompt_token_ids: &[u32],
+    counter: &mut GpuBuffer,
+) -> Result<GpuBuffer> {
+    let dtype = ScalarType::BF16;
+    let seq_len = prompt_token_ids.len();
+    let hidden_size = ctx.hidden_size;
+    let num_layers = ctx.num_layers;
+    let ple_hidden = ctx.ple_hidden;
+    let vocab_size = ctx.vocab_size;
+    let eps = ctx.eps;
+    let total = num_layers * ple_hidden;
+
+    // 1) main_embed[s, :] = embed_tokens[tok_s] * sqrt(hidden)  (BF16-rounded scale).
+    let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+    let mut main_embed_batch = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+    g4::embed_gather_scaled(
+        0, dtype, &mut main_embed_batch, token_ids_gpu, ctx.lm_head_w,
+        seq_len, hidden_size, vocab_size, embed_scale,
+    )?;
+
+    // 2) proj[s, :] = per_layer_model_projection @ main_embed[s, :]  → [S, total]
+    let mut proj = GpuBuffer::zeros(0, dtype, &[seq_len, total])?;
+    g4::matvec_batched(
+        0, dtype, &mut proj, &main_embed_batch, ctx.per_layer_model_projection_w,
+        seq_len, hidden_size, total, counter,
+    )?;
+
+    // 3) proj *= hidden^-0.5  (BF16-rounded scale — matches HF Python-float * tensor).
+    let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
+    g4::scalar_mul_inplace(0, dtype, &mut proj, proj_scale, seq_len * total)?;
+
+    // 4) rms_norm over last dim: view [S, total] as [S * num_layers, ple_hidden].
+    let mut proj_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
+    g4::rms_norm_rows(
+        0, dtype, &mut proj_normed, &proj, Some(ctx.per_layer_projection_norm_w),
+        eps, seq_len * num_layers, ple_hidden,
+    )?;
+
+    // 5) ple_raw[s, l, :] = embed_tokens_per_layer[tok_s, l*ple_hidden..(l+1)*ple_hidden]
+    //    * sqrt(ple_hidden)  (host-side gather; full 4.6GB table never uploaded).
+    let ple_raw_host = gather_ple_raw_batch(
+        ctx.loader,
+        &format!("{}.embed_tokens_per_layer.weight", ctx.weight_prefix),
+        prompt_token_ids,
+        total,
+        ple_hidden,
+    )?;
+    let ple_raw_gpu = upload_bf16(&[seq_len, num_layers, ple_hidden], &ple_raw_host)?;
+
+    // 6) pli = (proj_normed + ple_raw) * 2^-0.5  (BF16-rounded scale).
+    let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
+    let mut pli = GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
+    g4::add_scaled_residual(
+        0, dtype, &mut pli, &proj_normed, &ple_raw_gpu,
+        combine_scale, seq_len * num_layers * ple_hidden,
+    )?;
+
+    Ok(pli)
+}
+
+/// Single-launch-per-primitive prefill forward pass over the whole prompt.
+/// Replaces Phase A's per-position `run_forward_pass` loop with batched
+/// kernels that process all `seq_len` tokens in parallel inside each
+/// primitive. Returns the softcapped logits at the last prompt position.
+fn run_prefill(
+    ctx: &ForwardCtx,
+    prompt_token_ids: &[u32],
+    k_caches: &mut [GpuBuffer],
+    v_caches: &mut [GpuBuffer],
+    counter: &mut GpuBuffer,
+) -> Result<Vec<f32>> {
+    let dtype = ScalarType::BF16;
+    let seq_len = prompt_token_ids.len();
+    let hidden_size = ctx.hidden_size;
+    let num_q_heads = ctx.num_q_heads;
+    let num_kv_heads = ctx.num_kv_heads;
+    let eps = ctx.eps;
+    let ple_hidden = ctx.ple_hidden;
+    let num_layers = ctx.num_layers;
+    let max_t = ctx.max_t;
+    let vocab_size = ctx.vocab_size;
+
+    if seq_len == 0 {
+        bail!("run_prefill: seq_len must be > 0");
+    }
+
+    // Upload prompt token IDs once; reused for both main-embed and PLE gathers.
+    let mut id_bytes: Vec<u8> = Vec::with_capacity(seq_len * 4);
+    for &id in prompt_token_ids {
+        id_bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    let token_ids_gpu =
+        GpuBuffer::from_host_bytes(0, ScalarType::U32, &[seq_len], &id_bytes)?;
+
+    // h_running[s, :] = embed_tokens[tok_s] * sqrt(hidden)  (starting layer input).
+    let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+    let mut h_running = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+    g4::embed_gather_scaled(
+        0, dtype, &mut h_running, &token_ids_gpu, ctx.lm_head_w,
+        seq_len, hidden_size, vocab_size, embed_scale,
+    )?;
+
+    // Per-layer inputs for the whole prompt.
+    let pli = compute_per_layer_inputs_batched(ctx, &token_ids_gpu, prompt_token_ids, counter)?;
+
+    for layer_idx in 0..num_layers {
+        let w = &ctx.layers[layer_idx];
+        let head_dim = w.head_dim;
+        let rotary_dim = head_dim;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let sliding_window = match w.kind {
+            AttnKind::Sliding => ctx.tcfg.sliding_window as i32,
+            AttnKind::Full => 0,
+        };
+        let (cos_table, sin_table) = match w.kind {
+            AttnKind::Sliding => (ctx.sliding_cos, ctx.sliding_sin),
+            AttnKind::Full => (ctx.full_cos, ctx.full_sin),
+        };
+
+        let residual = h_running.clone_device()?;
+
+        let mut x = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut x, &h_running, Some(&w.input_norm),
+            eps, seq_len, hidden_size,
+        )?;
+
+        let mut q = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+        g4::matvec_batched(
+            0, dtype, &mut q, &x, &w.q_proj,
+            seq_len, hidden_size, q_dim, counter,
+        )?;
+        let mut q_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut q_normed, &q, Some(&w.q_norm),
+            eps, seq_len * num_q_heads, head_dim,
+        )?;
+        g4::rope_prefill(
+            0, dtype, &mut q_normed, cos_table, sin_table,
+            seq_len, num_q_heads, head_dim, rotary_dim, 0,
+        )?;
+
+        if !w.shared_kv {
+            let k_proj = w.k_proj.as_ref().expect("k_proj on non-shared layer");
+            let v_proj = w.v_proj.as_ref().expect("v_proj on non-shared layer");
+            let k_norm = w.k_norm.as_ref().expect("k_norm on non-shared layer");
+
+            let mut k = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+            g4::matvec_batched(
+                0, dtype, &mut k, &x, k_proj,
+                seq_len, hidden_size, kv_dim, counter,
+            )?;
+            let mut v = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+            g4::matvec_batched(
+                0, dtype, &mut v, &x, v_proj,
+                seq_len, hidden_size, kv_dim, counter,
+            )?;
+
+            let mut k_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+            g4::rms_norm_rows(
+                0, dtype, &mut k_normed, &k, Some(k_norm),
+                eps, seq_len * num_kv_heads, head_dim,
+            )?;
+            let mut v_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
+            g4::rms_norm_rows(
+                0, dtype, &mut v_normed, &v, None,
+                eps, seq_len * num_kv_heads, head_dim,
+            )?;
+
+            g4::rope_prefill(
+                0, dtype, &mut k_normed, cos_table, sin_table,
+                seq_len, num_kv_heads, head_dim, rotary_dim, 0,
+            )?;
+
+            g4::kv_append_prefill(
+                0, dtype, &k_normed, &v_normed,
+                &mut k_caches[layer_idx], &mut v_caches[layer_idx],
+                seq_len, num_kv_heads, head_dim, 0, max_t,
+            )?;
+
+            // Replicate to layers that share this one's KV. The shared layers'
+            // indices are monotonically larger than `layer_idx`, so the
+            // replicated slots will be in place before the dependent layer's
+            // attention reads.
+            for shared_layer in (layer_idx + 1)..num_layers {
+                let s = &ctx.layers[shared_layer];
+                if s.shared_kv && s.kv_source == layer_idx {
+                    let (lo, hi) = k_caches.split_at_mut(shared_layer);
+                    copy_kv_slots_range(
+                        &lo[layer_idx], &mut hi[0],
+                        num_kv_heads, max_t, head_dim, 0, seq_len,
+                    )?;
+                    let (lo, hi) = v_caches.split_at_mut(shared_layer);
+                    copy_kv_slots_range(
+                        &lo[layer_idx], &mut hi[0],
+                        num_kv_heads, max_t, head_dim, 0, seq_len,
+                    )?;
+                }
+            }
+        }
+
+        let mut attn_out = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
+        let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[seq_len, num_q_heads, max_t])?;
+        g4::attn_prefill(
+            0, dtype, &q_normed, &k_caches[layer_idx], &v_caches[layer_idx],
+            &mut scores, &mut attn_out,
+            seq_len, num_q_heads, num_kv_heads, head_dim, 0, max_t,
+            sliding_window, 1.0,
+        )?;
+
+        let mut o = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::matvec_batched(
+            0, dtype, &mut o, &attn_out, &w.o_proj,
+            seq_len, q_dim, hidden_size, counter,
+        )?;
+
+        let mut x2 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut x2, &o, Some(&w.post_attn_norm),
+            eps, seq_len, hidden_size,
+        )?;
+        let mut h_mid = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::add_residual(
+            0, dtype, &mut h_mid, &residual, &x2, seq_len * hidden_size,
+        )?;
+
+        let residual2 = h_mid.clone_device()?;
+
+        let mut x3 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm),
+            eps, seq_len, hidden_size,
+        )?;
+
+        let mut gate = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+        g4::matvec_batched(
+            0, dtype, &mut gate, &x3, &w.gate_proj,
+            seq_len, hidden_size, w.intermediate_size, counter,
+        )?;
+        let mut up_buf = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+        g4::matvec_batched(
+            0, dtype, &mut up_buf, &x3, &w.up_proj,
+            seq_len, hidden_size, w.intermediate_size, counter,
+        )?;
+        let mut y = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
+        g4::gelu_tanh_gate_mul(
+            0, dtype, &mut y, &gate, &up_buf, seq_len * w.intermediate_size,
+        )?;
+
+        let mut m = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::matvec_batched(
+            0, dtype, &mut m, &y, &w.down_proj,
+            seq_len, w.intermediate_size, hidden_size, counter,
+        )?;
+
+        let mut x4 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut x4, &m, Some(&w.post_ff_norm),
+            eps, seq_len, hidden_size,
+        )?;
+        let mut h_pre_ple = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::add_residual(
+            0, dtype, &mut h_pre_ple, &residual2, &x4, seq_len * hidden_size,
+        )?;
+
+        // PLE branch: extract this layer's PLI slice, then apply the
+        // gate-project-norm-residual chain across all S tokens.
+        let mut pli_slice = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+        g4::gather_layer_slice(
+            0, dtype, &mut pli_slice, &pli,
+            seq_len, num_layers, ple_hidden, layer_idx,
+        )?;
+
+        let mut gated = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+        g4::matvec_batched(
+            0, dtype, &mut gated, &h_pre_ple, &w.per_layer_input_gate_w,
+            seq_len, hidden_size, ple_hidden, counter,
+        )?;
+        let mut gated_act = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
+        g4::gelu_tanh_gate_mul(
+            0, dtype, &mut gated_act, &gated, &pli_slice, seq_len * ple_hidden,
+        )?;
+        let mut projected = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::matvec_batched(
+            0, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
+            seq_len, ple_hidden, hidden_size, counter,
+        )?;
+        let mut normed = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::rms_norm_rows(
+            0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
+            eps, seq_len, hidden_size,
+        )?;
+        let mut h_new = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
+        g4::add_scaled_residual(
+            0, dtype, &mut h_new, &h_pre_ple, &normed,
+            w.layer_scalar, seq_len * hidden_size,
+        )?;
+        h_running = h_new;
+    }
+
+    // Final norm + lm_head + softcap on the last-position hidden only.
+    let last_byte_off = (seq_len - 1) * hidden_size * 2;
+    let mut last_hidden = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    unsafe {
+        let src_ptr = h_running.offset_ptr(last_byte_off);
+        gpu_hal::copy_d2d(0, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+            .map_err(|e| anyhow!("copy last hidden: {e}"))?;
+    }
+
+    let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
+    g4::rms_norm(
+        0, dtype, &mut post_norm, &last_hidden, Some(ctx.final_norm_w),
+        eps, hidden_size,
+    )?;
+    let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
+    g4::matvec(
+        0, dtype, &mut logits_gpu, &post_norm, ctx.lm_head_w,
+        hidden_size, vocab_size, counter,
+    )?;
+    let mut logits_host = download_bf16(&logits_gpu)?;
+    let cap = ctx.cap;
+    for v in logits_host.iter_mut() {
+        *v = cap * (*v / cap).tanh();
+    }
+    Ok(logits_host)
+}
+
 /// Reshape our K/V cache (shape `[num_kv_heads, max_t, head_dim]`, first
 /// `prompt_tokens` slots filled by Phase A) into a flat vector matching the
 /// oracle's `[1, num_kv_heads, prompt_tokens, head_dim]` ordering, so the two
@@ -931,57 +1332,49 @@ fn main() -> Result<()> {
     let mut overall_pass = true;
     let mut generated_ids_rust: Vec<u32> = Vec::with_capacity(max_new_tokens);
 
-    // ===== PHASE A: Rust prefill =====
-    println!("\n[phase A] Rust prefill over {prompt_tokens} prompt tokens");
-    let mut phase_a_argmax: Option<u32> = None;
-    for pos in 0..prompt_tokens {
-        let tok = prompt_token_ids[pos];
-        let want_logits = pos + 1 == prompt_tokens;
-        let logits_opt = run_forward_pass(
-            &ctx, tok, pos, &mut k_caches, &mut v_caches, &mut counter, want_logits,
-        )?;
-        if want_logits {
-            let logits = logits_opt.expect("last prompt step must emit logits");
-            if oracle.prefill_logits.len() != vocab_size {
-                bail!(
-                    "oracle.prefill_logits len {} != vocab_size {}",
-                    oracle.prefill_logits.len(), vocab_size
-                );
-            }
-            let stats = compare_vectors(&logits, &oracle.prefill_logits)?;
-            let got_arg = argmax(&logits);
-            let want_arg = argmax(&oracle.prefill_logits);
-            let top5_got = top_k_indices(&logits, 5);
-            let top5_want = top_k_indices(&oracle.prefill_logits, 5);
-            let top5_overlap = top5_got.iter().filter(|i| top5_want.contains(*i)).count();
-            let expected_gen_id = oracle.generated_token_ids[0];
-            let match_gen = got_arg as u32 == expected_gen_id;
-            let match_oracle = got_arg == want_arg;
-
-            println!(
-                "[phase A] pos={pos} input_tok={tok} vs prefill_logits: \
-                 cos_sim={:.6} max_abs={:.6} rel_err={:.6}",
-                stats.cos_sim, stats.max_abs, stats.rel_err_norm,
-            );
-            println!(
-                "  argmax got={got_arg} want={want_arg} expected_gen_id={expected_gen_id} \
-                 argmax_vs_logits={} argmax_vs_gen_id={} top5_overlap={top5_overlap}/5",
-                if match_oracle { "MATCH" } else { "MISMATCH" },
-                if match_gen { "MATCH" } else { "MISMATCH" },
-            );
-            println!("  top5_got={:?} top5_want={:?}", top5_got, top5_want);
-            if stats.cos_sim < 0.999 || !match_gen || !match_oracle {
-                overall_pass = false;
-                println!("[phase A] FAIL");
-            }
-            phase_a_argmax = Some(got_arg as u32);
-            generated_ids_rust.push(got_arg as u32);
-        } else {
-            println!("[phase A] pos={pos} input_tok={tok} (no logits)");
-        }
+    // ===== PHASE A: batched Rust prefill =====
+    //
+    // Single invocation of `run_prefill` processes every prompt token through
+    // every layer using batched primitives — one kernel launch per sub-op per
+    // layer, independent of the prompt length. No Rust-side iteration over
+    // positions. Returns the softcapped logits at the last prompt position.
+    println!("\n[phase A] batched Rust prefill over {prompt_tokens} prompt tokens");
+    let logits = run_prefill(
+        &ctx, prompt_token_ids, &mut k_caches, &mut v_caches, &mut counter,
+    )?;
+    if oracle.prefill_logits.len() != vocab_size {
+        bail!(
+            "oracle.prefill_logits len {} != vocab_size {}",
+            oracle.prefill_logits.len(), vocab_size
+        );
     }
-    let phase_a_argmax =
-        phase_a_argmax.ok_or_else(|| anyhow!("phase A produced no argmax"))?;
+    let stats = compare_vectors(&logits, &oracle.prefill_logits)?;
+    let got_arg = argmax(&logits);
+    let want_arg = argmax(&oracle.prefill_logits);
+    let top5_got = top_k_indices(&logits, 5);
+    let top5_want = top_k_indices(&oracle.prefill_logits, 5);
+    let top5_overlap = top5_got.iter().filter(|i| top5_want.contains(*i)).count();
+    let expected_gen_id = oracle.generated_token_ids[0];
+    let match_gen = got_arg as u32 == expected_gen_id;
+    let match_oracle = got_arg == want_arg;
+
+    println!(
+        "[phase A] last-pos vs prefill_logits: cos_sim={:.6} max_abs={:.6} rel_err={:.6}",
+        stats.cos_sim, stats.max_abs, stats.rel_err_norm,
+    );
+    println!(
+        "  argmax got={got_arg} want={want_arg} expected_gen_id={expected_gen_id} \
+         argmax_vs_logits={} argmax_vs_gen_id={} top5_overlap={top5_overlap}/5",
+        if match_oracle { "MATCH" } else { "MISMATCH" },
+        if match_gen { "MATCH" } else { "MISMATCH" },
+    );
+    println!("  top5_got={:?} top5_want={:?}", top5_got, top5_want);
+    if stats.cos_sim < 0.999 || !match_gen || !match_oracle {
+        overall_pass = false;
+        println!("[phase A] FAIL");
+    }
+    let phase_a_argmax = got_arg as u32;
+    generated_ids_rust.push(phase_a_argmax);
 
     // ===== Optional intermediate KV sanity check =====
     if !cli.skip_kv_check {

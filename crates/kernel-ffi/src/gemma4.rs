@@ -84,6 +84,124 @@ unsafe extern "C" {
         k_cache: *mut c_void,
         v_cache: *mut c_void,
     ) -> c_int;
+
+    fn dotcache_gemma4_hip_rms_norm_rows(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        xs: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_matvec_batched(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut c_void,
+        counter: *mut c_uint,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_rope_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        pos_base: usize,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        x: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_kv_append_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pos_base: usize,
+        max_t: usize,
+        k_in: *const c_void,
+        v_in: *const c_void,
+        k_cache: *mut c_void,
+        v_cache: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_attn_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_q_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        pos_base: usize,
+        max_t: usize,
+        sliding_window: c_int,
+        scale: f32,
+        q: *const c_void,
+        k_cache: *const c_void,
+        v_cache: *const c_void,
+        scores_scratch: *mut c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_add_residual(
+        dtype: c_int,
+        device_ordinal: usize,
+        n: usize,
+        a: *const c_void,
+        b: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_add_scaled_residual(
+        dtype: c_int,
+        device_ordinal: usize,
+        n: usize,
+        scalar: f32,
+        a: *const c_void,
+        b: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_scalar_mul_inplace(
+        dtype: c_int,
+        device_ordinal: usize,
+        n: usize,
+        scalar: f32,
+        x: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_gather_layer_slice(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_layers: usize,
+        ple_hidden: usize,
+        layer_idx: usize,
+        src: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_embed_gather_scaled(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        hidden_size: usize,
+        vocab_size: usize,
+        scale: f32,
+        token_ids: *const c_uint,
+        table: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
 }
 
 /// Gemma-variant RMSNorm — plain `weight * (x / sqrt(mean(x^2) + eps))` with
@@ -348,6 +466,369 @@ pub fn kv_append(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 kv_append failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+// =============================================================================
+// Prefill / batched primitives (Step 13).
+//
+// Each wrapper below mirrors its single-token counterpart above but takes a
+// `seq_len` (or `n_rows`) parameter so the kernel launch processes the whole
+// batch in one shot. Only `gemma4_e2e_validate`'s Phase A consumes them today;
+// the decode path in `gemma4_decode_validate` continues to use the
+// single-token primitives unchanged.
+// =============================================================================
+
+/// Multi-row Gemma RMSNorm. Normalizes each row of a `[n_rows, n_cols]` tensor
+/// independently using the same `weight[n_cols]` (or `None` for
+/// `with_scale=False`). Dispatches to a single kernel launch (grid=n_rows).
+pub fn rms_norm_rows(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    weight: Option<&GpuBuffer>,
+    eps: f32,
+    n_rows: usize,
+    n_cols: usize,
+) -> Result<(), GpuError> {
+    let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    let status = unsafe {
+        dotcache_gemma4_hip_rms_norm_rows(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            input.as_ptr(),
+            weight_ptr,
+            output.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 rms_norm_rows failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Batched matvec `out[s, r] = dot(W[r, :], in[s, :])` computed for all (s, r).
+/// Single kernel launch with work-stealing over `seq_len * out_dim` items.
+pub fn matvec_batched(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    seq_len: usize,
+    in_dim: usize,
+    out_dim: usize,
+    counter_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_matvec_batched(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            in_dim,
+            out_dim,
+            input.as_ptr(),
+            weight.as_ptr(),
+            output.as_mut_ptr(),
+            counter_buf.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 matvec_batched failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Apply Gemma split-half RoPE to every token in a `[seq_len, num_heads,
+/// head_dim]` tensor, with token `s` using position `pos_base + s` into the
+/// shared cos/sin tables.
+#[allow(clippy::too_many_arguments)]
+pub fn rope_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    x: &mut GpuBuffer,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos_base: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_rope_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_heads,
+            head_dim,
+            rotary_dim,
+            pos_base,
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            x.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 rope_prefill failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Write a `[seq_len, num_kv_heads, head_dim]` K/V tensor into cache slots
+/// `[pos_base, pos_base+seq_len)` of a `[num_kv_heads, max_t, head_dim]` cache.
+#[allow(clippy::too_many_arguments)]
+pub fn kv_append_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    k_in: &GpuBuffer,
+    v_in: &GpuBuffer,
+    k_cache: &mut GpuBuffer,
+    v_cache: &mut GpuBuffer,
+    seq_len: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_base: usize,
+    max_t: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_kv_append_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_kv_heads,
+            head_dim,
+            pos_base,
+            max_t,
+            k_in.as_ptr(),
+            v_in.as_ptr(),
+            k_cache.as_mut_ptr(),
+            v_cache.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 kv_append_prefill failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Prefill-style SWA/full attention over `seq_len` query tokens. The cache
+/// must already contain `pos_base + seq_len` valid entries (fill via
+/// `kv_append_prefill`). `scores_scratch` needs at least
+/// `seq_len * num_q_heads * max_t * 4` bytes of F32 storage.
+///
+/// Output layout: `[seq_len, num_q_heads, head_dim]`.
+/// Pass `sliding_window <= 0` for full attention.
+#[allow(clippy::too_many_arguments)]
+pub fn attn_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    q: &GpuBuffer,
+    k_cache: &GpuBuffer,
+    v_cache: &GpuBuffer,
+    scores_scratch: &mut GpuBuffer,
+    out: &mut GpuBuffer,
+    seq_len: usize,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    pos_base: usize,
+    max_t: usize,
+    sliding_window: i32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_attn_prefill(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            pos_base,
+            max_t,
+            sliding_window as c_int,
+            scale,
+            q.as_ptr(),
+            k_cache.as_ptr(),
+            v_cache.as_ptr(),
+            scores_scratch.as_mut_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 attn_prefill failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Elementwise residual add `out[i] = a[i] + b[i]` over `n` scalars.
+pub fn add_residual(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    n: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_add_residual(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n,
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 add_residual failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Elementwise `out[i] = (a[i] + b[i]) * scalar` for the Gemma 4 PLE residual
+/// "(h_pre_ple + normed) * layer_scalar" step.
+pub fn add_scaled_residual(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    scalar: f32,
+    n: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_add_scaled_residual(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n,
+            scalar,
+            a.as_ptr(),
+            b.as_ptr(),
+            output.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 add_scaled_residual failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// In-place scalar multiply `x[i] *= scalar`. Use after a matvec when the
+/// output needs a constant BF16-rounded multiplier applied (mirrors HF's
+/// Python-float times BF16-tensor rounding — the caller should pass the
+/// scalar pre-rounded to BF16 on the host).
+pub fn scalar_mul_inplace(
+    ordinal: usize,
+    dtype: ScalarType,
+    x: &mut GpuBuffer,
+    scalar: f32,
+    n: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_scalar_mul_inplace(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n,
+            scalar,
+            x.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 scalar_mul_inplace failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Extract one layer's `[seq_len, ple_hidden]` slice from a batched
+/// `[seq_len, num_layers, ple_hidden]` PLI table. The output buffer is
+/// contiguous so the existing elementwise primitives can consume it.
+#[allow(clippy::too_many_arguments)]
+pub fn gather_layer_slice(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    src: &GpuBuffer,
+    seq_len: usize,
+    num_layers: usize,
+    ple_hidden: usize,
+    layer_idx: usize,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_gather_layer_slice(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_layers,
+            ple_hidden,
+            layer_idx,
+            src.as_ptr(),
+            output.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 gather_layer_slice failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Gather rows from an embedding table and scale by a host-side multiplier.
+/// `token_ids` is a device-resident `[seq_len]` u32 buffer; `table` is a
+/// `[vocab_size, hidden_size]` row-major embedding. The multiplier is applied
+/// in FP32 after the BF16 load (mirroring HF's `embed * sqrt(hidden_size)`).
+#[allow(clippy::too_many_arguments)]
+pub fn embed_gather_scaled(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    token_ids: &GpuBuffer,
+    table: &GpuBuffer,
+    seq_len: usize,
+    hidden_size: usize,
+    vocab_size: usize,
+    scale: f32,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_gemma4_hip_embed_gather_scaled(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            hidden_size,
+            vocab_size,
+            scale,
+            token_ids.as_ptr() as *const c_uint,
+            table.as_ptr(),
+            output.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 embed_gather_scaled failed with status {status}"
         )));
     }
     Ok(())
