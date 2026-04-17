@@ -268,10 +268,12 @@ static REGISTRY: &[RegistryEntry] = &[
         backend: Backend::Hip,
         arch: GpuArch::Gfx1150,
         vram: VramBudget {
-            // ~16 GiB weights (BF16) — does not fit in BF16, requires INT4 (~4 GiB)
-            // or FP8 (~8 GiB). Left at BF16 sizing so VRAM check flags the fit
-            // problem until INT4/FP8 paths land for Gemma 4.
-            fixed_bytes: 16 * GIB,
+            // Safetensors are ~16 GiB, but the ~5.6 GiB `embed_tokens_per_layer`
+            // table is mmap-sliced per token and never uploaded to GPU. Actual
+            // uploaded BF16 weights: ~9.2 GiB (per-layer ~7.8 GiB + tied embed
+            // 1.3 GiB + projection/norms ~0.06 GiB). Adding scratch + activations
+            // lands around 10 GiB fixed; KV cache + overhead_factor handle the rest.
+            fixed_bytes: 10 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Gemma4(Gemma4KernelParams {

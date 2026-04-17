@@ -354,4 +354,39 @@ mod tests {
         let cfg: Config = serde_json::from_value(v).unwrap();
         assert!(cfg.check_supported().is_err());
     }
+
+    #[test]
+    fn kv_source_layer_matches_e4b_pattern() {
+        // E4B: 42 layers, layer_types `[SWA*5, FULL]*7`, num_kv_shared_layers=18.
+        let mut types: Vec<String> = Vec::with_capacity(42);
+        for _ in 0..7 {
+            for _ in 0..5 {
+                types.push("sliding_attention".to_string());
+            }
+            types.push("full_attention".to_string());
+        }
+        let mut v: serde_json::Value = serde_json::from_str(E2B_CONFIG).unwrap();
+        v["text_config"]["num_hidden_layers"] = serde_json::json!(42);
+        v["text_config"]["num_kv_shared_layers"] = serde_json::json!(18);
+        v["text_config"]["use_double_wide_mlp"] = serde_json::json!(false);
+        v["text_config"]["layer_types"] = serde_json::Value::Array(
+            types.into_iter().map(serde_json::Value::String).collect(),
+        );
+        let cfg: Config = serde_json::from_value(v).unwrap();
+        let t = &cfg.text_config;
+        // 24 owning layers: 0..=23. Full-attn layers are at positions 5,11,17,23,29,35,41.
+        // The last FULL owning layer is 23; last SWA owning is 22.
+        for i in 0..24 {
+            assert_eq!(t.kv_source_layer(i), None, "layer {i}");
+        }
+        let full_layers = [29usize, 35, 41];
+        for i in 24..42 {
+            let expected = if full_layers.contains(&i) { 23 } else { 22 };
+            assert_eq!(t.kv_source_layer(i), Some(expected), "layer {i}");
+        }
+        // Also check owning-layer counts.
+        assert_eq!(t.num_kv_owning_layers(), 24);
+        // E4B's intermediate size is NOT doubled on the shared-KV tail.
+        assert_eq!(t.use_double_wide_mlp, false);
+    }
 }
