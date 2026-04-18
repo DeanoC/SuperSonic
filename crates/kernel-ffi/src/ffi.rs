@@ -392,6 +392,13 @@ pub fn rms_norm_4b(
     Ok(())
 }
 
+/// Maximum `in_dim` the standalone matvec kernels support. The kernels allocate
+/// a fixed `__shared__ float shared_input[STANDALONE_MATVEC_MAX_IN_DIM]` for the
+/// F32-cached input vector; anything larger overruns LDS and faults the same
+/// way the 2B attn_scratch crash did (c.f. 338b939). Keep in sync with the
+/// `shared_input[...]` declaration in every `full_attention*.hip`/`.cuh`.
+pub const STANDALONE_MATVEC_MAX_IN_DIM: usize = 4096;
+
 /// 4B variant of standalone matvec (same logic, separate compilation).
 pub fn standalone_matvec_4b(
     ordinal: usize,
@@ -403,6 +410,14 @@ pub fn standalone_matvec_4b(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if in_dim > STANDALONE_MATVEC_MAX_IN_DIM {
+        return Err(GpuError::InvalidArg(format!(
+            "standalone_matvec_4b in_dim={in_dim} exceeds kernel LDS bound \
+             STANDALONE_MATVEC_MAX_IN_DIM={STANDALONE_MATVEC_MAX_IN_DIM}. \
+             Raise `shared_input[...]` in full_attention_4b.hip + \
+             full_attention_4b_cuda.cuh and bump the constant."
+        )));
+    }
     let backend = output.backend();
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
     let status = match backend {
@@ -648,6 +663,14 @@ pub fn standalone_matvec(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if in_dim > STANDALONE_MATVEC_MAX_IN_DIM {
+        return Err(GpuError::InvalidArg(format!(
+            "standalone_matvec in_dim={in_dim} exceeds kernel LDS bound \
+             STANDALONE_MATVEC_MAX_IN_DIM={STANDALONE_MATVEC_MAX_IN_DIM}. \
+             Raise `shared_input[...]` in full_attention.hip + \
+             full_attention_cuda.cuh and bump the constant."
+        )));
+    }
     let backend = output.backend();
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
