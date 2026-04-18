@@ -9,7 +9,6 @@ pub struct OracleOutput {
     pub load_ms: f64,
     pub prefill_ms: f64,
     pub decode_ms: f64,
-    pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_logits: Vec<f32>,
     pub decode_logits: Vec<Vec<f32>>,
@@ -17,6 +16,10 @@ pub struct OracleOutput {
     // State export (only present with --emit-state)
     pub prefill_hidden: Option<String>,      // base64
     pub prefill_hidden_shape: Option<Vec<usize>>,
+    pub layer_attn_residual_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
+    pub layer_post_attn_norm_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
+    pub layer_mlp_outputs: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
+    pub layer_hidden_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer, decoder block output
     pub kv_caches: Option<Vec<KvCacheDump>>,
     pub conv_states: Option<Vec<StateDump>>,
     pub recurrent_states: Option<Vec<StateDump>>,
@@ -45,6 +48,7 @@ pub fn run_oracle(
     prompt_ids: &[u32],
     max_new_tokens: usize,
     dtype: &str,
+    device: &str,
     emit_state: bool,
     fp8_model_dir: Option<&Path>,
 ) -> Result<OracleOutput> {
@@ -59,7 +63,8 @@ pub fn run_oracle(
         .arg("--model-id").arg(model_id)
         .arg("--prompt-ids").arg(&ids_str)
         .arg("--max-new-tokens").arg(max_new_tokens.to_string())
-        .arg("--dtype").arg(dtype);
+        .arg("--dtype").arg(dtype)
+        .arg("--device").arg(device);
     if emit_state {
         cmd.arg("--emit-state");
     }
@@ -68,7 +73,7 @@ pub fn run_oracle(
     }
 
     let fp8_flag = fp8_model_dir.map(|d| format!(" --fp8-model-dir {}", d.display())).unwrap_or_default();
-    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype}{}{fp8_flag}",
+    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{fp8_flag}",
         oracle_script.display(),
         if emit_state { " --emit-state" } else { "" }
     );

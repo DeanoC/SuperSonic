@@ -1,8 +1,18 @@
 #pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
 
-#include <hip/hip_fp16.h>
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
+using hip_bfloat16 = __nv_bfloat16;
+
+#ifndef __HIP_PLATFORM_AMD__
+#define __shfl(val, lane) __shfl_sync(0xffffffffu, val, lane)
+#define __shfl_down(val, delta) __shfl_down_sync(0xffffffffu, val, delta)
+#define __shfl_xor(val, lane_mask) __shfl_xor_sync(0xffffffffu, val, lane_mask)
+#endif
+#pragma once
+
 #include <math.h>
 #include <stdint.h>
 
@@ -3090,14 +3100,17 @@ __device__ inline void grid_barrier(
 ) {
     __syncthreads();
     if (threadIdx.x == 0) {
-        unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        volatile unsigned int* counter_v = barrier_counter;
+        volatile unsigned int* flag_v = barrier_flag;
+        unsigned int phase = *flag_v;
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
-            __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
+            *counter_v = 0u;
             __threadfence();
-            __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
+            *flag_v = phase + 1;
         } else {
-            while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
+            while (*flag_v == phase) {}
+            __threadfence();
         }
     }
     __syncthreads();

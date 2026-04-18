@@ -1,5 +1,7 @@
 use std::fmt;
 
+pub use gpu_hal::Backend;
+
 /// Identifies a specific model variant with a known optimized megakernel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVariant {
@@ -43,33 +45,25 @@ impl fmt::Display for ModelVariant {
     }
 }
 
-/// Compute backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Backend {
-    Hip,
-}
-
-impl fmt::Display for Backend {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Hip => write!(f, "HIP"),
-        }
-    }
-}
-
 /// GPU architecture (must match for kernel dispatch).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuArch {
     Gfx1150,
+    Sm86,
     Unknown(String),
 }
 
 impl GpuArch {
-    /// Parse from the gcnArchName string returned by hipGetDeviceProperties.
-    pub fn from_rocm_name(name: &str) -> Self {
-        match name.trim() {
-            "gfx1150" => Self::Gfx1150,
-            other => Self::Unknown(other.to_owned()),
+    pub fn from_backend_name(backend: &Backend, name: &str) -> Self {
+        match backend {
+            Backend::Hip => match name.trim() {
+                "gfx1150" => Self::Gfx1150,
+                other => Self::Unknown(other.to_owned()),
+            },
+            Backend::Cuda => match name.trim() {
+                "sm86" => Self::Sm86,
+                other => Self::Unknown(other.to_owned()),
+            },
         }
     }
 }
@@ -78,6 +72,7 @@ impl fmt::Display for GpuArch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Gfx1150 => write!(f, "gfx1150"),
+            Self::Sm86 => write!(f, "sm86"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -103,15 +98,6 @@ pub struct VramBudget {
     pub fixed_bytes: u64,
     /// Safety margin multiplier (e.g. 1.1 for 10% headroom).
     pub overhead_factor: f64,
-}
-
-impl VramBudget {
-    /// Estimate total VRAM needed for a given context size.
-    /// `kv_bytes_per_token` is computed at runtime from the loaded model config.
-    pub fn estimate_total(&self, context_tokens: usize, kv_bytes_per_token: u64) -> u64 {
-        let kv_bytes = kv_bytes_per_token * context_tokens as u64;
-        ((self.fixed_bytes + kv_bytes) as f64 * self.overhead_factor) as u64
-    }
 }
 
 /// One supported (model, backend, arch) combination.
@@ -171,7 +157,7 @@ static REGISTRY: &[RegistryEntry] = &[
         },
         params: KernelParams {
             proj_buf_floats: 12352,
-            attn_scratch_floats: 4096,
+            attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
@@ -189,7 +175,39 @@ static REGISTRY: &[RegistryEntry] = &[
         },
         params: KernelParams {
             proj_buf_floats: 12352,
-            attn_scratch_floats: 4096,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        },
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 2 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 2048,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+        },
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
@@ -210,7 +228,6 @@ pub fn lookup(
 
 /// List all supported model names for error messages.
 pub fn supported_models_list() -> Vec<&'static str> {
-    // Deduplicate model names from registry
     let mut models: Vec<&str> = REGISTRY
         .iter()
         .map(|e| match &e.model {
@@ -220,6 +237,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
         })
         .collect();
+    models.sort_unstable();
     models.dedup();
     models
 }

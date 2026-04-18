@@ -133,12 +133,46 @@ def main():
     if args.emit_state:
         # Get the hidden state after all layers but before final norm + lm_head.
         # We re-run with output_hidden_states=True.
+        attn_residual_states = [None] * len(model.model.layers)
+        post_attn_norm_states = [None] * len(model.model.layers)
+        mlp_outputs = [None] * len(model.model.layers)
+        layer_outputs = [None] * len(model.model.layers)
+        hooks = []
+        for layer_idx, layer in enumerate(model.model.layers):
+            def make_pre_hook(idx):
+                def hook(module, inputs):
+                    attn_residual_states[idx] = inputs[0][:, -1:, :].detach().to(torch_dtype).cpu()
+                return hook
+            def make_forward_hook(idx, store):
+                def hook(module, inputs, output):
+                    out = output[0] if isinstance(output, tuple) else output
+                    store[idx] = out[:, -1:, :].detach().to(torch_dtype).cpu()
+                return hook
+            hooks.append(layer.post_attention_layernorm.register_forward_pre_hook(make_pre_hook(layer_idx)))
+            hooks.append(layer.post_attention_layernorm.register_forward_hook(make_forward_hook(layer_idx, post_attn_norm_states)))
+            hooks.append(layer.mlp.register_forward_hook(make_forward_hook(layer_idx, mlp_outputs)))
+            hooks.append(layer.register_forward_hook(make_forward_hook(layer_idx, layer_outputs)))
         with torch.no_grad():
             out2 = model.model(input_ids=input_ids, use_cache=False, output_hidden_states=True)
+        for hook in hooks:
+            hook.remove()
         # Last hidden state: [batch, seq, hidden] — take last token
         last_hidden = out2.last_hidden_state[:, -1:, :]  # [1, 1, hidden]
         state_payload["prefill_hidden"] = tensor_to_b64(last_hidden.to(torch_dtype))
         state_payload["prefill_hidden_shape"] = list(last_hidden.shape)
+        state_payload["layer_attn_residual_states"] = [
+            tensor_to_b64(h) for h in attn_residual_states
+        ]
+        state_payload["layer_post_attn_norm_states"] = [
+            tensor_to_b64(h) for h in post_attn_norm_states
+        ]
+        state_payload["layer_mlp_outputs"] = [
+            tensor_to_b64(h) for h in mlp_outputs
+        ]
+        state_payload["layer_hidden_states"] = [
+            tensor_to_b64(h)
+            for h in layer_outputs
+        ]
 
         # Extract KV caches and conv/recurrent states from past_key_values.
         # Qwen3.5 DynamicCache has .layers — each is either:

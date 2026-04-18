@@ -3,7 +3,14 @@
 //! orchestrates them layer by layer.
 
 use std::ffi::{c_int, c_void};
-use gpu_hal::{GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+
+fn ffi_error(msg: String) -> GpuError {
+    match gpu_hal::current_backend() {
+        Backend::Hip => GpuError::Hip(msg),
+        Backend::Cuda => GpuError::Cuda(msg),
+    }
+}
 
 unsafe extern "C" {
     // ---- Existing bridge functions (from full_attention_bridge.cpp) ----
@@ -151,26 +158,6 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_batched_matmul_view(
-        dtype: c_int,
-        device_ordinal: usize,
-        batch_rank: c_int,
-        batch_elems: usize,
-        m: c_int,
-        n: c_int,
-        k: c_int,
-        lhs_batch_strides: *const c_int,
-        rhs_batch_strides: *const c_int,
-        out_batch_dims: *const c_int,
-        lhs_row_stride: c_int,
-        lhs_k_stride: c_int,
-        rhs_k_stride: c_int,
-        rhs_col_stride: c_int,
-        lhs: *const c_void,
-        rhs: *const c_void,
-        out: *mut c_void,
-    ) -> c_int;
-
     // Tiled BF16 matmul: out = lhs × rhs^T (rhs stored [n, k])
     fn dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
         dtype: c_int,
@@ -290,6 +277,84 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_hip_linear_decode_prepare(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        state_len: usize,
+        kernel_size: usize,
+        head_repeat: usize,
+        mixed_qkv: *const c_void,
+        prev_conv_state: *const c_void,
+        weights: *const c_void,
+        a_beta_raw: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_linear_decode_apply(
+        device_ordinal: usize,
+        batch_size: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        packed: *const c_void,
+        initial_state: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_4b_hip_linear_decode_prepare(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        state_len: usize,
+        kernel_size: usize,
+        head_repeat: usize,
+        mixed_qkv: *const c_void,
+        prev_conv_state: *const c_void,
+        weights: *const c_void,
+        a_beta_raw: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_4b_hip_linear_decode_apply(
+        device_ordinal: usize,
+        batch_size: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        packed: *const c_void,
+        initial_state: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_4b_hip_linear_stateful_conv_value_decay(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        conv_dim: usize,
+        seq_len: usize,
+        state_len: usize,
+        kernel_size: usize,
+        num_heads: usize,
+        mixed_qkv: *const c_void,
+        prev_state: *const c_void,
+        weights: *const c_void,
+        a: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_hip_delta_recurrent_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -376,7 +441,7 @@ pub fn embedding_lookup(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("embedding_lookup failed: {status}")));
+        return Err(ffi_error(format!("embedding_lookup failed: {status}")));
     }
     Ok(())
 }
@@ -414,7 +479,7 @@ pub fn batched_matmul(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("batched_matmul failed: {status}")));
+        return Err(ffi_error(format!("batched_matmul failed: {status}")));
     }
     Ok(())
 }
@@ -457,7 +522,7 @@ pub fn full_attention_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("full_attention_prefill failed: {status}")));
+        return Err(ffi_error(format!("full_attention_prefill failed: {status}")));
     }
     Ok(())
 }
@@ -490,7 +555,199 @@ pub fn linear_prefill_conv_pack(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("linear_prefill_conv_pack failed: {status}")));
+        return Err(ffi_error(format!("linear_prefill_conv_pack failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Linear attention single-step decode prep.
+pub fn linear_decode_prepare(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    state_len: usize,
+    kernel_size: usize,
+    head_repeat: usize,
+    mixed_qkv: &GpuBuffer,
+    prev_conv_state: &GpuBuffer,
+    weights: &GpuBuffer,
+    a_beta_raw: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_linear_decode_prepare(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            state_len,
+            kernel_size,
+            head_repeat,
+            mixed_qkv.as_ptr(),
+            prev_conv_state.as_ptr(),
+            weights.as_ptr(),
+            a_beta_raw.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("linear_decode_prepare failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Linear attention single-step recurrent apply.
+pub fn linear_decode_apply(
+    ordinal: usize,
+    batch_size: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    packed: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_linear_decode_apply(
+            ordinal,
+            batch_size,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            packed.as_ptr(),
+            initial_state.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("linear_decode_apply failed: {status}")));
+    }
+    Ok(())
+}
+
+/// 4B linear attention single-step decode prep.
+pub fn linear_decode_prepare_4b(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    state_len: usize,
+    kernel_size: usize,
+    head_repeat: usize,
+    mixed_qkv: &GpuBuffer,
+    prev_conv_state: &GpuBuffer,
+    weights: &GpuBuffer,
+    a_beta_raw: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_linear_decode_prepare(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            state_len,
+            kernel_size,
+            head_repeat,
+            mixed_qkv.as_ptr(),
+            prev_conv_state.as_ptr(),
+            weights.as_ptr(),
+            a_beta_raw.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("linear_decode_prepare_4b failed: {status}")));
+    }
+    Ok(())
+}
+
+/// 4B linear attention single-step recurrent apply.
+pub fn linear_decode_apply_4b(
+    ordinal: usize,
+    batch_size: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    packed: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_linear_decode_apply(
+            ordinal,
+            batch_size,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            packed.as_ptr(),
+            initial_state.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("linear_decode_apply_4b failed: {status}")));
+    }
+    Ok(())
+}
+
+pub fn linear_stateful_conv_value_decay_4b(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    conv_dim: usize,
+    seq_len: usize,
+    state_len: usize,
+    kernel_size: usize,
+    num_heads: usize,
+    mixed_qkv: &GpuBuffer,
+    prev_state: &GpuBuffer,
+    weights: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_linear_stateful_conv_value_decay(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            conv_dim,
+            seq_len,
+            state_len,
+            kernel_size,
+            num_heads,
+            mixed_qkv.as_ptr(),
+            prev_state.as_ptr(),
+            weights.as_ptr(),
+            a.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "linear_stateful_conv_value_decay_4b failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -529,7 +786,7 @@ pub fn delta_recurrent_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("delta_recurrent_prefill failed: {status}")));
+        return Err(ffi_error(format!("delta_recurrent_prefill failed: {status}")));
     }
     Ok(())
 }
@@ -556,7 +813,7 @@ pub fn l2norm(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("l2norm failed: {status}")));
+        return Err(ffi_error(format!("l2norm failed: {status}")));
     }
     Ok(())
 }
@@ -581,7 +838,7 @@ pub fn swiglu_mul(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("swiglu_mul failed: {status}")));
+        return Err(ffi_error(format!("swiglu_mul failed: {status}")));
     }
     Ok(())
 }
@@ -612,7 +869,7 @@ pub fn rms_norm_gated(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("rms_norm_gated failed: {status}")));
+        return Err(ffi_error(format!("rms_norm_gated failed: {status}")));
     }
     Ok(())
 }
@@ -637,7 +894,7 @@ pub fn mul_scalar(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("mul_scalar failed: {status}")));
+        return Err(ffi_error(format!("mul_scalar failed: {status}")));
     }
     Ok(())
 }
@@ -680,7 +937,7 @@ pub fn fused_rms_norm_linear_rows(
             )
         };
         if status != 0 {
-            return Err(GpuError::Hip(format!("fused_rms_norm_linear row {row} failed: {status}")));
+            return Err(ffi_error(format!("fused_rms_norm_linear row {row} failed: {status}")));
         }
     }
     Ok(())
@@ -716,7 +973,7 @@ pub fn matmul_rhs_transposed(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("matmul_rhs_transposed failed: {status}")));
+        return Err(ffi_error(format!("matmul_rhs_transposed failed: {status}")));
     }
     Ok(())
 }
@@ -751,7 +1008,7 @@ pub fn matmul_rhs_transposed_fp8(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("matmul_rhs_transposed_fp8 failed: {status}")));
+        return Err(ffi_error(format!("matmul_rhs_transposed_fp8 failed: {status}")));
     }
     Ok(())
 }
@@ -788,7 +1045,7 @@ pub fn matmul_rhs_transposed_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("matmul_rhs_transposed_int4 failed: {status}")));
+        return Err(ffi_error(format!("matmul_rhs_transposed_int4 failed: {status}")));
     }
     Ok(())
 }
@@ -821,7 +1078,7 @@ pub fn rms_norm_rows(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("rms_norm_rows failed: {status}")));
+        return Err(ffi_error(format!("rms_norm_rows failed: {status}")));
     }
     Ok(())
 }
@@ -848,7 +1105,7 @@ pub fn cast(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("cast failed: {status}")));
+        return Err(ffi_error(format!("cast failed: {status}")));
     }
     Ok(())
 }
@@ -875,7 +1132,7 @@ pub fn element_add(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("element_add failed: {status}")));
+        return Err(ffi_error(format!("element_add failed: {status}")));
     }
     Ok(())
 }
@@ -919,7 +1176,7 @@ pub fn apply_rope_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("apply_rope_prefill failed: {status}")));
+        return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
     }
     Ok(())
 }
@@ -946,7 +1203,7 @@ pub fn transpose_shd_hsd(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("transpose_shd_hsd failed: {status}")));
+        return Err(ffi_error(format!("transpose_shd_hsd failed: {status}")));
     }
     Ok(())
 }
@@ -974,7 +1231,7 @@ pub fn transpose_pad_conv(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("transpose_pad_conv failed: {status}")));
+        return Err(ffi_error(format!("transpose_pad_conv failed: {status}")));
     }
     Ok(())
 }
@@ -1001,7 +1258,7 @@ pub fn extract_conv_state(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("extract_conv_state failed: {status}")));
+        return Err(ffi_error(format!("extract_conv_state failed: {status}")));
     }
     Ok(())
 }
@@ -1024,7 +1281,7 @@ pub fn sigmoid_mul(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("sigmoid_mul failed: {status}")));
+        return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
     }
     Ok(())
 }
@@ -1054,7 +1311,7 @@ pub fn compute_beta_g(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("compute_beta_g failed: {status}")));
+        return Err(ffi_error(format!("compute_beta_g failed: {status}")));
     }
     Ok(())
 }
@@ -1079,7 +1336,7 @@ pub fn split_qgate(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("split_qgate failed: {status}")));
+        return Err(ffi_error(format!("split_qgate failed: {status}")));
     }
     Ok(())
 }
@@ -1106,7 +1363,7 @@ pub fn split_qkv(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("split_qkv failed: {status}")));
+        return Err(ffi_error(format!("split_qkv failed: {status}")));
     }
     Ok(())
 }
@@ -1133,7 +1390,7 @@ pub fn repeat_interleave_heads(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("repeat_interleave_heads failed: {status}")));
+        return Err(ffi_error(format!("repeat_interleave_heads failed: {status}")));
     }
     Ok(())
 }
@@ -1169,7 +1426,7 @@ pub fn quantize_kv_to_fp8(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!("quantize_kv_to_fp8 failed: {status}")));
+        return Err(ffi_error(format!("quantize_kv_to_fp8 failed: {status}")));
     }
     Ok(())
 }

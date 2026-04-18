@@ -1,0 +1,87 @@
+{
+  "model_id": "Qwen/Qwen3.5-4B",
+  "generated_at": "2026-04-15 22:32:22",
+  "device": "native_gpu",
+  "test_cases": [
+    {
+      "name": "medium_context",
+      "type": "exact_prefix",
+      "description": "Medium-length context with question",
+      "prompt": "The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. What animal jumps?",
+      "prompt_tokens": 24,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        248068,
+        198,
+        90700,
+        8340,
+        25,
+        271,
+        16
+      ],
+      "expected_text": "\n\n<think>\nThinking Process:\n\n1",
+      "prefill_top5": []
+    },
+    {
+      "name": "niah_medium",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from medium context",
+      "prompt": "The weather today is sunny. Birds are singing in the trees. The river flows gently through the valley. Mountains rise in the distance. The password to the vault is diamond. Clouds drift lazily across the blue sky. Flowers bloom in the meadow. Children play in the park nearby. The wind whispers through the leaves. What is the password to the vault?",
+      "prompt_tokens": 74,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        248068,
+        198,
+        90700,
+        8340,
+        25,
+        271,
+        16
+      ],
+      "expected_text": "\n\n<think>\nThinking Process:\n\n1",
+      "prefill_top5": []
+    },
+    {
+      "name": "niah_long",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from long context",
+      "prompt": "Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. The audit keyword is saffron. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. What is the audit keyword?",
+      "prompt_tokens": 542,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        796,
+        529,
+        2176,
+        13,
+        28732,
+        4202,
+        20956,
+        16067
+      ],
+      "expected_text": " saffron. Archive entry gamma describes",
+      "prefill_top5": []
+    },
+    {
+      "name": "long_prompt",
+      "type": "exact_prefix",
+      "description": "Long repetitive prompt (50+ tokens)",
+      "prompt": "The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The The end.",
+      "prompt_tokens": 52,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        271,
+        760,
+        561,
+        561,
+        561,
+        561,
+        561,
+        561
+      ],
+      "expected_text": "\n\nThe The The The The The The",
+      "prefill_top5": []
+    }
+  ]
+}

@@ -1,10 +1,20 @@
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+using hip_bfloat16 = __nv_bfloat16;
+
+#ifndef __HIP_PLATFORM_AMD__
+#define __shfl(val, lane) __shfl_sync(0xffffffffu, val, lane)
+#define __shfl_down(val, delta) __shfl_down_sync(0xffffffffu, val, delta)
+#define __shfl_xor(val, lane_mask) __shfl_xor_sync(0xffffffffu, val, lane_mask)
+#endif
 // Prefill-specific helper kernels.
 // Kept in a separate compilation unit to avoid touching the decode megakernel
 // files (hipcc codegen sensitivity on gfx1150).
 
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_bfloat16.h>
 
 // ---- Type conversion helpers (matching the megakernel's conventions) ----
 

@@ -1,18 +1,20 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
+use crate::backend::Backend;
 use crate::error::{GpuError, Result};
 use crate::ops;
 use crate::scalar_type::ScalarType;
 
 /// Owned GPU device memory with shape and dtype metadata.
-/// Frees on drop via `hipFree`.
+/// Frees on drop via the active runtime's device free call.
 pub struct GpuBuffer {
     ptr: NonNull<c_void>,
     len_bytes: usize,
     dtype: ScalarType,
     shape: Vec<usize>,
     device_ordinal: usize,
+    backend: Backend,
 }
 
 // GPU pointers are not thread-safe by default, but access is serialized by the
@@ -21,7 +23,7 @@ unsafe impl Send for GpuBuffer {}
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        ops::free(self.device_ordinal, self.ptr.as_ptr());
+        ops::free(self.backend, self.device_ordinal, self.ptr.as_ptr());
     }
 }
 
@@ -37,6 +39,7 @@ impl GpuBuffer {
             dtype,
             shape: shape.to_vec(),
             device_ordinal: ordinal,
+            backend: crate::current_backend(),
         })
     }
 
@@ -51,6 +54,7 @@ impl GpuBuffer {
             dtype,
             shape: shape.to_vec(),
             device_ordinal: ordinal,
+            backend: crate::current_backend(),
         })
     }
 
@@ -82,6 +86,7 @@ impl GpuBuffer {
             dtype,
             shape: shape.to_vec(),
             device_ordinal: ordinal,
+            backend: crate::current_backend(),
         })
     }
 
@@ -114,6 +119,10 @@ impl GpuBuffer {
 
     pub fn device_ordinal(&self) -> usize {
         self.device_ordinal
+    }
+
+    pub fn backend(&self) -> Backend {
+        self.backend
     }
 
     pub fn elem_count(&self) -> usize {

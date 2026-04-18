@@ -19,7 +19,8 @@ struct Meta {
     group_size: usize,
     scale_rows: usize,
     scale_cols: usize,
-    tensor: String,
+    #[serde(rename = "tensor")]
+    _tensor: String,
 }
 
 fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {

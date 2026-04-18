@@ -13,6 +13,10 @@ pub struct LayerState {
     // FP8 KV cache scales (per-head-per-position absmax)
     pub kv_scale_k: Option<GpuBuffer>,
     pub kv_scale_v: Option<GpuBuffer>,
+    // BF16 shadow for decode-appended tokens when KV-FP8 is enabled.
+    pub kv_shadow_k: Option<GpuBuffer>,
+    pub kv_shadow_v: Option<GpuBuffer>,
+    pub kv_shadow_start: usize,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -45,6 +49,9 @@ impl LayerState {
             kv_filled: 0,
             kv_scale_k: None,
             kv_scale_v: None,
+            kv_shadow_k: None,
+            kv_shadow_v: None,
+            kv_shadow_start: usize::MAX,
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -58,6 +65,9 @@ impl LayerState {
             kv_filled: 0,
             kv_scale_k: None,
             kv_scale_v: None,
+            kv_shadow_k: None,
+            kv_shadow_v: None,
+            kv_shadow_start: usize::MAX,
             conv_state: None,
             recurrent_state: None,
         }
@@ -79,6 +89,15 @@ impl LayerState {
         let kv_dtype = if kv_fp8 { ScalarType::U8 } else { ScalarType::BF16 };
         if let (Some(ref k), Some(ref v)) = (&self.kv_cache_k, &self.kv_cache_v) {
             let current_cap = k.shape()[2]; // [1, nkv, seq, hd]
+            if kv_fp8 && (self.kv_shadow_k.is_none() || self.kv_shadow_v.is_none()) {
+                let nkv = config.num_key_value_heads;
+                let hd = config.head_dim;
+                self.kv_shadow_k =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, current_cap, hd])?);
+                self.kv_shadow_v =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, current_cap, hd])?);
+                self.kv_shadow_start = self.kv_filled;
+            }
             if current_cap >= needed {
                 return Ok(());
             }
@@ -94,6 +113,12 @@ impl LayerState {
                     let new_sv = sv.grow_seq_dim(1, new_cap)?;
                     self.kv_scale_k = Some(new_sk);
                     self.kv_scale_v = Some(new_sv);
+                }
+                if let (Some(ref shadow_k), Some(ref shadow_v)) = (&self.kv_shadow_k, &self.kv_shadow_v) {
+                    let new_shadow_k = shadow_k.grow_seq_dim(2, new_cap)?;
+                    let new_shadow_v = shadow_v.grow_seq_dim(2, new_cap)?;
+                    self.kv_shadow_k = Some(new_shadow_k);
+                    self.kv_shadow_v = Some(new_shadow_v);
                 }
             }
         } else {
@@ -111,6 +136,11 @@ impl LayerState {
                     Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
                 self.kv_scale_v =
                     Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
+                self.kv_shadow_k =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                self.kv_shadow_v =
+                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                self.kv_shadow_start = self.kv_filled;
             }
         }
         Ok(())
@@ -146,6 +176,9 @@ impl LayerState {
             kv_filled: self.kv_filled,
             kv_scale_k: clone_opt(&self.kv_scale_k)?,
             kv_scale_v: clone_opt(&self.kv_scale_v)?,
+            kv_shadow_k: clone_opt(&self.kv_shadow_k)?,
+            kv_shadow_v: clone_opt(&self.kv_shadow_v)?,
+            kv_shadow_start: self.kv_shadow_start,
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })

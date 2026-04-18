@@ -49,6 +49,8 @@ golden = json.load(open('$GOLDEN'))
 tc = golden['test_cases'][$i]
 prompt = tc['prompt']
 expected = tc['expected_text']
+expected_token_ids = tc.get('expected_token_ids')
+alternative_token_id_sets = tc.get('alternative_token_id_sets', [])
 extra = '$EXTRA_STR'.split() if '$EXTRA_STR' else []
 
 try:
@@ -62,7 +64,14 @@ try:
         print(proc.stderr[-200:] if proc.stderr else 'no stderr', file=sys.stderr)
         sys.exit(0)
 
-    full = proc.stdout.strip()
+    raw = proc.stdout
+    token_ids = None
+    if '\n[tokens]' in raw:
+        full, token_line = raw.split('\n[tokens]', 1)
+        token_ids = [int(tok) for tok in token_line.strip().split()] if token_line.strip() else []
+    else:
+        full = raw
+    full = full.rstrip()
 
     # Extract generated suffix
     if full.startswith(prompt):
@@ -70,8 +79,18 @@ try:
     else:
         generated = full
 
-    # Compare
-    if generated == expected:
+    # Prefer exact token-id comparison when the golden includes it.
+    if expected_token_ids is not None and token_ids is not None:
+        accepted = [expected_token_ids] + alternative_token_id_sets
+        if token_ids in accepted:
+            print('EXACT')
+        else:
+            print('MISMATCH')
+            print(f'expected tokens: {expected_token_ids[:40]}', file=sys.stderr)
+            if alternative_token_id_sets:
+                print(f'alternative tokens: {alternative_token_id_sets[:3]}', file=sys.stderr)
+            print(f'got tokens:      {token_ids[:40]}', file=sys.stderr)
+    elif generated == expected:
         print('EXACT')
     elif len(expected) >= 3 and generated.startswith(expected[:min(len(expected), 20)]):
         print('PREFIX')
