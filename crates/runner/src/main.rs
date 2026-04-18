@@ -375,6 +375,48 @@ fn try_download_bake(
     Ok(true)
 }
 
+/// Pick the variant the CLI flags imply, using the same INT4 > FP8 > BF16
+/// priority order as the rest of the runner.
+fn cli_variant(cli: &Cli) -> model_store::fetch::BakeVariant {
+    if cli.int4 {
+        model_store::fetch::BakeVariant::Int4Gptq
+    } else if cli.fp8_runtime {
+        model_store::fetch::BakeVariant::Fp8Native
+    } else {
+        model_store::fetch::BakeVariant::Bf16
+    }
+}
+
+/// When `--model-dir` has no `config.json`, we can't load the tokenizer or
+/// the model config — so fetch the bake first. The tarball bundles HF
+/// metadata under `hf/`, which the downloader extracts into `--model-dir`
+/// before anything else reads from it. This is the "fresh empty model dir"
+/// path that makes release-hosted bakes self-sufficient.
+fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<()> {
+    if cli.no_bake || cli.no_download {
+        return Ok(());
+    }
+    if cli.model_dir.join("config.json").exists() {
+        return Ok(());
+    }
+    let variant = cli_variant(cli);
+    let bake_dir = variant.bake_dir(&cli.model_dir);
+    let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+        .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
+    // Race: another process might have populated config between our check
+    // above and the lock acquisition.
+    if cli.model_dir.join("config.json").exists() {
+        return Ok(());
+    }
+    let canonical_model = model_variant.to_string();
+    eprintln!(
+        "[fetch] --model-dir has no config.json; downloading bake to populate \
+         HF metadata and weights in one pass"
+    );
+    try_download_bake(cli, variant, &canonical_model, &bake_dir)?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let ordinal = cli.device;
@@ -533,6 +575,10 @@ fn main() -> Result<()> {
             );
         }
     }
+
+    // If --model-dir is pristine (no config.json), fetch a bake first so the
+    // downloader can populate HF metadata before we try to read it.
+    ensure_hf_metadata_present(&cli, &model_variant)?;
 
     // Load config
     let config = qwen35::config::load_config(&cli.model_dir)
@@ -1429,6 +1475,9 @@ fn run_gemma4(
              Loading directly from safetensors."
         );
     }
+
+    // Fetch first if --model-dir is pristine so HF metadata lands before config load.
+    ensure_hf_metadata_present(cli, model_variant)?;
 
     let cfg = gemma4::config::load_config(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
