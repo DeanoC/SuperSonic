@@ -118,6 +118,27 @@ These were tested against the `4B` batch hero lane and intentionally not kept.
     `1625 ms` baseline.
   - Reverted because it did not clear the measurement gate.
 
+- `B == 2` MLP `down_proj` row streaming.
+  - Idea: load each `down_proj` row once and accumulate both batch items in
+    lockstep, instead of serializing the two batch items through the same row.
+  - Short benchmark on `pp533/tg16` improved from:
+    - decode `3265.7 ms` to `3084.0 ms`
+    - persistent decode `3171.989 ms` to `2990.370 ms`
+    - aggregate decode throughput `9.8 tok/s` to `10.4 tok/s`
+  - Reverted because the baked batch golden corpus regressed on
+    `medium_context`, producing the same token mismatch pattern seen in the
+    earlier linear-projection warpization attempt.
+
+- Persistent-kernel launch block-count sweep.
+  - Added a temporary bridge override and swept the short hero lane at block
+    counts `82`, `64`, `48`, and `32`.
+  - Result was flat within noise:
+    - `82`: decode `3265.5 ms`, persistent `3171.874 ms`
+    - `64`: decode `3266.0 ms`, persistent `3171.789 ms`
+    - `48`: decode `3265.0 ms`, persistent `3171.527 ms`
+    - `32`: decode `3265.5 ms`, persistent `3171.387 ms`
+  - Reverted because there was no meaningful exact-safe launch win to keep.
+
 ## Validation Notes
 
 One local environment detail matters on this machine:
