@@ -250,6 +250,27 @@ __device__ inline float dotcache_qwen35_wave_sum(float value) {
     return value;
 }
 
+__device__ inline float dotcache_qwen35_block_sum_256(float value, float* scratch) {
+    const int lane = threadIdx.x & (warpSize - 1);
+    const int warp = threadIdx.x / warpSize;
+
+    value = dotcache_qwen35_wave_sum(value);
+    if (lane == 0) {
+        scratch[warp] = value;
+    }
+    __syncthreads();
+
+    if (warp == 0) {
+        value = (lane < 8) ? scratch[lane] : 0.0f;
+        value = dotcache_qwen35_wave_sum(value);
+        if (lane == 0) {
+            scratch[0] = value;
+        }
+    }
+    __syncthreads();
+    return scratch[0];
+}
+
 template <typename T>
 __global__ void dotcache_qwen35_full_attention_prefill_kernel(
     int batch_size,
@@ -3234,13 +3255,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         float p = 0.0f;
                         for (int c = tid; c < hidden_dim; c += bs)
                             p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        lds[tid] = p;
-                        __syncthreads();
-                        for (int s = bs/2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid+s];
-                            __syncthreads();
-                        }
-                        if (tid == 0) proj_buf[sr] = lds[0];
+                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
+                        if (tid == 0) proj_buf[sr] = sum;
                         __syncthreads();
                     }
                 } else {
@@ -3307,13 +3323,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                     float sq = 0.0f;
                     for (int d = tid; d < hd; d += bs) sq += q_head[d] * q_head[d];
-                    lds[tid] = sq;
-                    __syncthreads();
-                    for (int s = bs / 2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid + s];
-                        __syncthreads();
-                    }
-                    float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
+                    float inv = rsqrtf(
+                        dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + 1e-6f);
                     const T* qnw = static_cast<const T*>(L.q_norm_w);
                     for (int d = tid; d < hd; d += bs) {
                         q_head[d] = q_head[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
@@ -3326,13 +3337,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     float* k_head = k_f32 + kh_idx * hd;
                     float sq = 0.0f;
                     for (int d = tid; d < hd; d += bs) sq += k_head[d] * k_head[d];
-                    lds[tid] = sq;
-                    __syncthreads();
-                    for (int s = bs / 2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid + s];
-                        __syncthreads();
-                    }
-                    float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
+                    float inv = rsqrtf(
+                        dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + 1e-6f);
                     const T* knw = static_cast<const T*>(L.k_norm_w);
                     for (int d = tid; d < hd; d += bs) {
                         k_head[d] = k_head[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
@@ -3414,13 +3420,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     for (int t = 0; t < kv_len; ++t) {
                         const size_t pos_base = kv_head_base + static_cast<size_t>(t) * hd;
                         float partial = q_val * dotcache_qwen35_to_float(ck[pos_base + tid]);
-                        lds[tid] = partial;
-                        __syncthreads();
-                        for (int s = bs / 2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid + s];
-                            __syncthreads();
-                        }
-                        const float score = lds[0] * scale;
+                        const float score = dotcache_qwen35_block_sum_256(partial, lds) * scale;
                         const float v_val = dotcache_qwen35_to_float(cv[pos_base + tid]);
                         const float old_max = my_max;
                         my_max = fmaxf(my_max, score);
@@ -3649,13 +3649,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         for (int c = tid; c < attn_size; c += bs) {
                             p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
                         }
-                        lds[tid] = p;
-                        __syncthreads();
-                        for (int s = bs / 2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid + s];
-                            __syncthreads();
-                        }
-                        if (tid == 0) hidden_f32[sr] += lds[0];
+                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
+                        if (tid == 0) hidden_f32[sr] += sum;
                         __syncthreads();
                     }
                 } else {
@@ -3712,13 +3707,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         float p = 0.0f;
                         for (int c = tid; c < hidden_dim; c += bs)
                             p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        lds[tid] = p;
-                        __syncthreads();
-                        for (int s = bs/2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid+s];
-                            __syncthreads();
-                        }
-                        if (tid == 0) proj_buf[sr] = lds[0];
+                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
+                        if (tid == 0) proj_buf[sr] = sum;
                         __syncthreads();
                     }
                 } else {
@@ -4188,13 +4178,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         for (int c = tid; c < vd; c += bs) {
                             p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
                         }
-                        lds[tid] = p;
-                        __syncthreads();
-                        for (int s = bs / 2; s > 0; s >>= 1) {
-                            if (tid < s) lds[tid] += lds[tid + s];
-                            __syncthreads();
-                        }
-                        if (tid == 0) hidden_f32[sr] += lds[0];
+                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
+                        if (tid == 0) hidden_f32[sr] += sum;
                         __syncthreads();
                     }
                 } else {
@@ -4251,25 +4236,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     float gp = 0.0f;
                     for (int c = tid; c < hidden_dim; c += bs)
                         gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
-                    lds[tid] = gp;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
-                        __syncthreads();
-                    }
-                    float gate_val = lds[0];
+                    float gate_val = dotcache_qwen35_block_sum_256(gp, lds);
 
                     const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
                     float up = 0.0f;
                     for (int c = tid; c < hidden_dim; c += bs)
                         up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
-                    lds[tid] = up;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
-                        __syncthreads();
-                    }
-                    float up_val = lds[0];
+                    float up_val = dotcache_qwen35_block_sum_256(up, lds);
 
                     if (tid == 0) {
                         float silu = gate_val / (1.0f + expf(-gate_val));
@@ -4334,13 +4307,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     float p = 0.0f;
                     for (int c = tid; c < L.intermediate_size; c += bs)
                         p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
-                        __syncthreads();
-                    }
-                    if (tid == 0) hidden_f32[sr] += lds[0];
+                    const float sum = dotcache_qwen35_block_sum_256(p, lds);
+                    if (tid == 0) hidden_f32[sr] += sum;
                     __syncthreads();
                 }
             } else {
