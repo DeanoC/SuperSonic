@@ -148,14 +148,79 @@ def collect_hf_files(model_dir: Path) -> list[Path]:
             found.append(p)
     return found
 
+class MultipartHashingWriter:
+    """Stream compressed output directly into GitHub-sized asset parts."""
+
+    def __init__(self, out_dir: Path, base_name: str, part_size: int) -> None:
+        self.out_dir = out_dir
+        self.base_name = base_name
+        self.part_size = part_size
+        self.sha = hashlib.sha256()
+        self.total_bytes = 0
+        self.parts: list[Path] = []
+        self.part_metas: list[dict] = []
+        self._idx = 0
+        self._size = 0
+        self._part_sha = hashlib.sha256()
+        self._path = self._part_path(self._idx)
+        self._raw = open(self._path, "wb")
+
+    def _part_path(self, idx: int) -> Path:
+        return self.out_dir / f"{self.base_name}.part{idx:02d}"
+
+    def _close_part(self) -> None:
+        if self._raw.closed:
+            return
+        self._raw.close()
+        size = self._path.stat().st_size
+        self.parts.append(self._path)
+        self.part_metas.append({
+            "name": self._path.name,
+            "bytes": size,
+            "sha256": self._part_sha.hexdigest(),
+        })
+
+    def _open_next_part(self) -> None:
+        self._idx += 1
+        self._size = 0
+        self._part_sha = hashlib.sha256()
+        self._path = self._part_path(self._idx)
+        self._raw = open(self._path, "wb")
+
+    def write(self, b) -> int:
+        view = memoryview(b)
+        written = 0
+        while view:
+            if self._size == self.part_size:
+                self._close_part()
+                self._open_next_part()
+            take = min(len(view), self.part_size - self._size)
+            chunk = view[:take]
+            self._raw.write(chunk)
+            self.sha.update(chunk)
+            self._part_sha.update(chunk)
+            self._size += take
+            self.total_bytes += take
+            written += take
+            view = view[take:]
+        return written
+
+    def finish(self) -> tuple[list[Path], list[dict] | None, str, int]:
+        self._close_part()
+        if len(self.parts) == 1:
+            final_path = self.out_dir / self.base_name
+            self.parts[0].rename(final_path)
+            return [final_path], None, self.sha.hexdigest(), self.total_bytes
+        return self.parts, self.part_metas, self.sha.hexdigest(), self.total_bytes
+
 
 def stream_tar_zst(
     bake_dir: Path,
     hf_files: list[Path],
-    out_path: Path,
-) -> tuple[str, int, str]:
-    """Write tar.zst of manifest.json + weights.bin + hf/*; return
-    (sha256_hex, total_bytes, manifest_sha256)."""
+    out_dir: Path,
+    base_name: str,
+) -> tuple[list[Path], list[dict] | None, str, int, str]:
+    """Write tar.zst of manifest.json + weights.bin + hf/* directly into upload-sized parts."""
     try:
         import zstandard
     except ImportError:
@@ -164,65 +229,39 @@ def stream_tar_zst(
             "  pip install -r oracle/requirements-upload.txt"
         )
 
-    sha = hashlib.sha256()
     manifest_sha = hashlib.sha256()
-    total_bytes = 0
 
     manifest_bytes = (bake_dir / "manifest.json").read_bytes()
     manifest_sha.update(manifest_bytes)
 
     cctx = zstandard.ZstdCompressor(level=ZSTD_LEVEL, threads=-1)
-    with open(out_path, "wb") as raw:
-        # Wrap raw output so we can SHA-256 the compressed stream on the fly.
-        class HashingWriter:
-            def write(self, b):
-                sha.update(b)
-                nonlocal_total = raw.write(b)
-                return nonlocal_total
-
-        hw = HashingWriter()
-        with cctx.stream_writer(hw) as zout:
-            with tarfile.open(fileobj=zout, mode="w|") as tar:
-                # manifest.json from bytes we already have
-                ti = tarfile.TarInfo(name="manifest.json")
-                ti.size = len(manifest_bytes)
+    writer = MultipartHashingWriter(out_dir, base_name, PART_SIZE_BYTES)
+    with cctx.stream_writer(writer) as zout:
+        with tarfile.open(fileobj=zout, mode="w|") as tar:
+            # manifest.json from bytes we already have
+            ti = tarfile.TarInfo(name="manifest.json")
+            ti.size = len(manifest_bytes)
+            ti.mtime = 0
+            ti.mode = 0o644
+            tar.addfile(ti, io.BytesIO(manifest_bytes))
+            # weights.bin streamed from disk
+            wb = bake_dir / "weights.bin"
+            ti = tarfile.TarInfo(name="weights.bin")
+            ti.size = wb.stat().st_size
+            ti.mtime = 0
+            ti.mode = 0o644
+            with open(wb, "rb") as f:
+                tar.addfile(ti, f)
+            # HF metadata under hf/ prefix
+            for hf_path in hf_files:
+                ti = tarfile.TarInfo(name=f"hf/{hf_path.name}")
+                ti.size = hf_path.stat().st_size
                 ti.mtime = 0
                 ti.mode = 0o644
-                tar.addfile(ti, io.BytesIO(manifest_bytes))
-                # weights.bin streamed from disk
-                wb = bake_dir / "weights.bin"
-                ti = tarfile.TarInfo(name="weights.bin")
-                ti.size = wb.stat().st_size
-                ti.mtime = 0
-                ti.mode = 0o644
-                with open(wb, "rb") as f:
+                with open(hf_path, "rb") as f:
                     tar.addfile(ti, f)
-                # HF metadata under hf/ prefix
-                for hf_path in hf_files:
-                    ti = tarfile.TarInfo(name=f"hf/{hf_path.name}")
-                    ti.size = hf_path.stat().st_size
-                    ti.mtime = 0
-                    ti.mode = 0o644
-                    with open(hf_path, "rb") as f:
-                        tar.addfile(ti, f)
-        total_bytes = raw.tell()
-    return sha.hexdigest(), total_bytes, manifest_sha.hexdigest()
-
-
-def split_file(src: Path, part_prefix: Path, part_size: int) -> list[Path]:
-    """Split src into part_prefix.part00, .part01, ... ; return part paths."""
-    parts: list[Path] = []
-    with open(src, "rb") as f:
-        idx = 0
-        while True:
-            chunk = f.read(part_size)
-            if not chunk:
-                break
-            out = part_prefix.with_name(part_prefix.name + f".part{idx:02d}")
-            out.write_bytes(chunk)
-            parts.append(out)
-            idx += 1
-    return parts
+    parts, part_metas, sha256_hex, total_bytes = writer.finish()
+    return parts, part_metas, sha256_hex, total_bytes, manifest_sha.hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -349,24 +388,14 @@ def main() -> None:
 
     base = asset_basename(args.model, variant)
     workdir = Path(tempfile.mkdtemp(prefix="supersonic-upload-"))
-    tar_path = workdir / base
     try:
-        log(f"[compress] tar+zstd(level={ZSTD_LEVEL}) → {tar_path}")
-        sha256_hex, total_bytes, inner_manifest_sha = stream_tar_zst(bake_dir, hf_files, tar_path)
+        log(f"[compress] tar+zstd(level={ZSTD_LEVEL}) → {workdir / base}")
+        parts, part_metas, sha256_hex, total_bytes, inner_manifest_sha = stream_tar_zst(
+            bake_dir, hf_files, workdir, base
+        )
         log(f"[compress] {total_bytes:,} bytes, sha256={sha256_hex[:16]}...")
-
-        if total_bytes > PART_SIZE_BYTES:
-            log(f"[split] >{PART_SIZE_BYTES // (1024*1024)} MiB → splitting")
-            parts = split_file(tar_path, tar_path, PART_SIZE_BYTES)
-            part_metas = [
-                {"name": p.name, "bytes": p.stat().st_size, "sha256": sha256_file(p)}
-                for p in parts
-            ]
-            tar_path.unlink()  # monolithic file no longer needed
+        if part_metas is not None:
             log(f"[split] wrote {len(parts)} parts")
-        else:
-            parts = [tar_path]
-            part_metas = None
 
         # Size of the uncompressed tar content (weights.bin + manifest.json + hf/*)
         uncompressed_bytes = (

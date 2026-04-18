@@ -158,13 +158,16 @@ bake_bf16() {
 }
 
 print_summary() {
+    local succeeded_count=${#SUCCEEDED[@]}
+    local skipped_count=${#SKIPPED[@]}
+    local failed_count=${#FAILED[@]}
     echo
     echo "==== bake_all summary ===="
-    echo "succeeded: ${#SUCCEEDED[@]}"
+    echo "succeeded: $succeeded_count"
     for s in "${SUCCEEDED[@]:-}"; do [[ -n "$s" ]] && echo "  OK   $s"; done
-    echo "skipped:   ${#SKIPPED[@]}"
+    echo "skipped:   $skipped_count"
     for s in "${SKIPPED[@]:-}"; do [[ -n "$s" ]] && echo "  --   $s"; done
-    echo "failed:    ${#FAILED[@]}"
+    echo "failed:    $failed_count"
     for s in "${FAILED[@]:-}"; do [[ -n "$s" ]] && echo "  FAIL $s"; done
 }
 
