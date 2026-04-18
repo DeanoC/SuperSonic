@@ -2292,7 +2292,7 @@ impl DecodeEngine {
         // 5. Launch persistent decode kernel (dispatch by model variant)
         let start = Instant::now();
         let persist_result = if sampling_mode == DecodeSamplingMode::CudaHeroFusedLmHead {
-            kernel_ffi::persistent_decode_qwen08_hero(
+            kernel_ffi::persistent_decode_qwen08_sm86_specialized(
                 self.ordinal,
                 ScalarType::BF16,
                 config.num_hidden_layers,

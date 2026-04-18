@@ -3141,7 +3141,7 @@ __device__ inline void block_rms_norm_global(
     __syncthreads();
 }
 
-template <typename T>
+template <typename T, bool HERO_MODE>
 __global__ void dotcache_qwen35_persistent_decode_kernel(
     int num_layers,
     int hidden_dim,
@@ -3155,8 +3155,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     unsigned int* __restrict__ barrier_flag,
     const T* __restrict__ cos_table,   // [max_positions, rotary_dim/2] RoPE cos
     const T* __restrict__ sin_table,   // [max_positions, rotary_dim/2] RoPE sin
-    int rotary_dim,                     // partial rotary dimension (64 for Qwen3.5)
-    int hero_mode
+    int rotary_dim                      // partial rotary dimension (64 for Qwen3.5)
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3187,7 +3186,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     grid_barrier(barrier_counter, barrier_flag, nb);
 
     const bool qwen08_hero =
-        hero_mode != 0 &&
+        HERO_MODE &&
         num_layers == 24 &&
         hidden_dim == 1024 &&
         intermediate_size == 3584 &&

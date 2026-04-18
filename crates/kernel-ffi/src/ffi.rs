@@ -22,7 +22,7 @@ unsafe extern "C" {
         rotary_dim: usize,
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
+    fn dotcache_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -249,7 +249,7 @@ pub fn persistent_decode(
     Ok(())
 }
 
-pub fn persistent_decode_qwen08_hero(
+pub fn persistent_decode_qwen08_sm86_specialized(
     ordinal: usize,
     dtype: ScalarType,
     num_layers: usize,
@@ -273,7 +273,7 @@ pub fn persistent_decode_qwen08_hero(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
+                dotcache_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -298,7 +298,7 @@ pub fn persistent_decode_qwen08_hero(
         }
         Backend::Hip => {
             return Err(GpuError::InvalidArg(
-                "persistent_decode_qwen08_hero is CUDA-only".into(),
+                "persistent_decode_qwen08_sm86_specialized is CUDA-only".into(),
             ))
         }
     };
@@ -306,7 +306,7 @@ pub fn persistent_decode_qwen08_hero(
     if status != 0 {
         return Err(backend_error(
             backend,
-            "persistent_decode_qwen08_hero kernel",
+            "persistent_decode_qwen08_sm86_specialized kernel",
             status,
         ));
     }
