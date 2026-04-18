@@ -913,6 +913,34 @@ impl Gemma4Int4Engine {
         Ok(pli)
     }
 
+    /// Reset per-session state so the engine is ready for a fresh prompt.
+    /// Callers pass `pos` to `decode_step`, so there's no internal position
+    /// counter — this just zero-memsets the K/V caches as a defensive measure.
+    /// Weights and scratch untouched.
+    pub fn reset(&mut self) -> Result<()> {
+        for buf in self.k_caches.iter_mut() {
+            gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                .map_err(|e| anyhow!("reset: zero k cache: {e}"))?;
+        }
+        for buf in self.v_caches.iter_mut() {
+            gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                .map_err(|e| anyhow!("reset: zero v cache: {e}"))?;
+        }
+        for seq in self.extra_k_caches.iter_mut() {
+            for buf in seq.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero extra k cache: {e}"))?;
+            }
+        }
+        for seq in self.extra_v_caches.iter_mut() {
+            for buf in seq.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero extra v cache: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Batched INT4 prefill; returns softcapped logits at the last position.
     pub fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
         let seq_len = prompt_token_ids.len();

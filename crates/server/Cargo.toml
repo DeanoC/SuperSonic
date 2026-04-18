@@ -1,0 +1,40 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "supersonic-serve"
+path = "src/main.rs"
+
+[dependencies]
+runner = { path = "../runner" }
+gpu-hal = { path = "../gpu-hal" }
+kernel-ffi = { path = "../kernel-ffi" }
+model-store = { path = "../model-store" }
+qwen35 = { path = "../qwen35" }
+gemma4 = { path = "../gemma4" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.22"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.5", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+async-stream = "0.3"
+
+minijinja = { version = "2", features = ["loop_controls"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+rand = "0.8"
+rand_chacha = "0.3"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
+tokio-stream = "0.1"

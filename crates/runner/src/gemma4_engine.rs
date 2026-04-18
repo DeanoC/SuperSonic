@@ -709,6 +709,27 @@ impl Gemma4Engine {
         self.max_t
     }
 
+    /// Reset per-session state so the engine is ready for a fresh prompt.
+    /// The engine has no internal position counter (callers pass `pos` to
+    /// `decode_step`), and prefill overwrites positions `0..seq_len` on every
+    /// call — so this is effectively a defensive zero-memset of the K/V
+    /// caches. Weights and scratch untouched.
+    pub fn reset(&mut self) -> Result<()> {
+        for seq_caches in self.k_caches.iter_mut() {
+            for buf in seq_caches.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero k cache: {e}"))?;
+            }
+        }
+        for seq_caches in self.v_caches.iter_mut() {
+            for buf in seq_caches.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero v cache: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Run prefill into sequence 0's K/V caches (convenience wrapper for
     /// `prefill_seq(0, ...)` matching the original single-sequence API).
     pub fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {

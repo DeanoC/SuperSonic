@@ -13,7 +13,15 @@ use qwen35::weights::Qwen35Weights;
 
 use crate::oracle::OracleOutput;
 use crate::prefill_engine;
-use crate::decode_f32_le;
+
+/// Decode a byte slice of little-endian `f32` values into a host `Vec<f32>`.
+/// Shared helper used across decode/validate paths.
+pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
 
 fn matmul_proj(
     ordinal: usize,
@@ -2136,6 +2144,23 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
 
+        Ok(())
+    }
+
+    /// Reset per-session state so the engine is ready for a fresh prompt.
+    /// Weights, rotary tables, scratch allocations, and quantization scales are
+    /// untouched — only KV caches, conv/recurrent state, and the sync counters
+    /// are cleared. Used by the HTTP server between requests.
+    pub fn reset(&mut self) -> Result<()> {
+        self.state = ModelState::new(&self.weights.config, self.ordinal)
+            .map_err(|e| anyhow::anyhow!("reset model state: {e}"))?;
+        for es in &mut self.extra_states {
+            *es = ModelState::new(&self.weights.config, self.ordinal)
+                .map_err(|e| anyhow::anyhow!("reset extra state: {e}"))?;
+        }
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
         Ok(())
     }
 
