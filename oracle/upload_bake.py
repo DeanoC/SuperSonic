@@ -39,6 +39,21 @@ INDEX_SCHEMA_VERSION = 1
 PART_SIZE_BYTES = 1800 * 1024 * 1024  # < GitHub's 2 GiB per-asset cap
 ZSTD_LEVEL = 19
 
+# Small HF metadata files bundled into every tarball under `hf/` so a
+# consumer with an empty --model-dir still has config + tokenizer after the
+# fetch. config.json and tokenizer.json are required; the rest are pulled in
+# when present.
+REQUIRED_HF_FILES = ["config.json", "tokenizer.json"]
+OPTIONAL_HF_FILES = [
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "chat_template.json",
+    "tokenizer.model",          # SentencePiece models (Gemma etc.)
+    "preprocessor_config.json",
+    "processor_config.json",
+]
+
 KNOWN_MODELS = {
     "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b",
     "gemma4-e2b", "gemma4-e4b",
@@ -110,8 +125,37 @@ def validate_bake(bake_dir: Path, variant: str) -> dict:
     return manifest
 
 
-def stream_tar_zst(bake_dir: Path, out_path: Path) -> tuple[str, int, str]:
-    """Write tar.zst of manifest.json + weights.bin; return (sha256_hex, total_bytes, manifest_sha256)."""
+def collect_hf_files(model_dir: Path) -> list[Path]:
+    """Return the set of HF metadata files to bundle. Errors if a required
+    file is missing; optional files are included silently when present."""
+    found: list[Path] = []
+    missing_required: list[str] = []
+    for name in REQUIRED_HF_FILES:
+        p = model_dir / name
+        if p.is_file():
+            found.append(p)
+        else:
+            missing_required.append(name)
+    if missing_required:
+        sys.exit(
+            f"error: required HF metadata missing in {model_dir}: "
+            f"{', '.join(missing_required)}. The consumer needs these to load "
+            f"the model; ensure the HF checkpoint is complete before baking."
+        )
+    for name in OPTIONAL_HF_FILES:
+        p = model_dir / name
+        if p.is_file():
+            found.append(p)
+    return found
+
+
+def stream_tar_zst(
+    bake_dir: Path,
+    hf_files: list[Path],
+    out_path: Path,
+) -> tuple[str, int, str]:
+    """Write tar.zst of manifest.json + weights.bin + hf/*; return
+    (sha256_hex, total_bytes, manifest_sha256)."""
     try:
         import zstandard
     except ImportError:
@@ -153,6 +197,14 @@ def stream_tar_zst(bake_dir: Path, out_path: Path) -> tuple[str, int, str]:
                 ti.mode = 0o644
                 with open(wb, "rb") as f:
                     tar.addfile(ti, f)
+                # HF metadata under hf/ prefix
+                for hf_path in hf_files:
+                    ti = tarfile.TarInfo(name=f"hf/{hf_path.name}")
+                    ti.size = hf_path.stat().st_size
+                    ti.mtime = 0
+                    ti.mode = 0o644
+                    with open(hf_path, "rb") as f:
+                        tar.addfile(ti, f)
         total_bytes = raw.tell()
     return sha.hexdigest(), total_bytes, manifest_sha.hexdigest()
 
@@ -292,12 +344,15 @@ def main() -> None:
             f"but --model={args.model} implies family {FAMILY_FOR[args.model]}"
         )
 
+    hf_files = collect_hf_files(args.model_dir)
+    log(f"[bake] bundling {len(hf_files)} HF metadata files: {[p.name for p in hf_files]}")
+
     base = asset_basename(args.model, variant)
     workdir = Path(tempfile.mkdtemp(prefix="supersonic-upload-"))
     tar_path = workdir / base
     try:
         log(f"[compress] tar+zstd(level={ZSTD_LEVEL}) → {tar_path}")
-        sha256_hex, total_bytes, inner_manifest_sha = stream_tar_zst(bake_dir, tar_path)
+        sha256_hex, total_bytes, inner_manifest_sha = stream_tar_zst(bake_dir, hf_files, tar_path)
         log(f"[compress] {total_bytes:,} bytes, sha256={sha256_hex[:16]}...")
 
         if total_bytes > PART_SIZE_BYTES:
@@ -313,9 +368,12 @@ def main() -> None:
             parts = [tar_path]
             part_metas = None
 
-        # Size of the uncompressed tar content (weights.bin + manifest.json + tar headers)
-        uncompressed_bytes = (bake_dir / "weights.bin").stat().st_size + \
-                             (bake_dir / "manifest.json").stat().st_size
+        # Size of the uncompressed tar content (weights.bin + manifest.json + hf/*)
+        uncompressed_bytes = (
+            (bake_dir / "weights.bin").stat().st_size
+            + (bake_dir / "manifest.json").stat().st_size
+            + sum(p.stat().st_size for p in hf_files)
+        )
 
         entry = {
             "model": args.model,

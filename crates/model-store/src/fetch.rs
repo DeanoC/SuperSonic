@@ -204,6 +204,9 @@ pub struct FetchRequest<'a> {
     pub model_cli_name: &'a str,
     pub variant: BakeVariant,
     pub target_bake_dir: &'a Path,
+    /// Where HF metadata files (config.json, tokenizer.json, …) get extracted
+    /// when the tarball bundles them. Typically the user's `--model-dir`.
+    pub target_model_dir: &'a Path,
     pub progress: &'a dyn Fn(FetchProgress),
 }
 
@@ -283,7 +286,11 @@ pub fn fetch_bake(req: FetchRequest<'_>) -> Result<(), FetchError> {
         }
     }
 
-    // Extract atomically: write into a partial dir, rename to the target.
+    // Extract atomically. Stage into a sibling `.partial-*` directory, then
+    // commit in a crash-safe order: HF metadata files first (overwrites into
+    // model_dir), bake-dir rename last. If the process dies before the final
+    // bake-dir rename, `version_ok` still returns false so a retry re-fetches;
+    // HF files are idempotent overwrites so a partial retry is fine.
     let partial_dir = parent.join(format!(
         ".partial-{tag}-{variant}-{pid}",
         tag = req.source.tag,
@@ -294,15 +301,35 @@ pub fn fetch_bake(req: FetchRequest<'_>) -> Result<(), FetchError> {
     fs::create_dir_all(&partial_dir)?;
 
     (req.progress)(FetchProgress::Extracting);
-    extract_tar_zst(&part_paths, &partial_dir, &entry.bake_manifest_sha256)?;
+    let staging = extract_tar_zst(&part_paths, &partial_dir, &entry.bake_manifest_sha256)?;
 
-    // Remove any prior target dir, then rename partial into place.
+    // 1. Move HF metadata files into model_dir (atomic per-file rename).
+    fs::create_dir_all(req.target_model_dir)?;
+    for name in &staging.hf_file_names {
+        let src = staging.hf_staging.join(name);
+        let dst = req.target_model_dir.join(name);
+        // `rename` is atomic on the same filesystem. On EXDEV (cross-device
+        // rename, e.g. if `.supersonic/` is on a different mount than
+        // model_dir) fall back to copy+unlink.
+        if let Err(e) = fs::rename(&src, &dst) {
+            if e.raw_os_error() == Some(libc_exdev()) {
+                fs::copy(&src, &dst)?;
+                let _ = fs::remove_file(&src);
+            } else {
+                return Err(e.into());
+            }
+        }
+    }
+
+    // 2. Atomically swap the bake-dir into place (commit point).
     let _ = fs::remove_dir_all(req.target_bake_dir);
-    fs::rename(&partial_dir, req.target_bake_dir)?;
+    fs::rename(&staging.bake_staging, req.target_bake_dir)?;
+
+    // 3. Cleanup staging + cache.
+    let _ = fs::remove_dir_all(&partial_dir);
 
     // Final sanity — the extracted bake must satisfy version_ok.
     if !version_ok(req.target_bake_dir) {
-        // Roll back and report so callers don't see a half-installed bake.
         let _ = fs::remove_dir_all(req.target_bake_dir);
         return Err(FetchError::Index(
             "extracted bake failed version_ok() check".into(),
@@ -520,6 +547,12 @@ fn eq_hex(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
+/// EXDEV (cross-device link) errno. Linux-specific constant; SuperSonic is
+/// Linux-only anyway.
+const fn libc_exdev() -> i32 {
+    18
+}
+
 /// Concat-reader that streams multiple on-disk parts as one byte stream. Used
 /// so `zstd::Decoder` can consume a split asset without us materialising a
 /// merged tarball on disk.
@@ -551,11 +584,41 @@ impl Read for ConcatReader {
     }
 }
 
+/// HF metadata files permitted inside the `hf/` prefix of a bake tarball.
+/// Anything else is rejected.
+const ALLOWED_HF_FILES: &[&str] = &[
+    "config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "generation_config.json",
+    "chat_template.json",
+    "tokenizer.model",
+    "preprocessor_config.json",
+    "processor_config.json",
+];
+
+/// Outcome of [`extract_tar_zst`]: the bake-dir files land under `bake_staging`
+/// and the HF metadata files under `hf_staging`. Ordering of the final move
+/// into place is the caller's responsibility (HF files first, bake-dir rename
+/// last — see [`fetch_bake`]).
+#[derive(Debug)]
+struct ExtractedStaging {
+    bake_staging: PathBuf,
+    hf_staging: PathBuf,
+    hf_file_names: Vec<String>,
+}
+
 fn extract_tar_zst(
     part_paths: &[PathBuf],
-    target: &Path,
+    partial_root: &Path,
     expected_manifest_sha: &str,
-) -> Result<(), FetchError> {
+) -> Result<ExtractedStaging, FetchError> {
+    let bake_staging = partial_root.join("bake");
+    let hf_staging = partial_root.join("hf");
+    fs::create_dir_all(&bake_staging)?;
+    fs::create_dir_all(&hf_staging)?;
+
     let reader = ConcatReader::open(part_paths)?;
     let decoder = zstd::stream::Decoder::new(reader).map_err(|e| FetchError::Zstd(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
@@ -564,6 +627,7 @@ fn extract_tar_zst(
 
     let mut saw_manifest = false;
     let mut saw_weights = false;
+    let mut hf_file_names: Vec<String> = Vec::new();
 
     for entry in archive.entries().map_err(|e| FetchError::Tar(e.to_string()))? {
         let mut entry = entry.map_err(|e| FetchError::Tar(e.to_string()))?;
@@ -578,29 +642,47 @@ fn extract_tar_zst(
             .path()
             .map_err(|e| FetchError::Tar(e.to_string()))?
             .into_owned();
+        let components: Vec<_> = path.components().collect();
         let name = match path.file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_string(),
             None => return Err(FetchError::BadTarEntry(format!("no filename: {}", path.display()))),
         };
-        // Reject any path with a directory component or parent traversal.
-        if path.components().count() != 1 {
-            return Err(FetchError::BadTarEntry(format!(
-                "unexpected path shape: {}",
-                path.display()
-            )));
-        }
-        let dst = match name.as_str() {
-            "manifest.json" => {
-                saw_manifest = true;
-                target.join("manifest.json")
-            }
-            "weights.bin" => {
-                saw_weights = true;
-                target.join("weights.bin")
+        let dst = match components.len() {
+            1 => match name.as_str() {
+                "manifest.json" => {
+                    saw_manifest = true;
+                    bake_staging.join("manifest.json")
+                }
+                "weights.bin" => {
+                    saw_weights = true;
+                    bake_staging.join("weights.bin")
+                }
+                _ => {
+                    return Err(FetchError::BadTarEntry(format!(
+                        "unexpected root entry: {}",
+                        path.display()
+                    )));
+                }
+            },
+            2 => {
+                let prefix = components[0].as_os_str().to_string_lossy();
+                if prefix != "hf" {
+                    return Err(FetchError::BadTarEntry(format!(
+                        "unexpected prefix: {}",
+                        path.display()
+                    )));
+                }
+                if !ALLOWED_HF_FILES.contains(&name.as_str()) {
+                    return Err(FetchError::BadTarEntry(format!(
+                        "hf file not in allowlist: {name}"
+                    )));
+                }
+                hf_file_names.push(name.clone());
+                hf_staging.join(&name)
             }
             _ => {
                 return Err(FetchError::BadTarEntry(format!(
-                    "unexpected entry: {}",
+                    "unexpected path shape: {}",
                     path.display()
                 )));
             }
@@ -616,7 +698,7 @@ fn extract_tar_zst(
     }
 
     // Cross-check the extracted manifest.json against the index's expected hash.
-    let got = sha256_of_file(&target.join("manifest.json"))?;
+    let got = sha256_of_file(&bake_staging.join("manifest.json"))?;
     if !eq_hex(&got, expected_manifest_sha) {
         return Err(FetchError::Sha256Mismatch {
             what: "extracted manifest.json".into(),
@@ -624,12 +706,108 @@ fn extract_tar_zst(
             got,
         });
     }
-    Ok(())
+    Ok(ExtractedStaging {
+        bake_staging,
+        hf_staging,
+        hf_file_names,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
+
+    /// Hand-roll a minimal tar+zstd containing manifest.json + weights.bin
+    /// (+ optional hf/<files>) so the extractor is tested end-to-end against
+    /// the bytes a producer would generate.
+    fn make_tar_zst(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar_buf: Vec<u8> = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            for (name, bytes) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_path(name).unwrap();
+                header.set_size(bytes.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(0);
+                header.set_cksum();
+                builder.append(&header, *bytes).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        let mut z: Vec<u8> = Vec::new();
+        {
+            let mut enc = zstd::stream::Encoder::new(&mut z, 3).unwrap();
+            enc.write_all(&tar_buf).unwrap();
+            enc.finish().unwrap();
+        }
+        z
+    }
+
+    #[test]
+    fn extract_accepts_bundled_hf_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("partial");
+
+        let manifest_bytes = br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+        let weights_bytes = b"fake weights";
+        let cfg_bytes = br#"{"hidden_size":128}"#;
+        let tok_bytes = br#"{"model":{"type":"BPE"}}"#;
+
+        let archive = make_tar_zst(&[
+            ("manifest.json", manifest_bytes),
+            ("weights.bin", weights_bytes),
+            ("hf/config.json", cfg_bytes),
+            ("hf/tokenizer.json", tok_bytes),
+        ]);
+
+        let asset_path = tmp.path().join("bake.tar.zst");
+        std::fs::write(&asset_path, &archive).unwrap();
+
+        let expected_manifest_sha = {
+            let mut h = Sha256::new();
+            h.update(manifest_bytes);
+            hex(&h.finalize())
+        };
+
+        let staging =
+            extract_tar_zst(&[asset_path], &partial, &expected_manifest_sha).unwrap();
+        assert!(staging.bake_staging.join("manifest.json").exists());
+        assert!(staging.bake_staging.join("weights.bin").exists());
+        assert!(staging.hf_staging.join("config.json").exists());
+        assert!(staging.hf_staging.join("tokenizer.json").exists());
+        assert_eq!(staging.hf_file_names.len(), 2);
+    }
+
+    #[test]
+    fn extract_rejects_hf_file_not_in_allowlist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let partial = tmp.path().join("partial");
+
+        let manifest_bytes = br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+        let archive = make_tar_zst(&[
+            ("manifest.json", manifest_bytes),
+            ("weights.bin", b"x"),
+            ("hf/evil.sh", b"rm -rf /"),
+        ]);
+        let asset_path = tmp.path().join("bake.tar.zst");
+        std::fs::write(&asset_path, &archive).unwrap();
+
+        let expected = {
+            let mut h = Sha256::new();
+            h.update(manifest_bytes);
+            hex(&h.finalize())
+        };
+        let err = extract_tar_zst(&[asset_path], &partial, &expected).unwrap_err();
+        assert!(matches!(err, FetchError::BadTarEntry(_)), "got {err:?}");
+    }
+
+    // (A classic path-traversal test — `hf/../../etc/passwd` — isn't
+    // reachable via `tar::Builder::append`; the tar crate rejects `..` at
+    // write time. The extractor also rejects paths with >2 components via
+    // its `components.len() != 1 && != 2` check, so any traversal attempt
+    // falls through to `unexpected path shape`.)
 
     #[test]
     fn variant_bake_dirs_distinct() {

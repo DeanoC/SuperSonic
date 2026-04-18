@@ -37,9 +37,31 @@ Variants: `bf16`, `fp8-native`, `int4-gptq`.
 
 Example: `gemma4-e4b-int4-gptq-fmt1-cvt2.tar.zst`.
 
-Tarballs contain exactly `manifest.json` + `weights.bin` at the root; the
-downloader rejects any tar entry with a different name, a directory
-component, or a non-file type.
+Tarballs contain `manifest.json` + `weights.bin` at the root plus the small
+HuggingFace metadata files under an `hf/` prefix:
+
+```
+manifest.json
+weights.bin
+hf/config.json
+hf/tokenizer.json
+hf/tokenizer_config.json     (optional)
+hf/special_tokens_map.json   (optional)
+hf/generation_config.json    (optional)
+hf/chat_template.json        (optional)
+hf/tokenizer.model           (optional, SentencePiece models)
+hf/preprocessor_config.json  (optional)
+hf/processor_config.json     (optional)
+```
+
+The consumer extracts the root-level files into
+`{model_dir}/.supersonic/v{N}[-variant]/` and the `hf/*` files into
+`{model_dir}/` itself. A consumer can therefore point `--model-dir` at an
+empty directory and the fetch populates everything needed — no separate HF
+checkpoint download required.
+
+The downloader rejects any tar entry with an unknown name, a path outside
+the documented structure, or a non-file type.
 
 ### `bakes-index.json`
 
@@ -112,6 +134,10 @@ The uploader:
   `manifest.json` + `weights.bin` with matching `format_version` /
   `converter_version` and at least one `Int4Quantized` tensor (catches the
   case where you point `--int4` at a BF16 bake directory).
+- Bundles `config.json` + `tokenizer.json` (required) and any of the
+  optional HF metadata files present in `--model-dir` (see asset layout
+  above) under `hf/` in the tarball, so consumers don't need a separate HF
+  checkpoint.
 - Tars + zstd-compresses into `/tmp/supersonic-upload-*/…tar.zst`, teeing the
   compressed stream through SHA-256.
 - Splits into `.partNN` at 1800 MiB if needed.

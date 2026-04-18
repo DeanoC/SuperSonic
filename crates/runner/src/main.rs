@@ -368,6 +368,7 @@ fn try_download_bake(
         model_cli_name,
         variant,
         target_bake_dir: target,
+        target_model_dir: &cli.model_dir,
         progress: &progress,
     };
     model_store::fetch::fetch_bake(req).map_err(|e| anyhow::anyhow!("fetch bake: {e}"))?;
