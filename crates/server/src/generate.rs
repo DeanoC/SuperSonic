@@ -96,14 +96,28 @@ fn run(
     }
     let prompt_tokens = prompt_ids.len() as u32;
 
+    // `saturating_add` so a pathological `max_tokens` near `usize::MAX` is
+    // rejected here rather than overflowing and bypassing the bound.
     let max_ctx = state.max_context;
-    if prompt_ids.len() + params.max_tokens > max_ctx {
+    let total_ctx = prompt_ids.len().saturating_add(params.max_tokens);
+    if total_ctx > max_ctx {
         return Err(anyhow!(
             "prompt ({} tokens) + max_tokens ({}) exceeds max_context ({})",
             prompt_ids.len(),
             params.max_tokens,
             max_ctx
         ));
+    }
+
+    // Zero-token request: return an empty completion without touching the
+    // engine. OpenAI semantics: `max_tokens=0` means no completion tokens.
+    if params.max_tokens == 0 {
+        let _ = tx.send(GenEvent::Done {
+            reason: FinishReason::Length,
+            prompt_tokens,
+            completion_tokens: 0,
+        });
+        return Ok(());
     }
 
     let mut guard = state.session.blocking_lock();
@@ -121,6 +135,12 @@ fn run(
     let mut completion_tokens: u32 = 0;
 
     let finish = loop {
+        // Budget check first — prevents emitting a token when the caller
+        // asked for `max_tokens == N` and we've already produced N.
+        if completion_tokens as usize >= params.max_tokens {
+            break FinishReason::Length;
+        }
+
         if state.eos_ids.contains(&next_token) {
             break FinishReason::Stop;
         }
@@ -145,10 +165,6 @@ fn run(
 
         if matches_stop(&prev_decoded, &params.stop) {
             break FinishReason::Stop;
-        }
-
-        if completion_tokens as usize >= params.max_tokens {
-            break FinishReason::Length;
         }
 
         let pos = prompt_ids.len() + emitted_ids.len() - 1;

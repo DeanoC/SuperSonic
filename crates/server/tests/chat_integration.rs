@@ -446,6 +446,21 @@ async fn test_empty_messages_error(h: &Harness) {
     eprintln!("[scenario] empty messages → OK (400 invalid_request_error)");
 }
 
+async fn test_max_tokens_zero(h: &Harness) {
+    // max_tokens=0 must produce an empty completion without invoking the
+    // engine loop. finish_reason=length, completion_tokens=0.
+    let body = json!({"prompt": "Hello", "max_tokens": 0, "temperature": 0});
+    let resp: Value = h.client.post(format!("{}/v1/completions", h.base))
+        .json(&body).send().await.expect("POST zero").json().await.expect("json");
+    let text = resp["choices"][0]["text"].as_str().expect("text");
+    assert_eq!(text, "", "max_tokens=0 must return empty text, got {text:?}");
+    let finish = resp["choices"][0]["finish_reason"].as_str().expect("finish");
+    assert_eq!(finish, "length");
+    let ct = resp["usage"]["completion_tokens"].as_u64().expect("ct");
+    assert_eq!(ct, 0, "completion_tokens must be 0");
+    eprintln!("[scenario] max_tokens=0 → OK");
+}
+
 async fn test_context_overflow_error(h: &Harness) {
     let body = json!({"prompt": "x", "max_tokens": 999_999});
     let resp = h.client.post(format!("{}/v1/completions", h.base))
@@ -494,6 +509,7 @@ async fn comprehensive_chat_suite() {
     test_seed_determinism(&h).await;
     test_stop_sequence(&h).await;
     test_concurrent_requests(&h).await;
+    test_max_tokens_zero(&h).await;
     test_context_overflow_error(&h).await;
 
     eprintln!(
