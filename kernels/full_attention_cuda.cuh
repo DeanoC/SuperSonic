@@ -3424,6 +3424,21 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         q_head[d] = q_head[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
                     }
                     __syncthreads();
+                    const int half_rot = rotary_dim / 2;
+                    const size_t cos_off = static_cast<size_t>(seqlen_offset) * half_rot;
+                    if (cos_table != nullptr && rotary_dim > 0 && tid < half_rot) {
+                            float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
+                            float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
+                            float x0 = q_head[tid];
+                            float x1 = q_head[half_rot + tid];
+                            q_head[tid] = x0 * c - x1 * s;
+                            q_head[half_rot + tid] = x0 * s + x1 * c;
+                    }
+                    __syncthreads();
+                    for (int d = tid; d < hd; d += bs) {
+                        saved_gate[qh * hd + d] = q_f32[qh * hd * 2 + hd + d];
+                    }
+                    __syncthreads();
                 }
 
                 if (blockIdx.x < nkv) {
@@ -3438,45 +3453,19 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         k_head[d] = k_head[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
                     }
                     __syncthreads();
-                }
-                grid_barrier(barrier_counter, barrier_flag, nb);
 
-                if (cos_table != nullptr && rotary_dim > 0) {
                     const int half_rot = rotary_dim / 2;
                     const size_t cos_off = static_cast<size_t>(seqlen_offset) * half_rot;
-
-                    if (blockIdx.x < nh) {
-                        const int qh = blockIdx.x;
-                        float* q_head = q_f32 + qh * hd * 2;
-                        if (tid < half_rot) {
-                            float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
-                            float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
-                            float x0 = q_head[tid];
-                            float x1 = q_head[half_rot + tid];
-                            q_head[tid] = x0 * c - x1 * s;
-                            q_head[half_rot + tid] = x0 * s + x1 * c;
-                        }
-                        __syncthreads();
+                    if (cos_table != nullptr && rotary_dim > 0 && tid < half_rot) {
+                        float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
+                        float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
+                        float x0 = k_head[tid];
+                        float x1 = k_head[half_rot + tid];
+                        k_head[tid] = x0 * c - x1 * s;
+                        k_head[half_rot + tid] = x0 * s + x1 * c;
                     }
+                    __syncthreads();
 
-                    if (blockIdx.x < nkv) {
-                        const int kh_idx = blockIdx.x;
-                        float* k_head = k_f32 + kh_idx * hd;
-                        if (tid < half_rot) {
-                            float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
-                            float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
-                            float x0 = k_head[tid];
-                            float x1 = k_head[half_rot + tid];
-                            k_head[tid] = x0 * c - x1 * s;
-                            k_head[half_rot + tid] = x0 * s + x1 * c;
-                        }
-                        __syncthreads();
-                    }
-                }
-                grid_barrier(barrier_counter, barrier_flag, nb);
-
-                if (blockIdx.x < nkv) {
-                    const int kh_idx = blockIdx.x;
                     T* cache_k = static_cast<T*>(L.kv_cache_k);
                     T* cache_v = static_cast<T*>(L.kv_cache_v);
                     for (int d = tid; d < hd; d += bs) {
@@ -3485,14 +3474,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             static_cast<size_t>(seqlen_offset) * hd + d;
                         cache_k[offset] = dotcache_qwen35_from_float<T>(k_f32[kh_idx * hd + d]);
                         cache_v[offset] = dotcache_qwen35_from_float<T>(v_f32[kh_idx * hd + d]);
-                    }
-                    __syncthreads();
-                }
-
-                if (blockIdx.x < nh) {
-                    const int qh = blockIdx.x;
-                    for (int d = tid; d < hd; d += bs) {
-                        saved_gate[qh * hd + d] = q_f32[qh * hd * 2 + hd + d];
                     }
                     __syncthreads();
                 }
@@ -3555,12 +3536,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         proj_buf[qh * hd + d0] = my_acc0 * inv_sum;
                         proj_buf[qh * hd + d0 + 1] = my_acc1 * inv_sum;
                     }
-                    __syncthreads();
-                }
-                grid_barrier(barrier_counter, barrier_flag, nb);
-
-                if (blockIdx.x < nh) {
-                    const int qh = blockIdx.x;
                     for (int d = tid; d < hd; d += bs) {
                         float gate_val = saved_gate[qh * hd + d];
                         float sigmoid_gate = 1.0f / (1.0f + expf(-gate_val));
