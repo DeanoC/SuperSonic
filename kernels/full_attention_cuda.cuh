@@ -3857,14 +3857,21 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
-                if (blockIdx.x < nv) {
-                    const int h = blockIdx.x;
+                const int linear_head_slices =
+                    (nb >= nv * 4) ? 4 : ((nb >= nv * 2) ? 2 : 1);
+
+                if (blockIdx.x < nv * linear_head_slices) {
+                    const int h = blockIdx.x / linear_head_slices;
+                    const int slice = blockIdx.x % linear_head_slices;
                     float* conv_out = gate_up;
                     float* sh = static_cast<float*>(L.recurrent_state) + h * hkd * hvd;
                     const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
                     const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
-                    const int v = tid & (hvd - 1);
-                    const int part = tid / hvd;
+                    const int v_chunk = hvd / linear_head_slices;
+                    const int v_local = tid % v_chunk;
+                    const int v = slice * v_chunk + v_local;
+                    const int part = tid / v_chunk;
+                    const int part_count = bs / v_chunk;
 
                     const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
                     float decay = 1.0f;
@@ -3874,42 +3881,46 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                     }
 
-                    if (v < hvd) {
-                        for (int k = part; k < hkd; k += 2) {
-                            sh[k * hvd + v] *= decay;
-                        }
+                    for (int k = part; k < hkd; k += part_count) {
+                        sh[k * hvd + v] *= decay;
+                    }
 
-                        float kv_mem_v = 0.0f;
-                        for (int k = part; k < hkd; k += 2) {
-                            kv_mem_v += sh[k * hvd + v] *
-                                        conv_out[k_key_offset + h * hkd + k];
+                    float kv_mem_v = 0.0f;
+                    for (int k = part; k < hkd; k += part_count) {
+                        kv_mem_v += sh[k * hvd + v] *
+                                    conv_out[k_key_offset + h * hkd + k];
+                    }
+                    lds[tid] = kv_mem_v;
+                    __syncthreads();
+                    if (tid < v_chunk) {
+                        float kv_mem_total = lds[tid];
+                        for (int off = v_chunk; off < bs; off += v_chunk) {
+                            kv_mem_total += lds[tid + off];
                         }
-                        lds[tid] = kv_mem_v;
-                        __syncthreads();
-                        if (tid < hvd) {
-                            kv_mem_v += lds[tid + hvd];
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            lds[tid] = (val - kv_mem_v) * beta;
-                        }
-                        __syncthreads();
-                        const float delta = lds[v];
+                        const float val = conv_out[v_val_offset + h * hvd + v];
+                        lds[tid] = (val - kv_mem_total) * beta;
+                    }
+                    __syncthreads();
+                    const float delta = lds[v_local];
 
-                        for (int k = part; k < hkd; k += 2) {
-                            sh[k * hvd + v] +=
-                                conv_out[k_key_offset + h * hkd + k] * delta;
-                        }
+                    for (int k = part; k < hkd; k += part_count) {
+                        sh[k * hvd + v] +=
+                            conv_out[k_key_offset + h * hkd + k] * delta;
+                    }
 
-                        float out_v = 0.0f;
-                        for (int k = part; k < hkd; k += 2) {
-                            out_v += sh[k * hvd + v] *
-                                     conv_out[q_key_offset + h * hkd + k];
+                    float out_v = 0.0f;
+                    for (int k = part; k < hkd; k += part_count) {
+                        out_v += sh[k * hvd + v] *
+                                 conv_out[q_key_offset + h * hkd + k];
+                    }
+                    lds[tid] = out_v;
+                    __syncthreads();
+                    if (tid < v_chunk) {
+                        float out_total = lds[tid];
+                        for (int off = v_chunk; off < bs; off += v_chunk) {
+                            out_total += lds[tid + off];
                         }
-                        lds[tid] = out_v;
-                        __syncthreads();
-                        if (tid < hvd) {
-                            out_v += lds[tid + hvd];
-                            attn_scratch[h * hvd + v] = out_v;
-                        }
+                        attn_scratch[h * hvd + v] = out_total;
                     }
                     __syncthreads();
                 }
