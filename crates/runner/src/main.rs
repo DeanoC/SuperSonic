@@ -492,10 +492,22 @@ fn main() -> Result<()> {
         return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
     }
 
-    let params = match &entry.params {
-        FamilyParams::Qwen35(p) => p,
+    let mut params = match &entry.params {
+        FamilyParams::Qwen35(p) => *p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
     };
+
+    // INT4 decode only lives in full_attention_4b.hip; the 0.8B-native kernel
+    // (full_attention.hip) has no INT4 megakernel support. Route 0.8B through
+    // the 4B kernel when --int4 is set. Scratch sizes match 2B already.
+    if cli.int4 && !params.use_4b_kernel && backend == Backend::Hip {
+        eprintln!(
+            "[int4] {} routing through 4B kernel (full_attention_4b.hip) for INT4 decode",
+            model_variant
+        );
+        params.use_4b_kernel = true;
+    }
+    let params = &params;
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
         anyhow::bail!("--trace-kv-fp8-cache requires --kv-fp8");

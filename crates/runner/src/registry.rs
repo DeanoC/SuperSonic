@@ -106,6 +106,7 @@ impl fmt::Display for GpuArch {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Qwen35KernelParams {
     pub proj_buf_floats: usize,
     pub attn_scratch_floats: usize,
