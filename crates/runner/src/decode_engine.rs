@@ -160,6 +160,8 @@ pub struct FullAttentionLayerOutputTrace {
 }
 
 impl DecodeEngine {
+    // Rebuild the BF16 sidecar from the current prefix cache when a KV-FP8 state
+    // grows after prefill or is cloned for batched decode.
     fn load_kv_shadow_for_state_static(
         config: &TextConfig,
         ordinal: usize,
@@ -338,55 +340,6 @@ impl DecodeEngine {
     ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         let state = self.state_for_batch(batch_index);
         self.assemble_full_attention_prefix_cache_bf16_host_for_state(state, layer_idx)
-    }
-
-    pub fn full_attention_shadow_prefix_bf16_host(
-        &self,
-        layer_idx: usize,
-        batch_index: usize,
-    ) -> Result<(Vec<u8>, Vec<u8>, usize, usize)> {
-        let config = &self.weights.config;
-        let state = self.state_for_batch(batch_index);
-        let ls = state
-            .layers
-            .get(layer_idx)
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?;
-        let prefix_len = ls.kv_filled;
-        let shadow_start = ls.kv_shadow_start;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
-        let mut out_k = vec![0u8; num_kv_heads * prefix_len * head_dim * elem_bytes];
-        let mut out_v = vec![0u8; num_kv_heads * prefix_len * head_dim * elem_bytes];
-        if prefix_len == 0 || ls.kv_shadow_k.is_none() || ls.kv_shadow_v.is_none() {
-            return Ok((out_k, out_v, prefix_len, shadow_start));
-        }
-
-        let shadow_k = ls
-            .kv_shadow_k
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K shadow"))?;
-        let shadow_v = ls
-            .kv_shadow_v
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V shadow"))?;
-        let cap = shadow_k.shape()[2];
-        let k_bytes = shadow_k
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow K D2H: {e}"))?;
-        let v_bytes = shadow_v
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V D2H: {e}"))?;
-        let src_head_stride = cap * head_dim * elem_bytes;
-        let dst_head_stride = prefix_len * head_dim * elem_bytes;
-        let copy_bytes = prefix_len * head_dim * elem_bytes;
-        for h in 0..num_kv_heads {
-            let src = h * src_head_stride;
-            let dst = h * dst_head_stride;
-            out_k[dst..dst + copy_bytes].copy_from_slice(&k_bytes[src..src + copy_bytes]);
-            out_v[dst..dst + copy_bytes].copy_from_slice(&v_bytes[src..src + copy_bytes]);
-        }
-        Ok((out_k, out_v, prefix_len, shadow_start))
     }
 
     pub fn trace_full_attention_stages_from_hidden(

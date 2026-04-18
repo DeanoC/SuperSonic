@@ -604,8 +604,8 @@ pub fn convert_kv_caches_to_fp8(
             continue;
         }
 
-        // Source: BF16 cache [1, nkv, cap, hd]. Preserve it as an exact BF16
-        // shadow for decode, and quantize from a contiguous assembled view.
+        // Source: BF16 cache [1, nkv, cap, hd]. Preserve it as the exact BF16
+        // sidecar used by KV-FP8 decode, and quantize from a contiguous view.
         let bf16_k = ls.kv_cache_k.take().unwrap();
         let bf16_v = ls.kv_cache_v.take().unwrap();
         let cap = bf16_k.shape()[2];

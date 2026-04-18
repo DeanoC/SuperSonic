@@ -13,7 +13,8 @@ pub struct LayerState {
     // FP8 KV cache scales (per-head-per-position absmax)
     pub kv_scale_k: Option<GpuBuffer>,
     pub kv_scale_v: Option<GpuBuffer>,
-    // BF16 shadow for decode-appended tokens when KV-FP8 is enabled.
+    // BF16 sidecar cache used by the 4B KV-FP8 decode path for parity-sensitive
+    // reads and debug tracing.
     pub kv_shadow_k: Option<GpuBuffer>,
     pub kv_shadow_v: Option<GpuBuffer>,
     pub kv_shadow_start: usize,

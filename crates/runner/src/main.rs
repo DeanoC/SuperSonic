@@ -1644,21 +1644,6 @@ fn trace_persistent_full_attn_layer(
         true,
         None,
     )?;
-    let mut replay_prefix_fp8_state = ModelState::new(&text_config, ordinal)
-        .map_err(|e| anyhow::anyhow!("persistent full-attn replay prefix fp8 state init: {e}"))?;
-    let _ = prefill_engine::prefill(
-        engine.weights(),
-        &mut replay_prefix_fp8_state,
-        engine.rotary(),
-        prefix_ids,
-        ordinal,
-        kv_chunk_size,
-        prefill_chunk_size,
-        true,
-        use_4b_kernel,
-        true,
-        None,
-    )?;
     let mut replay_state = ModelState::new(&text_config, ordinal)
         .map_err(|e| anyhow::anyhow!("persistent full-attn replay state init: {e}"))?;
     let replay = prefill_engine::prefill(
@@ -1670,21 +1655,6 @@ fn trace_persistent_full_attn_layer(
         kv_chunk_size,
         prefill_chunk_size,
         false,
-        use_4b_kernel,
-        true,
-        None,
-    )?;
-    let mut replay_fp8_state = ModelState::new(&text_config, ordinal)
-        .map_err(|e| anyhow::anyhow!("persistent full-attn replay fp8 state init: {e}"))?;
-    let replay_fp8 = prefill_engine::prefill(
-        engine.weights(),
-        &mut replay_fp8_state,
-        engine.rotary(),
-        token_ids,
-        ordinal,
-        kv_chunk_size,
-        prefill_chunk_size,
-        true,
         use_4b_kernel,
         true,
         None,
@@ -1702,13 +1672,6 @@ fn trace_persistent_full_attn_layer(
         &native_hidden,
         seqlen_offset,
     )?;
-    let replay_fp8_cache_component_layer =
-        engine.trace_full_attention_layer_output_from_hidden_state(
-            &replay_prefix_fp8_state,
-            trace_layer,
-            &native_hidden,
-            seqlen_offset,
-        )?;
 
     engine.rebuild_prefill_state(prefix_ids, true)?;
     let _ = engine.decode_step_batch(trace_tokens, seqlen_offset)?;
@@ -1720,12 +1683,6 @@ fn trace_persistent_full_attn_layer(
         .and_then(|layers| layers.get(trace_layer))
         .ok_or_else(|| anyhow::anyhow!("missing replay attn trace for layer {trace_layer}"))?;
     let replay_attn_hidden_f32 = decode_bf16_le(replay_attn_hidden);
-    let replay_fp8_attn_hidden = replay_fp8
-        .layer_attn_trace
-        .as_ref()
-        .and_then(|layers| layers.get(trace_layer))
-        .ok_or_else(|| anyhow::anyhow!("missing replay fp8 attn trace for layer {trace_layer}"))?;
-    let replay_fp8_attn_hidden_f32 = decode_bf16_le(replay_fp8_attn_hidden);
     let native_normed_f32 = decode_bf16_le(&native_component.normed);
     let replay_normed_f32 = decode_bf16_le(&replay_component.normed);
     let native_q_proj_f32 = decode_bf16_le(&native_component.q_proj);
@@ -1797,8 +1754,6 @@ fn trace_persistent_full_attn_layer(
     let native_token_mixer_f32 = decode_f32_le(&native_token_mixer);
     let native_comp_token_mixer_f32 = decode_bf16_le(&native_component_layer.attn_hidden);
     let replay_cache_token_mixer_f32 = decode_bf16_le(&replay_cache_component_layer.attn_hidden);
-    let replay_fp8_cache_token_mixer_f32 =
-        decode_bf16_le(&replay_fp8_cache_component_layer.attn_hidden);
     let mut kv_vs_bf16_pre_gate = None;
     let mut kv_vs_bf16_gated = None;
     let mut kv_vs_bf16_attn_hidden = None;
@@ -1809,25 +1764,9 @@ fn trace_persistent_full_attn_layer(
     let mut kv_vs_bf16_saved_gate = None;
     let mut kv_vs_bf16_cache_k = None;
     let mut kv_vs_bf16_cache_v = None;
-    let mut shadow_vs_prefix_k = None;
-    let mut shadow_vs_prefix_v = None;
-    let mut shadow_vs_bf16_cache_k = None;
-    let mut shadow_vs_bf16_cache_v = None;
-    let mut shadow_start = None;
     if engine.kv_fp8_enabled() {
         let (native_cache_k_bf16, native_cache_v_bf16, _) =
             engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
-        let (shadow_k_bf16, shadow_v_bf16, _, trace_shadow_start) =
-            engine.full_attention_shadow_prefix_bf16_host(trace_layer, 0)?;
-        shadow_vs_prefix_k = Some(validate::max_abs_delta(
-            &decode_bf16_le(&shadow_k_bf16),
-            &decode_bf16_le(&native_cache_k_bf16),
-        ));
-        shadow_vs_prefix_v = Some(validate::max_abs_delta(
-            &decode_bf16_le(&shadow_v_bf16),
-            &decode_bf16_le(&native_cache_v_bf16),
-        ));
-        shadow_start = Some(trace_shadow_start as i64);
         engine.set_kv_fp8_for_trace(false);
         engine.rebuild_prefill_state(prefix_ids, true)?;
         let (bf16_cache_k_bf16, bf16_cache_v_bf16, _) =
@@ -1870,14 +1809,6 @@ fn trace_persistent_full_attn_layer(
         ));
         kv_vs_bf16_cache_v = Some(validate::max_abs_delta(
             &decode_bf16_le(&native_cache_v_bf16),
-            &decode_bf16_le(&bf16_cache_v_bf16),
-        ));
-        shadow_vs_bf16_cache_k = Some(validate::max_abs_delta(
-            &decode_bf16_le(&shadow_k_bf16),
-            &decode_bf16_le(&bf16_cache_k_bf16),
-        ));
-        shadow_vs_bf16_cache_v = Some(validate::max_abs_delta(
-            &decode_bf16_le(&shadow_v_bf16),
             &decode_bf16_le(&bf16_cache_v_bf16),
         ));
         let score_cols = seqlen_offset + 1;
@@ -1989,16 +1920,10 @@ fn trace_persistent_full_attn_layer(
     };
     let native_vs_replay_attn_hidden =
         validate::max_abs_delta(&native_token_mixer_f32, &replay_attn_hidden_f32);
-    let native_vs_replay_fp8_attn_hidden =
-        validate::max_abs_delta(&native_token_mixer_f32, &replay_fp8_attn_hidden_f32);
     let native_cache_vs_replay_cache_attn_hidden =
         validate::max_abs_delta(&native_comp_token_mixer_f32, &replay_cache_token_mixer_f32);
-    let native_cache_vs_replay_fp8_cache_attn_hidden =
-        validate::max_abs_delta(&native_comp_token_mixer_f32, &replay_fp8_cache_token_mixer_f32);
     let component_vs_replay_attn_hidden =
         validate::max_abs_delta(&native_comp_token_mixer_f32, &replay_attn_hidden_f32);
-    let component_vs_replay_fp8_attn_hidden =
-        validate::max_abs_delta(&native_comp_token_mixer_f32, &replay_fp8_attn_hidden_f32);
 
     if let (Some(scale_k), Some(scale_v), Some(k_cache), Some(_v_cache)) = (
         native_layer.kv_scale_k.as_ref(),
@@ -2200,17 +2125,12 @@ fn trace_persistent_full_attn_layer(
         let kv_vs_bf16_saved_gate = kv_vs_bf16_saved_gate.unwrap_or(0.0);
         let kv_vs_bf16_cache_k = kv_vs_bf16_cache_k.unwrap_or(0.0);
         let kv_vs_bf16_cache_v = kv_vs_bf16_cache_v.unwrap_or(0.0);
-        let shadow_vs_prefix_k = shadow_vs_prefix_k.unwrap_or(0.0);
-        let shadow_vs_prefix_v = shadow_vs_prefix_v.unwrap_or(0.0);
-        let shadow_vs_bf16_cache_k = shadow_vs_bf16_cache_k.unwrap_or(0.0);
-        let shadow_vs_bf16_cache_v = shadow_vs_bf16_cache_v.unwrap_or(0.0);
-        let shadow_start = shadow_start.unwrap_or(-2);
         let kv_vs_bf16_scores_heads_str = kv_vs_bf16_scores_heads
             .as_ref()
             .map(|vals| vals.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","))
             .unwrap_or_default();
         eprintln!(
-            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_vs_host_pre_gate={native_vs_host_pre_gate:.6} kv_vs_bf16_hidden={kv_vs_bf16_hidden:.6} kv_vs_bf16_cache_k={kv_vs_bf16_cache_k:.6} kv_vs_bf16_cache_v={kv_vs_bf16_cache_v:.6} shadow_start={shadow_start} shadow_vs_prefix_k={shadow_vs_prefix_k:.6} shadow_vs_prefix_v={shadow_vs_prefix_v:.6} shadow_vs_bf16_cache_k={shadow_vs_bf16_cache_k:.6} shadow_vs_bf16_cache_v={shadow_vs_bf16_cache_v:.6} kv_vs_bf16_q={kv_vs_bf16_q:.6} kv_vs_bf16_saved_gate={kv_vs_bf16_saved_gate:.6} kv_vs_bf16_scores={kv_vs_bf16_scores:.6} kv_vs_bf16_scores_heads=[{kv_vs_bf16_scores_heads_str}] kv_vs_bf16_pre_gate={kv_vs_bf16_pre_gate:.6} per_head_host_pre_gate=[{per_head_host_pre_gate_str}] native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_host_gated={native_vs_host_gated:.6} kv_vs_bf16_gated={kv_vs_bf16_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} kv_vs_bf16_attn_hidden={kv_vs_bf16_attn_hidden:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_vs_replay_fp8_attn_hidden={native_vs_replay_fp8_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} native_cache_vs_replay_fp8_cache_attn_hidden={native_cache_vs_replay_fp8_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} component_vs_replay_fp8_attn_hidden={component_vs_replay_fp8_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_quant_k_mismatches={cache_vs_quant_k} cache_vs_quant_v_mismatches={cache_vs_quant_v} cache_vs_quant_k_scale_delta={scale_vs_quant_k:.6} cache_vs_quant_v_scale_delta={scale_vs_quant_v:.6}"
+            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_vs_host_pre_gate={native_vs_host_pre_gate:.6} kv_vs_bf16_hidden={kv_vs_bf16_hidden:.6} kv_vs_bf16_cache_k={kv_vs_bf16_cache_k:.6} kv_vs_bf16_cache_v={kv_vs_bf16_cache_v:.6} kv_vs_bf16_q={kv_vs_bf16_q:.6} kv_vs_bf16_saved_gate={kv_vs_bf16_saved_gate:.6} kv_vs_bf16_scores={kv_vs_bf16_scores:.6} kv_vs_bf16_scores_heads=[{kv_vs_bf16_scores_heads_str}] kv_vs_bf16_pre_gate={kv_vs_bf16_pre_gate:.6} per_head_host_pre_gate=[{per_head_host_pre_gate_str}] native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_host_gated={native_vs_host_gated:.6} kv_vs_bf16_gated={kv_vs_bf16_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} kv_vs_bf16_attn_hidden={kv_vs_bf16_attn_hidden:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_quant_k_mismatches={cache_vs_quant_k} cache_vs_quant_v_mismatches={cache_vs_quant_v} cache_vs_quant_k_scale_delta={scale_vs_quant_k:.6} cache_vs_quant_v_scale_delta={scale_vs_quant_v:.6}"
         );
     } else {
         let native_cache = engine.full_attention_cache_step_bytes(trace_layer, 0, seqlen_offset)?;
@@ -2221,7 +2141,7 @@ fn trace_persistent_full_attn_layer(
         let cache_vs_replay_k = validate::max_abs_delta(&native_cache_k_f32, &replay_comp_k_f32);
         let cache_vs_replay_v = validate::max_abs_delta(&native_cache_v_f32, &replay_comp_v_f32);
         eprintln!(
-            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_vs_replay_fp8_attn_hidden={native_vs_replay_fp8_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} native_cache_vs_replay_fp8_cache_attn_hidden={native_cache_vs_replay_fp8_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} component_vs_replay_fp8_attn_hidden={component_vs_replay_fp8_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_component_k={cache_vs_component_k:.6} cache_vs_component_v={cache_vs_component_v:.6} cache_vs_replay_k={cache_vs_replay_k:.6} cache_vs_replay_v={cache_vs_replay_v:.6}"
+            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_component_k={cache_vs_component_k:.6} cache_vs_component_v={cache_vs_component_v:.6} cache_vs_replay_k={cache_vs_replay_k:.6} cache_vs_replay_v={cache_vs_replay_v:.6}"
         );
     }
     Ok(())

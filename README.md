@@ -7,7 +7,7 @@ Currently supports:
 - Qwen3.5-0.8B and Qwen3.5-4B on AMD `gfx1150` (RDNA 3.5) via HIP
 - Qwen3.5-0.8B and Qwen3.5-4B on NVIDIA `sm86` (RTX 3090-class) via CUDA
 
-CUDA v1 is BF16-only. `--int4`, `--fp8-runtime`, and `--kv-fp8` remain HIP-only for now.
+CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` remain unsupported on CUDA. A hidden unstable CUDA `--kv-fp8` debug path exists for targeted validation work on `qwen3.5-4b`, but it is not part of the public supported surface.
 
 ## Supported Matrix
 
@@ -22,12 +22,19 @@ CUDA support is currently a narrow v1 surface:
 - BF16 decode path only
 - validated on NVIDIA `sm86` hardware (RTX 3090-class)
 - validated for both baked weights and direct `--no-bake` safetensors loads
+- hidden unstable CUDA `--kv-fp8` debug coverage currently exists only for `qwen3.5-4b` on `sm86`
 
 CUDA v1 does not currently support:
 
 - `--int4`
 - `--fp8-runtime`
-- `--kv-fp8`
+
+CUDA KV-FP8 is currently a debug-only surface:
+
+- hidden behind `--allow-unstable-cuda-kv-fp8`
+- validated only on `qwen3.5-4b` / `sm86`
+- exercised on the real persistent kernel path with `--force-kernel-decode`
+- checked against the CPU oracle, not presented as a general CUDA v1 feature
 
 CUDA batched decode is currently validated only for:
 
@@ -108,6 +115,20 @@ The long-context scripts use the CPU oracle on this box, because that is the sta
 for longer `4B` prompts today.
 `tests/sm86/run_long.sh` and `tests/sm86/run_4b_long.sh` add explicit long-context coverage
 against the CPU oracle using focused long-only golden corpora.
+
+The hidden CUDA KV-FP8 debug surface is validated separately with commands like:
+
+```bash
+target/release/supersonic --backend cuda --oracle-device cpu \
+  --model qwen3.5-4b --model-dir /path/to/Qwen3.5-4B \
+  --prompt '中国的首都是' --max-new-tokens 8 \
+  --batch-size 2 --kv-fp8 --allow-unstable-cuda-kv-fp8 --force-kernel-decode --validate
+
+CORPUS_TIMEOUT=1200 tests/corpus/run_golden.sh \
+  qwen3.5-4b /path/to/Qwen3.5-4B tests/corpus/golden_4b_batch2.json \
+  target/release/supersonic --backend cuda --oracle-device cpu \
+  --batch-size 2 --kv-fp8 --allow-unstable-cuda-kv-fp8 --force-kernel-decode
+```
 
 ### Benchmark baseline
 
