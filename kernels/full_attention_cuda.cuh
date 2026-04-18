@@ -160,6 +160,45 @@ __device__ inline float dotcache_qwen35_dot_row(
     return dot;
 }
 
+template <typename T>
+__device__ inline float dotcache_qwen35_dot_row_input_f32_hero(
+    const T* lhs,
+    const float* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    for (int idx = tid * 2; idx < size; idx += bs * 2) {
+        dot += dotcache_qwen35_to_float(lhs[idx]) * rhs[idx];
+        if (idx + 1 < size) {
+            dot += dotcache_qwen35_to_float(lhs[idx + 1]) * rhs[idx + 1];
+        }
+    }
+    return dot;
+}
+
+template <>
+__device__ inline float dotcache_qwen35_dot_row_input_f32_hero<hip_bfloat16>(
+    const hip_bfloat16* lhs,
+    const float* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    for (int idx = tid * 2; idx + 1 < size; idx += bs * 2) {
+        const __nv_bfloat162 packed =
+            *reinterpret_cast<const __nv_bfloat162*>(lhs + idx);
+        const float2 w = __bfloat1622float2(packed);
+        dot += w.x * rhs[idx] + w.y * rhs[idx + 1];
+    }
+    if ((size & 1) != 0 && tid == 0) {
+        dot += dotcache_qwen35_to_float(lhs[size - 1]) * rhs[size - 1];
+    }
+    return dot;
+}
+
 template <>
 __device__ inline float dotcache_qwen35_dot_row<__half>(
     const __half* lhs,
@@ -3645,10 +3684,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (qwen08_attn_hero) {
                     for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
                         const T* wr = ow + static_cast<size_t>(sr) * attn_size;
-                        float p = 0.0f;
-                        for (int c = tid; c < attn_size; c += bs) {
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        }
+                        float p = dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, attn_size);
                         const float sum = dotcache_qwen35_block_sum_256(p, lds);
                         if (tid == 0) hidden_f32[sr] += sum;
                         __syncthreads();
@@ -4174,10 +4210,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (qwen08_linear_hero) {
                     for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
                         const T* wr = ow + static_cast<size_t>(sr) * vd;
-                        float p = 0.0f;
-                        for (int c = tid; c < vd; c += bs) {
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        }
+                        float p = dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, vd);
                         const float sum = dotcache_qwen35_block_sum_256(p, lds);
                         if (tid == 0) hidden_f32[sr] += sum;
                         __syncthreads();
@@ -4304,9 +4337,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             if (qwen08_hero) {
                 for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
                     const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
-                    float p = 0.0f;
-                    for (int c = tid; c < L.intermediate_size; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    float p =
+                        dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, L.intermediate_size);
                     const float sum = dotcache_qwen35_block_sum_256(p, lds);
                     if (tid == 0) hidden_f32[sr] += sum;
                     __syncthreads();
