@@ -152,6 +152,24 @@ fn run(
         // tail. Works around BPE tokens that only produce a character when
         // combined with following tokens.
         let decoded = detokenize(&tokenizer, &emitted_ids);
+
+        // Stop-string detection must happen *before* we emit the delta —
+        // otherwise the client sees the stop sequence (and any text that
+        // followed it inside the same merged delta) even though we'll
+        // report `finish_reason=stop`. Trim the delta at the first stop
+        // occurrence in the cumulative output, emit the trimmed portion,
+        // and break.
+        if let Some(stop_at) = find_earliest_stop(&decoded, &params.stop) {
+            let delta = decoded[..stop_at]
+                .strip_prefix(prev_decoded.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !delta.is_empty() {
+                let _ = tx.send(GenEvent::Token(delta));
+            }
+            break FinishReason::Stop;
+        }
+
         let delta = decoded
             .strip_prefix(prev_decoded.as_str())
             .unwrap_or(&decoded[prev_decoded.len().min(decoded.len())..])
@@ -160,10 +178,6 @@ fn run(
 
         if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
             // Receiver dropped — client disconnected. Bail out.
-            break FinishReason::Stop;
-        }
-
-        if matches_stop(&prev_decoded, &params.stop) {
             break FinishReason::Stop;
         }
 
@@ -189,8 +203,19 @@ fn detokenize(tokenizer: &Tokenizer, ids: &[u32]) -> String {
     tokenizer.decode(ids, true).unwrap_or_default()
 }
 
-fn matches_stop(text: &str, stops: &[String]) -> bool {
-    stops.iter().any(|s| !s.is_empty() && text.contains(s))
+/// Return the lowest byte offset at which any non-empty stop string first
+/// occurs in `text`, or `None` if none match. Note that BPE tokens can
+/// straddle a stop string — e.g. stop="Hello" with tokens ["Hel","lo"]
+/// produces a delta of "Hel" that cannot be retracted after the fact.
+/// This function only detects stops that fall entirely inside the
+/// cumulative decoded output; streaming callers will still see at most a
+/// single-token overshoot in that straddling case.
+fn find_earliest_stop(text: &str, stops: &[String]) -> Option<usize> {
+    stops
+        .iter()
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| text.find(s.as_str()))
+        .min()
 }
 
 /// Drain the full event stream and return the concatenated text plus the

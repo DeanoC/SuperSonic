@@ -303,7 +303,20 @@ fn build_qwen(
             variant_bake,
             model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
         );
-        let downloaded = try_download_bake(cfg, variant_bake, &bake_dir)?;
+        // Network failures are recoverable when we can bake locally from the
+        // HF safetensors; for INT4 they're fatal (no local calibration path).
+        let downloaded = match try_download_bake(cfg, variant_bake, &bake_dir) {
+            Ok(v) => v,
+            Err(e) if local_bake_ok => {
+                tracing::warn!(
+                    "fetch {} bake failed: {}; falling back to local bake from safetensors",
+                    variant_bake,
+                    e
+                );
+                false
+            }
+            Err(e) => return Err(e),
+        };
         if !downloaded && !local_bake_ok {
             bail!(
                 "no {variant_bake} bake at {} and download unavailable. INT4 calibration \

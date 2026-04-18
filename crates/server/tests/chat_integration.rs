@@ -399,11 +399,14 @@ async fn test_stop_sequence(h: &Harness) {
         .json(&body).send().await.expect("POST stop").json().await.expect("json");
     let text = resp["choices"][0]["text"].as_str().expect("text");
     let finish = resp["choices"][0]["finish_reason"].as_str().expect("finish");
-    // Accept either "stop" (string hit) or "length" (model never emitted it);
-    // but if finish=="stop" the text must indeed contain the stop string.
+    // Accept either "stop" (string hit) or "length" (model never emitted it).
+    // When finish=="stop", the returned text must have the stop string
+    // trimmed out — OpenAI semantics, and the behavior we verify post-P2.
+    // (A one-token overshoot is theoretically possible if a BPE token
+    // straddles the stop string; single-letter 'E' is unlikely to straddle.)
     if finish == "stop" {
-        assert!(text.contains('E'),
-            "finish=stop but text did not contain the stop string 'E': {text:?}");
+        assert!(!text.contains('E'),
+            "finish=stop but returned text still contains the stop string 'E': {text:?}");
     }
     eprintln!("[scenario] stop sequence → OK (finish={}, text={:?})", finish, text);
 }
