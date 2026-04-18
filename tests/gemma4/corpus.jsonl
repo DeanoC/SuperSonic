@@ -1,0 +1,26 @@
+# Gemma 4 E2B correctness corpus — one JSON object per non-comment line.
+# Schema: {"name", "prompt", "max_new_tokens", "expect_error" (opt)}.
+# `gemma4_corpus_test` tokenizes, runs Gemma4Engine prefill + decode_step loop,
+# and asserts exact token-ID match against the oracle's greedy output.
+{"name": "hello_short", "prompt": "Hello", "max_new_tokens": 4}
+{"name": "fox_medium", "prompt": "The quick brown fox jumps", "max_new_tokens": 16}
+{"name": "hello_world", "prompt": "Hello, world", "max_new_tokens": 8}
+{"name": "hi_tiny", "prompt": "Hi", "max_new_tokens": 4}
+{"name": "good_morning", "prompt": "Good morning", "max_new_tokens": 8}
+{"name": "qa_capital_of_france", "prompt": "Q: What is the capital of France?\nA:", "max_new_tokens": 12}
+{"name": "qa_sky_blue", "prompt": "Why is the sky blue?", "max_new_tokens": 12}
+{"name": "chat_user_assistant", "prompt": "User: Hello\nAssistant:", "max_new_tokens": 12}
+{"name": "math_sum", "prompt": "100 + 200 =", "max_new_tokens": 8}
+{"name": "math_words", "prompt": "The sum of 2 and 3 is", "max_new_tokens": 8}
+{"name": "code_python_def", "prompt": "def fibonacci(n):\n    if n <= 1:\n        return n\n    return", "max_new_tokens": 12}
+{"name": "code_for_loop", "prompt": "for i in range(10):", "max_new_tokens": 6}
+{"name": "narrative_once_upon", "prompt": "Once upon a time in a faraway land,", "max_new_tokens": 16}
+{"name": "narrative_year_2050", "prompt": "In the year 2050,", "max_new_tokens": 12}
+{"name": "unicode_japanese", "prompt": "こんにちは", "max_new_tokens": 8}
+{"name": "unicode_chinese", "prompt": "你好", "max_new_tokens": 8}
+{"name": "unicode_emoji", "prompt": "Fire emoji: 🔥", "max_new_tokens": 8}
+{"name": "multilingual_french", "prompt": "Bonjour le monde", "max_new_tokens": 8}
+{"name": "list_items", "prompt": "1. apple\n2. banana\n3.", "max_new_tokens": 8}
+{"name": "long_near_context", "prompt": "The following is a long passage about the history of computing. In the mid-20th century, researchers began exploring electronic machines capable of performing complex calculations at speeds unimaginable with mechanical devices. Early pioneers like Alan Turing, John von Neumann, and Grace Hopper laid the theoretical and practical foundations that would become modern computer science. Transistors replaced vacuum tubes, integrated circuits replaced individual transistors, and microprocessors brought the computer from room-filling mainframe to the desktop. The rise of personal computing in the 1970s and 1980s, the internet revolution of the 1990s, the mobile era of the 2000s, and the current wave of machine learning and large language models each represent a distinct phase. In summary, the defining characteristic of the field has been", "max_new_tokens": 8}
+{"name": "empty_prompt", "prompt": "", "max_new_tokens": 4}
+{"name": "single_space", "prompt": " ", "max_new_tokens": 4}

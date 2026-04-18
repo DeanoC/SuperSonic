@@ -2167,14 +2167,6 @@ impl DecodeEngine {
             None,
         )?;
 
-        if self.kv_fp8 {
-            prefill_engine::convert_kv_caches_to_fp8(
-                &mut self.state,
-                &self.weights.config,
-                self.ordinal,
-            )?;
-        }
-
         self.scratch
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;

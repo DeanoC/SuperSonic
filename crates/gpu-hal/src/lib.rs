@@ -13,6 +13,6 @@ pub use buffer::GpuBuffer;
 pub use error::GpuError;
 pub use ops::{
     alloc, alloc_zeros, copy_d2d, copy_d2h, copy_h2d, memset_zeros, query_device_info,
-    set_device, sync,
+    set_device, sync, GpuEvent,
 };
 pub use scalar_type::ScalarType;

@@ -383,6 +383,137 @@ pub fn sync(ordinal: usize) -> Result<()> {
     })
 }
 
+/// RAII wrapper around a backend timing event.
+///
+/// Timing events are currently implemented only for HIP. On CUDA builds this
+/// returns an explicit error until the matching runtime bindings are added.
+pub struct GpuEvent {
+    backend: Backend,
+    ordinal: usize,
+    raw: *mut c_void,
+}
+
+impl GpuEvent {
+    pub fn new(ordinal: usize) -> Result<Self> {
+        let backend = current_backend();
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        with_device_impl(backend, ordinal, || match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventCreate(&mut raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventCreate", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+        })?;
+        Ok(Self {
+            backend,
+            ordinal,
+            raw,
+        })
+    }
+
+    pub fn record(&self) -> Result<()> {
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventRecord", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+        })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventSynchronize(self.raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventSynchronize", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+        })
+    }
+
+    pub fn elapsed_ms(start: &GpuEvent, end: &GpuEvent) -> Result<f32> {
+        if start.backend != end.backend || start.ordinal != end.ordinal {
+            return Err(GpuError::InvalidArg(
+                "GpuEvent::elapsed_ms requires matching backend/device".into(),
+            ));
+        }
+        match start.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let mut ms: f32 = 0.0;
+                    with_device_impl(start.backend, start.ordinal, || {
+                        let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
+                        if status != 0 {
+                            return Err(hip_error("hipEventElapsedTime", status));
+                        }
+                        Ok(())
+                    })?;
+                    Ok(ms)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+        }
+    }
+}
+
+impl Drop for GpuEvent {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        let _ = with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventDestroy(self.raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventDestroy", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Ok(()),
+        });
+    }
+}
+
 pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo> {
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;

@@ -15,11 +15,52 @@ path = "src/bin/int4_test.rs"
 name = "int4_real_test"
 path = "src/bin/int4_real_test.rs"
 
+[[bin]]
+name = "gemma4_primitive_test"
+path = "src/bin/gemma4_primitive_test.rs"
+
+[[bin]]
+name = "gemma4_layer0_validate"
+path = "src/bin/gemma4_layer0_validate.rs"
+
+[[bin]]
+name = "gemma4_decode_validate"
+path = "src/bin/gemma4_decode_validate.rs"
+
+[[bin]]
+name = "gemma4_e2e_validate"
+path = "src/bin/gemma4_e2e_validate.rs"
+
+[[bin]]
+name = "gemma4_fused_decode_validate"
+path = "src/bin/gemma4_fused_decode_validate.rs"
+
+[[bin]]
+name = "gemma4_mega_decode_validate"
+path = "src/bin/gemma4_mega_decode_validate.rs"
+
+[[bin]]
+name = "gemma4_bench"
+path = "src/bin/gemma4_bench.rs"
+
+[[bin]]
+name = "gemma4_corpus_test"
+path = "src/bin/gemma4_corpus_test.rs"
+
+[[bin]]
+name = "gemma4_int4_matvec_test"
+path = "src/bin/gemma4_int4_matvec_test.rs"
+
+[[bin]]
+name = "gemma4_fused_int4_validate"
+path = "src/bin/gemma4_fused_int4_validate.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }
 qwen35 = { path = "../qwen35" }
+gemma4 = { path = "../gemma4" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -27,3 +68,5 @@ serde_json = "1"
 tokenizers = "0.22"
 base64 = "0.22"
 half = "2.4"
+safetensors = "0.5"
+memmap2 = "0.9"

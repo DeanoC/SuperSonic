@@ -5,6 +5,7 @@ Optimized LLM inference with persistent decode megakernels. Each supported (mode
 Currently supports:
 
 - Qwen3.5-0.8B and Qwen3.5-4B on AMD `gfx1150` (RDNA 3.5) via HIP
+- Gemma 4 E2B and E4B on AMD `gfx1150` (RDNA 3.5) via HIP
 - Qwen3.5-0.8B and Qwen3.5-4B on NVIDIA `sm86` (RTX 3090-class) via CUDA
 
 CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` remain unsupported on CUDA. A hidden unstable CUDA `--kv-fp8` debug path exists for targeted validation work on `qwen3.5-4b`, but it is not part of the public supported surface.
@@ -14,6 +15,7 @@ CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` remain unsupported on CUDA. 
 | Backend | GPU arch | Models | Status |
 | --- | --- | --- | --- |
 | HIP | `gfx1150` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
+| HIP | `gfx1150` | `gemma4-e2b`, `gemma4-e4b` | upstream validated |
 | CUDA | `sm86` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
 
 CUDA support is currently a narrow v1 surface:
@@ -67,6 +69,35 @@ SUPERSONIC_BACKENDS=cuda cargo run --release --bin supersonic -- \
 ```
 
 On first run, SuperSonic bakes the HuggingFace safetensors into an optimized format at `{model_dir}/.supersonic/v1/`. Subsequent runs load from this baked format for faster startup.
+
+If a local bake is missing and one is available in the repo's GitHub releases,
+SuperSonic can download that package instead of rebuilding it locally. Pass
+`--no-download` to disable network fetches. See [docs/bake-distribution.md](docs/bake-distribution.md)
+for the producer workflow and release layout.
+
+## Producing And Publishing Bakes
+
+On a machine with enough VRAM/RAM for GPTQ calibration, `oracle/bake_all.sh`
+can bake and optionally upload every configured model in one pass. Unset model
+directory env vars are skipped, so this is the reference "big producer box"
+command:
+
+```bash
+pip install -r oracle/requirements-upload.txt
+gh auth login
+
+QWEN_0_8B_DIR=/models/Qwen3.5-0.8B \
+QWEN_2B_DIR=/models/Qwen3.5-2B \
+QWEN_4B_DIR=/models/Qwen3.5-4B \
+QWEN_9B_DIR=/models/Qwen3.5-9B \
+GEMMA_E2B_DIR=/models/gemma-4-E2B \
+GEMMA_E4B_DIR=/models/gemma-4-E4B \
+./oracle/bake_all.sh --upload
+```
+
+By default this produces INT4-GPTQ bakes for every configured model. Add
+`--bf16` to also publish Qwen BF16 bakes, `--force` to rebuild, or drop
+`--upload` to keep the output local.
 
 ## CUDA
 
