@@ -1862,11 +1862,7 @@ fn run_gemma4(
     Ok(())
 }
 
-fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
+use decode_engine::decode_f32_le;
 
 fn bf16_residual_sum(lhs_bf16: &[u8], rhs_bf16: &[u8]) -> Vec<f32> {
     lhs_bf16
