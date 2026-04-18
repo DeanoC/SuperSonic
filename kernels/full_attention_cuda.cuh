@@ -3186,6 +3186,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     }
     grid_barrier(barrier_counter, barrier_flag, nb);
 
+    const bool qwen08_hero =
+        hero_mode != 0 &&
+        num_layers == 24 &&
+        hidden_dim == 1024 &&
+        intermediate_size == 3584 &&
+        bs == 256;
+
     for (int layer = 0; layer < num_layers; ++layer) {
         const Qwen35DecodeLayerDesc& L = layers[layer];
 
@@ -3207,42 +3214,71 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // ---- FULL ATTENTION ----
             // Step A: Q/K/V projections via work-stealing
             // Q: [q_out_dim, hidden_dim], K: [k_out_dim, hidden_dim], V: same as K
-            if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
             const int total_proj = L.q_out_dim + L.k_out_dim + L.k_out_dim;
             {
-                for (;;) {
-                    __shared__ unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    if (sr >= static_cast<unsigned int>(total_proj)) break;
+                if (qwen08_hero) {
+                    for (int sr = blockIdx.x; sr < total_proj; sr += nb) {
+                        const T* w;
+                        int row;
+                        if (sr < L.q_out_dim) {
+                            w = static_cast<const T*>(L.q_proj_w);
+                            row = sr;
+                        } else if (sr < L.q_out_dim + L.k_out_dim) {
+                            w = static_cast<const T*>(L.k_proj_w);
+                            row = sr - L.q_out_dim;
+                        } else {
+                            w = static_cast<const T*>(L.v_proj_w);
+                            row = sr - L.q_out_dim - L.k_out_dim;
+                        }
+                        const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
-                    const T* w;
-                    int row;
-                    if (sr < static_cast<unsigned int>(L.q_out_dim)) {
-                        w = static_cast<const T*>(L.q_proj_w);
-                        row = sr;
-                    } else if (sr < static_cast<unsigned int>(L.q_out_dim + L.k_out_dim)) {
-                        w = static_cast<const T*>(L.k_proj_w);
-                        row = sr - L.q_out_dim;
-                    } else {
-                        w = static_cast<const T*>(L.v_proj_w);
-                        row = sr - L.q_out_dim - L.k_out_dim;
-                    }
-                    const T* wr = w + static_cast<size_t>(row) * hidden_dim;
-
-                    float p = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
+                        float p = 0.0f;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[sr] = lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) proj_buf[sr] = lds[0];
-                    __syncthreads();
+                } else {
+                    if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                    grid_barrier(barrier_counter, barrier_flag, nb);
+                    for (;;) {
+                        __shared__ unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        if (sr >= static_cast<unsigned int>(total_proj)) break;
+
+                        const T* w;
+                        int row;
+                        if (sr < static_cast<unsigned int>(L.q_out_dim)) {
+                            w = static_cast<const T*>(L.q_proj_w);
+                            row = sr;
+                        } else if (sr < static_cast<unsigned int>(L.q_out_dim + L.k_out_dim)) {
+                            w = static_cast<const T*>(L.k_proj_w);
+                            row = sr - L.q_out_dim;
+                        } else {
+                            w = static_cast<const T*>(L.v_proj_w);
+                            row = sr - L.q_out_dim - L.k_out_dim;
+                        }
+                        const T* wr = w + static_cast<size_t>(row) * hidden_dim;
+
+                        float p = 0.0f;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[sr] = lds[0];
+                        __syncthreads();
+                    }
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3250,13 +3286,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // Step B-G: QK-norm, RoPE, KV cache, attention, gating, o_proj
             // Block 0 handles the per-head sequential ops.
             // O_proj uses all blocks via work-stealing.
-            const bool qwen08_attn_hero =
-                hero_mode != 0 &&
-                num_layers == 24 &&
-                hidden_dim == 1024 &&
-                intermediate_size == 3584 &&
-                bs == 256 &&
-                nb >= 8;
+            const bool qwen08_attn_hero = qwen08_hero && nb >= 8;
 
             if (qwen08_attn_hero) {
                 float* q_f32 = proj_buf;
@@ -3613,28 +3643,45 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                 const T* ow = static_cast<const T*>(L.o_proj_w);
 
-                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-                grid_barrier(barrier_counter, barrier_flag, nb);
-
-                for (;;) {
-                    __shared__ unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
-
-                    const T* wr = ow + static_cast<size_t>(sr) * attn_size;
-                    float p = 0.0f;
-                    for (int c = tid; c < attn_size; c += bs) {
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs / 2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid + s];
+                if (qwen08_attn_hero) {
+                    for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
+                        const T* wr = ow + static_cast<size_t>(sr) * attn_size;
+                        float p = 0.0f;
+                        for (int c = tid; c < attn_size; c += bs) {
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs / 2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid + s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) hidden_f32[sr] += lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
-                    __syncthreads();
+                } else {
+                    if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                    grid_barrier(barrier_counter, barrier_flag, nb);
+                    for (;;) {
+                        __shared__ unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        const T* wr = ow + static_cast<size_t>(sr) * attn_size;
+                        float p = 0.0f;
+                        for (int c = tid; c < attn_size; c += bs) {
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs / 2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid + s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) hidden_f32[sr] += lds[0];
+                        __syncthreads();
+                    }
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3642,46 +3689,77 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         } else {
             // ---- LINEAR ATTENTION ----
             // Step A: qkv/z/b/a projections via work-stealing
-            if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
             const int total_proj = L.qkv_out_dim + L.z_out_dim + 16 + 16;
             {
-                for (;;) {
-                    __shared__ unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    if (sr >= static_cast<unsigned int>(total_proj)) break;
+                if (qwen08_hero) {
+                    for (int sr = blockIdx.x; sr < total_proj; sr += nb) {
+                        const T* w;
+                        int row;
+                        if (sr < L.qkv_out_dim) {
+                            w = static_cast<const T*>(L.qkv_proj_w);
+                            row = sr;
+                        } else if (sr < L.qkv_out_dim + L.z_out_dim) {
+                            w = static_cast<const T*>(L.z_proj_w);
+                            row = sr - L.qkv_out_dim;
+                        } else if (sr < L.qkv_out_dim + L.z_out_dim + 16) {
+                            w = static_cast<const T*>(L.b_proj_w);
+                            row = sr - L.qkv_out_dim - L.z_out_dim;
+                        } else {
+                            w = static_cast<const T*>(L.a_proj_w);
+                            row = sr - L.qkv_out_dim - L.z_out_dim - 16;
+                        }
+                        const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
-                    const T* w;
-                    int row;
-                    int offset = 0;
-                    if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
-                        w = static_cast<const T*>(L.qkv_proj_w);
-                        row = sr;
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
-                        w = static_cast<const T*>(L.z_proj_w);
-                        row = sr - L.qkv_out_dim;
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + 16)) {
-                        w = static_cast<const T*>(L.b_proj_w);
-                        row = sr - L.qkv_out_dim - L.z_out_dim;
-                    } else {
-                        w = static_cast<const T*>(L.a_proj_w);
-                        row = sr - L.qkv_out_dim - L.z_out_dim - 16;
-                    }
-                    const T* wr = w + static_cast<size_t>(row) * hidden_dim;
-
-                    float p = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
+                        float p = 0.0f;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[sr] = lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) proj_buf[sr] = lds[0];
-                    __syncthreads();
+                } else {
+                    if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                    grid_barrier(barrier_counter, barrier_flag, nb);
+                    for (;;) {
+                        __shared__ unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        if (sr >= static_cast<unsigned int>(total_proj)) break;
+
+                        const T* w;
+                        int row;
+                        if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
+                            w = static_cast<const T*>(L.qkv_proj_w);
+                            row = sr;
+                        } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
+                            w = static_cast<const T*>(L.z_proj_w);
+                            row = sr - L.qkv_out_dim;
+                        } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + 16)) {
+                            w = static_cast<const T*>(L.b_proj_w);
+                            row = sr - L.qkv_out_dim - L.z_out_dim;
+                        } else {
+                            w = static_cast<const T*>(L.a_proj_w);
+                            row = sr - L.qkv_out_dim - L.z_out_dim - 16;
+                        }
+                        const T* wr = w + static_cast<size_t>(row) * hidden_dim;
+
+                        float p = 0.0f;
+                        for (int c = tid; c < hidden_dim; c += bs)
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) proj_buf[sr] = lds[0];
+                        __syncthreads();
+                    }
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3689,7 +3767,182 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // Step B-E: conv1d, recurrent state, gated norm, out_proj
             // Block 0 handles sequential recurrent operations.
             // O_proj uses all blocks via work-stealing.
-            if (blockIdx.x == 0) {
+            const bool qwen08_linear_hero =
+                qwen08_hero &&
+                bs == 256 &&
+                nb >= 16 &&
+                L.linear_num_v_heads == 16 &&
+                L.linear_head_k_dim == 128 &&
+                L.linear_head_v_dim == 128 &&
+                L.qkv_out_dim == 6144 &&
+                L.z_out_dim == 2048;
+
+            if (qwen08_linear_hero) {
+                float* qkv_f32 = proj_buf;
+                float* z_f32 = proj_buf + L.qkv_out_dim;
+                float* b_f32 = proj_buf + L.qkv_out_dim + L.z_out_dim;
+                float* a_f32 = b_f32 + 16;
+
+                const int conv_dim = L.qkv_out_dim;
+                const int kern = L.conv_kernel_size;
+                const int nv = L.linear_num_v_heads;
+                const int hkd = L.linear_head_k_dim;
+                const int hvd = L.linear_head_v_dim;
+                const int key_dim = nv * hkd;
+                const int val_dim = L.linear_value_dim;
+                const int q_key_offset = 0;
+                const int k_key_offset = key_dim;
+                const int v_val_offset = key_dim * 2;
+
+                {
+                    T* cs = static_cast<T*>(L.conv_state);
+                    const T* cw = static_cast<const T*>(L.conv1d_w);
+                    float* conv_out = gate_up;
+                    for (int c = tid + blockIdx.x * bs; c < conv_dim; c += bs * nb) {
+                        T qkv_bf16 = dotcache_qwen35_from_float<T>(qkv_f32[c]);
+                        float acc = 0.0f;
+                        for (int t = 0; t < kern - 1; ++t) {
+                            acc += dotcache_qwen35_to_float(cs[c * (kern - 1) + t]) *
+                                   dotcache_qwen35_to_float(cw[c * kern + t]);
+                        }
+                        acc += dotcache_qwen35_to_float(qkv_bf16) *
+                               dotcache_qwen35_to_float(cw[c * kern + (kern - 1)]);
+                        conv_out[c] = acc / (1.0f + expf(-acc));
+
+                        for (int t = 0; t < kern - 2; ++t) {
+                            cs[c * (kern - 1) + t] = cs[c * (kern - 1) + t + 1];
+                        }
+                        cs[c * (kern - 1) + (kern - 2)] = qkv_bf16;
+                    }
+                    __syncthreads();
+                }
+                grid_barrier(barrier_counter, barrier_flag, nb);
+
+                if (blockIdx.x < nv) {
+                    const int h = blockIdx.x;
+                    float* conv_out = gate_up;
+
+                    float sq = 0.0f;
+                    for (int d = tid; d < hkd; d += bs) {
+                        float qv = conv_out[q_key_offset + h * hkd + d];
+                        sq += qv * qv;
+                    }
+                    lds[tid] = sq;
+                    __syncthreads();
+                    for (int s = bs / 2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid + s];
+                        __syncthreads();
+                    }
+                    float q_inv = rsqrtf(lds[0] + 1e-6f) * rsqrtf(static_cast<float>(hkd));
+                    for (int d = tid; d < hkd; d += bs) {
+                        conv_out[q_key_offset + h * hkd + d] *= q_inv;
+                    }
+                    __syncthreads();
+
+                    sq = 0.0f;
+                    for (int d = tid; d < hkd; d += bs) {
+                        float kv = conv_out[k_key_offset + h * hkd + d];
+                        sq += kv * kv;
+                    }
+                    lds[tid] = sq;
+                    __syncthreads();
+                    for (int s = bs / 2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid + s];
+                        __syncthreads();
+                    }
+                    float k_inv = rsqrtf(lds[0] + 1e-6f);
+                    for (int d = tid; d < hkd; d += bs) {
+                        conv_out[k_key_offset + h * hkd + d] *= k_inv;
+                    }
+                    __syncthreads();
+                }
+                grid_barrier(barrier_counter, barrier_flag, nb);
+
+                if (blockIdx.x < nv) {
+                    const int h = blockIdx.x;
+                    float* conv_out = gate_up;
+                    float* sh = static_cast<float*>(L.recurrent_state) + h * hkd * hvd;
+                    const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
+                    const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
+                    const int v = tid & (hvd - 1);
+                    const int part = tid / hvd;
+
+                    const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
+                    float decay = 1.0f;
+                    if (dt_bw != nullptr && ale_w != nullptr) {
+                        float sp = logf(1.0f + expf(
+                            a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                        decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
+                    }
+
+                    if (v < hvd) {
+                        for (int k = part; k < hkd; k += 2) {
+                            sh[k * hvd + v] *= decay;
+                        }
+
+                        float kv_mem_v = 0.0f;
+                        for (int k = part; k < hkd; k += 2) {
+                            kv_mem_v += sh[k * hvd + v] *
+                                        conv_out[k_key_offset + h * hkd + k];
+                        }
+                        lds[tid] = kv_mem_v;
+                        __syncthreads();
+                        if (tid < hvd) {
+                            kv_mem_v += lds[tid + hvd];
+                            const float val = conv_out[v_val_offset + h * hvd + v];
+                            lds[tid] = (val - kv_mem_v) * beta;
+                        }
+                        __syncthreads();
+                        const float delta = lds[v];
+
+                        for (int k = part; k < hkd; k += 2) {
+                            sh[k * hvd + v] +=
+                                conv_out[k_key_offset + h * hkd + k] * delta;
+                        }
+
+                        float out_v = 0.0f;
+                        for (int k = part; k < hkd; k += 2) {
+                            out_v += sh[k * hvd + v] *
+                                     conv_out[q_key_offset + h * hkd + k];
+                        }
+                        lds[tid] = out_v;
+                        __syncthreads();
+                        if (tid < hvd) {
+                            out_v += lds[tid + hvd];
+                            attn_scratch[h * hvd + v] = out_v;
+                        }
+                    }
+                    __syncthreads();
+                }
+                grid_barrier(barrier_counter, barrier_flag, nb);
+
+                if (blockIdx.x < nv) {
+                    const int h = blockIdx.x;
+                    const float* nw = static_cast<const float*>(L.linear_norm_w);
+                    const float* ho = attn_scratch + h * hvd;
+
+                    float sq = 0.0f;
+                    for (int j = tid; j < hvd; j += bs) {
+                        sq += ho[j] * ho[j];
+                    }
+                    lds[tid] = sq;
+                    __syncthreads();
+                    for (int s = bs / 2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid + s];
+                        __syncthreads();
+                    }
+                    const float rms_inv =
+                        rsqrtf(lds[0] / static_cast<float>(hvd) + L.linear_norm_eps);
+
+                    for (int j = tid; j < hvd; j += bs) {
+                        float n = attn_scratch[h * hvd + j] * rms_inv;
+                        float w = (nw != nullptr) ? nw[j] : 1.0f;
+                        float zv = z_f32[h * hvd + j];
+                        attn_scratch[h * hvd + j] = n * w * (zv / (1.0f + expf(-zv)));
+                    }
+                    __syncthreads();
+                }
+            } else if (blockIdx.x == 0) {
                 float* qkv_f32 = proj_buf;
                 float* z_f32 = proj_buf + L.qkv_out_dim;
                 float* b_f32 = proj_buf + L.qkv_out_dim + L.z_out_dim;
@@ -3918,28 +4171,45 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                 const T* ow = static_cast<const T*>(L.linear_out_proj_w);
 
-                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-                grid_barrier(barrier_counter, barrier_flag, nb);
-
-                for (;;) {
-                    __shared__ unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
-
-                    const T* wr = ow + static_cast<size_t>(sr) * vd;
-                    float p = 0.0f;
-                    for (int c = tid; c < vd; c += bs) {
-                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int s = bs / 2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid + s];
+                if (qwen08_linear_hero) {
+                    for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
+                        const T* wr = ow + static_cast<size_t>(sr) * vd;
+                        float p = 0.0f;
+                        for (int c = tid; c < vd; c += bs) {
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs / 2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid + s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) hidden_f32[sr] += lds[0];
                         __syncthreads();
                     }
-                    if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
-                    __syncthreads();
+                } else {
+                    if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                    grid_barrier(barrier_counter, barrier_flag, nb);
+                    for (;;) {
+                        __shared__ unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        const T* wr = ow + static_cast<size_t>(sr) * vd;
+                        float p = 0.0f;
+                        for (int c = tid; c < vd; c += bs) {
+                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int s = bs / 2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid + s];
+                            __syncthreads();
+                        }
+                        if (tid == 0) hidden_f32[sr] += lds[0];
+                        __syncthreads();
+                    }
                 }
             }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3962,50 +4232,80 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         // === Fused MLP gate+up+SwiGLU (all blocks work-steal) ===
         // Each work unit computes gate[i] AND up[i], applies SwiGLU, writes result.
         // Removes 2 barriers vs. separate gate+up → SwiGLU phases.
-        if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-        grid_barrier(barrier_counter, barrier_flag, nb);
-
         {
             const T* gw = static_cast<const T*>(L.gate_proj_w);
             const T* uw = static_cast<const T*>(L.up_proj_w);
-            for (;;) {
-                __shared__ unsigned int sr;
-                if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                __syncthreads();
-                if (sr >= static_cast<unsigned int>(L.intermediate_size)) break;
+            if (qwen08_hero) {
+                for (int sr = blockIdx.x; sr < L.intermediate_size; sr += nb) {
+                    const T* gr = gw + static_cast<size_t>(sr) * hidden_dim;
+                    float gp = 0.0f;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
+                    lds[tid] = gp;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    float gate_val = lds[0];
 
-                // gate_proj row (reads normed from LDS)
-                const T* gr = gw + static_cast<size_t>(sr) * hidden_dim;
-                float gp = 0.0f;
-                for (int c = tid; c < hidden_dim; c += bs)
-                    gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
-                lds[tid] = gp;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+                    const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
+                    float up = 0.0f;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
+                    lds[tid] = up;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    float up_val = lds[0];
+
+                    if (tid == 0) {
+                        float silu = gate_val / (1.0f + expf(-gate_val));
+                        gate_up[sr] = silu * up_val;
+                    }
                     __syncthreads();
                 }
-                float gate_val = lds[0];
+            } else {
+                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                grid_barrier(barrier_counter, barrier_flag, nb);
+                for (;;) {
+                    __shared__ unsigned int sr;
+                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                    __syncthreads();
+                    if (sr >= static_cast<unsigned int>(L.intermediate_size)) break;
 
-                // up_proj row (reads normed from LDS)
-                const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
-                float up = 0.0f;
-                for (int c = tid; c < hidden_dim; c += bs)
-                    up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
-                lds[tid] = up;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+                    const T* gr = gw + static_cast<size_t>(sr) * hidden_dim;
+                    float gp = 0.0f;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
+                    lds[tid] = gp;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    float gate_val = lds[0];
+
+                    const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
+                    float up = 0.0f;
+                    for (int c = tid; c < hidden_dim; c += bs)
+                        up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
+                    lds[tid] = up;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    float up_val = lds[0];
+
+                    if (tid == 0) {
+                        float silu = gate_val / (1.0f + expf(-gate_val));
+                        gate_up[sr] = silu * up_val;
+                    }
                     __syncthreads();
                 }
-                float up_val = lds[0];
-
-                // SwiGLU: silu(gate) * up
-                if (tid == 0) {
-                    float silu = gate_val / (1.0f + expf(-gate_val));
-                    gate_up[sr] = silu * up_val;
-                }
-                __syncthreads();
             }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4016,29 +4316,45 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             lds_input[c] = gate_up[c];
         __syncthreads();
 
-        if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-        grid_barrier(barrier_counter, barrier_flag, nb);
-
         {
             const T* dw = static_cast<const T*>(L.down_proj_w);
-            for (;;) {
-                __shared__ unsigned int sr;
-                if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                __syncthreads();
-                if (sr >= static_cast<unsigned int>(hidden_dim)) break;
-
-                const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
-                float p = 0.0f;
-                for (int c = tid; c < L.intermediate_size; c += bs)
-                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs/2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid+s];
+            if (qwen08_hero) {
+                for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
+                    const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
+                    float p = 0.0f;
+                    for (int c = tid; c < L.intermediate_size; c += bs)
+                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    lds[tid] = p;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    if (tid == 0) hidden_f32[sr] += lds[0];
                     __syncthreads();
                 }
-                if (tid == 0) hidden_f32[sr] += lds[0];  // fused residual add
-                __syncthreads();
+            } else {
+                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
+                grid_barrier(barrier_counter, barrier_flag, nb);
+                for (;;) {
+                    __shared__ unsigned int sr;
+                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                    __syncthreads();
+                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                    const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
+                    float p = 0.0f;
+                    for (int c = tid; c < L.intermediate_size; c += bs)
+                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                    lds[tid] = p;
+                    __syncthreads();
+                    for (int s = bs/2; s > 0; s >>= 1) {
+                        if (tid < s) lds[tid] += lds[tid+s];
+                        __syncthreads();
+                    }
+                    if (tid == 0) hidden_f32[sr] += lds[0];
+                    __syncthreads();
+                }
             }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);

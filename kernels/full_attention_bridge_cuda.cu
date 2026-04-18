@@ -54,6 +54,19 @@ int linear_prefill_block_override() {
     return static_cast<int>(parsed);
 }
 
+int qwen08_hero_blocks_override() {
+    const char* value = std::getenv("SUPERSONIC_QWEN08_HERO_BLOCKS");
+    if (value == nullptr || *value == '\0') {
+        return 82;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) {
+        return 82;
+    }
+    return static_cast<int>(parsed);
+}
+
 template <typename T>
 int full_attention_prefill_device(
     int device_ordinal,
@@ -4517,7 +4530,7 @@ extern "C" int dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
             static_cast<int>(seqlen_offset),
             layers, hidden_io, workspace, counters,
             barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim), 1, 82);
+            cos_table, sin_table, static_cast<int>(rotary_dim), 1, qwen08_hero_blocks_override());
     default:
         return 256;
     }
