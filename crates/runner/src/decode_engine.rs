@@ -2546,10 +2546,22 @@ impl DecodeEngine {
         token_ids: &[u32],
         seqlen_offset: usize,
     ) -> Result<Vec<Vec<f32>>> {
+        let (all_logits, _) = self.decode_step_batch_with_timings(token_ids, seqlen_offset)?;
+        Ok(all_logits)
+    }
+
+    /// Run one batched decode step and return per-sequence logits plus native
+    /// stage timings for the persistent batch path.
+    pub fn decode_step_batch_with_timings(
+        &mut self,
+        token_ids: &[u32],
+        seqlen_offset: usize,
+    ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
         assert_eq!(token_ids.len(), self.batch_size);
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
         let config = &self.weights.config;
         let b = self.batch_size;
+        let mut timings = DecodeStageTimings::default();
 
         // 1. Embedding lookup: place each sequence's embedding at offset b * hidden_size
         let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
@@ -2617,6 +2629,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset batched decode sync: {e}"))?;
 
         // 5. Launch batched persistent decode kernel
+        let start = Instant::now();
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2640,6 +2653,7 @@ impl DecodeEngine {
             self.int4_scale_device.as_ref(),
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;
@@ -2653,6 +2667,7 @@ impl DecodeEngine {
         }
 
         // 7-9. Final multi-row RMSNorm + tiled lm_head matmul, then one D2H.
+        let start = Instant::now();
         kernel_ffi::rms_norm_4b_multirow(
             self.ordinal,
             ScalarType::BF16,
@@ -2664,7 +2679,9 @@ impl DecodeEngine {
             &mut self.normed_buf,
         )
         .map_err(|e| anyhow::anyhow!("final rms_norm batch rows: {e}"))?;
+        timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        let start = Instant::now();
         kernel_ffi::matmul_rhs_transposed_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2677,11 +2694,14 @@ impl DecodeEngine {
             &mut self.logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("tiled lm_head batch matmul: {e}"))?;
+        timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
+        let start = Instant::now();
         let logits_host = self
             .logits_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("logits D2H batch rows: {e}"))?;
+        timings.logits_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
         let row_bytes = config.vocab_size * ScalarType::BF16.size_in_bytes();
         let mut all_logits = Vec::with_capacity(b);
         for bi in 0..b {
@@ -2694,7 +2714,7 @@ impl DecodeEngine {
             all_logits.push(logits_f32);
         }
 
-        Ok(all_logits)
+        Ok((all_logits, timings))
     }
 
     /// Debug-only: run the real batched 4B persistent kernel for the first `num_layers`

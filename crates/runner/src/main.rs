@@ -1184,7 +1184,7 @@ fn main() -> Result<()> {
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
-            let batch_logits = if replay_kv_fp8_enabled {
+            let (batch_logits, batch_timings) = if replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -1192,11 +1192,19 @@ fn main() -> Result<()> {
                     .chain(std::iter::once(next_token))
                     .collect();
                 let logits = engine.rebuild_prefill_state(&token_ids, true)?;
-                vec![logits; cli.batch_size]
+                (vec![logits; cli.batch_size], None)
+            } else if cli.emit_stage_timings {
+                let (logits, timings) =
+                    engine.decode_step_batch_with_timings(&batch_next_tokens, seqlen_offset)?;
+                (logits, Some(timings))
             } else {
                 // Batched decode
-                engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?
+                (engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?, None)
             };
+            if let Some(timings) = batch_timings {
+                native_decode_timings.add_assign(timings);
+                native_decode_timing_steps += 1;
+            }
 
             // Use sequence 0's logits for output and validation
             let logits = &batch_logits[0];
@@ -1214,8 +1222,13 @@ fn main() -> Result<()> {
             }
 
             // Sample next tokens for all sequences
+            let sampling_start = Instant::now();
             for (bi, seq_logits) in batch_logits.iter().enumerate() {
                 batch_next_tokens[bi] = DecodeEngine::greedy_sample(seq_logits);
+            }
+            if batch_timings.is_some() {
+                native_decode_timings.host_sampling_ms +=
+                    sampling_start.elapsed().as_secs_f64() * 1000.0;
             }
 
             generated_ids.push(next_token);
