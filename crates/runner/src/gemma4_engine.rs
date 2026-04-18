@@ -22,7 +22,7 @@ use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
-use kernel_ffi::gemma4::Gemma4DecodeLayerDesc;
+use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
@@ -405,14 +405,25 @@ pub struct Gemma4Engine {
     k_caches: Vec<Vec<GpuBuffer>>,
     v_caches: Vec<Vec<GpuBuffer>>,
 
-    // Megakernel-side state. With per-sequence KV pointers baked into the
-    // descriptor array, we hold `batch_size` separate descriptor arrays —
-    // each sequence picks the matching `layers_gpu[seq]` for its single-seq
-    // kernel call. (Phase 2 will collapse these into one batched-kernel
-    // arg + a per-layer Gemma4BatchSeqDesc array.)
+    // Megakernel-side state. Per-sequence layer-descriptor arrays hold each
+    // sequence's KV cache pointers — used by [`decode_step_seq`] to call the
+    // single-seq megakernel. The batched megakernel (Phase 2) reuses
+    // `layers_gpu[0]` for shape/weight pointers (KV fields ignored) and reads
+    // per-sequence K/V + position from `batch_descs_gpu`.
     #[allow(dead_code)]
     descs: Vec<Vec<Gemma4DecodeLayerDesc>>, // kept alive so `layers_gpu[seq]` pointers stay valid
     layers_gpu: Vec<GpuBuffer>,
+
+    /// `[num_layers]` parallel-array of [`Gemma4BatchSeqDesc`] on GPU, holding
+    /// per-sequence KV pointers + positions for the batched megakernel. Only
+    /// populated when `batch_size > 1`. Shared-KV layers alias the source
+    /// layer's per-sequence KV pointers (no extra replication).
+    batch_descs_host: Vec<Gemma4BatchSeqDesc>,
+    batch_descs_gpu: Option<GpuBuffer>,
+    /// Per-sequence slice stride into `mega_workspace` for the batched kernel
+    /// (= `persistent_decode_workspace_elems(...)`).
+    mega_ws_stride: usize,
+
     mega_workspace: GpuBuffer,
     mega_matvec_counter: GpuBuffer,
     mega_barrier_counter: GpuBuffer,
@@ -608,7 +619,47 @@ impl Gemma4Engine {
             tcfg.hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
             max_intermediate, ple_hidden,
         );
-        let mega_workspace = GpuBuffer::zeros(device, ScalarType::F32, &[workspace_elems])?;
+        // Batched kernel needs `B * workspace_elems`; single-seq kernel ignores
+        // the surplus. Always size for `batch_size` so both paths work.
+        let mega_workspace =
+            GpuBuffer::zeros(device, ScalarType::F32, &[batch_size * workspace_elems])?;
+        let mega_ws_stride = workspace_elems;
+
+        // Per-layer batched-seq descriptor array. `seqlen_offset` is updated
+        // per decode step; KV pointers and kv_max_t are fixed at engine-build
+        // time. Shared-KV layers inherit the source layer's per-sequence
+        // pointers so the kernel never needs to look up the mapping.
+        let mut batch_descs_host: Vec<Gemma4BatchSeqDesc> =
+            vec![Gemma4BatchSeqDesc::default(); num_layers];
+        for l in 0..num_layers {
+            let src_idx = {
+                let w = &layers[l];
+                if w.shared_kv { w.kv_source } else { l }
+            };
+            let d = &mut batch_descs_host[l];
+            for b in 0..batch_size {
+                d.seqlen_offset[b] = 0;
+                d.kv_cache_k[b] = k_caches[b][src_idx].as_ptr() as *mut c_void;
+                d.kv_cache_v[b] = v_caches[b][src_idx].as_ptr() as *mut c_void;
+                d.kv_max_t[b] = max_t as c_int;
+            }
+        }
+        let batch_descs_gpu = if batch_size > 1 {
+            let desc_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    batch_descs_host.as_ptr() as *const u8,
+                    batch_descs_host.len() * std::mem::size_of::<Gemma4BatchSeqDesc>(),
+                )
+            };
+            Some(GpuBuffer::from_host_bytes(
+                device,
+                ScalarType::U8,
+                &[desc_bytes.len()],
+                desc_bytes,
+            )?)
+        } else {
+            None
+        };
         let mega_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let mega_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let mega_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
@@ -634,6 +685,9 @@ impl Gemma4Engine {
             v_caches,
             descs,
             layers_gpu,
+            batch_descs_host,
+            batch_descs_gpu,
+            mega_ws_stride,
             mega_workspace,
             mega_matvec_counter,
             mega_barrier_counter,
@@ -1022,10 +1076,10 @@ impl Gemma4Engine {
     /// Run one decode step on every sequence in the batch and return one set
     /// of softcapped logits per sequence (`Vec<Vec<f32>>` length = batch_size).
     ///
-    /// **Phase 1 implementation**: serially calls [`Self::decode_step_seq`]
-    /// for each sequence. Same throughput as B sequential single-sequence
-    /// runs — the API is in place but the perf win waits on the kernel-side
-    /// batched megakernel (Phase 2).
+    /// When `batch_size == 1`, delegates to [`Self::decode_step_seq`] (which
+    /// uses the single-seq megakernel). When `batch_size > 1`, folds the work
+    /// into a single launch of the batched megakernel so weight reads amortize
+    /// across sequences.
     pub fn decode_step_batch(
         &mut self,
         input_tokens: &[u32],
@@ -1045,11 +1099,129 @@ impl Gemma4Engine {
                 self.batch_size
             );
         }
-        let mut out = Vec::with_capacity(self.batch_size);
-        for b in 0..self.batch_size {
-            out.push(self.decode_step_seq(b, input_tokens[b], positions[b])?);
+        for (b, &pos) in positions.iter().enumerate() {
+            if pos >= self.max_t {
+                bail!("decode_step_batch: seq {b} pos {pos} >= max_t {}", self.max_t);
+            }
         }
-        Ok(out)
+
+        if self.batch_size == 1 {
+            return Ok(vec![self.decode_step_seq(0, input_tokens[0], positions[0])?]);
+        }
+
+        let device = self.device;
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+        let num_layers = self.tcfg.num_hidden_layers;
+        let vocab_size = self.tcfg.vocab_size;
+        let b = self.batch_size;
+
+        // Stack per-seq embedded hidden inputs → [B, hidden_size] BF16.
+        let mut hidden_host_f32: Vec<f32> = Vec::with_capacity(b * hidden_size);
+        for &tok in input_tokens {
+            let row = load_scaled_embed_row(
+                &self.loader,
+                &format!("{}.embed_tokens.weight", self.weight_prefix),
+                tok,
+                hidden_size,
+            )?;
+            hidden_host_f32.extend_from_slice(&row);
+        }
+        let mut hidden_io = upload_bf16(device, &[b, hidden_size], &hidden_host_f32)?;
+
+        // Stack per-seq PLIs → [B, num_layers, ple_hidden] BF16.
+        let expected_pli_bytes = num_layers * ple_hidden * 2;
+        let mut pli_bytes: Vec<u8> = Vec::with_capacity(b * expected_pli_bytes);
+        for &tok in input_tokens {
+            let per_seq = self.compute_per_layer_inputs_single(tok)?;
+            if per_seq.len() != expected_pli_bytes {
+                bail!(
+                    "compute_per_layer_inputs_single returned {} bytes, expected {}",
+                    per_seq.len(), expected_pli_bytes
+                );
+            }
+            pli_bytes.extend_from_slice(&per_seq);
+        }
+        let pli_gpu = GpuBuffer::from_host_bytes(
+            device, dtype, &[b, num_layers, ple_hidden], &pli_bytes,
+        )?;
+
+        // Update per-step `seqlen_offset[b]` in each layer's batch desc, then
+        // re-upload the whole [num_layers] array. KV pointers and kv_max_t are
+        // invariant across decode steps.
+        for l in 0..num_layers {
+            for (i, &pos) in positions.iter().enumerate() {
+                self.batch_descs_host[l].seqlen_offset[i] = pos as c_int;
+            }
+        }
+        let batch_descs_gpu = self
+            .batch_descs_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow!("decode_step_batch: batch_descs_gpu missing"))?;
+        let desc_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.batch_descs_host.as_ptr() as *const u8,
+                self.batch_descs_host.len() * std::mem::size_of::<Gemma4BatchSeqDesc>(),
+            )
+        };
+        gpu_hal::copy_h2d(
+            device,
+            batch_descs_gpu.as_mut_ptr(),
+            desc_bytes.as_ptr() as *const c_void,
+            desc_bytes.len(),
+        )
+        .map_err(|e| anyhow!("upload batch_descs: {e}"))?;
+
+        // Batched megakernel launch — reuses seq 0's layers_gpu for shape +
+        // weight pointers (KV fields ignored; kernel reads them from
+        // batch_descs).
+        g4::persistent_decode_batch(
+            device, dtype,
+            &self.layers_gpu[0],
+            batch_descs_gpu,
+            &mut hidden_io,
+            &pli_gpu,
+            &mut self.mega_workspace,
+            &mut self.mega_matvec_counter,
+            &mut self.mega_barrier_counter,
+            &mut self.mega_barrier_flag,
+            num_layers, hidden_size, ple_hidden,
+            b, self.mega_ws_stride,
+            eps, 1.0f32,
+        )?;
+
+        // Final norm + lm_head + softcap, per seq. These are 2048→262144 matvecs;
+        // running them serially is fine — they dominate neither bandwidth nor
+        // latency at B=4 (~3 ms at hidden=2048, vocab=262k on gfx1150).
+        let cap = self.tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(b);
+        for seq in 0..b {
+            let row_off_bytes = seq * hidden_size * 2;
+            let mut seq_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+            unsafe {
+                let src_ptr = hidden_io.offset_ptr(row_off_bytes);
+                gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+                    .map_err(|e| anyhow!("copy seq {seq} hidden: {e}"))?;
+            }
+            let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+            g4::rms_norm(
+                device, dtype, &mut post_norm, &seq_hidden, Some(&self.final_norm_w),
+                eps, hidden_size,
+            )?;
+            let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
+            g4::matvec(
+                device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+                hidden_size, vocab_size, &mut self.counter,
+            )?;
+            let mut logits_host = download_bf16(&logits_gpu)?;
+            for v in logits_host.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+            outs.push(logits_host);
+        }
+        Ok(outs)
     }
 
     /// D2D-copy sequence 0's K/V cache contents into every other sequence's

@@ -40,9 +40,10 @@ impl Gemma4Runtime {
         }
     }
 
-    /// Run one decode step on every sequence. Only the BF16 megakernel
-    /// engine supports `batch_size > 1` in Phase 1; INT4 still runs the
-    /// primitive-chain decode and is single-sequence only.
+    /// Run one decode step on every sequence in the batch. Both BF16 and
+    /// INT4 engines honour `--batch-size > 1` via their batched persistent
+    /// megakernels (BF16: `g4::persistent_decode_batch`, INT4:
+    /// `g4::persistent_decode_batch_int4`).
     fn decode_step_batch(
         &mut self,
         input_tokens: &[u32],
@@ -50,25 +51,23 @@ impl Gemma4Runtime {
     ) -> anyhow::Result<Vec<Vec<f32>>> {
         match self {
             Self::Bf16(e) => e.decode_step_batch(input_tokens, positions),
-            Self::Int4(_) => {
-                anyhow::bail!("Gemma 4 INT4 engine does not yet support --batch-size > 1")
-            }
+            Self::Int4(e) => e.decode_step_batch(input_tokens, positions),
         }
     }
 
     /// Replicate seq 0's K/V cache contents into every other sequence's
-    /// caches. Only meaningful for the BF16 engine; no-op on INT4.
+    /// caches. Applies to both BF16 and INT4 engines.
     fn replicate_seq0_kv(&mut self) -> anyhow::Result<()> {
         match self {
             Self::Bf16(e) => e.replicate_seq0_kv(),
-            Self::Int4(_) => Ok(()),
+            Self::Int4(e) => e.replicate_seq0_kv(),
         }
     }
 
     fn batch_size(&self) -> usize {
         match self {
             Self::Bf16(e) => e.batch_size(),
-            Self::Int4(_) => 1,
+            Self::Int4(e) => e.batch_size(),
         }
     }
 
@@ -231,8 +230,8 @@ struct Cli {
     trace_prefill_layers: bool,
 
     /// Batch size for decode (number of sequences decoded in parallel).
-    /// Default 1. B=2 is supported on the 4B kernel and can improve aggregate throughput.
-    /// Requires 4B kernel (2B/4B/9B models).
+    /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
+    /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
     #[arg(long, default_value = "1")]
     batch_size: usize,
 
@@ -1524,11 +1523,6 @@ fn run_gemma4(
             kernel_ffi::MAX_BATCH_SIZE
         );
     }
-    if cli.batch_size > 1 && cli.int4 {
-        anyhow::bail!(
-            "Gemma 4 INT4 engine does not yet support --batch-size > 1 (Phase 1 batches BF16 only)"
-        );
-    }
     if cli.oracle_prefill || cli.gpu_validate {
         anyhow::bail!("Gemma 4 does not yet support --oracle-prefill / --gpu-validate");
     }
@@ -1656,11 +1650,12 @@ fn run_gemma4(
             }
         }
         eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
-        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load(
+        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load_with_batch(
             &cli.model_dir,
             params.weight_prefix,
             context_tokens,
             ordinal,
+            cli.batch_size,
         )?)
     } else {
         Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_batch(
