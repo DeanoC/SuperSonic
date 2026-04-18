@@ -381,6 +381,12 @@ pub struct Gemma4Engine {
     weight_prefix: &'static str,
     max_t: usize,
     device: usize,
+    /// Number of parallel decode sequences this engine is sized for. Always
+    /// `>= 1`. When `batch_size > 1` the engine holds `batch_size` parallel
+    /// sets of K/V caches + descriptor arrays so each sequence can decode into
+    /// its own state. Phase 1 dispatches sequences serially through the
+    /// existing single-seq megakernel; Phase 2 will fold them into one launch.
+    batch_size: usize,
 
     layers: Vec<LayerWeights>,
     lm_head_w: GpuBuffer, // tied to embed_tokens on E2B/E4B
@@ -393,13 +399,20 @@ pub struct Gemma4Engine {
     full_cos: GpuBuffer,
     full_sin: GpuBuffer,
 
-    k_caches: Vec<GpuBuffer>,
-    v_caches: Vec<GpuBuffer>,
+    /// Per-sequence K/V caches: `k_caches[seq][layer]`. Outer length is
+    /// `batch_size`, inner length is `num_hidden_layers`. Each inner buffer
+    /// has shape `[num_kv_heads, max_t, head_dim]`.
+    k_caches: Vec<Vec<GpuBuffer>>,
+    v_caches: Vec<Vec<GpuBuffer>>,
 
-    // Megakernel-side state (built once, reused every decode step).
+    // Megakernel-side state. With per-sequence KV pointers baked into the
+    // descriptor array, we hold `batch_size` separate descriptor arrays —
+    // each sequence picks the matching `layers_gpu[seq]` for its single-seq
+    // kernel call. (Phase 2 will collapse these into one batched-kernel
+    // arg + a per-layer Gemma4BatchSeqDesc array.)
     #[allow(dead_code)]
-    descs: Vec<Gemma4DecodeLayerDesc>, // kept alive so the GPU-side `layers_gpu` pointers stay valid
-    layers_gpu: GpuBuffer,
+    descs: Vec<Vec<Gemma4DecodeLayerDesc>>, // kept alive so `layers_gpu[seq]` pointers stay valid
+    layers_gpu: Vec<GpuBuffer>,
     mega_workspace: GpuBuffer,
     mega_matvec_counter: GpuBuffer,
     mega_barrier_counter: GpuBuffer,
@@ -410,15 +423,42 @@ pub struct Gemma4Engine {
 }
 
 impl Gemma4Engine {
-    /// Load all weights for a Gemma 4 dense variant and initialize GPU state.
-    /// `max_t` is the maximum token position the engine will ever be asked to
-    /// handle (prompt length + max new tokens) — K/V caches are sized once.
+    /// Load all weights for a Gemma 4 dense variant and initialize GPU state
+    /// for a single decoding sequence (`batch_size = 1`). Convenience wrapper
+    /// for [`Self::load_with_batch`] that preserves the original signature.
     pub fn load(
         model_dir: &Path,
         weight_prefix: &'static str,
         max_t: usize,
         device: usize,
     ) -> Result<Self> {
+        Self::load_with_batch(model_dir, weight_prefix, max_t, device, 1)
+    }
+
+    /// Load all weights and initialize GPU state for `batch_size` parallel
+    /// sequences. `max_t` is the maximum token position any sequence will ever
+    /// be asked to handle (prompt length + max new tokens) — K/V caches are
+    /// sized once per sequence.
+    ///
+    /// Per-sequence allocations grow linearly with `batch_size`:
+    /// `batch_size * num_layers * (k_cache + v_cache + descriptor_array)`.
+    pub fn load_with_batch(
+        model_dir: &Path,
+        weight_prefix: &'static str,
+        max_t: usize,
+        device: usize,
+        batch_size: usize,
+    ) -> Result<Self> {
+        if batch_size == 0 {
+            bail!("Gemma4Engine: batch_size must be >= 1");
+        }
+        if batch_size > kernel_ffi::MAX_BATCH_SIZE {
+            bail!(
+                "Gemma4Engine: batch_size {} > MAX_BATCH_SIZE {}",
+                batch_size,
+                kernel_ffi::MAX_BATCH_SIZE
+            );
+        }
         gpu_hal::set_device(device).map_err(|e| anyhow!("set_device: {e}"))?;
         let config: Config = ::gemma4::config::load_config(model_dir)
             .map_err(|e| anyhow!("load_config: {e}"))?;
@@ -443,14 +483,22 @@ impl Gemma4Engine {
         let num_kv_heads = tcfg.num_key_value_heads;
         let num_q_heads = tcfg.num_attention_heads;
 
-        // One K/V buffer per layer — prefill fills them all; decode reads
-        // shared-layer descriptors via pointer-alias into the source's buffer.
-        let mut k_caches: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
-        let mut v_caches: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
-        for l in 0..num_layers {
-            let hd = layers[l].head_dim;
-            k_caches.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
-            v_caches.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+        // Per-sequence K/V buffers — `[seq][layer]`. Each sequence has its own
+        // cache so decode steps are fully decoupled. Shared-KV layers within
+        // a sequence still alias the source layer's buffer (handled below in
+        // descriptor construction).
+        let mut k_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
+        let mut v_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let mut ks: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            let mut vs: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            for l in 0..num_layers {
+                let hd = layers[l].head_dim;
+                ks.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+                vs.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+            }
+            k_caches.push(ks);
+            v_caches.push(vs);
         }
 
         let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
@@ -470,77 +518,86 @@ impl Gemma4Engine {
         let full_cos = upload_bf16(device, &[max_t, full_head_dim], &fcos_h)?;
         let full_sin = upload_bf16(device, &[max_t, full_head_dim], &fsin_h)?;
 
-        // --- Persistent-decode descriptor array. Shared layers alias their
-        //     source's K/V cache pointers so the megakernel sees a single
-        //     coherent memory region for the source → shared dependency.
-        let mut descs: Vec<Gemma4DecodeLayerDesc> = Vec::with_capacity(num_layers);
-        for l in 0..num_layers {
-            let w = &layers[l];
-            let kind_code: c_int = match w.kind {
-                AttnKind::Sliding => 0,
-                AttnKind::Full => 1,
-            };
-            let sliding_window = match w.kind {
-                AttnKind::Sliding => tcfg.sliding_window as c_int,
-                AttnKind::Full => 0,
-            };
-            let (cos_table_buf, sin_table_buf) = match w.kind {
-                AttnKind::Sliding => (&sliding_cos, &sliding_sin),
-                AttnKind::Full => (&full_cos, &full_sin),
-            };
-            let src_idx = if w.shared_kv { w.kv_source } else { l };
-            let k_buf = &k_caches[src_idx];
-            let v_buf = &v_caches[src_idx];
+        // --- Persistent-decode descriptor arrays — one per sequence. Each
+        //     sequence's descriptor array embeds *that sequence's* K/V cache
+        //     pointers so the single-seq megakernel can decode any sequence
+        //     by being handed the matching `layers_gpu[seq]`. Shared-KV layers
+        //     alias the source layer's buffer **within the same sequence**.
+        let mut descs: Vec<Vec<Gemma4DecodeLayerDesc>> = Vec::with_capacity(batch_size);
+        let mut layers_gpu: Vec<GpuBuffer> = Vec::with_capacity(batch_size);
+        for seq in 0..batch_size {
+            let mut seq_descs: Vec<Gemma4DecodeLayerDesc> = Vec::with_capacity(num_layers);
+            for l in 0..num_layers {
+                let w = &layers[l];
+                let kind_code: c_int = match w.kind {
+                    AttnKind::Sliding => 0,
+                    AttnKind::Full => 1,
+                };
+                let sliding_window = match w.kind {
+                    AttnKind::Sliding => tcfg.sliding_window as c_int,
+                    AttnKind::Full => 0,
+                };
+                let (cos_table_buf, sin_table_buf) = match w.kind {
+                    AttnKind::Sliding => (&sliding_cos, &sliding_sin),
+                    AttnKind::Full => (&full_cos, &full_sin),
+                };
+                let src_idx = if w.shared_kv { w.kv_source } else { l };
+                let k_buf = &k_caches[seq][src_idx];
+                let v_buf = &v_caches[seq][src_idx];
 
-            let k_proj_ptr = w.k_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-            let v_proj_ptr = w.v_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-            let k_norm_ptr = w.k_norm.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+                let k_proj_ptr = w.k_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+                let v_proj_ptr = w.v_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+                let k_norm_ptr = w.k_norm.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
 
-            descs.push(Gemma4DecodeLayerDesc {
-                layer_type: kind_code,
-                shared_kv: if w.shared_kv { 1 } else { 0 },
-                num_q_heads: num_q_heads as c_int,
-                num_kv_heads: num_kv_heads as c_int,
-                head_dim: w.head_dim as c_int,
-                rotary_dim: w.head_dim as c_int,
-                sliding_window,
-                intermediate_size: w.intermediate_size as c_int,
-                kv_max_t: max_t as c_int,
-                layer_scalar: w.layer_scalar,
-                input_norm_w: w.input_norm.as_ptr(),
-                q_proj_w: w.q_proj.as_ptr(),
-                k_proj_w: k_proj_ptr,
-                v_proj_w: v_proj_ptr,
-                q_norm_w: w.q_norm.as_ptr(),
-                k_norm_w: k_norm_ptr,
-                o_proj_w: w.o_proj.as_ptr(),
-                post_attn_norm_w: w.post_attn_norm.as_ptr(),
-                pre_ff_norm_w: w.pre_ff_norm.as_ptr(),
-                gate_proj_w: w.gate_proj.as_ptr(),
-                up_proj_w: w.up_proj.as_ptr(),
-                down_proj_w: w.down_proj.as_ptr(),
-                post_ff_norm_w: w.post_ff_norm.as_ptr(),
-                per_layer_input_gate_w: w.per_layer_input_gate_w.as_ptr(),
-                per_layer_projection_w: w.per_layer_projection_w.as_ptr(),
-                post_per_layer_input_norm_w: w.post_per_layer_input_norm_w.as_ptr(),
-                cos_table: cos_table_buf.as_ptr(),
-                sin_table: sin_table_buf.as_ptr(),
-                kv_cache_k: k_buf.as_ptr() as *mut c_void,
-                kv_cache_v: v_buf.as_ptr() as *mut c_void,
-            });
+                seq_descs.push(Gemma4DecodeLayerDesc {
+                    layer_type: kind_code,
+                    shared_kv: if w.shared_kv { 1 } else { 0 },
+                    num_q_heads: num_q_heads as c_int,
+                    num_kv_heads: num_kv_heads as c_int,
+                    head_dim: w.head_dim as c_int,
+                    rotary_dim: w.head_dim as c_int,
+                    sliding_window,
+                    intermediate_size: w.intermediate_size as c_int,
+                    kv_max_t: max_t as c_int,
+                    layer_scalar: w.layer_scalar,
+                    input_norm_w: w.input_norm.as_ptr(),
+                    q_proj_w: w.q_proj.as_ptr(),
+                    k_proj_w: k_proj_ptr,
+                    v_proj_w: v_proj_ptr,
+                    q_norm_w: w.q_norm.as_ptr(),
+                    k_norm_w: k_norm_ptr,
+                    o_proj_w: w.o_proj.as_ptr(),
+                    post_attn_norm_w: w.post_attn_norm.as_ptr(),
+                    pre_ff_norm_w: w.pre_ff_norm.as_ptr(),
+                    gate_proj_w: w.gate_proj.as_ptr(),
+                    up_proj_w: w.up_proj.as_ptr(),
+                    down_proj_w: w.down_proj.as_ptr(),
+                    post_ff_norm_w: w.post_ff_norm.as_ptr(),
+                    per_layer_input_gate_w: w.per_layer_input_gate_w.as_ptr(),
+                    per_layer_projection_w: w.per_layer_projection_w.as_ptr(),
+                    post_per_layer_input_norm_w: w.post_per_layer_input_norm_w.as_ptr(),
+                    cos_table: cos_table_buf.as_ptr(),
+                    sin_table: sin_table_buf.as_ptr(),
+                    kv_cache_k: k_buf.as_ptr() as *mut c_void,
+                    kv_cache_v: v_buf.as_ptr() as *mut c_void,
+                });
+            }
+            let desc_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    seq_descs.as_ptr() as *const u8,
+                    seq_descs.len() * std::mem::size_of::<Gemma4DecodeLayerDesc>(),
+                )
+            };
+            let buf = GpuBuffer::from_host_bytes(
+                device,
+                ScalarType::U8,
+                &[desc_bytes.len()],
+                desc_bytes,
+            )?;
+            descs.push(seq_descs);
+            layers_gpu.push(buf);
+            let _ = seq; // kept for clarity at the outer index
         }
-        let desc_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                descs.as_ptr() as *const u8,
-                descs.len() * std::mem::size_of::<Gemma4DecodeLayerDesc>(),
-            )
-        };
-        let layers_gpu = GpuBuffer::from_host_bytes(
-            device,
-            ScalarType::U8,
-            &[desc_bytes.len()],
-            desc_bytes,
-        )?;
 
         let ple_hidden = tcfg.hidden_size_per_layer_input;
         let max_intermediate = (0..num_layers)
@@ -563,6 +620,7 @@ impl Gemma4Engine {
             weight_prefix,
             max_t,
             device,
+            batch_size,
             layers,
             lm_head_w,
             final_norm_w,
@@ -584,6 +642,11 @@ impl Gemma4Engine {
         })
     }
 
+    /// Number of parallel sequences this engine was sized for.
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
     pub fn text_config(&self) -> &TextConfig {
         &self.tcfg
     }
@@ -592,11 +655,28 @@ impl Gemma4Engine {
         self.max_t
     }
 
-    /// Run batched Rust prefill over the whole prompt and return the softcapped
-    /// logits at the last prompt position. Populates every K/V cache buffer;
-    /// shared-KV layers get their slots replicated from the source layer's
-    /// cache via D2D copies.
+    /// Run prefill into sequence 0's K/V caches (convenience wrapper for
+    /// `prefill_seq(0, ...)` matching the original single-sequence API).
     pub fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        self.prefill_seq(0, prompt_token_ids)
+    }
+
+    /// Run batched Rust prefill over the whole prompt for sequence `seq_idx`
+    /// and return the softcapped logits at the last prompt position.
+    /// Populates every K/V cache buffer for that sequence; shared-KV layers
+    /// get their slots replicated from the source layer's cache via D2D
+    /// copies.
+    ///
+    /// To prefill `B` sequences with the same prompt, prefer `prefill` +
+    /// [`Self::replicate_seq0_kv`] — that runs the GPU work once and clones
+    /// the resulting cache contents instead of re-running prefill `B` times.
+    pub fn prefill_seq(&mut self, seq_idx: usize, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        if seq_idx >= self.batch_size {
+            bail!(
+                "prefill_seq: seq_idx {seq_idx} >= batch_size {}",
+                self.batch_size
+            );
+        }
         let seq_len = prompt_token_ids.len();
         if seq_len == 0 {
             bail!("prefill: empty prompt");
@@ -706,7 +786,8 @@ impl Gemma4Engine {
 
                 g4::kv_append_prefill(
                     device, dtype, &k_normed, &v_normed,
-                    &mut self.k_caches[layer_idx], &mut self.v_caches[layer_idx],
+                    &mut self.k_caches[seq_idx][layer_idx],
+                    &mut self.v_caches[seq_idx][layer_idx],
                     seq_len, num_kv_heads, head_dim, 0, max_t,
                 )?;
 
@@ -714,12 +795,12 @@ impl Gemma4Engine {
                 for shared_layer in (layer_idx + 1)..num_layers {
                     let s = &self.layers[shared_layer];
                     if s.shared_kv && s.kv_source == layer_idx {
-                        let (lo, hi) = self.k_caches.split_at_mut(shared_layer);
+                        let (lo, hi) = self.k_caches[seq_idx].split_at_mut(shared_layer);
                         copy_kv_slots_range(device,
                             &lo[layer_idx], &mut hi[0],
                             num_kv_heads, max_t, head_dim, 0, seq_len,
                         )?;
-                        let (lo, hi) = self.v_caches.split_at_mut(shared_layer);
+                        let (lo, hi) = self.v_caches[seq_idx].split_at_mut(shared_layer);
                         copy_kv_slots_range(device,
                             &lo[layer_idx], &mut hi[0],
                             num_kv_heads, max_t, head_dim, 0, seq_len,
@@ -734,7 +815,7 @@ impl Gemma4Engine {
                 GpuBuffer::zeros(device, ScalarType::F32, &[seq_len, num_q_heads, max_t])?;
             g4::attn_prefill(
                 device, dtype, &q_normed,
-                &self.k_caches[layer_idx], &self.v_caches[layer_idx],
+                &self.k_caches[seq_idx][layer_idx], &self.v_caches[seq_idx][layer_idx],
                 &mut scores, &mut attn_out,
                 seq_len, num_q_heads, num_kv_heads, head_dim, 0, max_t,
                 sliding_window, 1.0,
@@ -855,12 +936,30 @@ impl Gemma4Engine {
         Ok(logits_host)
     }
 
-    /// Single decode step via the persistent megakernel. Writes new K/V slot
-    /// at `pos` in every non-shared layer's cache (shared layers read the
-    /// source's cache via descriptor aliasing). Returns softcapped logits.
+    /// Single decode step on sequence 0 (convenience wrapper for
+    /// `decode_step_seq(0, ...)` matching the original single-sequence API).
     pub fn decode_step(&mut self, input_token_id: u32, pos: usize) -> Result<Vec<f32>> {
+        self.decode_step_seq(0, input_token_id, pos)
+    }
+
+    /// Run one decode step on sequence `seq_idx` via the persistent
+    /// megakernel. Writes a new K/V slot at `pos` in every non-shared layer
+    /// of that sequence's caches; shared layers read the source's cache via
+    /// descriptor aliasing. Returns softcapped logits.
+    pub fn decode_step_seq(
+        &mut self,
+        seq_idx: usize,
+        input_token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>> {
+        if seq_idx >= self.batch_size {
+            bail!(
+                "decode_step_seq: seq_idx {seq_idx} >= batch_size {}",
+                self.batch_size
+            );
+        }
         if pos >= self.max_t {
-            bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
+            bail!("decode_step_seq: pos {pos} >= max_t {}", self.max_t);
         }
         let device = self.device;
         let dtype = ScalarType::BF16;
@@ -892,7 +991,7 @@ impl Gemma4Engine {
 
         g4::persistent_decode(
             device, dtype,
-            &self.layers_gpu,
+            &self.layers_gpu[seq_idx],
             &mut h_running,
             &pli_gpu,
             &mut self.mega_workspace,
@@ -918,6 +1017,69 @@ impl Gemma4Engine {
             *v = cap * (*v / cap).tanh();
         }
         Ok(logits_host)
+    }
+
+    /// Run one decode step on every sequence in the batch and return one set
+    /// of softcapped logits per sequence (`Vec<Vec<f32>>` length = batch_size).
+    ///
+    /// **Phase 1 implementation**: serially calls [`Self::decode_step_seq`]
+    /// for each sequence. Same throughput as B sequential single-sequence
+    /// runs — the API is in place but the perf win waits on the kernel-side
+    /// batched megakernel (Phase 2).
+    pub fn decode_step_batch(
+        &mut self,
+        input_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        if input_tokens.len() != self.batch_size {
+            bail!(
+                "decode_step_batch: got {} tokens, batch_size is {}",
+                input_tokens.len(),
+                self.batch_size
+            );
+        }
+        if positions.len() != self.batch_size {
+            bail!(
+                "decode_step_batch: got {} positions, batch_size is {}",
+                positions.len(),
+                self.batch_size
+            );
+        }
+        let mut out = Vec::with_capacity(self.batch_size);
+        for b in 0..self.batch_size {
+            out.push(self.decode_step_seq(b, input_tokens[b], positions[b])?);
+        }
+        Ok(out)
+    }
+
+    /// D2D-copy sequence 0's K/V cache contents into every other sequence's
+    /// caches. Use this immediately after [`Self::prefill`] when all `B`
+    /// sequences share the same prompt — much cheaper than running prefill
+    /// `B` times. The destination cache shapes match seq 0's (the engine
+    /// allocates them identically), so this is a straight per-layer
+    /// `[num_kv_heads, max_t, head_dim]` byte copy per sequence pair.
+    pub fn replicate_seq0_kv(&mut self) -> Result<()> {
+        if self.batch_size <= 1 {
+            return Ok(());
+        }
+        let num_layers = self.tcfg.num_hidden_layers;
+        let device = self.device;
+        // Snapshot seq 0 byte sizes per layer (they're invariant across seqs).
+        for l in 0..num_layers {
+            let bytes = self.k_caches[0][l].len_bytes();
+            let v_bytes = self.v_caches[0][l].len_bytes();
+            for b in 1..self.batch_size {
+                let src_k = self.k_caches[0][l].as_ptr();
+                let src_v = self.v_caches[0][l].as_ptr();
+                let dst_k = self.k_caches[b][l].as_mut_ptr();
+                let dst_v = self.v_caches[b][l].as_mut_ptr();
+                gpu_hal::copy_d2d(device, dst_k, src_k, bytes)
+                    .map_err(|e| anyhow!("replicate_seq0_kv k layer {l} → seq {b}: {e}"))?;
+                gpu_hal::copy_d2d(device, dst_v, src_v, v_bytes)
+                    .map_err(|e| anyhow!("replicate_seq0_kv v layer {l} → seq {b}: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Greedy sample — argmax.

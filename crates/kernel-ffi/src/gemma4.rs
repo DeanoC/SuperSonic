@@ -1685,6 +1685,46 @@ impl Default for Gemma4Int4ScaleDesc {
     }
 }
 
+/// Per-sequence state pointers for batched Gemma 4 decode.
+///
+/// One `Gemma4BatchSeqDesc` per layer (parallel array to
+/// [`Gemma4DecodeLayerDesc`]), holding per-sequence mutable state for up to
+/// [`crate::layer_desc::MAX_BATCH_SIZE`] sequences. Mirrors Qwen's
+/// [`crate::layer_desc::BatchSeqDesc`] but trimmed to Gemma 4's needs:
+/// no linear-attention (`conv_state` / `recurrent_state`), no FP8 KV
+/// (`kv_scale_*`), no BF16 shadow caches.
+///
+/// When `batch_size == 1` the kernel reads per-sequence state from the layer
+/// descriptor's own `kv_cache_k` / `kv_cache_v` and the scalar `position`
+/// argument — `batch_descs` is `nullptr`. When `batch_size > 1`, the kernel
+/// reads per-sequence pointers and offsets from this struct instead.
+///
+/// Shared-KV layers must alias the source layer's per-sequence cache pointers
+/// (i.e. `batch_descs[shared_layer].kv_cache_k[b] == batch_descs[source_layer].kv_cache_k[b]`)
+/// — replication across sequences is the engine's responsibility, not the
+/// kernel's.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Gemma4BatchSeqDesc {
+    /// Per-sequence position in the sequence (RoPE table lookup + KV write slot).
+    pub seqlen_offset: [c_int; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence K cache pointer (`[num_kv_heads, kv_max_t, head_dim]` BF16).
+    pub kv_cache_k: [*mut c_void; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence V cache pointer (`[num_kv_heads, kv_max_t, head_dim]` BF16).
+    pub kv_cache_v: [*mut c_void; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence allocated `T` dimension of the KV cache.
+    pub kv_max_t: [c_int; crate::layer_desc::MAX_BATCH_SIZE],
+}
+
+unsafe impl Send for Gemma4BatchSeqDesc {}
+unsafe impl Sync for Gemma4BatchSeqDesc {}
+
+impl Default for Gemma4BatchSeqDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Required F32 workspace (elements) for the persistent decode megakernel.
 /// Sized to the max of (fused_attn_block, fused_mlp_ple) needs across all
 /// layers — phase A and phase B run sequentially within each layer and share
