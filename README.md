@@ -36,6 +36,7 @@ CUDA KV-FP8 is currently a debug-only surface:
 - exercised on the real persistent kernel path with `--force-kernel-decode`
 - checked against the CPU oracle, not presented as a general CUDA v1 feature
 - the BF16 KV sidecar is a bring-up aid for parity-sensitive reads/debugging, not part of normal BF16 CUDA runs
+- normal CUDA BF16 runs do not allocate or use the sidecar
 - the sidecar can be disabled for A/B work with `SUPERSONIC_DEBUG_DISABLE_KV_FP8_BF16_SIDECAR=1`
 
 CUDA batched decode is currently validated only for:
