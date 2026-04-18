@@ -22,6 +22,24 @@ unsafe extern "C" {
         rotary_dim: usize,
     ) -> c_int;
 
+    fn dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_dim: usize,
+        intermediate_size: usize,
+        seqlen_offset: usize,
+        layers: *const c_void,
+        hidden_io: *mut c_void,
+        workspace: *mut c_void,
+        counters: *mut c_void,
+        barrier_counter: *mut c_void,
+        barrier_flag: *mut c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        rotary_dim: usize,
+    ) -> c_int;
+
     fn dotcache_qwen35_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
@@ -111,6 +129,27 @@ unsafe extern "C" {
         arch_name_out: *mut u8,
         arch_name_len: usize,
         total_vram_out: *mut u64,
+    ) -> c_int;
+}
+
+#[cfg(supersonic_backend_cuda)]
+unsafe extern "C" {
+    fn dotcache_qwen35_cuda_argmax_bf16(
+        device_ordinal: usize,
+        n: usize,
+        logits: *const c_void,
+        out_index: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_cuda_lm_head_argmax_bf16(
+        device_ordinal: usize,
+        hidden_dim: usize,
+        vocab_size: usize,
+        hidden: *const c_void,
+        weight: *const c_void,
+        block_best_vals: *mut c_void,
+        block_best_idxs: *mut c_void,
+        out_index: *mut c_void,
     ) -> c_int;
 }
 
@@ -206,6 +245,70 @@ pub fn persistent_decode(
     };
     if status != 0 {
         return Err(backend_error(backend, "persistent_decode kernel", status));
+    }
+    Ok(())
+}
+
+pub fn persistent_decode_qwen08_hero(
+    ordinal: usize,
+    dtype: ScalarType,
+    num_layers: usize,
+    hidden_dim: usize,
+    intermediate_size: usize,
+    seqlen_offset: usize,
+    layer_descs_device: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    rotary_dim: usize,
+) -> Result<(), GpuError> {
+    let backend = layer_descs_device.backend();
+    let counters = sync_buf.as_mut_ptr();
+    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
+    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
+
+    let status = match backend {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    num_layers,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_descs_device.as_ptr(),
+                    hidden_io.as_mut_ptr(),
+                    workspace.as_mut_ptr(),
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    cos_table.as_ptr(),
+                    sin_table.as_ptr(),
+                    rotary_dim,
+                )
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_qwen08_hero is CUDA-only".into(),
+            ))
+        }
+    };
+
+    if status != 0 {
+        return Err(backend_error(
+            backend,
+            "persistent_decode_qwen08_hero kernel",
+            status,
+        ));
     }
     Ok(())
 }
@@ -331,6 +434,127 @@ pub fn persistent_decode_4b(
         return Err(backend_error(backend, "persistent_decode_4b kernel", status));
     }
     Ok(())
+}
+
+pub fn cuda_argmax_bf16(
+    ordinal: usize,
+    logits: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+    n: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Cuda || out_index.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "cuda_argmax_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_argmax_bf16 requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "cuda_argmax_bf16 requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_argmax_bf16(
+            ordinal,
+            n,
+            logits.as_ptr(),
+            out_index.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_argmax_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, logits, out_index, n);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn cuda_lm_head_argmax_bf16(
+    ordinal: usize,
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    block_best_vals: &mut GpuBuffer,
+    block_best_idxs: &mut GpuBuffer,
+    out_index: &mut GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if hidden.backend() != Backend::Cuda
+        || weight.backend() != Backend::Cuda
+        || block_best_vals.backend() != Backend::Cuda
+        || block_best_idxs.backend() != Backend::Cuda
+        || out_index.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_argmax_bf16 requires BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    if block_best_vals.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16 requires F32 block_best_vals".into(),
+        ));
+    }
+    if block_best_idxs.dtype() != ScalarType::U32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16 requires U32 block_best_idxs".into(),
+        ));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16 requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_lm_head_argmax_bf16(
+            ordinal,
+            hidden_dim,
+            vocab_size,
+            hidden.as_ptr(),
+            weight.as_ptr(),
+            block_best_vals.as_mut_ptr(),
+            block_best_idxs.as_mut_ptr(),
+            out_index.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_lm_head_argmax_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            hidden,
+            weight,
+            block_best_vals,
+            block_best_idxs,
+            out_index,
+            hidden_dim,
+            vocab_size,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
 }
 
 /// 4B variant of RMSNorm (same logic, separate compilation).

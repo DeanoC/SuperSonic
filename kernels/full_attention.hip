@@ -59,6 +59,9 @@ struct Qwen35DecodeLayerDesc {
     void* kv_cache_v;                  // [num_kv_heads, max_T, head_dim] BF16 mutable
     int kv_len;                        // current cache length before this token
     int kv_max_t;                      // allocated T dimension of KV cache
+    void* kv_shadow_k;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
+    void* kv_shadow_v;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
+    int kv_shadow_start;               // first position covered by the sidecar, -1 when disabled
 };
 
 template <typename T>

@@ -1,4 +1,5 @@
 use std::ffi::c_void;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -100,6 +101,9 @@ pub struct DecodeEngine {
     hidden_io: GpuBuffer,
     normed_buf: GpuBuffer,
     logits_buf: GpuBuffer,
+    argmax_buf: GpuBuffer,
+    lm_head_block_best_vals: GpuBuffer,
+    lm_head_block_best_idxs: GpuBuffer,
     matvec_counter: GpuBuffer,
     ordinal: usize,
     kv_chunk_size: usize,
@@ -116,6 +120,52 @@ pub struct DecodeEngine {
     kv_fp8: bool,
     /// Batch size (1 = single-sequence, default).
     batch_size: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecodeSamplingMode {
+    HostLogits,
+    CudaFastGreedy,
+    CudaHeroFusedLmHead,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DecodeStageTimings {
+    pub persistent_ms: f64,
+    pub rms_norm_ms: f64,
+    pub lm_head_ms: f64,
+    pub logits_d2h_ms: f64,
+    pub host_sampling_ms: f64,
+    pub gpu_argmax_ms: f64,
+    pub token_d2h_ms: f64,
+}
+
+impl DecodeStageTimings {
+    pub fn add_assign(&mut self, rhs: Self) {
+        self.persistent_ms += rhs.persistent_ms;
+        self.rms_norm_ms += rhs.rms_norm_ms;
+        self.lm_head_ms += rhs.lm_head_ms;
+        self.logits_d2h_ms += rhs.logits_d2h_ms;
+        self.host_sampling_ms += rhs.host_sampling_ms;
+        self.gpu_argmax_ms += rhs.gpu_argmax_ms;
+        self.token_d2h_ms += rhs.token_d2h_ms;
+    }
+
+    pub fn total_ms(&self) -> f64 {
+        self.persistent_ms
+            + self.rms_norm_ms
+            + self.lm_head_ms
+            + self.logits_d2h_ms
+            + self.host_sampling_ms
+            + self.gpu_argmax_ms
+            + self.token_d2h_ms
+    }
+}
+
+pub struct DecodeStepOutput {
+    pub logits: Option<Vec<f32>>,
+    pub sampled_token: u32,
+    pub timings: DecodeStageTimings,
 }
 
 pub struct ComponentLayerTrace {
@@ -1998,6 +2048,12 @@ impl DecodeEngine {
         let logits_buf =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.vocab_size])
                 .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
+        let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
+        let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
+            .map_err(|e| anyhow::anyhow!("lm_head_block_best_vals: {e}"))?;
+        let lm_head_block_best_idxs = GpuBuffer::zeros(ordinal, ScalarType::U32, &[512])
+            .map_err(|e| anyhow::anyhow!("lm_head_block_best_idxs: {e}"))?;
         let matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("matvec_counter: {e}"))?;
 
@@ -2048,6 +2104,9 @@ impl DecodeEngine {
             hidden_io,
             normed_buf,
             logits_buf,
+            argmax_buf,
+            lm_head_block_best_vals,
+            lm_head_block_best_idxs,
             matvec_counter,
             ordinal,
             kv_chunk_size,
@@ -2174,13 +2233,14 @@ impl DecodeEngine {
         Ok(result)
     }
 
-    /// Run one decode step. Returns logits as Vec<f32> on CPU.
-    pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
-        if self.use_4b_kernel {
-            return self.component_decode_step_4b(token_id, seqlen_offset);
-        }
-
+    fn decode_step_non_4b(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        sampling_mode: DecodeSamplingMode,
+    ) -> Result<DecodeStepOutput> {
         let config = &self.weights.config;
+        let mut timings = DecodeStageTimings::default();
 
         // 1. Embedding lookup: copy one row from embed_tokens into hidden_io
         let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
@@ -2230,8 +2290,9 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset decode sync: {e}"))?;
 
         // 5. Launch persistent decode kernel (dispatch by model variant)
-        if self.use_4b_kernel {
-            kernel_ffi::persistent_decode_4b(
+        let start = Instant::now();
+        let persist_result = if sampling_mode == DecodeSamplingMode::CudaHeroFusedLmHead {
+            kernel_ffi::persistent_decode_qwen08_hero(
                 self.ordinal,
                 ScalarType::BF16,
                 config.num_hidden_layers,
@@ -2245,15 +2306,7 @@ impl DecodeEngine {
                 &self.rotary.cos,
                 &self.rotary.sin,
                 self.rotary.rotary_dim,
-                self.proj_buf_floats,
-                self.attn_scratch_floats,
-                self.fp8_scale_device.as_ref(),
-                self.scratch.kv_fp8_desc_device.as_ref(),
-                1, // batch_size=1 for single-sequence decode
-                None,
-                self.int4_scale_device.as_ref(),
             )
-            .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
         } else {
             kernel_ffi::persistent_decode(
                 self.ordinal,
@@ -2270,8 +2323,10 @@ impl DecodeEngine {
                 &self.rotary.sin,
                 self.rotary.rotary_dim,
             )
+        };
+        persist_result
             .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
-        }
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // 6. Update KV filled counts
         let filled = seqlen_offset + 1;
@@ -2282,8 +2337,8 @@ impl DecodeEngine {
         }
 
         // 7. Final RMSNorm
-        let rms_norm_fn = if self.use_4b_kernel { kernel_ffi::rms_norm_4b } else { kernel_ffi::rms_norm };
-        rms_norm_fn(
+        let start = Instant::now();
+        kernel_ffi::rms_norm(
             self.ordinal,
             ScalarType::BF16,
             &mut self.normed_buf,
@@ -2293,32 +2348,173 @@ impl DecodeEngine {
             config.hidden_size,
         )
         .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
+        timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        // 8. lm_head projection → logits (work-stealing matvec)
-        let matvec_fn = if self.use_4b_kernel { kernel_ffi::standalone_matvec_4b } else { kernel_ffi::standalone_matvec };
-        matvec_fn(
-            self.ordinal,
-            ScalarType::BF16,
-            &mut self.logits_buf,
-            &self.normed_buf,
-            &*self.weights.lm_head,
-            config.hidden_size,
-            config.vocab_size,
-            &mut self.matvec_counter,
-        )
-        .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+        match sampling_mode {
+            DecodeSamplingMode::CudaHeroFusedLmHead => {
+                let start = Instant::now();
+                kernel_ffi::cuda_lm_head_argmax_bf16(
+                    self.ordinal,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    &mut self.lm_head_block_best_vals,
+                    &mut self.lm_head_block_best_idxs,
+                    &mut self.argmax_buf,
+                    config.hidden_size,
+                    config.vocab_size,
+                )
+                .map_err(|e| anyhow::anyhow!("cuda fused lm_head argmax: {e}"))?;
+                timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
-        // 9. Copy logits to CPU and convert BF16 → F32
-        let logits_bytes = self
-            .logits_buf
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
-        let logits_f32: Vec<f32> = logits_bytes
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect();
+                let start = Instant::now();
+                let token_bytes = self
+                    .argmax_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
+                timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let sampled_token = u32::from_le_bytes(
+                    token_bytes[..4]
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
+                );
 
-        Ok(logits_f32)
+                Ok(DecodeStepOutput {
+                    logits: None,
+                    sampled_token,
+                    timings,
+                })
+            }
+            DecodeSamplingMode::CudaFastGreedy | DecodeSamplingMode::HostLogits => {
+                // 8. lm_head projection → logits (work-stealing matvec)
+                let start = Instant::now();
+                kernel_ffi::standalone_matvec(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &mut self.logits_buf,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    config.hidden_size,
+                    config.vocab_size,
+                    &mut self.matvec_counter,
+                )
+                .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+                timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                if sampling_mode == DecodeSamplingMode::CudaFastGreedy {
+                    let start = Instant::now();
+                    kernel_ffi::cuda_argmax_bf16(
+                        self.ordinal,
+                        &self.logits_buf,
+                        &mut self.argmax_buf,
+                        config.vocab_size,
+                    )
+                    .map_err(|e| anyhow::anyhow!("cuda argmax: {e}"))?;
+                    timings.gpu_argmax_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                    let start = Instant::now();
+                    let token_bytes = self
+                        .argmax_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
+                    timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let sampled_token = u32::from_le_bytes(
+                        token_bytes[..4]
+                            .try_into()
+                            .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
+                    );
+
+                    return Ok(DecodeStepOutput {
+                        logits: None,
+                        sampled_token,
+                        timings,
+                    });
+                }
+
+                // 9. Copy logits to CPU and convert BF16 → F32
+                let start = Instant::now();
+                let logits_bytes = self
+                    .logits_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
+                timings.logits_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                let start = Instant::now();
+                let logits_f32: Vec<f32> = logits_bytes
+                    .chunks_exact(2)
+                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                    .collect();
+                let sampled_token = Self::greedy_sample(&logits_f32);
+                timings.host_sampling_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                Ok(DecodeStepOutput {
+                    logits: Some(logits_f32),
+                    sampled_token,
+                    timings,
+                })
+            }
+        }
+    }
+
+    /// Run one decode step and return logits on CPU. Stage timings are only
+    /// populated for the non-4B native decode path.
+    pub fn decode_step_with_timings(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        if self.use_4b_kernel {
+            let logits = self.component_decode_step_4b(token_id, seqlen_offset)?;
+            return Ok((logits, DecodeStageTimings::default()));
+        }
+        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::HostLogits)?;
+        let logits = out
+            .logits
+            .ok_or_else(|| anyhow::anyhow!("decode_step_with_timings missing logits"))?;
+        Ok((logits, out.timings))
+    }
+
+    /// CUDA-only fast greedy path for the non-4B single-sequence decode path.
+    /// Returns the sampled token without copying full logits to the host.
+    pub fn decode_step_cuda_fast_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.use_4b_kernel {
+            anyhow::bail!("decode_step_cuda_fast_greedy only supports the non-4B path");
+        }
+        if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
+            anyhow::bail!("decode_step_cuda_fast_greedy requires CUDA backend");
+        }
+        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::CudaFastGreedy)?;
+        Ok((out.sampled_token, out.timings))
+    }
+
+    /// CUDA-only sm86/qwen3.5-0.8b hero path for the non-4B single-sequence decode path.
+    /// Returns the sampled token without materializing logits on the host.
+    pub fn decode_step_cuda_08b_hero(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.use_4b_kernel {
+            anyhow::bail!("decode_step_cuda_08b_hero only supports the non-4B path");
+        }
+        if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
+            anyhow::bail!("decode_step_cuda_08b_hero requires CUDA backend");
+        }
+        let out = self.decode_step_non_4b(
+            token_id,
+            seqlen_offset,
+            DecodeSamplingMode::CudaHeroFusedLmHead,
+        )?;
+        Ok((out.sampled_token, out.timings))
+    }
+
+    /// Run one decode step. Returns logits as Vec<f32> on CPU.
+    pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
+        let (logits, _) = self.decode_step_with_timings(token_id, seqlen_offset)?;
+        Ok(logits)
     }
 
     /// Greedy argmax over logits.

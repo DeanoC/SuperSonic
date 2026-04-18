@@ -4412,14 +4412,18 @@ int persistent_decode_device(
     unsigned int* barrier_flag,
     const void* cos_table,
     const void* sin_table,
-    int rotary_dim
+    int rotary_dim,
+    int hero_mode,
+    int num_blocks_override
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    const int num_blocks = num_blocks_override > 0
+        ? num_blocks_override
+        : (props.multiProcessorCount > 0 ? props.multiProcessorCount : 16);
     constexpr int block_size = 256;
     // LDS layout: [block_size] reduction scratch + [intermediate_size] input vector cache
     const size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
@@ -4446,7 +4450,8 @@ int persistent_decode_device(
         barrier_flag,
         static_cast<const T*>(cos_table),
         static_cast<const T*>(sin_table),
-        rotary_dim);
+        rotary_dim,
+        hero_mode);
     cudaError_t launch_err = cudaGetLastError();
     cudaError_t sync_err = cudaDeviceSynchronize();
     if (launch_err != cudaSuccess) return 254;
@@ -4480,7 +4485,39 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
             static_cast<int>(seqlen_offset),
             layers, hidden_io, workspace, counters,
             barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim));
+            cos_table, sin_table, static_cast<int>(rotary_dim), 0, 0);
+    default:
+        return 256;
+    }
+}
+
+extern "C" int dotcache_qwen35_cuda_persistent_decode_qwen08_hero(
+    int dtype,
+    size_t device_ordinal,
+    size_t num_layers,
+    size_t hidden_dim,
+    size_t intermediate_size,
+    size_t seqlen_offset,
+    const void* layers,
+    void* hidden_io,
+    float* workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    const void* cos_table,
+    const void* sin_table,
+    size_t rotary_dim) {
+    switch (dtype) {
+    case 2:
+        return persistent_decode_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(num_layers),
+            static_cast<int>(hidden_dim),
+            static_cast<int>(intermediate_size),
+            static_cast<int>(seqlen_offset),
+            layers, hidden_io, workspace, counters,
+            barrier_counter, barrier_flag,
+            cos_table, sin_table, static_cast<int>(rotary_dim), 1, 82);
     default:
         return 256;
     }

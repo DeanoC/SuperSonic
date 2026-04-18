@@ -143,6 +143,8 @@ Each `sm86` script currently validates:
 - golden corpus coverage
 
 `tests/sm86/run_batch.sh` adds `qwen3.5-4b --batch-size 2` coverage on the same `sm86` target.
+`tests/sm86/run_fast_greedy.sh` checks that the CUDA fast-greedy 0.8B path
+matches the legacy host-logits sampling path on short, medium, and long prompts.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference
@@ -173,6 +175,28 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
   /path/to/Qwen3.5-0.8B \
   /path/to/Qwen3.5-4B
 ```
+
+For a warmed Lucebox-style `qwen3.5-0.8b` parity run on `sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen08.sh \
+  /path/to/Qwen3.5-0.8B
+```
+
+That harness defaults to batch-1 BF16, a roughly `pp520` prompt target,
+`tg128`, `10` warmup runs, `20` timed runs, and prints aggregated native decode
+stage timings from `--emit-stage-timings`.
+
+For a one-token Nsight Compute pass over the non-4B persistent decode kernel on
+`sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/profile_qwen08_decode.sh \
+  /path/to/Qwen3.5-0.8B
+```
+
+Set `PROFILE_MODE=fast` to disable the hero path while keeping CUDA fast-greedy,
+or `PROFILE_MODE=legacy` to force the old host-logits decode path.
 
 Current behavior on this `sm86` box now depends on whether the path is using replayed prefill for correctness.
 With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
