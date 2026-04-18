@@ -160,20 +160,15 @@ fn run(
         // occurrence in the cumulative output, emit the trimmed portion,
         // and break.
         if let Some(stop_at) = find_earliest_stop(&decoded, &params.stop) {
-            let delta = decoded[..stop_at]
-                .strip_prefix(prev_decoded.as_str())
-                .unwrap_or("")
-                .to_string();
+            let trimmed = &decoded[..stop_at];
+            let delta = incremental_delta(&prev_decoded, trimmed);
             if !delta.is_empty() {
                 let _ = tx.send(GenEvent::Token(delta));
             }
             break FinishReason::Stop;
         }
 
-        let delta = decoded
-            .strip_prefix(prev_decoded.as_str())
-            .unwrap_or(&decoded[prev_decoded.len().min(decoded.len())..])
-            .to_string();
+        let delta = incremental_delta(&prev_decoded, &decoded);
         prev_decoded = decoded;
 
         if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
@@ -203,6 +198,29 @@ fn detokenize(tokenizer: &Tokenizer, ids: &[u32]) -> String {
     tokenizer.decode(ids, true).unwrap_or_default()
 }
 
+/// Produce the new output text that should be emitted as a delta, given
+/// the previously-emitted cumulative text `prev` and the latest
+/// cumulative decode `now`. Always slices at UTF-8 char boundaries, even
+/// when `prev` is not a strict byte prefix of `now` (which can happen if
+/// the tokenizer renormalizes across steps — a multi-byte codepoint
+/// composing across a token boundary, for instance).
+fn incremental_delta(prev: &str, now: &str) -> String {
+    if let Some(rest) = now.strip_prefix(prev) {
+        return rest.to_string();
+    }
+    // Walk aligned codepoints until `prev` and `now` diverge; slice at
+    // the last matching char boundary. Safe against non-prefix cases.
+    let mut common_bytes = 0usize;
+    let mut prev_chars = prev.chars();
+    for (idx, ch) in now.char_indices() {
+        match prev_chars.next() {
+            Some(pc) if pc == ch => common_bytes = idx + ch.len_utf8(),
+            _ => break,
+        }
+    }
+    now[common_bytes..].to_string()
+}
+
 /// Return the lowest byte offset at which any non-empty stop string first
 /// occurs in `text`, or `None` if none match. Note that BPE tokens can
 /// straddle a stop string — e.g. stop="Hello" with tokens ["Hel","lo"]
@@ -220,16 +238,20 @@ fn find_earliest_stop(text: &str, stops: &[String]) -> Option<usize> {
 
 /// Drain the full event stream and return the concatenated text plus the
 /// terminating event. Used by non-streaming responses.
+///
+/// A channel that closes without a terminal `Done` or `Error` is treated
+/// as an error — otherwise a panic inside the `spawn_blocking` task would
+/// silently produce a 200 response with empty content.
 pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedResult> {
     let mut text = String::new();
-    let mut finish = FinishReason::Stop;
+    let mut finish: Option<FinishReason> = None;
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0;
     while let Some(ev) = rx.recv().await {
         match ev {
             GenEvent::Token(s) => text.push_str(&s),
             GenEvent::Done { reason, prompt_tokens: p, completion_tokens: c } => {
-                finish = reason;
+                finish = Some(reason);
                 prompt_tokens = p;
                 completion_tokens = c;
                 break;
@@ -237,6 +259,9 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
             GenEvent::Error(msg) => return Err(anyhow!(msg)),
         }
     }
+    let finish = finish.ok_or_else(|| anyhow!(
+        "generation task ended without a terminal event (likely panicked)"
+    ))?;
     Ok(CollectedResult {
         text,
         finish,
@@ -254,3 +279,52 @@ pub struct CollectedResult {
 
 /// Re-export kept so downstream route modules can name the session type.
 pub type Session = InferenceSession;
+
+#[cfg(test)]
+mod tests {
+    use super::incremental_delta;
+
+    #[test]
+    fn prefix_case_returns_suffix() {
+        assert_eq!(incremental_delta("Hello", "Hello, world"), ", world");
+    }
+
+    #[test]
+    fn identical_returns_empty() {
+        assert_eq!(incremental_delta("abc", "abc"), "");
+    }
+
+    #[test]
+    fn prev_longer_returns_empty() {
+        // Renormalization shortened the cumulative decode — safest delta is
+        // empty (we can't retract already-emitted text).
+        assert_eq!(incremental_delta("Hello!", "Hello"), "");
+    }
+
+    #[test]
+    fn multibyte_divergence_slices_on_char_boundary() {
+        // `prev` ends inside a multi-byte codepoint of `now`: naïve byte
+        // slicing would panic. Must slice at the codepoint boundary.
+        let prev = "caf";
+        let now = "café world";
+        let out = incremental_delta(prev, now);
+        assert_eq!(out, "é world");
+    }
+
+    #[test]
+    fn non_prefix_multibyte_walks_to_common_boundary() {
+        // The tokenizer renormalized the last character. `prev` is not a
+        // strict byte prefix. Fallback must still slice on a boundary.
+        let prev = "naïve";
+        let now = "naïvely";
+        let out = incremental_delta(prev, now);
+        assert_eq!(out, "ly");
+    }
+
+    #[test]
+    fn fully_divergent_emits_full_now() {
+        let prev = "foo";
+        let now = "bar";
+        assert_eq!(incremental_delta(prev, now), "bar");
+    }
+}
