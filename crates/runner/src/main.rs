@@ -130,6 +130,111 @@ struct Cli {
     /// been explicitly tuned.
     #[arg(long)]
     allow_untested_gpu: Option<String>,
+
+    /// Disable downloading pre-baked weights from GitHub releases when the
+    /// local bake is missing. Prints the "run bake_int4.py" error instead of
+    /// touching the network. Use on air-gapped machines.
+    #[arg(long)]
+    no_download: bool,
+
+    /// Force downloading a pre-baked package even if a valid local bake exists.
+    /// Useful for reproducing release content on a big-box producer.
+    #[arg(long)]
+    download_bake: bool,
+
+    /// Override the GitHub release to fetch pre-baked weights from. Accepts a
+    /// bare tag (e.g. "bakes-v1") or a full release URL. Also readable from
+    /// the `SUPERSONIC_BAKE_RELEASE` env var.
+    #[arg(long)]
+    bake_release: Option<String>,
+}
+
+/// Resolve the release source from CLI flags and env var.
+fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
+    let raw = cli
+        .bake_release
+        .clone()
+        .or_else(|| std::env::var("SUPERSONIC_BAKE_RELEASE").ok());
+    match raw {
+        Some(s) if !s.is_empty() => model_store::fetch::ReleaseSource::from_override(&s)
+            .map_err(|e| anyhow::anyhow!("invalid --bake-release: {e}")),
+        _ => Ok(model_store::fetch::ReleaseSource::default_for_format_version()),
+    }
+}
+
+/// Pretty-print fetch progress. Throttles the per-byte update so the log
+/// doesn't flood; prints on each ~5% crossing or on part transitions.
+fn log_fetch_progress() -> impl Fn(model_store::fetch::FetchProgress) {
+    use std::cell::Cell;
+    let last_pct = Cell::new(i32::MIN);
+    let last_part = Cell::new(u32::MAX);
+    move |p| {
+        use model_store::fetch::FetchProgress::*;
+        match p {
+            ResolvingIndex => eprintln!("[fetch] resolving release index..."),
+            Downloading {
+                part,
+                total_parts,
+                bytes_done,
+                bytes_total,
+            } => {
+                let pct = if bytes_total > 0 {
+                    (bytes_done * 100 / bytes_total) as i32
+                } else {
+                    0
+                };
+                if part != last_part.get() {
+                    last_part.set(part);
+                    last_pct.set(i32::MIN);
+                    eprintln!(
+                        "[fetch] downloading part {part}/{total_parts} ({} MiB)",
+                        bytes_total / (1024 * 1024)
+                    );
+                }
+                if pct / 5 != last_pct.get() / 5 {
+                    last_pct.set(pct);
+                    eprintln!(
+                        "[fetch]   {pct}% ({} / {} MiB)",
+                        bytes_done / (1024 * 1024),
+                        bytes_total / (1024 * 1024)
+                    );
+                }
+            }
+            Verifying => eprintln!("[fetch] verifying SHA-256..."),
+            Extracting => eprintln!("[fetch] extracting tarball..."),
+            Done => eprintln!("[fetch] done"),
+        }
+    }
+}
+
+/// Attempt to download a bake. Returns `Ok(true)` if the download succeeded
+/// and the bake is now present; `Ok(false)` if downloads are disabled by
+/// `--no-download`; `Err` on any fetch error (with an instructive message).
+fn try_download_bake(
+    cli: &Cli,
+    variant: model_store::fetch::BakeVariant,
+    model_cli_name: &str,
+    target: &std::path::Path,
+) -> Result<bool> {
+    if cli.no_download {
+        return Ok(false);
+    }
+    let source = resolve_release_source(cli)?;
+    eprintln!(
+        "[fetch] downloading {model_cli_name} {variant} from {}/{}",
+        source.repo_slug, source.tag
+    );
+    let progress = log_fetch_progress();
+    let req = model_store::fetch::FetchRequest {
+        source: &source,
+        model_cli_name,
+        variant,
+        target_bake_dir: target,
+        progress: &progress,
+    };
+    model_store::fetch::fetch_bake(req)
+        .map_err(|e| anyhow::anyhow!("fetch bake: {e}"))?;
+    Ok(true)
 }
 
 fn main() -> Result<()> {
@@ -278,46 +383,78 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
     } else {
-        // Select bake directory: INT4 > FP8-native > BF16 (priority order)
-        let bake_dir = if cli.int4 {
-            model_store::bake_dir_int4(&cli.model_dir)
+        // Select bake directory + variant: INT4 > FP8-native > BF16 (priority order)
+        let variant = if cli.int4 {
+            model_store::fetch::BakeVariant::Int4Gptq
         } else if cli.fp8_runtime {
-            model_store::bake_dir_fp8(&cli.model_dir)
+            model_store::fetch::BakeVariant::Fp8Native
         } else {
-            model_store::bake_dir(&cli.model_dir)
+            model_store::fetch::BakeVariant::Bf16
         };
-        if !model_store::version_ok(&bake_dir) {
-            if cli.int4 {
-                anyhow::bail!(
-                    "no INT4 baked package found at {}\n\n\
-                     INT4 baking requires a GPTQ calibration pass in Python. \
-                     Run:\n  python oracle/bake_int4.py --model-dir {}\n\n\
-                     This is a one-time developer step (requires torch, transformers, \
-                     and datasets — installs via `pip install torch transformers datasets`). \
-                     Calibration takes ~5-30 min depending on model size and GPU.",
-                    bake_dir.display(),
-                    cli.model_dir.display(),
-                );
+        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
+
+        if cli.download_bake || !model_store::version_ok(&bake_dir) {
+            // Choose provisioning strategy: for BF16 we have a local baker;
+            // for INT4/FP8-native (Qwen) the only way to get a bake is to
+            // download or run the Python baker manually.
+            let local_bake_ok = matches!(variant, model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native);
+            let canonical_model = model_variant.to_string();
+            let downloaded = try_download_bake(&cli, variant, &canonical_model, &bake_dir);
+            match downloaded {
+                Ok(true) => {
+                    eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
+                }
+                Ok(false) => {
+                    if local_bake_ok {
+                        // --no-download: fall through to local bake below.
+                    } else {
+                        anyhow::bail!(
+                            "no {variant} bake at {} and --no-download set.\n\
+                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
+                            bake_dir.display(),
+                            cli.model_dir.display(),
+                        );
+                    }
+                }
+                Err(e) => {
+                    if local_bake_ok {
+                        eprintln!("[fetch] {e}; falling back to local bake");
+                    } else {
+                        anyhow::bail!(
+                            "could not obtain {variant} bake: {e}\n\n\
+                             INT4 baking requires a GPTQ calibration pass in Python. \
+                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}\n\n\
+                             then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
+                            cli.model_dir.display(),
+                            cli.model,
+                            cli.model_dir.display(),
+                        );
+                    }
+                }
             }
-            let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
-            eprintln!("[bake] no baked package found — baking weights{mode_str} (one-time)...");
-            let bake_start = Instant::now();
-            let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
-                .map(|i| text_config.is_full_attention(i))
-                .collect();
-            model_store::bake_qwen35(
-                &cli.model_dir,
-                params.weight_prefix,
-                text_config.num_hidden_layers,
-                &layer_is_full,
-                cli.fp8_runtime,
-                &|msg| eprintln!("{msg}"),
-            )
-            .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
-            eprintln!(
-                "[bake] done in {:.1}s",
-                bake_start.elapsed().as_secs_f64()
-            );
+
+            if !model_store::version_ok(&bake_dir) && local_bake_ok {
+                let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
+                eprintln!(
+                    "[bake] no baked package found — baking weights{mode_str} (one-time)..."
+                );
+                let bake_start = Instant::now();
+                let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
+                    .map(|i| text_config.is_full_attention(i))
+                    .collect();
+                model_store::bake_qwen35(
+                    &cli.model_dir,
+                    params.weight_prefix,
+                    text_config.num_hidden_layers,
+                    &layer_is_full,
+                    cli.fp8_runtime,
+                    &|msg| eprintln!("{msg}"),
+                )
+                .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+                eprintln!("[bake] done in {:.1}s", bake_start.elapsed().as_secs_f64());
+            }
         } else {
             eprintln!("[weights] found baked package at {}", bake_dir.display());
         }
@@ -697,13 +834,39 @@ fn run_gemma4(
     // chain for decode instead of the persistent megakernel.
     let t0 = Instant::now();
     let mut engine: Gemma4Runtime = if cli.int4 {
-        if !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
-            anyhow::bail!(
-                "No INT4 bake at {}. Run first:\n  \
-                 python oracle/bake_int4_gemma4.py --model-dir {}",
-                gemma4_int4_engine::int4_bake_dir(&cli.model_dir).display(),
-                cli.model_dir.display()
-            );
+        let target = gemma4_int4_engine::int4_bake_dir(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
+        if cli.download_bake || !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
+            let canonical_model = model_variant.to_string();
+            match try_download_bake(
+                cli,
+                model_store::fetch::BakeVariant::Int4Gptq,
+                &canonical_model,
+                &target,
+            ) {
+                Ok(true) => eprintln!("[fetch] installed Gemma 4 INT4 bake at {}", target.display()),
+                Ok(false) => {
+                    anyhow::bail!(
+                        "No INT4 bake at {} and --no-download set.\n\
+                         Run on a bigger machine:\n  \
+                         python oracle/bake_int4_gemma4.py --model-dir {}",
+                        target.display(),
+                        cli.model_dir.display(),
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "could not obtain Gemma 4 INT4 bake: {e}\n\n\
+                         Run on a bigger machine:\n  \
+                         python oracle/bake_int4_gemma4.py --model-dir {}\n\
+                         then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
+                        cli.model_dir.display(),
+                        cli.model,
+                        cli.model_dir.display(),
+                    );
+                }
+            }
         }
         eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
         Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load(

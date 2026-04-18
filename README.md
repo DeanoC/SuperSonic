@@ -20,6 +20,38 @@ cargo run --release --bin supersonic -- \
 
 On first run, SuperSonic bakes the HuggingFace safetensors into an optimized format at `{model_dir}/.supersonic/v1/`. Subsequent runs load from this baked format for faster startup.
 
+If a local bake isn't possible (e.g. INT4 calibration OOMs on small-VRAM hardware), SuperSonic auto-downloads a pre-baked package from the repo's GitHub releases. Pass `--no-download` to disable. See `docs/bake-distribution.md` for how producers publish bakes with `oracle/upload_bake.py`.
+
+## Producing and publishing bakes (big-box producer)
+
+On a machine with enough VRAM/RAM for GPTQ calibration, run `oracle/bake_all.sh`
+to bake everything you have weights for and upload each to the GitHub release
+as it finishes. Unset env vars are silently skipped, so this command is the
+"everything" reference — set whichever dirs you have and copy-paste:
+
+```bash
+pip install -r oracle/requirements-upload.txt   # one-time: zstandard
+gh auth login                                   # one-time: gh CLI
+
+QWEN_0_8B_DIR=/models/Qwen3.5-0.8B \
+QWEN_2B_DIR=/models/Qwen3.5-2B \
+QWEN_4B_DIR=/models/Qwen3.5-4B \
+QWEN_9B_DIR=/models/Qwen3.5-9B \
+GEMMA_E2B_DIR=/models/gemma-4-E2B \
+GEMMA_E4B_DIR=/models/gemma-4-E4B \
+./oracle/bake_all.sh --upload
+```
+
+By default this produces INT4-GPTQ bakes for every configured model. Add
+`--bf16` to also publish Qwen BF16 bakes, `--force` to re-bake, or drop
+`--upload` to bake locally without publishing. Both Python bakers checkpoint
+per-layer, so an interrupted run resumes cleanly. The producer can be any
+arch — a CUDA machine's output loads on a HIP consumer byte-for-byte (see
+`docs/bake-distribution.md`).
+
+As new models are added to the registry, extend the `MODELS` table at the top
+of `oracle/bake_all.sh` so this command keeps working as the one-stop batch.
+
 ## E2E Tests
 
 Tests are machine-specific — each GPU architecture has its own test script under `tests/`. A test runs the full decode pipeline with PyTorch oracle validation and checks that the output delta is below a threshold.

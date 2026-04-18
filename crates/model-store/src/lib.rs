@@ -2,6 +2,7 @@ pub mod manifest;
 pub mod transforms;
 pub mod baker;
 pub mod store;
+pub mod fetch;
 
 use std::path::{Path, PathBuf};
 
@@ -66,6 +67,35 @@ pub fn manifest_path(bake_dir: &Path) -> PathBuf {
 /// Path to weights.bin within a bake directory.
 pub fn weights_bin_path(bake_dir: &Path) -> PathBuf {
     bake_dir.join("weights.bin")
+}
+
+/// Exclusive filesystem lock held for the duration of a bake or fetch
+/// operation. Prevents two concurrent `supersonic` invocations from racing on
+/// the same `{model_dir}/.supersonic/` directory. Released on drop.
+pub struct BakeLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl BakeLock {
+    /// Acquire the lock. Blocks until the existing holder releases it.
+    pub fn acquire(model_dir: &Path) -> std::io::Result<Self> {
+        use fs2::FileExt;
+        let dir = model_dir.join(".supersonic");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(".lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.lock_exclusive()?;
+        Ok(Self { _file: file, path })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 /// Check if a valid baked package exists at the given bake directory.
