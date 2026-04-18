@@ -3506,26 +3506,55 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* cv = static_cast<const T*>(L.kv_cache_v);
                     const size_t kv_head_base = static_cast<size_t>(kvh) * L.kv_max_t * hd;
 
-                    float my_acc = 0.0f;
+                    for (int d = tid; d < hd; d += bs) {
+                        lds_input_bf16[d] = dotcache_qwen35_from_float<T>(q_head[d]);
+                    }
+                    __syncthreads();
+
+                    float my_acc0 = 0.0f;
+                    float my_acc1 = 0.0f;
                     float my_max = -1e30f;
                     float my_sum = 0.0f;
-                    const float q_val = q_head[tid];
+                    const bool attn_lane_active = tid < (hd / 2);
 
                     for (int t = 0; t < kv_len; ++t) {
                         const size_t pos_base = kv_head_base + static_cast<size_t>(t) * hd;
-                        float partial = q_val * dotcache_qwen35_to_float(ck[pos_base + tid]);
+                        float partial = 0.0f;
+                        float v0 = 0.0f;
+                        float v1 = 0.0f;
+                        if (attn_lane_active) {
+                            const int d0 = tid * 2;
+                            const __nv_bfloat162 q_pack =
+                                *reinterpret_cast<const __nv_bfloat162*>(lds_input_bf16 + d0);
+                            const __nv_bfloat162 k_pack =
+                                *reinterpret_cast<const __nv_bfloat162*>(ck + pos_base + d0);
+                            const __nv_bfloat162 v_pack =
+                                *reinterpret_cast<const __nv_bfloat162*>(cv + pos_base + d0);
+                            const float2 qv = __bfloat1622float2(q_pack);
+                            const float2 kv = __bfloat1622float2(k_pack);
+                            const float2 vv = __bfloat1622float2(v_pack);
+                            partial = qv.x * kv.x + qv.y * kv.y;
+                            v0 = vv.x;
+                            v1 = vv.y;
+                        }
                         const float score = dotcache_qwen35_block_sum_256(partial, lds) * scale;
-                        const float v_val = dotcache_qwen35_to_float(cv[pos_base + tid]);
                         const float old_max = my_max;
                         my_max = fmaxf(my_max, score);
                         const float rescale = expf(old_max - my_max);
                         const float w = expf(score - my_max);
-                        my_acc = my_acc * rescale + w * v_val;
-                        my_sum = my_sum * rescale + w;
+                        if (attn_lane_active) {
+                            my_acc0 = my_acc0 * rescale + w * v0;
+                            my_acc1 = my_acc1 * rescale + w * v1;
+                            my_sum = my_sum * rescale + w;
+                        }
                     }
 
-                    proj_buf[qh * hd + tid] =
-                        (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f;
+                    if (attn_lane_active) {
+                        const int d0 = tid * 2;
+                        const float inv_sum = (my_sum > 0.0f) ? (1.0f / my_sum) : 0.0f;
+                        proj_buf[qh * hd + d0] = my_acc0 * inv_sum;
+                        proj_buf[qh * hd + d0 + 1] = my_acc1 * inv_sum;
+                    }
                     __syncthreads();
                 }
                 grid_barrier(barrier_counter, barrier_flag, nb);
