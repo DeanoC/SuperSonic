@@ -80,6 +80,18 @@ COMMON_TESTS = [
         "max_new_tokens": 8,
         "description": "NIAH: retrieve embedded fact from medium context",
     },
+    {
+        "name": "niah_long",
+        "type": "exact_prefix",
+        "prompt": (
+            ("Archive entry alpha describes a kernel launch and cache update. " * 24)
+            + "The audit keyword is saffron. "
+            + ("Archive entry beta repeats the validation checklist and decode observations. " * 24)
+            + "What is the audit keyword?"
+        ),
+        "max_new_tokens": 8,
+        "description": "NIAH: retrieve embedded fact from long context",
+    },
     # Edge cases
     {
         "name": "single_token",

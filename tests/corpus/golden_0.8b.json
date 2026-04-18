@@ -318,6 +318,26 @@
       ]
     },
     {
+      "name": "niah_long",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from long context",
+      "prompt": "Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. The audit keyword is saffron. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. What is the audit keyword?",
+      "prompt_tokens": 542,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        3437,
+        369,
+        279,
+        23513,
+        15698,
+        30,
+        3437,
+        369
+      ],
+      "expected_text": " What is the audit keyword? What is",
+      "prefill_top5": []
+    },
+    {
       "name": "single_token",
       "type": "exact_prefix",
       "description": "Single token prompt",
@@ -425,6 +445,18 @@
         96878,
         98116,
         1710
+      ],
+      "alternative_token_id_sets": [
+        [
+          101857,
+          97035,
+          10992,
+          271,
+          96328,
+          102357,
+          96878,
+          332
+        ]
       ],
       "expected_text": "哪个城市？\n\n中国的首都是**",
       "prefill_top5": [

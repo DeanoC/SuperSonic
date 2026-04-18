@@ -1,7 +1,7 @@
 use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, BatchSeqDesc, MAX_BATCH_SIZE};
 
 use crate::state::ModelState;
-use crate::weights::{Qwen35Weights, LayerKind};
+use crate::weights::{LayerKind, Qwen35Weights};
 
 /// Build the array of layer descriptors for the persistent decode kernel.
 /// Must be called each decode step (kv_len changes).
@@ -81,6 +81,17 @@ pub fn build_layer_descs(
                 if let Some(ref v) = ls.kv_cache_v {
                     d.kv_cache_v = v.as_ptr() as *mut _;
                 }
+                if let Some(ref shadow_k) = ls.kv_shadow_k {
+                    d.kv_shadow_k = shadow_k.as_ptr() as *mut _;
+                }
+                if let Some(ref shadow_v) = ls.kv_shadow_v {
+                    d.kv_shadow_v = shadow_v.as_ptr() as *mut _;
+                }
+                d.kv_shadow_start = if ls.kv_shadow_start == usize::MAX {
+                    -1
+                } else {
+                    ls.kv_shadow_start as i32
+                };
             }
         }
 
@@ -231,6 +242,17 @@ pub fn build_batch_seq_descs(
                         if let Some(ref sv) = ls.kv_scale_v {
                             d.kv_scale_v[b] = sv.as_ptr() as *mut _;
                         }
+                        if let Some(ref shadow_k) = ls.kv_shadow_k {
+                            d.kv_shadow_k[b] = shadow_k.as_ptr() as *mut _;
+                        }
+                        if let Some(ref shadow_v) = ls.kv_shadow_v {
+                            d.kv_shadow_v[b] = shadow_v.as_ptr() as *mut _;
+                        }
+                        d.kv_shadow_start[b] = if ls.kv_shadow_start == usize::MAX {
+                            -1
+                        } else {
+                            ls.kv_shadow_start as i32
+                        };
                     }
                 }
                 LayerKind::Linear => {

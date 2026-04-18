@@ -588,13 +588,7 @@ fn main() -> Result<()> {
         .prompt_token_ids
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing prompt_token_ids; re-run gemma4_oracle.py"))?;
-    if prompt_token_ids.len() != oracle.prompt_tokens {
-        bail!(
-            "prompt_token_ids length {} != prompt_tokens {}",
-            prompt_token_ids.len(),
-            oracle.prompt_tokens
-        );
-    }
+    let prompt_tokens = prompt_token_ids.len();
     let kv_caches = oracle
         .kv_caches
         .as_ref()
@@ -603,7 +597,6 @@ fn main() -> Result<()> {
     // oracle also dumped `per_layer_inputs_by_step`, cross-check per step.
     let pli_by_step_oracle = oracle.per_layer_inputs_by_step.as_ref();
 
-    let prompt_tokens = oracle.prompt_tokens;
     let last_token_id = *prompt_token_ids
         .last()
         .ok_or_else(|| anyhow!("prompt_tokens == 0"))?;

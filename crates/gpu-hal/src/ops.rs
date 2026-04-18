@@ -1,23 +1,70 @@
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
 
-use crate::error::{hip_error, GpuError, Result};
+use crate::backend::{current_backend, Backend, DeviceInfo};
+#[cfg(supersonic_backend_cuda)]
+use crate::cuda_sys::*;
+use crate::error::{cuda_error, hip_error, GpuError, Result};
+#[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
 use crate::scalar_type::ScalarType;
 
-/// Set the active HIP device, execute `f`, then restore the previous device.
-pub(crate) fn with_device<T>(ordinal: usize, f: impl FnOnce() -> Result<T>) -> Result<T> {
+fn with_device_impl<T>(
+    backend: Backend,
+    ordinal: usize,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
     let mut prev = 0;
-    let status = unsafe { hipGetDevice(&mut prev) };
-    if status != 0 {
-        return Err(hip_error("hipGetDevice", status));
+    match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            {
+                let status = unsafe { hipGetDevice(&mut prev) };
+                if status != 0 {
+                    return Err(hip_error("hipGetDevice", status));
+                }
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+        }
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let status = unsafe { cudaGetDevice(&mut prev) };
+                if status != 0 {
+                    return Err(cuda_error("cudaGetDevice", status));
+                }
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
+        }
     }
     let restore = if prev != ordinal_i32 {
-        let status = unsafe { hipSetDevice(ordinal_i32) };
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipSetDevice(ordinal_i32)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaSetDevice(ordinal_i32)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipSetDevice", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipSetDevice", status),
+                Backend::Cuda => cuda_error("cudaSetDevice", status),
+            });
         }
         Some(prev)
     } else {
@@ -25,37 +72,101 @@ pub(crate) fn with_device<T>(ordinal: usize, f: impl FnOnce() -> Result<T>) -> R
     };
     let result = f();
     if let Some(prev) = restore {
-        let status = unsafe { hipSetDevice(prev) };
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipSetDevice(prev)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaSetDevice(prev)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipSetDevice(restore)", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipSetDevice(restore)", status),
+                Backend::Cuda => cuda_error("cudaSetDevice(restore)", status),
+            });
         }
     }
     result
 }
 
-/// Set the active HIP device.
 pub fn set_device(ordinal: usize) -> Result<()> {
+    let backend = current_backend();
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
-    let status = unsafe { hipSetDevice(ordinal_i32) };
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                hipSetDevice(ordinal_i32)
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            1
+        }
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                cudaSetDevice(ordinal_i32)
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            1
+        }
+    };
     if status != 0 {
-        return Err(hip_error("hipSetDevice", status));
+        return Err(match backend {
+            Backend::Hip => hip_error("hipSetDevice", status),
+            Backend::Cuda => cuda_error("cudaSetDevice", status),
+        });
     }
     Ok(())
 }
 
 /// Allocate `len_bytes` of device memory, returning a non-null pointer.
 pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
+    let backend = current_backend();
     if len_bytes == 0 {
         return Err(GpuError::InvalidArg("allocation size must be > 0".into()));
     }
-    with_device(ordinal, || {
+    with_device_impl(backend, ordinal, || {
         let mut ptr = std::ptr::null_mut();
-        let status = unsafe { hipMalloc(&mut ptr, len_bytes) };
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipMalloc(&mut ptr, len_bytes)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaMalloc(&mut ptr, len_bytes)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipMalloc", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipMalloc", status),
+                Backend::Cuda => cuda_error("cudaMalloc", status),
+            });
         }
-        NonNull::new(ptr).ok_or_else(|| GpuError::Hip("hipMalloc returned null".into()))
+        NonNull::new(ptr).ok_or_else(|| match backend {
+            Backend::Hip => GpuError::Hip("hipMalloc returned null".into()),
+            Backend::Cuda => GpuError::Cuda("cudaMalloc returned null".into()),
+        })
     })
 }
 
@@ -67,14 +178,34 @@ pub fn alloc_zeros(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> 
 }
 
 /// Free device memory. No-op on null.
-pub fn free(ordinal: usize, ptr: *mut c_void) {
+pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    let _ = with_device(ordinal, || {
-        let status = unsafe { hipFree(ptr) };
+    let _ = with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipFree(ptr)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaFree(ptr)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipFree", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipFree", status),
+                Backend::Cuda => cuda_error("cudaFree", status),
+            });
         }
         Ok(())
     });
@@ -82,13 +213,34 @@ pub fn free(ordinal: usize, ptr: *mut c_void) {
 
 /// Copy from host memory to device memory.
 pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
+    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg("copy_h2d: null pointer or zero len".into()));
     }
-    with_device(ordinal, || {
-        let status = unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE) };
+    with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_HOST_TO_DEVICE)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipMemcpy(H2D)", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipMemcpy(H2D)", status),
+                Backend::Cuda => cuda_error("cudaMemcpy(H2D)", status),
+            });
         }
         Ok(())
     })
@@ -96,13 +248,34 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 
 /// Copy from device memory to host memory.
 pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
+    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg("copy_d2h: null pointer or zero len".into()));
     }
-    with_device(ordinal, || {
-        let status = unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST) };
+    with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_HOST)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipMemcpy(D2H)", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipMemcpy(D2H)", status),
+                Backend::Cuda => cuda_error("cudaMemcpy(D2H)", status),
+            });
         }
         Ok(())
     })
@@ -110,13 +283,34 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 
 /// Copy from device memory to device memory.
 pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
+    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg("copy_d2d: null pointer or zero len".into()));
     }
-    with_device(ordinal, || {
-        let status = unsafe { hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE) };
+    with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_DEVICE)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipMemcpy(D2D)", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipMemcpy(D2D)", status),
+                Backend::Cuda => cuda_error("cudaMemcpy(D2D)", status),
+            });
         }
         Ok(())
     })
@@ -124,13 +318,34 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 
 /// Set device memory to zero.
 pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> {
+    let backend = current_backend();
     if dst.is_null() || len == 0 {
         return Err(GpuError::InvalidArg("memset_zeros: null pointer or zero len".into()));
     }
-    with_device(ordinal, || {
-        let status = unsafe { hipMemset(dst, 0, len) };
+    with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipMemset(dst, 0, len)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaMemset(dst, 0, len)
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipMemset", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipMemset", status),
+                Backend::Cuda => cuda_error("cudaMemset", status),
+            });
         }
         Ok(())
     })
@@ -138,79 +353,193 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
 
 /// Synchronize the device (block until all pending work completes).
 pub fn sync(ordinal: usize) -> Result<()> {
-    with_device(ordinal, || {
-        let status = unsafe { hipDeviceSynchronize() };
+    let backend = current_backend();
+    with_device_impl(backend, ordinal, || {
+        let status = match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    hipDeviceSynchronize()
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                1
+            }
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    cudaDeviceSynchronize()
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                1
+            }
+        };
         if status != 0 {
-            return Err(hip_error("hipDeviceSynchronize", status));
+            return Err(match backend {
+                Backend::Hip => hip_error("hipDeviceSynchronize", status),
+                Backend::Cuda => cuda_error("cudaDeviceSynchronize", status),
+            });
         }
         Ok(())
     })
 }
 
-/// RAII wrapper around `hipEvent_t`. Records and measures GPU wall time.
+/// RAII wrapper around a backend timing event.
+///
+/// Timing events are currently implemented only for HIP. On CUDA builds this
+/// returns an explicit error until the matching runtime bindings are added.
 pub struct GpuEvent {
+    backend: Backend,
     ordinal: usize,
     raw: *mut c_void,
 }
 
 impl GpuEvent {
     pub fn new(ordinal: usize) -> Result<Self> {
+        let backend = current_backend();
         let mut raw: *mut c_void = std::ptr::null_mut();
-        with_device(ordinal, || {
-            let status = unsafe { hipEventCreate(&mut raw) };
-            if status != 0 {
-                return Err(hip_error("hipEventCreate", status));
+        with_device_impl(backend, ordinal, || match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventCreate(&mut raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventCreate", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Ok(())
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
         })?;
-        Ok(Self { ordinal, raw })
+        Ok(Self {
+            backend,
+            ordinal,
+            raw,
+        })
     }
 
     pub fn record(&self) -> Result<()> {
-        with_device(self.ordinal, || {
-            let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
-            if status != 0 {
-                return Err(hip_error("hipEventRecord", status));
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventRecord", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Ok(())
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
         })
     }
 
     pub fn synchronize(&self) -> Result<()> {
-        with_device(self.ordinal, || {
-            let status = unsafe { hipEventSynchronize(self.raw) };
-            if status != 0 {
-                return Err(hip_error("hipEventSynchronize", status));
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventSynchronize(self.raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventSynchronize", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Ok(())
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
         })
     }
 
-    /// Elapsed milliseconds between `start` and `end`. Both events must have
-    /// been recorded and `end` must have been synchronized first.
     pub fn elapsed_ms(start: &GpuEvent, end: &GpuEvent) -> Result<f32> {
-        let mut ms: f32 = 0.0;
-        with_device(start.ordinal, || {
-            let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
-            if status != 0 {
-                return Err(hip_error("hipEventElapsedTime", status));
+        if start.backend != end.backend || start.ordinal != end.ordinal {
+            return Err(GpuError::InvalidArg(
+                "GpuEvent::elapsed_ms requires matching backend/device".into(),
+            ));
+        }
+        match start.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let mut ms: f32 = 0.0;
+                    with_device_impl(start.backend, start.ordinal, || {
+                        let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
+                        if status != 0 {
+                            return Err(hip_error("hipEventElapsedTime", status));
+                        }
+                        Ok(())
+                    })?;
+                    Ok(ms)
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            Ok(())
-        })?;
-        Ok(ms)
+            Backend::Cuda => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+        }
     }
 }
 
 impl Drop for GpuEvent {
     fn drop(&mut self) {
-        if !self.raw.is_null() {
-            let _ = with_device(self.ordinal, || {
-                let status = unsafe { hipEventDestroy(self.raw) };
-                if status != 0 {
-                    return Err(hip_error("hipEventDestroy", status));
+        if self.raw.is_null() {
+            return;
+        }
+        let _ = with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventDestroy(self.raw) };
+                    if status != 0 {
+                        return Err(hip_error("hipEventDestroy", status));
+                    }
+                    Ok(())
                 }
-                Ok(())
-            });
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Ok(()),
+        });
+    }
+}
+
+pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo> {
+    let ordinal_i32 = c_int::try_from(ordinal)
+        .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
+    match backend {
+        Backend::Hip => Err(GpuError::InvalidArg(
+            "HIP device query is provided by the HIP kernel bridge, not gpu-hal".into(),
+        )),
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let mut props = unsafe { std::mem::zeroed::<CudaDeviceProp>() };
+                let status = unsafe { cudaGetDeviceProperties(&mut props, ordinal_i32) };
+                if status != 0 {
+                    return Err(cuda_error("cudaGetDeviceProperties", status));
+                }
+                let arch_name = format!("sm{}{}", props.major, props.minor);
+                Ok(DeviceInfo {
+                    arch_name,
+                    total_vram_bytes: props.totalGlobalMem as u64,
+                    warp_size: props.warpSize as u32,
+                })
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
         }
     }
 }

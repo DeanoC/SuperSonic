@@ -59,6 +59,10 @@ pub struct DecodeLayerDesc {
     pub kv_cache_v: *mut c_void,
     pub kv_len: c_int,
     pub kv_max_t: c_int,
+    // Optional BF16 sidecar for KV-FP8 bring-up / parity-sensitive reads.
+    pub kv_shadow_k: *mut c_void,
+    pub kv_shadow_v: *mut c_void,
+    pub kv_shadow_start: c_int,
 }
 
 unsafe impl Send for DecodeLayerDesc {}
@@ -188,6 +192,10 @@ pub struct BatchSeqDesc {
     pub kv_cache_v: [*mut c_void; MAX_BATCH_SIZE],
     pub kv_len: [c_int; MAX_BATCH_SIZE],
     pub kv_max_t: [c_int; MAX_BATCH_SIZE],
+    // Optional BF16 sidecar for KV-FP8 bring-up / parity-sensitive reads.
+    pub kv_shadow_k: [*mut c_void; MAX_BATCH_SIZE],
+    pub kv_shadow_v: [*mut c_void; MAX_BATCH_SIZE],
+    pub kv_shadow_start: [c_int; MAX_BATCH_SIZE],
     // --- Linear attention per-sequence state ---
     pub conv_state: [*mut c_void; MAX_BATCH_SIZE],
     pub recurrent_state: [*mut c_void; MAX_BATCH_SIZE],

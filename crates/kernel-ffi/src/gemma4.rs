@@ -12,6 +12,7 @@ use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
+#[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
     fn dotcache_gemma4_hip_rms_norm(
         dtype: c_int,
@@ -406,6 +407,47 @@ unsafe extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+}
+
+#[cfg(not(supersonic_backend_hip))]
+macro_rules! gemma4_stub {
+    ($(fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> c_int;)+) => {
+        $(
+            #[no_mangle]
+            unsafe extern "C" fn $name($($arg: $ty),*) -> c_int {
+                let _ = ($($arg),*);
+                1
+            }
+        )+
+    };
+}
+
+#[cfg(not(supersonic_backend_hip))]
+gemma4_stub! {
+    fn dotcache_gemma4_hip_rms_norm(dtype: c_int, device_ordinal: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_matvec(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_gelu_tanh_gate_mul(dtype: c_int, device_ordinal: usize, n: usize, gate: *const c_void, up: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_rope_decode(dtype: c_int, device_ordinal: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_swa_attn_decode(dtype: c_int, device_ordinal: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, kv_len: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_kv_append(dtype: c_int, device_ordinal: usize, num_kv_heads: usize, head_dim: usize, pos: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_rms_norm_rows(dtype: c_int, device_ordinal: usize, n_rows: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_matvec_batched(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_matvec_int4(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_matvec_batched_int4(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_rope_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, pos_base: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_kv_append_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_attn_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_add_residual(dtype: c_int, device_ordinal: usize, n: usize, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_add_scaled_residual(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_scalar_mul_inplace(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, x: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_fused_attn_block(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_w: *const c_void, k_proj_w: *const c_void, v_proj_w: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_w: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_fused_attn_block_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, group_size: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_packed: *const c_void, q_proj_scale: *const c_void, q_proj_zero: *const c_void, k_proj_packed: *const c_void, k_proj_scale: *const c_void, k_proj_zero: *const c_void, v_proj_packed: *const c_void, v_proj_scale: *const c_void, v_proj_zero: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_packed: *const c_void, o_proj_scale: *const c_void, o_proj_zero: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_fused_mlp_ple_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, group_size: c_int, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_packed: *const c_void, gate_proj_scale: *const c_void, gate_proj_zero: *const c_void, up_proj_packed: *const c_void, up_proj_scale: *const c_void, up_proj_zero: *const c_void, down_proj_packed: *const c_void, down_proj_scale: *const c_void, down_proj_zero: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_packed: *const c_void, per_layer_input_gate_scale: *const c_void, per_layer_input_gate_zero: *const c_void, per_layer_projection_packed: *const c_void, per_layer_projection_scale: *const c_void, per_layer_projection_zero: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_fused_mlp_ple(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_w: *const c_void, up_proj_w: *const c_void, down_proj_w: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_w: *const c_void, per_layer_projection_w: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_gather_layer_slice(dtype: c_int, device_ordinal: usize, seq_len: usize, num_layers: usize, ple_hidden: usize, layer_idx: usize, src: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_embed_gather_scaled(dtype: c_int, device_ordinal: usize, seq_len: usize, hidden_size: usize, vocab_size: usize, scale: f32, token_ids: *const c_uint, table: *const c_void, out: *mut c_void) -> c_int;
+    fn dotcache_gemma4_hip_persistent_decode_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, int4_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
 }
 
 /// Gemma-variant RMSNorm — plain `weight * (x / sqrt(mean(x^2) + eps))` with

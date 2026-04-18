@@ -318,6 +318,26 @@
       ]
     },
     {
+      "name": "niah_long",
+      "type": "exact_prefix",
+      "description": "NIAH: retrieve embedded fact from long context",
+      "prompt": "Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. Archive entry alpha describes a kernel launch and cache update. The audit keyword is saffron. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. Archive entry beta repeats the validation checklist and decode observations. What is the audit keyword?",
+      "prompt_tokens": 542,
+      "max_new_tokens": 8,
+      "expected_token_ids": [
+        796,
+        529,
+        2176,
+        13,
+        28732,
+        4202,
+        20956,
+        16067
+      ],
+      "expected_text": " saffron. Archive entry gamma describes",
+      "prefill_top5": []
+    },
+    {
       "name": "single_token",
       "type": "exact_prefix",
       "description": "Single token prompt",

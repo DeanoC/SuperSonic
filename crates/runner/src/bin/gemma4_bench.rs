@@ -404,7 +404,7 @@ fn main() -> Result<()> {
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing kv_caches (need --emit-state)"))?;
 
-    let prompt_tokens = oracle.prompt_tokens;
+    let prompt_tokens = prompt_token_ids.len();
     let last_token_id = *prompt_token_ids
         .last()
         .ok_or_else(|| anyhow!("prompt_tokens == 0"))?;

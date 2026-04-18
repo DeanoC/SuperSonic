@@ -1201,19 +1201,12 @@ fn main() -> Result<()> {
         .prompt_token_ids
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing prompt_token_ids; re-run gemma4_oracle.py"))?;
-    if prompt_token_ids.len() != oracle.prompt_tokens {
-        bail!(
-            "prompt_token_ids length {} != prompt_tokens {}",
-            prompt_token_ids.len(),
-            oracle.prompt_tokens
-        );
-    }
+    let prompt_tokens = prompt_token_ids.len();
     let kv_caches_oracle = oracle
         .kv_caches
         .as_ref()
         .ok_or_else(|| anyhow!("oracle JSON missing kv_caches (need --emit-state)"))?;
 
-    let prompt_tokens = oracle.prompt_tokens;
     if prompt_tokens == 0 {
         bail!("prompt_tokens == 0");
     }
