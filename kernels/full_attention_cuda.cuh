@@ -178,6 +178,23 @@ __device__ inline float dotcache_qwen35_dot_row_input_f32_hero(
     return dot;
 }
 
+template <typename T>
+__device__ inline float dotcache_qwen35_dot_row_input_bf16_warp_hero(
+    const T* lhs,
+    const T* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int lane = threadIdx.x & (warpSize - 1);
+    for (int idx = lane; idx < size; idx += warpSize) {
+        dot += dotcache_qwen35_to_float(lhs[idx]) * dotcache_qwen35_to_float(rhs[idx]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        dot += __shfl_down(dot, offset);
+    }
+    return dot;
+}
+
 template <>
 __device__ inline float dotcache_qwen35_dot_row_input_f32_hero<hip_bfloat16>(
     const hip_bfloat16* lhs,
@@ -195,6 +212,33 @@ __device__ inline float dotcache_qwen35_dot_row_input_f32_hero<hip_bfloat16>(
     }
     if ((size & 1) != 0 && tid == 0) {
         dot += dotcache_qwen35_to_float(lhs[size - 1]) * rhs[size - 1];
+    }
+    return dot;
+}
+
+template <>
+__device__ inline float dotcache_qwen35_dot_row_input_bf16_warp_hero<hip_bfloat16>(
+    const hip_bfloat16* lhs,
+    const hip_bfloat16* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int lane = threadIdx.x & (warpSize - 1);
+    for (int idx = lane * 2; idx + 1 < size; idx += warpSize * 2) {
+        const __nv_bfloat162 packed_lhs =
+            *reinterpret_cast<const __nv_bfloat162*>(lhs + idx);
+        const __nv_bfloat162 packed_rhs =
+            *reinterpret_cast<const __nv_bfloat162*>(rhs + idx);
+        const float2 w = __bfloat1622float2(packed_lhs);
+        const float2 x = __bfloat1622float2(packed_rhs);
+        dot += w.x * x.x + w.y * x.y;
+    }
+    if ((size & 1) != 0 && lane == 0) {
+        dot += dotcache_qwen35_to_float(lhs[size - 1]) *
+               dotcache_qwen35_to_float(rhs[size - 1]);
+    }
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        dot += __shfl_down(dot, offset);
     }
     return dot;
 }
@@ -3235,9 +3279,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     // proj_buf holds projection results as F32 for all layer types
     // attn_scratch holds intermediate attention or recurrent output
 
-    extern __shared__ float lds[];
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+    float* lds = reinterpret_cast<float*>(shared_raw);
     // LDS layout: lds[0..bs-1] = reduction scratch, lds[bs..] = input vector cache
     float* lds_input = lds + bs;  // LDS-resident copy of input vectors for matvecs
+    T* lds_input_bf16 = reinterpret_cast<T*>(lds_input + intermediate_size);
 
     // Load hidden BF16 → F32
     for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
@@ -3682,13 +3728,24 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 const T* ow = static_cast<const T*>(L.o_proj_w);
 
                 if (qwen08_attn_hero) {
-                    for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
-                        const T* wr = ow + static_cast<size_t>(sr) * attn_size;
-                        float p = dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, attn_size);
-                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
-                        if (tid == 0) hidden_f32[sr] += sum;
-                        __syncthreads();
+                    for (int c = tid; c < attn_size; c += bs) {
+                        lds_input_bf16[c] = dotcache_qwen35_from_float<T>(proj_buf[c]);
                     }
+                    __syncthreads();
+
+                    const int lane = tid & (warpSize - 1);
+                    const int warp = tid / warpSize;
+                    const int warps_per_block = bs / warpSize;
+                    for (int sr = blockIdx.x * warps_per_block + warp;
+                         sr < hidden_dim;
+                         sr += nb * warps_per_block) {
+                        const T* wr = ow + static_cast<size_t>(sr) * attn_size;
+                        const float sum =
+                            dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                                wr, lds_input_bf16, attn_size);
+                        if (lane == 0) hidden_f32[sr] += sum;
+                    }
+                    __syncthreads();
                 } else {
                     if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                     grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4208,13 +4265,24 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 const T* ow = static_cast<const T*>(L.linear_out_proj_w);
 
                 if (qwen08_linear_hero) {
-                    for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
-                        const T* wr = ow + static_cast<size_t>(sr) * vd;
-                        float p = dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, vd);
-                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
-                        if (tid == 0) hidden_f32[sr] += sum;
-                        __syncthreads();
+                    for (int c = tid; c < vd; c += bs) {
+                        lds_input_bf16[c] = dotcache_qwen35_from_float<T>(attn_scratch[c]);
                     }
+                    __syncthreads();
+
+                    const int lane = tid & (warpSize - 1);
+                    const int warp = tid / warpSize;
+                    const int warps_per_block = bs / warpSize;
+                    for (int sr = blockIdx.x * warps_per_block + warp;
+                         sr < hidden_dim;
+                         sr += nb * warps_per_block) {
+                        const T* wr = ow + static_cast<size_t>(sr) * vd;
+                        const float sum =
+                            dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                                wr, lds_input_bf16, vd);
+                        if (lane == 0) hidden_f32[sr] += sum;
+                    }
+                    __syncthreads();
                 } else {
                     if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                     grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4335,14 +4403,24 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         {
             const T* dw = static_cast<const T*>(L.down_proj_w);
             if (qwen08_hero) {
-                for (int sr = blockIdx.x; sr < hidden_dim; sr += nb) {
-                    const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
-                    float p =
-                        dotcache_qwen35_dot_row_input_f32_hero(wr, lds_input, L.intermediate_size);
-                    const float sum = dotcache_qwen35_block_sum_256(p, lds);
-                    if (tid == 0) hidden_f32[sr] += sum;
-                    __syncthreads();
+                for (int c = tid; c < L.intermediate_size; c += bs) {
+                    lds_input_bf16[c] = dotcache_qwen35_from_float<T>(gate_up[c]);
                 }
+                __syncthreads();
+
+                const int lane = tid & (warpSize - 1);
+                const int warp = tid / warpSize;
+                const int warps_per_block = bs / warpSize;
+                for (int sr = blockIdx.x * warps_per_block + warp;
+                     sr < hidden_dim;
+                     sr += nb * warps_per_block) {
+                    const T* wr = dw + static_cast<size_t>(sr) * L.intermediate_size;
+                    const float sum =
+                        dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                            wr, lds_input_bf16, L.intermediate_size);
+                    if (lane == 0) hidden_f32[sr] += sum;
+                }
+                __syncthreads();
             } else {
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);

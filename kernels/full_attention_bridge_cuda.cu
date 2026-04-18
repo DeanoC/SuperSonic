@@ -4445,7 +4445,10 @@ int persistent_decode_device(
     }
     constexpr int block_size = 256;
     // LDS layout: [block_size] reduction scratch + [intermediate_size] input vector cache
-    const size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
+    size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
+    if constexpr (HERO_MODE) {
+        shared_bytes += static_cast<size_t>(intermediate_size) * sizeof(T);
+    }
 
     // Barrier counters zeroed on first allocation by Rust PersistentDecodeCache.
     // Grid barrier self-resets between uses (barrier_counter reset by last block,
