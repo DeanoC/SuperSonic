@@ -4,13 +4,17 @@ use std::mem;
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
 
+pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 20;
+pub const PERSISTENT_SYNC_COUNTER_BYTES: usize = 24;
+
 /// Pre-allocated device scratch buffers for the persistent decode kernel.
 /// Avoids per-token hipMalloc/hipFree overhead.
 pub struct PersistentDecodeScratch {
     ordinal: usize,
     /// F32 workspace for projections, MLP, attention scratch.
     pub workspace: GpuBuffer,
-    /// Sync region: counters[4×u32=16B] + barrier_counter[u32=4B] + barrier_flag[u32=4B] = 24B.
+    /// Sync region: counters[4×u32=16B] + barrier_counter[u32=4B] + barrier_flag[u32=4B]
+    /// plus persistent 4B timing slots [6×u64].
     pub sync_buf: GpuBuffer,
     /// Device copy of Vec<DecodeLayerDesc>.
     pub desc_device: GpuBuffer,
@@ -49,7 +53,9 @@ impl PersistentDecodeScratch {
             &[workspace_floats],
         )?;
 
-        let sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[24])?;
+        let sync_bytes = PERSISTENT_SYNC_COUNTER_BYTES
+            + num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();
+        let sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[sync_bytes])?;
 
         let desc_bytes = num_layers * mem::size_of::<DecodeLayerDesc>();
         let desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[desc_bytes])?;
@@ -124,6 +130,10 @@ impl PersistentDecodeScratch {
 
     /// Reset sync counters to zero (needed before first kernel launch of a sequence).
     pub fn reset_sync(&mut self) -> Result<(), GpuError> {
-        gpu_hal::memset_zeros(self.ordinal, self.sync_buf.as_mut_ptr(), 24)
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.sync_buf.as_mut_ptr(),
+            self.sync_buf.len_bytes(),
+        )
     }
 }

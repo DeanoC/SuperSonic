@@ -8,7 +8,9 @@ use gpu_hal::{GpuBuffer, ScalarType};
 use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs, build_batch_seq_descs};
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
-use qwen35::scratch::PersistentDecodeScratch;
+use qwen35::scratch::{
+    PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
+};
 use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
 use qwen35::weights::Qwen35Weights;
 
@@ -138,6 +140,12 @@ pub struct DecodeStageTimings {
     pub host_sampling_ms: f64,
     pub gpu_argmax_ms: f64,
     pub token_d2h_ms: f64,
+    pub persistent_full_attn_ms: f64,
+    pub persistent_linear_proj_ms: f64,
+    pub persistent_linear_core_ms: f64,
+    pub persistent_linear_out_ms: f64,
+    pub persistent_mlp_gate_up_ms: f64,
+    pub persistent_mlp_down_ms: f64,
 }
 
 impl DecodeStageTimings {
@@ -149,6 +157,12 @@ impl DecodeStageTimings {
         self.host_sampling_ms += rhs.host_sampling_ms;
         self.gpu_argmax_ms += rhs.gpu_argmax_ms;
         self.token_d2h_ms += rhs.token_d2h_ms;
+        self.persistent_full_attn_ms += rhs.persistent_full_attn_ms;
+        self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
+        self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
+        self.persistent_linear_out_ms += rhs.persistent_linear_out_ms;
+        self.persistent_mlp_gate_up_ms += rhs.persistent_mlp_gate_up_ms;
+        self.persistent_mlp_down_ms += rhs.persistent_mlp_down_ms;
     }
 
     pub fn total_ms(&self) -> f64 {
@@ -207,6 +221,93 @@ pub struct FullAttentionLayerOutputTrace {
     pub pre_gate: Vec<u8>,
     pub gated: Vec<u8>,
     pub attn_hidden: Vec<u8>,
+}
+
+const PERSISTENT_4B_TIMING_FULL_ATTN: usize = 0;
+const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 1;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 2;
+const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 10;
+const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 18;
+const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 19;
+
+fn persistent_4b_clock_cycles_to_ms(cycles: u64, clock_rate_khz: u32) -> f64 {
+    if cycles == 0 || clock_rate_khz == 0 {
+        0.0
+    } else {
+        cycles as f64 / clock_rate_khz as f64
+    }
+}
+
+fn decode_persistent_4b_timing_slots(
+    sync_bytes: &[u8],
+    num_layers: usize,
+    batch_size: usize,
+    clock_rate_khz: u32,
+) -> DecodeStageTimings {
+    let timing_bytes =
+        num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();
+    let start = PERSISTENT_SYNC_COUNTER_BYTES;
+    let end = start + timing_bytes;
+    if sync_bytes.len() < end {
+        return DecodeStageTimings::default();
+    }
+
+    let load_slot = |idx: usize| -> u64 {
+        let byte_start = start + idx * std::mem::size_of::<u64>();
+        let byte_end = byte_start + std::mem::size_of::<u64>();
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&sync_bytes[byte_start..byte_end]);
+        u64::from_le_bytes(raw)
+    };
+
+    let mut full_attn_cycles = 0u64;
+    let mut linear_proj_cycles = 0u64;
+    let mut linear_core_cycles = 0u64;
+    let mut linear_out_cycles = 0u64;
+    let mut mlp_gate_up_cycles = 0u64;
+    let mut mlp_down_cycles = 0u64;
+    let linear_batches = batch_size.min(8);
+    for layer in 0..num_layers {
+        let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
+        full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
+        linear_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
+        mlp_gate_up_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
+        mlp_down_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
+        for b in 0..linear_batches {
+            linear_core_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
+            linear_out_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+        }
+    }
+
+    DecodeStageTimings {
+        persistent_full_attn_ms: persistent_4b_clock_cycles_to_ms(
+            full_attn_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_proj_ms: persistent_4b_clock_cycles_to_ms(
+            linear_proj_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_out_ms: persistent_4b_clock_cycles_to_ms(
+            linear_out_cycles,
+            clock_rate_khz,
+        ),
+        persistent_mlp_gate_up_ms: persistent_4b_clock_cycles_to_ms(
+            mlp_gate_up_cycles,
+            clock_rate_khz,
+        ),
+        persistent_mlp_down_ms: persistent_4b_clock_cycles_to_ms(
+            mlp_down_cycles,
+            clock_rate_khz,
+        ),
+        ..DecodeStageTimings::default()
+    }
 }
 
 impl DecodeEngine {
@@ -2546,7 +2647,7 @@ impl DecodeEngine {
         token_ids: &[u32],
         seqlen_offset: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        let (all_logits, _) = self.decode_step_batch_with_timings(token_ids, seqlen_offset)?;
+        let (all_logits, _) = self.decode_step_batch_impl(token_ids, seqlen_offset, false)?;
         Ok(all_logits)
     }
 
@@ -2556,6 +2657,15 @@ impl DecodeEngine {
         &mut self,
         token_ids: &[u32],
         seqlen_offset: usize,
+    ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
+        self.decode_step_batch_impl(token_ids, seqlen_offset, true)
+    }
+
+    fn decode_step_batch_impl(
+        &mut self,
+        token_ids: &[u32],
+        seqlen_offset: usize,
+        enable_timing_slots: bool,
     ) -> Result<(Vec<Vec<f32>>, DecodeStageTimings)> {
         assert_eq!(token_ids.len(), self.batch_size);
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
@@ -2651,9 +2761,26 @@ impl DecodeEngine {
             b,
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
+            enable_timing_slots,
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+        if enable_timing_slots {
+            let clock_rate_khz = gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
+                .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
+                .clock_rate_khz;
+            let sync_bytes = self
+                .scratch
+                .sync_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
+            timings.add_assign(decode_persistent_4b_timing_slots(
+                &sync_bytes,
+                config.num_hidden_layers,
+                b,
+                clock_rate_khz,
+            ));
+        }
 
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;
@@ -2830,6 +2957,7 @@ impl DecodeEngine {
             b,
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
+            false,
         )
         .map_err(|e| anyhow::anyhow!("trace persistent_decode_4b batch kernel: {e}"))?;
 

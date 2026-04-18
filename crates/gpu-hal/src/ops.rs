@@ -534,6 +534,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                     arch_name,
                     total_vram_bytes: props.totalGlobalMem as u64,
                     warp_size: props.warpSize as u32,
+                    clock_rate_khz: props.clockRate as u32,
                 })
             }
             #[cfg(not(supersonic_backend_cuda))]

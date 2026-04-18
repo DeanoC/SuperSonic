@@ -77,6 +77,7 @@ unsafe extern "C" {
         counters: *mut c_void,
         barrier_counter: *mut c_void,
         barrier_flag: *mut c_void,
+        timing_slots: *mut c_void,
         cos_table: *const c_void,
         sin_table: *const c_void,
         rotary_dim: usize,
@@ -188,7 +189,6 @@ pub fn persistent_decode(
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
-
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -340,11 +340,17 @@ pub fn persistent_decode_4b(
     batch_size: usize,
     batch_descs: Option<&GpuBuffer>,
     int4_scale_descs: Option<&GpuBuffer>,
+    enable_timing_slots: bool,
 ) -> Result<(), GpuError> {
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
+    let timing_slots = if enable_timing_slots {
+        unsafe { (counters as *mut u8).add(24) as *mut c_void }
+    } else {
+        std::ptr::null_mut()
+    };
 
     let fp8_scales_ptr = fp8_scale_descs
         .map(|b| b.as_ptr())
@@ -379,6 +385,7 @@ pub fn persistent_decode_4b(
                     counters,
                     barrier_counter,
                     barrier_flag,
+                    timing_slots,
                     cos_table.as_ptr(),
                     sin_table.as_ptr(),
                     rotary_dim,
@@ -412,6 +419,7 @@ pub fn persistent_decode_4b(
                     counters,
                     barrier_counter,
                     barrier_flag,
+                    timing_slots,
                     cos_table.as_ptr(),
                     sin_table.as_ptr(),
                     rotary_dim,

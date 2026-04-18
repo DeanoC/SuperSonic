@@ -16,6 +16,16 @@ using hip_bfloat16 = __nv_bfloat16;
 #include <math.h>
 #include <stdint.h>
 
+enum Qwen35Persistent4BTimingSlot {
+    QWEN35_4B_TIMING_FULL_ATTN = 0,
+    QWEN35_4B_TIMING_LINEAR_PROJ = 1,
+    QWEN35_4B_TIMING_LINEAR_CORE_BASE = 2,
+    QWEN35_4B_TIMING_LINEAR_OUT_BASE = 10,
+    QWEN35_4B_TIMING_MLP_GATE_UP = 18,
+    QWEN35_4B_TIMING_MLP_DOWN = 19,
+    QWEN35_4B_TIMING_COUNT = 20,
+};
+
 // Weight descriptor for the persistent decode megakernel.
 // One struct per decoder layer (24 total for Qwen3.5-0.8B).
 // Immutable weight pointers are const; mutable state pointers are non-const.
@@ -602,6 +612,16 @@ __device__ inline float dotcache_qwen35_wave_sum(float value) {
         value += __shfl_down(value, offset);
     }
     return value;
+}
+
+__device__ __forceinline__ void qwen35_record_persistent_4b_timing(
+    unsigned long long* timing_slots,
+    int slot,
+    unsigned long long start_clock
+) {
+    if (timing_slots != nullptr && threadIdx.x == 0) {
+        atomicMax(&timing_slots[slot], clock64() - start_clock);
+    }
 }
 
 template <typename T>
@@ -3923,6 +3943,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     unsigned int* __restrict__ counters,
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag,
+    unsigned long long* __restrict__ timing_slots,
     const T* __restrict__ cos_table,   // [max_positions, rotary_dim/2] RoPE cos
     const T* __restrict__ sin_table,   // [max_positions, rotary_dim/2] RoPE sin
     int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
@@ -3984,6 +4005,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
     for (int layer = 0; layer < num_layers; ++layer) {
         const Qwen35DecodeLayerDesc& L = layers[layer];
+        unsigned long long* layer_timing_slots = timing_slots != nullptr
+            ? timing_slots + static_cast<size_t>(layer) * QWEN35_4B_TIMING_COUNT
+            : nullptr;
 
         // Match the component path's BF16 hidden-state boundaries: each layer
         // starts from BF16-hidden activations rather than carrying full F32
@@ -4038,6 +4062,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         // === Token mixer: projections + core ===
         if (L.layer_type == 1) {
             // ---- FULL ATTENTION ----
+            const unsigned long long full_attn_clock = clock64();
             // Step A: Q/K/V projections via work-stealing
             // Q: [q_out_dim, hidden_dim], K: [k_out_dim, hidden_dim], V: same as K
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
@@ -4617,10 +4642,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
                 grid_barrier(barrier_counter, barrier_flag, nb);
             } // end for (b) batch loop
+            qwen35_record_persistent_4b_timing(
+                layer_timing_slots, QWEN35_4B_TIMING_FULL_ATTN, full_attn_clock);
             } // end full attention scope
 
         } else {
             // ---- LINEAR ATTENTION ----
+            const unsigned long long linear_proj_clock = clock64();
             // Step A: qkv/z/b/a projections via work-stealing
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4731,12 +4759,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
             }
             __syncthreads();
+            qwen35_record_persistent_4b_timing(
+                layer_timing_slots, QWEN35_4B_TIMING_LINEAR_PROJ, linear_proj_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step B-E: conv1d, recurrent state, gated norm, out_proj
             // Block 0 handles sequential recurrent operations (per-sequence loop).
             // O_proj uses all blocks via work-stealing (per-sequence loop).
             for (int b = 0; b < B; b++) {
+            const unsigned long long linear_core_clock = clock64();
             // Per-sequence state
             void* conv_b = batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state;
             void* rec_b  = batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state;
@@ -4962,10 +4993,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
             } // end if (blockIdx.x == 0) for linear attention core
             // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+            qwen35_record_persistent_4b_timing(
+                layer_timing_slots, QWEN35_4B_TIMING_LINEAR_CORE_BASE + b, linear_core_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
 
             // Step E: out_proj [hidden_dim, val_dim] × attn_scratch → hidden_f32 (fused residual)
             // Per-sequence: cache batch b's output in LDS, work-steal hidden_dim rows
+            const unsigned long long linear_out_clock = clock64();
             {
                 const int vd = L.linear_value_dim;  // 2048
 
@@ -5035,6 +5069,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
             }
             __syncthreads();
+            qwen35_record_persistent_4b_timing(
+                layer_timing_slots, QWEN35_4B_TIMING_LINEAR_OUT_BASE + b, linear_out_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
             } // end for (b) batch loop for linear attention
 
@@ -5093,6 +5129,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
         // === Fused MLP gate+up+SwiGLU (all blocks work-steal, BATCHED) ===
         // Use full-block reductions here for parity with the component path.
+        const unsigned long long mlp_gate_up_clock = clock64();
         if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -5246,10 +5283,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
             }
         }
+        qwen35_record_persistent_4b_timing(
+            layer_timing_slots, QWEN35_4B_TIMING_MLP_GATE_UP, mlp_gate_up_clock);
         grid_barrier(barrier_counter, barrier_flag, nb);
 
         // === MLP down_proj (all blocks work-steal, per-sequence) ===
         // Process one batch item at a time: cache SwiGLU output in LDS, work-steal
+        const unsigned long long mlp_down_clock = clock64();
         for (int b = 0; b < B; b++) {
             for (int c = tid; c < L.intermediate_size; c += bs)
                 lds_input[c] = gate_up[b * intermediate_size * 2 + c];
@@ -5329,6 +5369,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             __syncthreads();
             grid_barrier(barrier_counter, barrier_flag, nb);
         } // end for (b) down_proj batch loop
+        qwen35_record_persistent_4b_timing(
+            layer_timing_slots, QWEN35_4B_TIMING_MLP_DOWN, mlp_down_clock);
 
         // Residual add for MLP is fused into down_proj above.
     }

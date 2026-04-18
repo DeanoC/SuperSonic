@@ -75,6 +75,44 @@ What that means:
 - `lm_head` is visible but not the main blocker
 - host-side work is not the first thing to optimize for this lane
 
+## Internal Persistent Split
+
+Added a `4B`-local persistent-section timing breakdown on the warmed batch hero
+lane.
+
+Short sanity run (`pp533` / `tg16`) came in at:
+
+- decode: about `3283 ms`
+- persistent decode: about `3169 ms`
+- persistent sections:
+  - full attention: about `1632 ms`
+  - linear projection: about `188 ms`
+  - linear core: about `867 ms`
+  - linear out: about `158 ms`
+  - MLP gate+up: about `266 ms`
+  - MLP down: about `427 ms`
+
+Full warmed result (`pp533` / `tg128`) came in at:
+
+- decode: `27548.9 ms`
+- aggregate decode throughput: `9.3 tok/s`
+- persistent decode: `26640.164 ms`
+- persistent sections:
+  - full attention: `14336.164 ms`
+  - linear projection: `1503.813 ms`
+  - linear core: `6909.271 ms`
+  - linear out: `1260.057 ms`
+  - MLP gate+up: `2122.330 ms`
+  - MLP down: `3396.552 ms`
+
+How to read it:
+
+- the per-section totals are measured inside the persistent kernel and are close
+  enough to the wall-clock persistent total to guide optimization choice
+- full attention is the dominant subsection on this machine and lane
+- the next bounded pass should target full-attention internals before returning
+  to MLP or linear attention
+
 ## Bottleneck Read
 
 The real bottleneck is the batched persistent kernel body, not sampling.
@@ -87,6 +125,8 @@ From the current kernel structure in
 - the MLP projection family also still uses block-wide reductions
 - several large sections still process `batch_size=2` via explicit `for (int b = 0; b < B; b++)`
   loops inside the persistent body
+- with the new internal split, full attention is now the first place to look
+  inside the persistent kernel on `4B`
 
 That combination makes the next bounded target clear:
 
@@ -96,9 +136,9 @@ That combination makes the next bounded target clear:
 
 The highest-probability next areas are:
 
-- linear-attention projection family
-- MLP projection family
-- batch-loop serialization inside the persistent body
+- full-attention internal body
+- linear-attention recurrent/core body
+- MLP down projection
 
 ## Experiments Tried And Reverted
 

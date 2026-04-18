@@ -73,6 +73,14 @@ stage_pat = re.compile(
     r"lm_head_ms=([0-9.]+) logits_d2h_ms=([0-9.]+) host_sampling_ms=([0-9.]+) "
     r"gpu_argmax_ms=([0-9.]+) token_d2h_ms=([0-9.]+) total_native_decode_ms=([0-9.]+)"
 )
+section_keys = [
+    "persistent_full_attn_ms",
+    "persistent_linear_proj_ms",
+    "persistent_linear_core_ms",
+    "persistent_linear_out_ms",
+    "persistent_mlp_gate_up_ms",
+    "persistent_mlp_down_ms",
+]
 
 base = "SuperSonic parity benchmark sentence for warmed Qwen decode throughput. "
 
@@ -105,6 +113,10 @@ def run_once(prompt: str, run_max_new_tokens: int):
     if not stage:
         print(stderr, file=sys.stderr)
         raise SystemExit("failed to parse stage timings output")
+    sections = {}
+    for key in section_keys:
+        m = re.search(rf"{key}=([0-9.]+)", stderr)
+        sections[key] = float(m.group(1)) if m else 0.0
     return {
         "prompt_tokens": int(result.group(1)),
         "generated_tokens": int(result.group(2)),
@@ -119,6 +131,7 @@ def run_once(prompt: str, run_max_new_tokens: int):
         "gpu_argmax_ms": float(stage.group(7)),
         "token_d2h_ms": float(stage.group(8)),
         "total_native_decode_ms": float(stage.group(9)),
+        **sections,
     }
 
 repeat = 32
@@ -152,6 +165,10 @@ host_sampling_mean = statistics.mean(r["host_sampling_ms"] for r in runs)
 gpu_argmax_mean = statistics.mean(r["gpu_argmax_ms"] for r in runs)
 token_d2h_mean = statistics.mean(r["token_d2h_ms"] for r in runs)
 native_mean = statistics.mean(r["total_native_decode_ms"] for r in runs)
+section_means = {
+    key: statistics.mean(r[key] for r in runs)
+    for key in section_keys
+}
 
 prefill_toks_s = (prompt_tokens / prefill_mean) * 1000.0 if prefill_mean else 0.0
 decode_toks_s = (aggregate_tokens / decode_mean) * 1000.0 if decode_mean else 0.0
@@ -167,5 +184,14 @@ print(
     f"logits_d2h={logits_d2h_mean:.3f} host_sampling={host_sampling_mean:.3f} "
     f"gpu_argmax={gpu_argmax_mean:.3f} token_d2h={token_d2h_mean:.3f} "
     f"native_total={native_mean:.3f}"
+)
+print(
+    "persistent_sections_ms_mean "
+    f"full_attn={section_means['persistent_full_attn_ms']:.3f} "
+    f"linear_proj={section_means['persistent_linear_proj_ms']:.3f} "
+    f"linear_core={section_means['persistent_linear_core_ms']:.3f} "
+    f"linear_out={section_means['persistent_linear_out_ms']:.3f} "
+    f"mlp_gate_up={section_means['persistent_mlp_gate_up_ms']:.3f} "
+    f"mlp_down={section_means['persistent_mlp_down_ms']:.3f}"
 )
 PY
