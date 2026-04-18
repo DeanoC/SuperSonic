@@ -2070,6 +2070,38 @@ impl DecodeEngine {
         self.kv_fp8
     }
 
+    /// Verify the engine's attn_scratch budget covers the current largest
+    /// `kv_max_t` across all full-attention layers (of every batch item).
+    /// The 4B persistent decode kernel writes `saved_q+gate+pre_gate+scores`
+    /// into attn_scratch; `saved_scores` is indexed `[qh * kv_max_b + t]`.
+    fn check_attn_scratch_budget(&self) -> Result<()> {
+        if !self.use_4b_kernel {
+            return Ok(());
+        }
+        let config = &self.weights.config;
+        let nh = config.num_attention_heads;
+        let hd = config.head_dim;
+        let base = 3 * nh * hd;
+        let mut max_kv = 0usize;
+        for st in std::iter::once(&self.state).chain(self.extra_states.iter()) {
+            for ls in &st.layers {
+                max_kv = max_kv.max(ls.kv_capacity());
+            }
+        }
+        let required = base + nh * max_kv;
+        if required > self.attn_scratch_floats {
+            anyhow::bail!(
+                "attn_scratch_floats={} too small for kv_max_t={} \
+                 (need {} = 3*{nh}*{hd} + {nh}*{max_kv}). \
+                 Pass --context-size to budget the run's max context.",
+                self.attn_scratch_floats,
+                max_kv,
+                required,
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_kv_fp8_for_trace(&mut self, enabled: bool) {
         self.kv_fp8 = enabled;
     }
@@ -2200,6 +2232,7 @@ impl DecodeEngine {
                     .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }
+        self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
             Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
         }
@@ -2380,6 +2413,7 @@ impl DecodeEngine {
                 }
             }
         }
+        self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
             Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
             for bi in 0..self.extra_states.len() {

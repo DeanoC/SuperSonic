@@ -772,12 +772,28 @@ fn main() -> Result<()> {
         anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
     }
 
+    // attn_scratch_floats must cover saved_q+gate+pre_gate+scores for the largest
+    // kv_max_t the run will hit. Registry value is the floor; scale up with context.
+    let required_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
+        text_config.num_attention_heads,
+        text_config.head_dim,
+        context_tokens,
+        params.kv_chunk_size,
+    );
+    let attn_scratch_floats = params.attn_scratch_floats.max(required_attn_scratch);
+    if attn_scratch_floats > params.attn_scratch_floats {
+        eprintln!(
+            "[scratch] context={} → attn_scratch_floats={} (registry floor {})",
+            context_tokens, attn_scratch_floats, params.attn_scratch_floats
+        );
+    }
+
     // Create decode engine
     let mut engine = DecodeEngine::new(
         weights,
         ordinal,
         params.proj_buf_floats,
-        params.attn_scratch_floats,
+        attn_scratch_floats,
         params.kv_chunk_size,
         params.use_4b_kernel,
         cli.prefill_chunk_size,
