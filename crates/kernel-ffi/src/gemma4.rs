@@ -407,6 +407,47 @@ unsafe extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+
+    fn dotcache_gemma4_hip_persistent_decode_batch(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_size: usize,
+        ple_hidden: usize,
+        eps: f32,
+        scale: f32,
+        batch_size: usize,
+        ws_stride: usize,
+        layers: *const c_void,
+        batch_descs: *const c_void,
+        hidden_io: *mut c_void,
+        per_layer_inputs: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
+    fn dotcache_gemma4_hip_persistent_decode_batch_int4(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_size: usize,
+        ple_hidden: usize,
+        eps: f32,
+        scale: f32,
+        batch_size: usize,
+        ws_stride: usize,
+        layers: *const c_void,
+        int4_scales: *const c_void,
+        batch_descs: *const c_void,
+        hidden_io: *mut c_void,
+        per_layer_inputs: *const c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
 }
 
 #[cfg(not(supersonic_backend_hip))]
@@ -448,6 +489,8 @@ gemma4_stub! {
     fn dotcache_gemma4_hip_embed_gather_scaled(dtype: c_int, device_ordinal: usize, seq_len: usize, hidden_size: usize, vocab_size: usize, scale: f32, token_ids: *const c_uint, table: *const c_void, out: *mut c_void) -> c_int;
     fn dotcache_gemma4_hip_persistent_decode_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, int4_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
     fn dotcache_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_persistent_decode_batch(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_persistent_decode_batch_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, int4_scales: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
 }
 
 /// Gemma-variant RMSNorm — plain `weight * (x / sqrt(mean(x^2) + eps))` with
@@ -1685,6 +1728,46 @@ impl Default for Gemma4Int4ScaleDesc {
     }
 }
 
+/// Per-sequence state pointers for batched Gemma 4 decode.
+///
+/// One `Gemma4BatchSeqDesc` per layer (parallel array to
+/// [`Gemma4DecodeLayerDesc`]), holding per-sequence mutable state for up to
+/// [`crate::layer_desc::MAX_BATCH_SIZE`] sequences. Mirrors Qwen's
+/// [`crate::layer_desc::BatchSeqDesc`] but trimmed to Gemma 4's needs:
+/// no linear-attention (`conv_state` / `recurrent_state`), no FP8 KV
+/// (`kv_scale_*`), no BF16 shadow caches.
+///
+/// When `batch_size == 1` the kernel reads per-sequence state from the layer
+/// descriptor's own `kv_cache_k` / `kv_cache_v` and the scalar `position`
+/// argument — `batch_descs` is `nullptr`. When `batch_size > 1`, the kernel
+/// reads per-sequence pointers and offsets from this struct instead.
+///
+/// Shared-KV layers must alias the source layer's per-sequence cache pointers
+/// (i.e. `batch_descs[shared_layer].kv_cache_k[b] == batch_descs[source_layer].kv_cache_k[b]`)
+/// — replication across sequences is the engine's responsibility, not the
+/// kernel's.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Gemma4BatchSeqDesc {
+    /// Per-sequence position in the sequence (RoPE table lookup + KV write slot).
+    pub seqlen_offset: [c_int; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence K cache pointer (`[num_kv_heads, kv_max_t, head_dim]` BF16).
+    pub kv_cache_k: [*mut c_void; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence V cache pointer (`[num_kv_heads, kv_max_t, head_dim]` BF16).
+    pub kv_cache_v: [*mut c_void; crate::layer_desc::MAX_BATCH_SIZE],
+    /// Per-sequence allocated `T` dimension of the KV cache.
+    pub kv_max_t: [c_int; crate::layer_desc::MAX_BATCH_SIZE],
+}
+
+unsafe impl Send for Gemma4BatchSeqDesc {}
+unsafe impl Sync for Gemma4BatchSeqDesc {}
+
+impl Default for Gemma4BatchSeqDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Required F32 workspace (elements) for the persistent decode megakernel.
 /// Sized to the max of (fused_attn_block, fused_mlp_ple) needs across all
 /// layers — phase A and phase B run sequentially within each layer and share
@@ -1758,6 +1841,83 @@ pub fn persistent_decode(
     Ok(())
 }
 
+/// Batched variant of [`persistent_decode`] — runs `batch_size` parallel
+/// decode tokens through all layers in a single kernel launch. Weight reads
+/// in the six matmul phases (Q/K/V, o_proj, gate+up, down, per_layer_input_gate,
+/// per_layer_projection) are amortized across sequences.
+///
+/// Buffer shapes:
+/// - `layers`: `[num_layers]` of [`Gemma4DecodeLayerDesc`] (same as single-seq).
+/// - `batch_descs`: `[num_layers]` of [`Gemma4BatchSeqDesc`], one per layer.
+///   `batch_descs[l].kv_cache_k[b]`, `.kv_cache_v[b]`, `.seqlen_offset[b]`,
+///   `.kv_max_t[b]` encode sequence `b`'s state for layer `l`. Shared-KV layers
+///   must alias the source layer's per-sequence KV pointers in the same `b`.
+/// - `hidden_io`: `[batch_size, hidden_size]` BF16 contiguous (in/out per seq).
+/// - `per_layer_inputs`: `[batch_size, num_layers, ple_hidden]` BF16 contiguous.
+/// - `workspace`: `batch_size * persistent_decode_workspace_elems(...)` F32.
+///
+/// `ws_stride` must equal the value returned by
+/// [`persistent_decode_workspace_elems`] for this engine's configuration —
+/// it's the per-sequence slice size into `workspace`.
+///
+/// All sequences in the batch must share the same allocated `max_t`
+/// (`batch_descs[l].kv_max_t[b] == layers[l].kv_max_t` for every `b`); the
+/// kernel uses `layers[l].kv_max_t` as the uniform scores-stride across seqs.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_batch(
+    ordinal: usize,
+    dtype: ScalarType,
+    layers: &GpuBuffer,
+    batch_descs: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    per_layer_inputs: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    num_layers: usize,
+    hidden_size: usize,
+    ple_hidden: usize,
+    batch_size: usize,
+    ws_stride: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode_batch: batch_size {batch_size} out of range [1, {}]",
+            crate::layer_desc::MAX_BATCH_SIZE
+        )));
+    }
+    let status = unsafe {
+        dotcache_gemma4_hip_persistent_decode_batch(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            eps,
+            scale,
+            batch_size,
+            ws_stride,
+            layers.as_ptr(),
+            batch_descs.as_ptr(),
+            hidden_io.as_mut_ptr(),
+            per_layer_inputs.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode_batch failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 /// INT4 version of [`persistent_decode`]. Runs a full Gemma 4 forward pass
 /// for one decode token in a single kernel launch with all Q/K/V/O/gate/up/
 /// down/per_layer_input_gate/per_layer_projection matmuls INT4-dequantized
@@ -1814,6 +1974,71 @@ pub fn persistent_decode_int4(
     if status != 0 {
         return Err(GpuError::Hip(format!(
             "gemma4 persistent_decode_int4 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Batched INT4 variant of [`persistent_decode_int4`] — runs `batch_size`
+/// parallel decode tokens through all layers in a single kernel launch with
+/// every matmul INT4-dequantized inline. Same buffer conventions as
+/// [`persistent_decode_batch`] plus the `int4_scales` parallel array.
+///
+/// `ws_stride` must equal [`persistent_decode_workspace_elems`] for this
+/// engine's configuration. `workspace` must be sized `batch_size * ws_stride`
+/// F32 elements.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_batch_int4(
+    ordinal: usize,
+    dtype: ScalarType,
+    layers: &GpuBuffer,
+    int4_scales: &GpuBuffer,
+    batch_descs: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    per_layer_inputs: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    num_layers: usize,
+    hidden_size: usize,
+    ple_hidden: usize,
+    batch_size: usize,
+    ws_stride: usize,
+    eps: f32,
+    scale: f32,
+) -> Result<(), GpuError> {
+    if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode_batch_int4: batch_size {batch_size} out of range [1, {}]",
+            crate::layer_desc::MAX_BATCH_SIZE
+        )));
+    }
+    let status = unsafe {
+        dotcache_gemma4_hip_persistent_decode_batch_int4(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            eps,
+            scale,
+            batch_size,
+            ws_stride,
+            layers.as_ptr(),
+            int4_scales.as_ptr(),
+            batch_descs.as_ptr(),
+            hidden_io.as_mut_ptr(),
+            per_layer_inputs.as_ptr(),
+            workspace.as_mut_ptr(),
+            matvec_counter.as_mut_ptr() as *mut c_uint,
+            barrier_counter.as_mut_ptr() as *mut c_uint,
+            barrier_flag.as_mut_ptr() as *mut c_uint,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Hip(format!(
+            "gemma4 persistent_decode_batch_int4 failed with status {status}"
         )));
     }
     Ok(())
