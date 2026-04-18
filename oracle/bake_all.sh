@@ -18,10 +18,18 @@
 #   --upload        Publish each bake via oracle/upload_bake.py once it succeeds.
 #   --bf16          Also produce Qwen BF16 bakes (triggered via a throwaway
 #                   `supersonic` run). Gemma 4 has no BF16 bake format.
+#   --fp8-native    Also produce Qwen FP8-native bakes (needs a model source
+#                   with FP8 tensors; e.g. lovedheart/Qwen3.5-*-FP8). Gemma 4
+#                   has no FP8-native bake format.
 #   --no-int4       Skip INT4 bakes (useful with --bf16 for a BF16-only run).
 #   --force         Re-bake even if a valid bake already exists.
 #   --stop-on-error Abort the whole batch if any single bake fails.
 #                   (Default: keep going and report failures at the end.)
+#
+# 9B INT4 note: GPTQ calibration for qwen3.5-9b loads the full BF16 model
+# (~18 GiB) into GPU memory, which OOMs on ≤16 GiB cards (including gfx1150).
+# Bake it on a box with ≥24 GiB GPU RAM or skip it by leaving QWEN_9B_DIR
+# unset. `oracle/bake_int4.py --help` documents the memory requirements.
 #
 # The script is safely re-runnable — existing valid bakes are skipped unless
 # --force is set. Both Python bakers checkpoint per-layer, so an interrupted
@@ -34,6 +42,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 UPLOAD=0
 INCLUDE_BF16=0
+INCLUDE_FP8=0
 INCLUDE_INT4=1
 FORCE=0
 STOP_ON_ERROR=0
@@ -42,6 +51,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --upload) UPLOAD=1 ;;
         --bf16) INCLUDE_BF16=1 ;;
+        --fp8-native) INCLUDE_FP8=1 ;;
         --no-int4) INCLUDE_INT4=0 ;;
         --force) FORCE=1 ;;
         --stop-on-error) STOP_ON_ERROR=1 ;;
@@ -69,6 +79,7 @@ bake_dir_for() {
     local model_dir="$1" variant="$2"
     case "$variant" in
         bf16) echo "$model_dir/.supersonic/v${FORMAT_VERSION}" ;;
+        fp8-native) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-fp8" ;;
         int4) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-int4-gptq" ;;
         *) echo "bad variant: $variant" >&2 ; return 2 ;;
     esac
@@ -157,6 +168,37 @@ bake_bf16() {
     fi
 }
 
+bake_fp8_native() {
+    local cli_name="$1" model_dir="$2" family="$3"
+    if [[ "$family" == "gemma" ]]; then
+        echo "[skip] $cli_name fp8-native — Gemma 4 has no FP8-native bake format"
+        SKIPPED+=("$cli_name fp8-native")
+        return 0
+    fi
+    local dir ; dir="$(bake_dir_for "$model_dir" fp8-native)" || return 2
+    local label="$cli_name fp8-native"
+    if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
+        echo "[skip] $label — valid bake at $dir"
+        SKIPPED+=("$label")
+        return 0
+    fi
+    # --fp8-runtime requires the source model to ship FP8 tensors (e.g.
+    # lovedheart/Qwen3.5-*-FP8). A stock BF16 checkpoint will fail the bake
+    # with a clear error; don't treat that as a script bug.
+    run_or_record "$label" cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
+        --bin supersonic -- \
+        --model "$cli_name" \
+        --model-dir "$model_dir" \
+        --prompt "bake-trigger" \
+        --max-new-tokens 1 \
+        --fp8-runtime \
+        --no-download || return $?
+    if [[ $UPLOAD -eq 1 ]]; then
+        run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
+            --model "$cli_name" --fp8-native --model-dir "$model_dir"
+    fi
+}
+
 print_summary() {
     local succeeded_count=${#SUCCEEDED[@]}
     local skipped_count=${#SKIPPED[@]}
@@ -187,6 +229,9 @@ for entry in "${MODELS[@]}"; do
     echo "#### $cli_name @ $model_dir"
     if [[ $INCLUDE_BF16 -eq 1 ]]; then
         bake_bf16 "$cli_name" "$model_dir" "$family" || true
+    fi
+    if [[ $INCLUDE_FP8 -eq 1 ]]; then
+        bake_fp8_native "$cli_name" "$model_dir" "$family" || true
     fi
     if [[ $INCLUDE_INT4 -eq 1 ]]; then
         bake_int4 "$cli_name" "$model_dir" "$family" || true
