@@ -187,6 +187,10 @@ That harness defaults to batch-1 BF16, a roughly `pp520` prompt target,
 `tg128`, `10` warmup runs, `20` timed runs, and prints aggregated native decode
 stage timings from `--emit-stage-timings`.
 
+The current `qwen3.5-0.8b` CUDA `sm86` optimization record, benchmark progression,
+remaining gap to Lucebox, and carry-forward process for the other supported Qwen3.5
+CUDA models are tracked in [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
+
 For a one-token Nsight Compute pass over the non-4B persistent decode kernel on
 `sm86`, use:
 
