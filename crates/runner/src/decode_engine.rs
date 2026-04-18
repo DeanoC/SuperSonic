@@ -8,7 +8,7 @@ use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_int4_
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::PersistentDecodeScratch;
-use qwen35::state::ModelState;
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use crate::oracle::OracleOutput;
@@ -2208,7 +2208,7 @@ impl DecodeEngine {
                     .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }
-        if self.kv_fp8 {
+        if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
             Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
         }
 
@@ -2388,7 +2388,7 @@ impl DecodeEngine {
                 }
             }
         }
-        if self.kv_fp8 {
+        if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
             Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
             for bi in 0..self.extra_states.len() {
                 Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.extra_states[bi])?;

@@ -3,6 +3,10 @@ use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use crate::config::TextConfig;
 use crate::weights::LayerKind;
 
+pub fn kv_fp8_bf16_sidecar_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_DEBUG_DISABLE_KV_FP8_BF16_SIDECAR").is_none()
+}
+
 /// Mutable per-layer state (KV cache, conv state, recurrent state).
 pub struct LayerState {
     pub kind: LayerKind,
@@ -90,7 +94,10 @@ impl LayerState {
         let kv_dtype = if kv_fp8 { ScalarType::U8 } else { ScalarType::BF16 };
         if let (Some(ref k), Some(ref v)) = (&self.kv_cache_k, &self.kv_cache_v) {
             let current_cap = k.shape()[2]; // [1, nkv, seq, hd]
-            if kv_fp8 && (self.kv_shadow_k.is_none() || self.kv_shadow_v.is_none()) {
+            if kv_fp8
+                && kv_fp8_bf16_sidecar_enabled()
+                && (self.kv_shadow_k.is_none() || self.kv_shadow_v.is_none())
+            {
                 let nkv = config.num_key_value_heads;
                 let hd = config.head_dim;
                 self.kv_shadow_k =
@@ -137,11 +144,13 @@ impl LayerState {
                     Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
                 self.kv_scale_v =
                     Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
-                self.kv_shadow_k =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
-                self.kv_shadow_v =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
-                self.kv_shadow_start = self.kv_filled;
+                if kv_fp8_bf16_sidecar_enabled() {
+                    self.kv_shadow_k =
+                        Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                    self.kv_shadow_v =
+                        Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                    self.kv_shadow_start = self.kv_filled;
+                }
             }
         }
         Ok(())
