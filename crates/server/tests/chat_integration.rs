@@ -468,14 +468,16 @@ async fn test_context_overflow_error(h: &Harness) {
     let body = json!({"prompt": "x", "max_tokens": 999_999});
     let resp = h.client.post(format!("{}/v1/completions", h.base))
         .json(&body).send().await.expect("POST overflow");
-    let status = resp.status();
+    // Post-refactor this is a client error (400) because the check runs
+    // in the handler before we commit to an SSE response.
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST,
+        "expected 400 for context overflow");
     let v: Value = resp.json().await.expect("parse body");
-    assert!(status.is_client_error() || status.is_server_error(),
-        "expected error status, got {status}");
+    assert_eq!(v["error"]["type"], "invalid_request_error");
     let msg = v["error"]["message"].as_str().unwrap_or("");
     assert!(msg.contains("max_context") || msg.contains("exceeds"),
         "error should mention context overflow: {msg}");
-    eprintln!("[scenario] context overflow → OK ({})", status);
+    eprintln!("[scenario] context overflow → OK (400 invalid_request_error)");
 }
 
 /* ---------- the suite ---------- */

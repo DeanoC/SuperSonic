@@ -252,12 +252,19 @@ fn resolve_backend(choice: &str, ordinal: usize) -> Result<Backend> {
         "hip" => Ok(Backend::Hip),
         "cuda" => Ok(Backend::Cuda),
         "auto" | "" => {
-            // Prefer HIP when a HIP device is reachable; fall back to CUDA.
+            // Prefer HIP when a HIP device is reachable; otherwise try
+            // CUDA. Failing both is a hard error here rather than later —
+            // keeps the "no usable backend" case actionable.
             if kernel_ffi::query_gpu_info(ordinal).is_ok() {
-                Ok(Backend::Hip)
-            } else {
-                Ok(Backend::Cuda)
+                return Ok(Backend::Hip);
             }
+            if gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok() {
+                return Ok(Backend::Cuda);
+            }
+            bail!(
+                "--backend auto: neither HIP nor CUDA device is reachable at ordinal {ordinal}; \
+                 pass --backend hip or --backend cuda explicitly if you know one is available"
+            )
         }
         other => bail!("unknown --backend '{other}' (auto | hip | cuda)"),
     }

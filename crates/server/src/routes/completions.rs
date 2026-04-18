@@ -38,16 +38,21 @@ pub async fn completions(
     // Raw-prompt path: let the tokenizer add its own BOS etc.
     let add_special_tokens = true;
 
+    // Tokenize + bounds-check synchronously so setup failures become
+    // structured HTTP errors (400), not in-band SSE error events.
+    let prompt_ids = generate::prepare(&state, &prompt, add_special_tokens, params.max_tokens)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
     let id = make_id();
     let created = epoch_secs();
     let model = state.model_id.clone();
 
     if req.stream {
-        let rx = generate::spawn(state.clone(), prompt, add_special_tokens, params);
+        let rx = generate::spawn(state.clone(), prompt_ids, params);
         let stream = completion_sse_stream(rx, id, created, model);
         Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
     } else {
-        let rx = generate::spawn(state.clone(), prompt, add_special_tokens, params);
+        let rx = generate::spawn(state.clone(), prompt_ids, params);
         let result = generate::collect(rx)
             .await
             .map_err(|e| ApiError::internal(format!("generation failed: {e}")))?;

@@ -62,17 +62,50 @@ impl FinishReason {
     }
 }
 
-/// Start generation. Returns the receiver side of the event channel — the
-/// caller drains it either eagerly (non-stream) or as an SSE stream.
+/// Tokenize + bounds-check a request synchronously. The route handlers
+/// call this before committing to an SSE response, so setup failures
+/// (empty prompt, context overflow) surface as real HTTP errors instead
+/// of in-band SSE error events under a misleading 200.
+pub fn prepare(
+    state: &ServerState,
+    prompt_text: &str,
+    add_special_tokens: bool,
+    max_tokens: usize,
+) -> Result<Vec<u32>> {
+    let encoding = state
+        .tokenizer
+        .encode(prompt_text, add_special_tokens)
+        .map_err(|e| anyhow!("tokenize: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if prompt_ids.is_empty() {
+        return Err(anyhow!("empty prompt after tokenization"));
+    }
+    // `saturating_add` so a pathological `max_tokens` near `usize::MAX` is
+    // rejected here rather than overflowing and bypassing the bound.
+    let total_ctx = prompt_ids.len().saturating_add(max_tokens);
+    if total_ctx > state.max_context {
+        return Err(anyhow!(
+            "prompt ({} tokens) + max_tokens ({}) exceeds max_context ({})",
+            prompt_ids.len(),
+            max_tokens,
+            state.max_context
+        ));
+    }
+    Ok(prompt_ids)
+}
+
+/// Start generation from pre-validated token IDs. Returns the receiver
+/// side of the event channel — the caller drains it either eagerly
+/// (non-stream) or as an SSE stream. Call [`prepare`] first and bail out
+/// of the handler with an HTTP error if it fails.
 pub fn spawn(
     state: Arc<ServerState>,
-    prompt_text: String,
-    add_special_tokens: bool,
+    prompt_ids: Vec<u32>,
     params: GenParams,
 ) -> UnboundedReceiver<GenEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = run(state, prompt_text, add_special_tokens, params, tx.clone()) {
+        if let Err(e) = run(state, prompt_ids, params, tx.clone()) {
             let _ = tx.send(GenEvent::Error(e.to_string()));
         }
     });
@@ -81,33 +114,12 @@ pub fn spawn(
 
 fn run(
     state: Arc<ServerState>,
-    prompt_text: String,
-    add_special_tokens: bool,
+    prompt_ids: Vec<u32>,
     params: GenParams,
     tx: UnboundedSender<GenEvent>,
 ) -> Result<()> {
     let tokenizer = state.tokenizer.clone();
-    let encoding = tokenizer
-        .encode(prompt_text.as_str(), add_special_tokens)
-        .map_err(|e| anyhow!("tokenize: {e}"))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    if prompt_ids.is_empty() {
-        return Err(anyhow!("empty prompt after tokenization"));
-    }
     let prompt_tokens = prompt_ids.len() as u32;
-
-    // `saturating_add` so a pathological `max_tokens` near `usize::MAX` is
-    // rejected here rather than overflowing and bypassing the bound.
-    let max_ctx = state.max_context;
-    let total_ctx = prompt_ids.len().saturating_add(params.max_tokens);
-    if total_ctx > max_ctx {
-        return Err(anyhow!(
-            "prompt ({} tokens) + max_tokens ({}) exceeds max_context ({})",
-            prompt_ids.len(),
-            params.max_tokens,
-            max_ctx
-        ));
-    }
 
     // Zero-token request: return an empty completion without touching the
     // engine. OpenAI semantics: `max_tokens=0` means no completion tokens.
