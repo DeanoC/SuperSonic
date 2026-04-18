@@ -75,6 +75,9 @@ stage_pat = re.compile(
 )
 section_keys = [
     "persistent_full_attn_ms",
+    "persistent_full_attn_proj_ms",
+    "persistent_full_attn_core_ms",
+    "persistent_full_attn_out_ms",
     "persistent_linear_proj_ms",
     "persistent_linear_core_ms",
     "persistent_linear_out_ms",
@@ -188,6 +191,9 @@ print(
 print(
     "persistent_sections_ms_mean "
     f"full_attn={section_means['persistent_full_attn_ms']:.3f} "
+    f"full_attn_proj={section_means['persistent_full_attn_proj_ms']:.3f} "
+    f"full_attn_core={section_means['persistent_full_attn_core_ms']:.3f} "
+    f"full_attn_out={section_means['persistent_full_attn_out_ms']:.3f} "
     f"linear_proj={section_means['persistent_linear_proj_ms']:.3f} "
     f"linear_core={section_means['persistent_linear_core_ms']:.3f} "
     f"linear_out={section_means['persistent_linear_out_ms']:.3f} "

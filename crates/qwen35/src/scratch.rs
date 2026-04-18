@@ -4,7 +4,7 @@ use std::mem;
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
 
-pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 20;
+pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 37;
 pub const PERSISTENT_SYNC_COUNTER_BYTES: usize = 24;
 
 /// Pre-allocated device scratch buffers for the persistent decode kernel.

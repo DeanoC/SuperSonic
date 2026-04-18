@@ -141,6 +141,9 @@ pub struct DecodeStageTimings {
     pub gpu_argmax_ms: f64,
     pub token_d2h_ms: f64,
     pub persistent_full_attn_ms: f64,
+    pub persistent_full_attn_proj_ms: f64,
+    pub persistent_full_attn_core_ms: f64,
+    pub persistent_full_attn_out_ms: f64,
     pub persistent_linear_proj_ms: f64,
     pub persistent_linear_core_ms: f64,
     pub persistent_linear_out_ms: f64,
@@ -158,6 +161,9 @@ impl DecodeStageTimings {
         self.gpu_argmax_ms += rhs.gpu_argmax_ms;
         self.token_d2h_ms += rhs.token_d2h_ms;
         self.persistent_full_attn_ms += rhs.persistent_full_attn_ms;
+        self.persistent_full_attn_proj_ms += rhs.persistent_full_attn_proj_ms;
+        self.persistent_full_attn_core_ms += rhs.persistent_full_attn_core_ms;
+        self.persistent_full_attn_out_ms += rhs.persistent_full_attn_out_ms;
         self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
         self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
         self.persistent_linear_out_ms += rhs.persistent_linear_out_ms;
@@ -224,11 +230,14 @@ pub struct FullAttentionLayerOutputTrace {
 }
 
 const PERSISTENT_4B_TIMING_FULL_ATTN: usize = 0;
-const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 1;
-const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 2;
-const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 10;
-const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 18;
-const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 19;
+const PERSISTENT_4B_TIMING_FULL_ATTN_PROJ: usize = 1;
+const PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE: usize = 2;
+const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
+const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
+const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 27;
+const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 35;
+const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 36;
 
 fn persistent_4b_clock_cycles_to_ms(cycles: u64, clock_rate_khz: u32) -> f64 {
     if cycles == 0 || clock_rate_khz == 0 {
@@ -261,19 +270,27 @@ fn decode_persistent_4b_timing_slots(
     };
 
     let mut full_attn_cycles = 0u64;
+    let mut full_attn_proj_cycles = 0u64;
+    let mut full_attn_core_cycles = 0u64;
+    let mut full_attn_out_cycles = 0u64;
     let mut linear_proj_cycles = 0u64;
     let mut linear_core_cycles = 0u64;
     let mut linear_out_cycles = 0u64;
     let mut mlp_gate_up_cycles = 0u64;
     let mut mlp_down_cycles = 0u64;
-    let linear_batches = batch_size.min(8);
+    let section_batches = batch_size.min(8);
     for layer in 0..num_layers {
         let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
         full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
+        full_attn_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
         linear_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
         mlp_gate_up_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
         mlp_down_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
-        for b in 0..linear_batches {
+        for b in 0..section_batches {
+            full_attn_core_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + b);
+            full_attn_out_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + b);
             linear_core_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
             linear_out_cycles +=
@@ -284,6 +301,18 @@ fn decode_persistent_4b_timing_slots(
     DecodeStageTimings {
         persistent_full_attn_ms: persistent_4b_clock_cycles_to_ms(
             full_attn_cycles,
+            clock_rate_khz,
+        ),
+        persistent_full_attn_proj_ms: persistent_4b_clock_cycles_to_ms(
+            full_attn_proj_cycles,
+            clock_rate_khz,
+        ),
+        persistent_full_attn_core_ms: persistent_4b_clock_cycles_to_ms(
+            full_attn_core_cycles,
+            clock_rate_khz,
+        ),
+        persistent_full_attn_out_ms: persistent_4b_clock_cycles_to_ms(
+            full_attn_out_cycles,
             clock_rate_khz,
         ),
         persistent_linear_proj_ms: persistent_4b_clock_cycles_to_ms(

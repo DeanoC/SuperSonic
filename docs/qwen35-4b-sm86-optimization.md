@@ -50,7 +50,7 @@ Defaults:
 - timed runs: `20`
 - stage timings enabled
 
-## Current Baseline
+## Initial Baseline
 
 Current warmed result on this RTX 3090-class `sm86` machine:
 
@@ -113,6 +113,78 @@ How to read it:
 - the next bounded pass should target full-attention internals before returning
   to MLP or linear attention
 
+## Full-Attention Internal Split
+
+Added one more level of timing inside the `4B` full-attention section so the
+next optimization pass would not guess between projection, the attention core,
+and `o_proj`.
+
+Short sanity run (`pp533` / `tg16`) came in at:
+
+- decode: `3286.7 ms`
+- persistent decode: `3173.691 ms`
+- full attention total: `1632.724 ms`
+- full-attention subsections:
+  - projection: `21.540 ms`
+  - core: `1596.197 ms`
+  - `o_proj`: `14.185 ms`
+
+Full warmed result (`pp533` / `tg128`) came in at:
+
+- decode: `27454.2 ms`
+- aggregate decode throughput: `9.3 tok/s`
+- persistent decode: `26551.106 ms`
+- full attention total: `14375.092 ms`
+- full-attention subsections:
+  - projection: `172.364 ms`
+  - core: `14082.755 ms`
+  - `o_proj`: `113.577 ms`
+
+What that clarified:
+
+- the real `4B` full-attention bottleneck is the BF16 attention core, not the
+  matmul work around it
+- copying the `0.8B` projection or `o_proj` hero ideas first would not have
+  matched the measured hotspot on this lane
+- the first structural pass should target the per-head attention body itself
+
+## First Kept Pass
+
+Added a narrow `sm86` batch-2 full-attention core specialization for the baked
+BF16 hero lane:
+
+- fixed lane guard: `B == 2`, `bs == 256`, `hd == 256`, `nh == 8`, `nkv == 2`
+- left `q_proj/k_proj/v_proj` and `o_proj` unchanged
+- replaced the sequential block-0 full-attention core with head-parallel work
+  across blocks for:
+  - Q norm + RoPE + saved-gate staging
+  - K norm + RoPE + KV append
+  - attention + gate
+- left `kv_fp8` on the old path; this pass is explicitly for the current BF16
+  hero lane and does not widen to other modes yet
+
+Short sanity result (`pp533` / `tg16`):
+
+- decode improved from `3286.7 ms` to `3275.0 ms`
+- persistent decode improved from `3173.691 ms` to `3161.851 ms`
+- full-attention core improved from `1596.197 ms` to `1581.192 ms`
+
+Full warmed result (`pp533` / `tg128`):
+
+- decode improved from `27454.2 ms` to `27347.7 ms`
+- aggregate decode throughput moved from `9.3 tok/s` to `9.4 tok/s`
+- persistent decode improved from `26551.106 ms` to `26444.424 ms`
+- full attention improved from `14375.092 ms` to `14241.680 ms`
+- full-attention core improved from `14082.755 ms` to `13950.210 ms`
+
+Why this one stayed:
+
+- it is numerically safe on the baked CUDA path
+- the warmed measurement moved in the expected direction, in the exact
+  subsection it was meant to target
+- the gain is modest, but it cleared the “measured win” bar without regressing
+  correctness
+
 ## Bottleneck Read
 
 The real bottleneck is the batched persistent kernel body, not sampling.
@@ -125,8 +197,8 @@ From the current kernel structure in
 - the MLP projection family also still uses block-wide reductions
 - several large sections still process `batch_size=2` via explicit `for (int b = 0; b < B; b++)`
   loops inside the persistent body
-- with the new internal split, full attention is now the first place to look
-  inside the persistent kernel on `4B`
+- with the new internal split, full-attention core is now the first place to
+  look inside the persistent kernel on `4B`
 
 That combination makes the next bounded target clear:
 
@@ -136,7 +208,7 @@ That combination makes the next bounded target clear:
 
 The highest-probability next areas are:
 
-- full-attention internal body
+- full-attention core inner loop
 - linear-attention recurrent/core body
 - MLP down projection
 
@@ -194,3 +266,12 @@ That means:
 
 The baked batch path and baked batch golden corpus remain the relevant
 correctness gates for this optimization lane on this machine.
+
+Additional baked-path validation for the kept full-attention-core pass:
+
+- single-sequence baked validate passed with `decode_max_delta=0.2812`
+- single-sequence baked `--gpu-validate` passed with exact token match and
+  `gpu_oracle_max_delta=0.0000`
+- baked batch quick validate passed with `decode_max_delta=0.3047`
+- baked batch golden corpus passed `11 / 11`
+- single-sequence long-context golden corpus passed `4 / 4`
