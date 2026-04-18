@@ -3322,7 +3322,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             const int total_proj = L.q_out_dim + L.k_out_dim + L.k_out_dim;
             {
                 if (qwen08_hero) {
-                    for (int sr = blockIdx.x; sr < total_proj; sr += nb) {
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        lds_input_bf16[c] = dotcache_qwen35_from_float<T>(normed[c]);
+                    }
+                    __syncthreads();
+
+                    const int lane = tid & (warpSize - 1);
+                    const int warp = tid / warpSize;
+                    const int warps_per_block = bs / warpSize;
+                    for (int sr = blockIdx.x * warps_per_block + warp;
+                         sr < total_proj;
+                         sr += nb * warps_per_block) {
                         const T* w;
                         int row;
                         if (sr < L.q_out_dim) {
@@ -3337,13 +3347,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
-                        float p = 0.0f;
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
-                        if (tid == 0) proj_buf[sr] = sum;
-                        __syncthreads();
+                        const float sum =
+                            dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                                wr, lds_input_bf16, hidden_dim);
+                        if (lane == 0) proj_buf[sr] = sum;
                     }
+                    __syncthreads();
                 } else {
                     if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                     grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3779,7 +3788,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             const int total_proj = L.qkv_out_dim + L.z_out_dim + 16 + 16;
             {
                 if (qwen08_hero) {
-                    for (int sr = blockIdx.x; sr < total_proj; sr += nb) {
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        lds_input_bf16[c] = dotcache_qwen35_from_float<T>(normed[c]);
+                    }
+                    __syncthreads();
+
+                    const int lane = tid & (warpSize - 1);
+                    const int warp = tid / warpSize;
+                    const int warps_per_block = bs / warpSize;
+                    for (int sr = blockIdx.x * warps_per_block + warp;
+                         sr < total_proj;
+                         sr += nb * warps_per_block) {
                         const T* w;
                         int row;
                         if (sr < L.qkv_out_dim) {
@@ -3797,13 +3816,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         const T* wr = w + static_cast<size_t>(row) * hidden_dim;
 
-                        float p = 0.0f;
-                        for (int c = tid; c < hidden_dim; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        const float sum = dotcache_qwen35_block_sum_256(p, lds);
-                        if (tid == 0) proj_buf[sr] = sum;
-                        __syncthreads();
+                        const float sum =
+                            dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                                wr, lds_input_bf16, hidden_dim);
+                        if (lane == 0) proj_buf[sr] = sum;
                     }
+                    __syncthreads();
                 } else {
                     if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                     grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4332,25 +4350,33 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             const T* gw = static_cast<const T*>(L.gate_proj_w);
             const T* uw = static_cast<const T*>(L.up_proj_w);
             if (qwen08_hero) {
-                for (int sr = blockIdx.x; sr < L.intermediate_size; sr += nb) {
+                for (int c = tid; c < hidden_dim; c += bs) {
+                    lds_input_bf16[c] = dotcache_qwen35_from_float<T>(normed[c]);
+                }
+                __syncthreads();
+
+                const int lane = tid & (warpSize - 1);
+                const int warp = tid / warpSize;
+                const int warps_per_block = bs / warpSize;
+                for (int sr = blockIdx.x * warps_per_block + warp;
+                     sr < L.intermediate_size;
+                     sr += nb * warps_per_block) {
                     const T* gr = gw + static_cast<size_t>(sr) * hidden_dim;
-                    float gp = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        gp += dotcache_qwen35_to_float(gr[c]) * lds_input[c];
-                    float gate_val = dotcache_qwen35_block_sum_256(gp, lds);
+                    const float gate_val =
+                        dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                            gr, lds_input_bf16, hidden_dim);
 
                     const T* ur = uw + static_cast<size_t>(sr) * hidden_dim;
-                    float up = 0.0f;
-                    for (int c = tid; c < hidden_dim; c += bs)
-                        up += dotcache_qwen35_to_float(ur[c]) * lds_input[c];
-                    float up_val = dotcache_qwen35_block_sum_256(up, lds);
+                    const float up_val =
+                        dotcache_qwen35_dot_row_input_bf16_warp_hero(
+                            ur, lds_input_bf16, hidden_dim);
 
-                    if (tid == 0) {
+                    if (lane == 0) {
                         float silu = gate_val / (1.0f + expf(-gate_val));
                         gate_up[sr] = silu * up_val;
                     }
-                    __syncthreads();
                 }
+                __syncthreads();
             } else {
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);
