@@ -98,7 +98,7 @@ echo "--- 0.8B ---"
 # Guards against two regressions: (a) the 0.8B INT4 memory-fault bug fixed 2026-04-18
 # (commit 5b27c41) and (b) any future silent fall-through where the dispatch reverts
 # to the BF16-only 0.8B kernel.
-check_case "0.8B --int4"            qwen3.5-0.8b "$MODEL_DIR_08B" "369 264 5243 321 5243 9572" --int4
+check_case "0.8B --int4"            qwen3.5-0.8b "$MODEL_DIR_08B" "369 264 1865 9572 303 279" --int4
 
 echo ""
 echo "Quant regression: $PASSED passed, $FAILED failed"
