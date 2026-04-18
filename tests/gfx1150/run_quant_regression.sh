@@ -88,9 +88,9 @@ check_case "4B --int4 --kv-fp8"     qwen3.5-4b "$MODEL_DIR_4B" "33075 888 279 15
 echo ""
 echo "--- 2B ---"
 check_case "2B bf16"                qwen3.5-2b "$MODEL_DIR_2B" "33075 888 279 15217 5388 13"
-check_case "2B --int4"              qwen3.5-2b "$MODEL_DIR_2B" "369 264 220 17 15 16" --int4
+check_case "2B --int4"              qwen3.5-2b "$MODEL_DIR_2B" "369 264 42140 3542 494 279" --int4
 check_case "2B --kv-fp8"            qwen3.5-2b "$MODEL_DIR_2B" "33075 888 279 15217 5388 13" --kv-fp8
-check_case "2B --int4 --kv-fp8"     qwen3.5-2b "$MODEL_DIR_2B" "369 264 220 17 15 16" --int4 --kv-fp8
+check_case "2B --int4 --kv-fp8"     qwen3.5-2b "$MODEL_DIR_2B" "369 264 42140 3542 494 279" --int4 --kv-fp8
 
 echo ""
 echo "--- 0.8B ---"

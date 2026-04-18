@@ -158,7 +158,9 @@ static REGISTRY: &[RegistryEntry] = &[
         },
         params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 8224,
-            attn_scratch_floats: 2048,
+            // 4B kernel's attn_scratch holds saved_q+saved_gate+saved_pre_gate+saved_scores.
+            // Needs 3*nh*hd + nh*kv_max_t floats; keep in sync with other 4B-kernel entries.
+            attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
@@ -174,7 +176,7 @@ static REGISTRY: &[RegistryEntry] = &[
         },
         params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 8224,
-            attn_scratch_floats: 2048,
+            attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
@@ -222,7 +224,7 @@ static REGISTRY: &[RegistryEntry] = &[
         },
         params: FamilyParams::Qwen35(Qwen35KernelParams {
             proj_buf_floats: 8224,
-            attn_scratch_floats: 2048,
+            attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
