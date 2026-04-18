@@ -1598,21 +1598,33 @@ fn run_gemma4(
             kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
         }
     }
-    let kv_bytes = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    // Both BF16 and INT4 engines allocate `batch_size` parallel KV cache sets
+    // (one per decode sequence); scale accordingly so `--batch-size > 1` can't
+    // pass the preflight check and then OOM during engine load.
+    let batch_size_u64 = cli.batch_size as u64;
+    let kv_bytes_per_seq = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    let kv_bytes = kv_bytes_per_seq * batch_size_u64;
     let estimated_vram =
         ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
-        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok x B={}) available={:.1}GiB",
         gib(estimated_vram),
         gib(entry.vram.fixed_bytes),
         gib(kv_bytes),
         context_tokens,
+        cli.batch_size,
         gib(total_vram),
     );
     if estimated_vram > total_vram {
+        let reduce_hint = if cli.batch_size > 1 {
+            "Reduce --context-size, --max-new-tokens, or --batch-size."
+        } else {
+            "Reduce --context-size or --max-new-tokens."
+        };
         anyhow::bail!(
-            "Insufficient VRAM for {context_tokens}-token context: need ~{:.2}GiB, GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
+            "Insufficient VRAM for {context_tokens}-token context at batch_size={}: need ~{:.2}GiB, GPU has {:.1}GiB. {reduce_hint}",
+            cli.batch_size,
             gib(estimated_vram),
             gib(total_vram),
         );
