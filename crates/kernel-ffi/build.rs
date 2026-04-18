@@ -279,9 +279,12 @@ fn main() {
         compile_hip(&kernel_dir, &out_dir);
     } else if normalized == "cuda" {
         compile_cuda(&kernel_dir, &out_dir);
-    } else if have_cuda_toolchain {
-        compile_cuda(&kernel_dir, &out_dir);
     } else {
-        compile_hip(&kernel_dir, &out_dir);
+        if have_hip_toolchain {
+            compile_hip(&kernel_dir, &out_dir);
+        }
+        if have_cuda_toolchain {
+            compile_cuda(&kernel_dir, &out_dir);
+        }
     }
 }

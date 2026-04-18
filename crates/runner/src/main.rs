@@ -62,7 +62,7 @@ impl BackendChoice {
     }
 }
 
-fn resolve_backend(choice: BackendChoice) -> Result<Backend> {
+fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
     match choice {
         BackendChoice::Explicit(backend) => {
             if !gpu_hal::is_backend_compiled(backend) {
@@ -78,13 +78,24 @@ fn resolve_backend(choice: BackendChoice) -> Result<Backend> {
             Ok(backend)
         }
         BackendChoice::Auto => {
-            if gpu_hal::is_backend_compiled(Backend::Cuda) {
-                Ok(Backend::Cuda)
-            } else if gpu_hal::is_backend_compiled(Backend::Hip) {
-                Ok(Backend::Hip)
-            } else {
-                anyhow::bail!("No GPU backend compiled into this build")
+            if gpu_hal::is_backend_compiled(Backend::Cuda)
+                && gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok()
+            {
+                return Ok(Backend::Cuda);
             }
+            if gpu_hal::is_backend_compiled(Backend::Hip)
+                && kernel_ffi::query_gpu_info(ordinal).is_ok()
+            {
+                return Ok(Backend::Hip);
+            }
+            anyhow::bail!(
+                "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
+                gpu_hal::compiled_backends()
+                    .into_iter()
+                    .map(|b| b.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         }
     }
 }
@@ -369,7 +380,7 @@ fn main() -> Result<()> {
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
         anyhow::anyhow!("Unknown backend '{}'. Expected one of: auto, hip, cuda", cli.backend)
     })?;
-    let backend = resolve_backend(backend_choice)?;
+    let backend = resolve_backend(backend_choice, ordinal)?;
     gpu_hal::set_backend(backend);
 
     // 1. Parse model variant
