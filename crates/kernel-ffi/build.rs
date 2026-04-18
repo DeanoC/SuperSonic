@@ -1,4 +1,5 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -88,7 +89,8 @@ fn detect_cuda_root() -> Option<PathBuf> {
         return None;
     }
 
-    let nvcc = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let nvcc = fs::canonicalize(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+        .ok()?;
     nvcc.parent()
         .and_then(|bin| bin.parent())
         .map(Path::to_path_buf)
@@ -275,16 +277,21 @@ fn main() {
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+    if want_hip && want_cuda && have_hip_toolchain && have_cuda_toolchain {
+        panic!(
+            "SUPERSONIC_BACKENDS={requested} is not supported by kernel-ffi yet: \
+             HIP and CUDA bridge archives export the same symbol set. \
+             Choose one backend, or build on a machine with only one toolchain available."
+        );
+    }
+
     if normalized == "hip" {
         compile_hip(&kernel_dir, &out_dir);
     } else if normalized == "cuda" {
         compile_cuda(&kernel_dir, &out_dir);
+    } else if have_cuda_toolchain {
+        compile_cuda(&kernel_dir, &out_dir);
     } else {
-        if have_hip_toolchain {
-            compile_hip(&kernel_dir, &out_dir);
-        }
-        if have_cuda_toolchain {
-            compile_cuda(&kernel_dir, &out_dir);
-        }
+        compile_hip(&kernel_dir, &out_dir);
     }
 }
