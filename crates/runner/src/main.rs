@@ -549,15 +549,24 @@ fn main() -> Result<()> {
         }
     };
 
-    // DFlash is Qwen3.5-9B-only today. Reject the flag on other families
-    // before the family dispatch returns, otherwise `--dflash` is silently
-    // ignored on e.g. Gemma4 / Phi4 and the user thinks speculative
-    // decoding is enabled when it isn't.
+    // DFlash validation runs BEFORE the family dispatch so a misconfig on
+    // non-Qwen families fails fast. The dispatch below returns for Gemma4/
+    // Phi4 — if we deferred these checks until the Qwen branch, callers
+    // would see --dflash / --dflash-draft-dir / etc. silently ignored on
+    // other model families and think speculative decoding was enabled
+    // when it wasn't.
     if cli.dflash && !matches!(model_variant.family(), ModelFamily::Qwen35) {
         anyhow::bail!(
             "--dflash is only supported on Qwen3.5 family models (got family={:?}, model={model_variant}).",
             model_variant.family(),
         );
+    }
+    if !cli.dflash
+        && (cli.dflash_draft_dir.is_some()
+            || cli.dflash_block.is_some()
+            || cli.dflash_tap_layers.is_some())
+    {
+        anyhow::bail!("--dflash-* flags require --dflash");
     }
 
     match model_variant.family() {
@@ -614,9 +623,7 @@ fn main() -> Result<()> {
             total_vram,
         );
     }
-    if cli.dflash_draft_dir.is_some() || cli.dflash_block.is_some() || cli.dflash_tap_layers.is_some() {
-        anyhow::bail!("--dflash-* flags require --dflash");
-    }
+    // --dflash-* guard already ran before the family dispatch above.
 
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,

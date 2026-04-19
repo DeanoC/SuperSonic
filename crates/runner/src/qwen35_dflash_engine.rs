@@ -225,6 +225,27 @@ pub fn run_qwen35_dflash(
             text_config.hidden_size,
         );
     }
+    // The draft borrows the target's `embed_tokens` + `lm_head` (docs §7)
+    // and uses draft-side token IDs to index them, so the two checkpoints
+    // must share the same vocabulary. Mismatch would silently read past
+    // the target embedding rows or truncate draft logits. Verify both
+    // before spending any more time on state / scratch allocation.
+    if draft_config.vocab_size != text_config.vocab_size {
+        bail!(
+            "draft vocab_size {} != target vocab_size {} — the draft borrows the target's \
+             embed_tokens / lm_head and must share its vocabulary",
+            draft_config.vocab_size,
+            text_config.vocab_size,
+        );
+    }
+    let mask_id = draft_config.dflash_config.mask_token_id;
+    if (mask_id as usize) >= text_config.vocab_size {
+        bail!(
+            "draft mask_token_id {mask_id} is out of range for target vocab_size {} — \
+             the MASK token is looked up in the target embedding table each round",
+            text_config.vocab_size,
+        );
+    }
 
     let draft_weights = dflash::DFlashWeights::load(
         draft_dir,
