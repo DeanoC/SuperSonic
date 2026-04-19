@@ -284,6 +284,61 @@ What this means now:
 - the next bounded pass should break down whether the remaining cost is mostly
   in score reduction or in value accumulation / softmax rescaling
 
+## Third Kept Single-Stream Pass
+
+The next kept pass stayed inside the same packed BF16 single-stream attention
+path and targeted the remaining reduction overhead:
+
+- kept the single-block `B == 1` BF16 path introduced in the second kept pass
+- left FP8-KV and batch-2 decode unchanged
+- raised the packed BF16 inner loop from `2` dims per active thread to `4`
+  dims per active thread
+- hoisted the packed `q` loads out of the KV-token loop
+- reduced the active attention waves in the score reduction from `4` to `2`
+  while keeping the online softmax math unchanged
+
+Why this pass was chosen:
+
+- after `5915e54`, the packed BF16 path was still paying the old cross-wave
+  reduction cost every token
+- the remaining hotspot still looked like score reduction overhead more than
+  projection or output work
+- this was the smallest way to cut the reduction footprint again without
+  changing the outer schedule or widening the optimization to other modes
+
+Short screening result (`pp533` / `tg16`) against commit `5915e54`:
+
+- decode improved from `1647.7 ms` to `1545.0 ms`
+- persistent decode improved from `1555.383 ms` to `1453.126 ms`
+- full attention improved from `670.579 ms` to `557.794 ms`
+- full-attention core improved from `643.178 ms` to `529.680 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `5915e54`:
+
+- prefill moved from `4485.2 ms` to `4481.3 ms`
+- decode improved from `13644.5 ms` to `12756.0 ms`
+- native decode total improved from `13433.153 ms` to `12544.656 ms`
+- persistent decode improved from `12910.028 ms` to `12021.549 ms`
+- full attention improved from `5893.787 ms` to `4891.021 ms`
+- full-attention core improved from `5673.589 ms` to `4672.824 ms`
+
+Verification notes:
+
+- `--validate --force-kernel-decode` passed with `decode_max_delta=0.2627`
+- `--gpu-validate --force-kernel-decode` passed with matching tokens and
+  `gpu_oracle_max_delta=0.3125`
+- baked-path batch-2 validate still passed with `decode_max_delta=0.3047`
+
+What this means now:
+
+- the single-stream `4B` hero lane is still nowhere near the practical 3090
+  ceiling, but it is now materially faster than the initial native-kernel lane
+- `full_attn_core` remains the largest single subsection, but it is no longer
+  overwhelmingly dominant the way it was at the start of the 4B single-stream
+  work
+- the next pass should explicitly separate score-reduction work from value
+  accumulation / softmax rescaling before attempting another structural rewrite
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero

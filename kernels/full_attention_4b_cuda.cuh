@@ -4685,15 +4685,30 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const float* q_head = q_f32 + qh * hd * 2;
                             const size_t kv_head_base =
                                 static_cast<size_t>(kvh) * kv_max_b * hd;
-                            const bool attn_lane_active = tid < (hd / 2);
+                            const bool attn_lane_active = tid < (hd / 4);
+                            const int attn_active_waves = 2;
 
                             for (int d = tid; d < hd; d += bs) {
                                 q_head_bf16[d] = dotcache_qwen35_from_float<T>(q_head[d]);
                             }
                             __syncthreads();
 
+                            float2 qv0 = make_float2(0.0f, 0.0f);
+                            float2 qv1 = make_float2(0.0f, 0.0f);
+                            if (attn_lane_active) {
+                                const int d0 = tid * 4;
+                                const __nv_bfloat162 q_pack0 =
+                                    *reinterpret_cast<const __nv_bfloat162*>(q_head_bf16 + d0);
+                                const __nv_bfloat162 q_pack1 =
+                                    *reinterpret_cast<const __nv_bfloat162*>(q_head_bf16 + d0 + 2);
+                                qv0 = __bfloat1622float2(q_pack0);
+                                qv1 = __bfloat1622float2(q_pack1);
+                            }
+
                             float my_acc0 = 0.0f;
                             float my_acc1 = 0.0f;
+                            float my_acc2 = 0.0f;
+                            float my_acc3 = 0.0f;
                             float my_max = -1e30f;
                             float my_sum = 0.0f;
 
@@ -4703,28 +4718,39 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 float partial = 0.0f;
                                 float v0 = 0.0f;
                                 float v1 = 0.0f;
+                                float v2 = 0.0f;
+                                float v3 = 0.0f;
                                 if (attn_lane_active) {
-                                    const int d0 = tid * 2;
-                                    const __nv_bfloat162 q_pack =
-                                        *reinterpret_cast<const __nv_bfloat162*>(q_head_bf16 + d0);
-                                    const __nv_bfloat162 k_pack =
+                                    const int d0 = tid * 4;
+                                    const __nv_bfloat162 k_pack0 =
                                         *reinterpret_cast<const __nv_bfloat162*>(ck + pos_base + d0);
-                                    const __nv_bfloat162 v_pack =
+                                    const __nv_bfloat162 k_pack1 =
+                                        *reinterpret_cast<const __nv_bfloat162*>(ck + pos_base + d0 + 2);
+                                    const __nv_bfloat162 v_pack0 =
                                         *reinterpret_cast<const __nv_bfloat162*>(cv + pos_base + d0);
-                                    const float2 qv = __bfloat1622float2(q_pack);
-                                    const float2 kv = __bfloat1622float2(k_pack);
-                                    const float2 vv = __bfloat1622float2(v_pack);
-                                    partial = qv.x * kv.x + qv.y * kv.y;
-                                    v0 = vv.x;
-                                    v1 = vv.y;
+                                    const __nv_bfloat162 v_pack1 =
+                                        *reinterpret_cast<const __nv_bfloat162*>(cv + pos_base + d0 + 2);
+                                    const float2 kv0 = __bfloat1622float2(k_pack0);
+                                    const float2 kv1 = __bfloat1622float2(k_pack1);
+                                    const float2 vv0 = __bfloat1622float2(v_pack0);
+                                    const float2 vv1 = __bfloat1622float2(v_pack1);
+                                    partial =
+                                        qv0.x * kv0.x + qv0.y * kv0.y +
+                                        qv1.x * kv1.x + qv1.y * kv1.y;
+                                    v0 = vv0.x;
+                                    v1 = vv0.y;
+                                    v2 = vv1.x;
+                                    v3 = vv1.y;
                                 }
                                 float wave_sum = wave_reduce_sum_f32(partial);
-                                if (attn_lane == 0) lds[attn_wave] = wave_sum;
+                                if (attn_lane == 0 && attn_wave < attn_active_waves) {
+                                    lds[attn_wave] = wave_sum;
+                                }
                                 __syncthreads();
                                 float score_val = 0.0f;
                                 if (tid == 0) {
                                     float total = 0.0f;
-                                    for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
+                                    for (int w = 0; w < attn_active_waves; ++w) total += lds[w];
                                     lds[0] = total;
                                     if (emit_attention_trace) {
                                         saved_scores[qh * kv_max_b + t] = total * scale;
@@ -4740,17 +4766,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 if (attn_lane_active) {
                                     my_acc0 = my_acc0 * rescale + w * v0;
                                     my_acc1 = my_acc1 * rescale + w * v1;
+                                    my_acc2 = my_acc2 * rescale + w * v2;
+                                    my_acc3 = my_acc3 * rescale + w * v3;
                                     my_sum = my_sum * rescale + w;
                                 }
                             }
 
                             if (attn_lane_active) {
-                                const int d0 = tid * 2;
+                                const int d0 = tid * 4;
                                 const float inv_sum = (my_sum > 0.0f) ? (1.0f / my_sum) : 0.0f;
                                 attn_flat[qh * hd + d0] =
                                     bf16_round_rne_f32_finite(my_acc0 * inv_sum);
                                 attn_flat[qh * hd + d0 + 1] =
                                     bf16_round_rne_f32_finite(my_acc1 * inv_sum);
+                                attn_flat[qh * hd + d0 + 2] =
+                                    bf16_round_rne_f32_finite(my_acc2 * inv_sum);
+                                attn_flat[qh * hd + d0 + 3] =
+                                    bf16_round_rne_f32_finite(my_acc3 * inv_sum);
                             }
                             __syncthreads();
                         }
