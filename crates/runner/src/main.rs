@@ -354,11 +354,13 @@ pub(crate) struct Cli {
     #[arg(long)]
     dflash_tap_layers: Option<String>,
 
-    /// DFlash verify strategy (M4.1 dev flag, will be removed once the
-    /// prefill path is known-good on a corpus). `iterative` runs B
-    /// per-token decodes (M3.5, correct but slow). `prefill` runs a
-    /// single mid-sequence prefill chunk (M4.1). Defaults to `prefill`
-    /// if unset.
+    /// DFlash verify strategy (dev flag; a follow-up will delete this
+    /// once the winning path is proven on a corpus). `iterative` runs
+    /// B per-token decodes (M3.5, correct but slow). `prefill` runs a
+    /// single mid-sequence prefill chunk (M4.1). `fused` runs a single
+    /// persistent_decode_4b megakernel launch with batch_size=B and
+    /// shared KV/linear state across all B slots (M4.3). Defaults to
+    /// `prefill`.
     #[arg(long, default_value = "prefill")]
     dflash_verify: String,
 }

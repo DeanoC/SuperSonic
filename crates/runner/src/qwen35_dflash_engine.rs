@@ -44,11 +44,14 @@ use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 #[derive(Clone, Copy, Debug)]
 enum VerifyMode {
     /// Iterative B-decode path from M3.5 — slow but minimal kernel surface,
-    /// kept during M4.1 bring-up for A/B correctness debugging. Removed
-    /// once `Prefill` is known-good on a corpus.
+    /// kept during M4.1 bring-up for A/B correctness debugging.
     Iterative,
     /// One-launch mid-sequence prefill — M4.1 default.
     Prefill,
+    /// Single `persistent_decode_4b` megakernel launch over all B positions
+    /// (M4.3). Shares the live sequence's KV/linear buffers across all B
+    /// batch slots with `seqlen_offset[b] = L + b`.
+    Fused,
 }
 use crate::Cli;
 
@@ -87,8 +90,9 @@ pub fn run_qwen35_dflash(
     let verify_mode = match cli.dflash_verify.as_str() {
         "prefill" => VerifyMode::Prefill,
         "iterative" => VerifyMode::Iterative,
+        "fused" => VerifyMode::Fused,
         other => bail!(
-            "--dflash-verify must be 'prefill' or 'iterative' (got '{other}')"
+            "--dflash-verify must be 'prefill' | 'iterative' | 'fused' (got '{other}')"
         ),
     };
 
@@ -363,6 +367,8 @@ pub fn run_qwen35_dflash(
                 &draft_candidates,
                 l,
             )?,
+            VerifyMode::Fused => target_engine
+                .verify_block_fused_decode(&draft_candidates, l)?,
         };
         ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
 

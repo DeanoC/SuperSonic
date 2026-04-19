@@ -137,10 +137,6 @@ pub struct DecodeEngine {
     /// + batch-seq desc table so the per-round allocation cost is paid
     /// only once per fused-verify call chain. Re-allocated if the block
     /// size changes between calls.
-    // allow(dead_code): the method that writes this field
-    // (`verify_block_fused_decode`) lands in M4.3a as scaffolding; M4.3b
-    // wires it into the DFlash engine and drops this allow.
-    #[allow(dead_code)]
     dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
 }
 
@@ -152,7 +148,6 @@ pub struct DecodeEngine {
 /// `batch_size = 1` scratch. The cache is populated lazily on first
 /// fused-verify call and reused thereafter via the take/put pattern that
 /// `decode_step_with_taps_kernel` uses for `dflash_tap_cache`.
-#[allow(dead_code)]
 struct DFlashFusedVerifyCache {
     /// Block size the cache is sized for. A change in `--dflash-block`
     /// between calls triggers a full re-allocation.
@@ -174,7 +169,6 @@ struct DFlashFusedVerifyCache {
 
 impl DFlashFusedVerifyCache {
     #[allow(clippy::too_many_arguments)]
-    #[allow(dead_code)]
     fn alloc(
         ordinal: usize,
         block_size: usize,
@@ -2821,9 +2815,6 @@ impl DecodeEngine {
     /// caller MUST snapshot linear state before this call and restore
     /// it after the accept decision — same snapshot/restore contract
     /// the existing verify paths already require.
-    // allow(dead_code): M4.3b flips the DFlash engine over to this
-    // method and drops the allow.
-    #[allow(dead_code)]
     pub fn verify_block_fused_decode(
         &mut self,
         tokens: &[u32],
@@ -2862,6 +2853,30 @@ impl DecodeEngine {
                 c.rms_norm_eps as f32,
             )
         };
+
+        // The 4B megakernel's shared-memory footprint per workgroup is
+        //   (block_size + max(B × hidden_dim, intermediate_size) + fp8_lut) × sizeof(f32)
+        // with kernel block_size = 256 and fp8_lut = 256. gfx1150 caps
+        // LDS at 64 KiB per workgroup → 16384 floats total. Reserve 2
+        // KiB (512 floats) for block_size + fp8_lut, leaving 15872
+        // floats for the input cache. 9B (hidden=4096) tops out at B=3;
+        // 4B (hidden=2048) tops out at B=7. If a user passes a larger
+        // --dflash-block the launch fails with HIP status 254 and a
+        // confusing error — fail fast here instead with the math
+        // spelled out.
+        const MAX_INPUT_CACHE_FLOATS: usize = 15872;
+        let input_cache = (b * hidden_dim).max(intermediate_size);
+        if input_cache > MAX_INPUT_CACHE_FLOATS {
+            anyhow::bail!(
+                "verify_block_fused_decode: shared-memory budget exceeded \
+                 (B={b} × hidden_dim={hidden_dim} = {}, intermediate={intermediate_size}; \
+                 cap = {MAX_INPUT_CACHE_FLOATS} floats). \
+                 Lower --dflash-block to ≤ {}.",
+                b * hidden_dim,
+                MAX_INPUT_CACHE_FLOATS.min(b * hidden_dim) / hidden_dim.max(1),
+            );
+        }
+
         let max_pos = pos_offset + b - 1;
 
         // Ensure KV capacity on every full-attention layer for the
