@@ -2618,6 +2618,44 @@ impl DecodeEngine {
         }
     }
 
+    /// DFlash M4.1 one-launch verify: single mid-sequence prefill over
+    /// `tokens` at absolute position `pos_offset`, writing K/V without
+    /// advancing `kv_filled`. Returns per-position logits `[count][vocab]`.
+    ///
+    /// Requires `use_4b_kernel=true`, `batch_size=1`, `!kv_fp8`. The caller
+    /// must have invoked `snapshot_linear()` on `state_mut()` before this
+    /// call — linear state mutates in place and the snapshot is how the
+    /// engine rolls back on rejection.
+    pub fn verify_block_prefill(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("verify_block_prefill requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("verify_block_prefill requires batch_size=1");
+        }
+        if self.kv_fp8 {
+            anyhow::bail!("verify_block_prefill does not support kv_fp8");
+        }
+        let result = prefill_engine::prefill_verify_block(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            tokens,
+            pos_offset,
+            self.kv_chunk_size,
+            self.use_4b_kernel,
+            self.ordinal,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after verify_block_prefill: {e}"))?;
+        Ok(result.logits_per_pos)
+    }
+
     /// Greedy argmax over logits.
     pub fn greedy_sample(logits: &[f32]) -> u32 {
         logits

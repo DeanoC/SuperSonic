@@ -185,6 +185,222 @@ pub fn compute_logits_for_range(
     Ok((logits_per_pos, normed))
 }
 
+/// DFlash one-launch verify: runs a single mid-sequence prefill chunk at
+/// absolute position `pos_offset` over `tokens`, writing K/V into every
+/// full-attention layer at `[pos_offset, pos_offset + tokens.len())`
+/// WITHOUT advancing `kv_filled`. Returns per-position logits via
+/// [`compute_logits_for_range`].
+///
+/// Replaces the M3 iterative `decode_step` verify path — one chunked
+/// prefill per round vs B per-token decodes. Correctness is
+/// bit-equivalent in greedy mode because the same per-layer kernels are
+/// used against the same committed KV prefix; the only difference is the
+/// granularity of matmuls and attention.
+///
+/// Linear-attention state is seeded from the live `conv_state` and
+/// `recurrent_state` in `state.layers[i]` before the single chunk, so
+/// the conv1d sees the correct prior `kern-1` QKVs and the recurrence
+/// picks up from the decode-time state. After the call, both are
+/// mutated in place with the post-verify values — the speculative
+/// engine is expected to have called
+/// [`ModelState::snapshot_linear`] beforehand and will
+/// [`ModelState::restore_linear`] after rejection.
+///
+/// Constraints (engine-enforced at dispatch):
+///   * single sequence (no `--batch-size > 1`),
+///   * `!kv_fp8` — this path writes BF16 K/V just like normal prefill,
+///   * `tokens.len()` must fit in the per-layer scratch (typically
+///     bounded by the draft's `block_size`).
+///
+/// The function leaves `kv_filled` untouched on every layer. The caller
+/// must overwrite (via re-decode or another verify) before relying on
+/// the tail; the data at `[pos_offset, pos_offset + tokens.len())` in
+/// the KV caches is speculative until committed.
+pub fn prefill_verify_block(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    tokens: &[u32],
+    pos_offset: usize,
+    kv_chunk_size: usize,
+    use_4b_kernel: bool,
+    ordinal: usize,
+) -> Result<VerifyResult> {
+    let config = &weights.config;
+    let chunk_len = tokens.len();
+    if chunk_len == 0 {
+        return Err(anyhow::anyhow!(
+            "prefill_verify_block: tokens must be non-empty"
+        ));
+    }
+    let hidden_dim = config.hidden_size;
+
+    let mut scratch = PrefillScratch::new(config, chunk_len, ordinal)?;
+
+    // Seed per-linear-layer inter-chunk state from the live pre-verify
+    // `state.layers[i]`. This is the key difference from chunk 0 of a
+    // fresh prefill — instead of zero-initialized scratch, we carry
+    // forward the conv tail and recurrence accumulated through decode
+    // up to position L. Allocated fresh each call because (a) verify
+    // is called at most once per round and (b) the buffers need to be
+    // mutated independently from the persistent state so rollback via
+    // snapshot_linear leaves the live state untouched until the chunk
+    // actually runs.
+    let nv = config.linear_num_value_heads;
+    let khd = config.linear_key_head_dim;
+    let vhd = config.linear_value_head_dim;
+    let kern = config.linear_conv_kernel_dim;
+    let pad = kern - 1;
+    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2 + nv * vhd;
+
+    let mut chunk_recurrent: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
+        .map(|i| -> Result<Option<GpuBuffer>> {
+            if config.is_full_attention(i) {
+                Ok(None)
+            } else {
+                // state.recurrent_state is F32; the prefill scan kernel
+                // takes the inter-chunk seed as BF16 (see
+                // feedback_dtype_ffi — delta_recurrent reads initial_state
+                // as T). Cast down here.
+                let mut bf16_buf = GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[nv, khd, vhd],
+                )
+                .map_err(|e| anyhow::anyhow!("verify chunk_recurrent alloc: {e}"))?;
+                let src = state.layers[i].recurrent_state.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("verify: layer {i} recurrent_state missing")
+                })?;
+                prefill_ffi::cast(
+                    ordinal,
+                    ScalarType::F32,
+                    ScalarType::BF16,
+                    nv * khd * vhd,
+                    src,
+                    &mut bf16_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("verify recurrent cast layer {i}: {e}"))?;
+                Ok(Some(bf16_buf))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
+        .map(|i| -> Result<Option<GpuBuffer>> {
+            if config.is_full_attention(i) {
+                Ok(None)
+            } else {
+                let buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, pad])
+                    .map_err(|e| anyhow::anyhow!("verify chunk_conv_tail alloc: {e}"))?;
+                let src = state.layers[i].conv_state.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("verify: layer {i} conv_state missing")
+                })?;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    buf.as_ptr() as *mut c_void,
+                    src.as_ptr(),
+                    src.len_bytes(),
+                )
+                .map_err(|e| anyhow::anyhow!("verify conv_state seed layer {i}: {e}"))?;
+                Ok(Some(buf))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Embed the B draft candidates into scratch.hidden [chunk_len, hidden].
+    let id_bytes: Vec<u8> = tokens.iter().flat_map(|id| id.to_le_bytes()).collect();
+    let token_ids_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[chunk_len], &id_bytes)
+            .map_err(|e| anyhow::anyhow!("verify upload token ids: {e}"))?;
+    prefill_ffi::embedding_lookup(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        config.vocab_size,
+        hidden_dim,
+        &weights.embed_tokens,
+        &token_ids_gpu,
+        &mut scratch.hidden,
+    )?;
+
+    let mut no_debug_trace: Option<LinearLayerDebugTrace> = None;
+
+    for idx in 0..config.num_hidden_layers {
+        // Input RMSNorm
+        prefill_ffi::rms_norm_rows(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            hidden_dim,
+            config.rms_norm_eps as f32,
+            &scratch.hidden,
+            &weights.layers[idx].input_norm_w,
+            &mut scratch.normed,
+        )
+        .map_err(|e| anyhow::anyhow!("verify layer {idx} input norm: {e}"))?;
+
+        if config.is_full_attention(idx) {
+            prefill_full_attention_layer(
+                weights,
+                state,
+                rotary,
+                &mut scratch,
+                config,
+                idx,
+                chunk_len,
+                pos_offset,
+                ordinal,
+                kv_chunk_size,
+                /* commit_kv_filled */ false,
+            )?;
+        } else {
+            prefill_linear_attention_layer(
+                weights,
+                state,
+                &mut scratch,
+                config,
+                idx,
+                chunk_len,
+                pos_offset,
+                /* is_last_chunk */ true,
+                chunk_recurrent[idx].as_mut().unwrap(),
+                chunk_conv_tail[idx].as_mut().unwrap(),
+                ordinal,
+                /* trace_linear_debug */ false,
+                &mut no_debug_trace,
+            )?;
+        }
+
+        // Post-attention RMSNorm
+        prefill_ffi::rms_norm_rows(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            hidden_dim,
+            config.rms_norm_eps as f32,
+            &scratch.hidden,
+            &weights.layers[idx].post_attn_norm_w,
+            &mut scratch.normed,
+        )
+        .map_err(|e| anyhow::anyhow!("verify layer {idx} post-attn norm: {e}"))?;
+
+        prefill_mlp_layer(weights, &mut scratch, config, idx, chunk_len, ordinal)?;
+    }
+
+    // Per-position logits for the whole block.
+    let (logits_per_pos, _normed) = compute_logits_for_range(
+        &scratch.hidden,
+        weights,
+        config,
+        0,
+        chunk_len,
+        use_4b_kernel,
+        ordinal,
+    )?;
+
+    Ok(VerifyResult { logits_per_pos })
+}
+
 /// Result of a prefill pass.
 pub struct PrefillResult {
     /// Logits for the last token position [vocab_size] as F32 on CPU.

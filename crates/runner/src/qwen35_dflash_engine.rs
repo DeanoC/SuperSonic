@@ -40,6 +40,16 @@ use qwen35_dflash as dflash;
 
 use crate::decode_engine::DecodeEngine;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
+
+#[derive(Clone, Copy, Debug)]
+enum VerifyMode {
+    /// Iterative B-decode path from M3.5 — slow but minimal kernel surface,
+    /// kept during M4.1 bring-up for A/B correctness debugging. Removed
+    /// once `Prefill` is known-good on a corpus.
+    Iterative,
+    /// One-launch mid-sequence prefill — M4.1 default.
+    Prefill,
+}
 use crate::Cli;
 
 /// Run the Qwen3.5-9B DFlash speculative decoder. Parallels
@@ -74,6 +84,13 @@ pub fn run_qwen35_dflash(
     if cli.oracle_prefill || cli.validate || cli.gpu_validate {
         bail!("--dflash does not support --oracle-prefill / --validate / --gpu-validate at M3");
     }
+    let verify_mode = match cli.dflash_verify.as_str() {
+        "prefill" => VerifyMode::Prefill,
+        "iterative" => VerifyMode::Iterative,
+        other => bail!(
+            "--dflash-verify must be 'prefill' or 'iterative' (got '{other}')"
+        ),
+    };
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
@@ -318,12 +335,18 @@ pub fn run_qwen35_dflash(
             .snapshot_linear()
             .map_err(|e| anyhow!("snapshot linear: {e}"))?;
 
-        // 8c. Verify: decode the B candidate block at positions [L, L+B).
-        let verify_logits = verify_block(
-            &mut target_engine,
-            &draft_candidates,
-            l,
-        )?;
+        // 8c. Verify: one-launch prefill at `[l, l+B)` (M4.1 default) or
+        //     iterative B decode_step calls (M3.5 fallback, kept behind
+        //     --dflash-verify=iterative during bring-up).
+        let verify_logits = match verify_mode {
+            VerifyMode::Prefill => target_engine
+                .verify_block_prefill(&draft_candidates, l)?,
+            VerifyMode::Iterative => verify_block_iterative(
+                &mut target_engine,
+                &draft_candidates,
+                l,
+            )?,
+        };
 
         // 8d. Accept check, full protocol (docs/dflash.md §6):
         //   preds[0]   = argmax(prev_logits)            (target's pick at L;
@@ -645,14 +668,15 @@ fn draft_forward_and_sample(
     Ok((candidates, draft_final_hidden_bytes))
 }
 
-/// Iteratively run `block_size` decode_step calls on the target to verify
-/// the draft's candidate block at positions `[l, l + block_size)`. Returns
-/// the per-position logits as `Vec<Vec<f32>>` of length `block_size`.
+/// M3.5 iterative verify: one `decode_step` per draft candidate at
+/// positions `[l, l + block_size)`. Slow but minimal kernel surface —
+/// kept during M4.1 bring-up for A/B correctness comparison against the
+/// new `verify_block_prefill` path.
 ///
 /// The target's linear state and full-attention kv_filled are MUTATED
 /// during this call — the caller must snapshot before and restore/rewind
 /// after based on the accept decision.
-fn verify_block(
+fn verify_block_iterative(
     target_engine: &mut DecodeEngine,
     draft_candidates: &[u32],
     l: usize,

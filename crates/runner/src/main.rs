@@ -348,6 +348,14 @@ pub(crate) struct Cli {
     /// checkpoint's `dflash_config.target_layer_ids`.
     #[arg(long)]
     dflash_tap_layers: Option<String>,
+
+    /// DFlash verify strategy (M4.1 dev flag, will be removed once the
+    /// prefill path is known-good on a corpus). `iterative` runs B
+    /// per-token decodes (M3.5, correct but slow). `prefill` runs a
+    /// single mid-sequence prefill chunk (M4.1). Defaults to `prefill`
+    /// if unset.
+    #[arg(long, default_value = "prefill")]
+    dflash_verify: String,
 }
 
 fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
