@@ -55,6 +55,10 @@ path = "src/bin/gemma4_int4_matvec_test.rs"
 name = "gemma4_fused_int4_validate"
 path = "src/bin/gemma4_fused_int4_validate.rs"
 
+[[bin]]
+name = "gemma4_int4_layer_diag"
+path = "src/bin/gemma4_int4_layer_diag.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

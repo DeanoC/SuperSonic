@@ -50,6 +50,31 @@ fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
     Ok(bf16_bytes_to_f32(&buf.to_host_bytes()?))
 }
 
+/// Copy the last row of a `[seq_len, hidden_size]` BF16 buffer to host as F32.
+/// Used by the diagnostic capture path in [`Gemma4Engine::prefill_with_capture`].
+fn extract_last_row_bf16(
+    device: usize,
+    buf: &GpuBuffer,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let dtype = ScalarType::BF16;
+    let mut tmp = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+    let byte_off = (seq_len - 1) * hidden_size * 2;
+    let src = buf.offset_ptr(byte_off);
+    gpu_hal::copy_d2d(device, tmp.as_mut_ptr(), src, hidden_size * 2)
+        .map_err(|e| anyhow!("extract_last_row_bf16: {e}"))?;
+    download_bf16(&tmp)
+}
+
+/// Per-layer capture returned by [`Gemma4Engine::prefill_with_capture`].
+/// `per_layer_hidden[l]` = last-token BF16 hidden (post-PLE, pre-final-norm)
+/// for layer `l`. `final_norm_hidden` = post-final-norm last-token hidden.
+pub struct PerLayerCapture {
+    pub per_layer_hidden: Vec<Vec<f32>>,
+    pub final_norm_hidden: Vec<f32>,
+}
+
 struct UnbakedLoader {
     shards: Vec<Mmap>,
     index: std::collections::BTreeMap<String, usize>,
@@ -736,6 +761,29 @@ impl Gemma4Engine {
         self.prefill_seq(0, prompt_token_ids)
     }
 
+    /// Diagnostic-only: run prefill on seq 0 and additionally capture each
+    /// layer's post-PLE hidden (last prompt token) plus the post-final-norm
+    /// hidden. Math is bit-identical to [`Self::prefill`] — the capture is a
+    /// single `copy_d2d` of one BF16 row per layer.
+    pub fn prefill_with_capture(
+        &mut self,
+        prompt_token_ids: &[u32],
+    ) -> Result<(Vec<f32>, PerLayerCapture)> {
+        self.prefill_seq_with_capture(0, prompt_token_ids)
+    }
+
+    fn prefill_seq_with_capture(
+        &mut self,
+        seq_idx: usize,
+        prompt_token_ids: &[u32],
+    ) -> Result<(Vec<f32>, PerLayerCapture)> {
+        // Wrapper: run normal prefill via a shared implementation that emits
+        // captures into `caps_sink` when `capture=true`. See prefill_seq_inner.
+        let (logits, caps) = self.prefill_seq_inner(seq_idx, prompt_token_ids, true)?;
+        let caps = caps.ok_or_else(|| anyhow!("prefill_seq_with_capture: captures missing"))?;
+        Ok((logits, caps))
+    }
+
     /// Run batched Rust prefill over the whole prompt for sequence `seq_idx`
     /// and return the softcapped logits at the last prompt position.
     /// Populates every K/V cache buffer for that sequence; shared-KV layers
@@ -746,6 +794,16 @@ impl Gemma4Engine {
     /// [`Self::replicate_seq0_kv`] — that runs the GPU work once and clones
     /// the resulting cache contents instead of re-running prefill `B` times.
     pub fn prefill_seq(&mut self, seq_idx: usize, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        let (logits, _caps) = self.prefill_seq_inner(seq_idx, prompt_token_ids, false)?;
+        Ok(logits)
+    }
+
+    fn prefill_seq_inner(
+        &mut self,
+        seq_idx: usize,
+        prompt_token_ids: &[u32],
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<PerLayerCapture>)> {
         if seq_idx >= self.batch_size {
             bail!(
                 "prefill_seq: seq_idx {seq_idx} >= batch_size {}",
@@ -785,6 +843,12 @@ impl Gemma4Engine {
         )?;
 
         let pli = self.compute_per_layer_inputs_batched(&token_ids_gpu, prompt_token_ids)?;
+
+        let mut per_layer_capture: Vec<Vec<f32>> = if capture {
+            Vec::with_capacity(num_layers)
+        } else {
+            Vec::new()
+        };
 
         for layer_idx in 0..num_layers {
             let w = &self.layers[layer_idx];
@@ -982,6 +1046,11 @@ impl Gemma4Engine {
                 w.layer_scalar, seq_len * hidden_size,
             )?;
             h_running = h_new;
+
+            if capture {
+                per_layer_capture
+                    .push(extract_last_row_bf16(device, &h_running, seq_len, hidden_size)?);
+            }
         }
 
         // Last-position hidden → final norm + lm_head + softcap.
@@ -997,6 +1066,11 @@ impl Gemma4Engine {
             device, dtype, &mut post_norm, &last_hidden, Some(&self.final_norm_w),
             eps, hidden_size,
         )?;
+        let final_norm_capture = if capture {
+            Some(download_bf16(&post_norm)?)
+        } else {
+            None
+        };
         let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
             device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
@@ -1008,7 +1082,16 @@ impl Gemma4Engine {
             *v = cap * (*v / cap).tanh();
         }
         let _ = self.device;
-        Ok(logits_host)
+        let caps = if capture {
+            Some(PerLayerCapture {
+                per_layer_hidden: per_layer_capture,
+                final_norm_hidden: final_norm_capture
+                    .expect("capture=true populates final_norm_capture"),
+            })
+        } else {
+            None
+        };
+        Ok((logits_host, caps))
     }
 
     /// Single decode step on sequence 0 (convenience wrapper for

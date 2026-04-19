@@ -53,6 +53,34 @@ fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
     Ok(bf16_bytes_to_f32(&buf.to_host_bytes()?))
 }
 
+/// Copy the last row of a `[seq_len, hidden_size]` BF16 buffer to host as
+/// F32. Used by the diagnostic capture path in `prefill_with_capture` to
+/// snapshot each layer's output at the last prompt-token position.
+fn extract_last_row_bf16(
+    device: usize,
+    buf: &GpuBuffer,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let dtype = ScalarType::BF16;
+    let mut tmp = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+    let byte_off = (seq_len - 1) * hidden_size * 2;
+    let src = buf.offset_ptr(byte_off);
+    gpu_hal::copy_d2d(device, tmp.as_mut_ptr(), src, hidden_size * 2)
+        .map_err(|e| anyhow!("extract_last_row_bf16: {e}"))?;
+    download_bf16(&tmp)
+}
+
+/// Per-layer capture produced by [`Gemma4Int4Engine::prefill_with_capture`].
+/// Each entry in `per_layer_hidden` is the last-token post-PLE hidden state
+/// for one layer, BF16→F32 host values of length `hidden_size`.
+/// `final_norm_hidden` is the output of the final RMSNorm applied to layer
+/// N-1's output at the last prompt-token (the input to the lm-head).
+pub struct PerLayerCapture {
+    pub per_layer_hidden: Vec<Vec<f32>>,
+    pub final_norm_hidden: Vec<f32>,
+}
+
 fn build_rope_table_from_inv_freq(
     inv_freq: &[f32],
     head_dim: usize,
@@ -943,6 +971,30 @@ impl Gemma4Int4Engine {
 
     /// Batched INT4 prefill; returns softcapped logits at the last position.
     pub fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        let (logits, _caps) = self.prefill_inner(prompt_token_ids, false)?;
+        Ok(logits)
+    }
+
+    /// Diagnostic-only variant of [`Self::prefill`] that additionally captures
+    /// every layer's post-PLE hidden state at the last prompt-token position
+    /// plus the post-final-norm hidden before lm-head. Returns
+    /// `(softcapped_logits, PerLayerCapture)`. Math is bit-identical to
+    /// [`Self::prefill`] — the capture is a `copy_d2d` of a single row per
+    /// layer, never writes into `h_running`.
+    pub fn prefill_with_capture(
+        &mut self,
+        prompt_token_ids: &[u32],
+    ) -> Result<(Vec<f32>, PerLayerCapture)> {
+        let (logits, caps) = self.prefill_inner(prompt_token_ids, true)?;
+        let caps = caps.ok_or_else(|| anyhow!("prefill_with_capture: captures missing"))?;
+        Ok((logits, caps))
+    }
+
+    fn prefill_inner(
+        &mut self,
+        prompt_token_ids: &[u32],
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<PerLayerCapture>)> {
         let seq_len = prompt_token_ids.len();
         if seq_len == 0 {
             bail!("prefill: empty prompt");
@@ -976,6 +1028,12 @@ impl Gemma4Int4Engine {
         )?;
 
         let pli = self.compute_per_layer_inputs_batched(&token_ids_gpu, prompt_token_ids)?;
+
+        let mut per_layer_capture: Vec<Vec<f32>> = if capture {
+            Vec::with_capacity(num_layers)
+        } else {
+            Vec::new()
+        };
 
         for layer_idx in 0..num_layers {
             let w = &self.layers[layer_idx];
@@ -1189,6 +1247,11 @@ impl Gemma4Int4Engine {
                 w.layer_scalar, seq_len * hidden_size,
             )?;
             h_running = h_new;
+
+            if capture {
+                per_layer_capture
+                    .push(extract_last_row_bf16(device, &h_running, seq_len, hidden_size)?);
+            }
         }
 
         let last_byte_off = (seq_len - 1) * hidden_size * 2;
@@ -1201,6 +1264,11 @@ impl Gemma4Int4Engine {
             device, dtype, &mut post_norm, &last_hidden, Some(&self.final_norm_w),
             eps, hidden_size,
         )?;
+        let final_norm_capture = if capture {
+            Some(download_bf16(&post_norm)?)
+        } else {
+            None
+        };
         let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
             device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
@@ -1211,7 +1279,16 @@ impl Gemma4Int4Engine {
         for v in logits_host.iter_mut() {
             *v = cap * (*v / cap).tanh();
         }
-        Ok(logits_host)
+        let caps = if capture {
+            Some(PerLayerCapture {
+                per_layer_hidden: per_layer_capture,
+                final_norm_hidden: final_norm_capture
+                    .expect("capture=true populates final_norm_capture"),
+            })
+        } else {
+            None
+        };
+        Ok((logits_host, caps))
     }
 
     /// Single INT4 decode step — full 35-layer forward pass in ONE kernel
