@@ -883,6 +883,7 @@ fn main() -> Result<()> {
                 layer_mlp_swiglu_trace: None,
                 layer_mlp_out_trace: None,
                 layer_hidden_trace: None,
+                tap_hiddens: None,
                 linear_debug_trace: None,
             }
         };

@@ -91,6 +91,11 @@ pub struct PrefillResult {
     pub layer_mlp_out_trace: Option<Vec<Vec<u8>>>,
     /// Optional BF16 last-token hidden dump after each decoder layer.
     pub layer_hidden_trace: Option<Vec<Vec<u8>>>,
+    /// DFlash hidden-state taps. When `tap_layers` is supplied to `prefill`, this
+    /// vector is 1:1 with `tap_layers`: each entry is a BF16-encoded `[hidden_dim]`
+    /// blob holding the post-MLP residual hidden state of the LAST token of the
+    /// final chunk for that layer. Always None when `tap_layers` was None.
+    pub tap_hiddens: Option<Vec<Vec<u8>>>,
     /// Optional last-token debug trace for one selected linear-attention layer.
     pub linear_debug_trace: Option<LinearLayerDebugTrace>,
 }
@@ -223,6 +228,52 @@ pub fn prefill(
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
 ) -> Result<PrefillResult> {
+    prefill_inner(
+        weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
+        prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
+        debug_linear_layer, None,
+    )
+}
+
+/// DFlash variant of `prefill`. Identical behavior plus selective per-layer
+/// hidden-state capture: when `tap_layers` is supplied, the returned
+/// `PrefillResult.tap_hiddens` carries one BF16 `[hidden_dim]` blob per tap
+/// (the post-MLP residual hidden state at the LAST token of the final chunk).
+pub fn prefill_with_taps(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+    trace_layers: bool,
+    debug_linear_layer: Option<usize>,
+    tap_layers: &[usize],
+) -> Result<PrefillResult> {
+    prefill_inner(
+        weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
+        prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
+        debug_linear_layer, Some(tap_layers),
+    )
+}
+
+fn prefill_inner(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+    trace_layers: bool,
+    debug_linear_layer: Option<usize>,
+    tap_layers: Option<&[usize]>,
+) -> Result<PrefillResult> {
     let config = &weights.config;
     let seq_len = prompt_ids.len();
     let hidden_dim = config.hidden_size;
@@ -275,6 +326,22 @@ pub fn prefill(
         None
     };
     let mut linear_debug_trace = None;
+
+    // DFlash hidden-state taps: pre-allocate one slot per requested layer.
+    // Validate indices up front so we fail loudly before doing prefill work.
+    let mut tap_hiddens: Option<Vec<Vec<u8>>> = if let Some(tap) = tap_layers {
+        for &li in tap {
+            if li >= config.num_hidden_layers {
+                return Err(anyhow::anyhow!(
+                    "tap layer index {li} out of range (num_hidden_layers={})",
+                    config.num_hidden_layers
+                ));
+            }
+        }
+        Some(vec![Vec::new(); tap.len()])
+    } else {
+        None
+    };
 
     // Per-layer inter-chunk state for linear attention layers
     let nv = config.linear_num_value_heads;
@@ -493,6 +560,31 @@ pub fn prefill(
                             .map_err(|e| anyhow::anyhow!("trace last_hidden D2H layer {idx}: {e}"))?,
                     );
                 }
+
+                // DFlash tap: same data point as layer_hidden_trace (post-MLP residual,
+                // last token of the final chunk) but captured selectively for the
+                // requested tap layers only — avoids per-layer D2H cost when only a
+                // few layers are needed.
+                if let (Some(tap), Some(out)) = (tap_layers, tap_hiddens.as_mut()) {
+                    for (slot, &target_layer) in tap.iter().enumerate().map(|(s, t)| (s, t)) {
+                        if target_layer == idx {
+                            let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+                            let last_token_offset = (chunk_len - 1) * hidden_bytes;
+                            let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+                                .map_err(|e| anyhow::anyhow!("dflash tap alloc layer {idx}: {e}"))?;
+                            gpu_hal::copy_d2d(
+                                ordinal,
+                                last_hidden.as_ptr() as *mut c_void,
+                                scratch.hidden.offset_ptr(last_token_offset),
+                                hidden_bytes,
+                            )
+                            .map_err(|e| anyhow::anyhow!("dflash tap copy layer {idx}: {e}"))?;
+                            out[slot] = last_hidden
+                                .to_host_bytes()
+                                .map_err(|e| anyhow::anyhow!("dflash tap D2H layer {idx}: {e}"))?;
+                        }
+                    }
+                }
             }
 
         }
@@ -581,6 +673,7 @@ pub fn prefill(
         layer_mlp_swiglu_trace,
         layer_mlp_out_trace,
         layer_hidden_trace,
+        tap_hiddens,
         linear_debug_trace,
     })
 }
@@ -701,6 +794,43 @@ pub fn gpu_reference_replay_step(
         None,
     )?;
     Ok(result.logits)
+}
+
+/// DFlash variant of `gpu_reference_replay_step` that additionally returns the
+/// post-MLP residual hidden state at the LAST token of the input sequence for
+/// each layer in `tap_layers`. The taps are 1:1 with `tap_layers` (BF16 bytes,
+/// length `hidden_dim` each). Used by the DFlash speculative decoder to feed
+/// fused multi-layer target context into the small bidirectional draft model.
+pub fn gpu_reference_replay_step_with_taps(
+    weights: &Qwen35Weights,
+    rotary: &RotaryTables,
+    token_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    use_4b_kernel: bool,
+    tap_layers: &[usize],
+) -> Result<(Vec<f32>, Vec<Vec<u8>>)> {
+    let mut replay_state = ModelState::new(&weights.config, ordinal)
+        .map_err(|e| anyhow::anyhow!("gpu replay state init: {e}"))?;
+    let result = prefill_with_taps(
+        weights,
+        &mut replay_state,
+        rotary,
+        token_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        false,
+        use_4b_kernel,
+        false,
+        None,
+        tap_layers,
+    )?;
+    let taps = result.tap_hiddens.ok_or_else(|| {
+        anyhow::anyhow!("internal: tap_hiddens missing despite tap_layers being supplied")
+    })?;
+    Ok((result.logits, taps))
 }
 
 fn prefill_full_attention_layer(
