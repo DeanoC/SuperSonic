@@ -5322,6 +5322,30 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         } // end for (b) down_proj batch loop
 
         // Residual add for MLP is fused into down_proj above.
+
+        // === DFlash hidden-state tap (M1.2) ===
+        // When the host requests it, mirror the post-MLP residual hidden state
+        // into tap_workspace for any tap layer matching `layer`. Layout is
+        // [num_taps, B, hidden_dim]. The branch is runtime-gated; we rely on
+        // the kernel never being launched with non-null tap params unless the
+        // workspace is sized for [num_taps * B * hidden_dim] T elements.
+        // hidden_f32 is settled at this point (last grid_barrier completed for
+        // the down_proj batch above); the new grid_barrier inside the if-branch
+        // serializes the tap write with the next layer's hidden_f32 mutations.
+        if (tap_workspace != nullptr) {
+            for (int t = 0; t < num_taps; ++t) {
+                if (tap_layers[t] == layer) {
+                    for (int b = 0; b < B; ++b) {
+                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+                            tap_workspace[(t * B + b) * hidden_dim + c] =
+                                dotcache_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            grid_barrier(barrier_counter, barrier_flag, nb);
+        }
     }
 
     // Write back F32 → BF16 for all batch items
