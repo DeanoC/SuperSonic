@@ -2,6 +2,7 @@ mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod oracle;
+mod phi4_engine;
 mod prefill_engine;
 mod registry;
 mod validate;
@@ -143,7 +144,7 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
-struct Cli {
+pub(crate) struct Cli {
     /// Model variant (e.g. "qwen3.5-0.8b")
     #[arg(long, default_value = "qwen3.5-0.8b")]
     model: String,
@@ -519,13 +520,18 @@ fn main() -> Result<()> {
         }
     };
 
-    if model_variant.family() == ModelFamily::Gemma4 {
-        return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
+    match model_variant.family() {
+        ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
+        ModelFamily::Phi4 => {
+            return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
+        }
+        ModelFamily::Qwen35 => {}
     }
 
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+        FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
     };
 
     // INT4 decode only lives in full_attention_4b.hip; the 0.8B-native kernel
@@ -1512,6 +1518,7 @@ fn run_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use manifest::{CONVERTER_VERSION, FORMAT_VERSION, Manifest};
 
-pub use baker::bake_qwen35;
+pub use baker::{bake_phi4, bake_qwen35};
 pub use store::BakedStore;
 
 /// Error type for bake and load operations.

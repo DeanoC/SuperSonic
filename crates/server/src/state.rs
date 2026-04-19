@@ -122,6 +122,11 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     let (session, eos_ids) = match variant.family() {
         ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
         ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
+        ModelFamily::Phi4 => {
+            bail!(
+                "Phi-4 engine is under development — not yet exposed via supersonic-serve"
+            );
+        }
     };
 
     tracing::info!(
@@ -278,6 +283,7 @@ fn build_qwen(
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
         FamilyParams::Gemma4(_) => unreachable!("caller filtered to Qwen"),
+        FamilyParams::Phi4(_) => unreachable!("caller filtered to Qwen"),
     };
 
     // INT4 decode lives in the 4B kernel; force-route 0.8B through it.
@@ -400,6 +406,7 @@ fn build_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("caller filtered to Gemma 4"),
+        FamilyParams::Phi4(_) => unreachable!("caller filtered to Gemma 4"),
     };
 
     let g_cfg = gemma4::config::load_config(&cfg.model_dir)

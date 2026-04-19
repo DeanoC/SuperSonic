@@ -1,0 +1,14 @@
+[package]
+name = "phi4"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpu-hal = { path = "../gpu-hal" }
+model-store = { path = "../model-store" }
+half = "2.4"
+memmap2 = "0.9"
+safetensors = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
