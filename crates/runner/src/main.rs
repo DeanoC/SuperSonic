@@ -549,6 +549,17 @@ fn main() -> Result<()> {
         }
     };
 
+    // DFlash is Qwen3.5-9B-only today. Reject the flag on other families
+    // before the family dispatch returns, otherwise `--dflash` is silently
+    // ignored on e.g. Gemma4 / Phi4 and the user thinks speculative
+    // decoding is enabled when it isn't.
+    if cli.dflash && !matches!(model_variant.family(), ModelFamily::Qwen35) {
+        anyhow::bail!(
+            "--dflash is only supported on Qwen3.5 family models (got family={:?}, model={model_variant}).",
+            model_variant.family(),
+        );
+    }
+
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
         ModelFamily::Phi4 => {

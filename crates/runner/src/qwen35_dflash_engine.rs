@@ -430,13 +430,26 @@ pub fn run_qwen35_dflash(
         round_taps_len = accepted_len;
 
         // 8f. Advance counters + record generated.
+        // Stop as soon as any committed token is EOS — every committed
+        // token goes through the target's greedy pick, same semantics
+        // as the non-DFlash decode loop which bails on the first EOS
+        // it samples. Without this, generation would keep rolling past
+        // an EOS that appeared inside a speculative commit block.
         committed_len = l + accepted_len;
         accepted_total += accepted;
+        let mut hit_eos = false;
         for &t in committed_block.iter() {
             generated_ids.push(t);
+            if eos_ids.contains(&t) {
+                hit_eos = true;
+                break;
+            }
             if generated_ids.len() >= cli.max_new_tokens {
                 break;
             }
+        }
+        if hit_eos {
+            break;
         }
         bonus_seed = match final_round_logits {
             Some(logits) => DecodeEngine::greedy_sample(&logits),
