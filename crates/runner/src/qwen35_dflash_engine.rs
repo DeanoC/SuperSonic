@@ -308,6 +308,12 @@ pub fn run_qwen35_dflash(
     let decode_start = Instant::now();
     let mut rounds_run: usize = 0;
     let mut accepted_total: usize = 0;
+    // Per-stage timing accumulators. Reported alongside rounds summary so
+    // anyone profiling DFlash can see which stage dominates wall-clock
+    // before deciding what to optimize next.
+    let mut ms_draft: f64 = 0.0;
+    let mut ms_verify: f64 = 0.0;
+    let mut ms_redecode: f64 = 0.0;
     while generated_ids.len() < cli.max_new_tokens {
         if eos_ids.contains(&bonus_seed) {
             generated_ids.push(bonus_seed);
@@ -322,6 +328,7 @@ pub fn run_qwen35_dflash(
         // rows (1 after prefill, accepted_len after every round). Output
         // hidden is projected through target's lm_head → B block logits →
         // argmax → B candidates at positions L..L+B-1.
+        let t_draft = Instant::now();
         let (draft_candidates, draft_final_hidden_bytes) = draft_forward_and_sample(
             &mut draft_state,
             &mut draft_scratch,
@@ -336,6 +343,7 @@ pub fn run_qwen35_dflash(
             ordinal,
         )?;
         let _ = draft_final_hidden_bytes; // retained for future logits caching
+        ms_draft += t_draft.elapsed().as_secs_f64() * 1000.0;
 
         // 8b. Snapshot linear state (before verify mutates it).
         let snap: LinearStateSnapshot = target_engine
@@ -346,6 +354,7 @@ pub fn run_qwen35_dflash(
         // 8c. Verify: one-launch prefill at `[l, l+B)` (M4.1 default) or
         //     iterative B decode_step calls (M3.5 fallback, kept behind
         //     --dflash-verify=iterative during bring-up).
+        let t_verify = Instant::now();
         let verify_logits = match verify_mode {
             VerifyMode::Prefill => target_engine
                 .verify_block_prefill(&draft_candidates, l)?,
@@ -355,6 +364,7 @@ pub fn run_qwen35_dflash(
                 l,
             )?,
         };
+        ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
 
         // 8d. Accept check, full protocol (docs/dflash.md §6):
         //   preds[0]   = argmax(prev_logits)            (target's pick at L;
@@ -419,6 +429,7 @@ pub fn run_qwen35_dflash(
         let mut stacked_taps: Vec<u8> =
             Vec::with_capacity(accepted_len * per_tap_row_bytes);
         let mut final_round_logits: Option<Vec<f32>> = None;
+        let t_redecode = Instant::now();
         for (i, &tok) in committed_block.iter().enumerate() {
             let seqlen_offset = l + i;
             let (logits, taps_bytes) = target_engine
@@ -435,6 +446,7 @@ pub fn run_qwen35_dflash(
                 final_round_logits = Some(logits);
             }
         }
+        ms_redecode += t_redecode.elapsed().as_secs_f64() * 1000.0;
         round_taps = stacked_taps;
         round_taps_len = accepted_len;
 
@@ -483,6 +495,11 @@ pub fn run_qwen35_dflash(
         "[dflash] rounds={rounds_run} mean_accepted_per_round={mean_accepted:.2} \
          generated={} decode_ms={decode_ms:.0}",
         generated_ids.len()
+    );
+    let ms_other = (decode_ms - ms_draft - ms_verify - ms_redecode).max(0.0);
+    eprintln!(
+        "[dflash] breakdown ms: draft={ms_draft:.0} verify={ms_verify:.0} \
+         redecode={ms_redecode:.0} other={ms_other:.0}",
     );
 
     let _ = draft_rotary; // drop order guard (rotary/scratch hold GPU buffers)
