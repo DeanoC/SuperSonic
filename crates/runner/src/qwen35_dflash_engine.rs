@@ -443,8 +443,22 @@ pub fn run_qwen35_dflash(
             None => bonus, // fallback; should always be Some since accepted_len >= 1
         };
 
-        // 8g. Crop the draft's KV cache to the new committed length.
-        draft_state.crop(committed_len);
+        // 8g. Crop the draft's KV cache in draft-coordinate space.
+        // `DFlashState::crop` truncates physical rows, so it must be passed
+        // a draft-side row count — not the target-coord `committed_len`
+        // (which includes prompt_len and is larger than the draft cursor
+        // for any non-empty prompt, silently no-op'ing the crop and
+        // leaving the rejected noise tail in cache). Post-forward,
+        //   draft_state.kv_filled = kv_pre + ctx_len + block_size
+        // and the draft-side noise rows committed this round are the
+        // `accepted` rows at the head of the noise block (the bonus is
+        // target-picked and has no draft noise row). So the keeper is
+        //   kv_pre + ctx_len + accepted
+        //     = draft_state.kv_filled - (block_size - accepted)
+        // which drops exactly the rejected noise tail.
+        let rejected_tail = block_size - accepted;
+        let draft_keep = draft_state.kv_filled.saturating_sub(rejected_tail);
+        draft_state.crop(draft_keep);
     }
 
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
