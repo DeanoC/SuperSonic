@@ -15,7 +15,7 @@
 set -eu
 
 BASE_CMD="./target/release/supersonic --model qwen3.5-9b --model-dir /home/deano/models/qwen3.5-9b --int4 --force-kernel-decode"
-DFLASH_CMD="$BASE_CMD --dflash --dflash-draft-dir /home/deano/models/qwen35-9b-dflash --dflash-verify prefill"
+DFLASH_CMD="$BASE_CMD --dflash --dflash-draft-dir /home/deano/models/qwen35-9b-dflash"
 
 # Prompts drawn from the Gemma4 corpus, excluding empty/whitespace cases
 # that the dflash engine bails on.

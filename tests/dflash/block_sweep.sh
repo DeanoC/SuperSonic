@@ -3,12 +3,16 @@
 #
 # Small block = lower fixed verify cost per round but also smaller max
 # commit per round (accepted_len is capped at block_size - 1 by the
-# engine). Empirically B=4 beat B=16 on both prompts tested 2026-04-19
-# against Qwen3.5-9B INT4 on gfx1150. See `project_m4_2_findings.md`.
+# engine). The fused verify path is capped at B=3 on Qwen3.5-9B because
+# (block_size + B*hidden + fp8_lut)*4 must fit in 64 KiB LDS on gfx1150;
+# launches with B>3 fail in verify_block_fused_decode with a diagnostic.
+# Historical note: the earlier M4.1 prefill verify path (deleted in
+# M4.3c) had no LDS constraint and swept B up to 16 — see git log for
+# B=4 winning vs B=16 on this hardware.
 set -eu
 
 BASE_CMD="./target/release/supersonic --model qwen3.5-9b --model-dir /home/deano/models/qwen3.5-9b --int4 --force-kernel-decode"
-DFLASH_CMD_PREFIX="$BASE_CMD --dflash --dflash-draft-dir /home/deano/models/qwen35-9b-dflash --dflash-verify prefill"
+DFLASH_CMD_PREFIX="$BASE_CMD --dflash --dflash-draft-dir /home/deano/models/qwen35-9b-dflash"
 MAX_NEW=12
 
 # Low-accept + high-accept representatives.
@@ -21,7 +25,7 @@ for PROMPT in "Hello" "The sum of 2 and 3 is"; do
   base_tokens=$(grep '^\[tokens\]' "$base_log")
   printf "baseline (fkd)   : %5sms  tokens=%s\n" "$base_ms" "$base_tokens"
   rm "$base_log"
-  for B in 4 8 12 16; do
+  for B in 1 2 3; do
     df_log=$(mktemp)
     $DFLASH_CMD_PREFIX --dflash-block $B --prompt "$PROMPT" --max-new-tokens $MAX_NEW > "$df_log" 2>&1
     ms=$(grep -oE 'decode_ms=[0-9]+' "$df_log" | head -1 | cut -d= -f2)

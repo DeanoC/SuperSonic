@@ -8,14 +8,14 @@
 //! 2. Per round:
 //!    a. Draft `forward()` on `noise_embedding = embed([bonus_seed, MASK,…])`
 //!       with `target_hidden = taps` → B draft candidates (via target's
-//!       `lm_head`). M3 uses the full q_len output; dflash.py's
-//!       `[:, 1-block_size:, :]` slice is equivalent for block_size=16 on
-//!       the last 15 rows, we use all 16 for simpler verify indexing.
+//!       `lm_head`).
 //!    b. Snapshot linear state of the target.
-//!    c. Verify: run B iterative `decode_step`s on the candidate block at
-//!       positions `[L, L+B)` to get per-position logits. This writes K/V
-//!       into full-attention caches at those positions and advances the
-//!       linear state — both will be fixed up after the accept check.
+//!    c. Verify: one `persistent_decode_4b` megakernel launch at positions
+//!       `[L, L+B)` (see `DecodeEngine::verify_block_fused_decode`). The
+//!       launch shares the live sequence's KV/linear buffers across all B
+//!       batch slots with `seqlen_offset[b] = L + b`, so each position
+//!       reads the K/V written by prior positions within the same launch
+//!       (M4.3).
 //!    d. Compute `accepted` = longest prefix match vs target's greedy
 //!       per-position picks (§6).
 //!    e. Restore linear state, then re-decode each committed position via
@@ -23,15 +23,11 @@
 //!       the next round's draft receives `ctx_len = accepted + 1` taps.
 //!    f. Rewind target's full-attention `kv_filled` to `L + accepted + 1`.
 //!    g. Crop the draft's KV cache to the new committed length.
-//!
-//! This is the correctness-first implementation. M4 will replace the B
-//! iterative verify decodes with a single mid-sequence prefill call and
-//! explore megakernel-based acceleration.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::state::LinearStateSnapshot;
@@ -40,19 +36,6 @@ use qwen35_dflash as dflash;
 
 use crate::decode_engine::DecodeEngine;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
-
-#[derive(Clone, Copy, Debug)]
-enum VerifyMode {
-    /// Iterative B-decode path from M3.5 — slow but minimal kernel surface,
-    /// kept during M4.1 bring-up for A/B correctness debugging.
-    Iterative,
-    /// One-launch mid-sequence prefill — M4.1 default.
-    Prefill,
-    /// Single `persistent_decode_4b` megakernel launch over all B positions
-    /// (M4.3). Shares the live sequence's KV/linear buffers across all B
-    /// batch slots with `seqlen_offset[b] = L + b`.
-    Fused,
-}
 use crate::Cli;
 
 /// Run the Qwen3.5-9B DFlash speculative decoder. Parallels
@@ -87,14 +70,6 @@ pub fn run_qwen35_dflash(
     if cli.oracle_prefill || cli.validate || cli.gpu_validate {
         bail!("--dflash does not support --oracle-prefill / --validate / --gpu-validate at M3");
     }
-    let verify_mode = match cli.dflash_verify.as_str() {
-        "prefill" => VerifyMode::Prefill,
-        "iterative" => VerifyMode::Iterative,
-        "fused" => VerifyMode::Fused,
-        other => bail!(
-            "--dflash-verify must be 'prefill' | 'iterative' | 'fused' (got '{other}')"
-        ),
-    };
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
@@ -292,12 +267,16 @@ pub fn run_qwen35_dflash(
     let mut committed_len: usize = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let eos_ids: Vec<u32> = text_config.eos_token_ids();
-    // Default block_size = 4: small enough to keep per-round verify cost
-    // low, empirically the best point across a 15-prompt corpus on
-    // Qwen3.5-9B INT4/gfx1150 (37% wall-clock win vs the draft's native
-    // block_size=16 at the same 14/15 match rate). See
-    // project_m4_2_findings + tests/dflash/block_sweep.sh.
-    const DEFAULT_BLOCK_SIZE: usize = 4;
+    // Default block_size = 3: the fused verify path (now the only verify
+    // path after M4.3c) caps B at 3 on Qwen3.5-9B because the 4B
+    // megakernel's 64 KiB LDS budget has to hold (block_size + B*hidden
+    // + fp8_lut) * 4 bytes. 4*4096 = 16384 floats exceeds the 15872
+    // float budget — verify_block_fused_decode errors out with a
+    // diagnostic if the user forces --dflash-block >= 4 on 9B.
+    // Historical context: the M4.1 prefill verify path had no such cap
+    // and used DEFAULT_BLOCK_SIZE=4 per project_m4_2_findings; see git
+    // history before M4.3c for the B=4 vs B=16 sweep.
+    const DEFAULT_BLOCK_SIZE: usize = 3;
     let block_size = cli
         .dflash_block
         .unwrap_or(DEFAULT_BLOCK_SIZE.min(draft_config.block_size));
@@ -355,21 +334,15 @@ pub fn run_qwen35_dflash(
             .snapshot_linear()
             .map_err(|e| anyhow!("snapshot linear: {e}"))?;
 
-        // 8c. Verify: one-launch prefill at `[l, l+B)` (M4.1 default) or
-        //     iterative B decode_step calls (M3.5 fallback, kept behind
-        //     --dflash-verify=iterative during bring-up).
+        // 8c. Verify: one `persistent_decode_4b` megakernel launch at
+        //     positions `[l, l+B)`. Shared-cache BatchSeqDesc aliases the
+        //     live sequence's KV/linear buffers across all B batch slots
+        //     with `seqlen_offset[b] = l + b`; the kernel runs the B
+        //     iterations sequentially on block 0 within a single layer so
+        //     position b reads the K/V written by positions 0..b of the
+        //     same launch.
         let t_verify = Instant::now();
-        let verify_logits = match verify_mode {
-            VerifyMode::Prefill => target_engine
-                .verify_block_prefill(&draft_candidates, l)?,
-            VerifyMode::Iterative => verify_block_iterative(
-                &mut target_engine,
-                &draft_candidates,
-                l,
-            )?,
-            VerifyMode::Fused => target_engine
-                .verify_block_fused_decode(&draft_candidates, l)?,
-        };
+        let verify_logits = target_engine.verify_block_fused_decode(&draft_candidates, l)?;
         ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
 
         // 8d. Accept check, full protocol (docs/dflash.md §6):
@@ -697,27 +670,4 @@ fn draft_forward_and_sample(
         .map_err(|e| anyhow!("draft final_hidden D2H: {e}"))?;
 
     Ok((candidates, draft_final_hidden_bytes))
-}
-
-/// M3.5 iterative verify: one `decode_step` per draft candidate at
-/// positions `[l, l + block_size)`. Slow but minimal kernel surface —
-/// kept during M4.1 bring-up for A/B correctness comparison against the
-/// new `verify_block_prefill` path.
-///
-/// The target's linear state and full-attention kv_filled are MUTATED
-/// during this call — the caller must snapshot before and restore/rewind
-/// after based on the accept decision.
-fn verify_block_iterative(
-    target_engine: &mut DecodeEngine,
-    draft_candidates: &[u32],
-    l: usize,
-) -> Result<Vec<Vec<f32>>> {
-    let mut out = Vec::with_capacity(draft_candidates.len());
-    for (i, &tok) in draft_candidates.iter().enumerate() {
-        let logits = target_engine
-            .decode_step(tok, l + i)
-            .with_context(|| format!("verify decode_step i={i}"))?;
-        out.push(logits);
-    }
-    Ok(out)
 }
