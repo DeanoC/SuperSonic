@@ -75,6 +75,116 @@ fn residual_add(
     Ok(())
 }
 
+/// Result of the DFlash verify path: per-position logits for the B=16
+/// candidate block. Separate from [`PrefillResult`] to keep the blast
+/// radius tight — the two paths share the lm_head helper but differ in
+/// what they capture (traces / KV-FP8 conversion belong to prefill, not
+/// verify).
+pub struct VerifyResult {
+    /// Logits for each position in the block, F32 on CPU. Length equals the
+    /// `count` argument to `compute_logits_for_range` (typically `block_size`).
+    /// Inner vec length is `vocab_size`.
+    pub logits_per_pos: Vec<Vec<f32>>,
+}
+
+/// Compute per-position logits for a contiguous range of the hidden-state
+/// buffer.
+///
+/// * `hidden`: `[seq_len, hidden_dim]` BF16 (typically `scratch.hidden` after
+///   a prefill pass).
+/// * `start`, `count`: logical range `[start..start+count]`.
+///
+/// Returns `(logits_per_pos, normed)` where `logits_per_pos.len() == count`
+/// and each inner vec has `vocab_size` F32 entries. `normed` is the BF16
+/// `[count, hidden_dim]` buffer produced by the final RMSNorm before
+/// `lm_head` — kept available so the caller can emit a final-norm trace
+/// without re-running the norm.
+///
+/// Allocates scratch buffers locally; the verify path is called at most
+/// once per speculative round and once per prefill, so the cost is
+/// amortized. Hot-path prefill also goes through here with `count=1`.
+pub fn compute_logits_for_range(
+    hidden: &GpuBuffer,
+    weights: &Qwen35Weights,
+    config: &TextConfig,
+    start: usize,
+    count: usize,
+    use_4b_kernel: bool,
+    ordinal: usize,
+) -> Result<(Vec<Vec<f32>>, GpuBuffer)> {
+    if count == 0 {
+        return Err(anyhow::anyhow!("compute_logits_for_range: count must be > 0"));
+    }
+    let hidden_dim = config.hidden_size;
+    let vocab_size = config.vocab_size;
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+
+    // D2D slice [start..start+count] of the hidden-state buffer.
+    let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("range slice alloc: {e}"))?;
+    let src_offset = start * hidden_dim * elem_bytes;
+    gpu_hal::copy_d2d(
+        ordinal,
+        slice.as_ptr() as *mut c_void,
+        hidden.offset_ptr(src_offset),
+        count * hidden_dim * elem_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("range slice copy: {e}"))?;
+
+    // Final RMSNorm → BF16 [count, hidden_dim]. Qwen3.5 uses add_unit_offset=1.
+    let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("range normed alloc: {e}"))?;
+    prefill_ffi::rms_norm_rows(
+        ordinal, ScalarType::BF16, count, hidden_dim,
+        config.rms_norm_eps as f32,
+        &slice, &weights.norm_weight, &mut normed,
+    )
+    .map_err(|e| anyhow::anyhow!("range final norm: {e}"))?;
+
+    // lm_head projection. For count=1 the standalone matvec is competitive with
+    // the tiled path on gfx1150; for count>1 we must use the tiled matmul.
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
+        .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
+    if use_4b_kernel || count > 1 {
+        kernel_ffi::matmul_rhs_transposed_4b(
+            ordinal, ScalarType::BF16,
+            1,         // batch
+            count,     // m
+            vocab_size, // n
+            hidden_dim, // k
+            &normed, &*weights.lm_head, &mut logits_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
+    } else {
+        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("range matvec counter: {e}"))?;
+        kernel_ffi::standalone_matvec(
+            ordinal, ScalarType::BF16,
+            &mut logits_buf, &normed, &*weights.lm_head,
+            hidden_dim, vocab_size, &mut counter,
+        )
+        .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
+    }
+
+    // D2H + split into one Vec<f32> per position.
+    let host_bytes = logits_buf
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("range logits D2H: {e}"))?;
+    let row_elems = vocab_size;
+    let mut logits_per_pos: Vec<Vec<f32>> = Vec::with_capacity(count);
+    for row in 0..count {
+        let start_byte = row * row_elems * elem_bytes;
+        let end_byte = start_byte + row_elems * elem_bytes;
+        let row_vec: Vec<f32> = host_bytes[start_byte..end_byte]
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+        logits_per_pos.push(row_vec);
+    }
+
+    Ok((logits_per_pos, normed))
+}
+
 /// Result of a prefill pass.
 pub struct PrefillResult {
     /// Logits for the last token position [vocab_size] as F32 on CPU.
@@ -428,6 +538,7 @@ fn prefill_inner(
                 prefill_full_attention_layer(
                     weights, state, rotary, &mut scratch, config, idx,
                     chunk_len, chunk_start, ordinal, kv_chunk_size,
+                    /* commit_kv_filled */ true,
                 )?;
             } else {
                 let mut no_debug_trace = None;
@@ -592,28 +703,19 @@ fn prefill_inner(
         chunk_start += chunk_len;
     }
 
-    // Extract last token from the final chunk's hidden state.
-    // last_chunk_len was set in the loop — the last token is at index last_chunk_len-1.
-    let last_token_offset = (last_chunk_len - 1) * hidden_dim * ScalarType::BF16.size_in_bytes();
-    let last_hidden_ptr = scratch.hidden.offset_ptr(last_token_offset);
-    let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-        .map_err(|e| anyhow::anyhow!("last_hidden alloc: {e}"))?;
-    gpu_hal::copy_d2d(
+    // Extract logits for the last token of the final chunk. Refactored out
+    // into `compute_logits_for_range` so the DFlash verify path can request
+    // count=B and walk the block argmax in one shot (M3; see docs/dflash.md §6).
+    let (mut logits_per_pos, normed_last) = compute_logits_for_range(
+        &scratch.hidden,
+        weights,
+        config,
+        last_chunk_len - 1,
+        1,
+        use_4b_kernel,
         ordinal,
-        last_hidden.as_ptr() as *mut c_void,
-        last_hidden_ptr,
-        hidden_dim * ScalarType::BF16.size_in_bytes(),
-    )
-    .map_err(|e| anyhow::anyhow!("copy last hidden: {e}"))?;
-
-    let mut normed_last = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-        .map_err(|e| anyhow::anyhow!("normed_last alloc: {e}"))?;
-    prefill_ffi::rms_norm_rows(
-        ordinal, ScalarType::BF16, 1, hidden_dim,
-        config.rms_norm_eps as f32,
-        &last_hidden, &weights.norm_weight, &mut normed_last,
-    )
-    .map_err(|e| anyhow::anyhow!("final norm: {e}"))?;
+    )?;
+    let logits = logits_per_pos.pop().expect("count=1 produces exactly one row");
     let final_norm_trace = if trace_layers {
         Some(
             normed_last
@@ -623,40 +725,6 @@ fn prefill_inner(
     } else {
         None
     };
-
-    // lm_head projection → logits [1, vocab_size]
-    let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-        .map_err(|e| anyhow::anyhow!("matvec counter: {e}"))?;
-    if use_4b_kernel {
-        kernel_ffi::matmul_rhs_transposed_4b(
-            ordinal,
-            ScalarType::BF16,
-            1,
-            1,
-            config.vocab_size,
-            hidden_dim,
-            &normed_last,
-            &*weights.lm_head,
-            &mut scratch.logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("lm_head tiled 4b matmul: {e}"))?;
-    } else {
-        kernel_ffi::standalone_matvec(
-            ordinal, ScalarType::BF16,
-            &mut scratch.logits_buf, &normed_last, &*weights.lm_head,
-            hidden_dim, config.vocab_size, &mut counter,
-        )
-        .map_err(|e| anyhow::anyhow!("lm_head: {e}"))?;
-    }
-
-    // Copy logits to CPU, convert BF16 → F32
-    let logits_bytes = scratch.logits_buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
-    let logits: Vec<f32> = logits_bytes
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-        .collect();
 
     // Post-prefill: convert BF16 KV caches to FP8 if requested.
     // During prefill we use BF16 KV so the attention kernel can read them directly.
@@ -833,6 +901,14 @@ pub fn gpu_reference_replay_step_with_taps(
     Ok((result.logits, taps))
 }
 
+/// Per-layer full-attention prefill step.
+///
+/// `commit_kv_filled`: when false, K/V are written to the cache at positions
+/// `[chunk_start, chunk_start + chunk_len)` but `ls.kv_filled` is NOT
+/// advanced. That's the DFlash verify path per docs/dflash.md §6 — the
+/// speculative engine owns the post-acceptance `set_kv_filled(L + k + 1)`
+/// call and harmlessly overwrites the tail on the next round. Normal
+/// prefill passes `true`.
 fn prefill_full_attention_layer(
     weights: &Qwen35Weights,
     state: &mut ModelState,
@@ -844,6 +920,7 @@ fn prefill_full_attention_layer(
     chunk_start: usize,
     ordinal: usize,
     kv_chunk_size: usize,
+    commit_kv_filled: bool,
 ) -> Result<()> {
     let fw = weights.layers[idx]
         .full
@@ -973,7 +1050,9 @@ fn prefill_full_attention_layer(
             .map_err(|e| anyhow::anyhow!("layer {idx} KV cache V write h={h}: {e}"))?;
         }
     }
-    ls.set_kv_filled(kv_len);
+    if commit_kv_filled {
+        ls.set_kv_filled(kv_len);
+    }
 
     // 10. Transpose Q to [H, chunk_len, D]
     prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &query_buf, &mut scratch.attn_q)
