@@ -3915,7 +3915,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
     int batch_size,                      // 1 for single-sequence, >1 for batched
     const BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
-    const Qwen35INT4ScaleDesc* __restrict__ int4_scales  // nullptr for non-INT4, else [num_layers]
+    const Qwen35INT4ScaleDesc* __restrict__ int4_scales,  // nullptr for non-INT4, else [num_layers]
+    // DFlash hidden-state taps (M1, currently plumbing-only): when tap_workspace != nullptr,
+    // the per-layer post-MLP residual hidden state for each layer in tap_layers[0..num_taps]
+    // is mirrored into tap_workspace at offset i * hidden_dim (i = tap index, not layer index).
+    // All three default to nullptr/0 from non-DFlash callers — the kernel body must treat
+    // them as no-op when tap_workspace == nullptr to preserve gfx1150 codegen on the hot path.
+    T* __restrict__ tap_workspace,       // nullptr disables; else [num_taps * hidden_dim]
+    const int* __restrict__ tap_layers,  // nullptr when tap_workspace is nullptr
+    int num_taps                         // 0 when tap_workspace is nullptr
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;

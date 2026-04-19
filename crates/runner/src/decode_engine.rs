@@ -2310,6 +2310,8 @@ impl DecodeEngine {
                 1, // batch_size=1 for single-sequence decode
                 None,
                 self.int4_scale_device.as_ref(),
+                None, // tap_workspace: DFlash-only, off in vanilla decode
+                None, // tap_layers: DFlash-only, off in vanilla decode
             )
             .map_err(|e| anyhow::anyhow!("persistent_decode_4b kernel: {e}"))?;
         } else {
@@ -2501,6 +2503,8 @@ impl DecodeEngine {
             b,
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
+            None, // tap_workspace: DFlash-only, off in batched decode
+            None, // tap_layers: DFlash-only, off in batched decode
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
 
@@ -2673,6 +2677,8 @@ impl DecodeEngine {
             b,
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
+            None, // tap_workspace: DFlash-only, off in trace path
+            None, // tap_layers: DFlash-only, off in trace path
         )
         .map_err(|e| anyhow::anyhow!("trace persistent_decode_4b batch kernel: {e}"))?;
 
