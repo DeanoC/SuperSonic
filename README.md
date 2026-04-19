@@ -229,8 +229,8 @@ There is now also an explicit native single-sequence staging lane for `4B`
 behind `--force-kernel-decode`. A warmed `pp533 / tg128` run on this box comes
 in at roughly:
 
-- prefill `4497 ms` (`118 tok/s`)
-- decode `12686 ms` (`10.1 tok/s`)
+- prefill `4483 ms` (`119 tok/s`)
+- decode `12501 ms` (`10.2 tok/s`)
 
 The first kept single-stream `4B` CUDA pass on this lane removed
 unconditional full-attention trace-buffer writes from the hot path and left
@@ -240,8 +240,11 @@ by moving to packed two-dimension BF16 score/value work inside the existing
 `B == 1` schedule, and then by raising that packed path to four dimensions per
 active thread. The latest kept pass then stopped the idle threads in that same
 hero branch from doing useless BF16 query staging plus zero-value score/softmax
-work. Together, those passes reduced the warmed single-lane full-attention core
-from about `6934 ms` to `4599 ms` on this machine.
+work. The next kept pass then moved off attention entirely once the temporary
+split showed `linear_core` was now mostly recurrent-state traffic: it fused the
+serial recurrent update from four state walks down to two and reduced the
+warmed single-lane linear core from about `3471 ms` to `3275 ms` on this
+machine while leaving the attention core flat at about `4600 ms`.
 
 That lane is intended for Lucebox-style single-stream optimization work; the
 validated production throughput lane remains `qwen3.5-4b --batch-size 2`.

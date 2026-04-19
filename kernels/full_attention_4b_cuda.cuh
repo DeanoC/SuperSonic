@@ -5256,37 +5256,34 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                             }
 
-                            // Apply decay: state *= exp(g)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] *= decay;
-                            }
-
                             // Map value head to key head for Q/K indexing
                             // nk key heads shared among nv value heads
                             const int h_k = h * nk / nv;
+                            const float* kh = conv_out + k_key_offset + h_k * hkd;
+                            const float* qh = conv_out + q_key_offset + h_k * hkd;
 
-                            // kv_mem[v] = sum_k(state[k, v] * key[k])
+                            // First pass: apply decay and accumulate kv_mem from the
+                            // decayed state so we do not reload the recurrent tile.
                             float kv_mem_v = 0.0f;
                             for (int k = 0; k < hkd; ++k) {
-                                kv_mem_v += sh[k * hvd + v]
-                                          * conv_out[k_key_offset + h_k * hkd + k];
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_decay = (*state_kv) * decay;
+                                *state_kv = state_decay;
+                                kv_mem_v += state_decay * kh[k];
                             }
 
                             // delta = (value - kv_mem) * beta
                             const float val = conv_out[v_val_offset + h * hvd + v];
                             const float delta = (val - kv_mem_v) * beta;
 
-                            // state[k, v] += key[k] * delta (each thread owns its v)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] +=
-                                    conv_out[k_key_offset + h_k * hkd + k] * delta;
-                            }
-
-                            // output[v] = sum_k(state[k, v] * query[k])
+                            // Second pass: update the state and accumulate the output
+                            // from the updated value in the same walk.
                             float out_v = 0.0f;
                             for (int k = 0; k < hkd; ++k) {
-                                out_v += sh[k * hvd + v]
-                                       * conv_out[q_key_offset + h_k * hkd + k];
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_update = (*state_kv) + kh[k] * delta;
+                                *state_kv = state_update;
+                                out_v += state_update * qh[k];
                             }
 
                             attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);

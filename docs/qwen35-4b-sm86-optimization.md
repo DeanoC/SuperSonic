@@ -400,6 +400,96 @@ What this means now:
 - the next pass should still focus on the attention core, but it needs to buy
   more than this pass did to justify added complexity
 
+## Linear-Core Internal Split
+
+Before touching the next structural pass, the single-stream hero lane added a
+temporary internal split inside the `4B` linear-attention core to measure where
+`linear_core` time was actually going.
+
+Short diagnostic run (`tg16`) on the current `6866040` baseline:
+
+- total `linear_core`: `433.919 ms`
+- conv front-end: `6.186 ms`
+- recurrent update body: `423.504 ms`
+- post/gating tail: `4.045 ms`
+
+What that clarified:
+
+- the next pass should not guess from the `0.8B` schedule copy attempts
+- the measured `4B` hotspot was the recurrent-state walk, not conv or post
+- a useful bounded pass should reduce recurrent-state traffic before trying
+  another block-level remap
+
+## Fifth Kept Single-Stream Pass
+
+The next kept pass stayed inside the serial `4B` linear-attention block and
+reduced how many times it walks recurrent state:
+
+- left the single-sequence native-kernel hero lane unchanged:
+  `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- left batch-2 decode, FP8-KV, and the packed BF16 full-attention hero path
+  untouched
+- fused the linear-attention recurrent body from four state walks down to two:
+  - fused decay with the `kv_mem` accumulation pass
+  - fused state update with the final output accumulation pass
+- kept the math order and output semantics unchanged
+
+Why this pass was chosen:
+
+- the temporary split showed the recurrent update body consuming essentially
+  all of `linear_core`
+- earlier attempts to copy the `0.8B` block/head mapping into `4B` linear
+  attention were flat to worse on this machine
+- reducing recurrent-state memory traffic is the smallest pass that matches the
+  measured hotspot without broadening the optimization surface
+
+Short screening result (`pp533` / `tg16`) against commit `6866040`:
+
+- prefill moved from `4496.5 ms` to `4458.0 ms`
+- decode improved from `1539.0 ms` to `1516.7 ms`
+- native decode total improved from `1490.119 ms` to `1490.015 ms`
+- persistent decode improved from `1447.006 ms` to `1424.597 ms`
+- full attention stayed flat: `548.709 ms` to `548.653 ms`
+- full-attention core stayed flat: `521.446 ms` to `521.454 ms`
+- linear projection stayed flat: `140.272 ms` to `140.277 ms`
+- linear core improved from `434.034 ms` to `409.137 ms`
+- linear out stayed flat: `79.714 ms` to `79.690 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `6866040`:
+
+- prefill moved from `4496.5 ms` to `4482.9 ms`
+- decode improved from `12685.8 ms` to `12500.6 ms`
+- native decode total improved from `12475.365 ms` to `12288.288 ms`
+- persistent decode improved from `11952.418 ms` to `11765.571 ms`
+- full attention stayed flat: `4817.504 ms` to `4813.594 ms`
+- full-attention core stayed flat: `4599.407 ms` to `4600.385 ms`
+- linear projection stayed flat: `1122.219 ms` to `1121.687 ms`
+- linear core improved from `3471.135 ms` to `3275.092 ms`
+- linear out stayed flat: `637.595 ms` to `637.628 ms`
+
+Verification notes:
+
+- baked `--validate --force-kernel-decode` still passed with
+  `decode_max_delta=0.7930` and matched the kept baseline token stream
+- baked batch-2 validate still passed with `decode_max_delta=0.8086`
+- `tests/sm86/run_4b.sh` baked path still passed; its `--no-bake` subtest still
+  fails on this machine because `/workspace/models/Qwen3.5-4B` has no raw
+  safetensors files
+- `tests/sm86/run_batch.sh` baked path still passed; its `--no-bake` subtest
+  fails for the same model-directory reason
+- `tests/sm86/run_4b_long.sh` passed all `4/4` long-context corpus cases on
+  this build
+
+What this means now:
+
+- the single-stream `4B` hero lane is no longer purely a full-attention story;
+  `linear_core` is now the section that moved materially on the kept pass
+- the right lesson from `0.8B` is still to copy the workflow, not the lane
+  mapping
+- the next bounded pass should keep targeting the no-batch hero lane first and
+  should either split `linear_core` again on the final build or prove that a
+  head-parallel recurrent remap beats the simpler fused serial path
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero
