@@ -39,7 +39,6 @@ use qwen35::weights::Qwen35Weights;
 use qwen35_dflash as dflash;
 
 use crate::decode_engine::DecodeEngine;
-use crate::prefill_engine;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::Cli;
 
