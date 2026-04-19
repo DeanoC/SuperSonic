@@ -240,7 +240,7 @@ behind `--force-kernel-decode`. The exact lane is:
 The current warmed result on this box comes in at roughly:
 
 - prefill `4484 ms` (`119 tok/s`)
-- decode `12097 ms` (`10.6 tok/s`)
+- decode `12095 ms` (`10.6 tok/s`)
 
 The first kept single-stream `4B` CUDA pass on this lane removed
 unconditional full-attention trace-buffer writes from the hot path and left
@@ -263,7 +263,10 @@ the real remaining cost was score-side work, not value accumulation, then
 collapsed the hero branch from a two-wave `64 x 4` score reduction to a
 one-wave `32 x 8` mapping. That cut warmed single-lane full-attention core
 from about `4600 ms` to `4166 ms` and improved warmed decode from about
-`12463 ms` to `12097 ms` on this machine.
+`12463 ms` to `12097 ms` on this machine. The latest kept pass then reduced
+hot projection live state for `B <= 2`, dropping the persistent kernel's
+static footprint from `170` to `164` registers and nudging warmed decode to
+about `12095 ms` on this box.
 
 That lane is intended for Lucebox-style single-stream optimization work; the
 validated production throughput lane remains `qwen3.5-4b --batch-size 2`.

@@ -669,6 +669,97 @@ What this means now:
   single-stream attention-core overhead carefully, because the broad
   cross-wave reduction tax is now gone
 
+## Eighth Kept Single-Stream Pass
+
+The next kept pass stayed off the hero attention branch and instead reduced
+live projection state in the same single-stream native lane:
+
+- left the hero lane unchanged:
+  `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- left the one-wave `32 x 8` attention-core hero mapping unchanged
+- left FP8-KV, batch scheduling, and the linear-attention recurrent path
+  untouched
+- specialized the hot full-attention projection accumulation path for
+  `B <= 2`
+- replaced the generic `float p[MAX_BATCH_SIZE]` accumulator array in that hot
+  path with scalar accumulators for the `B == 1` / `B == 2` cases, and kept
+  the old generic path for larger batch counts
+
+Why this pass was chosen:
+
+- after the one-wave attention-core win, temporary timing splits showed the
+  broad cross-wave score tax was already gone
+- several follow-up attention-core experiments were correct but flat to worse,
+  so the next bounded pass needed to reduce live state instead of changing the
+  score/value math again
+- static resource inspection on this machine is available through `cuobjdump`
+  even though Nsight Compute counters are blocked by `ERR_NVGPUCTRPERM`
+- the generic projection path was still carrying an unnecessary
+  `MAX_BATCH_SIZE` accumulator array in the hot `B == 1` and `B == 2` cases
+
+Static resource change:
+
+- persistent kernel resource usage moved from `REG:170 STACK:128 SHARED:16`
+  to `REG:164 STACK:128 SHARED:16`
+
+Short screening result (`pp533` / `tg16`) against commit `a3c72eb`:
+
+- prefill moved from `4429.7 ms` to `4454.7 ms`
+- decode improved from `1469.3 ms` to `1468.7 ms`
+- native decode total improved from `1443.121 ms` to `1442.123 ms`
+- persistent decode improved from `1377.798 ms` to `1376.694 ms`
+- full attention improved from `499.054 ms` to `497.901 ms`
+- full-attention projection improved from `19.015 ms` to `8.959 ms`
+- full-attention core regressed from `472.388 ms` to `480.818 ms`
+- linear projection stayed flat: `140.532 ms` to `140.850 ms`
+- linear core stayed flat-to-slightly-better: `405.461 ms` to `404.158 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `a3c72eb`:
+
+- prefill moved from `4483.7 ms` to `4484.7 ms`
+- decode improved from `12097.2 ms` to `12095.4 ms`
+- native decode total improved from `11885.495 ms` to `11884.882 ms`
+- persistent decode improved from `11362.940 ms` to `11361.844 ms`
+- full attention improved from `4379.307 ms` to `4377.807 ms`
+- full-attention projection improved from `152.137 ms` to `71.659 ms`
+- full-attention core regressed from `4165.966 ms` to `4240.442 ms`
+- linear projection moved from `1124.275 ms` to `1126.750 ms`
+- linear core improved from `3243.006 ms` to `3233.276 ms`
+- linear out stayed flat: `638.729 ms` to `638.767 ms`
+
+Why this one stayed:
+
+- both the short screen and the full warmed screen stayed slightly positive on
+  end-to-end decode
+- the pass is numerically safe on the baked native-kernel lane
+- the persistent kernel footprint dropped materially, which is useful headroom
+  even though the wall-clock gain is small
+- this is a bounded cleanup that does not widen the hero surface or lock in a
+  speculative new attention schedule
+
+Verification notes:
+
+- baked `--validate --force-kernel-decode` still passed with the same token
+  stream and `decode_max_delta=0.8359`
+- `tests/sm86/run_4b.sh` baked path still passed; its `--no-bake` subtest
+  still fails on this machine because `/workspace/models/Qwen3.5-4B` has no
+  raw safetensors files
+- `tests/sm86/run_batch.sh` baked path still passed; its `--no-bake` subtest
+  fails for the same model-directory reason
+- `tests/sm86/run_4b_long.sh` passed all `4/4` long-context corpus cases on
+  this build
+
+What this means now:
+
+- the next real performance pass should still treat the single-stream `4B`
+  lane as an attention-side problem first
+- the score-reduction rewrite and this projection-state cleanup together make
+  register pressure and live-range control a more credible next lever than
+  another immediate math rewrite
+- the next bounded experiment should target the remaining score/K-load side of
+  the hero attention core or another provable live-range reduction inside that
+  section
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero

@@ -4105,85 +4105,174 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (int4_scales) { w_i4_scale = int4_scales[layer].v_proj_scale; w_i4_zero = int4_scales[layer].v_proj_zero; }
                     }
 
-                    float p[MAX_BATCH_SIZE];
-                    for (int b = 0; b < B; b++) p[b] = 0.0f;
-                    if (int4_scales != nullptr && w_i4_scale != nullptr) {
-                        // INT4 dequant: load 4 packed bytes (8 weights) at a time
-                        const int gsz = int4_scales[layer].group_size;
-                        const int byte_cols = hidden_dim / 2;  // packed width
-                        const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
-                        const hip_bfloat16* scales_p = static_cast<const hip_bfloat16*>(w_i4_scale);
-                        const hip_bfloat16* zeros_p = static_cast<const hip_bfloat16*>(w_i4_zero);
-                        const int scale_row = row / gsz;
-                        const int scale_cols = (hidden_dim + gsz - 1) / gsz;
-                        const int vd8 = hidden_dim & ~7;
-                        for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
-                            uint32_t packed = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
-                            float w[8];
-                            int4_dequant_8(packed, scales_p, zeros_p, scale_row, c, scale_cols, gsz, w);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
-                                      + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
+                    if (B <= 2) {
+                        float p0 = 0.0f;
+                        float p1 = 0.0f;
+                        if (int4_scales != nullptr && w_i4_scale != nullptr) {
+                            const int gsz = int4_scales[layer].group_size;
+                            const int byte_cols = hidden_dim / 2;
+                            const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
+                            const hip_bfloat16* scales_p = static_cast<const hip_bfloat16*>(w_i4_scale);
+                            const hip_bfloat16* zeros_p = static_cast<const hip_bfloat16*>(w_i4_zero);
+                            const int scale_row = row / gsz;
+                            const int scale_cols = (hidden_dim + gsz - 1) / gsz;
+                            const int vd8 = hidden_dim & ~7;
+                            for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
+                                uint32_t packed = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                                float w[8];
+                                int4_dequant_8(packed, scales_p, zeros_p, scale_row, c, scale_cols, gsz, w);
+                                const float* inp0 = lds_input + c;
+                                p0 += w[0]*inp0[0] + w[1]*inp0[1] + w[2]*inp0[2] + w[3]*inp0[3]
+                                   + w[4]*inp0[4] + w[5]*inp0[5] + w[6]*inp0[6] + w[7]*inp0[7];
+                                if (B > 1) {
+                                    const float* inp1 = lds_input + hidden_dim + c;
+                                    p1 += w[0]*inp1[0] + w[1]*inp1[1] + w[2]*inp1[2] + w[3]*inp1[3]
+                                       + w[4]*inp1[4] + w[5]*inp1[5] + w[6]*inp1[6] + w[7]*inp1[7];
+                                }
+                            }
+                            for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                                p0 += w * lds_input[c];
+                                if (B > 1) p1 += w * lds_input[hidden_dim + c];
+                            }
+                        } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                            const uint8_t* fp8_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                            const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(w_scale);
+                            const int bsz = fp8_scales[layer].block_size;
+                            const int scale_row = row / bsz;
+                            const int scale_cols = (hidden_dim + bsz - 1) / bsz;
+                            const int vd4 = hidden_dim & ~3;
+                            for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                                uint32_t packed = *reinterpret_cast<const uint32_t*>(&fp8_row[c]);
+                                float w0 = fp8_lut[packed & 0xFF];
+                                float w1 = fp8_lut[(packed >> 8) & 0xFF];
+                                float w2 = fp8_lut[(packed >> 16) & 0xFF];
+                                float w3 = fp8_lut[(packed >> 24) & 0xFF];
+                                const int sb = scale_row * scale_cols;
+                                w0 = bf16_round_rne_f32_finite((w0 * static_cast<float>(scales[sb + c / bsz])));
+                                w1 = bf16_round_rne_f32_finite((w1 * static_cast<float>(scales[sb + (c+1) / bsz])));
+                                w2 = bf16_round_rne_f32_finite((w2 * static_cast<float>(scales[sb + (c+2) / bsz])));
+                                w3 = bf16_round_rne_f32_finite((w3 * static_cast<float>(scales[sb + (c+3) / bsz])));
+                                const float* inp0 = lds_input + c;
+                                p0 += w0 * inp0[0] + w1 * inp0[1] + w2 * inp0[2] + w3 * inp0[3];
+                                if (B > 1) {
+                                    const float* inp1 = lds_input + hidden_dim + c;
+                                    p1 += w0 * inp1[0] + w1 * inp1[1] + w2 * inp1[2] + w3 * inp1[3];
+                                }
+                            }
+                            for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, bsz, fp8_lut);
+                                p0 += w * lds_input[c];
+                                if (B > 1) p1 += w * lds_input[hidden_dim + c];
+                            }
+                        } else {
+                            const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                            const int vd4 = hidden_dim & ~3;
+                            for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                                float w0 = dotcache_qwen35_to_float(wr[c]);
+                                float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                const float* inp0 = lds_input + c;
+                                p0 += w0 * inp0[0] + w1 * inp0[1] + w2 * inp0[2] + w3 * inp0[3];
+                                if (B > 1) {
+                                    const float* inp1 = lds_input + hidden_dim + c;
+                                    p1 += w0 * inp1[0] + w1 * inp1[1] + w2 * inp1[2] + w3 * inp1[3];
+                                }
+                            }
+                            for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = dotcache_qwen35_to_float(wr[c]);
+                                p0 += w * lds_input[c];
+                                if (B > 1) p1 += w * lds_input[hidden_dim + c];
                             }
                         }
-                        for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
-                        // Vectorized FP8 dequant: load 4 bytes at a time, LUT decode, scale
-                        const uint8_t* fp8_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(w_scale);
-                        const int bsz = fp8_scales[layer].block_size;
-                        const int scale_row = row / bsz;
-                        const int scale_cols = (hidden_dim + bsz - 1) / bsz;
-                        const int vd4 = hidden_dim & ~3;
-                        for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
-                            uint32_t packed = *reinterpret_cast<const uint32_t*>(&fp8_row[c]);
-                            float w0 = fp8_lut[packed & 0xFF];
-                            float w1 = fp8_lut[(packed >> 8) & 0xFF];
-                            float w2 = fp8_lut[(packed >> 16) & 0xFF];
-                            float w3 = fp8_lut[(packed >> 24) & 0xFF];
-                            const int sb = scale_row * scale_cols;
-                            w0 = bf16_round_rne_f32_finite((w0 * static_cast<float>(scales[sb + c / bsz])));
-                            w1 = bf16_round_rne_f32_finite((w1 * static_cast<float>(scales[sb + (c+1) / bsz])));
-                            w2 = bf16_round_rne_f32_finite((w2 * static_cast<float>(scales[sb + (c+2) / bsz])));
-                            w3 = bf16_round_rne_f32_finite((w3 * static_cast<float>(scales[sb + (c+3) / bsz])));
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
-                            }
-                        }
-                        for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, bsz, fp8_lut);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
+                        float result0 = wave_reduce_sum_f32(p0);
+                        if (lane_p == 0)
+                            proj_buf[sr] = bf16_round_rne_f32_finite(result0);
+                        if (B > 1) {
+                            float result1 = wave_reduce_sum_f32(p1);
+                            if (lane_p == 0)
+                                proj_buf[proj_buf_floats + sr] = bf16_round_rne_f32_finite(result1);
                         }
                     } else {
-                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        const int vd4 = hidden_dim & ~3;
-                        for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
-                            float w0 = dotcache_qwen35_to_float(wr[c]);
-                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
-                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
-                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                        float p[MAX_BATCH_SIZE];
+                        for (int b = 0; b < B; b++) p[b] = 0.0f;
+                        if (int4_scales != nullptr && w_i4_scale != nullptr) {
+                            const int gsz = int4_scales[layer].group_size;
+                            const int byte_cols = hidden_dim / 2;
+                            const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
+                            const hip_bfloat16* scales_p = static_cast<const hip_bfloat16*>(w_i4_scale);
+                            const hip_bfloat16* zeros_p = static_cast<const hip_bfloat16*>(w_i4_zero);
+                            const int scale_row = row / gsz;
+                            const int scale_cols = (hidden_dim + gsz - 1) / gsz;
+                            const int vd8 = hidden_dim & ~7;
+                            for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
+                                uint32_t packed = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                                float w[8];
+                                int4_dequant_8(packed, scales_p, zeros_p, scale_row, c, scale_cols, gsz, w);
+                                for (int b = 0; b < B; b++) {
+                                    const float* inp = lds_input + b * hidden_dim + c;
+                                    p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
+                                          + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
+                                }
+                            }
+                            for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
+                            }
+                        } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                            const uint8_t* fp8_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                            const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(w_scale);
+                            const int bsz = fp8_scales[layer].block_size;
+                            const int scale_row = row / bsz;
+                            const int scale_cols = (hidden_dim + bsz - 1) / bsz;
+                            const int vd4 = hidden_dim & ~3;
+                            for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                                uint32_t packed = *reinterpret_cast<const uint32_t*>(&fp8_row[c]);
+                                float w0 = fp8_lut[packed & 0xFF];
+                                float w1 = fp8_lut[(packed >> 8) & 0xFF];
+                                float w2 = fp8_lut[(packed >> 16) & 0xFF];
+                                float w3 = fp8_lut[(packed >> 24) & 0xFF];
+                                const int sb = scale_row * scale_cols;
+                                w0 = bf16_round_rne_f32_finite((w0 * static_cast<float>(scales[sb + c / bsz])));
+                                w1 = bf16_round_rne_f32_finite((w1 * static_cast<float>(scales[sb + (c+1) / bsz])));
+                                w2 = bf16_round_rne_f32_finite((w2 * static_cast<float>(scales[sb + (c+2) / bsz])));
+                                w3 = bf16_round_rne_f32_finite((w3 * static_cast<float>(scales[sb + (c+3) / bsz])));
+                                for (int b = 0; b < B; b++) {
+                                    const float* inp = lds_input + b * hidden_dim + c;
+                                    p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                                }
+                            }
+                            for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, bsz, fp8_lut);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
+                            }
+                        } else {
+                            const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                            const int vd4 = hidden_dim & ~3;
+                            for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                                float w0 = dotcache_qwen35_to_float(wr[c]);
+                                float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                for (int b = 0; b < B; b++) {
+                                    const float* inp = lds_input + b * hidden_dim + c;
+                                    p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                                }
+                            }
+                            for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                                float w = dotcache_qwen35_to_float(wr[c]);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
                             }
                         }
-                        for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = dotcache_qwen35_to_float(wr[c]);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
+                        for (int b = 0; b < B; b++) {
+                            float result = wave_reduce_sum_f32(p[b]);
+                            if (lane_p == 0)
+                                proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(result);
                         }
-                    }
-                    for (int b = 0; b < B; b++) {
-                        float result = wave_reduce_sum_f32(p[b]);
-                        if (lane_p == 0)
-                            proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(result);
                     }
                 }
             }
