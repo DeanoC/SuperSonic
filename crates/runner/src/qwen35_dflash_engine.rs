@@ -288,7 +288,15 @@ pub fn run_qwen35_dflash(
     let mut committed_len: usize = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let eos_ids: Vec<u32> = text_config.eos_token_ids();
-    let block_size = cli.dflash_block.unwrap_or(draft_config.block_size);
+    // Default block_size = 4: small enough to keep per-round verify cost
+    // low, empirically the best point across a 15-prompt corpus on
+    // Qwen3.5-9B INT4/gfx1150 (37% wall-clock win vs the draft's native
+    // block_size=16 at the same 14/15 match rate). See
+    // project_m4_2_findings + tests/dflash/block_sweep.sh.
+    const DEFAULT_BLOCK_SIZE: usize = 4;
+    let block_size = cli
+        .dflash_block
+        .unwrap_or(DEFAULT_BLOCK_SIZE.min(draft_config.block_size));
     if block_size == 0 || block_size > draft_config.block_size {
         bail!(
             "--dflash-block must be in 1..={} (got {block_size})",

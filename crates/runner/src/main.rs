@@ -337,8 +337,13 @@ pub(crate) struct Cli {
     #[arg(long)]
     dflash_draft_dir: Option<PathBuf>,
 
-    /// Override the DFlash block size (draft candidates per round).
-    /// Must be 1..=draft_config.block_size (default 16 from the checkpoint).
+    /// Override the DFlash block size (draft candidates per round). Must
+    /// be 1..=draft_config.block_size. Default is 4 — empirically the
+    /// best wall-clock point on a 15-prompt corpus against Qwen3.5-9B
+    /// INT4 on gfx1150 (see project_m4_2_findings memory). The draft's
+    /// native block_size is higher (16 for the z-lab checkpoint) but
+    /// smaller blocks cut per-round verify cost more than they lose in
+    /// max acceptance at the current accept rates.
     #[arg(long)]
     dflash_block: Option<usize>,
 
