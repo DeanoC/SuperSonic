@@ -124,6 +124,12 @@ pub struct DecodeEngine {
     kv_fp8: bool,
     /// Batch size (1 = single-sequence, default).
     batch_size: usize,
+    /// Cached DFlash tap scratch: `(tap_layers, workspace [num_taps,
+    /// hidden_dim] BF16, layer_ids i32-as-u8 buffer)`. `decode_step_
+    /// with_taps_kernel` reuses these across calls with the same
+    /// tap_layers list. Avoids a per-call GpuBuffer::zeros + upload of
+    /// a small i32 vec — ~100ms savings per call at 9B INT4.
+    dflash_tap_cache: Option<(Vec<usize>, GpuBuffer, GpuBuffer)>,
 }
 
 pub struct ComponentLayerTrace {
@@ -2067,6 +2073,7 @@ impl DecodeEngine {
             prefill_chunk_size,
             kv_fp8,
             batch_size,
+            dflash_tap_cache: None,
         })
     }
 
@@ -2448,22 +2455,40 @@ impl DecodeEngine {
             }
         }
 
-        // 1) Allocate the tap workspace + upload the i32 tap-layer indices.
+        // 1) Tap workspace + i32-layer-indices: reuse the cache if tap_layers
+        //    hasn't changed, otherwise (re)allocate once. DFlash calls this
+        //    in a tight loop with a fixed tap_layers list, so the second+
+        //    call pays zero allocation / upload cost here.
+        //
+        // Take the cache out of `self` into locals for the kernel call
+        // (split-borrow through `Option::as_mut` conflicts with the many
+        // other `&self` / `&mut self.*` borrows persistent_decode_4b needs);
+        // put it back after a successful kernel launch. Kernel error paths
+        // drop the cache, which is fine — next call re-allocates.
         let hidden_dim = config.hidden_size;
         let num_taps = tap_layers.len();
-        let mut tap_workspace =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_taps, hidden_dim])
+        let (mut tap_workspace, tap_layers_buf) = match self.dflash_tap_cache.take() {
+            Some((cached, ws, lb)) if cached.as_slice() == tap_layers => (ws, lb),
+            _ => {
+                let workspace = GpuBuffer::zeros(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &[num_taps, hidden_dim],
+                )
                 .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
-        let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
-        let tap_ints_bytes: Vec<u8> =
-            tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let tap_layers_buf = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::U8,
-            &[tap_ints_bytes.len()],
-            &tap_ints_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("upload tap_layers: {e}"))?;
+                let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
+                let tap_ints_bytes: Vec<u8> =
+                    tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let layers_buf = GpuBuffer::from_host_bytes(
+                    self.ordinal,
+                    ScalarType::U8,
+                    &[tap_ints_bytes.len()],
+                    &tap_ints_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("upload tap_layers: {e}"))?;
+                (workspace, layers_buf)
+            }
+        };
 
         // 2) Embedding lookup → hidden_io.
         let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
@@ -2584,10 +2609,13 @@ impl DecodeEngine {
             .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
             .collect();
 
-        // 8) D2H the tap workspace.
+        // 8) D2H the tap workspace, then put the workspace + layer-ids
+        // back into the cache so subsequent calls with the same tap_layers
+        // avoid the allocation.
         let tap_host = tap_workspace
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("dflash-taps D2H: {e}"))?;
+        self.dflash_tap_cache = Some((tap_layers.to_vec(), tap_workspace, tap_layers_buf));
 
         Ok((logits_f32, tap_host))
     }
