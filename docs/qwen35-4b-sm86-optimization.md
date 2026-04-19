@@ -7,9 +7,9 @@ that were tried and intentionally not kept.
 It is the `4B` companion to [qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md),
 which remains the completed `0.8B` reference workflow.
 
-## Throughput Lane
+## Production Throughput Lane
 
-The current validated `4B` CUDA throughput target is:
+The current validated `4B` CUDA production-throughput target is:
 
 - backend: CUDA
 - arch: `sm86`
@@ -28,10 +28,9 @@ Why this lane:
 - existing `sm86` coverage already treats `qwen3.5-4b --batch-size 2` as the
   checked CUDA batch lane
 
-## Single-Sequence Native Lane
+## Hero Lane
 
-To stage Lucebox-style single-stream work, this branch now also defines a
-measured single-sequence native-kernel lane:
+The current `4B` CUDA `sm86` hero lane for single-stream optimization work is:
 
 - backend: CUDA
 - arch: `sm86`
@@ -41,14 +40,22 @@ measured single-sequence native-kernel lane:
 - mode: normal generation
 - path: baked model load + `--force-kernel-decode`
 - benchmark shape: warmed `pp533` / `tg128`
+- hero attention guard: `B == 1 && bs == 256 && hd == 256`
 
-Why this lane exists:
+Why this is the hero lane:
 
 - `0.8B`-style hero work is fundamentally a single-stream latency problem
 - the default single-sequence `4B` path on this box replays prefill for
   correctness, which is the wrong surface for latency optimization
 - forcing the native `4B` kernel gives a direct staging lane that is much
   closer in spirit to the `0.8B` hero process
+- the production-throughput CUDA lane for `4B` remains `--batch-size 2`, but
+  that is not the right first surface for Lucebox-style single-stream work
+
+## Single-Sequence Native Lane
+
+This hero lane is measured with the warmed single-sequence native-kernel
+harness below.
 
 ## Benchmark Harness
 
@@ -560,6 +567,107 @@ What this means now:
 - the next bounded pass should likely compare this serial shared-staging path
   against a narrow head-parallel recurrent remap, not a broader `0.8B`-style
   schedule copy
+
+## Attention-Core Bottleneck Read
+
+Before changing the next structural pass, a temporary split was added inside
+the `4B` single-stream hero attention core to separate score-side work from
+value-side work. The instrumentation was measured and then reverted.
+
+Measured on the hero lane with:
+
+- `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- prompt: warmed parity prompt, `tg16`
+
+Two runs came in essentially identical:
+
+- full-attention core total: about `45.8 ms`
+- score-side work: about `32.7 ms`
+- value-side work: about `5.0 ms`
+
+What that clarified:
+
+- the real remaining bottleneck inside the current single-stream hero
+  attention core is score-side work, not value accumulation
+- the next bounded pass should remove score-reduction overhead before trying a
+  broader remap of the full attention body
+- a narrow head-parallel recurrent remap for `linear_core` and a shared
+  softmax-scalar experiment were both tested after this read and reverted,
+  because they were flat to worse on the warmed lane
+
+## Seventh Kept Single-Stream Pass
+
+The next kept pass stayed inside the same single-stream `4B` full-attention
+hero branch, but collapsed the score reduction down to one active wave:
+
+- left the hero lane unchanged:
+  `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- left batch scheduling, FP8-KV, and the linear-attention recurrent path
+  untouched
+- changed the single-stream attention-core hero mapping from `64` active lanes
+  x `4` dims to `32` active lanes x `8` dims
+- kept the same BF16 math and output semantics, but removed the cross-wave
+  score reduction and its inner-loop shared-memory synchronization from the
+  hot per-token path
+- widened the per-lane value accumulation to match the new `8`-dim lane shape
+
+Why this pass was chosen:
+
+- the temporary split showed score-side work dominating value-side work by
+  roughly `6.6x`
+- the existing hero branch was still paying for a two-wave score reduction on
+  every token, even though the lane geometry could be collapsed into one wave
+- this is a bounded structural pass in the exact hot section that measured as
+  the bottleneck, without reopening batch behavior or the recurrent path
+
+Short screening result (`pp533` / `tg16`) against commit `4197860`:
+
+- prefill moved slightly and is not meaningful for this pass
+- decode improved from `1512.0 ms` to `1469.3 ms`
+- native decode total improved from `1485.502 ms` to `1443.121 ms`
+- persistent decode improved from `1420.061 ms` to `1377.798 ms`
+- full attention improved from `548.610 ms` to `499.054 ms`
+- full-attention core improved from `521.495 ms` to `472.388 ms`
+- linear projection stayed flat: `140.224 ms` to `140.532 ms`
+- linear core stayed effectively flat: `404.261 ms` to `405.461 ms`
+- linear out stayed flat: `79.682 ms` to `79.846 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `4197860`:
+
+- prefill moved from `4474.9 ms` to `4483.7 ms`
+- decode improved from `12462.6 ms` to `12097.2 ms`
+- native decode total improved from `12251.867 ms` to `11885.495 ms`
+- persistent decode improved from `11729.533 ms` to `11362.940 ms`
+- full attention improved from `4813.412 ms` to `4379.307 ms`
+- full-attention core improved from `4600.225 ms` to `4165.966 ms`
+- linear projection stayed flat: `1121.198 ms` to `1124.275 ms`
+- linear core stayed effectively flat: `3235.868 ms` to `3243.006 ms`
+- linear out stayed flat: `637.556 ms` to `638.729 ms`
+
+Verification notes:
+
+- baked `--validate --force-kernel-decode` still passed with the same token
+  stream and `decode_max_delta=0.8359`
+- a direct stage-timing spot check on the warmed hero lane moved in the same
+  direction, with full-attention core dropping to about `38.8 ms` on `tg16`
+- `tests/sm86/run_4b.sh` baked path still passed; its `--no-bake` subtest
+  still fails on this machine because `/workspace/models/Qwen3.5-4B` has no
+  raw safetensors files
+- `tests/sm86/run_batch.sh` baked path still passed; its `--no-bake` subtest
+  fails for the same model-directory reason
+- `tests/sm86/run_4b_long.sh` passed all `4/4` long-context corpus cases on
+  this build
+
+What this means now:
+
+- the measured single-stream `4B` bottleneck has moved back toward the
+  attention core, but in a narrower form than the earlier full-attention
+  hotspot
+- the useful `0.8B` lesson remains to copy the workflow, not the exact lane
+  mapping or packing assumptions
+- the next bounded pass should instrument or target the remaining
+  single-stream attention-core overhead carefully, because the broad
+  cross-wave reduction tax is now gone
 
 ## Internal Persistent Split
 

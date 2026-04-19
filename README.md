@@ -225,12 +225,22 @@ So the current CUDA `4B` story on this box is split:
 - single-sequence decode is correctness-first and much slower because it replays prefill
 - batched decode remains the fast path and is still the better place to do performance work
 
-There is now also an explicit native single-sequence staging lane for `4B`
-behind `--force-kernel-decode`. A warmed `pp533 / tg128` run on this box comes
-in at roughly:
+There is now also an explicit native single-sequence hero lane for `4B`
+behind `--force-kernel-decode`. The exact lane is:
 
-- prefill `4475 ms` (`119 tok/s`)
-- decode `12463 ms` (`10.3 tok/s`)
+- CUDA + `sm86`
+- `qwen3.5-4b`
+- BF16
+- baked load
+- `--force-kernel-decode`
+- `--batch-size 1`
+- warmed `pp533 / tg128`
+- hero attention guard `B == 1 && bs == 256 && hd == 256`
+
+The current warmed result on this box comes in at roughly:
+
+- prefill `4484 ms` (`119 tok/s`)
+- decode `12097 ms` (`10.6 tok/s`)
 
 The first kept single-stream `4B` CUDA pass on this lane removed
 unconditional full-attention trace-buffer writes from the hot path and left
@@ -247,7 +257,13 @@ warmed single-lane linear core from about `3471 ms` to `3275 ms` on this
 machine while leaving the attention core flat at about `4600 ms`. The latest
 kept pass then staged the normalized per-head `q/k` vectors for that serial
 linear-attention loop into shared memory once per head pair, trimming the
-warmed single-lane linear core again from about `3275 ms` to `3236 ms`.
+warmed single-lane linear core again from about `3275 ms` to `3236 ms`. The
+next kept pass temporarily split the single-stream attention core and showed
+the real remaining cost was score-side work, not value accumulation, then
+collapsed the hero branch from a two-wave `64 x 4` score reduction to a
+one-wave `32 x 8` mapping. That cut warmed single-lane full-attention core
+from about `4600 ms` to `4166 ms` and improved warmed decode from about
+`12463 ms` to `12097 ms` on this machine.
 
 That lane is intended for Lucebox-style single-stream optimization work; the
 validated production throughput lane remains `qwen3.5-4b --batch-size 2`.
