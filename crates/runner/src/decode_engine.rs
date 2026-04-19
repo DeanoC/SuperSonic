@@ -2206,6 +2206,34 @@ impl DecodeEngine {
         Ok(logits)
     }
 
+    /// DFlash prefill: runs `prefill_with_taps` against the engine's own
+    /// target state + weights, returning the regular PrefillResult with
+    /// its `tap_hiddens` populated for the layers in `tap_layers`.
+    pub fn prefill_native_with_taps(
+        &mut self,
+        prompt_ids: &[u32],
+        tap_layers: &[usize],
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill_with_taps(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            false,
+            None,
+            tap_layers,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after dflash prefill: {e}"))?;
+        Ok(result)
+    }
+
     pub fn prefill_native_with_trace(
         &mut self,
         prompt_ids: &[u32],
@@ -2379,6 +2407,215 @@ impl DecodeEngine {
             .collect();
 
         Ok(logits_f32)
+    }
+
+    /// One decode step via the 4B persistent megakernel, capturing DFlash
+    /// hidden-state taps for the specified target layers.
+    ///
+    /// Returns `(logits_f32, tap_hiddens_bf16_bytes)`:
+    /// * `logits_f32` — `[vocab_size]` F32 logits for the next position.
+    /// * `tap_hiddens_bf16_bytes` — raw BF16 bytes of shape
+    ///   `[num_taps, hidden_dim]`, one row per entry in `tap_layers`.
+    ///
+    /// Requires `use_4b_kernel=true`, `batch_size=1`, and a non-empty
+    /// `tap_layers`. Every element of `tap_layers` must be in
+    /// `0..num_hidden_layers`. The tap values match what the persistent
+    /// megakernel writes for each listed layer — the post-MLP residual
+    /// hidden state, i.e. the same data point captured by
+    /// `prefill_with_taps` / `layer_hidden_trace`.
+    pub fn decode_step_with_taps_kernel(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        tap_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<u8>)> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("decode_step_with_taps_kernel requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("decode_step_with_taps_kernel requires batch_size=1");
+        }
+        if tap_layers.is_empty() {
+            anyhow::bail!("decode_step_with_taps_kernel requires at least one tap layer");
+        }
+        let config = &self.weights.config;
+        let num_layers = config.num_hidden_layers;
+        for &li in tap_layers {
+            if li >= num_layers {
+                anyhow::bail!(
+                    "tap layer {li} out of range (num_hidden_layers={num_layers})"
+                );
+            }
+        }
+
+        // 1) Allocate the tap workspace + upload the i32 tap-layer indices.
+        let hidden_dim = config.hidden_size;
+        let num_taps = tap_layers.len();
+        let mut tap_workspace =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_taps, hidden_dim])
+                .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
+        let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
+        let tap_ints_bytes: Vec<u8> =
+            tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tap_layers_buf = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::U8,
+            &[tap_ints_bytes.len()],
+            &tap_ints_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("upload tap_layers: {e}"))?;
+
+        // 2) Embedding lookup → hidden_io.
+        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let src_offset = token_id as usize * row_bytes;
+        gpu_hal::copy_d2d(
+            self.ordinal,
+            self.hidden_io.as_ptr() as *mut c_void,
+            self.weights.embed_tokens.offset_ptr(src_offset),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("dflash-taps embedding: {e}"))?;
+
+        // 3) Ensure KV capacity on full-attention layers.
+        for (i, ls) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(i) {
+                ls.ensure_kv_capacity(
+                    seqlen_offset,
+                    self.ordinal,
+                    config,
+                    self.kv_chunk_size,
+                    self.kv_fp8,
+                )
+                .map_err(|e| anyhow::anyhow!("dflash-taps ensure KV layer {i}: {e}"))?;
+            }
+        }
+        self.check_attn_scratch_budget()?;
+        if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
+            Self::load_kv_shadow_for_state_static(
+                &self.weights.config,
+                self.ordinal,
+                &mut self.state,
+            )?;
+        }
+
+        // 4) Build + upload layer descs (pointers + kv_len change each step).
+        let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("dflash-taps upload descs: {e}"))?;
+        if let Some(kv_fp8_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
+            self.scratch
+                .upload_kv_fp8_descs(&kv_fp8_descs)
+                .map_err(|e| anyhow::anyhow!("dflash-taps upload KV FP8 descs: {e}"))?;
+        }
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.scratch.workspace.as_mut_ptr(),
+            self.scratch.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("dflash-taps clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("dflash-taps reset sync: {e}"))?;
+
+        // 5) Launch the 4B megakernel with taps enabled.
+        kernel_ffi::persistent_decode_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            num_layers,
+            hidden_dim,
+            config.intermediate_size,
+            seqlen_offset,
+            &self.scratch.desc_device,
+            &mut self.hidden_io,
+            &mut self.scratch.workspace,
+            &mut self.scratch.sync_buf,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            self.rotary.rotary_dim,
+            self.proj_buf_floats,
+            self.attn_scratch_floats,
+            self.fp8_scale_device.as_ref(),
+            self.scratch.kv_fp8_desc_device.as_ref(),
+            1, // batch_size=1
+            None,
+            self.int4_scale_device.as_ref(),
+            Some(&mut tap_workspace),
+            Some(&tap_layers_buf),
+        )
+        .map_err(|e| anyhow::anyhow!("dflash-taps persistent_decode_4b: {e}"))?;
+
+        // 6) Advance kv_filled on every full-attention layer.
+        let filled = seqlen_offset + 1;
+        for (i, ls) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(i) {
+                ls.set_kv_filled(filled);
+            }
+        }
+
+        // 7) Final RMSNorm + lm_head → logits F32.
+        kernel_ffi::rms_norm_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            &mut self.normed_buf,
+            &self.hidden_io,
+            &self.weights.norm_weight,
+            config.rms_norm_eps as f32,
+            hidden_dim,
+        )
+        .map_err(|e| anyhow::anyhow!("dflash-taps final rms_norm: {e}"))?;
+        kernel_ffi::standalone_matvec_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            &mut self.logits_buf,
+            &self.normed_buf,
+            &*self.weights.lm_head,
+            hidden_dim,
+            config.vocab_size,
+            &mut self.matvec_counter,
+        )
+        .map_err(|e| anyhow::anyhow!("dflash-taps lm_head matvec: {e}"))?;
+        let logits_bytes = self
+            .logits_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("dflash-taps logits D2H: {e}"))?;
+        let logits_f32: Vec<f32> = logits_bytes
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect();
+
+        // 8) D2H the tap workspace.
+        let tap_host = tap_workspace
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("dflash-taps D2H: {e}"))?;
+
+        Ok((logits_f32, tap_host))
+    }
+
+    /// Mutable access to the engine's primary `ModelState`. Used by the
+    /// DFlash speculative engine to snapshot/restore linear-attention state.
+    pub fn state_mut(&mut self) -> &mut ModelState {
+        &mut self.state
+    }
+
+    /// Device ordinal carried by the engine. Used by the DFlash engine when
+    /// invoking free-function helpers (e.g. `ModelState::restore_linear`).
+    pub fn ordinal(&self) -> usize {
+        self.ordinal
+    }
+
+    /// Rewind every full-attention layer's `kv_filled` cursor to `new_len`
+    /// (no-op if already at or below). The physical K/V beyond the cursor is
+    /// untouched and will be harmlessly overwritten by subsequent decodes —
+    /// used by the DFlash engine after a partial-acceptance verify to roll
+    /// the cache logically back to the committed length.
+    pub fn rewind_full_kv_filled(&mut self, new_len: usize) {
+        let config = &self.weights.config;
+        for (i, ls) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(i) && ls.kv_filled > new_len {
+                ls.set_kv_filled(new_len);
+            }
+        }
     }
 
     /// Greedy argmax over logits.
