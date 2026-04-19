@@ -1717,6 +1717,7 @@ dependencies = [
  "model-store",
  "phi4",
  "qwen35",
+ "qwen35_dflash",
  "safetensors",
  "serde",
  "serde_json",
