@@ -225,14 +225,41 @@ position (cache + ctx + noise) attends to every other position.
 ## 6. Accept/reject (M3, not M2)
 
 1. Verify: run target prefill for the 16-candidate block at positions
-   `[L, L+16)`, with `commit_kv_filled = false`.
+   `[L, L+16)`, with `commit_kv_filled = false` on full-attention layers.
 2. `block_argmax = argmax_per_pos(verify_logits)`.
 3. `accepted = longest prefix i s.t. block_tokens[0..i] == block_argmax[0..i]`
    at temperature 0. Commit `accepted + 1` tokens (accepted + 1 bonus).
-4. `kv_filled = L + accepted + 1`. KV past that offset is harmlessly
-   overwritten next round (no tree attention, no rollback machinery).
+4. `kv_filled = L + accepted + 1`. Full-attention K/V past that offset is
+   harmlessly overwritten next round.
 5. Mask-token semantics are only relevant to the draft's INPUT (for positions
    it hasn't seen yet) — they do not enter verification.
+
+### 6.1 Linear-attention state rollback (IMPORTANT)
+
+Qwen3.5-9B is 32 layers with `full_attention_interval: 4` — 8 full-attention
+layers (indices 3, 7, 11, 15, 19, 23, 27, 31) and 24 linear-attention layers.
+DFlash tap indices `[1, 8, 15, 22, 29]` touch 1 full layer (15) and 4 linear
+layers. Every verify prefill advances the linear attention state —
+`conv_state` (size `(kern-1) * conv_dim` BF16) and `recurrent_state`
+(`n_v_heads * value_head_dim * key_head_dim` BF16) — IN-PLACE for all 24
+linear layers. Counter-flip rollback only works for the full-attention K/V
+cache; linear state has to be snapshot-and-restored.
+
+Snapshot cost per layer (9B):
+- `conv_state`: `(4-1) * (16*128*2 + 32*128) * 2 = ~48 KiB`
+- `recurrent_state`: `32 * 128 * 128 * 2 = 1 MiB`
+
+Across 24 linear layers: ~25 MiB total — fits comfortably in the draft
+VRAM budget. M3 must add:
+  1. Pre-verify `snapshot_linear_state()` → D2D copies into a sidecar.
+  2. Post-accept `restore_linear_state(accepted_len)` if `accepted < block_size`.
+  3. After restore, re-run `decode_step` for the `accepted + 1` committed
+     positions to bring linear state back to the right cursor.
+
+This supersedes the plan's optimistic "adjusting a counter" phrasing; the
+counter-flip pattern only covers full-attention K/V, not linear state.
+Full-attention K/V rollback is still just a `commit_kv_filled = false`
+flag on `prefill_full_attention_layer`, per the plan.
 
 ## 7. Sharing with target (Arc pattern)
 
