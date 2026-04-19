@@ -231,6 +231,59 @@ What this changes about the next step:
 - the next structural experiment should avoid reintroducing trace or debug
   work into the hot path
 
+## Second Kept Single-Stream Pass
+
+The next kept pass targeted the actual BF16 attention-core math in the
+single-stream lane rather than the surrounding schedule:
+
+- left the single-block `B == 1` decode schedule in place
+- left FP8-KV and batched decode untouched
+- staged each `q` head into shared memory as BF16
+- switched the BF16 attention inner loop from scalar per-dimension loads to
+  packed two-dimension BF16 loads for `q`, `k`, and `v`
+- kept the existing online softmax structure and output semantics
+
+Why this pass was chosen:
+
+- after the trace-gating cleanup, `full_attn_core` was still the dominant
+  single-stream hotspot by a large margin
+- the first failed `B == 1` hero-copy experiment changed scheduling and math at
+  the same time, which made it a poor template
+- this pass isolates the likely useful part of the `0.8B` idea: packed BF16
+  score/value work inside the existing `4B` single-stream control flow
+
+Short screening result (`pp533` / `tg16`) against commit `d3a7ab3`:
+
+- decode improved from `1770.0 ms` to `1647.7 ms`
+- persistent decode improved from `1678.152 ms` to `1555.383 ms`
+- full attention improved from `812.547 ms` to `670.579 ms`
+- full-attention core improved from `785.903 ms` to `643.178 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `d3a7ab3`:
+
+- prefill moved from `4482.7 ms` to `4485.2 ms`
+- decode improved from `14733.1 ms` to `13644.5 ms`
+- native decode total improved from `14520.915 ms` to `13433.153 ms`
+- persistent decode improved from `13998.467 ms` to `12910.028 ms`
+- full attention improved from `7147.420 ms` to `5893.787 ms`
+- full-attention core improved from `6934.247 ms` to `5673.589 ms`
+
+Verification notes:
+
+- `--validate --force-kernel-decode` passed with `decode_max_delta=0.2734`
+- `--gpu-validate --force-kernel-decode` passed with matching tokens and
+  `gpu_oracle_max_delta=0.3125`
+- baked-path batch-2 validate still passed with `decode_max_delta=0.3047`
+
+What this means now:
+
+- the single-stream `4B` lane finally has a meaningful structural win, not
+  just instrumentation cleanup
+- the remaining `full_attn_core` cost is now much smaller in absolute terms,
+  but it is still the largest single subsection
+- the next bounded pass should break down whether the remaining cost is mostly
+  in score reduction or in value accumulation / softmax rescaling
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero

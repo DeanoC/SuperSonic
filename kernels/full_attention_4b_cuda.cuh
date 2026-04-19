@@ -4675,56 +4675,136 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 } else {
                     const T* ck = static_cast<const T*>(kv_k_b);
                     const T* cv = static_cast<const T*>(kv_v_b);
+                    T* q_head_bf16 = reinterpret_cast<T*>(lds_input);
+                    const bool qwen4b_single_bf16_attn_core_hero =
+                        B == 1 && bs == 256 && hd == 256;
 
-                    for (int qh = 0; qh < nh; ++qh) {
-                        const int kvh = qh / kv_groups;
-                        const float* q_head = q_f32 + qh * hd * 2;
+                    if (qwen4b_single_bf16_attn_core_hero) {
+                        for (int qh = 0; qh < nh; ++qh) {
+                            const int kvh = qh / kv_groups;
+                            const float* q_head = q_f32 + qh * hd * 2;
+                            const size_t kv_head_base =
+                                static_cast<size_t>(kvh) * kv_max_b * hd;
+                            const bool attn_lane_active = tid < (hd / 2);
 
-                        float my_acc = 0.0f;
-                        float my_max = -1e30f;
-                        float my_sum = 0.0f;
-
-                        const float q_val = q_head[tid];
-                        const size_t kv_head_base =
-                            static_cast<size_t>(kvh) * kv_max_b * hd;
-
-                        for (int t = 0; t < kv_len_b; ++t) {
-                            const size_t pos_base = kv_head_base +
-                                static_cast<size_t>(t) * hd;
-
-                            float partial = q_val *
-                                dotcache_qwen35_to_float(ck[pos_base + tid]);
-                            // Wave-level reduce then cross-wave via LDS
-                            float wave_sum = wave_reduce_sum_f32(partial);
-                            if (attn_lane == 0) lds[attn_wave] = wave_sum;
-                            __syncthreads();
-                            float score_val = 0.0f;
-                            if (tid == 0) {
-                                float total = 0.0f;
-                                for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
-                                lds[0] = total;
-                                if (emit_attention_trace) {
-                                    saved_scores[qh * kv_max_b + t] = total * scale;
-                                }
+                            for (int d = tid; d < hd; d += bs) {
+                                q_head_bf16[d] = dotcache_qwen35_from_float<T>(q_head[d]);
                             }
                             __syncthreads();
-                            score_val = lds[0] * scale;
 
-                            float v_val =
-                                dotcache_qwen35_to_float(cv[pos_base + tid]);
+                            float my_acc0 = 0.0f;
+                            float my_acc1 = 0.0f;
+                            float my_max = -1e30f;
+                            float my_sum = 0.0f;
 
-                            float old_max = my_max;
-                            my_max = fmaxf(my_max, score_val);
-                            float rescale = expf(old_max - my_max);
-                            float w = expf(score_val - my_max);
-                            my_acc = my_acc * rescale + w * v_val;
-                            my_sum = my_sum * rescale + w;
+                            for (int t = 0; t < kv_len_b; ++t) {
+                                const size_t pos_base =
+                                    kv_head_base + static_cast<size_t>(t) * hd;
+                                float partial = 0.0f;
+                                float v0 = 0.0f;
+                                float v1 = 0.0f;
+                                if (attn_lane_active) {
+                                    const int d0 = tid * 2;
+                                    const __nv_bfloat162 q_pack =
+                                        *reinterpret_cast<const __nv_bfloat162*>(q_head_bf16 + d0);
+                                    const __nv_bfloat162 k_pack =
+                                        *reinterpret_cast<const __nv_bfloat162*>(ck + pos_base + d0);
+                                    const __nv_bfloat162 v_pack =
+                                        *reinterpret_cast<const __nv_bfloat162*>(cv + pos_base + d0);
+                                    const float2 qv = __bfloat1622float2(q_pack);
+                                    const float2 kv = __bfloat1622float2(k_pack);
+                                    const float2 vv = __bfloat1622float2(v_pack);
+                                    partial = qv.x * kv.x + qv.y * kv.y;
+                                    v0 = vv.x;
+                                    v1 = vv.y;
+                                }
+                                float wave_sum = wave_reduce_sum_f32(partial);
+                                if (attn_lane == 0) lds[attn_wave] = wave_sum;
+                                __syncthreads();
+                                float score_val = 0.0f;
+                                if (tid == 0) {
+                                    float total = 0.0f;
+                                    for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
+                                    lds[0] = total;
+                                    if (emit_attention_trace) {
+                                        saved_scores[qh * kv_max_b + t] = total * scale;
+                                    }
+                                }
+                                __syncthreads();
+                                score_val = lds[0] * scale;
+
+                                float old_max = my_max;
+                                my_max = fmaxf(my_max, score_val);
+                                float rescale = expf(old_max - my_max);
+                                float w = expf(score_val - my_max);
+                                if (attn_lane_active) {
+                                    my_acc0 = my_acc0 * rescale + w * v0;
+                                    my_acc1 = my_acc1 * rescale + w * v1;
+                                    my_sum = my_sum * rescale + w;
+                                }
+                            }
+
+                            if (attn_lane_active) {
+                                const int d0 = tid * 2;
+                                const float inv_sum = (my_sum > 0.0f) ? (1.0f / my_sum) : 0.0f;
+                                attn_flat[qh * hd + d0] =
+                                    bf16_round_rne_f32_finite(my_acc0 * inv_sum);
+                                attn_flat[qh * hd + d0 + 1] =
+                                    bf16_round_rne_f32_finite(my_acc1 * inv_sum);
+                            }
+                            __syncthreads();
                         }
+                    } else {
+                        for (int qh = 0; qh < nh; ++qh) {
+                            const int kvh = qh / kv_groups;
+                            const float* q_head = q_f32 + qh * hd * 2;
 
-                        attn_flat[qh * hd + tid] =
-                            bf16_round_rne_f32_finite(
-                                (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
-                        __syncthreads();
+                            float my_acc = 0.0f;
+                            float my_max = -1e30f;
+                            float my_sum = 0.0f;
+
+                            const float q_val = q_head[tid];
+                            const size_t kv_head_base =
+                                static_cast<size_t>(kvh) * kv_max_b * hd;
+
+                            for (int t = 0; t < kv_len_b; ++t) {
+                                const size_t pos_base = kv_head_base +
+                                    static_cast<size_t>(t) * hd;
+
+                                float partial = q_val *
+                                    dotcache_qwen35_to_float(ck[pos_base + tid]);
+                                // Wave-level reduce then cross-wave via LDS
+                                float wave_sum = wave_reduce_sum_f32(partial);
+                                if (attn_lane == 0) lds[attn_wave] = wave_sum;
+                                __syncthreads();
+                                float score_val = 0.0f;
+                                if (tid == 0) {
+                                    float total = 0.0f;
+                                    for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
+                                    lds[0] = total;
+                                    if (emit_attention_trace) {
+                                        saved_scores[qh * kv_max_b + t] = total * scale;
+                                    }
+                                }
+                                __syncthreads();
+                                score_val = lds[0] * scale;
+
+                                float v_val =
+                                    dotcache_qwen35_to_float(cv[pos_base + tid]);
+
+                                float old_max = my_max;
+                                my_max = fmaxf(my_max, score_val);
+                                float rescale = expf(old_max - my_max);
+                                float w = expf(score_val - my_max);
+                                my_acc = my_acc * rescale + w * v_val;
+                                my_sum = my_sum * rescale + w;
+                            }
+
+                            attn_flat[qh * hd + tid] =
+                                bf16_round_rne_f32_finite(
+                                    (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
+                            __syncthreads();
+                        }
                     }
                 }
 
