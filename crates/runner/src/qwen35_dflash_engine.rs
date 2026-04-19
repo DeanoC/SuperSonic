@@ -18,11 +18,9 @@
 //!       linear state — both will be fixed up after the accept check.
 //!    d. Compute `accepted` = longest prefix match vs target's greedy
 //!       per-position picks (§6).
-//!    e. Restore linear state, then re-decode the committed
-//!       `accepted + 1` tokens. The last re-decode uses
-//!       `decode_step_with_taps_kernel` to capture the next round's
-//!       draft context (single-position tap; per-accepted-position taps
-//!       are a future optimization).
+//!    e. Restore linear state, then re-decode each committed position via
+//!       `decode_step_with_taps_kernel`, stacking per-position tap rows so
+//!       the next round's draft receives `ctx_len = accepted + 1` taps.
 //!    f. Rewind target's full-attention `kv_filled` to `L + accepted + 1`.
 //!    g. Crop the draft's KV cache to the new committed length.
 //!
@@ -87,6 +85,7 @@ pub fn run_qwen35_dflash(
     if !params.use_4b_kernel {
         bail!("--dflash requires the 4B kernel path (qwen3.5-9b INT4)");
     }
+    let weight_prefix: &'static str = params.weight_prefix;
 
     // --------- 2. Tokenizer + target config ------------------------------
     let text_config = {
@@ -155,7 +154,8 @@ pub fn run_qwen35_dflash(
 
     // --------- 4. Load target weights (INT4 bake) ------------------------
     let t0 = Instant::now();
-    let target_weights = load_target_int4_weights(cli, entry, &text_config, ordinal)?;
+    let target_weights =
+        load_target_int4_weights(cli, entry, &text_config, ordinal, weight_prefix)?;
     eprintln!(
         "[weights] target (INT4, group_size={}) loaded in {:.0}ms",
         target_weights.int4_group_size,
@@ -293,14 +293,11 @@ pub fn run_qwen35_dflash(
         rounds_run += 1;
         let l = committed_len;
 
-        // 8a. Draft forward: produces [1, B, hidden]. Project through target
-        // lm_head to get block_logits, argmax → B candidates. For M3 the
-        // "bonus_seed as first noise" and "B-1 usable draft candidates" vs
-        // "use all B candidates" distinction (dflash.py's
-        // [:, 1-B:, :] slice) is resolved by verifying all B positions:
-        // position L is verified against target's pred-at-L from the
-        // previous round's logits stream; positions L+1..L+B-1 against
-        // verify's per-position logits.
+        // 8a. Draft forward: noise_embedding = embed([bonus_seed, MASK, …])
+        // of length B; target_hidden_raw carries ctx_len=round_taps_len tap
+        // rows (1 after prefill, accepted_len after every round). Output
+        // hidden is projected through target's lm_head → B block logits →
+        // argmax → B candidates at positions L..L+B-1.
         let (draft_candidates, draft_final_hidden_bytes) = draft_forward_and_sample(
             &mut draft_state,
             &mut draft_scratch,
@@ -329,67 +326,87 @@ pub fn run_qwen35_dflash(
             l,
         )?;
 
-        // 8d. Accept check:
-        //   preds[0] = argmax(prev_logits_for_pos_L)   — produced by prefill's last token
-        //                                               on round 0, or by previous round's
-        //                                               tail decode on subsequent rounds.
-        //     In this engine, we don't retain prev_logits across rounds;
-        //     so we use the rule: d_i at position L+i is verified by
-        //     argmax(verify_logits[i]) which predicts position L+i+1 — i.e.
-        //     we compare d_{i+1} to argmax(verify_logits[i]).
-        //   Consequence: the FIRST draft token d_0 isn't verified against
-        //   target directly; it's implicitly trusted from the draft (the
-        //   speculative decoding "free first token" convention used in
-        //   several production implementations). For M3 correctness this
-        //   is acceptable — d_0 is the draft's best pick and the target
-        //   can still reject d_1..d_{B-1}.
-        //   TODO(M4): thread prev_logits through the round to enable a
-        //   true argmax comparison for d_0.
+        // 8d. Accept check, full protocol (docs/dflash.md §6):
+        //   preds[0]   = argmax(prev_logits)            (target's pick at L;
+        //                                                = bonus_seed)
+        //   preds[i+1] = argmax(verify_logits[i])       (target's pick at L+i+1
+        //                                                given draft_candidates[..=i] at
+        //                                                L..L+i)
+        //   accepted = longest j in 0..=B where
+        //              preds[0..j] == draft_candidates[0..j].
+        //   bonus = preds[accepted]      (target's pick at L+accepted).
+        //
+        // Note: preds[0] is meaningful. If draft_candidates[0] != bonus_seed
+        // we reject immediately (accepted=0) and commit just bonus_seed at
+        // position L. This is the "d_0 verified" path — the target's pick
+        // at L is authoritative regardless of what the draft said.
+        let pred_at = |i: usize, verify: &[Vec<f32>]| -> u32 {
+            if i == 0 {
+                bonus_seed
+            } else {
+                DecodeEngine::greedy_sample(&verify[i - 1])
+            }
+        };
+        // Cap accepted at block_size-1 so accepted_len <= block_size — the
+        // draft's scratch buffers are sized for ctx_len <= block_size and
+        // our next-round round_taps_len = accepted_len.
         let mut accepted = 0usize;
         while accepted < block_size - 1 {
-            let target_pred = DecodeEngine::greedy_sample(&verify_logits[accepted]);
-            if target_pred == draft_candidates[accepted + 1] {
+            let pred = pred_at(accepted, &verify_logits);
+            if pred == draft_candidates[accepted] {
                 accepted += 1;
             } else {
                 break;
             }
         }
-        // Bonus: target's pred for position L+accepted+1 (argmax of verify_logits[accepted]).
-        let bonus = DecodeEngine::greedy_sample(&verify_logits[accepted]);
+        // bonus lives at position L+accepted. verify_logits has len = block_size
+        // so pred_at(accepted) indexes at most verify_logits[block_size-2].
+        let bonus = pred_at(accepted, &verify_logits);
 
         // 8e. Restore linear, rewind full-attn kv_filled, then re-decode
-        //     the committed tokens to rewrite full-attn K/V with the
-        //     correct committed block and to capture taps for next round.
+        //     the committed tokens to rewrite full-attn K/V and capture a
+        //     tap row per committed position so the next round's
+        //     target_hidden carries `ctx_len = accepted_len` context.
         target_engine
             .state_mut()
             .restore_linear(&snap, ordinal)
             .map_err(|e| anyhow!("restore linear: {e}"))?;
         target_engine.rewind_full_kv_filled(l);
 
-        // Committed sequence this round: [d_0, d_1, ..., d_{accepted-1}, bonus]
-        // plus the FIRST draft token d_0 is actually already the draft's choice.
-        // accepted_len = accepted + 1 positions (drafts 0..accepted + bonus).
+        // Committed sequence this round: [d_0, ..., d_{accepted-1}, bonus]
+        // at positions [L, L+1, ..., L+accepted] — length accepted+1.
         let accepted_len = accepted + 1;
         let mut committed_block: Vec<u32> = Vec::with_capacity(accepted_len);
         committed_block.extend_from_slice(&draft_candidates[..accepted]);
         committed_block.push(bonus);
 
-        // Re-decode accepted_len - 1 tokens via plain decode_step, then the
-        // final token via decode_step_with_taps_kernel to capture taps.
+        // Capture taps at every re-decoded position so the next round sees
+        // `ctx_len = accepted_len` tap rows covering the newly committed
+        // block. target_hidden_raw layout expected by the draft:
+        // `[1, ctx_len, num_taps * hidden]` BF16, row-major per ctx pos.
+        let per_tap_row_bytes =
+            tap_layers.len() * text_config.hidden_size * ScalarType::BF16.size_in_bytes();
+        let mut stacked_taps: Vec<u8> =
+            Vec::with_capacity(accepted_len * per_tap_row_bytes);
         let mut final_round_logits: Option<Vec<f32>> = None;
         for (i, &tok) in committed_block.iter().enumerate() {
             let seqlen_offset = l + i;
+            let (logits, taps_bytes) = target_engine
+                .decode_step_with_taps_kernel(tok, seqlen_offset, &tap_layers)?;
+            if taps_bytes.len() != per_tap_row_bytes {
+                bail!(
+                    "decode_step_with_taps_kernel returned {} bytes, expected {}",
+                    taps_bytes.len(),
+                    per_tap_row_bytes,
+                );
+            }
+            stacked_taps.extend_from_slice(&taps_bytes);
             if i + 1 == committed_block.len() {
-                // Last committed token → capture taps for next round.
-                let (logits, taps_bytes) = target_engine
-                    .decode_step_with_taps_kernel(tok, seqlen_offset, &tap_layers)?;
-                round_taps = taps_bytes;
-                round_taps_len = 1; // T=1 per M3 simplification.
                 final_round_logits = Some(logits);
-            } else {
-                let _ = target_engine.decode_step(tok, seqlen_offset)?;
             }
         }
+        round_taps = stacked_taps;
+        round_taps_len = accepted_len;
 
         // 8f. Advance counters + record generated.
         committed_len = l + accepted_len;
@@ -466,6 +483,7 @@ fn load_target_int4_weights(
     _entry: &RegistryEntry,
     text_config: &qwen35::config::TextConfig,
     ordinal: usize,
+    weight_prefix: &str,
 ) -> Result<Qwen35Weights> {
     let bake_dir = model_store::fetch::BakeVariant::Int4Gptq.bake_dir(&cli.model_dir);
     if !model_store::version_ok(&bake_dir) {
@@ -478,13 +496,8 @@ fn load_target_int4_weights(
     }
     let store = model_store::BakedStore::open(&bake_dir)
         .map_err(|e| anyhow!("open target INT4 bake: {e}"))?;
-    Qwen35Weights::load_baked(
-        &store,
-        text_config,
-        ordinal,
-        "model", // Qwen weight prefix
-    )
-    .map_err(|e| anyhow!("load target INT4 weights: {e}"))
+    Qwen35Weights::load_baked(&store, text_config, ordinal, weight_prefix)
+        .map_err(|e| anyhow!("load target INT4 weights: {e}"))
 }
 
 /// Concatenate per-tap `[hidden_dim]` BF16 blobs into a single
