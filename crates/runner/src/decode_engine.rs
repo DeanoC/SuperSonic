@@ -130,6 +130,114 @@ pub struct DecodeEngine {
     /// tap_layers list. Avoids a per-call GpuBuffer::zeros + upload of
     /// a small i32 vec — ~100ms savings per call at 9B INT4.
     dflash_tap_cache: Option<(Vec<usize>, GpuBuffer, GpuBuffer)>,
+    /// Cached workspace for `verify_block_fused_decode` (DFlash M4.3).
+    /// The fused verify path runs the persistent 4B megakernel with
+    /// `batch_size = B` while the live engine is constructed with
+    /// `batch_size = 1`; the cache owns a B-sized workspace + IO buffers
+    /// + batch-seq desc table so the per-round allocation cost is paid
+    /// only once per fused-verify call chain. Re-allocated if the block
+    /// size changes between calls.
+    // allow(dead_code): the method that writes this field
+    // (`verify_block_fused_decode`) lands in M4.3a as scaffolding; M4.3b
+    // wires it into the DFlash engine and drops this allow.
+    #[allow(dead_code)]
+    dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
+}
+
+/// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
+///
+/// The fused verify path needs a B-sized workspace (F32 projection +
+/// attention scratch, multi-row hidden_io / normed_buf / logits_buf) and
+/// a `BatchSeqDesc` table, sized independently from `DecodeEngine`'s
+/// `batch_size = 1` scratch. The cache is populated lazily on first
+/// fused-verify call and reused thereafter via the take/put pattern that
+/// `decode_step_with_taps_kernel` uses for `dflash_tap_cache`.
+#[allow(dead_code)]
+struct DFlashFusedVerifyCache {
+    /// Block size the cache is sized for. A change in `--dflash-block`
+    /// between calls triggers a full re-allocation.
+    block_size: usize,
+    /// F32 scratch for projections + MLP + attention. Sized to the same
+    /// per-item layout as `PersistentDecodeScratch::workspace` at
+    /// `batch_size = block_size`.
+    workspace: GpuBuffer,
+    /// BF16 hidden I/O, shape `[block_size, 1, hidden_size]`.
+    hidden_io: GpuBuffer,
+    /// BF16 RMSNorm output, shape `[block_size, 1, hidden_size]`.
+    normed_buf: GpuBuffer,
+    /// BF16 logits output, shape `[block_size, 1, vocab_size]`.
+    logits_buf: GpuBuffer,
+    /// Device copy of `Vec<BatchSeqDesc>` (one per layer), re-uploaded
+    /// each fused-verify call.
+    batch_desc_device: GpuBuffer,
+}
+
+impl DFlashFusedVerifyCache {
+    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
+    fn alloc(
+        ordinal: usize,
+        block_size: usize,
+        hidden_dim: usize,
+        intermediate_size: usize,
+        vocab_size: usize,
+        num_layers: usize,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
+    ) -> Result<Self> {
+        // Layout matches `PersistentDecodeScratch::new` — see
+        // crates/qwen35/src/scratch.rs. Per-item segments:
+        //   [hidden] input/output, [hidden] normed, [inter*2] gate+up,
+        //   [hidden] down-proj slab × 2, [proj_buf_floats] proj, and
+        //   [attn_scratch_floats] attention saved_q/gate/pre_gate/scores.
+        let per_item_floats = hidden_dim
+            + hidden_dim
+            + intermediate_size * 2
+            + hidden_dim
+            + hidden_dim
+            + proj_buf_floats
+            + attn_scratch_floats;
+        let workspace = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[per_item_floats * block_size],
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[block_size, 1, hidden_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[block_size, 1, hidden_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[block_size, 1, vocab_size],
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
+        let batch_desc_bytes =
+            num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
+        let batch_desc_device = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::U8,
+            &[batch_desc_bytes],
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
+        Ok(Self {
+            block_size,
+            workspace,
+            hidden_io,
+            normed_buf,
+            logits_buf,
+            batch_desc_device,
+        })
+    }
 }
 
 pub struct ComponentLayerTrace {
@@ -2074,6 +2182,7 @@ impl DecodeEngine {
             kv_fp8,
             batch_size,
             dflash_tap_cache: None,
+            dflash_fused_verify_cache: None,
         })
     }
 
@@ -2682,6 +2791,258 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after verify_block_prefill: {e}"))?;
         Ok(result.logits_per_pos)
+    }
+
+    /// DFlash M4.3 fused verify: single `persistent_decode_4b` megakernel
+    /// launch over all `tokens.len()` consecutive positions starting at
+    /// `pos_offset`. Returns per-position logits `[tokens.len()][vocab]`.
+    ///
+    /// The megakernel's batched path already runs `B` batch elements
+    /// sequentially on `blockIdx.x == 0` within a single layer iteration
+    /// (see `kernels/full_attention_4b.hip` ~4165). Feeding it a
+    /// `BatchSeqDesc` whose slots alias one sequence's KV cache with
+    /// `seqlen_offset[b] = pos_offset + b` yields the correct causal
+    /// in-sequence verify — each position reads the cache written by
+    /// prior positions within the same launch.
+    ///
+    /// Requirements:
+    /// * `use_4b_kernel = true` and `batch_size = 1` (engine construction
+    ///   is not mutated; a verify-local B-sized cache is used instead).
+    /// * `kv_fp8 = false` — fused verify uses BF16 KV like
+    ///   `verify_block_prefill`.
+    /// * `tokens.len()` must be in `1..=MAX_BATCH_SIZE` (kernel limit).
+    ///
+    /// Semantics match `verify_block_prefill`: full-attention K/V is
+    /// written at positions `[pos_offset, pos_offset + tokens.len())`
+    /// but `kv_filled` is NOT advanced on any layer — the DFlash engine
+    /// owns rollback via `rewind_full_kv_filled` + `restore_linear`.
+    /// Linear-attention `conv_state` / `recurrent_state` are mutated in
+    /// place (shared across all B slots via pointer aliasing), so the
+    /// caller MUST snapshot linear state before this call and restore
+    /// it after the accept decision — same snapshot/restore contract
+    /// the existing verify paths already require.
+    // allow(dead_code): M4.3b flips the DFlash engine over to this
+    // method and drops the allow.
+    #[allow(dead_code)]
+    pub fn verify_block_fused_decode(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("verify_block_fused_decode requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("verify_block_fused_decode requires engine batch_size=1");
+        }
+        if self.kv_fp8 {
+            anyhow::bail!("verify_block_fused_decode does not support kv_fp8");
+        }
+        if tokens.is_empty() {
+            anyhow::bail!("verify_block_fused_decode: tokens must be non-empty");
+        }
+        let b = tokens.len();
+        if b > kernel_ffi::MAX_BATCH_SIZE {
+            anyhow::bail!(
+                "verify_block_fused_decode: block size {b} > MAX_BATCH_SIZE {}",
+                kernel_ffi::MAX_BATCH_SIZE,
+            );
+        }
+
+        // Copy out primitive config values up front so the later
+        // `self.state.layers.iter_mut()` borrow doesn't fight with
+        // `&self.weights.config` reads.
+        let (hidden_dim, intermediate_size, vocab_size, num_layers, rms_norm_eps) = {
+            let c = &self.weights.config;
+            (
+                c.hidden_size,
+                c.intermediate_size,
+                c.vocab_size,
+                c.num_hidden_layers,
+                c.rms_norm_eps as f32,
+            )
+        };
+        let max_pos = pos_offset + b - 1;
+
+        // Ensure KV capacity on every full-attention layer for the
+        // highest position this launch will write.
+        {
+            let config = &self.weights.config;
+            for (i, ls) in self.state.layers.iter_mut().enumerate() {
+                if config.is_full_attention(i) {
+                    ls.ensure_kv_capacity(
+                        max_pos,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("fused verify ensure KV layer {i}: {e}"))?;
+                }
+            }
+        }
+        self.check_attn_scratch_budget()?;
+
+        // Take the cached workspace if it matches the current block
+        // size, otherwise allocate fresh. Put it back at the end.
+        let mut cache = match self.dflash_fused_verify_cache.take() {
+            Some(c) if c.block_size == b => c,
+            _ => DFlashFusedVerifyCache::alloc(
+                self.ordinal,
+                b,
+                hidden_dim,
+                intermediate_size,
+                vocab_size,
+                num_layers,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+            )?,
+        };
+
+        // Layer descs (state pointers are ignored by the kernel when
+        // `batch_descs` is non-null — weights + norm pointers still
+        // matter). Reuse `self.scratch.desc_device` to avoid a second
+        // device allocation; the scratch is not otherwise touched by
+        // this method.
+        let descs = build_layer_descs(&self.weights, &self.state, pos_offset);
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("fused verify upload layer descs: {e}"))?;
+
+        // Shared-cache batch-seq descriptors: all B slots point at
+        // `self.state`'s per-layer buffers; `seqlen_offset[b] =
+        // pos_offset + b` gives the kernel the unique per-position
+        // offset for RoPE + KV append + causal read.
+        let state_refs: Vec<&ModelState> = (0..b).map(|_| &self.state).collect();
+        let seqlen_offsets: Vec<usize> = (0..b).map(|bi| pos_offset + bi).collect();
+        let batch_descs = build_batch_seq_descs(
+            &state_refs,
+            &seqlen_offsets,
+            /* kv_fp8 */ false,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}")
+        })?;
+        let desc_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                batch_descs.as_ptr() as *const u8,
+                batch_descs.len() * std::mem::size_of::<kernel_ffi::BatchSeqDesc>(),
+            )
+        };
+        gpu_hal::copy_h2d(
+            self.ordinal,
+            cache.batch_desc_device.as_mut_ptr(),
+            desc_bytes.as_ptr() as *const c_void,
+            desc_bytes.len(),
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify upload batch-seq descs: {e}"))?;
+
+        // Embedding lookup: gather each token's row into
+        // cache.hidden_io[b, 0, :].
+        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        for (bi, &tid_val) in tokens.iter().enumerate() {
+            let src_offset = tid_val as usize * row_bytes;
+            let dst_offset = bi * row_bytes;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                unsafe {
+                    (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void
+                },
+                self.weights.embed_tokens.offset_ptr(src_offset),
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("fused verify embedding slot {bi}: {e}"))?;
+        }
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            cache.workspace.as_mut_ptr(),
+            cache.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("fused verify reset sync: {e}"))?;
+
+        // Launch the fused megakernel. `pos_offset` as the kernel's
+        // `seqlen_offset` arg is ignored because `batch_descs` is
+        // non-null; pass it through for consistency with the batched
+        // call site.
+        kernel_ffi::persistent_decode_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            num_layers,
+            hidden_dim,
+            intermediate_size,
+            pos_offset,
+            &self.scratch.desc_device,
+            &mut cache.hidden_io,
+            &mut cache.workspace,
+            &mut self.scratch.sync_buf,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            self.rotary.rotary_dim,
+            self.proj_buf_floats,
+            self.attn_scratch_floats,
+            self.fp8_scale_device.as_ref(),
+            None, // kv_fp8_descs: fused verify disallows kv_fp8
+            b,
+            Some(&cache.batch_desc_device),
+            self.int4_scale_device.as_ref(),
+            None, // tap_workspace: verify doesn't capture taps — re-decode does
+            None, // tap_layers: ignored when tap_workspace is None
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify persistent_decode_4b: {e}"))?;
+
+        // Deliberately do NOT advance `kv_filled` on any layer. The
+        // DFlash engine rolls the K/V cursor back via
+        // `rewind_full_kv_filled` and the linear state via
+        // `restore_linear` after the accept decision.
+
+        // Final RMSNorm (multirow) + tiled lm_head over all B hiddens.
+        kernel_ffi::rms_norm_4b_multirow(
+            self.ordinal,
+            ScalarType::BF16,
+            b,
+            hidden_dim,
+            rms_norm_eps,
+            &cache.hidden_io,
+            &self.weights.norm_weight,
+            &mut cache.normed_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify final rms_norm: {e}"))?;
+
+        kernel_ffi::matmul_rhs_transposed_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            b,
+            vocab_size,
+            hidden_dim,
+            &cache.normed_buf,
+            &*self.weights.lm_head,
+            &mut cache.logits_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("fused verify lm_head matmul: {e}"))?;
+
+        let logits_host = cache
+            .logits_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("fused verify logits D2H: {e}"))?;
+        let row_stride_bytes = vocab_size * ScalarType::BF16.size_in_bytes();
+        let mut logits_per_pos = Vec::with_capacity(b);
+        for bi in 0..b {
+            let start = bi * row_stride_bytes;
+            let end = start + row_stride_bytes;
+            let row: Vec<f32> = logits_host[start..end]
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect();
+            logits_per_pos.push(row);
+        }
+
+        self.dflash_fused_verify_cache = Some(cache);
+        Ok(logits_per_pos)
     }
 
     /// Greedy argmax over logits.
