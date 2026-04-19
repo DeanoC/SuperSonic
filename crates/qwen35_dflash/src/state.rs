@@ -1,9 +1,16 @@
-//! Pre-allocated per-round scratch buffers for the DFlash draft forward pass.
+//! Pre-allocated per-round scratch buffers + per-layer persistent KV caches
+//! for the DFlash draft forward pass.
+//!
+//! Split responsibility:
+//!   - [`DFlashScratch`] — per-round transient buffers (norm_concat, q/k/v
+//!     projection outputs, attention output, MLP intermediates, final hidden,
+//!     logits). Overwritten every `forward()` call.
+//!   - [`DFlashState`] — persistent across rounds. Per-layer K/V caches that
+//!     get appended on each forward and cropped after each speculative round
+//!     (see docs/dflash.md §5.4).
 //!
 //! Batch-outer = 1 (one speculative round at a time). `q_len` is the draft's
-//! block size (16). The attention's effective K/V sequence length is
-//! `ctx_len + q_len` where `ctx_len = block_size` too (the fused tap vector
-//! is tiled to match `q_len`). See docs/dflash.md §3, §4.
+//! block size (16); `ctx_len` varies per round in 1..block_size.
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
@@ -96,5 +103,67 @@ impl DFlashScratch {
 
             matvec_counter: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1])?,
         })
+    }
+}
+
+/// Persistent per-layer KV cache for the DFlash draft.
+///
+/// Physical layout is `[max_ctx, num_kv_heads, head_dim]` BF16, matching the
+/// SHD layout expected by the bidirectional attention helper. The kernel
+/// only reads `[0..kv_filled + seq]` rows on each forward, so unused slots
+/// beyond the cursor are harmless.
+pub struct DFlashLayerKv {
+    pub cache_k: GpuBuffer,
+    pub cache_v: GpuBuffer,
+}
+
+/// All persistent (across-round) state the draft owns.
+///
+/// `kv_filled` is the number of real positions currently stored in every
+/// layer's cache — all layers move in lockstep. `max_ctx` is the physical
+/// capacity.
+///
+/// Lifecycle per speculative round (see docs/dflash.md §5.4):
+///   1. forward() appends `ctx_len + q_len` positions to every layer.
+///   2. After acceptance, the engine calls [`DFlashState::crop`] with the
+///      new committed length, rolling back the unused ctx+noise tail.
+///   3. Next round starts from `kv_filled = committed_length`.
+pub struct DFlashState {
+    pub ordinal: usize,
+    pub layers: Vec<DFlashLayerKv>,
+    pub kv_filled: usize,
+    pub max_ctx: usize,
+}
+
+impl DFlashState {
+    pub fn new(
+        ordinal: usize,
+        config: &DFlashConfig,
+        max_ctx: usize,
+    ) -> Result<Self, GpuError> {
+        let nkv = config.num_key_value_heads;
+        let hd = config.head_dim;
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            layers.push(DFlashLayerKv {
+                cache_k: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_ctx, nkv, hd])?,
+                cache_v: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_ctx, nkv, hd])?,
+            });
+        }
+        Ok(Self { ordinal, layers, kv_filled: 0, max_ctx })
+    }
+
+    /// Roll back the logical fill cursor. Physical memory beyond the cursor
+    /// is untouched — it will be overwritten on the next append. Per the
+    /// canonical `past_key_values_draft.crop(start)` pattern.
+    pub fn crop(&mut self, keep: usize) {
+        if keep < self.kv_filled {
+            self.kv_filled = keep;
+        }
+    }
+
+    /// Discard all cached positions. Equivalent to starting a fresh sequence.
+    pub fn reset(&mut self) {
+        self.kv_filled = 0;
     }
 }

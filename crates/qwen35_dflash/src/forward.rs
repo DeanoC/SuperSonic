@@ -1,47 +1,50 @@
 //! DFlash draft forward pass.
 //!
 //! One call per speculative round, per the protocol in `docs/dflash.md` §5.
-//! Ownership of the per-round KV cache lifecycle (append + crop rollback)
-//! is M3's problem; this function takes any `past_len` and assumes the
-//! caller has arranged the inputs correctly.
+//! Appends `ctx_len + q_len` positions to every layer's KV cache; the engine
+//! must call [`DFlashState::crop`] after acceptance to roll back the
+//! unused tail. See `DFlashState` docs for the full lifecycle.
 //!
 //! The forward returns a reference to `scratch.final_hidden`
 //! `[1, q_len, hidden]`. Applying `lm_head` is the caller's responsibility,
-//! because the draft does not own that tensor (see §7).
-//!
-//! M2 supports `past_len = 0`. The signature accepts `past_len` so M3 can
-//! drive it without a refactor.
+//! because the draft does not own that tensor (see `docs/dflash.md` §7).
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::{dflash, prefill_ffi};
 
 use crate::rotary::RotaryTables;
-use crate::state::DFlashScratch;
+use crate::state::{DFlashScratch, DFlashState};
 use crate::weights::DFlashWeights;
 
 pub struct ForwardParams {
-    /// Number of already-cached positions in the draft KV (M3; 0 for M2).
-    pub past_len: usize,
-    /// Number of ctx (tap) positions in the current round, 1..block_size.
+    /// Number of ctx (tap) positions this round, 1..block_size.
     pub ctx_len: usize,
     /// Number of draft query positions (= block_size).
     pub q_len: usize,
     /// First absolute position id of the contiguous slice covering ctx+noise.
-    /// This is `past_len` for M3's monotonic arange layout, or 0 for the
-    /// very first round.
+    /// Typically equals `state.kv_filled` — the draft's contiguous arange
+    /// layout (docs/dflash.md §5.3).
     pub pos_offset: usize,
 }
 
 /// Run one DFlash draft forward pass.
 ///
-/// * `noise_embedding: [1, q_len, hidden]` — already embedded
+/// Inputs:
+/// * `state` — persistent KV caches. Pre-call `state.kv_filled` is the count
+///   of positions already cached from prior rounds; forward appends
+///   `ctx_len + q_len` more, so post-call `kv_filled = pre + ctx_len + q_len`.
+/// * `scratch` — per-round transient buffers.
+/// * `rotary` — precomputed RoPE tables sized to cover at least
+///   `pos_offset + ctx_len + q_len` positions.
+/// * `noise_embedding: [1, q_len, hidden]` — already-embedded
 ///   `[bonus_seed, MASK, MASK, ...]`. Caller applies target.embed_tokens.
 /// * `target_hidden_raw: [1, ctx_len, num_taps * hidden]` — per-ctx-position
-///   concat-along-hidden of the tapped target hiddens. Un-normed.
+///   concatenation of the tapped target hiddens, un-normed.
 ///
 /// Returns `&scratch.final_hidden` `[1, q_len, hidden]`.
 pub fn forward<'a>(
     weights: &DFlashWeights,
+    state: &mut DFlashState,
     scratch: &'a mut DFlashScratch,
     rotary: &RotaryTables,
     noise_embedding: &GpuBuffer,
@@ -63,12 +66,7 @@ pub fn forward<'a>(
     let eps = cfg.rms_norm_eps as f32;
     let scale = 1.0_f32 / (hd as f32).sqrt();
 
-    let ForwardParams { past_len, ctx_len, q_len, pos_offset } = params;
-    if past_len != 0 {
-        return Err(GpuError::InvalidArg(
-            "dflash::forward: past_len > 0 is M3 (requires draft KV cache); not yet wired".into(),
-        ));
-    }
+    let ForwardParams { ctx_len, q_len, pos_offset } = params;
     if ctx_len == 0 || q_len == 0 {
         return Err(GpuError::InvalidArg(
             "dflash::forward: ctx_len and q_len must both be > 0".into(),
@@ -80,39 +78,40 @@ pub fn forward<'a>(
             scratch.block_size
         )));
     }
-    let seq = past_len + ctx_len + q_len;
-    if pos_offset + seq > rotary.max_position {
+    if state.layers.len() != weights.layers.len() {
         return Err(GpuError::InvalidArg(format!(
-            "dflash::forward: pos_offset+seq = {} exceeds RoPE table max_position = {}",
-            pos_offset + seq,
+            "dflash::forward: state has {} layers but weights have {}",
+            state.layers.len(),
+            weights.layers.len(),
+        )));
+    }
+
+    let past_len = state.kv_filled;
+    let kv_seq = ctx_len + q_len;
+    let full_seq = past_len + kv_seq;
+    if full_seq > state.max_ctx {
+        return Err(GpuError::InvalidArg(format!(
+            "dflash::forward: full_seq={full_seq} exceeds DFlashState.max_ctx={}",
+            state.max_ctx,
+        )));
+    }
+    if pos_offset + kv_seq > rotary.max_position {
+        return Err(GpuError::InvalidArg(format!(
+            "dflash::forward: pos_offset+kv_seq = {} exceeds RoPE table max_position = {}",
+            pos_offset + kv_seq,
             rotary.max_position,
         )));
     }
 
     // ----- Per-round fuser (runs once, reused by every layer) -----
-    //
-    // target_hidden_raw  [1, ctx_len, num_taps*hidden]
-    //   -- fc matmul -->  target_hidden_ctx  [1, ctx_len, hidden]
-    //   -- hidden_norm -> target_hidden_ctx_norm  [1, ctx_len, hidden]
     prefill_ffi::matmul_rhs_transposed(
-        ordinal,
-        dtype,
-        1,
-        ctx_len,
-        hidden,
-        cfg.fuser_in_dim(),
-        target_hidden_raw,
-        &weights.fc_w,
-        &mut scratch.target_hidden_ctx,
+        ordinal, dtype, 1,
+        ctx_len, hidden, cfg.fuser_in_dim(),
+        target_hidden_raw, &weights.fc_w, &mut scratch.target_hidden_ctx,
     )?;
     prefill_ffi::rms_norm_rows_plain(
-        ordinal,
-        dtype,
-        ctx_len,
-        hidden,
-        eps,
-        &scratch.target_hidden_ctx,
-        &weights.hidden_norm_w,
+        ordinal, dtype, ctx_len, hidden, eps,
+        &scratch.target_hidden_ctx, &weights.hidden_norm_w,
         &mut scratch.target_hidden_ctx_norm,
     )?;
 
@@ -125,24 +124,24 @@ pub fn forward<'a>(
         hidden_bytes,
     )?;
 
+    // Byte stride of one cache row: nKV * head_dim * bf16.
+    let cache_row_bytes = nkv * hd * bf16_bytes;
+    let append_bytes = kv_seq * cache_row_bytes;
+    let past_byte_offset = past_len * cache_row_bytes;
+
     // ----- Per-layer loop -----
-    for layer in weights.layers.iter() {
+    for (idx, layer) in weights.layers.iter().enumerate() {
+        let layer_kv = &mut state.layers[idx];
+
         // 1) input_layernorm (noise side only).
         prefill_ffi::rms_norm_rows_plain(
-            ordinal,
-            dtype,
-            q_len,
-            hidden,
-            eps,
-            &scratch.hidden_a,
-            &layer.input_norm_w,
-            &mut scratch.hidden_norm,
+            ordinal, dtype, q_len, hidden, eps,
+            &scratch.hidden_a, &layer.input_norm_w, &mut scratch.hidden_norm,
         )?;
 
         // 2) Concat [target_hidden_ctx_norm; hidden_norm] into norm_concat.
-        //    Ctx-input already post-fuser-norm; noise-input post-input_layernorm.
-        let ctx_bytes   = ctx_len * hidden * bf16_bytes;
-        let noise_bytes = q_len   * hidden * bf16_bytes;
+        let ctx_bytes = ctx_len * hidden * bf16_bytes;
+        let noise_bytes_copy = q_len * hidden * bf16_bytes;
         gpu_hal::copy_d2d(
             ordinal,
             scratch.norm_concat.as_mut_ptr(),
@@ -150,18 +149,17 @@ pub fn forward<'a>(
             ctx_bytes,
         )?;
         let concat_noise_dst = unsafe {
-            (scratch.norm_concat.as_mut_ptr() as *mut u8).add(ctx_bytes) as *mut std::ffi::c_void
+            (scratch.norm_concat.as_mut_ptr() as *mut u8).add(ctx_bytes)
+                as *mut std::ffi::c_void
         };
         gpu_hal::copy_d2d(
             ordinal,
             concat_noise_dst,
             scratch.hidden_norm.as_ptr(),
-            noise_bytes,
+            noise_bytes_copy,
         )?;
 
-        let kv_seq = ctx_len + q_len;
-
-        // 3) Q from draft-only; K/V from concat (shared k_proj/v_proj weights).
+        // 3) Q from draft-only; K/V from concat (shared k_proj/v_proj).
         prefill_ffi::matmul_rhs_transposed(
             ordinal, dtype, 1,
             q_len, q_out, hidden,
@@ -178,26 +176,18 @@ pub fn forward<'a>(
             &scratch.norm_concat, &layer.v_proj_w, &mut scratch.v_concat,
         )?;
 
-        // 4) Per-head q_norm / k_norm. These are RMSNorm over head_dim=128
-        //    applied to each (position, head) slice. Layout is contiguous
-        //    [positions, heads, head_dim], so row count = positions*heads,
-        //    col count = head_dim. In-place is fine — the kernel reads each
-        //    row's sq-sum before writing that row's output.
+        // 4) Per-head q_norm / k_norm (in-place over head_dim).
         prefill_ffi::rms_norm_rows_plain_inplace(
-            ordinal, dtype,
-            q_len * nh, hd, eps,
+            ordinal, dtype, q_len * nh, hd, eps,
             &mut scratch.q_proj, &layer.q_norm_w,
         )?;
         prefill_ffi::rms_norm_rows_plain_inplace(
-            ordinal, dtype,
-            kv_seq * nkv, hd, eps,
+            ordinal, dtype, kv_seq * nkv, hd, eps,
             &mut scratch.k_concat, &layer.k_norm_w,
         )?;
 
-        // 5) RoPE — full-dim rotary (rotary_dim = head_dim).
-        //    K sees all kv_seq positions starting at pos_offset.
-        //    Q sees only the last q_len positions (after ctx) —
-        //    dflash.py line 24 uses cos[..., -q_len:, :].
+        // 5) RoPE — full-dim rotary. Q at pos_offset + ctx_len; K across full
+        //    kv_seq starting at pos_offset. V is not rotated (dflash.py).
         prefill_ffi::apply_rope_prefill(
             ordinal, dtype,
             kv_seq, nkv, hd, rotary.rotary_dim,
@@ -213,15 +203,42 @@ pub fn forward<'a>(
             &mut scratch.q_proj,
         )?;
 
-        // 6) Bidirectional attention.
+        // 6) Append this round's K/V to the per-layer cache.
+        //    Dst offset = past_len * row_bytes. Source is the current round's
+        //    k_concat / v_concat buffers (post k_norm, post RoPE).
+        let cache_k_dst = unsafe {
+            (layer_kv.cache_k.as_mut_ptr() as *mut u8).add(past_byte_offset)
+                as *mut std::ffi::c_void
+        };
+        gpu_hal::copy_d2d(
+            ordinal,
+            cache_k_dst,
+            scratch.k_concat.as_ptr(),
+            append_bytes,
+        )?;
+        let cache_v_dst = unsafe {
+            (layer_kv.cache_v.as_mut_ptr() as *mut u8).add(past_byte_offset)
+                as *mut std::ffi::c_void
+        };
+        gpu_hal::copy_d2d(
+            ordinal,
+            cache_v_dst,
+            scratch.v_concat.as_ptr(),
+            append_bytes,
+        )?;
+
+        // 7) Bidirectional attention reads the cache up to full_seq rows.
+        //    Physical cache is [max_ctx, nKV, hd]; kernel only touches
+        //    [0..full_seq, nKV, hd]. The stride (nKV*hd) is identical either
+        //    way, so passing the cache pointer with seq_len=full_seq is safe.
         dflash::bidir_attention(
             ordinal, dtype,
-            q_len, kv_seq, nh, nkv, hd, scale,
-            &scratch.q_proj, &scratch.k_concat, &scratch.v_concat,
+            q_len, full_seq, nh, nkv, hd, scale,
+            &scratch.q_proj, &layer_kv.cache_k, &layer_kv.cache_v,
             &mut scratch.attn_out,
         )?;
 
-        // 7) o_proj into hidden_b, residual-add into hidden_a.
+        // 8) o_proj into hidden_b, residual-add into hidden_a.
         prefill_ffi::matmul_rhs_transposed(
             ordinal, dtype, 1,
             q_len, hidden, q_out,
@@ -233,10 +250,9 @@ pub fn forward<'a>(
             &mut scratch.hidden_a, &scratch.hidden_b,
         )?;
 
-        // 8) post_attention_layernorm → gate + up → SwiGLU → down.
+        // 9) post_attention_layernorm → gate + up → SwiGLU → down → residual.
         prefill_ffi::rms_norm_rows_plain(
-            ordinal, dtype,
-            q_len, hidden, eps,
+            ordinal, dtype, q_len, hidden, eps,
             &scratch.hidden_a, &layer.post_attn_norm_w, &mut scratch.post_attn_norm,
         )?;
         prefill_ffi::matmul_rhs_transposed(
@@ -250,8 +266,7 @@ pub fn forward<'a>(
             &scratch.post_attn_norm, &layer.up_proj_w, &mut scratch.up,
         )?;
         prefill_ffi::swiglu_mul(
-            ordinal, dtype,
-            q_len * intermediate,
+            ordinal, dtype, q_len * intermediate,
             &scratch.gate, &scratch.up, &mut scratch.swiglu_out,
         )?;
         prefill_ffi::matmul_rhs_transposed(
@@ -265,16 +280,13 @@ pub fn forward<'a>(
         )?;
     }
 
+    // Advance the fill cursor after all layers succeed.
+    state.kv_filled = full_seq;
+
     // ----- Final norm (before lm_head) -----
     prefill_ffi::rms_norm_rows_plain(
-        ordinal,
-        dtype,
-        q_len,
-        hidden,
-        eps,
-        &scratch.hidden_a,
-        &weights.norm_w,
-        &mut scratch.final_hidden,
+        ordinal, dtype, q_len, hidden, eps,
+        &scratch.hidden_a, &weights.norm_w, &mut scratch.final_hidden,
     )?;
 
     Ok(&scratch.final_hidden)

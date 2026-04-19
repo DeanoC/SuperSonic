@@ -23,5 +23,5 @@ pub use config::{DFlashConfig, load_config};
 pub use forward::{forward, ForwardParams};
 pub use loader::LoadError;
 pub use rotary::RotaryTables;
-pub use state::DFlashScratch;
+pub use state::{DFlashLayerKv, DFlashScratch, DFlashState};
 pub use weights::{DFlashLayerWeights, DFlashWeights};
