@@ -2817,6 +2817,7 @@ impl DecodeEngine {
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
             enable_timing_slots,
+            false,
         )
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -3013,6 +3014,7 @@ impl DecodeEngine {
             self.scratch.batch_seq_desc_device.as_ref(),
             self.int4_scale_device.as_ref(),
             false,
+            true,
         )
         .map_err(|e| anyhow::anyhow!("trace persistent_decode_4b batch kernel: {e}"))?;
 

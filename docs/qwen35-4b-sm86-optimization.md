@@ -1,8 +1,8 @@
 # Qwen3.5-4B CUDA `sm86` Optimization Notes
 
 This document records the current `qwen3.5-4b` CUDA `sm86` hero lane, the
-first warmed baseline captured on this machine, and the early experiments that
-were tried and intentionally not kept.
+current warmed baselines captured on this machine, and the early experiments
+that were tried and intentionally not kept.
 
 It is the `4B` companion to [qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md),
 which remains the completed `0.8B` reference workflow.
@@ -116,8 +116,8 @@ What that means:
 
 ## Single-Sequence Native Baseline
 
-Current warmed result for the forced single-sequence native-kernel lane on this
-RTX 3090-class `sm86` machine:
+Committed baseline for the forced single-sequence native-kernel lane on this
+RTX 3090-class `sm86` machine (`29450cc`):
 
 - prompt tokens: `533`
 - generated tokens: `128`
@@ -153,6 +153,83 @@ What that means:
   just as it is in the batched lane
 - the single-stream baseline is now close enough in shape to the `0.8B`
   workflow to justify using it as the next hero staging surface
+
+## Early Single-Stream Experiments Not Kept
+
+The first speculative `B == 1` packed-BF16 attention-core branch, copied in the
+spirit of the `0.8B` hero path, was tested and reverted.
+
+Short screening result (`pp533` / `tg16`):
+
+- baseline decode: `1776.0 ms`
+- experiment decode: `1777.3 ms`
+- baseline full-attention core: `791.650 ms`
+- experiment full-attention core: `792.208 ms`
+
+Why it was dropped:
+
+- the packed two-float inner loop was correct but flat to slightly worse
+- it did not change the actual bottleneck enough to justify more validation
+- this reinforced that `4B` should keep following measured bottlenecks, not
+  copy `0.8B` structure blindly
+
+## First Kept Single-Stream Pass
+
+The first kept `4B` single-stream pass was narrower than the failed hero-copy
+experiment:
+
+- left the attention math unchanged
+- kept `saved_gate`, which the decode path still needs after attention
+- made `saved_q`, `saved_pre_gate`, and `saved_scores` opt-in instead of
+  writing them unconditionally on every decode step
+- enabled those scratch writes only for the persistent full-attention trace
+  path used by the debug tooling in `main.rs`
+
+Why this was the right next pass:
+
+- those trace buffers are read by the trace/validation workflow, not by the
+  normal decode or stage-timing lane
+- the previous `4B` implementation was paying for trace-only global writes in
+  the hottest part of single-stream attention
+- this is exactly the kind of bounded, measurable cleanup worth doing before a
+  larger structural kernel rewrite
+
+Short screening result (`pp533` / `tg16`):
+
+- decode improved from `1776.0 ms` to `1770.0 ms`
+- persistent decode improved from `1683.655 ms` to `1678.152 ms`
+- full attention improved from `818.310 ms` to `812.547 ms`
+- full-attention core improved from `791.650 ms` to `785.903 ms`
+
+Full warmed result (`pp533` / `tg128`):
+
+- prefill moved from `4470.4 ms` to `4482.7 ms`
+- decode improved from `14780.5 ms` to `14733.1 ms`
+- native decode total improved from `14567.735 ms` to `14520.915 ms`
+- persistent decode improved from `14045.437 ms` to `13998.467 ms`
+- full attention improved from `7197.903 ms` to `7147.420 ms`
+- full-attention core improved from `6984.718 ms` to `6934.247 ms`
+
+Verification notes:
+
+- `--validate --force-kernel-decode` passed with `decode_max_delta=0.3047`
+- `--gpu-validate --force-kernel-decode` passed with matching tokens and
+  `gpu_oracle_max_delta=0.3125`
+- baked-path batch-2 validate still passed with `decode_max_delta=0.3047`
+- `tests/sm86/run_4b.sh` baked path still passed; its `--no-bake` subtest still
+  fails on this machine because `/workspace/models/Qwen3.5-4B` has no raw
+  safetensors files
+- `tests/sm86/run_4b_long.sh` still fails the `medium_context` golden case, but
+  that same failure reproduces on baseline commit `29450cc`, so it is not
+  introduced by this pass
+
+What this changes about the next step:
+
+- the single-stream hero lane still points at full-attention core as the main
+  structural bottleneck
+- the next pass should continue to target the single native-kernel lane first
+- the next structural experiment should avoid reintroducing trace or debug
+  work into the hot path
 
 ## Internal Persistent Split
 

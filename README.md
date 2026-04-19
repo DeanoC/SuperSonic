@@ -229,8 +229,14 @@ There is now also an explicit native single-sequence staging lane for `4B`
 behind `--force-kernel-decode`. A warmed `pp533 / tg128` run on this box comes
 in at roughly:
 
-- prefill `4470 ms` (`119 tok/s`)
-- decode `14780 ms` (`8.7 tok/s`)
+- prefill `4483 ms` (`119 tok/s`)
+- decode `14733 ms` (`8.7 tok/s`)
+
+The first kept single-stream `4B` CUDA pass on this lane was not a new
+attention math rewrite. It removed unconditional full-attention trace-buffer
+writes from the hot path and left those writes enabled only for the explicit
+trace workflow, which reduced the warmed single-lane full-attention core from
+about `6985 ms` to `6934 ms` on this machine.
 
 That lane is intended for Lucebox-style single-stream optimization work; the
 validated production throughput lane remains `qwen3.5-4b --batch-size 2`.

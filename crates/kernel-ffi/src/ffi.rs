@@ -83,6 +83,7 @@ unsafe extern "C" {
         rotary_dim: usize,
         proj_buf_floats: usize,
         attn_scratch_floats: usize,
+        enable_attention_trace: c_int,
         fp8_scales: *const c_void,  // nullptr for BF16, pointer to FP8ScaleDesc[] for FP8
         kv_fp8_descs: *const c_void,  // nullptr for BF16 KV, pointer to KVCacheFp8Desc[] for FP8 KV
         batch_size: usize,            // 1 for single-sequence (default), >1 for batched
@@ -341,6 +342,7 @@ pub fn persistent_decode_4b(
     batch_descs: Option<&GpuBuffer>,
     int4_scale_descs: Option<&GpuBuffer>,
     enable_timing_slots: bool,
+    enable_attention_trace: bool,
 ) -> Result<(), GpuError> {
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr();
@@ -391,6 +393,7 @@ pub fn persistent_decode_4b(
                     rotary_dim,
                     proj_buf_floats,
                     attn_scratch_floats,
+                    if enable_attention_trace { 1 } else { 0 },
                     fp8_scales_ptr,
                     kv_fp8_ptr,
                     batch_size,
@@ -425,6 +428,7 @@ pub fn persistent_decode_4b(
                     rotary_dim,
                     proj_buf_floats,
                     attn_scratch_floats,
+                    if enable_attention_trace { 1 } else { 0 },
                     fp8_scales_ptr,
                     kv_fp8_ptr,
                     batch_size,

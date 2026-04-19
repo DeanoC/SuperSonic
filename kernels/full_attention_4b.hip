@@ -3911,6 +3911,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
     int proj_buf_floats,                 // max projection output buffer size
     int attn_scratch_floats,             // attention/recurrent scratch buffer size
+    int enable_attention_trace,          // 1 to emit full-attn trace scratch, 0 for hot path
     const Qwen35FP8ScaleDesc* __restrict__ fp8_scales,  // nullptr for BF16, else [num_layers]
     const KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
     int batch_size,                      // 1 for single-sequence, >1 for batched
@@ -3921,6 +3922,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const int bs = blockDim.x;
     const int nb = gridDim.x;
     const int B = batch_size;
+    const bool emit_attention_trace = enable_attention_trace != 0;
 
     // Workspace layout (F32 unless noted).
     // Each section is multiplied by batch_size. Per-batch offset: section + b * section_size.
@@ -4335,10 +4337,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* saved_gate = saved_q + nh * hd;
                 float* saved_pre_gate = saved_gate + nh * hd;
                 float* saved_scores = saved_pre_gate + nh * hd;
-                for (int i = tid; i < nh * hd; i += bs) {
-                    const int h = i / hd;
-                    const int d = i % hd;
-                    saved_q[i] = bf16_round_rne_f32_finite(q_f32[h * hd * 2 + d]);
+                if (emit_attention_trace) {
+                    for (int i = tid; i < nh * hd; i += bs) {
+                        const int h = i / hd;
+                        const int d = i % hd;
+                        saved_q[i] = bf16_round_rne_f32_finite(q_f32[h * hd * 2 + d]);
+                    }
                 }
                 for (int i = tid; i < nh * hd; i += bs) {
                     const int h = i / hd;
@@ -4398,7 +4402,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 float total = 0.0f;
                                 for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
                                 lds[0] = total;
-                                saved_scores[qh * kv_max_b + t] = total * scale;
+                                if (emit_attention_trace) {
+                                    saved_scores[qh * kv_max_b + t] = total * scale;
+                                }
                             }
                             __syncthreads();
                             score_val = lds[0] * scale;
@@ -4460,7 +4466,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 float total = 0.0f;
                                 for (int w = 0; w < attn_nwaves; ++w) total += lds[w];
                                 lds[0] = total;
-                                saved_scores[qh * kv_max_b + t] = total * scale;
+                                if (emit_attention_trace) {
+                                    saved_scores[qh * kv_max_b + t] = total * scale;
+                                }
                             }
                             __syncthreads();
                             score_val = lds[0] * scale;
@@ -4483,8 +4491,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                 }
 
-                for (int i = tid; i < nh * hd; i += bs) {
-                    saved_pre_gate[i] = attn_flat[i];
+                if (emit_attention_trace) {
+                    for (int i = tid; i < nh * hd; i += bs) {
+                        saved_pre_gate[i] = attn_flat[i];
+                    }
                 }
                 __syncthreads();
 
