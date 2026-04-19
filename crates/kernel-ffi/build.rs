@@ -140,6 +140,7 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
         ("prefill_helpers_bridge.cpp", "qwen35_prefill_helpers_hip.o", "building prefill helpers HIP bridge"),
         ("gemma4_bridge.cpp", "gemma4_hip.o", "building Gemma 4 HIP bridge"),
         ("phi4_bridge.cpp", "phi4_hip.o", "building Phi-4 HIP bridge"),
+        ("dflash_draft_bridge.cpp", "dflash_draft_hip.o", "building DFlash draft HIP bridge"),
     ];
     let archs = detect_hip_archs();
     if archs.is_empty() {
@@ -256,6 +257,8 @@ fn main() {
         "gemma4_bridge.cpp",
         "phi4.hip",
         "phi4_bridge.cpp",
+        "dflash_draft.hip",
+        "dflash_draft_bridge.cpp",
         "full_attention_cuda.cuh",
         "full_attention_4b_cuda.cuh",
         "prefill_helpers_cuda.cuh",

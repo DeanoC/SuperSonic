@@ -28,15 +28,11 @@ pub struct DFlashScratch {
     pub post_attn_norm: GpuBuffer,
 
     // Attention projections.
-    //   q: [1, q_len, q_out_dim]
-    //   k/v noise: [1, q_len, kv_out_dim]
-    //   k/v ctx:   [1, ctx_len, kv_out_dim]
-    //   k/v concat:[1, ctx_len + q_len, kv_out_dim]  (physical storage for cat)
+    //   q:        [1, q_len, q_out_dim]
+    //   norm_concat: [1, ctx_len + q_len, hidden]  — [ctx_norm || noise_norm]
+    //   k/v concat: [1, ctx_len + q_len, kv_out_dim]
     pub q_proj: GpuBuffer,
-    pub k_noise: GpuBuffer,
-    pub v_noise: GpuBuffer,
-    pub k_ctx: GpuBuffer,
-    pub v_ctx: GpuBuffer,
+    pub norm_concat: GpuBuffer,
     pub k_concat: GpuBuffer,
     pub v_concat: GpuBuffer,
 
@@ -85,10 +81,7 @@ impl DFlashScratch {
             post_attn_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, hidden])?,
 
             q_proj: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, q_out])?,
-            k_noise: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, kv_out])?,
-            v_noise: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, kv_out])?,
-            k_ctx: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len, kv_out])?,
-            v_ctx: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len, kv_out])?,
+            norm_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, hidden])?,
             k_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
             v_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
 

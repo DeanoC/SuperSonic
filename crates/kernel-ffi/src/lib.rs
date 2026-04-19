@@ -1,5 +1,6 @@
 mod ffi;
 mod layer_desc;
+pub mod dflash;
 pub mod prefill_ffi;
 pub mod gemma4;
 pub mod phi4;

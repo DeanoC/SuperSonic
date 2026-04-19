@@ -13,11 +13,15 @@
 //! `Arc<GpuBuffer>` shared with the target model.
 
 pub mod config;
+pub mod forward;
 pub mod loader;
+pub mod rotary;
 pub mod state;
 pub mod weights;
 
 pub use config::{DFlashConfig, load_config};
+pub use forward::{forward, ForwardParams};
 pub use loader::LoadError;
+pub use rotary::RotaryTables;
 pub use state::DFlashScratch;
 pub use weights::{DFlashLayerWeights, DFlashWeights};
