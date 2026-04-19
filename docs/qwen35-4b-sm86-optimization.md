@@ -7,9 +7,9 @@ were tried and intentionally not kept.
 It is the `4B` companion to [qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md),
 which remains the completed `0.8B` reference workflow.
 
-## Hero Lane
+## Throughput Lane
 
-The current `4B` CUDA optimization target is:
+The current validated `4B` CUDA throughput target is:
 
 - backend: CUDA
 - arch: `sm86`
@@ -27,6 +27,28 @@ Why this lane:
 - the validated fast CUDA path for `4B` is batched decode
 - existing `sm86` coverage already treats `qwen3.5-4b --batch-size 2` as the
   checked CUDA batch lane
+
+## Single-Sequence Native Lane
+
+To stage Lucebox-style single-stream work, this branch now also defines a
+measured single-sequence native-kernel lane:
+
+- backend: CUDA
+- arch: `sm86`
+- model: `qwen3.5-4b`
+- dtype: BF16
+- batch size: `1`
+- mode: normal generation
+- path: baked model load + `--force-kernel-decode`
+- benchmark shape: warmed `pp533` / `tg128`
+
+Why this lane exists:
+
+- `0.8B`-style hero work is fundamentally a single-stream latency problem
+- the default single-sequence `4B` path on this box replays prefill for
+  correctness, which is the wrong surface for latency optimization
+- forcing the native `4B` kernel gives a direct staging lane that is much
+  closer in spirit to the `0.8B` hero process
 
 ## Benchmark Harness
 
@@ -46,6 +68,23 @@ Defaults:
 - target prompt: about `pp520` and calibrates to `pp533` on this box
 - generation: `tg128`
 - batch size: `2`
+- warmup runs: `10`
+- timed runs: `20`
+- stage timings enabled
+
+Single-sequence native-kernel command:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
+  /path/to/Qwen3.5-4B
+```
+
+Single-sequence harness defaults:
+
+- target prompt: about `pp520` and calibrates to `pp533` on this box
+- generation: `tg128`
+- batch size: `1`
+- forces native kernel decode with `--force-kernel-decode`
 - warmup runs: `10`
 - timed runs: `20`
 - stage timings enabled
@@ -74,6 +113,46 @@ What that means:
 - persistent decode is about `97.4%` of native decode time
 - `lm_head` is visible but not the main blocker
 - host-side work is not the first thing to optimize for this lane
+
+## Single-Sequence Native Baseline
+
+Current warmed result for the forced single-sequence native-kernel lane on this
+RTX 3090-class `sm86` machine:
+
+- prompt tokens: `533`
+- generated tokens: `128`
+- prefill: `4470.4 ms` = `119.2 tok/s`
+- decode: `14780.5 ms` = `8.7 tok/s`
+
+Stage timing mean:
+
+- persistent decode: `14045.437 ms`
+- `rms_norm`: `1.854 ms`
+- `lm_head`: `510.347 ms`
+- logits D2H: `10.094 ms`
+- host sampling: `0.002 ms`
+- total native decode: `14567.735 ms`
+
+Persistent subsection mean:
+
+- full attention: `7197.903 ms`
+- full-attention projection: `152.364 ms`
+- full-attention core: `6984.718 ms`
+- full-attention `o_proj`: `56.676 ms`
+- linear projection: `1119.540 ms`
+- linear core: `3481.079 ms`
+- linear out: `634.208 ms`
+- MLP gate+up: `1455.487 ms`
+- MLP down: `1708.718 ms`
+
+What that means:
+
+- the native single-sequence `4B` path is now directly measurable instead of
+  being hidden behind replayed prefill
+- full-attention core is still the main bottleneck in the single-stream lane,
+  just as it is in the batched lane
+- the single-stream baseline is now close enough in shape to the `0.8B`
+  workflow to justify using it as the next hero staging surface
 
 ## Internal Persistent Split
 
@@ -275,3 +354,9 @@ Additional baked-path validation for the kept full-attention-core pass:
 - baked batch quick validate passed with `decode_max_delta=0.3047`
 - baked batch golden corpus passed `11 / 11`
 - single-sequence long-context golden corpus passed `4 / 4`
+
+Additional validation for the single-sequence native-kernel staging lane:
+
+- baked `--validate --force-kernel-decode` passed with `decode_max_delta=0.3047`
+- baked `--gpu-validate --force-kernel-decode` passed with token agreement and
+  `gpu_oracle_max_delta=0.3125`

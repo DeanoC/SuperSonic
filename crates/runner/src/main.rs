@@ -1420,7 +1420,15 @@ fn main() -> Result<()> {
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
-                engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
+                if cli.emit_stage_timings {
+                    let (logits, timings) =
+                        engine.decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
+                    native_decode_timings.add_assign(timings);
+                    native_decode_timing_steps += 1;
+                    logits
+                } else {
+                    engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
+                }
             } else if cli.emit_stage_timings {
                 let (logits, timings) = engine.decode_step_with_timings(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);

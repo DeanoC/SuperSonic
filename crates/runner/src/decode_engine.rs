@@ -2647,6 +2647,32 @@ impl DecodeEngine {
         Ok(logits)
     }
 
+    /// Forced single-sequence 4B kernel path with native stage timings.
+    pub fn decode_step_4b_single_kernel_with_timings(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        anyhow::ensure!(
+            self.use_4b_kernel,
+            "decode_step_4b_single_kernel_with_timings requires 4B kernel"
+        );
+        anyhow::ensure!(
+            self.batch_size == 1,
+            "decode_step_4b_single_kernel_with_timings requires batch_size == 1"
+        );
+
+        let (mut batch_logits, mut timings) =
+            self.decode_step_batch_impl(&[token_id], seqlen_offset, true)?;
+        let logits = batch_logits
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("single-sequence 4B kernel timings missing logits"))?;
+        let sampling_start = Instant::now();
+        let _ = Self::greedy_sample(&logits);
+        timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
+        Ok((logits, timings))
+    }
+
     /// Greedy argmax over logits.
     pub fn greedy_sample(logits: &[f32]) -> u32 {
         logits

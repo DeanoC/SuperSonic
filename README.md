@@ -187,6 +187,17 @@ That harness defaults to batch-1 BF16, a roughly `pp520` prompt target,
 `tg128`, `10` warmup runs, `20` timed runs, and prints aggregated native decode
 stage timings from `--emit-stage-timings`.
 
+For a warmed single-sequence native-kernel `qwen3.5-4b` run on `sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
+  /path/to/Qwen3.5-4B
+```
+
+That harness forces `--force-kernel-decode` so the run measures the native
+single-sequence `4B` kernel instead of the default replayed-prefill
+correctness path.
+
 The current `qwen3.5-0.8b` CUDA `sm86` optimization record, benchmark progression,
 remaining gap to Lucebox, and carry-forward process for the other supported Qwen3.5
 CUDA models are tracked in [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
@@ -213,6 +224,16 @@ So the current CUDA `4B` story on this box is split:
 
 - single-sequence decode is correctness-first and much slower because it replays prefill
 - batched decode remains the fast path and is still the better place to do performance work
+
+There is now also an explicit native single-sequence staging lane for `4B`
+behind `--force-kernel-decode`. A warmed `pp533 / tg128` run on this box comes
+in at roughly:
+
+- prefill `4470 ms` (`119 tok/s`)
+- decode `14780 ms` (`8.7 tok/s`)
+
+That lane is intended for Lucebox-style single-stream optimization work; the
+validated production throughput lane remains `qwen3.5-4b --batch-size 2`.
 
 ## E2E Tests
 
