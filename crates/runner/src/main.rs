@@ -4,6 +4,7 @@ mod gemma4_int4_engine;
 mod oracle;
 mod phi4_engine;
 mod prefill_engine;
+mod qwen35_dflash_engine;
 mod registry;
 mod validate;
 
@@ -323,6 +324,30 @@ pub(crate) struct Cli {
     /// Override the GitHub release/tag used for bake downloads.
     #[arg(long)]
     bake_release: Option<String>,
+
+    /// Enable DFlash speculative decoding. Requires `--model qwen3.5-9b`,
+    /// `--int4`, and `--dflash-draft-dir`. Target is the Qwen3.5-9B INT4
+    /// bake; draft is the DFlash 5-layer checkpoint shared via Arc.
+    #[arg(long)]
+    dflash: bool,
+
+    /// Path to the DFlash draft checkpoint directory (e.g.
+    /// `z-lab/Qwen3.5-9B-DFlash` extracted locally). Must contain
+    /// `config.json` and `model.safetensors`.
+    #[arg(long)]
+    dflash_draft_dir: Option<PathBuf>,
+
+    /// Override the DFlash block size (draft candidates per round).
+    /// Must be 1..=draft_config.block_size (default 16 from the checkpoint).
+    #[arg(long)]
+    dflash_block: Option<usize>,
+
+    /// Override the DFlash tap layers as a comma-separated list of
+    /// target-model layer indices (e.g. `1,8,15,22,29`). Must match the
+    /// count implied by the draft's `fc.in_features`. Defaults to the
+    /// checkpoint's `dflash_config.target_layer_ids`.
+    #[arg(long)]
+    dflash_tap_layers: Option<String>,
 }
 
 fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
@@ -526,6 +551,19 @@ fn main() -> Result<()> {
             return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
         }
         ModelFamily::Qwen35 => {}
+    }
+
+    if cli.dflash {
+        return qwen35_dflash_engine::run_qwen35_dflash(
+            &cli,
+            &model_variant,
+            entry,
+            ordinal,
+            total_vram,
+        );
+    }
+    if cli.dflash_draft_dir.is_some() || cli.dflash_block.is_some() || cli.dflash_tap_layers.is_some() {
+        anyhow::bail!("--dflash-* flags require --dflash");
     }
 
     let mut params = match &entry.params {
