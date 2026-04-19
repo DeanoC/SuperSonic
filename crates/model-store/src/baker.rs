@@ -314,3 +314,237 @@ pub fn bake_qwen35(
     Ok(())
 }
 
+/// Dtype bytes-per-element lookup for split helpers.
+fn dtype_bytes(dt: safetensors::Dtype) -> Result<usize, Error> {
+    match dt {
+        safetensors::Dtype::F16 | safetensors::Dtype::BF16 => Ok(2),
+        safetensors::Dtype::F32 => Ok(4),
+        safetensors::Dtype::U8 | safetensors::Dtype::F8_E4M3 => Ok(1),
+        safetensors::Dtype::U32 => Ok(4),
+        safetensors::Dtype::I64 => Ok(8),
+        other => Err(Error::UnsupportedDtype(format!("{other:?}"))),
+    }
+}
+
+/// Bake Phi-4 HuggingFace safetensors into a SuperSonic binary package.
+///
+/// Unlike Qwen3.5, Phi-4 stores fused `qkv_proj` and `gate_up_proj` tensors.
+/// This baker splits them at bake time so the Rust runtime sees canonical
+/// q_proj / k_proj / v_proj / gate_proj / up_proj tensors (all `LayoutTag::Raw`).
+pub fn bake_phi4(
+    model_dir: &Path,
+    num_layers: usize,
+    num_attention_heads: usize,
+    num_key_value_heads: usize,
+    head_dim: usize,
+    intermediate_size: usize,
+    progress: &dyn Fn(&str),
+) -> Result<(), Error> {
+    let bake_dir = crate::bake_dir(model_dir);
+    fs::create_dir_all(&bake_dir)?;
+
+    let (shards, tensor_index) = open_shards(model_dir)?;
+    progress(&format!(
+        "[bake] opened {} safetensors shard(s), {} tensors",
+        shards.len(),
+        tensor_index.len()
+    ));
+
+    let weights_path = crate::weights_bin_path(&bake_dir);
+    let mut weights_file = File::create(&weights_path)?;
+    let mut cursor: u64 = 0;
+    let mut entries: Vec<TensorMeta> = Vec::new();
+
+    let q_rows = num_attention_heads * head_dim;
+    let k_rows = num_key_value_heads * head_dim;
+    let v_rows = k_rows;
+
+    let mut names: Vec<String> = tensor_index
+        .keys()
+        .filter(|n| n.starts_with("model.") || *n == "lm_head.weight")
+        .cloned()
+        .collect();
+    names.sort();
+
+    progress(&format!("[bake] baking {} tensors (phi4)...", names.len()));
+
+    for name in &names {
+        let &shard_idx = tensor_index.get(name).unwrap();
+        let st = SafeTensors::deserialize(&shards[shard_idx])?;
+        let view = st.tensor(name)?;
+        let shape: Vec<usize> = view.shape().to_vec();
+        let raw_bytes = view.data();
+        let raw_dtype = view.dtype();
+        let dt_bytes = dtype_bytes(raw_dtype)?;
+        let dt_name = dtype_name(raw_dtype)?.to_string();
+
+        if let Some((prefix, _)) = split_phi4_qkv_name(name) {
+            let (qb, qs, kb, ks, vb, vs) = transforms::split_qkv_proj(
+                raw_bytes, &shape, q_rows, k_rows, v_rows, dt_bytes,
+            );
+            for (suffix, bytes, shape) in [
+                ("q_proj.weight", qb, qs),
+                ("k_proj.weight", kb, ks),
+                ("v_proj.weight", vb, vs),
+            ] {
+                let out_name = format!("{prefix}.{suffix}");
+                cursor = write_entry(
+                    &mut weights_file,
+                    cursor,
+                    &out_name,
+                    &bytes,
+                    shape,
+                    dt_name.clone(),
+                    LayoutTag::Raw,
+                    &mut entries,
+                )?;
+            }
+            continue;
+        }
+
+        if let Some(prefix) = split_phi4_gate_up_name(name) {
+            let (gb, gs, ub, us) = transforms::split_gate_up_proj(
+                raw_bytes, &shape, intermediate_size, dt_bytes,
+            );
+            for (suffix, bytes, shape) in [
+                ("gate_proj.weight", gb, gs),
+                ("up_proj.weight", ub, us),
+            ] {
+                let out_name = format!("{prefix}.{suffix}");
+                cursor = write_entry(
+                    &mut weights_file,
+                    cursor,
+                    &out_name,
+                    &bytes,
+                    shape,
+                    dt_name.clone(),
+                    LayoutTag::Raw,
+                    &mut entries,
+                )?;
+            }
+            continue;
+        }
+
+        cursor = write_entry(
+            &mut weights_file,
+            cursor,
+            name,
+            raw_bytes,
+            shape,
+            dt_name,
+            LayoutTag::Raw,
+            &mut entries,
+        )?;
+    }
+
+    weights_file.flush()?;
+    drop(weights_file);
+
+    // Sanity: every layer must have exactly q_proj, k_proj, v_proj, gate_proj, up_proj.
+    for layer_idx in 0..num_layers {
+        for needed in [
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+        ] {
+            let expected = format!("model.layers.{layer_idx}.{needed}");
+            if !entries.iter().any(|e| e.name == expected) {
+                return Err(Error::Other(format!(
+                    "bake_phi4: missing split tensor {expected} after bake"
+                )));
+            }
+        }
+    }
+
+    progress(&format!(
+        "[bake] wrote {:.1}MiB to weights.bin",
+        cursor as f64 / (1024.0 * 1024.0)
+    ));
+
+    let manifest = Manifest {
+        format_version: FORMAT_VERSION,
+        converter_version: CONVERTER_VERSION,
+        model_family: "phi4".to_string(),
+        tensors: entries,
+    };
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    fs::write(crate::manifest_path(&bake_dir), manifest_json)?;
+
+    progress(&format!("[bake] manifest written to {}", bake_dir.display()));
+    Ok(())
+}
+
+fn write_entry(
+    file: &mut File,
+    cursor: u64,
+    name: &str,
+    bytes: &[u8],
+    shape: Vec<usize>,
+    dtype: String,
+    layout: LayoutTag,
+    entries: &mut Vec<TensorMeta>,
+) -> Result<u64, Error> {
+    let offset = align_up(cursor, 4096);
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(bytes)?;
+    let byte_len = bytes.len() as u64;
+    entries.push(TensorMeta {
+        name: name.to_string(),
+        shape,
+        dtype,
+        layout,
+        offset,
+        byte_len,
+    });
+    Ok(offset + byte_len)
+}
+
+/// Match `model.layers.{N}.self_attn.qkv_proj.weight` and return (`model.layers.{N}.self_attn`, N).
+fn split_phi4_qkv_name(name: &str) -> Option<(String, usize)> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let dot = rest.find('.')?;
+    let idx: usize = rest[..dot].parse().ok()?;
+    let tail = &rest[dot + 1..];
+    if tail == "self_attn.qkv_proj.weight" {
+        Some((format!("model.layers.{idx}.self_attn"), idx))
+    } else {
+        None
+    }
+}
+
+/// Match `model.layers.{N}.mlp.gate_up_proj.weight` and return `model.layers.{N}.mlp`.
+fn split_phi4_gate_up_name(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("model.layers.")?;
+    let dot = rest.find('.')?;
+    let idx: usize = rest[..dot].parse().ok()?;
+    let tail = &rest[dot + 1..];
+    if tail == "mlp.gate_up_proj.weight" {
+        Some(format!("model.layers.{idx}.mlp"))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qkv_name_match() {
+        let (prefix, idx) = split_phi4_qkv_name("model.layers.7.self_attn.qkv_proj.weight").unwrap();
+        assert_eq!(prefix, "model.layers.7.self_attn");
+        assert_eq!(idx, 7);
+        assert!(split_phi4_qkv_name("model.layers.7.self_attn.o_proj.weight").is_none());
+        assert!(split_phi4_qkv_name("lm_head.weight").is_none());
+    }
+
+    #[test]
+    fn gate_up_name_match() {
+        let prefix = split_phi4_gate_up_name("model.layers.3.mlp.gate_up_proj.weight").unwrap();
+        assert_eq!(prefix, "model.layers.3.mlp");
+        assert!(split_phi4_gate_up_name("model.layers.3.mlp.down_proj.weight").is_none());
+    }
+}
+

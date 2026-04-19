@@ -2,7 +2,9 @@ mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod oracle;
+mod phi4_engine;
 mod prefill_engine;
+mod qwen35_dflash_engine;
 mod registry;
 mod validate;
 
@@ -143,7 +145,7 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
-struct Cli {
+pub(crate) struct Cli {
     /// Model variant (e.g. "qwen3.5-0.8b")
     #[arg(long, default_value = "qwen3.5-0.8b")]
     model: String,
@@ -322,6 +324,34 @@ struct Cli {
     /// Override the GitHub release/tag used for bake downloads.
     #[arg(long)]
     bake_release: Option<String>,
+
+    /// Enable DFlash speculative decoding. Requires `--model qwen3.5-9b`,
+    /// `--int4`, and `--dflash-draft-dir`. Target is the Qwen3.5-9B INT4
+    /// bake; draft is the DFlash 5-layer checkpoint shared via Arc.
+    #[arg(long)]
+    dflash: bool,
+
+    /// Path to the DFlash draft checkpoint directory (e.g.
+    /// `z-lab/Qwen3.5-9B-DFlash` extracted locally). Must contain
+    /// `config.json` and `model.safetensors`.
+    #[arg(long)]
+    dflash_draft_dir: Option<PathBuf>,
+
+    /// Override the DFlash block size (draft candidates per round). Must
+    /// be 1..=draft_config.block_size. Default is 3 — the fused verify
+    /// megakernel on Qwen3.5-9B is LDS-bound and caps B at 3 on gfx1150
+    /// (block_size + B*hidden + fp8_lut must fit in 64 KiB shared mem).
+    /// Launches with B >= 4 fail fast with a shared-memory diagnostic.
+    #[arg(long)]
+    dflash_block: Option<usize>,
+
+    /// Override the DFlash tap layers as a comma-separated list of
+    /// target-model layer indices (e.g. `1,8,15,22,29`). Must match the
+    /// count implied by the draft's `fc.in_features`. Defaults to the
+    /// checkpoint's `dflash_config.target_layer_ids`.
+    #[arg(long)]
+    dflash_tap_layers: Option<String>,
+
 }
 
 fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
@@ -519,13 +549,86 @@ fn main() -> Result<()> {
         }
     };
 
-    if model_variant.family() == ModelFamily::Gemma4 {
-        return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
+    // DFlash validation runs BEFORE the family dispatch so a misconfig on
+    // non-Qwen families fails fast. The dispatch below returns for Gemma4/
+    // Phi4 — if we deferred these checks until the Qwen branch, callers
+    // would see --dflash / --dflash-draft-dir / etc. silently ignored on
+    // other model families and think speculative decoding was enabled
+    // when it wasn't.
+    if cli.dflash && !matches!(model_variant.family(), ModelFamily::Qwen35) {
+        anyhow::bail!(
+            "--dflash is only supported on Qwen3.5 family models (got family={:?}, model={model_variant}).",
+            model_variant.family(),
+        );
     }
+    if !cli.dflash
+        && (cli.dflash_draft_dir.is_some()
+            || cli.dflash_block.is_some()
+            || cli.dflash_tap_layers.is_some())
+    {
+        anyhow::bail!("--dflash-* flags require --dflash");
+    }
+
+    match model_variant.family() {
+        ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
+        ModelFamily::Phi4 => {
+            return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
+        }
+        ModelFamily::Qwen35 => {}
+    }
+
+    if cli.dflash {
+        // DFlash needs the target's HF metadata (config.json + tokenizer.json)
+        // and the INT4 bake. Reuse the same download hooks as the regular
+        // Qwen35 path so the dflash dispatch is self-contained on a fresh
+        // machine: ensure_hf_metadata_present fetches HF metadata from the
+        // bake tarball if config.json is missing, then we verify or download
+        // the INT4 bake itself.
+        ensure_hf_metadata_present(&cli, &model_variant)?;
+        if !cli.no_bake {
+            let variant = model_store::fetch::BakeVariant::Int4Gptq;
+            let bake_dir = variant.bake_dir(&cli.model_dir);
+            let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+                .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
+            if cli.download_bake || !model_store::version_ok(&bake_dir) {
+                let canonical_model = model_variant.to_string();
+                match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
+                    Ok(true) => {
+                        eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
+                    }
+                    Ok(false) => {
+                        anyhow::bail!(
+                            "no INT4 bake at {} and --no-download set.\n\
+                             Run:\n  python oracle/bake_int4.py --model-dir {}",
+                            bake_dir.display(),
+                            cli.model_dir.display(),
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "could not obtain INT4 bake for --dflash: {e}\n\n\
+                             INT4 baking requires a GPTQ calibration pass in Python. \
+                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
+                            cli.model_dir.display(),
+                        );
+                    }
+                }
+            }
+        }
+        return qwen35_dflash_engine::run_qwen35_dflash(
+            &cli,
+            &model_variant,
+            entry,
+            ordinal,
+            total_vram,
+        );
+    }
+    // --dflash-* guard already ran before the family dispatch above.
 
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+        FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
     };
 
     // INT4 decode only lives in full_attention_4b.hip; the 0.8B-native kernel
@@ -877,6 +980,7 @@ fn main() -> Result<()> {
                 layer_mlp_swiglu_trace: None,
                 layer_mlp_out_trace: None,
                 layer_hidden_trace: None,
+                tap_hiddens: None,
                 linear_debug_trace: None,
             }
         };
@@ -1512,6 +1616,7 @@ fn run_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {

@@ -1,7 +1,9 @@
 mod ffi;
 mod layer_desc;
+pub mod dflash;
 pub mod prefill_ffi;
 pub mod gemma4;
+pub mod phi4;
 
 pub use ffi::{
     matmul_rhs_transposed_4b, persistent_decode, persistent_decode_4b, query_gpu_info, rms_norm,

@@ -69,6 +69,9 @@ unsafe extern "C" {
         batch_size: usize,            // 1 for single-sequence (default), >1 for batched
         batch_descs: *const c_void,   // nullptr for single-sequence, BatchSeqDesc[] for batched
         int4_scales: *const c_void,   // nullptr for non-INT4, pointer to INT4ScaleDesc[] for INT4
+        tap_workspace: *mut c_void,   // nullptr for non-DFlash, [num_taps * hidden_dim] T for DFlash
+        tap_layers: *const c_int,     // nullptr when tap_workspace is nullptr
+        num_taps: usize,              // 0 when tap_workspace is nullptr
     ) -> c_int;
 
     fn dotcache_qwen35_4b_hip_rms_norm(
@@ -216,6 +219,11 @@ pub fn persistent_decode(
 /// `batch_size`: number of sequences (1 = single-sequence, default).
 /// `batch_descs`: when Some, contains BatchSeqDesc array on GPU for per-sequence state.
 /// `int4_scale_descs`: when Some, contains INT4ScaleDesc array on GPU for INT4 dequant.
+/// `tap_workspace` / `tap_layers`: DFlash hidden-state taps. When `tap_workspace` is Some,
+///   the kernel mirrors the per-layer post-MLP residual hidden state for each layer in
+///   `tap_layers` into `tap_workspace` at offset `i * hidden_dim` (i = tap index, not layer
+///   index). Both must be Some together or both None. The kernel body short-circuits the
+///   tap write when `tap_workspace` is null to preserve gfx1150 codegen on the hot path.
 pub fn persistent_decode_4b(
     ordinal: usize,
     dtype: ScalarType,
@@ -237,6 +245,8 @@ pub fn persistent_decode_4b(
     batch_size: usize,
     batch_descs: Option<&GpuBuffer>,
     int4_scale_descs: Option<&GpuBuffer>,
+    tap_workspace: Option<&mut GpuBuffer>,
+    tap_layers: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr();
@@ -258,6 +268,21 @@ pub fn persistent_decode_4b(
     let int4_scales_ptr = int4_scale_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
+
+    // num_taps is derived from tap_layers length (4-byte ints). Both must be Some or both None.
+    let (tap_ws_ptr, tap_layers_ptr, num_taps) = match (tap_workspace, tap_layers) {
+        (Some(ws), Some(layers)) => (
+            ws.as_mut_ptr(),
+            layers.as_ptr() as *const c_int,
+            layers.len_bytes() / std::mem::size_of::<c_int>(),
+        ),
+        (None, None) => (std::ptr::null_mut(), std::ptr::null::<c_int>(), 0),
+        _ => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b: tap_workspace and tap_layers must both be Some or both None".into(),
+            ));
+        }
+    };
 
     let status = match backend {
         Backend::Hip => {
@@ -286,6 +311,9 @@ pub fn persistent_decode_4b(
                     batch_size,
                     batch_descs_ptr,
                     int4_scales_ptr,
+                    tap_ws_ptr,
+                    tap_layers_ptr,
+                    num_taps,
                 )
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -319,6 +347,9 @@ pub fn persistent_decode_4b(
                     batch_size,
                     batch_descs_ptr,
                     int4_scales_ptr,
+                    tap_ws_ptr,
+                    tap_layers_ptr,
+                    num_taps,
                 )
             }
             #[cfg(not(supersonic_backend_cuda))]

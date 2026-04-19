@@ -18,7 +18,7 @@ fn gemma4_oracle_json_deserializes_into_oracle_output() {
     let parsed: oracle::OracleOutput =
         serde_json::from_str(&raw).expect("fixture should deserialize into OracleOutput");
 
-    assert_eq!(parsed.prompt_tokens, 4);
+    assert_eq!(parsed.prompt_tokens, Some(4));
     assert_eq!(parsed.generated_tokens, 4);
     assert_eq!(parsed.generated_token_ids.len(), parsed.generated_tokens);
     assert_eq!(parsed.decode_logits.len(), parsed.generated_tokens);

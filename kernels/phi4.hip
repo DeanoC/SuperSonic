@@ -6,55 +6,33 @@
 #include <math.h>
 #include <stdint.h>
 
-// Weight descriptor for the persistent decode megakernel.
-// One struct per decoder layer (24 total for Qwen3.5-0.8B).
+// Weight descriptor for the Phi-4-mini persistent decode megakernel.
+// One struct per decoder layer (32 total for Phi-4-mini).
+// Phi-4-mini is pure full-attention: no linear/hybrid layers, no Q/K-norm.
 // Immutable weight pointers are const; mutable state pointers are non-const.
-struct Qwen35DecodeLayerDesc {
-    int layer_type;                    // 0=linear_attention, 1=full_attention
-    int intermediate_size;             // MLP intermediate dim (3584)
-    // --- RMSNorm weights (both layer types) ---
+// Struct layout must match kernel_ffi::phi4::Phi4DecodeLayerDesc in Rust.
+struct Phi4DecodeLayerDesc {
+    int intermediate_size;             // MLP intermediate dim (8192)
+    int rot_dim;                       // partial rotary dim (96 for Phi-4-mini; rot_dim <= head_dim, even)
+    // --- RMSNorm weights ---
     const void* input_norm_w;          // [hidden_size] BF16
     float input_norm_eps;
     const void* post_attn_norm_w;      // [hidden_size] BF16
     float post_attn_norm_eps;
-    // --- MLP weights (both layer types) ---
+    // --- MLP weights (SwiGLU) ---
     const void* gate_proj_w;           // [intermediate_size, hidden_size] BF16
     const void* up_proj_w;             // [intermediate_size, hidden_size] BF16
     const void* down_proj_w;           // [hidden_size, intermediate_size] BF16
-    // --- Linear attention weights (layer_type==0) ---
-    const void* qkv_proj_w;           // [6144, hidden_size] BF16
-    int qkv_out_dim;                   // 6144
-    const void* z_proj_w;             // [2048, hidden_size] BF16
-    int z_out_dim;                     // 2048
-    const void* b_proj_w;             // [16, hidden_size] BF16
-    const void* a_proj_w;             // [16, hidden_size] BF16
-    const void* conv1d_w;             // [6144, 1, 4] BF16 (depthwise)
-    int conv_kernel_size;              // 4
-    const void* linear_out_proj_w;    // [hidden_size, 2048] BF16
-    int linear_value_dim;              // 2048
-    int linear_num_v_heads;            // 16
-    int linear_head_k_dim;             // 128
-    int linear_head_v_dim;             // 128
-    const void* dt_bias_w;             // [num_v_heads] BF16 (decay bias)
-    const void* a_log_exp_w;           // [num_v_heads] BF16 (decay scaling)
-    const void* linear_norm_w;         // [value_dim] BF16 (gated RMSNorm weight)
-    float linear_norm_eps;              // gated RMSNorm epsilon
-    void* conv_state;                  // [6144, 3] BF16 mutable
-    void* recurrent_state;             // [num_v_heads, head_k_dim, head_v_dim] F32 mutable
-    // --- Full attention weights (layer_type==1) ---
-    const void* q_proj_w;             // [4096, hidden_size] BF16
-    int q_out_dim;                     // 4096
-    const void* k_proj_w;             // [512, hidden_size] BF16
-    int k_out_dim;                     // 512
-    const void* v_proj_w;             // [512, hidden_size] BF16
-    const void* o_proj_w;             // [hidden_size, 2048] BF16
-    int attn_head_dim;                 // 256
-    int attn_num_heads;                // 8
-    int attn_num_kv_heads;             // 2
-    const void* q_norm_w;             // [head_dim] BF16
-    const void* k_norm_w;             // [head_dim] BF16
-    float q_norm_eps;
-    float k_norm_eps;
+    // --- Full attention weights (GQA 3:1 for Phi-4-mini) ---
+    const void* q_proj_w;              // [q_out_dim, hidden_size] BF16
+    int q_out_dim;                     // 24 * 128 = 3072
+    const void* k_proj_w;              // [k_out_dim, hidden_size] BF16
+    int k_out_dim;                     // 8 * 128 = 1024
+    const void* v_proj_w;              // [k_out_dim, hidden_size] BF16 (same shape as K)
+    const void* o_proj_w;              // [hidden_size, q_out_dim] BF16
+    int attn_head_dim;                 // 128
+    int attn_num_heads;                // 24
+    int attn_num_kv_heads;             // 8
     void* kv_cache_k;                  // [num_kv_heads, max_T, head_dim] BF16 mutable
     void* kv_cache_v;                  // [num_kv_heads, max_T, head_dim] BF16 mutable
     int kv_len;                        // current cache length before this token
@@ -71,17 +49,11 @@ struct Qwen35DecodeLayerDesc {
 // FP8 scale_inv pointers for runtime dequantization.
 // One per decoder layer, passed as a separate kernel parameter.
 // Struct layout must match kernel_ffi::FP8ScaleDesc in Rust.
-struct Qwen35FP8ScaleDesc {
-    // Common MLP weights
+struct Phi4FP8ScaleDesc {
+    // MLP weights
     const void* gate_proj_scale;
     const void* up_proj_scale;
     const void* down_proj_scale;
-    // Linear attention weights
-    const void* qkv_proj_scale;
-    const void* z_proj_scale;
-    const void* b_proj_scale;
-    const void* a_proj_scale;
-    const void* linear_out_proj_scale;
     // Full attention weights
     const void* q_proj_scale;
     const void* k_proj_scale;
@@ -148,19 +120,19 @@ __device__ __forceinline__ float bf16_round_rne_f32_finite(float x) {
 
 // KV cache FP8 scale pointers for dynamic quantization.
 // One per decoder layer, passed as a separate kernel parameter.
-// Struct layout must match kernel_ffi::KVCacheFp8Desc in Rust.
-struct KVCacheFp8Desc {
+// Struct layout must match kernel_ffi::Phi4KVCacheFp8Desc in Rust.
+struct Phi4KVCacheFp8Desc {
     void* kv_scale_k;   // [num_kv_heads, max_T] F32 — per-head-per-position absmax scale
     void* kv_scale_v;   // [num_kv_heads, max_T] F32
 };
 
 // Per-sequence state pointers for batched decode.
-// One per layer (parallel to Qwen35DecodeLayerDesc).
+// One per layer (parallel to Phi4DecodeLayerDesc).
 // When batch_size > 1, the kernel reads per-sequence state from here
-// instead of from Qwen35DecodeLayerDesc.
-// Struct layout must match kernel_ffi::BatchSeqDesc in Rust.
+// instead of from Phi4DecodeLayerDesc.
+// Struct layout must match kernel_ffi::Phi4BatchSeqDesc in Rust.
 #define MAX_BATCH_SIZE 8
-struct BatchSeqDesc {
+struct Phi4BatchSeqDesc {
     int seqlen_offset[MAX_BATCH_SIZE];
     // Full attention per-sequence
     void* kv_cache_k[MAX_BATCH_SIZE];
@@ -170,9 +142,6 @@ struct BatchSeqDesc {
     void* kv_shadow_k[MAX_BATCH_SIZE];
     void* kv_shadow_v[MAX_BATCH_SIZE];
     int kv_shadow_start[MAX_BATCH_SIZE];
-    // Linear attention per-sequence
-    void* conv_state[MAX_BATCH_SIZE];
-    void* recurrent_state[MAX_BATCH_SIZE];
     // FP8 KV scales per-sequence
     void* kv_scale_k[MAX_BATCH_SIZE];
     void* kv_scale_v[MAX_BATCH_SIZE];
@@ -260,21 +229,14 @@ __device__ inline float fp8_dequant_weight_lut(
 // Struct layout must match kernel_ffi::INT4ScaleDesc in Rust.
 // Weights are packed as 2×INT4 per byte (low nibble = even col, high nibble = odd col).
 // Asymmetric quantization: dequant = (int4_val - zero) * scale
-struct Qwen35INT4ScaleDesc {
-    // Common MLP weights
+struct Phi4INT4ScaleDesc {
+    // MLP weights
     const void* gate_proj_scale;
     const void* gate_proj_zero;
     const void* up_proj_scale;
     const void* up_proj_zero;
     const void* down_proj_scale;
     const void* down_proj_zero;
-    // Linear attention weights
-    const void* qkv_proj_scale;
-    const void* qkv_proj_zero;
-    const void* z_proj_scale;
-    const void* z_proj_zero;
-    const void* linear_out_proj_scale;
-    const void* linear_out_proj_zero;
     // Full attention weights
     const void* q_proj_scale;
     const void* q_proj_zero;
@@ -373,42 +335,42 @@ __device__ inline float int4_dequant_scalar(
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_to_float(T value);
+__device__ inline float phi4_to_float(T value);
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<__half>(__half value) {
+__device__ inline float phi4_to_float<__half>(__half value) {
     return __half2float(value);
 }
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<float>(float value) {
+__device__ inline float phi4_to_float<float>(float value) {
     return value;
 }
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<hip_bfloat16>(hip_bfloat16 value) {
+__device__ inline float phi4_to_float<hip_bfloat16>(hip_bfloat16 value) {
     return static_cast<float>(value);
 }
 
 template <typename T>
-__device__ inline T dotcache_qwen35_from_float(float value);
+__device__ inline T phi4_from_float(float value);
 
 template <>
-__device__ inline __half dotcache_qwen35_from_float<__half>(float value) {
+__device__ inline __half phi4_from_float<__half>(float value) {
     return __float2half(value);
 }
 
 template <>
-__device__ inline float dotcache_qwen35_from_float<float>(float value) {
+__device__ inline float phi4_from_float<float>(float value) {
     return value;
 }
 
 template <>
-__device__ inline hip_bfloat16 dotcache_qwen35_from_float<hip_bfloat16>(float value) {
+__device__ inline hip_bfloat16 phi4_from_float<hip_bfloat16>(float value) {
     return hip_bfloat16(value);
 }
 
-__device__ inline float dotcache_qwen35_binary_op_apply(int op, float lhs, float rhs) {
+__device__ inline float phi4_binary_op_apply(int op, float lhs, float rhs) {
     switch (op) {
     case 0:
         return lhs + rhs;
@@ -423,7 +385,7 @@ __device__ inline float dotcache_qwen35_binary_op_apply(int op, float lhs, float
     }
 }
 
-__device__ inline size_t dotcache_qwen35_broadcast_elem_index(
+__device__ inline size_t phi4_broadcast_elem_index(
     size_t out_index,
     int rank,
     const int* out_dims,
@@ -446,20 +408,20 @@ __device__ inline size_t dotcache_qwen35_broadcast_elem_index(
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_dot_row(
+__device__ inline float phi4_dot_row(
     const T* lhs,
     const T* rhs,
     int size
 ) {
     float dot = 0.0f;
     for (int idx = 0; idx < size; ++idx) {
-        dot += dotcache_qwen35_to_float(lhs[idx]) * dotcache_qwen35_to_float(rhs[idx]);
+        dot += phi4_to_float(lhs[idx]) * phi4_to_float(rhs[idx]);
     }
     return dot;
 }
 
 template <>
-__device__ inline float dotcache_qwen35_dot_row<__half>(
+__device__ inline float phi4_dot_row<__half>(
     const __half* lhs,
     const __half* rhs,
     int size
@@ -478,46 +440,46 @@ __device__ inline float dotcache_qwen35_dot_row<__half>(
     return dot;
 }
 
-__device__ inline float dotcache_qwen35_exp_fast(float x) {
+__device__ inline float phi4_exp_fast(float x) {
     return __expf(x);
 }
 
-__device__ inline float dotcache_qwen35_sigmoid_fast(float x) {
+__device__ inline float phi4_sigmoid_fast(float x) {
     if (x >= 0.0f) {
-        const float e = dotcache_qwen35_exp_fast(-x);
+        const float e = phi4_exp_fast(-x);
         return 1.0f / (1.0f + e);
     }
-    const float e = dotcache_qwen35_exp_fast(x);
+    const float e = phi4_exp_fast(x);
     return e / (1.0f + e);
 }
 
-__device__ inline float dotcache_qwen35_softplus_fast(float x) {
+__device__ inline float phi4_softplus_fast(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return dotcache_qwen35_exp_fast(x);
-    return log1pf(dotcache_qwen35_exp_fast(x));
+    if (x < -20.0f) return phi4_exp_fast(x);
+    return log1pf(phi4_exp_fast(x));
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3(
+__device__ inline float phi4_conv4_contiguous_t_ge3(
     const T* mixed_qkv,
     size_t mixed_c_offset,
     size_t t,
     const T* weights,
     size_t weight_offset
 ) {
-    const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-    const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-    const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-    const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-    const float x0 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 3)]);
-    const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 2)]);
-    const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 1)]);
-    const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + t]);
+    const float w0 = phi4_to_float(weights[weight_offset]);
+    const float w1 = phi4_to_float(weights[weight_offset + 1]);
+    const float w2 = phi4_to_float(weights[weight_offset + 2]);
+    const float w3 = phi4_to_float(weights[weight_offset + 3]);
+    const float x0 = phi4_to_float(mixed_qkv[mixed_c_offset + (t - 3)]);
+    const float x1 = phi4_to_float(mixed_qkv[mixed_c_offset + (t - 2)]);
+    const float x2 = phi4_to_float(mixed_qkv[mixed_c_offset + (t - 1)]);
+    const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + t]);
     return ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
 }
 
 template <>
-__device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3<__half>(
+__device__ inline float phi4_conv4_contiguous_t_ge3<__half>(
     const __half* mixed_qkv,
     size_t mixed_c_offset,
     size_t t,
@@ -542,7 +504,7 @@ __device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3<__half>(
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_conv4_state3_decode(
+__device__ inline float phi4_conv4_state3_decode(
     const T* mixed_qkv,
     size_t mixed_offset,
     const T* prev_state,
@@ -550,19 +512,19 @@ __device__ inline float dotcache_qwen35_conv4_state3_decode(
     const T* weights,
     size_t weight_offset
 ) {
-    const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-    const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-    const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-    const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-    const float x0 = dotcache_qwen35_to_float(prev_state[state_offset]);
-    const float x1 = dotcache_qwen35_to_float(prev_state[state_offset + 1]);
-    const float x2 = dotcache_qwen35_to_float(prev_state[state_offset + 2]);
-    const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_offset]);
+    const float w0 = phi4_to_float(weights[weight_offset]);
+    const float w1 = phi4_to_float(weights[weight_offset + 1]);
+    const float w2 = phi4_to_float(weights[weight_offset + 2]);
+    const float w3 = phi4_to_float(weights[weight_offset + 3]);
+    const float x0 = phi4_to_float(prev_state[state_offset]);
+    const float x1 = phi4_to_float(prev_state[state_offset + 1]);
+    const float x2 = phi4_to_float(prev_state[state_offset + 2]);
+    const float x3 = phi4_to_float(mixed_qkv[mixed_offset]);
     return ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
 }
 
 template <>
-__device__ inline float dotcache_qwen35_conv4_state3_decode<__half>(
+__device__ inline float phi4_conv4_state3_decode<__half>(
     const __half* mixed_qkv,
     size_t mixed_offset,
     const __half* prev_state,
@@ -587,7 +549,7 @@ __device__ inline float dotcache_qwen35_conv4_state3_decode<__half>(
     return (f01.x + f01.y) + (f23.x + f23.y);
 }
 
-__device__ inline float dotcache_qwen35_wave_sum(float value) {
+__device__ inline float phi4_wave_sum(float value) {
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         value += __shfl_down(value, offset);
     }
@@ -595,7 +557,7 @@ __device__ inline float dotcache_qwen35_wave_sum(float value) {
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_full_attention_prefill_kernel(
+__global__ void phi4_full_attention_prefill_kernel(
     int batch_size,
     int q_heads,
     int kv_heads,
@@ -659,9 +621,9 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 
             float partial = 0.0f;
             for (int d = lane; d < head_dim; d += warpSize) {
-                partial += dotcache_qwen35_to_float(q_row[d]) * dotcache_qwen35_to_float(k_row[d]);
+                partial += phi4_to_float(q_row[d]) * phi4_to_float(k_row[d]);
             }
-            float score = dotcache_qwen35_wave_sum(partial) * scale;
+            float score = phi4_wave_sum(partial) * scale;
 
             if (lane == 0) {
                 if (!isfinite(running_max)) {
@@ -686,12 +648,12 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 
             if (shared_curr_scale == 1.0f && shared_prev_scale == 0.0f) {
                 for (int i = 0; i < local_count; ++i) {
-                    local_acc[i] = dotcache_qwen35_to_float(v_row[local_dims[i]]);
+                    local_acc[i] = phi4_to_float(v_row[local_dims[i]]);
                 }
             } else {
                 for (int i = 0; i < local_count; ++i) {
                     local_acc[i] = local_acc[i] * shared_prev_scale +
-                        shared_curr_scale * dotcache_qwen35_to_float(v_row[local_dims[i]]);
+                        shared_curr_scale * phi4_to_float(v_row[local_dims[i]]);
                 }
             }
             __syncthreads();
@@ -709,7 +671,7 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_prefill_conv_pack_kernel(
+__global__ void phi4_linear_prefill_conv_pack_kernel(
     int batch_size,
     int conv_dim,
     int total_len,
@@ -738,16 +700,16 @@ __global__ void dotcache_qwen35_linear_prefill_conv_pack_kernel(
 
     float acc = 0.0f;
     for (int tap = 0; tap < kernel_size; ++tap) {
-        acc += dotcache_qwen35_to_float(mixed_qkv[input_c_offset + t + static_cast<size_t>(tap)]) *
-            dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+        acc += phi4_to_float(mixed_qkv[input_c_offset + t + static_cast<size_t>(tap)]) *
+            phi4_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
     }
 
-    const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-    out[tid] = dotcache_qwen35_from_float<T>(silu);
+    const float silu = acc * phi4_sigmoid_fast(acc);
+    out[tid] = phi4_from_float<T>(silu);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_kernel(
+__global__ void phi4_linear_stateful_conv_kernel(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -784,22 +746,22 @@ __global__ void dotcache_qwen35_linear_stateful_conv_kernel(
         const int src = static_cast<int>(t) + tap - history;
         float x = 0.0f;
         if (src >= 0) {
-            x = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
+            x = phi4_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
         } else {
             const int state_idx = state_len + src;
             if (state_idx >= 0) {
-                x = dotcache_qwen35_to_float(prev_state[state_c_offset + static_cast<size_t>(state_idx)]);
+                x = phi4_to_float(prev_state[state_c_offset + static_cast<size_t>(state_idx)]);
             }
         }
-        acc += x * dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+        acc += x * phi4_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
     }
 
-    const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-    out[tid] = dotcache_qwen35_from_float<T>(silu);
+    const float silu = acc * phi4_sigmoid_fast(acc);
+    out[tid] = phi4_from_float<T>(silu);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
+__global__ void phi4_linear_stateful_conv_value_decay_kernel(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -842,20 +804,20 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
             const int src = static_cast<int>(t) + tap - history;
             float x = 0.0f;
             if (src >= 0) {
-                x = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
+                x = phi4_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
             } else {
                 const int state_idx = state_len + src;
                 if (state_idx >= 0) {
-                    x = dotcache_qwen35_to_float(
+                    x = phi4_to_float(
                         prev_state[state_c_offset + static_cast<size_t>(state_idx)]
                     );
                 }
             }
-            acc += x * dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+            acc += x * phi4_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
         }
 
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * phi4_sigmoid_fast(acc);
+        out[tid] = phi4_from_float<T>(silu);
         return;
     }
 
@@ -863,15 +825,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
+    const float a_val = phi4_to_float(a[a_base + head]);
+    const float bias = phi4_to_float(dt_bias[head]);
+    const float decay = phi4_to_float(a_log_exp[head]);
     const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    out[tid] = phi4_from_float<T>(-softplus * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
+__global__ void phi4_linear_stateful_conv_value_decay_kernel_k4s3(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -908,41 +870,41 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
 
         float acc;
         if (t >= 3) {
-            acc = dotcache_qwen35_conv4_contiguous_t_ge3(
+            acc = phi4_conv4_contiguous_t_ge3(
                 mixed_qkv, mixed_c_offset, t, weights, weight_offset);
         } else if (t == 2) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x1 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x2 = phi4_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 2]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else if (t == 1) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 1]);
+            const float x1 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x2 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 1]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 0]);
+            const float x1 = phi4_to_float(prev_state[state_c_offset + 1]);
+            const float x2 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         }
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * phi4_sigmoid_fast(acc);
+        out[tid] = phi4_from_float<T>(silu);
         return;
     }
 
@@ -950,15 +912,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
+    const float a_val = phi4_to_float(a[a_base + head]);
+    const float bias = phi4_to_float(dt_bias[head]);
+    const float decay = phi4_to_float(a_log_exp[head]);
     const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    out[tid] = phi4_from_float<T>(-softplus * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3(
+__global__ void phi4_linear_stateful_conv_value_decay_with_state_kernel_k4s3(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -1006,41 +968,41 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kern
 
         float acc;
         if (t >= 3) {
-            acc = dotcache_qwen35_conv4_contiguous_t_ge3(
+            acc = phi4_conv4_contiguous_t_ge3(
                 mixed_qkv, mixed_c_offset, t, weights, weight_offset);
         } else if (t == 2) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x1 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x2 = phi4_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 2]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else if (t == 1) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 1]);
+            const float x1 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x2 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 1]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float w0 = phi4_to_float(weights[weight_offset]);
+            const float w1 = phi4_to_float(weights[weight_offset + 1]);
+            const float w2 = phi4_to_float(weights[weight_offset + 2]);
+            const float w3 = phi4_to_float(weights[weight_offset + 3]);
+            const float x0 = phi4_to_float(prev_state[state_c_offset + 0]);
+            const float x1 = phi4_to_float(prev_state[state_c_offset + 1]);
+            const float x2 = phi4_to_float(prev_state[state_c_offset + 2]);
+            const float x3 = phi4_to_float(mixed_qkv[mixed_c_offset + 0]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         }
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * phi4_sigmoid_fast(acc);
+        out[tid] = phi4_from_float<T>(silu);
         return;
     }
 
@@ -1048,15 +1010,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kern
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
+    const float a_val = phi4_to_float(a[a_base + head]);
+    const float bias = phi4_to_float(dt_bias[head]);
+    const float decay = phi4_to_float(a_log_exp[head]);
     const float softplus = logf(1.0f + expf(a_val + bias));
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    out[tid] = phi4_from_float<T>(-softplus * decay);
 }
 
 template <typename T, int MAX_K = 256>
-__global__ void dotcache_qwen35_linear_decode_prepare_kernel(
+__global__ void phi4_linear_decode_prepare_kernel(
     int batch_size,
     int num_v_heads,
     int head_k_dim,
@@ -1096,7 +1058,7 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
         const int state_base = state_batch_base + channel * state_len;
         float acc = 0.0f;
         if (kernel_size == 4 && state_len == 3) {
-            acc = dotcache_qwen35_conv4_state3_decode(
+            acc = phi4_conv4_state3_decode(
                 mixed_qkv,
                 static_cast<size_t>(mixed_batch_base + channel),
                 prev_conv_state,
@@ -1107,15 +1069,15 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
             for (int tap = 0; tap < kernel_size; ++tap) {
                 float x = 0.0f;
                 if (tap + 1 == kernel_size) {
-                    x = dotcache_qwen35_to_float(mixed_qkv[mixed_batch_base + channel]);
+                    x = phi4_to_float(mixed_qkv[mixed_batch_base + channel]);
                 } else if (tap < state_len) {
-                    x = dotcache_qwen35_to_float(prev_conv_state[state_base + tap]);
+                    x = phi4_to_float(prev_conv_state[state_base + tap]);
                 }
-                acc += x * dotcache_qwen35_to_float(weights[weight_base + tap]);
+                acc += x * phi4_to_float(weights[weight_base + tap]);
             }
         }
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        return dotcache_qwen35_to_float(dotcache_qwen35_from_float<T>(silu));
+        const float silu = acc * phi4_sigmoid_fast(acc);
+        return phi4_to_float(phi4_from_float<T>(silu));
     };
 
     __shared__ float shared_q[MAX_K];
@@ -1142,12 +1104,12 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
             out[pair_out_base + head_k_dim + k_idx] = shared_k[k_idx] * k_inv;
         }
         const int head_base = batch * (2 * num_v_heads) + v_head;
-        const float a_raw = dotcache_qwen35_to_float(a_beta_raw[head_base]);
-        const float beta_raw = dotcache_qwen35_to_float(a_beta_raw[head_base + num_v_heads]);
+        const float a_raw = phi4_to_float(a_beta_raw[head_base]);
+        const float beta_raw = phi4_to_float(a_beta_raw[head_base + num_v_heads]);
         out[pair_out_base + 2 * head_k_dim + head_v_dim] =
             1.0f / (1.0f + expf(-beta_raw));
-        const float bias = dotcache_qwen35_to_float(dt_bias[v_head]);
-        const float decay = dotcache_qwen35_to_float(a_log_exp[v_head]);
+        const float bias = phi4_to_float(dt_bias[v_head]);
+        const float decay = phi4_to_float(a_log_exp[v_head]);
         const float g = -logf(1.0f + expf(a_raw + bias)) * decay;
         out[pair_out_base + 2 * head_k_dim + head_v_dim + 1] = expf(g);
     }
@@ -1158,7 +1120,7 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
 }
 
 template <int MAX_K = 256>
-__global__ void dotcache_qwen35_linear_decode_apply_kernel(
+__global__ void phi4_linear_decode_apply_kernel(
     int batch_size,
     int num_v_heads,
     int head_k_dim,
@@ -1214,7 +1176,7 @@ __global__ void dotcache_qwen35_linear_decode_apply_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
+__device__ inline void phi4_delta_recurrent_prefill_impl(
     int batch_heads,
     int seq_len,
     int k_head_dim,
@@ -1243,13 +1205,13 @@ __device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < seq_len; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(phi4_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -1260,32 +1222,32 @@ __device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * phi4_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (phi4_to_float(value[value_row + v_idx]) - kv_mem) *
+            phi4_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += phi4_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * phi4_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = phi4_from_float<T>(out_t);
     }
 
     const int state_out = out_base + seq_len * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
+__global__ void phi4_delta_recurrent_prefill_kernel(
     int batch_heads,
     int seq_len,
     int k_head_dim,
@@ -1299,7 +1261,7 @@ __global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_recurrent_prefill_impl(
+    phi4_delta_recurrent_prefill_impl(
         batch_heads,
         seq_len,
         k_head_dim,
@@ -1316,7 +1278,7 @@ __global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_step_impl(
+__device__ inline void phi4_delta_chunk_step_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1345,13 +1307,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_step_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             prev_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < chunk_size; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(phi4_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -1362,32 +1324,32 @@ __device__ inline void dotcache_qwen35_delta_chunk_step_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * phi4_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (phi4_to_float(value[value_row + v_idx]) - kv_mem) *
+            phi4_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += phi4_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * phi4_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = phi4_from_float<T>(out_t);
     }
 
     const int state_out = out_base + chunk_size * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_step_kernel(
+__global__ void phi4_delta_chunk_step_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1401,7 +1363,7 @@ __global__ void dotcache_qwen35_delta_chunk_step_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_step_impl(
+    phi4_delta_chunk_step_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -1418,7 +1380,7 @@ __global__ void dotcache_qwen35_delta_chunk_step_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
+__device__ inline void phi4_delta_chunk_scan_raw_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1449,13 +1411,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < total_tokens; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(phi4_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -1466,32 +1428,32 @@ __device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * phi4_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (phi4_to_float(value[value_row + v_idx]) - kv_mem) *
+            phi4_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += phi4_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * phi4_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = phi4_from_float<T>(out_t);
     }
 
     const int state_out = out_base + total_tokens * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
+__global__ void phi4_delta_chunk_scan_raw_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1506,7 +1468,7 @@ __global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_scan_raw_impl(
+    phi4_delta_chunk_scan_raw_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -1524,7 +1486,7 @@ __global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_state_scan_impl(
+__device__ inline void phi4_delta_state_scan_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1549,15 +1511,15 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         const int idx = bh * state_stride + k_idx * v_head_dim + v_idx;
-        state[k_idx] = dotcache_qwen35_to_float(initial_state[idx]);
-        out[idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        state[k_idx] = phi4_to_float(initial_state[idx]);
+        out[idx] = phi4_from_float<T>(state[k_idx]);
     }
 
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
         const int packed_chunk_base = ((bh * num_chunks) + chunk) * chunk_size * packed_width;
         const int value_chunk_base = ((bh * num_chunks) + chunk) * chunk_size * v_head_dim;
         const float state_decay =
-            dotcache_qwen35_to_float(packed_scan[packed_chunk_base + 2 * k_head_dim]);
+            phi4_to_float(packed_scan[packed_chunk_base + 2 * k_head_dim]);
         float update[MAX_K];
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             update[k_idx] = 0.0f;
@@ -1568,12 +1530,12 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
             const int value_row = value_chunk_base + t * v_head_dim;
             float v_prime = 0.0f;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(packed_scan[packed_row + k_head_dim + k_idx]) *
+                v_prime += phi4_to_float(packed_scan[packed_row + k_head_dim + k_idx]) *
                     state[k_idx];
             }
-            const float v_new = dotcache_qwen35_to_float(value[value_row + v_idx]) - v_prime;
+            const float v_new = phi4_to_float(value[value_row + v_idx]) - v_prime;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                update[k_idx] += dotcache_qwen35_to_float(packed_scan[packed_row + k_idx]) * v_new;
+                update[k_idx] += phi4_to_float(packed_scan[packed_row + k_idx]) * v_new;
             }
         }
 
@@ -1581,13 +1543,13 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             state[k_idx] = state_decay * state[k_idx] + update[k_idx];
             out[out_chunk_base + k_idx * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(state[k_idx]);
+                phi4_from_float<T>(state[k_idx]);
         }
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_state_scan_kernel(
+__global__ void phi4_delta_state_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1599,7 +1561,7 @@ __global__ void dotcache_qwen35_delta_state_scan_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_state_scan_impl(
+    phi4_delta_state_scan_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -1614,7 +1576,7 @@ __global__ void dotcache_qwen35_delta_state_scan_kernel(
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
+__device__ inline void phi4_delta_chunk_fused_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1641,7 +1603,7 @@ __device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             prev_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -1654,33 +1616,33 @@ __device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
         float attn = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             v_prime +=
-                dotcache_qwen35_to_float(packed_chunk[packed_row + k_head_dim + k_idx]) *
+                phi4_to_float(packed_chunk[packed_row + k_head_dim + k_idx]) *
                 state[k_idx];
             attn +=
-                dotcache_qwen35_to_float(packed_chunk[packed_row + 2 * k_head_dim + k_idx]) *
+                phi4_to_float(packed_chunk[packed_row + 2 * k_head_dim + k_idx]) *
                 state[k_idx];
         }
-        v_new[t] = dotcache_qwen35_to_float(value[value_base + t * v_head_dim + v_idx]) - v_prime;
+        v_new[t] = phi4_to_float(value[value_base + t * v_head_dim + v_idx]) - v_prime;
         attn_inter[t] = attn;
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(v_new[t]);
+        out[out_base + t * v_head_dim + v_idx] = phi4_from_float<T>(v_new[t]);
         out[out_base + (chunk_size + t) * v_head_dim + v_idx] =
-            dotcache_qwen35_from_float<T>(attn_inter[t]);
+            phi4_from_float<T>(attn_inter[t]);
     }
 
-    const float state_decay = dotcache_qwen35_to_float(packed_chunk[packed_base + 3 * k_head_dim]);
+    const float state_decay = phi4_to_float(packed_chunk[packed_base + 3 * k_head_dim]);
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         float update = 0.0f;
         for (int t = 0; t < chunk_size; ++t) {
             const int packed_row = packed_base + t * packed_width;
-            update += dotcache_qwen35_to_float(packed_chunk[packed_row + k_idx]) * v_new[t];
+            update += phi4_to_float(packed_chunk[packed_row + k_idx]) * v_new[t];
         }
         out[out_base + (2 * chunk_size + k_idx) * v_head_dim + v_idx] =
-            dotcache_qwen35_from_float<T>(state_decay * state[k_idx] + update);
+            phi4_from_float<T>(state_decay * state[k_idx] + update);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_fused_kernel(
+__global__ void phi4_delta_chunk_fused_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1691,7 +1653,7 @@ __global__ void dotcache_qwen35_delta_chunk_fused_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_fused_impl(
+    phi4_delta_chunk_fused_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -1705,7 +1667,7 @@ __global__ void dotcache_qwen35_delta_chunk_fused_kernel(
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_full_scan_impl(
+__device__ inline void phi4_delta_full_scan_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1738,7 +1700,7 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -1754,10 +1716,10 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
             float attn = 0.0f;
             const int row = chunk_scan + t * k_head_dim;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(k_cumdecay_scan[row + k_idx]) * state[k_idx];
-                attn += dotcache_qwen35_to_float(q_state_scan[row + k_idx]) * state[k_idx];
+                v_prime += phi4_to_float(k_cumdecay_scan[row + k_idx]) * state[k_idx];
+                attn += phi4_to_float(q_state_scan[row + k_idx]) * state[k_idx];
             }
-            v_new[t] = dotcache_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) -
+            v_new[t] = phi4_to_float(value[chunk_value + t * v_head_dim + v_idx]) -
                 v_prime;
             attn_inter[t] = attn;
         }
@@ -1766,18 +1728,18 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
             float local = 0.0f;
             const int row = chunk_local + t * chunk_size;
             for (int s = 0; s < chunk_size; ++s) {
-                local += dotcache_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
+                local += phi4_to_float(local_attn_scan[row + s]) * v_new[s];
             }
             out[out_base + (chunk * chunk_size + t) * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(attn_inter[t] + local);
+                phi4_from_float<T>(attn_inter[t] + local);
         }
 
-        const float state_decay = dotcache_qwen35_to_float(state_decay_scan[decay_base + chunk]);
+        const float state_decay = phi4_to_float(state_decay_scan[decay_base + chunk]);
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             float update = 0.0f;
             for (int t = 0; t < chunk_size; ++t) {
                 const int row = chunk_scan + t * k_head_dim;
-                update += dotcache_qwen35_to_float(weighted_key_scan[row + k_idx]) * v_new[t];
+                update += phi4_to_float(weighted_key_scan[row + k_idx]) * v_new[t];
             }
             state[k_idx] = state_decay * state[k_idx] + update;
         }
@@ -1785,12 +1747,12 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
 
     const int state_out = out_base + token_count * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_local_attn_scan_flat_kernel(
+__global__ void phi4_delta_local_attn_scan_flat_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1812,27 +1774,27 @@ __global__ void dotcache_qwen35_delta_local_attn_scan_flat_kernel(
     const int bh = tid / (num_chunks * chunk_size * chunk_size);
 
     if (col > row_in_chunk) {
-        out[tid] = dotcache_qwen35_from_float<T>(0.0f);
+        out[tid] = phi4_from_float<T>(0.0f);
         return;
     }
 
     const int row_base =
         ((bh * num_chunks + chunk) * chunk_size + row_in_chunk) * k_head_dim;
     const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
-    const float dot = dotcache_qwen35_dot_row(
+    const float dot = phi4_dot_row(
         query_scan + row_base,
         key_scan + col_base,
         k_head_dim);
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
-    const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+    const float exp_g_t = phi4_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_s = phi4_to_float(exp_g_scan[exp_base + col]);
     const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-    out[tid] = dotcache_qwen35_from_float<T>(dot * decay);
+    out[tid] = phi4_from_float<T>(dot * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_local_attn_scan_row_kernel(
+__global__ void phi4_delta_local_attn_scan_row_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1863,30 +1825,30 @@ __global__ void dotcache_qwen35_delta_local_attn_scan_row_kernel(
     __syncthreads();
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_t = phi4_to_float(exp_g_scan[exp_base + row_in_chunk]);
     const int out_base = (bh * num_chunks + chunk) * chunk_size * chunk_size;
 
     for (int col = lane; col < chunk_size; col += blockDim.x) {
         const int out_idx = out_base + row_in_chunk * chunk_size + col;
         if (col > row_in_chunk) {
-            out[out_idx] = dotcache_qwen35_from_float<T>(0.0f);
+            out[out_idx] = phi4_from_float<T>(0.0f);
             continue;
         }
 
         const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
-        const float dot = dotcache_qwen35_dot_row(
+        const float dot = phi4_dot_row(
             query_row,
             key_scan + col_base,
             k_head_dim);
 
-        const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+        const float exp_g_s = phi4_to_float(exp_g_scan[exp_base + col]);
         const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-        out[out_idx] = dotcache_qwen35_from_float<T>(dot * decay);
+        out[out_idx] = phi4_from_float<T>(dot * decay);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
+__global__ void phi4_delta_base_attn_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1908,7 +1870,7 @@ __global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
     const int bh = tid / (num_chunks * chunk_size * chunk_size);
 
     if (col >= row_in_chunk) {
-        out[tid] = dotcache_qwen35_from_float<T>(0.0f);
+        out[tid] = phi4_from_float<T>(0.0f);
         return;
     }
 
@@ -1917,19 +1879,19 @@ __global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
     const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
     float dot = 0.0f;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        dot += dotcache_qwen35_to_float(k_beta_scan[row_base + k_idx]) *
-               dotcache_qwen35_to_float(key_scan[col_base + k_idx]);
+        dot += phi4_to_float(k_beta_scan[row_base + k_idx]) *
+               phi4_to_float(key_scan[col_base + k_idx]);
     }
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
-    const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+    const float exp_g_t = phi4_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_s = phi4_to_float(exp_g_scan[exp_base + col]);
     const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-    out[tid] = dotcache_qwen35_from_float<T>(-dot * decay);
+    out[tid] = phi4_from_float<T>(-dot * decay);
 }
 
 template <typename T, int MAX_CHUNK = 64>
-__global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
+__global__ void phi4_delta_attn_solve_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1952,10 +1914,10 @@ __global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
 
     for (int i = 1; i < chunk_size; ++i) {
         for (int j = 0; j < i; ++j) {
-            const float row_val = dotcache_qwen35_to_float(base_attn_scan[base + i * chunk_size + j]);
+            const float row_val = phi4_to_float(base_attn_scan[base + i * chunk_size + j]);
             float correction = 0.0f;
             for (int k = 0; k < i; ++k) {
-                correction += dotcache_qwen35_to_float(base_attn_scan[base + i * chunk_size + k]) *
+                correction += phi4_to_float(base_attn_scan[base + i * chunk_size + k]) *
                     rows[k * chunk_size + j];
             }
             rows[i * chunk_size + j] = row_val + correction;
@@ -1968,13 +1930,13 @@ __global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
             if (i == j) {
                 value += 1.0f;
             }
-            out[base + i * chunk_size + j] = dotcache_qwen35_from_float<T>(value);
+            out[base + i * chunk_size + j] = phi4_from_float<T>(value);
         }
     }
 }
 
 template <typename T, int MAX_CHUNK = 64>
-__global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
+__global__ void phi4_delta_attn_solve_from_inputs_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2001,16 +1963,16 @@ __global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
     }
 
     for (int i = 1; i < chunk_size; ++i) {
-        const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[chunk_base + i]);
+        const float exp_g_t = phi4_to_float(exp_g_scan[chunk_base + i]);
         for (int k = 0; k < i; ++k) {
             const int row_base = qk_base + i * k_head_dim;
             const int col_base = qk_base + k * k_head_dim;
             float dot = 0.0f;
             for (int d = 0; d < k_head_dim; ++d) {
-                dot += dotcache_qwen35_to_float(k_beta_scan[row_base + d]) *
-                    dotcache_qwen35_to_float(key_scan[col_base + d]);
+                dot += phi4_to_float(k_beta_scan[row_base + d]) *
+                    phi4_to_float(key_scan[col_base + d]);
             }
-            const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[chunk_base + k]);
+            const float exp_g_s = phi4_to_float(exp_g_scan[chunk_base + k]);
             const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
             base_row[k] = -dot * decay;
         }
@@ -2029,13 +1991,13 @@ __global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
             if (i == j) {
                 value += 1.0f;
             }
-            out[out_base + i * chunk_size + j] = dotcache_qwen35_from_float<T>(value);
+            out[out_base + i * chunk_size + j] = phi4_from_float<T>(value);
         }
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_swiglu_mul_kernel(
+__global__ void phi4_swiglu_mul_kernel(
     int elem_count,
     const T* gate,
     const T* up,
@@ -2045,14 +2007,14 @@ __global__ void dotcache_qwen35_swiglu_mul_kernel(
     if (idx >= elem_count) {
         return;
     }
-    const float gate_x = dotcache_qwen35_to_float(gate[idx]);
-    const float up_x = dotcache_qwen35_to_float(up[idx]);
+    const float gate_x = phi4_to_float(gate[idx]);
+    const float up_x = phi4_to_float(up[idx]);
     const float silu = gate_x / (1.0f + expf(-gate_x));
-    out[idx] = dotcache_qwen35_from_float<T>(silu * up_x);
+    out[idx] = phi4_from_float<T>(silu * up_x);
 }
 
 template <typename T, typename IndexT>
-__global__ void dotcache_qwen35_embedding_lookup_kernel(
+__global__ void phi4_embedding_lookup_kernel(
     int token_count,
     int vocab_size,
     int hidden_size,
@@ -2069,14 +2031,14 @@ __global__ void dotcache_qwen35_embedding_lookup_kernel(
     const int col = idx - token_idx * hidden_size;
     const int64_t row = static_cast<int64_t>(indexes[token_idx]);
     if (row < 0 || row >= static_cast<int64_t>(vocab_size)) {
-        out[idx] = dotcache_qwen35_from_float<T>(0.0f);
+        out[idx] = phi4_from_float<T>(0.0f);
         return;
     }
     out[idx] = embeddings[row * hidden_size + col];
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_output_projection_lookup_kernel(
+__global__ void phi4_output_projection_lookup_kernel(
     int rows,
     int hidden_size,
     int vocab_size,
@@ -2095,13 +2057,13 @@ __global__ void dotcache_qwen35_output_projection_lookup_kernel(
     const T* row_weight = weights + static_cast<size_t>(vocab) * static_cast<size_t>(hidden_size);
     float acc = 0.0f;
     for (int col = 0; col < hidden_size; ++col) {
-        acc += dotcache_qwen35_to_float(row_hidden[col]) * dotcache_qwen35_to_float(row_weight[col]);
+        acc += phi4_to_float(row_hidden[col]) * phi4_to_float(row_weight[col]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = phi4_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_causal_mask_kernel(
+__global__ void phi4_causal_mask_kernel(
     int batch_size,
     int tgt_len,
     int seqlen_offset,
@@ -2116,11 +2078,11 @@ __global__ void dotcache_qwen35_causal_mask_kernel(
     const int col = idx % kv_len;
     const int row = (idx / kv_len) % tgt_len;
     const bool allowed = col <= (seqlen_offset + row);
-    out[idx] = dotcache_qwen35_from_float<T>(allowed ? 0.0f : -INFINITY);
+    out[idx] = phi4_from_float<T>(allowed ? 0.0f : -INFINITY);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_cumsum_last_dim_kernel(
+__global__ void phi4_cumsum_last_dim_kernel(
     int rows,
     int cols,
     const T* xs,
@@ -2133,13 +2095,13 @@ __global__ void dotcache_qwen35_cumsum_last_dim_kernel(
     const int row_offset = row * cols;
     float acc = 0.0f;
     for (int col = 0; col < cols; ++col) {
-        acc += dotcache_qwen35_to_float(xs[row_offset + col]);
-        out[row_offset + col] = dotcache_qwen35_from_float<T>(acc);
+        acc += phi4_to_float(xs[row_offset + col]);
+        out[row_offset + col] = phi4_from_float<T>(acc);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_exp_kernel(
+__global__ void phi4_exp_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -2148,11 +2110,11 @@ __global__ void dotcache_qwen35_exp_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(expf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = phi4_from_float<T>(expf(phi4_to_float(xs[idx])));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_recip_kernel(
+__global__ void phi4_recip_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -2161,11 +2123,11 @@ __global__ void dotcache_qwen35_recip_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(1.0f / dotcache_qwen35_to_float(xs[idx]));
+    out[idx] = phi4_from_float<T>(1.0f / phi4_to_float(xs[idx]));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_sigmoid_kernel(
+__global__ void phi4_sigmoid_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -2174,13 +2136,13 @@ __global__ void dotcache_qwen35_sigmoid_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(
-        dotcache_qwen35_sigmoid_fast(dotcache_qwen35_to_float(xs[idx]))
+    out[idx] = phi4_from_float<T>(
+        phi4_sigmoid_fast(phi4_to_float(xs[idx]))
     );
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_log_kernel(
+__global__ void phi4_log_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -2189,11 +2151,11 @@ __global__ void dotcache_qwen35_log_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(logf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = phi4_from_float<T>(logf(phi4_to_float(xs[idx])));
 }
 
 template <typename In, typename Out>
-__global__ void dotcache_qwen35_cast_kernel(
+__global__ void phi4_cast_kernel(
     int total_elems,
     const In* xs,
     Out* out
@@ -2202,10 +2164,10 @@ __global__ void dotcache_qwen35_cast_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<Out>(dotcache_qwen35_to_float(xs[idx]));
+    out[idx] = phi4_from_float<Out>(phi4_to_float(xs[idx]));
 }
 
-__device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
+__device__ __forceinline__ float phi4_unary_op_apply(
     int op,
     float x,
     float scalar
@@ -2216,7 +2178,7 @@ __device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
     case 1:
         return 1.0f / x;
     case 2:
-        return dotcache_qwen35_sigmoid_fast(x);
+        return phi4_sigmoid_fast(x);
     case 3:
         return logf(x);
     case 4:
@@ -2231,7 +2193,7 @@ __device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_unary_view_kernel(
+__global__ void phi4_unary_view_kernel(
     int op,
     int rank,
     size_t total_elems,
@@ -2253,12 +2215,12 @@ __global__ void dotcache_qwen35_unary_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         in_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    const float x = dotcache_qwen35_to_float(xs[in_offset]);
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_unary_op_apply(op, x, scalar));
+    const float x = phi4_to_float(xs[in_offset]);
+    out[idx] = phi4_from_float<T>(phi4_unary_op_apply(op, x, scalar));
 }
 
 template <typename In, typename Out>
-__global__ void dotcache_qwen35_cast_view_kernel(
+__global__ void phi4_cast_view_kernel(
     int rank,
     size_t total_elems,
     const In* xs,
@@ -2278,11 +2240,11 @@ __global__ void dotcache_qwen35_cast_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         in_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    out[idx] = dotcache_qwen35_from_float<Out>(dotcache_qwen35_to_float(xs[in_offset]));
+    out[idx] = phi4_from_float<Out>(phi4_to_float(xs[in_offset]));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_binary_broadcast_kernel(
+__global__ void phi4_binary_broadcast_kernel(
     int op,
     int rank,
     size_t total_elems,
@@ -2309,13 +2271,13 @@ __global__ void dotcache_qwen35_binary_broadcast_kernel(
         rhs_offset += static_cast<size_t>(coord) * static_cast<size_t>(rhs_strides[dim]);
     }
 
-    const float lhs_f = dotcache_qwen35_to_float(lhs[lhs_offset]);
-    const float rhs_f = dotcache_qwen35_to_float(rhs[rhs_offset]);
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_binary_op_apply(op, lhs_f, rhs_f));
+    const float lhs_f = phi4_to_float(lhs[lhs_offset]);
+    const float rhs_f = phi4_to_float(rhs[rhs_offset]);
+    out[idx] = phi4_from_float<T>(phi4_binary_op_apply(op, lhs_f, rhs_f));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_mul_scalar_kernel(
+__global__ void phi4_mul_scalar_kernel(
     int total_elems,
     float scalar,
     const T* xs,
@@ -2325,11 +2287,11 @@ __global__ void dotcache_qwen35_mul_scalar_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_to_float(xs[idx]) * scalar);
+    out[idx] = phi4_from_float<T>(phi4_to_float(xs[idx]) * scalar);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_add_scalar_kernel(
+__global__ void phi4_add_scalar_kernel(
     int total_elems,
     float scalar,
     const T* xs,
@@ -2339,11 +2301,11 @@ __global__ void dotcache_qwen35_add_scalar_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_to_float(xs[idx]) + scalar);
+    out[idx] = phi4_from_float<T>(phi4_to_float(xs[idx]) + scalar);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_sqrt_kernel(
+__global__ void phi4_sqrt_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -2352,11 +2314,11 @@ __global__ void dotcache_qwen35_sqrt_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(sqrtf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = phi4_from_float<T>(sqrtf(phi4_to_float(xs[idx])));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_reduce_keepdim_kernel(
+__global__ void phi4_reduce_keepdim_kernel(
     int outer,
     int reduce,
     int inner,
@@ -2372,20 +2334,20 @@ __global__ void dotcache_qwen35_reduce_keepdim_kernel(
     const int outer_idx = idx / inner;
     const int inner_idx = idx % inner;
     const int base = (outer_idx * reduce) * inner + inner_idx;
-    float acc = dotcache_qwen35_to_float(xs[base]);
+    float acc = phi4_to_float(xs[base]);
     for (int r = 1; r < reduce; ++r) {
-        const float value = dotcache_qwen35_to_float(xs[base + r * inner]);
+        const float value = phi4_to_float(xs[base + r * inner]);
         if (sum) {
             acc += value;
         } else {
             acc = value > acc ? value : acc;
         }
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = phi4_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
+__global__ void phi4_reduce_keepdim_view_kernel(
     int rank,
     int reduce_dim,
     size_t reduce_len,
@@ -2408,9 +2370,9 @@ __global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         base_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    float acc = dotcache_qwen35_to_float(xs[base_offset]);
+    float acc = phi4_to_float(xs[base_offset]);
     for (size_t r = 1; r < reduce_len; ++r) {
-        const float value = dotcache_qwen35_to_float(
+        const float value = phi4_to_float(
             xs[base_offset + r * static_cast<size_t>(in_strides[reduce_dim])]);
         if (sum) {
             acc += value;
@@ -2418,11 +2380,11 @@ __global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
             acc = value > acc ? value : acc;
         }
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = phi4_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_batched_matmul_kernel(
+__global__ void phi4_batched_matmul_kernel(
     int batch_rank,
     size_t batch_elems,
     int m,
@@ -2446,19 +2408,19 @@ __global__ void dotcache_qwen35_batched_matmul_kernel(
     const int row = static_cast<int>(matrix_idx / static_cast<size_t>(n));
     const int col = static_cast<int>(matrix_idx % static_cast<size_t>(n));
 
-    const size_t lhs_batch_idx = dotcache_qwen35_broadcast_elem_index(
+    const size_t lhs_batch_idx = phi4_broadcast_elem_index(
         batch_idx, batch_rank, out_batch_dims, lhs_batch_dims);
-    const size_t rhs_batch_idx = dotcache_qwen35_broadcast_elem_index(
+    const size_t rhs_batch_idx = phi4_broadcast_elem_index(
         batch_idx, batch_rank, out_batch_dims, rhs_batch_dims);
 
     const size_t lhs_base = lhs_batch_idx * static_cast<size_t>(m) * static_cast<size_t>(k);
     const size_t rhs_base = rhs_batch_idx * static_cast<size_t>(k) * static_cast<size_t>(n);
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        acc += dotcache_qwen35_to_float(lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(kk)]) *
-               dotcache_qwen35_to_float(rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(n) + static_cast<size_t>(col)]);
+        acc += phi4_to_float(lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(kk)]) *
+               phi4_to_float(rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(n) + static_cast<size_t>(col)]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = phi4_from_float<T>(acc);
 }
 
 // =============================================================================
@@ -2478,7 +2440,7 @@ __global__ void dotcache_qwen35_batched_matmul_kernel(
 #define BF16_TILE_K 32
 
 template <typename T>
-__global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
+__global__ void phi4_matmul_rhs_transposed_tiled_kernel(
     size_t batch_elems,
     int m,
     int n,
@@ -2513,7 +2475,7 @@ __global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
             int gr = tile_row + lr;
             int gc = kk_base + lc;
             if (gr < m && gc < k)
-                s_lhs[lr][lc] = dotcache_qwen35_to_float(lhs[lhs_base + static_cast<size_t>(gr) * k + gc]);
+                s_lhs[lr][lc] = phi4_to_float(lhs[lhs_base + static_cast<size_t>(gr) * k + gc]);
             else
                 s_lhs[lr][lc] = 0.0f;
         }
@@ -2525,7 +2487,7 @@ __global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
             int gn = tile_col + rr;
             int gk = kk_base + rc;
             if (gn < n && gk < k)
-                s_rhs[rr][rc] = dotcache_qwen35_to_float(rhs[rhs_base + static_cast<size_t>(gn) * k + gk]);
+                s_rhs[rr][rc] = phi4_to_float(rhs[rhs_base + static_cast<size_t>(gn) * k + gk]);
             else
                 s_rhs[rr][rc] = 0.0f;
         }
@@ -2543,12 +2505,12 @@ __global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
     if (row < m && col < n) {
         size_t out_idx = static_cast<size_t>(batch_idx) * m * n +
                          static_cast<size_t>(row) * n + col;
-        out[out_idx] = dotcache_qwen35_from_float<T>(acc);
+        out[out_idx] = phi4_from_float<T>(acc);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_batched_matmul_view_kernel(
+__global__ void phi4_batched_matmul_view_kernel(
     int batch_rank,
     size_t batch_elems,
     int m,
@@ -2589,14 +2551,14 @@ __global__ void dotcache_qwen35_batched_matmul_view_kernel(
 
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        acc += dotcache_qwen35_to_float(
+        acc += phi4_to_float(
                    lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(lhs_row_stride) +
                        static_cast<size_t>(kk) * static_cast<size_t>(lhs_k_stride)]) *
-               dotcache_qwen35_to_float(
+               phi4_to_float(
                    rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(rhs_k_stride) +
                        static_cast<size_t>(col) * static_cast<size_t>(rhs_col_stride)]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = phi4_from_float<T>(acc);
 }
 
 // =============================================================================
@@ -2618,7 +2580,7 @@ __global__ void dotcache_qwen35_batched_matmul_view_kernel(
 #define FP8_TILE_K 32
 
 template <typename T>
-__global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
+__global__ void phi4_matmul_fp8_dequant_kernel(
     size_t batch_elems,
     int m,
     int n,
@@ -2662,7 +2624,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
             int global_r = tile_row + lr;
             int global_c = kk_base + lc;
             if (global_r < m && global_c < k) {
-                s_lhs[lr][lc] = dotcache_qwen35_to_float(
+                s_lhs[lr][lc] = phi4_to_float(
                     lhs[lhs_base + static_cast<size_t>(global_r) * k + global_c]);
             } else {
                 s_lhs[lr][lc] = 0.0f;
@@ -2681,7 +2643,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
                 float fp8_val = fp8_e4m3_to_float(fp8_byte);
                 int sr = global_n / block_size;
                 int sc = global_k / block_size;
-                float s = dotcache_qwen35_to_float(scale[sr * scale_cols + sc]);
+                float s = phi4_to_float(scale[sr * scale_cols + sc]);
                 s_rhs[rr][rc] = bf16_round_rne_f32_finite((fp8_val * s));
             } else {
                 s_rhs[rr][rc] = 0.0f;
@@ -2704,7 +2666,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
     if (row < m && col < n) {
         size_t out_idx = static_cast<size_t>(batch_idx) * m * n +
                          static_cast<size_t>(row) * n + col;
-        out[out_idx] = dotcache_qwen35_from_float<T>(acc);
+        out[out_idx] = phi4_from_float<T>(acc);
     }
 }
 
@@ -2716,7 +2678,7 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
 #define INT4_TILE_N 16
 #define INT4_TILE_K 32
 template <typename T>
-__global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
+__global__ void phi4_matmul_int4_dequant_kernel(
     size_t batch_elems,
     int m,
     int n,
@@ -2757,7 +2719,7 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
             int global_r = tile_row + lr;
             int global_c = kk_base + lc;
             if (global_r < m && global_c < k) {
-                s_lhs[lr][lc] = dotcache_qwen35_to_float(
+                s_lhs[lr][lc] = phi4_to_float(
                     lhs[lhs_base + static_cast<size_t>(global_r) * k + global_c]);
             } else {
                 s_lhs[lr][lc] = 0.0f;
@@ -2779,8 +2741,8 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
                 int sr = global_n / group_size;
                 int sc = global_k / group_size;
                 int si = sr * scale_cols + sc;
-                float s = dotcache_qwen35_to_float(scale[si]);
-                float z = dotcache_qwen35_to_float(zero[si]);
+                float s = phi4_to_float(scale[si]);
+                float z = phi4_to_float(zero[si]);
                 // Round through BF16 so prefill matches the decode megakernel's
                 // dequant path and the Python GPTQ reference (`bf16(q*s - zf*s)`).
                 s_rhs[rr][rc] = bf16_round_rne_f32_finite(static_cast<float>(nibble) * s - z * s);
@@ -2803,12 +2765,12 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
     if (row < m && col < n) {
         size_t out_idx = static_cast<size_t>(batch_idx) * m * n +
                          static_cast<size_t>(row) * n + col;
-        out[out_idx] = dotcache_qwen35_from_float<T>(acc);
+        out[out_idx] = phi4_from_float<T>(acc);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
+__global__ void phi4_delta_full_scan_pack_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2833,24 +2795,24 @@ __global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
     const int scan_row = row * row_stride;
     const int packed_row = row * packed_width;
 
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[row]);
-    const float exp_g_last = dotcache_qwen35_to_float(exp_g_scan[bh * num_chunks * chunk_size + chunk * chunk_size + (chunk_size - 1)]);
+    const float exp_g_t = phi4_to_float(exp_g_scan[row]);
+    const float exp_g_last = phi4_to_float(exp_g_scan[bh * num_chunks * chunk_size + chunk * chunk_size + (chunk_size - 1)]);
     const float chunk_decay = exp_g_t != 0.0f ? (exp_g_last / exp_g_t) : 0.0f;
 
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[packed_row + k_idx] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(key_scan[scan_row + k_idx]) * chunk_decay
+        out[packed_row + k_idx] = phi4_from_float<T>(
+            phi4_to_float(key_scan[scan_row + k_idx]) * chunk_decay
         );
         out[packed_row + k_head_dim + k_idx] = k_cumdecay_scan[scan_row + k_idx];
-        out[packed_row + 2 * k_head_dim + k_idx] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(query_scan[scan_row + k_idx]) * exp_g_t
+        out[packed_row + 2 * k_head_dim + k_idx] = phi4_from_float<T>(
+            phi4_to_float(query_scan[scan_row + k_idx]) * exp_g_t
         );
     }
-    out[packed_row + 3 * k_head_dim] = dotcache_qwen35_from_float<T>(exp_g_last);
+    out[packed_row + 3 * k_head_dim] = phi4_from_float<T>(exp_g_last);
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
+__device__ inline void phi4_delta_full_scan_packed_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2880,7 +2842,7 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = phi4_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -2896,10 +2858,10 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
             float attn = 0.0f;
             const int row = chunk_packed + t * packed_width;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(packed_scan[row + k_head_dim + k_idx]) * state[k_idx];
-                attn += dotcache_qwen35_to_float(packed_scan[row + 2 * k_head_dim + k_idx]) * state[k_idx];
+                v_prime += phi4_to_float(packed_scan[row + k_head_dim + k_idx]) * state[k_idx];
+                attn += phi4_to_float(packed_scan[row + 2 * k_head_dim + k_idx]) * state[k_idx];
             }
-            v_new[t] = dotcache_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) - v_prime;
+            v_new[t] = phi4_to_float(value[chunk_value + t * v_head_dim + v_idx]) - v_prime;
             attn_inter[t] = attn;
         }
 
@@ -2907,18 +2869,18 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
             float local = 0.0f;
             const int row = chunk_local + t * chunk_size;
             for (int s = 0; s < chunk_size; ++s) {
-                local += dotcache_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
+                local += phi4_to_float(local_attn_scan[row + s]) * v_new[s];
             }
             out[out_base + (chunk * chunk_size + t) * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(attn_inter[t] + local);
+                phi4_from_float<T>(attn_inter[t] + local);
         }
 
-        const float state_decay = dotcache_qwen35_to_float(packed_scan[chunk_packed + 3 * k_head_dim]);
+        const float state_decay = phi4_to_float(packed_scan[chunk_packed + 3 * k_head_dim]);
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             float update = 0.0f;
             for (int t = 0; t < chunk_size; ++t) {
                 const int row = chunk_packed + t * packed_width;
-                update += dotcache_qwen35_to_float(packed_scan[row + k_idx]) * v_new[t];
+                update += phi4_to_float(packed_scan[row + k_idx]) * v_new[t];
             }
             state[k_idx] = state_decay * state[k_idx] + update;
         }
@@ -2926,12 +2888,12 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
 
     const int state_out = out_base + token_count * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
+__global__ void phi4_delta_full_scan_packed_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2944,7 +2906,7 @@ __global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_full_scan_packed_impl(
+    phi4_delta_full_scan_packed_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -2960,7 +2922,7 @@ __global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_kernel(
+__global__ void phi4_delta_full_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2976,7 +2938,7 @@ __global__ void dotcache_qwen35_delta_full_scan_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_full_scan_impl(
+    phi4_delta_full_scan_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -2995,7 +2957,7 @@ __global__ void dotcache_qwen35_delta_full_scan_kernel(
 }
 
 template <typename T, int MAX_CHUNK = 64, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
+__device__ inline void phi4_delta_chunk_single_prefill_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -3025,7 +2987,7 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
 
     float g_acc = 0.0f;
     for (int t = 0; t < chunk_size; ++t) {
-        raw_g[t] = dotcache_qwen35_to_float(g_raw[bh * token_stride_s + t]);
+        raw_g[t] = phi4_to_float(g_raw[bh * token_stride_s + t]);
         g_acc += raw_g[t];
         prefix_g[t] = g_acc;
     }
@@ -3038,13 +3000,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
             const int row_j_k = bh * token_stride_k + j * k_head_dim;
             float dot = 0.0f;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                dot += dotcache_qwen35_to_float(query[row_i_k + k_idx]) *
-                    dotcache_qwen35_to_float(key[row_j_k + k_idx]);
+                dot += phi4_to_float(query[row_i_k + k_idx]) *
+                    phi4_to_float(key[row_j_k + k_idx]);
             }
             const float local = dot * expf(prefix_g[i] - prefix_g[j]);
-            out_i += local * dotcache_qwen35_to_float(value[bh * token_stride_v + j * v_head_dim + v_idx]);
+            out_i += local * phi4_to_float(value[bh * token_stride_v + j * v_head_dim + v_idx]);
         }
-        out[out_base + i * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_i);
+        out[out_base + i * v_head_dim + v_idx] = phi4_from_float<T>(out_i);
     }
 
     const float g_last = raw_g[chunk_size - 1];
@@ -3052,17 +3014,17 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         float state = 0.0f;
         for (int t = 0; t < chunk_size; ++t) {
-            const float beta_t = dotcache_qwen35_to_float(beta[bh * token_stride_s + t]);
-            state += dotcache_qwen35_to_float(key[bh * token_stride_k + t * k_head_dim + k_idx]) *
+            const float beta_t = phi4_to_float(beta[bh * token_stride_s + t]);
+            state += phi4_to_float(key[bh * token_stride_k + t * k_head_dim + k_idx]) *
                 expf(g_last - raw_g[t]) *
-                dotcache_qwen35_to_float(value[bh * token_stride_v + t * v_head_dim + v_idx]);
+                phi4_to_float(value[bh * token_stride_v + t * v_head_dim + v_idx]);
         }
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state);
+        out[state_out + k_idx * v_head_dim + v_idx] = phi4_from_float<T>(state);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
+__global__ void phi4_delta_chunk_single_prefill_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -3075,7 +3037,7 @@ __global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_single_prefill_impl(
+    phi4_delta_chunk_single_prefill_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -3091,7 +3053,7 @@ __global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_l2norm_kernel(
+__global__ void phi4_l2norm_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -3109,7 +3071,7 @@ __global__ void dotcache_qwen35_l2norm_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_in[col]);
+        const float x = phi4_to_float(row_in[col]);
         partial += x * x;
     }
 
@@ -3131,14 +3093,14 @@ __global__ void dotcache_qwen35_l2norm_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        row_out[col] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(row_in[col]) * shared_inv_norm
+        row_out[col] = phi4_from_float<T>(
+            phi4_to_float(row_in[col]) * shared_inv_norm
         );
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_value_decay_kernel(
+__global__ void phi4_value_decay_kernel(
     int total_elems,
     int num_heads,
     const T* a,
@@ -3152,15 +3114,15 @@ __global__ void dotcache_qwen35_value_decay_kernel(
     }
 
     const int head = idx % num_heads;
-    const float a_val = dotcache_qwen35_to_float(a[idx]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
-    const float softplus = dotcache_qwen35_softplus_fast(a_val + bias);
-    out[idx] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    const float a_val = phi4_to_float(a[idx]);
+    const float bias = phi4_to_float(dt_bias[head]);
+    const float decay = phi4_to_float(a_log_exp[head]);
+    const float softplus = phi4_softplus_fast(a_val + bias);
+    out[idx] = phi4_from_float<T>(-softplus * decay);
 }
 
 template <typename T, bool ADD_UNIT_OFFSET>
-__global__ void dotcache_qwen35_rms_norm_kernel(
+__global__ void phi4_rms_norm_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -3179,7 +3141,7 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_in[col]);
+        const float x = phi4_to_float(row_in[col]);
         partial += x * x;
     }
 
@@ -3202,9 +3164,9 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float weight_val = dotcache_qwen35_to_float(weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
-        const float x = dotcache_qwen35_to_float(row_in[col]);
-        row_out[col] = dotcache_qwen35_from_float<T>(x * shared_inv_rms * weight_val);
+        const float weight_val = phi4_to_float(weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
+        const float x = phi4_to_float(row_in[col]);
+        row_out[col] = phi4_from_float<T>(x * shared_inv_rms * weight_val);
     }
 }
 
@@ -3226,7 +3188,7 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
 //
 // Requires shared memory: hidden_dim * sizeof(float) + BLOCK_SIZE * sizeof(float)
 template <typename T, bool ADD_UNIT_OFFSET>
-__global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
+__global__ void phi4_fused_rms_norm_linear_kernel(
     int hidden_dim,
     int out_dim,
     float eps,
@@ -3255,7 +3217,7 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
     // 1a: Accumulate sum of squares
     float partial_sq = 0.0f;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float x = dotcache_qwen35_to_float(hidden[col]);
+        const float x = phi4_to_float(hidden[col]);
         partial_sq += x * x;
     }
     shared_scratch[tid] = partial_sq;
@@ -3278,8 +3240,8 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
 
     const float inv_rms = shared_inv_rms;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float x = dotcache_qwen35_to_float(hidden[col]);
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
+        const float x = phi4_to_float(hidden[col]);
+        const float w = phi4_to_float(norm_weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
         shared_normed[col] = x * inv_rms * w;
     }
     __syncthreads();
@@ -3289,7 +3251,7 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
 
     float partial_dot = 0.0f;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        partial_dot += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+        partial_dot += phi4_to_float(w_row[col]) * shared_normed[col];
     }
     shared_scratch[tid] = partial_dot;
     __syncthreads();
@@ -3302,12 +3264,12 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
     }
 
     if (tid == 0) {
-        out[out_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+        out[out_row] = phi4_from_float<T>(shared_scratch[0]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_rms_norm_gated_kernel(
+__global__ void phi4_rms_norm_gated_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -3328,7 +3290,7 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_hidden[col]);
+        const float x = phi4_to_float(row_hidden[col]);
         partial += x * x;
     }
 
@@ -3351,12 +3313,12 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_hidden[col]);
-        const float gate_x = dotcache_qwen35_to_float(row_gate[col]);
-    const float gate_silu = gate_x * dotcache_qwen35_sigmoid_fast(gate_x);
-        const float weight_val = dotcache_qwen35_to_float(weight[col]);
+        const float x = phi4_to_float(row_hidden[col]);
+        const float gate_x = phi4_to_float(row_gate[col]);
+    const float gate_silu = gate_x * phi4_sigmoid_fast(gate_x);
+        const float weight_val = phi4_to_float(weight[col]);
         row_out[col] =
-            dotcache_qwen35_from_float<T>(x * shared_inv_rms * weight_val * gate_silu);
+            phi4_from_float<T>(x * shared_inv_rms * weight_val * gate_silu);
     }
 }
 
@@ -3383,7 +3345,7 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
 // =============================================================================
 
 // Device-side wave-level sum reduction (Wave32 on RDNA3.5)
-__device__ inline float dotcache_qwen35_wave_reduce_sum(float val) {
+__device__ inline float phi4_wave_reduce_sum(float val) {
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         val += __shfl_down(val, offset);
     }
@@ -3391,7 +3353,7 @@ __device__ inline float dotcache_qwen35_wave_reduce_sum(float val) {
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_mlp_decode_megakernel(
+__global__ void phi4_mlp_decode_megakernel(
     int hidden_dim,           // 1024
     int intermediate_size,    // 3584
     float norm_eps,
@@ -3423,7 +3385,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
     // Load hidden from global → LDS as F32
     for (int col = tid; col < hidden_dim; col += block_size) {
-        shared_hidden[col] = dotcache_qwen35_to_float(hidden_in[col]);
+        shared_hidden[col] = phi4_to_float(hidden_in[col]);
     }
     __syncthreads();
 
@@ -3451,7 +3413,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
     const float inv_rms = shared_inv_rms;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + 1.0f;  // add_unit_offset
+        const float w = phi4_to_float(norm_weight[col]);
         shared_normed[col] = shared_hidden[col] * inv_rms * w;
     }
     __syncthreads();
@@ -3482,7 +3444,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
         float partial = 0.0f;
         for (int col = tid; col < hidden_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+            partial += phi4_to_float(w_row[col]) * shared_normed[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -3507,7 +3469,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
 // SwiGLU activation kernel: silu(gate) * up, element-wise
 template <typename T>
-__global__ void dotcache_qwen35_mlp_swiglu_kernel(
+__global__ void phi4_mlp_swiglu_kernel(
     int intermediate_size,
     float* __restrict__ gate_up_scratch    // [intermediate_size * 2]
 ) {
@@ -3522,7 +3484,7 @@ __global__ void dotcache_qwen35_mlp_swiglu_kernel(
 // down_proj matvec kernel: [hidden_dim, intermediate_size] × SwiGLU[intermediate_size]
 // Block-level work-stealing with full-block reduction.
 template <typename T>
-__global__ void dotcache_qwen35_mlp_down_proj_kernel(
+__global__ void phi4_mlp_down_proj_kernel(
     int hidden_dim,
     int intermediate_size,
     const T* __restrict__ down_proj_w,
@@ -3547,7 +3509,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < intermediate_size; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * swiglu_scratch[col];
+            partial += phi4_to_float(w_row[col]) * swiglu_scratch[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -3560,7 +3522,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
         }
 
         if (tid == 0) {
-            hidden_out[my_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+            hidden_out[my_row] = phi4_from_float<T>(shared_scratch[0]);
         }
         __syncthreads();
     }
@@ -3573,7 +3535,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
 // All accumulation in F32 with block-level reduction.
 // =============================================================================
 template <typename T>
-__global__ void dotcache_qwen35_standalone_matvec_kernel(
+__global__ void phi4_standalone_matvec_kernel(
     int out_dim,
     int in_dim,
     const T* __restrict__ weight,      // [out_dim, in_dim]
@@ -3588,7 +3550,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
     // Load input into shared memory as F32
     __shared__ float shared_input[4096];  // max in_dim we support
     for (int col = tid; col < in_dim; col += block_size) {
-        shared_input[col] = dotcache_qwen35_to_float(input[col]);
+        shared_input[col] = phi4_to_float(input[col]);
     }
     __syncthreads();
 
@@ -3605,7 +3567,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < in_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_input[col];
+            partial += phi4_to_float(w_row[col]) * shared_input[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -3618,7 +3580,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
         }
 
         if (tid == 0) {
-            output[my_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+            output[my_row] = phi4_from_float<T>(shared_scratch[0]);
         }
         __syncthreads();
     }
@@ -3637,20 +3599,20 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
 // (e.g., Q/K/V for attention, or gate/up for MLP).
 // =============================================================================
 
-struct Qwen35ProjectionDesc {
+struct Phi4ProjectionDesc {
     const void* weight;    // [out_dim, hidden_dim] BF16
     int out_dim;           // number of output rows
     int output_offset;     // offset in the output buffer
 };
 
 template <typename T>
-__global__ void dotcache_qwen35_norm_multi_proj_kernel(
+__global__ void phi4_norm_multi_proj_kernel(
     int hidden_dim,
     int total_rows,                           // sum of all out_dims
     float norm_eps,
     const T* __restrict__ hidden_in,          // [hidden_dim]
     const T* __restrict__ norm_weight,        // [hidden_dim]
-    const Qwen35ProjectionDesc* __restrict__ proj_table,  // device ptr
+    const Phi4ProjectionDesc* __restrict__ proj_table,  // device ptr
     int num_projections,
     float* __restrict__ output,               // [total_rows] F32
     unsigned int* __restrict__ row_counter
@@ -3665,7 +3627,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 
     // Step 1: Load hidden + RMSNorm
     for (int col = tid; col < hidden_dim; col += block_size) {
-        shared_hidden[col] = dotcache_qwen35_to_float(hidden_in[col]);
+        shared_hidden[col] = phi4_to_float(hidden_in[col]);
     }
     __syncthreads();
 
@@ -3686,7 +3648,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
     __syncthreads();
 
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + 1.0f;
+        const float w = phi4_to_float(norm_weight[col]);
         shared_normed[col] = shared_hidden[col] * shared_inv_rms * w;
     }
     __syncthreads();
@@ -3717,7 +3679,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < hidden_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+            partial += phi4_to_float(w_row[col]) * shared_normed[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -3837,7 +3799,7 @@ __device__ inline void block_rms_norm_global(
     __syncthreads();
     float inv = rsqrtf(scratch[0] / static_cast<float>(dim) + eps);
     for (int c = tid; c < dim; c += bs) {
-        dst[c] = src[c] * inv * (dotcache_qwen35_to_float(weight[c]) + 1.0f);
+        dst[c] = src[c] * inv * phi4_to_float(weight[c]);
     }
     __syncthreads();
 }
@@ -3895,35 +3857,26 @@ __global__ void quantize_kv_to_fp8_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_persistent_decode_kernel(
+__global__ void phi4_persistent_decode_kernel(
     int num_layers,
     int hidden_dim,
     int intermediate_size,
     int seqlen_offset,
-    const Qwen35DecodeLayerDesc* __restrict__ layers,
+    const Phi4DecodeLayerDesc* __restrict__ layers,
     T* __restrict__ hidden_io,
     float* __restrict__ workspace,
     unsigned int* __restrict__ counters,
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag,
-    const T* __restrict__ cos_table,   // [max_positions, rotary_dim/2] RoPE cos
-    const T* __restrict__ sin_table,   // [max_positions, rotary_dim/2] RoPE sin
-    int rotary_dim,                      // partial rotary dimension (64 for Qwen3.5)
+    const T* __restrict__ cos_table,   // [max_positions, rot_dim/2] RoPE cos (runner selects short/long table)
+    const T* __restrict__ sin_table,   // [max_positions, rot_dim/2] RoPE sin
     int proj_buf_floats,                 // max projection output buffer size
     int attn_scratch_floats,             // attention/recurrent scratch buffer size
-    const Qwen35FP8ScaleDesc* __restrict__ fp8_scales,  // nullptr for BF16, else [num_layers]
-    const KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
+    const Phi4FP8ScaleDesc* __restrict__ fp8_scales,  // nullptr for BF16, else [num_layers]
+    const Phi4KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
     int batch_size,                      // 1 for single-sequence, >1 for batched
-    const BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
-    const Qwen35INT4ScaleDesc* __restrict__ int4_scales,  // nullptr for non-INT4, else [num_layers]
-    // DFlash hidden-state taps (M1, currently plumbing-only): when tap_workspace != nullptr,
-    // the per-layer post-MLP residual hidden state for each layer in tap_layers[0..num_taps]
-    // is mirrored into tap_workspace at offset i * hidden_dim (i = tap index, not layer index).
-    // All three default to nullptr/0 from non-DFlash callers — the kernel body must treat
-    // them as no-op when tap_workspace == nullptr to preserve gfx1150 codegen on the hot path.
-    T* __restrict__ tap_workspace,       // nullptr disables; else [num_taps * hidden_dim]
-    const int* __restrict__ tap_layers,  // nullptr when tap_workspace is nullptr
-    int num_taps                         // 0 when tap_workspace is nullptr
+    const Phi4BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
+    const Phi4INT4ScaleDesc* __restrict__ int4_scales  // nullptr for non-INT4, else [num_layers]
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3968,13 +3921,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     // Load hidden BF16 → F32 for all batch items
     for (int b = 0; b < B; b++) {
         for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-            hidden_f32[b * hidden_dim + c] = dotcache_qwen35_to_float(hidden_io[b * hidden_dim + c]);
+            hidden_f32[b * hidden_dim + c] = phi4_to_float(hidden_io[b * hidden_dim + c]);
         }
     }
     grid_barrier(barrier_counter, barrier_flag, nb);
 
     for (int layer = 0; layer < num_layers; ++layer) {
-        const Qwen35DecodeLayerDesc& L = layers[layer];
+        const Phi4DecodeLayerDesc& L = layers[layer];
 
         // Match the component path's BF16 hidden-state boundaries: each layer
         // starts from BF16-hidden activations rather than carrying full F32
@@ -4011,8 +3964,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     float inv_rms = rsqrtf(lds[0] / static_cast<float>(hidden_dim) + norm_eps);
                     for (int c = tid; c < hidden_dim; c += bs) {
-                        dst[c] = dotcache_qwen35_from_float<T>(
-                            src[c] * inv_rms * (dotcache_qwen35_to_float(norm_w[c]) + 1.0f));
+                        dst[c] = phi4_from_float<T>(
+                            src[c] * inv_rms * phi4_to_float(norm_w[c]));
                     }
                     __syncthreads();
                 }
@@ -4026,9 +3979,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 lds_input[b * hidden_dim + c] = normed[b * hidden_dim + c];
         __syncthreads();
 
-        // === Token mixer: projections + core ===
-        if (L.layer_type == 1) {
-            // ---- FULL ATTENTION ----
+        // === Token mixer: full attention ===
+        {
             // Step A: Q/K/V projections via work-stealing
             // Q: [q_out_dim, hidden_dim], K: [k_out_dim, hidden_dim], V: same as K
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
@@ -4125,17 +4077,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
                         const int vd4 = hidden_dim & ~3;
                         for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
-                            float w0 = dotcache_qwen35_to_float(wr[c]);
-                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
-                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
-                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                            float w0 = phi4_to_float(wr[c]);
+                            float w1 = phi4_to_float(wr[c+1]);
+                            float w2 = phi4_to_float(wr[c+2]);
+                            float w3 = phi4_to_float(wr[c+3]);
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
                             }
                         }
                         for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = dotcache_qwen35_to_float(wr[c]);
+                            float w = phi4_to_float(wr[c]);
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
@@ -4154,13 +4106,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // Block 0 handles per-head sequential ops (per-sequence loop).
             // O_proj uses all blocks via work-stealing (per-sequence loop).
             {
-                const int hd = L.attn_head_dim;       // 256
-                const int nh = L.attn_num_heads;       // 8
-                const int nkv = L.attn_num_kv_heads;   // 2
-                const int kv_groups = nh / nkv;         // 4
+                const int hd = L.attn_head_dim;       // 128 for Phi-4-mini
+                const int nh = L.attn_num_heads;       // 24
+                const int nkv = L.attn_num_kv_heads;   // 8
+                const int kv_groups = nh / nkv;         // 3 (GQA 3:1)
                 const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-                const int rot_dim = hd / 4;             // 64 (partial_rotary_factor=0.25)
-                const int attn_size = nh * hd;          // 2048
+                const int rot_dim = L.rot_dim;          // descriptor-driven (96 = 0.75 * hd)
+                const int attn_size = nh * hd;          // 3072
 
             for (int b = 0; b < B; b++) {
                 // Per-sequence state: read from batch_descs when batched, else from L/seqlen_offset
@@ -4182,56 +4134,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* k_f32 = proj_b + L.q_out_dim;
                 float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
 
-                // Step B: QK-norm — RMSNorm per head on head_dim
-                // Wave-level reduce + cross-wave LDS reduce (2 syncthreads vs 8)
-                {
-                    const int norm_lane = tid % warpSize;
-                    const int norm_wave = tid / warpSize;
-                    const int norm_nwaves = bs / warpSize;
-
-                    for (int h = 0; h < nh; ++h) {
-                        float* qh = q_f32 + h * hd * 2;
-                        float sq = 0.0f;
-                        for (int d = tid; d < hd; d += bs) sq += qh[d] * qh[d];
-                        float wsq = wave_reduce_sum_f32(sq);
-                        if (norm_lane == 0) lds[norm_wave] = wsq;
-                        __syncthreads();
-                        if (tid == 0) {
-                            float total = 0.0f;
-                            for (int w = 0; w < norm_nwaves; ++w) total += lds[w];
-                            lds[0] = total;
-                        }
-                        __syncthreads();
-                        float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
-                        const T* qnw = static_cast<const T*>(L.q_norm_w);
-                        for (int d = tid; d < hd; d += bs) {
-                            qh[d] = bf16_round_rne_f32_finite(
-                                qh[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f));
-                        }
-                        __syncthreads();
-                    }
-                    for (int h = 0; h < nkv; ++h) {
-                        float* kh = k_f32 + h * hd;
-                        float sq = 0.0f;
-                        for (int d = tid; d < hd; d += bs) sq += kh[d] * kh[d];
-                        float wsq = wave_reduce_sum_f32(sq);
-                        if (norm_lane == 0) lds[norm_wave] = wsq;
-                        __syncthreads();
-                        if (tid == 0) {
-                            float total = 0.0f;
-                            for (int w = 0; w < norm_nwaves; ++w) total += lds[w];
-                            lds[0] = total;
-                        }
-                        __syncthreads();
-                        float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
-                        const T* knw = static_cast<const T*>(L.k_norm_w);
-                        for (int d = tid; d < hd; d += bs) {
-                            kh[d] = bf16_round_rne_f32_finite(
-                                kh[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f));
-                        }
-                        __syncthreads();
-                    }
-                }
+                // Step B: (QK-norm stripped — Phi-4-mini does not apply Q/K-norm.)
 
                 // Step C: RoPE (partial, first rot_dim dims of head_dim)
                 if (cos_table != nullptr && rot_dim > 0) {
@@ -4239,12 +4142,16 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const size_t cos_off =
                         static_cast<size_t>(seq_off_b) * half_rot;
 
-                    if (tid < nh * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
-                        float* qh = q_f32 + h * hd * 2;
-                        float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
-                        float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
+                    // Phi-4: nh*half_rot = 24*48 = 1152 > block_size=256, so a
+                    // single-element-per-thread block leaves most heads
+                    // unrotated. Strided loop covers all heads regardless of
+                    // (nh*half_rot) vs bs.
+                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
+                        float* qh = q_f32 + h * hd;
+                        float c = phi4_to_float(cos_table[cos_off + i]);
+                        float s = phi4_to_float(sin_table[cos_off + i]);
                         float x0 = qh[i];
                         float x1 = qh[half_rot + i];
                         qh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
@@ -4252,12 +4159,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    if (tid < nkv * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* kh = k_f32 + h * hd;
-                        float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
-                        float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
+                        float c = phi4_to_float(cos_table[cos_off + i]);
+                        float s = phi4_to_float(sin_table[cos_off + i]);
                         float x0 = kh[i];
                         float x1 = kh[half_rot + i];
                         kh[i] = bf16_round_rne_f32_finite(x0 * c - x1 * s);
@@ -4317,8 +4224,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 fp8_k[offset] = float_to_fp8_e4m3(k_store * k_inv);
                                 fp8_v[offset] = float_to_fp8_e4m3(v_store * v_inv);
                                 if (shadow_k != nullptr && shadow_v != nullptr) {
-                                    shadow_k[offset] = dotcache_qwen35_from_float<T>(k_store);
-                                    shadow_v[offset] = dotcache_qwen35_from_float<T>(v_store);
+                                    shadow_k[offset] = phi4_from_float<T>(k_store);
+                                    shadow_v[offset] = phi4_from_float<T>(v_store);
                                 }
                             }
                         }
@@ -4330,31 +4237,18 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 const size_t offset =
                                     static_cast<size_t>(h) * kv_max_b * hd +
                                     static_cast<size_t>(seq_off_b) * hd + d;
-                                cache_k[offset] = dotcache_qwen35_from_float<T>(k_f32[h * hd + d]);
-                                cache_v[offset] = dotcache_qwen35_from_float<T>(v_f32[h * hd + d]);
+                                cache_k[offset] = phi4_from_float<T>(k_f32[h * hd + d]);
+                                cache_v[offset] = phi4_from_float<T>(v_f32[h * hd + d]);
                             }
                         }
                     }
                     __syncthreads();
                 }
 
-                // Save gate values before attention overwrites proj_buf.
-                float* saved_q = attn_scratch + b * attn_scratch_floats;
-                float* saved_gate = saved_q + nh * hd;
-                float* saved_pre_gate = saved_gate + nh * hd;
-                float* saved_scores = saved_pre_gate + nh * hd;
-                for (int i = tid; i < nh * hd; i += bs) {
-                    const int h = i / hd;
-                    const int d = i % hd;
-                    saved_q[i] = bf16_round_rne_f32_finite(q_f32[h * hd * 2 + d]);
-                }
-                for (int i = tid; i < nh * hd; i += bs) {
-                    const int h = i / hd;
-                    const int d = i % hd;
-                    saved_gate[i] = bf16_round_rne_f32_finite(
-                        q_f32[h * hd * 2 + hd + d]);
-                }
-                __syncthreads();
+                // Phi-4 has no Q/K-norm and no attention-output gate (unlike
+                // Qwen3.5's GatedAttentionUnit). Only saved_scores is needed
+                // for online softmax bookkeeping; no Q/gate/pre-gate saves.
+                float* saved_scores = attn_scratch + b * attn_scratch_floats;
 
                 // Step E: Parallel attention — Flash-style online softmax
                 float* attn_flat = proj_b;  // reuse projection buffer
@@ -4374,27 +4268,32 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const float* scale_v_buf = static_cast<const float*>(kv_scale_v_b);
                     for (int qh = 0; qh < nh; ++qh) {
                         const int kvh = qh / kv_groups;
-                        const float* q_head = q_f32 + qh * hd * 2;
+                        const float* q_head = q_f32 + qh * hd;
                         float my_acc = 0.0f;
                         float my_max = -1e30f;
                         float my_sum = 0.0f;
-                        const float q_val = q_head[tid];
+                        // Phi-4 hd=128 < block_size=256 — only first hd threads
+                        // hold real Q/K elements; mask the rest to 0 so they
+                        // contribute nothing to wave-reduce sums.
+                        const float q_val = (tid < hd) ? q_head[tid] : 0.0f;
                         const size_t kv_head_base =
                             static_cast<size_t>(kvh) * kv_max_b * hd;
 
                         for (int t = 0; t < kv_len_b; ++t) {
                             const size_t pos_base = kv_head_base + static_cast<size_t>(t) * hd;
                             float k_val = 0.0f;
-                            if (kv_shadow_k_b != nullptr && kv_shadow_v_b != nullptr &&
-                                kv_shadow_start_b >= 0 && t >= kv_shadow_start_b) {
-                                const T* shadow_k = static_cast<const T*>(kv_shadow_k_b);
-                                k_val = dotcache_qwen35_to_float(shadow_k[pos_base + tid]);
-                            } else if (t == seq_off_b) {
-                                k_val = bf16_round_rne_f32_finite(k_f32[kvh * hd + tid]);
-                            } else {
-                                k_val = bf16_round_rne_f32_finite(
-                                    fp8_lut[fp8_ck[pos_base + tid]] *
-                                    scale_k_buf[kvh * kv_max_b + t]);
+                            if (tid < hd) {
+                                if (kv_shadow_k_b != nullptr && kv_shadow_v_b != nullptr &&
+                                    kv_shadow_start_b >= 0 && t >= kv_shadow_start_b) {
+                                    const T* shadow_k = static_cast<const T*>(kv_shadow_k_b);
+                                    k_val = phi4_to_float(shadow_k[pos_base + tid]);
+                                } else if (t == seq_off_b) {
+                                    k_val = bf16_round_rne_f32_finite(k_f32[kvh * hd + tid]);
+                                } else {
+                                    k_val = bf16_round_rne_f32_finite(
+                                        fp8_lut[fp8_ck[pos_base + tid]] *
+                                        scale_k_buf[kvh * kv_max_b + t]);
+                                }
                             }
                             float partial = q_val * k_val;
                             float wave_sum = wave_reduce_sum_f32(partial);
@@ -4412,16 +4311,18 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             score_val = lds[0] * scale;
 
                             float v_val = 0.0f;
-                            if (kv_shadow_k_b != nullptr && kv_shadow_v_b != nullptr &&
-                                kv_shadow_start_b >= 0 && t >= kv_shadow_start_b) {
-                                const T* shadow_v = static_cast<const T*>(kv_shadow_v_b);
-                                v_val = dotcache_qwen35_to_float(shadow_v[pos_base + tid]);
-                            } else if (t == seq_off_b) {
-                                v_val = bf16_round_rne_f32_finite(v_f32[kvh * hd + tid]);
-                            } else {
-                                v_val = bf16_round_rne_f32_finite(
-                                    fp8_lut[fp8_cv[pos_base + tid]] *
-                                    scale_v_buf[kvh * kv_max_b + t]);
+                            if (tid < hd) {
+                                if (kv_shadow_k_b != nullptr && kv_shadow_v_b != nullptr &&
+                                    kv_shadow_start_b >= 0 && t >= kv_shadow_start_b) {
+                                    const T* shadow_v = static_cast<const T*>(kv_shadow_v_b);
+                                    v_val = phi4_to_float(shadow_v[pos_base + tid]);
+                                } else if (t == seq_off_b) {
+                                    v_val = bf16_round_rne_f32_finite(v_f32[kvh * hd + tid]);
+                                } else {
+                                    v_val = bf16_round_rne_f32_finite(
+                                        fp8_lut[fp8_cv[pos_base + tid]] *
+                                        scale_v_buf[kvh * kv_max_b + t]);
+                                }
                             }
 
                             float old_max = my_max;
@@ -4432,9 +4333,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             my_sum = my_sum * rescale + w;
                         }
 
-                        attn_flat[qh * hd + tid] =
-                            bf16_round_rne_f32_finite(
-                                (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
+                        if (tid < hd) {
+                            attn_flat[qh * hd + tid] =
+                                bf16_round_rne_f32_finite(
+                                    (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
+                        }
                         __syncthreads();
                     }
                 } else {
@@ -4443,13 +4346,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                     for (int qh = 0; qh < nh; ++qh) {
                         const int kvh = qh / kv_groups;
-                        const float* q_head = q_f32 + qh * hd * 2;
+                        const float* q_head = q_f32 + qh * hd;
 
                         float my_acc = 0.0f;
                         float my_max = -1e30f;
                         float my_sum = 0.0f;
 
-                        const float q_val = q_head[tid];
+                        // Phi-4 hd=128 < block_size=256 — only first hd threads
+                        // own real Q/K/V elements; mask the rest to 0.
+                        const float q_val = (tid < hd) ? q_head[tid] : 0.0f;
                         const size_t kv_head_base =
                             static_cast<size_t>(kvh) * kv_max_b * hd;
 
@@ -4457,8 +4362,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const size_t pos_base = kv_head_base +
                                 static_cast<size_t>(t) * hd;
 
-                            float partial = q_val *
-                                dotcache_qwen35_to_float(ck[pos_base + tid]);
+                            float partial = (tid < hd)
+                                ? q_val * phi4_to_float(ck[pos_base + tid])
+                                : 0.0f;
                             // Wave-level reduce then cross-wave via LDS
                             float wave_sum = wave_reduce_sum_f32(partial);
                             if (attn_lane == 0) lds[attn_wave] = wave_sum;
@@ -4473,8 +4379,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             __syncthreads();
                             score_val = lds[0] * scale;
 
-                            float v_val =
-                                dotcache_qwen35_to_float(cv[pos_base + tid]);
+                            float v_val = (tid < hd)
+                                ? phi4_to_float(cv[pos_base + tid])
+                                : 0.0f;
 
                             float old_max = my_max;
                             my_max = fmaxf(my_max, score_val);
@@ -4484,25 +4391,18 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             my_sum = my_sum * rescale + w;
                         }
 
-                        attn_flat[qh * hd + tid] =
-                            bf16_round_rne_f32_finite(
-                                (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
+                        if (tid < hd) {
+                            attn_flat[qh * hd + tid] =
+                                bf16_round_rne_f32_finite(
+                                    (my_sum > 0.0f) ? (my_acc / my_sum) : 0.0f);
+                        }
                         __syncthreads();
                     }
                 }
 
-                for (int i = tid; i < nh * hd; i += bs) {
-                    saved_pre_gate[i] = attn_flat[i];
-                }
-                __syncthreads();
-
-                // Step F: Gate
-                for (int i = tid; i < nh * hd; i += bs) {
-                    float gate_val = saved_gate[i];
-                    float sigmoid_gate = dotcache_qwen35_sigmoid_fast(gate_val);
-                    attn_flat[i] = bf16_round_rne_f32_finite(attn_flat[i] * sigmoid_gate);
-                }
-                __syncthreads();
+                // Phi-4 has no SwiGLU gate on the attention output — attn_flat
+                // flows straight into o_proj. (Qwen3.5 had a sigmoid(gate) *
+                // attn step here; Phi-4 is plain GQA.)
 
                 } // end if (blockIdx.x == 0)
                 // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
@@ -4582,19 +4482,19 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             if (kv_fp8 != nullptr) {
                                 if (lane_o == 0) {
                                     for (int c = 0; c < attn_size; ++c) {
-                                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                                        p += phi4_to_float(wr[c]) * lds_input[c];
                                     }
                                 }
                             } else {
                                 const int as4 = attn_size & ~3;
                                 for (int c = lane_o * 4; c < as4; c += warpSize * 4) {
-                                    p += dotcache_qwen35_to_float(wr[c])   * lds_input[c]
-                                       + dotcache_qwen35_to_float(wr[c+1]) * lds_input[c+1]
-                                       + dotcache_qwen35_to_float(wr[c+2]) * lds_input[c+2]
-                                       + dotcache_qwen35_to_float(wr[c+3]) * lds_input[c+3];
+                                    p += phi4_to_float(wr[c])   * lds_input[c]
+                                       + phi4_to_float(wr[c+1]) * lds_input[c+1]
+                                       + phi4_to_float(wr[c+2]) * lds_input[c+2]
+                                       + phi4_to_float(wr[c+3]) * lds_input[c+3];
                                 }
                                 for (int c = as4 + lane_o; c < attn_size; c += warpSize)
-                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                                    p += phi4_to_float(wr[c]) * lds_input[c];
                             }
                         }
                         float result = wave_reduce_sum_f32(p);
@@ -4609,427 +4509,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 grid_barrier(barrier_counter, barrier_flag, nb);
             } // end for (b) batch loop
             } // end full attention scope
-
-        } else {
-            // ---- LINEAR ATTENTION ----
-            // Step A: qkv/z/b/a projections via work-stealing
-            if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
-            // b_proj and a_proj have linear_num_v_heads rows (not num_k_heads)
-            const int nv_heads = L.linear_num_v_heads;
-            const int total_proj = L.qkv_out_dim + L.z_out_dim + nv_heads + nv_heads;
-            {
-                for (;;) {
-                    unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __shared__ unsigned int shared_sr;
-                    if (tid == 0) shared_sr = sr;
-                    __syncthreads();
-                    sr = shared_sr;
-                    if (sr >= static_cast<unsigned int>(total_proj)) break;
-
-                    const void* w_raw;
-                    const void* w_scale = nullptr;
-                    const void* w_i4_scale = nullptr;
-                    const void* w_i4_zero = nullptr;
-                    int row;
-                    if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
-                        w_raw = L.qkv_proj_w;
-                        row = sr;
-                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
-                        w_raw = L.z_proj_w;
-                        row = sr - L.qkv_out_dim;
-                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
-                        w_raw = L.b_proj_w;
-                        row = sr - L.qkv_out_dim - L.z_out_dim;
-                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
-                        // b_proj: keep BF16 (only 16 rows, no INT4)
-                    } else {
-                        w_raw = L.a_proj_w;
-                        row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
-                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
-                        // a_proj: keep BF16 (only 16 rows, no INT4)
-                    }
-
-                    float p[MAX_BATCH_SIZE];
-                    for (int b = 0; b < B; b++) p[b] = 0.0f;
-                    if (int4_scales != nullptr && w_i4_scale != nullptr) {
-                        // INT4 dequant path for qkv/z projections
-                        const int gsz = int4_scales[layer].group_size;
-                        const int byte_cols = hidden_dim / 2;
-                        const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
-                        const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(w_i4_scale);
-                        const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(w_i4_zero);
-                        const int sr_g = row / gsz;
-                        const int sc_cols = (hidden_dim + gsz - 1) / gsz;
-                        const int vd8 = hidden_dim & ~7;
-                        for (int c = tid * 8; c < vd8; c += bs * 8) {
-                            uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
-                            float w[8];
-                            int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
-                                      + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
-                            }
-                        }
-                        for (int c = vd8 + tid; c < hidden_dim; c += bs) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
-                        for (int c = tid; c < hidden_dim; c += bs) {
-                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    } else {
-                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        const int vd4 = hidden_dim & ~3;
-                        for (int c = tid * 4; c < vd4; c += bs * 4) {
-                            float w0 = dotcache_qwen35_to_float(wr[c]);
-                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
-                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
-                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
-                            }
-                        }
-                        for (int c = vd4 + tid; c < hidden_dim; c += bs) {
-                            float w = dotcache_qwen35_to_float(wr[c]);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    }
-                    for (int b = 0; b < B; b++) {
-                        lds[tid] = p[b];
-                        __syncthreads();
-                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                            if (tid < stride) lds[tid] += lds[tid + stride];
-                            __syncthreads();
-                        }
-                        if (tid == 0)
-                            proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(lds[0]);
-                        __syncthreads();
-                    }
-                }
-            }
-            __syncthreads();
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
-            // Step B-E: conv1d, recurrent state, gated norm, out_proj
-            // Block 0 handles sequential recurrent operations (per-sequence loop).
-            // O_proj uses all blocks via work-stealing (per-sequence loop).
-            for (int b = 0; b < B; b++) {
-            // Per-sequence state
-            void* conv_b = batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state;
-            void* rec_b  = batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state;
-            float* proj_b = proj_buf + b * proj_buf_floats;
-
-            if (blockIdx.x == 0) {
-                float* qkv_f32 = proj_b;
-                float* z_f32 = proj_b + L.qkv_out_dim;
-                float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
-                float* a_f32 = b_f32 + nv_heads;
-                // Batch-strided scratch aliases
-                float* gate_up_b = gate_up + b * intermediate_size * 2;
-                float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
-                float* mlp_out_b = mlp_out + b * hidden_dim;
-
-                const int conv_dim = L.qkv_out_dim;
-                const int kern = L.conv_kernel_size;
-                const int nv = L.linear_num_v_heads;
-                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
-                const int hkd = L.linear_head_k_dim;
-                const int hvd = L.linear_head_v_dim;
-                const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
-                const int val_dim = L.linear_value_dim; // 2048
-
-                // Step B: Conv1d stateful update
-                // conv_state: [conv_dim, kern-1] BF16 (sliding window of past values)
-                // New qkv values: qkv_f32[conv_dim] (current step)
-                // Conv: for each channel c, output = sum(conv_state[c,t] * weight[c,t]) + qkv[c] * weight[c,kern-1]
-                // Then update conv_state: shift left, append new value
-                {
-                    T* cs = static_cast<T*>(conv_b);
-                    const T* cw = static_cast<const T*>(L.conv1d_w);
-                    // cw layout: [conv_dim, 1, kern] — depthwise conv weight
-                    // We treat it as [conv_dim, kern]
-
-                    float* conv_out = gate_up_b;  // reuse MLP scratch for conv output
-                    for (int c = tid; c < conv_dim; c += bs) {
-                        // Depthwise conv: sum(state[t] * weight[t]) + new_value * weight[kern-1]
-                        // Match standard path: convert new value to BF16 for consistency
-                        T qkv_bf16 = dotcache_qwen35_from_float<T>(qkv_f32[c]);
-                        float acc = 0.0f;
-                        if (kern == 4) {
-                            const int state_base = c * (kern - 1);
-                            const int weight_base = c * kern;
-                            const float x0 = dotcache_qwen35_to_float(cs[state_base + 0]);
-                            const float x1 = dotcache_qwen35_to_float(cs[state_base + 1]);
-                            const float x2 = dotcache_qwen35_to_float(cs[state_base + 2]);
-                            const float x3 = dotcache_qwen35_to_float(qkv_bf16);
-                            const float w0 = dotcache_qwen35_to_float(cw[weight_base + 0]);
-                            const float w1 = dotcache_qwen35_to_float(cw[weight_base + 1]);
-                            const float w2 = dotcache_qwen35_to_float(cw[weight_base + 2]);
-                            const float w3 = dotcache_qwen35_to_float(cw[weight_base + 3]);
-                            acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
-                        } else {
-                            for (int t = 0; t < kern - 1; ++t) {
-                                acc += dotcache_qwen35_to_float(cs[c * (kern-1) + t])
-                                     * dotcache_qwen35_to_float(cw[c * kern + t]);
-                            }
-                            acc += dotcache_qwen35_to_float(qkv_bf16)
-                                 * dotcache_qwen35_to_float(cw[c * kern + (kern-1)]);
-                        }
-                        // SiLU activation
-                        conv_out[c] = bf16_round_rne_f32_finite(
-                            acc * dotcache_qwen35_sigmoid_fast(acc));
-
-                        // Update conv_state: shift left, append new
-                        for (int t = 0; t < kern - 2; ++t) {
-                            cs[c * (kern-1) + t] = cs[c * (kern-1) + t + 1];
-                        }
-                        cs[c * (kern-1) + (kern-2)] = qkv_bf16;
-                    }
-                    __syncthreads();
-
-                    // conv_out[conv_dim] now has the post-conv, post-SiLU output
-                    // Split into query, key, value
-                    // Layout: [key_dim | key_dim | val_dim] within conv_dim
-                    // Actually conv_dim = key_dim*2 + val_dim = 2048+2048+2048? No...
-                    // conv_dim = 6144. With nv=16, hkd=128, hvd=128:
-                    // key_dim = 16*128 = 2048, val_dim = 16*128 = 2048
-                    // So 6144 = 2048 + 2048 + 2048? That's only if there are separate Q/K/V.
-                    // Actually for linear attention: conv_dim = in_proj_qkv out = 6144
-                    // which packs Q, K, V differently. Let me use the existing split:
-                    // First key_dim values = query (normalized later)
-                    // Next key_dim values = key
-                    // Next val_dim values = value
-                    // But wait, with 16 k_heads * 128 k_dim = 2048 for Q
-                    //          16 k_heads * 128 k_dim = 2048 for K
-                    //          16 v_heads * 128 v_dim = 2048 for V
-                    // Total = 6144 ✓
-                }
-
-                // Step C0: L2-normalize Q and K per-head (matches standard path)
-                // Q_norm = Q / ||Q|| * rsqrt(k_head_dim)
-                // K_norm = K / ||K||
-                {
-                    float* conv_out = gate_up_b;  // reused
-                    // nk already derived above from qkv_out_dim
-                    // Q layout: conv_out[k_head * hkd .. (k_head+1) * hkd]
-                    // K layout: conv_out[key_dim + k_head * hkd .. key_dim + (k_head+1) * hkd]
-
-                    // Normalize Q and K per head using threads 0..nk-1
-                    if (tid < nk) {
-                        const int h = tid;
-                        // Q head
-                        float* qh = conv_out + h * hkd;  // q_key_offset + h * hkd
-                        float sq = 0.0f;
-                        for (int d = 0; d < hkd; ++d)
-                            sq += qh[d] * qh[d];
-                        float inv = rsqrtf(sq + 1e-6f) * rsqrtf(static_cast<float>(hkd));
-                        for (int d = 0; d < hkd; ++d)
-                            qh[d] *= inv;
-
-                        // K head
-                        float* kh = conv_out + key_dim + h * hkd;
-                        sq = 0.0f;
-                        for (int d = 0; d < hkd; ++d)
-                            sq += kh[d] * kh[d];
-                        inv = rsqrtf(sq + 1e-6f);
-                        for (int d = 0; d < hkd; ++d)
-                            kh[d] *= inv;
-                    }
-                    __syncthreads();
-                }
-
-                // Step C: Parallel delta recurrent state update
-                // state: [nv, hkd, hvd] F32 — the recurrent memory
-                // 256 threads process 2 heads at a time: threads 0-127 → head h,
-                // threads 128-255 → head h+1. Each thread owns one v-dimension.
-                // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
-                //           state += outer(key, delta), output = state @ query
-                {
-                    float* conv_out = gate_up_b;  // reused
-                    float* state = static_cast<float*>(rec_b);
-
-                    const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
-                    const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
-
-                    const int q_key_offset = 0;
-                    const int k_key_offset = key_dim;
-                    const int v_val_offset = key_dim * 2;
-                    const int v = tid % hvd;          // v-dimension for this thread
-
-                    // Process 2 heads per iteration (256 threads / 128 hvd)
-                    for (int hp = 0; hp < nv; hp += 2) {
-                        const int h = hp + (tid >= hvd ? 1 : 0);
-
-                        if (h < nv) {
-                            float* sh = state + h * hkd * hvd;
-                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
-                            float decay = 1.0f;
-                            if (dt_bw != nullptr && ale_w != nullptr) {
-                                const float sp = logf(1.0f + expf(
-                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
-                            }
-
-                            // Apply decay: state *= exp(g)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] *= decay;
-                            }
-
-                            // Map value head to key head for Q/K indexing
-                            // nk key heads shared among nv value heads
-                            const int h_k = h * nk / nv;
-
-                            // kv_mem[v] = sum_k(state[k, v] * key[k])
-                            float kv_mem_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                kv_mem_v += sh[k * hvd + v]
-                                          * conv_out[k_key_offset + h_k * hkd + k];
-                            }
-
-                            // delta = (value - kv_mem) * beta
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            const float delta = (val - kv_mem_v) * beta;
-
-                            // state[k, v] += key[k] * delta (each thread owns its v)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] +=
-                                    conv_out[k_key_offset + h_k * hkd + k] * delta;
-                            }
-
-                            // output[v] = sum_k(state[k, v] * query[k])
-                            float out_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                out_v += sh[k * hvd + v]
-                                       * conv_out[q_key_offset + h_k * hkd + k];
-                            }
-
-                            attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
-                        }
-                        __syncthreads();
-                    }
-                }
-
-                __syncthreads();
-
-                // Step D: Per-head RMSNorm + weight + SiLU(z) gating
-                {
-                    const float* nw = static_cast<const float*>(L.linear_norm_w);
-                    if (tid < nv) {
-                        const int h = tid;
-                        const float* ho = attn_scratch_b + h * hvd;
-                        float sq = 0.0f;
-                        for (int j = 0; j < hvd; ++j)
-                            sq += ho[j] * ho[j];
-                        lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
-                    }
-                    __syncthreads();
-                    for (int d = tid; d < val_dim; d += bs) {
-                        const int h = d / hvd;
-                        const int hd_idx = d % hvd;
-                        float rms_inv = lds[h];
-                        float n = attn_scratch_b[d] * rms_inv;
-                        float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
-                        float zv = z_f32[d];
-                        attn_scratch_b[d] = bf16_round_rne_f32_finite(
-                            n * w * (zv * dotcache_qwen35_sigmoid_fast(zv)));
-                    }
-                    __syncthreads();
-                }
-
-            } // end if (blockIdx.x == 0) for linear attention core
-            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
-            grid_barrier(barrier_counter, barrier_flag, nb);
-
-            // Step E: out_proj [hidden_dim, val_dim] × attn_scratch → hidden_f32 (fused residual)
-            // Per-sequence: cache batch b's output in LDS, work-steal hidden_dim rows
-            {
-                const int vd = L.linear_value_dim;  // 2048
-
-                for (int c = tid; c < vd; c += bs)
-                    lds_input[c] = attn_scratch[b * attn_scratch_floats + c];
-                __syncthreads();
-
-                if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
-                grid_barrier(barrier_counter, barrier_flag, nb);
-
-                for (;;) {
-                    unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __shared__ unsigned int shared_sr;
-                    if (tid == 0) shared_sr = sr;
-                    __syncthreads();
-                    sr = shared_sr;
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
-
-                    float p = 0.0f;
-                    if (int4_scales != nullptr && int4_scales[layer].linear_out_proj_scale != nullptr) {
-                        const int gsz = int4_scales[layer].group_size;
-                        const int byte_cols = vd / 2;
-                        const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
-                        const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_scale);
-                        const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_zero);
-                        const int sr_g = sr / gsz;
-                        const int sc_cols = (vd + gsz - 1) / gsz;
-                        const int vd8 = vd & ~7;
-                        for (int c = tid * 8; c < vd8; c += bs * 8) {
-                            uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
-                            float w[8];
-                            int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
-                            p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
-                               + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
-                        }
-                        for (int c = vd8 + tid; c < vd; c += bs)
-                            p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
-                    } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
-                        for (int c = tid; c < vd; c += bs)
-                            p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
-                    } else {
-                        const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
-                        if (kv_fp8 != nullptr) {
-                            if (tid == 0) {
-                                for (int c = 0; c < vd; ++c) {
-                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                                }
-                            }
-                        } else {
-                            for (int c = tid; c < vd; c += bs)
-                                p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                        }
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
-                    }
-                    if (tid == 0) {
-                        float add = bf16_round_rne_f32_finite(lds[0]);
-                        hidden_f32[b * hidden_dim + sr] =
-                            bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
-                    }
-                    __syncthreads();
-                }
-            }
-            __syncthreads();
-            grid_barrier(barrier_counter, barrier_flag, nb);
-            } // end for (b) batch loop for linear attention
-
-        }
+        } // end token mixer scope
 
         if (blockIdx.x == 0) {
             for (int b = 0; b < B; b++) {
@@ -5037,9 +4517,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const float checkpoint =
                         bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + c]);
                     token_out[b * hidden_dim + c] = checkpoint;
-                    hidden_io[b * hidden_dim + c] = dotcache_qwen35_from_float<T>(checkpoint);
+                    hidden_io[b * hidden_dim + c] = phi4_from_float<T>(checkpoint);
                     hidden_f32[b * hidden_dim + c] =
-                        dotcache_qwen35_to_float(hidden_io[b * hidden_dim + c]);
+                        phi4_to_float(hidden_io[b * hidden_dim + c]);
                 }
                 __syncthreads();
             }
@@ -5067,8 +4547,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     float inv_rms = rsqrtf(lds[0] / static_cast<float>(hidden_dim) + norm_eps);
                     for (int c = tid; c < hidden_dim; c += bs) {
-                        dst[c] = dotcache_qwen35_from_float<T>(
-                            src[c] * inv_rms * (dotcache_qwen35_to_float(norm_w[c]) + 1.0f));
+                        dst[c] = phi4_from_float<T>(
+                            src[c] * inv_rms * phi4_to_float(norm_w[c]));
                     }
                     __syncthreads();
                 }
@@ -5188,14 +4668,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
                     const int vec_dim = hidden_dim & ~3;
                     for (int c = tid * 4; c < vec_dim; c += bs * 4) {
-                        float gw0 = dotcache_qwen35_to_float(gr[c]);
-                        float gw1 = dotcache_qwen35_to_float(gr[c+1]);
-                        float gw2 = dotcache_qwen35_to_float(gr[c+2]);
-                        float gw3 = dotcache_qwen35_to_float(gr[c+3]);
-                        float uw0 = dotcache_qwen35_to_float(ur[c]);
-                        float uw1 = dotcache_qwen35_to_float(ur[c+1]);
-                        float uw2 = dotcache_qwen35_to_float(ur[c+2]);
-                        float uw3 = dotcache_qwen35_to_float(ur[c+3]);
+                        float gw0 = phi4_to_float(gr[c]);
+                        float gw1 = phi4_to_float(gr[c+1]);
+                        float gw2 = phi4_to_float(gr[c+2]);
+                        float gw3 = phi4_to_float(gr[c+3]);
+                        float uw0 = phi4_to_float(ur[c]);
+                        float uw1 = phi4_to_float(ur[c+1]);
+                        float uw2 = phi4_to_float(ur[c+2]);
+                        float uw3 = phi4_to_float(ur[c+3]);
                         for (int b = 0; b < B; b++) {
                             const float* inp = lds_input + b * hidden_dim + c;
                             gp[b] += gw0 * inp[0] + gw1 * inp[1] + gw2 * inp[2] + gw3 * inp[3];
@@ -5203,8 +4683,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                     }
                     for (int c = vec_dim + tid; c < hidden_dim; c += bs) {
-                        float gw = dotcache_qwen35_to_float(gr[c]);
-                        float uw = dotcache_qwen35_to_float(ur[c]);
+                        float gw = phi4_to_float(gr[c]);
+                        float uw = phi4_to_float(ur[c]);
                         for (int b = 0; b < B; b++) {
                             float inp = lds_input[b * hidden_dim + c];
                             gp[b] += gw * inp;
@@ -5299,7 +4779,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     } else {
                         const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
                         for (int c = tid; c < L.intermediate_size; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                            p += phi4_to_float(wr[c]) * lds_input[c];
                     }
                     lds[tid] = p;
                     __syncthreads();
@@ -5322,36 +4802,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         } // end for (b) down_proj batch loop
 
         // Residual add for MLP is fused into down_proj above.
-
-        // === DFlash hidden-state tap (M1.2) ===
-        // When the host requests it, mirror the post-MLP residual hidden state
-        // into tap_workspace for any tap layer matching `layer`. Layout is
-        // [num_taps, B, hidden_dim]. The branch is runtime-gated; we rely on
-        // the kernel never being launched with non-null tap params unless the
-        // workspace is sized for [num_taps * B * hidden_dim] T elements.
-        // hidden_f32 is settled at this point (last grid_barrier completed for
-        // the down_proj batch above); the new grid_barrier inside the if-branch
-        // serializes the tap write with the next layer's hidden_f32 mutations.
-        if (tap_workspace != nullptr) {
-            for (int t = 0; t < num_taps; ++t) {
-                if (tap_layers[t] == layer) {
-                    for (int b = 0; b < B; ++b) {
-                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-                            tap_workspace[(t * B + b) * hidden_dim + c] =
-                                dotcache_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
-                        }
-                    }
-                }
-            }
-            __syncthreads();
-            grid_barrier(barrier_counter, barrier_flag, nb);
-        }
     }
 
     // Write back F32 → BF16 for all batch items
     for (int b = 0; b < B; b++) {
         for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
-            hidden_io[b * hidden_dim + c] = dotcache_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
+            hidden_io[b * hidden_dim + c] = phi4_from_float<T>(hidden_f32[b * hidden_dim + c]);
         }
     }
 }

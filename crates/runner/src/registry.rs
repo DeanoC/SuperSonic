@@ -6,6 +6,7 @@ pub use gpu_hal::Backend;
 pub enum ModelFamily {
     Qwen35,
     Gemma4,
+    Phi4,
 }
 
 impl fmt::Display for ModelFamily {
@@ -13,6 +14,7 @@ impl fmt::Display for ModelFamily {
         match self {
             Self::Qwen35 => write!(f, "qwen3.5"),
             Self::Gemma4 => write!(f, "gemma4"),
+            Self::Phi4 => write!(f, "phi4"),
         }
     }
 }
@@ -25,6 +27,7 @@ pub enum ModelVariant {
     Qwen3_5_9B,
     Gemma4_E2B,
     Gemma4_E4B,
+    Phi4_Mini,
 }
 
 impl ModelVariant {
@@ -36,6 +39,7 @@ impl ModelVariant {
             "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
             "gemma4-e2b" | "gemma-4-e2b" | "e2b" => Some(Self::Gemma4_E2B),
             "gemma4-e4b" | "gemma-4-e4b" | "e4b" => Some(Self::Gemma4_E4B),
+            "phi4-mini" | "phi-4-mini" | "phi4mini" => Some(Self::Phi4_Mini),
             _ => None,
         }
     }
@@ -48,6 +52,7 @@ impl ModelVariant {
             Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
             Self::Gemma4_E2B => "google/gemma-4-E2B",
             Self::Gemma4_E4B => "google/gemma-4-E4B",
+            Self::Phi4_Mini => "microsoft/Phi-4-mini-instruct",
         }
     }
 
@@ -57,6 +62,7 @@ impl ModelVariant {
                 ModelFamily::Qwen35
             }
             Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
+            Self::Phi4_Mini => ModelFamily::Phi4,
         }
     }
 }
@@ -70,6 +76,7 @@ impl fmt::Display for ModelVariant {
             Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
             Self::Gemma4_E2B => write!(f, "gemma4-e2b"),
             Self::Gemma4_E4B => write!(f, "gemma4-e4b"),
+            Self::Phi4_Mini => write!(f, "phi4-mini"),
         }
     }
 }
@@ -120,9 +127,16 @@ pub struct Gemma4KernelParams {
     pub kv_chunk_size: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct Phi4KernelParams {
+    pub weight_prefix: &'static str,
+    pub kv_chunk_size: usize,
+}
+
 pub enum FamilyParams {
     Qwen35(Qwen35KernelParams),
     Gemma4(Gemma4KernelParams),
+    Phi4(Phi4KernelParams),
 }
 
 pub struct VramBudget {
@@ -272,6 +286,22 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    // Phi-4-mini: 3.8B dense, full-attention all 32 layers, LongRoPE.
+    // BF16 weights ≈ 7.6 GiB; KV cache at 4K ctx ≈ 520 MiB (32 layers × 2 × 8 kv_heads × 128 head_dim × 2 B).
+    // Fits gfx1150 with headroom. Weight prefix is bare `model` (Phi stores tensors as `model.*`).
+    RegistryEntry {
+        model: ModelVariant::Phi4_Mini,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1150,
+        vram: VramBudget {
+            fixed_bytes: 8 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Phi4(Phi4KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
 ];
 
 pub fn lookup(
@@ -294,6 +324,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
             ModelVariant::Gemma4_E2B => "gemma4-e2b",
             ModelVariant::Gemma4_E4B => "gemma4-e4b",
+            ModelVariant::Phi4_Mini => "phi4-mini",
         })
         .collect();
     models.sort_unstable();
