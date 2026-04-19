@@ -4688,8 +4688,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const bool attn_lane_active = tid < (hd / 4);
                             const int attn_active_waves = 2;
 
-                            for (int d = tid; d < hd; d += bs) {
-                                q_head_bf16[d] = dotcache_qwen35_from_float<T>(q_head[d]);
+                            if (attn_lane_active) {
+                                const int d0 = tid * 4;
+                                q_head_bf16[d0] = dotcache_qwen35_from_float<T>(q_head[d0]);
+                                q_head_bf16[d0 + 1] = dotcache_qwen35_from_float<T>(q_head[d0 + 1]);
+                                q_head_bf16[d0 + 2] = dotcache_qwen35_from_float<T>(q_head[d0 + 2]);
+                                q_head_bf16[d0 + 3] = dotcache_qwen35_from_float<T>(q_head[d0 + 3]);
                             }
                             __syncthreads();
 
@@ -4742,9 +4746,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     v2 = vv1.x;
                                     v3 = vv1.y;
                                 }
-                                float wave_sum = wave_reduce_sum_f32(partial);
-                                if (attn_lane == 0 && attn_wave < attn_active_waves) {
-                                    lds[attn_wave] = wave_sum;
+                                if (attn_lane_active) {
+                                    float wave_sum = wave_reduce_sum_f32(partial);
+                                    if (attn_lane == 0) {
+                                        lds[attn_wave] = wave_sum;
+                                    }
                                 }
                                 __syncthreads();
                                 float score_val = 0.0f;
@@ -4757,13 +4763,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     }
                                 }
                                 __syncthreads();
-                                score_val = lds[0] * scale;
-
-                                float old_max = my_max;
-                                my_max = fmaxf(my_max, score_val);
-                                float rescale = expf(old_max - my_max);
-                                float w = expf(score_val - my_max);
                                 if (attn_lane_active) {
+                                    score_val = lds[0] * scale;
+                                    float old_max = my_max;
+                                    my_max = fmaxf(my_max, score_val);
+                                    float rescale = expf(old_max - my_max);
+                                    float w = expf(score_val - my_max);
                                     my_acc0 = my_acc0 * rescale + w * v0;
                                     my_acc1 = my_acc1 * rescale + w * v1;
                                     my_acc2 = my_acc2 * rescale + w * v2;

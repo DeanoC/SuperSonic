@@ -339,6 +339,67 @@ What this means now:
 - the next pass should explicitly separate score-reduction work from value
   accumulation / softmax rescaling before attempting another structural rewrite
 
+## Fourth Kept Single-Stream Pass
+
+The next kept pass stayed inside the same packed BF16 single-stream attention
+path, but it stopped making the idle threads do useless score-side work:
+
+- kept the single-block `B == 1` BF16 path introduced in the earlier kept
+  passes
+- left FP8-KV and batch-2 decode unchanged
+- kept the existing `4` dims per active thread mapping and the same full-block
+  synchronization points
+- changed `q`-head BF16 staging so only the `64` active attention lanes write
+  the staged shared-memory query buffer
+- changed the per-token score path so only the active lanes execute the
+  wave-level reduction and online-softmax scalar update, while the other
+  threads only participate in the required block barriers
+
+Why this pass was chosen:
+
+- the one-warp subset-barrier experiment was faster but not safe enough to
+  keep
+- the earlier timing split still pointed at score-side work, not projection or
+  output
+- on the current `4B` hero branch, `192` threads were still spending cycles on
+  zero-value shuffle/reduction and scalar softmax math every token
+- this pass keeps the proven schedule and math ordering intact while trimming
+  only work that does not contribute to the result
+
+Short screening result (`pp533` / `tg16`) against commit `9cce7c2`:
+
+- decode improved from `1544.3 ms` to `1539.0 ms`
+- persistent decode improved from `1452.782 ms` to `1447.006 ms`
+- full attention improved from `557.829 ms` to `548.709 ms`
+- full-attention core improved from `529.602 ms` to `521.446 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `9cce7c2`:
+
+- prefill moved from `4481.3 ms` to `4496.5 ms`
+- decode improved from `12756.0 ms` to `12685.8 ms`
+- native decode total improved from `12544.656 ms` to `12475.365 ms`
+- persistent decode improved from `12021.549 ms` to `11952.418 ms`
+- full attention improved from `4891.021 ms` to `4817.504 ms`
+- full-attention core improved from `4672.824 ms` to `4599.407 ms`
+
+Verification notes:
+
+- short-prompt baked `--validate --force-kernel-decode` matched the restored
+  `9cce7c2` baseline token stream and deltas on this machine
+- short-prompt baked `--gpu-validate --force-kernel-decode` also matched the
+  restored baseline token stream and deltas
+- baked batch-2 quick validate matched the restored baseline, and the batch
+  path was not modified by this pass
+
+What this means now:
+
+- the remaining single-stream `4B` bottleneck is still the packed BF16
+  attention core
+- score-side work can still be reduced a little without changing the proven
+  lane mapping or synchronization structure
+- the next pass should still focus on the attention core, but it needs to buy
+  more than this pass did to justify added complexity
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero
