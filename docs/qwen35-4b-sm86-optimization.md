@@ -490,6 +490,77 @@ What this means now:
   should either split `linear_core` again on the final build or prove that a
   head-parallel recurrent remap beats the simpler fused serial path
 
+## Sixth Kept Single-Stream Pass
+
+The next kept pass stayed inside the same serial `4B` linear-attention body,
+but cut redundant Q/K reloads from the recurrent loop:
+
+- left the hero lane unchanged:
+  `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- left batch scheduling, FP8-KV, and the full-attention hero path untouched
+- reused the front of `lds_input` as a small per-head staging buffer
+- staged the normalized `q` and `k` vectors for each two-head recurrent
+  iteration into shared memory once, then reused those shared values across all
+  `128` value-lane threads for that head
+- kept the recurrent math and writeback ordering unchanged
+
+Why this pass was chosen:
+
+- after the recurrent-pass fusion, `linear_core` was still a real bottleneck,
+  but the remaining work was no longer dominated by recurrent-state traffic
+  alone
+- each thread in the recurrent body was still reloading the same normalized
+  `q/k` vectors from global scratch on every pass over state
+- staging those vectors once per head pair is the smallest way to reduce that
+  redundant traffic without reopening the wider block/head scheduling question
+
+Short screening result (`pp533` / `tg16`) against commit `44ab4bd`:
+
+- prefill stayed flat: `4483.0 ms`
+- decode improved from `1516.7 ms` to `1512.0 ms`
+- native decode total improved from `1490.015 ms` to `1485.502 ms`
+- persistent decode improved from `1424.597 ms` to `1420.061 ms`
+- full attention stayed flat: `548.653 ms` to `548.610 ms`
+- full-attention core stayed flat: `521.454 ms` to `521.495 ms`
+- linear projection stayed flat: `140.277 ms` to `140.224 ms`
+- linear core improved from `409.137 ms` to `404.261 ms`
+- linear out stayed flat: `79.690 ms` to `79.682 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `44ab4bd`:
+
+- prefill improved from `4482.9 ms` to `4474.9 ms`
+- decode improved from `12500.6 ms` to `12462.6 ms`
+- native decode total improved from `12288.288 ms` to `12251.867 ms`
+- persistent decode improved from `11765.571 ms` to `11729.533 ms`
+- full attention stayed flat: `4813.594 ms` to `4813.412 ms`
+- full-attention core stayed flat: `4600.385 ms` to `4600.225 ms`
+- linear projection stayed flat: `1121.687 ms` to `1121.198 ms`
+- linear core improved from `3275.092 ms` to `3235.868 ms`
+- linear out stayed flat: `637.628 ms` to `637.556 ms`
+
+Verification notes:
+
+- baked `--validate --force-kernel-decode` still passed with
+  `decode_max_delta=0.7930` and the same token stream as the kept baseline
+- baked batch-2 validate still passed with `decode_max_delta=0.8086` and the
+  same token stream as the kept baseline
+- `tests/sm86/run_4b.sh` baked path still passed; its `--no-bake` subtest still
+  fails on this machine because `/workspace/models/Qwen3.5-4B` has no raw
+  safetensors files
+- `tests/sm86/run_batch.sh` baked path still passed; its `--no-bake` subtest
+  fails for the same model-directory reason
+- `tests/sm86/run_4b_long.sh` again passed all `4/4` long-context corpus cases
+
+What this means now:
+
+- the current single-stream `4B` hero lane is still best treated as a
+  no-batch latency lane first, with batch remaining a secondary surface
+- the remaining easy wins inside the serial linear-attention body are getting
+  smaller, which raises the bar for any further in-place tweaks
+- the next bounded pass should likely compare this serial shared-staging path
+  against a narrow head-parallel recurrent remap, not a broader `0.8B`-style
+  schedule copy
+
 ## Internal Persistent Split
 
 Added a `4B`-local persistent-section timing breakdown on the warmed batch hero

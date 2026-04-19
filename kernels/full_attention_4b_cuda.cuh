@@ -5232,6 +5232,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 {
                     float* conv_out = gate_up_b;  // reused
                     float* state = static_cast<float*>(rec_b);
+                    // Reuse the front of lds_input as a tiny per-head staging area
+                    // so the recurrent body does not keep reloading the same Q/K
+                    // vectors from global scratch.
+                    float* q_stage = lds_input;
+                    float* k_stage = q_stage + 2 * hkd;
 
                     const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
                     const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
@@ -5243,6 +5248,20 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                     // Process 2 heads per iteration (256 threads / 128 hvd)
                     for (int hp = 0; hp < nv; hp += 2) {
+                        if (tid < 2 * hkd) {
+                            const int pair_head = tid / hkd;
+                            const int d = tid % hkd;
+                            const int staged_h = hp + pair_head;
+                            if (staged_h < nv) {
+                                const int staged_hk = staged_h * nk / nv;
+                                q_stage[tid] =
+                                    conv_out[q_key_offset + staged_hk * hkd + d];
+                                k_stage[tid] =
+                                    conv_out[k_key_offset + staged_hk * hkd + d];
+                            }
+                        }
+                        __syncthreads();
+
                         const int h = hp + (tid >= hvd ? 1 : 0);
 
                         if (h < nv) {
@@ -5258,9 +5277,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                             // Map value head to key head for Q/K indexing
                             // nk key heads shared among nv value heads
-                            const int h_k = h * nk / nv;
-                            const float* kh = conv_out + k_key_offset + h_k * hkd;
-                            const float* qh = conv_out + q_key_offset + h_k * hkd;
+                            const int pair_head = h - hp;
+                            const float* qh = q_stage + pair_head * hkd;
+                            const float* kh = k_stage + pair_head * hkd;
 
                             // First pass: apply decay and accumulate kv_mem from the
                             // decayed state so we do not reload the recurrent tile.
