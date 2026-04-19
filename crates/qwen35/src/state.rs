@@ -221,4 +221,263 @@ impl ModelState {
         }
         Ok(Self { layers })
     }
+
+    /// Capture `(conv_state, recurrent_state)` for every linear-attention
+    /// layer into a sidecar. Full-attention slots carry `None` so the inner
+    /// `Vec` is indexed 1:1 with `self.layers`.
+    ///
+    /// Used by the DFlash speculative engine to roll back linear state after
+    /// a partial-acceptance verify — full-attention K/V uses the separate
+    /// counter-flip (commit_kv_filled=false) path, per docs/dflash.md §6.1.
+    /// Cost on Qwen3.5-9B: ~1 MiB/layer × 24 linear layers = ~25 MiB.
+    pub fn snapshot_linear(&self) -> Result<LinearStateSnapshot, GpuError> {
+        let mut per_layer = Vec::with_capacity(self.layers.len());
+        for ls in &self.layers {
+            match (ls.kind, &ls.conv_state, &ls.recurrent_state) {
+                (LayerKind::Linear, Some(conv), Some(rec)) => {
+                    per_layer.push(Some((conv.clone_device()?, rec.clone_device()?)));
+                }
+                _ => per_layer.push(None),
+            }
+        }
+        Ok(LinearStateSnapshot { per_layer })
+    }
+
+    /// Restore every linear layer's `(conv_state, recurrent_state)` from
+    /// `snap` via D2D copies into the existing buffers. Shapes/dtypes must
+    /// match what `snapshot_linear` captured — this is a tight invariant
+    /// because the sidecar originated from the same `ModelState::new`.
+    pub fn restore_linear(
+        &mut self,
+        snap: &LinearStateSnapshot,
+        ordinal: usize,
+    ) -> Result<(), GpuError> {
+        if snap.per_layer.len() != self.layers.len() {
+            return Err(GpuError::InvalidArg(format!(
+                "restore_linear: snapshot has {} layers, state has {}",
+                snap.per_layer.len(),
+                self.layers.len(),
+            )));
+        }
+        for (i, ls) in self.layers.iter_mut().enumerate() {
+            match (ls.kind, &snap.per_layer[i]) {
+                (LayerKind::Linear, Some((conv_src, rec_src))) => {
+                    let conv_dst = ls.conv_state.as_mut().ok_or_else(|| {
+                        GpuError::InvalidArg(format!(
+                            "restore_linear: layer {i} missing conv_state"
+                        ))
+                    })?;
+                    let rec_dst = ls.recurrent_state.as_mut().ok_or_else(|| {
+                        GpuError::InvalidArg(format!(
+                            "restore_linear: layer {i} missing recurrent_state"
+                        ))
+                    })?;
+                    if conv_dst.len_bytes() != conv_src.len_bytes()
+                        || rec_dst.len_bytes() != rec_src.len_bytes()
+                    {
+                        return Err(GpuError::InvalidArg(format!(
+                            "restore_linear: layer {i} size mismatch (conv dst={} src={}, rec dst={} src={})",
+                            conv_dst.len_bytes(),
+                            conv_src.len_bytes(),
+                            rec_dst.len_bytes(),
+                            rec_src.len_bytes(),
+                        )));
+                    }
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        conv_dst.as_mut_ptr(),
+                        conv_src.as_ptr(),
+                        conv_src.len_bytes(),
+                    )?;
+                    gpu_hal::copy_d2d(
+                        ordinal,
+                        rec_dst.as_mut_ptr(),
+                        rec_src.as_ptr(),
+                        rec_src.len_bytes(),
+                    )?;
+                }
+                (LayerKind::Full, None) => {}
+                (LayerKind::Linear, None) => {
+                    return Err(GpuError::InvalidArg(format!(
+                        "restore_linear: layer {i} is Linear but snapshot slot is None"
+                    )));
+                }
+                (LayerKind::Full, Some(_)) => {
+                    return Err(GpuError::InvalidArg(format!(
+                        "restore_linear: layer {i} is Full but snapshot slot is Some"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Sidecar holding `(conv_state, recurrent_state)` for every linear-attention
+/// layer at some earlier logical position. Produced by
+/// [`ModelState::snapshot_linear`] and consumed by
+/// [`ModelState::restore_linear`]. Full-attention layers store `None` so
+/// slot indices line up 1:1 with [`ModelState::layers`].
+pub struct LinearStateSnapshot {
+    pub per_layer: Vec<Option<(GpuBuffer, GpuBuffer)>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Activation;
+
+    fn tiny_config() -> TextConfig {
+        TextConfig {
+            vocab_size: 128,
+            hidden_size: 64,
+            intermediate_size: 64,
+            num_hidden_layers: 4,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            hidden_act: Activation::default(),
+            max_position_embeddings: 64,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            eos_token_id: None,
+            head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 8,
+            linear_value_head_dim: 8,
+            linear_num_key_heads: 2,
+            linear_num_value_heads: 4,
+            layer_types: vec![],
+            rope_parameters: None,
+        }
+        .normalized()
+    }
+
+    fn random_bytes(count: usize, seed: u64) -> Vec<u8> {
+        let mut s: u64 = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            out.push(((s >> 33) & 0xFF) as u8);
+        }
+        out
+    }
+
+    /// Bit-exact roundtrip: fill linear state with bytes A, snapshot, overwrite
+    /// with bytes B, restore, assert we read back bytes A everywhere.
+    ///
+    /// `#[ignore]` because it needs a HIP/CUDA runtime. Run with:
+    ///   cargo test -p qwen35 -- --ignored linear_snapshot_roundtrip_bit_exact
+    #[test]
+    #[ignore = "requires a GPU runtime"]
+    fn linear_snapshot_roundtrip_bit_exact() {
+        let ordinal = 0_usize;
+        let config = tiny_config();
+        assert_eq!(config.layer_types.len(), config.num_hidden_layers);
+        assert!(!config.is_full_attention(0));
+        assert!(config.is_full_attention(3));
+
+        let mut state = ModelState::new(&config, ordinal).expect("alloc ModelState");
+
+        // Write bytes-A into every linear layer's (conv_state, recurrent_state).
+        let mut expected_per_layer: Vec<Option<(Vec<u8>, Vec<u8>)>> =
+            Vec::with_capacity(state.layers.len());
+        for (i, ls) in state.layers.iter_mut().enumerate() {
+            match (ls.kind, ls.conv_state.as_mut(), ls.recurrent_state.as_mut()) {
+                (LayerKind::Linear, Some(conv), Some(rec)) => {
+                    let conv_a = random_bytes(conv.len_bytes(), 0xC07A + i as u64);
+                    let rec_a = random_bytes(rec.len_bytes(), 0x8EC0 + i as u64);
+                    gpu_hal::copy_h2d(
+                        ordinal,
+                        conv.as_mut_ptr(),
+                        conv_a.as_ptr() as *const _,
+                        conv_a.len(),
+                    )
+                    .expect("h2d conv A");
+                    gpu_hal::copy_h2d(
+                        ordinal,
+                        rec.as_mut_ptr(),
+                        rec_a.as_ptr() as *const _,
+                        rec_a.len(),
+                    )
+                    .expect("h2d rec A");
+                    expected_per_layer.push(Some((conv_a, rec_a)));
+                }
+                _ => expected_per_layer.push(None),
+            }
+        }
+
+        // Snapshot at bytes-A.
+        let snap = state.snapshot_linear().expect("snapshot_linear");
+        assert_eq!(snap.per_layer.len(), state.layers.len());
+
+        // Overwrite with bytes-B (different seed).
+        for (i, ls) in state.layers.iter_mut().enumerate() {
+            if let (LayerKind::Linear, Some(conv), Some(rec)) =
+                (ls.kind, ls.conv_state.as_mut(), ls.recurrent_state.as_mut())
+            {
+                let conv_b = random_bytes(conv.len_bytes(), 0xBBBB + i as u64);
+                let rec_b = random_bytes(rec.len_bytes(), 0xCCCC + i as u64);
+                gpu_hal::copy_h2d(
+                    ordinal,
+                    conv.as_mut_ptr(),
+                    conv_b.as_ptr() as *const _,
+                    conv_b.len(),
+                )
+                .expect("h2d conv B");
+                gpu_hal::copy_h2d(
+                    ordinal,
+                    rec.as_mut_ptr(),
+                    rec_b.as_ptr() as *const _,
+                    rec_b.len(),
+                )
+                .expect("h2d rec B");
+            }
+        }
+
+        // Restore from the bytes-A snapshot.
+        state
+            .restore_linear(&snap, ordinal)
+            .expect("restore_linear");
+
+        // Read back and assert bit-exact equality with bytes-A.
+        for (i, ls) in state.layers.iter().enumerate() {
+            match (ls.kind, &ls.conv_state, &ls.recurrent_state, &expected_per_layer[i]) {
+                (LayerKind::Linear, Some(conv), Some(rec), Some((conv_a, rec_a))) => {
+                    let conv_rb = conv.to_host_bytes().expect("d2h conv restored");
+                    let rec_rb = rec.to_host_bytes().expect("d2h rec restored");
+                    assert_eq!(
+                        &conv_rb, conv_a,
+                        "layer {i}: conv_state mismatch after restore"
+                    );
+                    assert_eq!(
+                        &rec_rb, rec_a,
+                        "layer {i}: recurrent_state mismatch after restore"
+                    );
+                }
+                (LayerKind::Full, None, None, None) => {}
+                _ => panic!(
+                    "layer {i}: kind/state/snapshot-slot inconsistency after restore"
+                ),
+            }
+        }
+
+        // Sanity: a second snapshot + restore round-trip on the restored state
+        // is a no-op.
+        let snap2 = state.snapshot_linear().expect("snapshot_linear 2nd");
+        state.restore_linear(&snap2, ordinal).expect("restore_linear 2nd");
+        for (i, ls) in state.layers.iter().enumerate() {
+            if let (LayerKind::Linear, Some(conv), Some(rec), Some((conv_a, rec_a))) =
+                (ls.kind, &ls.conv_state, &ls.recurrent_state, &expected_per_layer[i])
+            {
+                let conv_rb = conv.to_host_bytes().expect("d2h conv 2nd");
+                let rec_rb = rec.to_host_bytes().expect("d2h rec 2nd");
+                assert_eq!(&conv_rb, conv_a, "layer {i}: conv drift on 2nd roundtrip");
+                assert_eq!(&rec_rb, rec_a, "layer {i}: rec drift on 2nd roundtrip");
+            }
+        }
+    }
 }
