@@ -9,19 +9,20 @@ issue with your GPU arch, ROCm/CUDA versions, and the exact command line.
 
 ## HIP — `gfx1150` (AMD Radeon 890M iGPU)
 
-16 CUs, 2.9 GHz core, shared with system memory. Measurements from
-2026-04-20 on commit `b075b00` (0.8B-native kernel deleted, 2× grid
-oversubscription merged).
+16 CUs, 2.9 GHz core, shared with system memory. Measurements on
+2026-04-20 at current main (0.8B-native kernel deleted, 2× grid
+oversubscription merged, registry-driven cooperative-launch preset
+for 0.8B).
 
 ### Qwen3.5
 
 | Model              | Quant | ms/tok | tok/s |
 |--------------------|-------|-------:|------:|
-| qwen3.5-0.8b       | BF16  |   91   | 11.0  |
-| qwen3.5-0.8b       | INT4  |   78   | 12.8  |
-| qwen3.5-2b         | BF16  |  159   |  6.3  |
+| qwen3.5-0.8b       | BF16  |   76   | 13.2  |
+| qwen3.5-0.8b       | INT4  |   67   | 14.9  |
+| qwen3.5-2b         | BF16  |  155   |  6.5  |
 | qwen3.5-2b         | INT4  |  118   |  8.5  |
-| qwen3.5-4b         | BF16  |  514   |  1.9  |
+| qwen3.5-4b         | BF16  |  388   |  2.6  |
 | qwen3.5-4b         | INT4  |  286   |  3.5  |
 | qwen3.5-9b         | FP8   |  697   |  1.4  |
 
@@ -31,6 +32,14 @@ Notes:
   megakernel. The dedicated 0.8B-native kernel was deleted on 2026-04-20 —
   it had no INT4/FP8 path and was ~2.8× slower than the 4B-routed path
   even for BF16.
+- The 0.8B HIP registry entry carries a `hip_launch_preset` of `(32 blocks,
+  cooperative=true)`, installed automatically at startup. Cooperative
+  launch on gfx1150 caps conservatively at 24 blocks for 0.8B's 14 KB LDS
+  footprint — that's where the ~1.2× speedup over the plain 2× default
+  (16 blocks) comes from. 2B/4B/9B have no preset because their larger LDS
+  caps the cooperative grid at or below the 2× default; they stay on the
+  non-cooperative path. `SUPERSONIC_QWEN4B_BLOCKS` / `SUPERSONIC_QWEN4B_COOP`
+  env vars still override the preset.
 - `qwen3.5-9b` INT4 bake runs out of VRAM during GPTQ calibration on 16 GiB
   cards. Consumers pull the released bake from GitHub releases (see
   [bake-distribution.md](bake-distribution.md)); the INT4 runtime itself is

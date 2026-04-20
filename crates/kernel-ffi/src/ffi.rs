@@ -173,6 +173,13 @@ unsafe extern "C" {
         device_ordinal: c_int,
         clock_rate_khz_out: *mut u32,
     ) -> c_int;
+
+    // Per-model launch preset for the qwen4b persistent decode kernel.
+    // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
+    // default). `coop != 0` opts into `hipLaunchCooperativeKernel` for that
+    // preset, which is safe at higher block counts but caps conservatively
+    // based on `hipOccupancyMaxActiveBlocksPerMultiprocessor`.
+    fn dotcache_qwen35_4b_hip_set_launch_preset(blocks: c_int, coop: c_int);
 }
 
 #[cfg(supersonic_backend_cuda)]
@@ -1179,5 +1186,26 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
         )));
     }
     Ok(clock_khz)
+    }
+}
+
+/// Install a per-model launch preset for the qwen4b persistent decode
+/// kernel on HIP. `blocks == 0` clears any active preset; a positive value
+/// makes the bridge pick that grid size when no `SUPERSONIC_QWEN4B_BLOCKS`
+/// env var is set. `coop == true` opts the preset into cooperative launch
+/// (recommended whenever the preset exceeds the safe non-coop 2x default).
+///
+/// No-op on non-HIP builds — CUDA has its own separate bridge.
+pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
+    #[cfg(supersonic_backend_hip)]
+    unsafe {
+        dotcache_qwen35_4b_hip_set_launch_preset(
+            blocks as c_int,
+            if coop { 1 } else { 0 },
+        );
+    }
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = (blocks, coop);
     }
 }
