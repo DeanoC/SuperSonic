@@ -3967,7 +3967,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const int nb = gridDim.x;
     constexpr bool hero_specialized = SINGLE_STREAM_BF16_SPECIALIZED;
     const int B = hero_specialized ? 1 : batch_size;
-    const bool emit_attention_trace = hero_specialized ? false : (enable_attention_trace != 0);
+    // Keep the hot single-stream hero path unchanged for normal execution, but
+    // allow debug tracing to force the trace-capable fallback path in this same
+    // kernel so the exported attention scratch is valid on 4B CUDA.
+    const bool emit_attention_trace = (enable_attention_trace != 0);
     const bool runtime_qwen35_4b_shape =
         hidden_dim == 2560 &&
         intermediate_size == 9216 &&
