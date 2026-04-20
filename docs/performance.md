@@ -69,12 +69,13 @@ stay on the work-stealing scalar kernel. Gated by
 `SUPERSONIC_GEMMA4_DISABLE_WMMA=1`. Prefill speedups measured
 2026-04-20:
 
-| Model        | Prompt tokens | Scalar    | WMMA    | Speedup |
-|--------------|--------------:|----------:|--------:|:--------|
-| gemma4-e2b   |          1021 | 417190 ms | 8863 ms |  47.1×  |
-| gemma4-e4b   |           241 | 206045 ms | 5935 ms |  34.7×  |
+| Model        | Quant | Prompt tokens | Scalar    | WMMA    | Speedup |
+|--------------|-------|--------------:|----------:|--------:|:--------|
+| gemma4-e2b   | BF16  |          1021 | 417190 ms | 8863 ms |  47.1×  |
+| gemma4-e4b   | BF16  |           241 | 206045 ms | 5935 ms |  34.7×  |
+| gemma4-e2b   | INT4  |          1021 | 182116 ms | 4866 ms |  37.4×  |
 
-The ratio is larger than the Qwen WMMA port (~2×) because the Gemma 4
+The ratio is larger than the Qwen WMMA port (~2–4×) because the Gemma 4
 scalar path was a one-block-per-output-element work-stealing matvec
 (fine for decode, terrible for prefill), not a tiled matmul.
 
