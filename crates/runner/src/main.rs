@@ -248,6 +248,18 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     trace_prefill_linear_layer: Option<usize>,
 
+    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
+    /// full-attention layer's internal tensors against the Python oracle.
+    /// Defaults to a later full-attention layer where parity drift is larger.
+    #[arg(long, hide = true)]
+    trace_prefill_full_layer: Option<usize>,
+
+    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
+    /// MLP block's internal tensors against the Python oracle.
+    /// Defaults to the selected full-attention trace layer when present.
+    #[arg(long, hide = true)]
+    trace_prefill_mlp_layer: Option<usize>,
+
     /// Batch size for decode (number of sequences decoded in parallel).
     /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
     /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
@@ -1012,6 +1024,47 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let trace_prefill_full_layer = if cli.trace_prefill_layers
+        && model_variant.family() == ModelFamily::Qwen35
+    {
+        let layer = cli.trace_prefill_full_layer.unwrap_or(19);
+        let config = &engine.weights().config;
+        if layer >= config.num_hidden_layers {
+            anyhow::bail!(
+                "--trace-prefill-full-layer {} out of range for {} layers",
+                layer,
+                config.num_hidden_layers
+            );
+        }
+        if !config.is_full_attention(layer) {
+            anyhow::bail!(
+                "--trace-prefill-full-layer {} selects a linear-attention layer; choose a full-attention layer",
+                layer
+            );
+        }
+        Some(layer)
+    } else {
+        None
+    };
+    let trace_prefill_mlp_layer = if cli.trace_prefill_layers
+        && model_variant.family() == ModelFamily::Qwen35
+    {
+        let layer = cli
+            .trace_prefill_mlp_layer
+            .or(trace_prefill_full_layer)
+            .unwrap_or(19);
+        let config = &engine.weights().config;
+        if layer >= config.num_hidden_layers {
+            anyhow::bail!(
+                "--trace-prefill-mlp-layer {} out of range for {} layers",
+                layer,
+                config.num_hidden_layers
+            );
+        }
+        Some(layer)
+    } else {
+        None
+    };
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
@@ -1020,6 +1073,7 @@ fn main() -> Result<()> {
         native_prefill_trace,
         native_linear_debug_trace,
         native_layer3_full_attn_trace,
+        native_mlp_debug_trace,
         mut next_token,
     ) = if cli.oracle_prefill {
         let model_id = cli
@@ -1039,10 +1093,15 @@ fn main() -> Result<()> {
         engine.load_prefill_state(&output)?;
         let first = output.generated_token_ids[0];
         eprintln!("[prefill] oracle prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
-        (output.prefill_logits, None, None, None, first)
+        (output.prefill_logits, None, None, None, None, first)
     } else {
         let prefill_result = if cli.trace_prefill_layers {
-            engine.prefill_native_with_trace(&prompt_ids, trace_prefill_linear_layer)?
+            engine.prefill_native_with_trace(
+                &prompt_ids,
+                trace_prefill_linear_layer,
+                trace_prefill_full_layer,
+                trace_prefill_mlp_layer,
+            )?
         } else {
             prefill_engine::PrefillResult {
                 logits: engine.prefill_native(&prompt_ids)?,
@@ -1055,6 +1114,7 @@ fn main() -> Result<()> {
                 tap_hiddens: None,
                 linear_debug_trace: None,
                 layer3_full_attn_trace: None,
+                mlp_debug_trace: None,
             }
         };
         let first = DecodeEngine::greedy_sample(&prefill_result.logits);
@@ -1070,6 +1130,7 @@ fn main() -> Result<()> {
             )),
             prefill_result.linear_debug_trace,
             prefill_result.layer3_full_attn_trace,
+            prefill_result.mlp_debug_trace,
             first,
         )
     };
@@ -1117,6 +1178,8 @@ fn main() -> Result<()> {
                 &cli.oracle_dtype,
                 &oracle_device,
                 trace_prefill_linear_layer,
+                trace_prefill_full_layer,
+                trace_prefill_mlp_layer,
             )?)
         } else {
             None
@@ -1406,6 +1469,10 @@ fn main() -> Result<()> {
                 native_layer3_full_attn_trace.as_ref(),
                 qwen35_trace_output.as_ref(),
             ) {
+                let trace_full_layer = trace
+                    .trace_full_layer
+                    .or(trace_prefill_full_layer)
+                    .unwrap_or(3);
                 if let (
                     Some(oracle_q_and_gate),
                     Some(oracle_gate_proj),
@@ -1416,14 +1483,30 @@ fn main() -> Result<()> {
                     Some(oracle_v_prepared),
                     Some(oracle_attn),
                 ) = (
-                    flatten_last_token_bsd(&trace.layer3_q_and_gate_output),
-                    flatten_last_token_bsd(&trace.layer3_gate_output),
-                    flatten_last_token_bsd(&trace.layer3_k_proj_output),
-                    flatten_last_token_bsd(&trace.layer3_v_proj_output),
-                    flatten_last_token_bhsd(&trace.layer3_prepared_query_output),
-                    flatten_last_token_bhsd(&trace.layer3_prepared_key_output),
-                    flatten_last_token_bhsd(&trace.layer3_prepared_value_output),
-                    flatten_last_token_bsd(&trace.layer3_attention_output),
+                    trace.trace_full_q_and_gate_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_full_gate_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_full_k_proj_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_full_v_proj_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_full_prepared_query_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bhsd),
+                    trace.trace_full_prepared_key_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bhsd),
+                    trace.trace_full_prepared_value_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bhsd),
+                    trace.trace_full_attention_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
                 ) {
                     let native_q_proj = decode_bf16_le(&native.q_proj);
                     let native_gate_proj = decode_bf16_le(&native.gate_proj);
@@ -1445,7 +1528,8 @@ fn main() -> Result<()> {
                             .copy_from_slice(&oracle_q_and_gate[src_base..src_base + head_dim]);
                     }
                     eprintln!(
-                        "[trace-prefill-layer3-full] q_proj_delta={:.4} gate_proj_delta={:.4} k_proj_delta={:.4} v_proj_delta={:.4} q_prepared_delta={:.4} k_prepared_delta={:.4} v_prepared_delta={:.4} attn_output_delta={:.4}",
+                        "[trace-prefill-full] layer={} q_proj_delta={:.4} gate_proj_delta={:.4} k_proj_delta={:.4} v_proj_delta={:.4} q_prepared_delta={:.4} k_prepared_delta={:.4} v_prepared_delta={:.4} attn_output_delta={:.4}",
+                        trace_full_layer,
                         validate::max_abs_delta(&native_q_proj, &oracle_q_proj),
                         validate::max_abs_delta(&native_gate_proj, &oracle_gate_proj),
                         validate::max_abs_delta(&native_k_proj, &oracle_k_proj),
@@ -1456,10 +1540,73 @@ fn main() -> Result<()> {
                         validate::max_abs_delta(&native_attn, &oracle_attn),
                     );
                 } else {
-                    eprintln!("[trace-prefill-layer3-full] missing flattenable qwen35 trace tensors");
+                    eprintln!(
+                        "[trace-prefill-full] layer={} missing flattenable qwen35 trace tensors",
+                        trace_full_layer
+                    );
                 }
             } else if model_variant.family() == ModelFamily::Qwen35 {
-                eprintln!("[trace-prefill-layer3-full] missing native or qwen35 trace data");
+                let layer = trace_prefill_full_layer.unwrap_or(3);
+                eprintln!(
+                    "[trace-prefill-full] layer={} missing native or qwen35 trace data",
+                    layer
+                );
+            }
+
+            if let (Some(native), Some(trace)) = (
+                native_mlp_debug_trace.as_ref(),
+                qwen35_trace_output.as_ref(),
+            ) {
+                let trace_mlp_layer = trace.trace_mlp_layer.or(trace_prefill_mlp_layer).unwrap_or(19);
+                if let (
+                    Some(oracle_post_norm),
+                    Some(oracle_gate_proj),
+                    Some(oracle_up_proj),
+                    Some(oracle_swiglu),
+                    Some(oracle_down_proj),
+                ) = (
+                    trace.trace_mlp_post_attention_layernorm_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_mlp_gate_proj_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_mlp_up_proj_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_mlp_activated_hidden
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_mlp_down_proj_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                ) {
+                    let native_post_norm = decode_bf16_le(&native.post_norm);
+                    let native_gate_proj = decode_bf16_le(&native.gate_proj);
+                    let native_up_proj = decode_bf16_le(&native.up_proj);
+                    let native_swiglu = decode_bf16_le(&native.swiglu);
+                    let native_down_proj = decode_bf16_le(&native.down_proj);
+                    eprintln!(
+                        "[trace-prefill-mlp] layer={} post_norm_delta={:.4} gate_proj_delta={:.4} up_proj_delta={:.4} swiglu_delta={:.4} down_proj_delta={:.4}",
+                        trace_mlp_layer,
+                        validate::max_abs_delta(&native_post_norm, &oracle_post_norm),
+                        validate::max_abs_delta(&native_gate_proj, &oracle_gate_proj),
+                        validate::max_abs_delta(&native_up_proj, &oracle_up_proj),
+                        validate::max_abs_delta(&native_swiglu, &oracle_swiglu),
+                        validate::max_abs_delta(&native_down_proj, &oracle_down_proj),
+                    );
+                } else {
+                    eprintln!(
+                        "[trace-prefill-mlp] layer={} missing flattenable qwen35 trace tensors",
+                        trace_mlp_layer
+                    );
+                }
+            } else if model_variant.family() == ModelFamily::Qwen35 {
+                let layer = trace_prefill_mlp_layer.unwrap_or(19);
+                eprintln!(
+                    "[trace-prefill-mlp] layer={} missing native or qwen35 trace data",
+                    layer
+                );
             }
         }
 
@@ -2452,6 +2599,8 @@ fn trace_kv_cache(
         use_4b_kernel,
         false,
         None,
+        None,
+        None,
     )?;
 
     for batch_index in 0..batch_size {
@@ -2616,6 +2765,8 @@ fn trace_component_input_layer(
         use_4b_kernel,
         true,
         None,
+        None,
+        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -2663,6 +2814,8 @@ fn trace_persistent_input_layer(
         use_4b_kernel,
         true,
         None,
+        None,
+        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -2709,6 +2862,8 @@ fn trace_persistent_linear_state_layer(
         false,
         use_4b_kernel,
         false,
+        None,
+        None,
         None,
     )?;
 
@@ -2867,6 +3022,8 @@ fn trace_persistent_full_attn_layer(
         use_4b_kernel,
         true,
         None,
+        None,
+        None,
     )?;
     let mut replay_state = ModelState::new(&text_config, ordinal)
         .map_err(|e| anyhow::anyhow!("persistent full-attn replay state init: {e}"))?;
@@ -2881,6 +3038,8 @@ fn trace_persistent_full_attn_layer(
         false,
         use_4b_kernel,
         true,
+        None,
+        None,
         None,
     )?;
     let replay_hidden = replay
@@ -3409,6 +3568,8 @@ fn trace_persistent_linear_layer(
         use_4b_kernel,
         true,
         None,
+        None,
+        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -3622,6 +3783,8 @@ fn trace_component_layer(
         use_4b_kernel,
         true,
         None,
+        None,
+        None,
     )?;
     let attn = replay
         .layer_attn_trace
@@ -3676,6 +3839,8 @@ fn trace_component_linear_layer(
         use_4b_kernel,
         false,
         Some(trace_layer),
+        None,
+        None,
     )?;
     let replay = replay
         .linear_debug_trace
@@ -3894,6 +4059,8 @@ fn trace_component_linear_state_layer(
         false,
         use_4b_kernel,
         false,
+        None,
+        None,
         None,
     )?;
     let replay_layer = replay_state

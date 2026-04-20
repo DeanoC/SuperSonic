@@ -211,6 +211,8 @@ pub struct PrefillResult {
     pub linear_debug_trace: Option<LinearLayerDebugTrace>,
     /// Optional layer-3 full-attention stage trace for the last prompt token.
     pub layer3_full_attn_trace: Option<Layer3FullAttentionTrace>,
+    /// Optional last-token debug trace for one selected MLP block.
+    pub mlp_debug_trace: Option<MlpLayerDebugTrace>,
 }
 
 pub struct LinearLayerDebugTrace {
@@ -235,6 +237,14 @@ pub struct Layer3FullAttentionTrace {
     pub k_prepared: Vec<u8>,
     pub v_prepared: Vec<u8>,
     pub attn_output: Vec<u8>,
+}
+
+pub struct MlpLayerDebugTrace {
+    pub post_norm: Vec<u8>,
+    pub gate_proj: Vec<u8>,
+    pub up_proj: Vec<u8>,
+    pub swiglu: Vec<u8>,
+    pub down_proj: Vec<u8>,
 }
 
 /// Scratch buffers for prefill (larger than decode — seq_len > 1).
@@ -353,11 +363,13 @@ pub fn prefill(
     use_4b_kernel: bool,
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
+    debug_full_layer: Option<usize>,
+    debug_mlp_layer: Option<usize>,
 ) -> Result<PrefillResult> {
     prefill_inner(
         weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
         prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
-        debug_linear_layer, None,
+        debug_linear_layer, debug_full_layer, debug_mlp_layer, None,
     )
 }
 
@@ -377,12 +389,14 @@ pub fn prefill_with_taps(
     use_4b_kernel: bool,
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
+    debug_full_layer: Option<usize>,
+    debug_mlp_layer: Option<usize>,
     tap_layers: &[usize],
 ) -> Result<PrefillResult> {
     prefill_inner(
         weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
         prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
-        debug_linear_layer, Some(tap_layers),
+        debug_linear_layer, debug_full_layer, debug_mlp_layer, Some(tap_layers),
     )
 }
 
@@ -398,6 +412,8 @@ fn prefill_inner(
     use_4b_kernel: bool,
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
+    debug_full_layer: Option<usize>,
+    debug_mlp_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
 ) -> Result<PrefillResult> {
     let config = &weights.config;
@@ -453,6 +469,7 @@ fn prefill_inner(
     };
     let mut linear_debug_trace = None;
     let mut layer3_full_attn_trace = None;
+    let mut mlp_debug_trace = None;
 
     // DFlash hidden-state taps: pre-allocate one slot per requested layer.
     // Validate indices up front so we fail loudly before doing prefill work.
@@ -555,6 +572,7 @@ fn prefill_inner(
                 prefill_full_attention_layer(
                     weights, state, rotary, &mut scratch, config, idx,
                     chunk_len, chunk_start, ordinal, kv_chunk_size,
+                    debug_full_layer,
                     &mut layer3_full_attn_trace,
                     /* commit_kv_filled */ true,
                 )?;
@@ -627,7 +645,17 @@ fn prefill_inner(
             }
 
             // MLP
-            prefill_mlp_layer(weights, &mut scratch, config, idx, chunk_len, ordinal)?;
+            let trace_mlp_debug = debug_mlp_layer == Some(idx) && is_last_chunk;
+            prefill_mlp_layer(
+                weights,
+                &mut scratch,
+                config,
+                idx,
+                chunk_len,
+                ordinal,
+                trace_mlp_debug,
+                &mut mlp_debug_trace,
+            )?;
 
             if is_last_chunk {
                 if let Some(trace) = layer_mlp_swiglu_trace.as_mut() {
@@ -762,6 +790,7 @@ fn prefill_inner(
         tap_hiddens,
         linear_debug_trace,
         layer3_full_attn_trace,
+        mlp_debug_trace,
     })
 }
 
@@ -879,6 +908,8 @@ pub fn gpu_reference_replay_step(
         use_4b_kernel,
         false,
         None,
+        None,
+        None,
     )?;
     Ok(result.logits)
 }
@@ -912,6 +943,8 @@ pub fn gpu_reference_replay_step_with_taps(
         use_4b_kernel,
         false,
         None,
+        None,
+        None,
         tap_layers,
     )?;
     let taps = result.tap_hiddens.ok_or_else(|| {
@@ -939,6 +972,7 @@ fn prefill_full_attention_layer(
     chunk_start: usize,
     ordinal: usize,
     kv_chunk_size: usize,
+    debug_full_layer: Option<usize>,
     layer3_trace: &mut Option<Layer3FullAttentionTrace>,
     commit_kv_filled: bool,
 ) -> Result<()> {
@@ -957,6 +991,9 @@ fn prefill_full_attention_layer(
     let rotary_dim = config.rotary_dim();
     let elem_bytes = ScalarType::BF16.size_in_bytes();
     let kv_len = chunk_start + chunk_len; // total KV length after this chunk
+    let trace_full_debug = debug_full_layer == Some(idx);
+    let mut layer3_q_proj_trace: Option<Vec<u8>> = None;
+    let mut layer3_k_proj_trace: Option<Vec<u8>> = None;
 
     // 1. Q projection
     let mut q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_proj_dim])
@@ -974,6 +1011,23 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
     prefill_ffi::split_qgate(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &q_full, &mut query_buf, &mut gate_buf)
         .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
+    if trace_full_debug {
+        let row_bytes = q_dim * ScalarType::BF16.size_in_bytes();
+        let offset = (chunk_len - 1) * row_bytes;
+        let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+            .map_err(|e| anyhow::anyhow!("layer {idx} q_proj alloc: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            row.as_ptr() as *mut c_void,
+            query_buf.offset_ptr(offset),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} q_proj copy: {e}"))?;
+        layer3_q_proj_trace = Some(
+            row.to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} q_proj D2H: {e}"))?,
+        );
+    }
 
     // 3. K projection
     matmul_proj(
@@ -981,6 +1035,23 @@ fn prefill_full_attention_layer(
         &scratch.normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
+    if trace_full_debug {
+        let row_bytes = kv_dim * ScalarType::BF16.size_in_bytes();
+        let offset = (chunk_len - 1) * row_bytes;
+        let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+            .map_err(|e| anyhow::anyhow!("layer {idx} k_proj alloc: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            row.as_ptr() as *mut c_void,
+            scratch.proj_buf2.offset_ptr(offset),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} k_proj copy: {e}"))?;
+        layer3_k_proj_trace = Some(
+            row.to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} k_proj D2H: {e}"))?,
+        );
+    }
 
     // 4. Q normalization
     let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_q_heads, head_dim])
@@ -1154,7 +1225,7 @@ fn prefill_full_attention_layer(
     residual_add(ordinal, chunk_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf2)
         .map_err(|e| anyhow::anyhow!("layer {idx} attention residual: {e}"))?;
 
-    if idx == 3 {
+    if trace_full_debug {
         let copy_last_row = |src: &GpuBuffer, row_elems: usize, name: &str| -> Result<Vec<u8>> {
             let row_bytes = row_elems * ScalarType::BF16.size_in_bytes();
             let offset = (chunk_len - 1) * row_bytes;
@@ -1189,9 +1260,11 @@ fn prefill_full_attention_layer(
             };
 
         *layer3_trace = Some(Layer3FullAttentionTrace {
-            q_proj: copy_last_row(&query_buf, q_dim, "q_proj")?,
+            q_proj: layer3_q_proj_trace
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_proj trace"))?,
             gate_proj: copy_last_row(&gate_buf, q_dim, "gate_proj")?,
-            k_proj: copy_last_row(&scratch.proj_buf2, kv_dim, "k_proj")?,
+            k_proj: layer3_k_proj_trace
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_proj trace"))?,
             v_proj: copy_last_row(&v_buf, kv_dim, "v_proj")?,
             q_prepared: copy_last_token_heads(&q_normed, num_q_heads, "q_prepared")?,
             k_prepared: copy_last_token_heads(&k_normed, num_kv_heads, "k_prepared")?,
@@ -1881,6 +1954,8 @@ fn prefill_mlp_layer(
     idx: usize,
     seq_len: usize,
     ordinal: usize,
+    trace_mlp_debug: bool,
+    mlp_debug_trace: &mut Option<MlpLayerDebugTrace>,
 ) -> Result<()> {
     let lw = &weights.layers[idx];
     let hidden_dim = config.hidden_size;
@@ -1892,6 +1967,27 @@ fn prefill_mlp_layer(
         &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
         lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
+    if trace_mlp_debug {
+        let normed_bytes = scratch
+            .normed
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug mlp normed D2H: {e}"))?;
+        let normed_row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let normed_start = (seq_len - 1) * normed_row_bytes;
+        let gate_bytes = scratch
+            .proj_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug gate_proj D2H: {e}"))?;
+        let row_bytes = intermediate * ScalarType::BF16.size_in_bytes();
+        let start = (seq_len - 1) * row_bytes;
+        *mlp_debug_trace = Some(MlpLayerDebugTrace {
+            post_norm: normed_bytes[normed_start..normed_start + normed_row_bytes].to_vec(),
+            gate_proj: gate_bytes[start..start + row_bytes].to_vec(),
+            up_proj: Vec::new(),
+            swiglu: Vec::new(),
+            down_proj: Vec::new(),
+        });
+    }
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
     matmul_proj(
@@ -1899,6 +1995,16 @@ fn prefill_mlp_layer(
         &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
+    if trace_mlp_debug {
+        let trace = mlp_debug_trace.as_mut().expect("mlp debug trace missing");
+        let bytes = scratch
+            .proj_buf2
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug up_proj D2H: {e}"))?;
+        let row_bytes = intermediate * ScalarType::BF16.size_in_bytes();
+        let start = (seq_len - 1) * row_bytes;
+        trace.up_proj = bytes[start..start + row_bytes].to_vec();
+    }
 
     // SwiGLU: out = silu(gate) * up
     prefill_ffi::swiglu_mul(
@@ -1909,6 +2015,16 @@ fn prefill_mlp_layer(
         &scratch.proj_buf2,
         &mut scratch.mlp_buf,
     )?;
+    if trace_mlp_debug {
+        let trace = mlp_debug_trace.as_mut().expect("mlp debug trace missing");
+        let bytes = scratch
+            .mlp_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug swiglu D2H: {e}"))?;
+        let row_bytes = intermediate * ScalarType::BF16.size_in_bytes();
+        let start = (seq_len - 1) * row_bytes;
+        trace.swiglu = bytes[start..start + row_bytes].to_vec();
+    }
 
     // down_proj: mlp_buf [seq, intermediate] × down_w [hidden, intermediate]^T → [seq, hidden]
     matmul_proj(
@@ -1916,6 +2032,16 @@ fn prefill_mlp_layer(
         &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
         lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
+    if trace_mlp_debug {
+        let trace = mlp_debug_trace.as_mut().expect("mlp debug trace missing");
+        let bytes = scratch
+            .proj_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug down_proj D2H: {e}"))?;
+        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let start = (seq_len - 1) * row_bytes;
+        trace.down_proj = bytes[start..start + row_bytes].to_vec();
+    }
 
     // Residual: hidden += down_proj output
     residual_add(ordinal, seq_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf)

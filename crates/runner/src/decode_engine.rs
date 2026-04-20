@@ -2563,6 +2563,8 @@ impl DecodeEngine {
             self.use_4b_kernel,
             false,
             None,
+            None,
+            None,
         )?;
 
         // Reset sync counters for the decode kernel
@@ -2610,6 +2612,8 @@ impl DecodeEngine {
             self.use_4b_kernel,
             false,
             None,
+            None,
+            None,
             tap_layers,
         )?;
         self.scratch
@@ -2622,6 +2626,8 @@ impl DecodeEngine {
         &mut self,
         prompt_ids: &[u32],
         debug_linear_layer: Option<usize>,
+        debug_full_layer: Option<usize>,
+        debug_mlp_layer: Option<usize>,
     ) -> Result<prefill_engine::PrefillResult> {
         let result = prefill_engine::prefill(
             &self.weights,
@@ -2635,6 +2641,8 @@ impl DecodeEngine {
             self.use_4b_kernel,
             true,
             debug_linear_layer,
+            debug_full_layer,
+            debug_mlp_layer,
         )?;
 
         self.scratch

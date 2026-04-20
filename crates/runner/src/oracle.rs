@@ -65,6 +65,10 @@ pub struct Qwen35TraceOutput {
     #[serde(default)]
     pub trace_linear_layer: Option<usize>,
     #[serde(default)]
+    pub trace_full_layer: Option<usize>,
+    #[serde(default)]
+    pub trace_mlp_layer: Option<usize>,
+    #[serde(default)]
     pub trace_linear_input_layernorm_output: Option<Value>,
     #[serde(default)]
     pub trace_linear_qkv_output: Option<Value>,
@@ -88,6 +92,32 @@ pub struct Qwen35TraceOutput {
     pub trace_linear_norm_output: Option<Value>,
     #[serde(default)]
     pub trace_linear_token_mixer_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_q_and_gate_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_gate_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_k_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_v_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_query_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_key_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_value_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_attention_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_post_attention_layernorm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_gate_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_up_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_activated_hidden: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_down_proj_output: Option<Value>,
     pub first_layer_linear_qkv_output: Value,
     pub first_layer_linear_z_output: Value,
     pub first_layer_linear_prepared_query_output: Value,
@@ -189,6 +219,8 @@ pub fn run_qwen35_trace_oracle(
     dtype: &str,
     device: &str,
     trace_linear_layer: Option<usize>,
+    trace_full_layer: Option<usize>,
+    trace_mlp_layer: Option<usize>,
 ) -> Result<Qwen35TraceOutput> {
     let ids_str = prompt_ids
         .iter()
@@ -211,6 +243,12 @@ pub fn run_qwen35_trace_oracle(
         .arg(device);
     if let Some(layer) = trace_linear_layer {
         cmd.arg("--trace-linear-layer").arg(layer.to_string());
+    }
+    if let Some(layer) = trace_full_layer {
+        cmd.arg("--trace-full-layer").arg(layer.to_string());
+    }
+    if let Some(layer) = trace_mlp_layer {
+        cmd.arg("--trace-mlp-layer").arg(layer.to_string());
     }
     let output = cmd
         .output()

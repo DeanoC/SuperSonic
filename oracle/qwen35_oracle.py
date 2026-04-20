@@ -22,6 +22,16 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Optional Qwen linear-attention layer index to dump prefill internals for.",
     )
+    parser.add_argument(
+        "--trace-full-layer",
+        type=int,
+        help="Optional Qwen full-attention layer index to dump prefill internals for.",
+    )
+    parser.add_argument(
+        "--trace-mlp-layer",
+        type=int,
+        help="Optional Qwen MLP layer index to dump prefill internals for.",
+    )
     return parser.parse_args()
 
 
@@ -165,6 +175,8 @@ def main() -> None:
     layer4_mlp_output = None
     layer4_output = None
     trace_linear_layer_idx = args.trace_linear_layer
+    trace_full_layer_idx = args.trace_full_layer
+    trace_mlp_layer_idx = args.trace_mlp_layer
     trace_linear_qkv_output = None
     trace_linear_z_output = None
     trace_linear_input_layernorm_output = None
@@ -177,6 +189,19 @@ def main() -> None:
     trace_linear_direct_recurrent_output = None
     trace_linear_norm_output = None
     trace_linear_token_mixer_output = None
+    trace_full_q_and_gate_output = None
+    trace_full_gate_output = None
+    trace_full_k_proj_output = None
+    trace_full_v_proj_output = None
+    trace_full_prepared_query_output = None
+    trace_full_prepared_key_output = None
+    trace_full_prepared_value_output = None
+    trace_full_attention_output = None
+    trace_mlp_post_attention_layernorm_output = None
+    trace_mlp_gate_proj_output = None
+    trace_mlp_up_proj_output = None
+    trace_mlp_activated_hidden = None
+    trace_mlp_down_proj_output = None
 
     # Dictionary-based capture for middle decode layers (15-18)
     mid_layer_captures: dict[str, Any] = {}
@@ -755,6 +780,100 @@ def main() -> None:
             linear_attn.register_forward_hook(token_mixer_hook),
         ]
 
+    def make_trace_full_hooks(layer_idx: int):
+        layer = model.model.layers[layer_idx]
+        attn = layer.self_attn
+
+        def q_proj_hook(_module, _inputs, output):
+            nonlocal trace_full_q_and_gate_output
+            nonlocal trace_full_gate_output
+            if capture_phase != "prefill":
+                return
+            tensor = capture_tensor(output)
+            trace_full_q_and_gate_output = tensor
+            head_dim = int(attn.head_dim)
+            num_heads = tensor.shape[-1] // (head_dim * 2)
+            q_and_gate = tensor.reshape(
+                input_ids.shape[0], input_ids.shape[1], num_heads, head_dim * 2
+            )
+            trace_full_gate_output = q_and_gate[..., head_dim:].reshape(
+                input_ids.shape[0], input_ids.shape[1], num_heads * head_dim
+            ).cpu()
+
+        def k_proj_hook(_module, _inputs, output):
+            nonlocal trace_full_k_proj_output
+            if capture_phase != "prefill":
+                return
+            trace_full_k_proj_output = capture_tensor(output)
+
+        def v_proj_hook(_module, _inputs, output):
+            nonlocal trace_full_v_proj_output
+            nonlocal trace_full_prepared_value_output
+            if capture_phase != "prefill":
+                return
+            tensor = capture_tensor(output)
+            trace_full_v_proj_output = tensor
+            head_dim = int(attn.head_dim)
+            num_kv_heads = tensor.shape[-1] // head_dim
+            trace_full_prepared_value_output = tensor.reshape(
+                input_ids.shape[0], input_ids.shape[1], num_kv_heads, head_dim
+            ).transpose(1, 2).contiguous().cpu()
+
+        def o_proj_pre_hook(_module, inputs):
+            nonlocal trace_full_attention_output
+            if capture_phase != "prefill":
+                return
+            trace_full_attention_output = capture_tensor(inputs[0])
+
+        return [
+            attn.q_proj.register_forward_hook(q_proj_hook),
+            attn.k_proj.register_forward_hook(k_proj_hook),
+            attn.v_proj.register_forward_hook(v_proj_hook),
+            attn.o_proj.register_forward_pre_hook(o_proj_pre_hook),
+        ]
+
+    def make_trace_mlp_hooks(layer_idx: int):
+        layer = model.model.layers[layer_idx]
+        mlp = layer.mlp
+
+        def post_attention_layernorm_hook(_module, _inputs, output):
+            nonlocal trace_mlp_post_attention_layernorm_output
+            if capture_phase != "prefill":
+                return
+            trace_mlp_post_attention_layernorm_output = capture_tensor(output)
+
+        def gate_proj_hook(_module, _inputs, output):
+            nonlocal trace_mlp_gate_proj_output
+            if capture_phase != "prefill":
+                return
+            trace_mlp_gate_proj_output = capture_tensor(output)
+
+        def up_proj_hook(_module, _inputs, output):
+            nonlocal trace_mlp_up_proj_output
+            if capture_phase != "prefill":
+                return
+            trace_mlp_up_proj_output = capture_tensor(output)
+
+        def down_proj_pre_hook(_module, inputs):
+            nonlocal trace_mlp_activated_hidden
+            if capture_phase != "prefill":
+                return
+            trace_mlp_activated_hidden = capture_tensor(inputs[0])
+
+        def down_proj_hook(_module, _inputs, output):
+            nonlocal trace_mlp_down_proj_output
+            if capture_phase != "prefill":
+                return
+            trace_mlp_down_proj_output = capture_tensor(output)
+
+        return [
+            layer.post_attention_layernorm.register_forward_hook(post_attention_layernorm_hook),
+            mlp.gate_proj.register_forward_hook(gate_proj_hook),
+            mlp.up_proj.register_forward_hook(up_proj_hook),
+            mlp.down_proj.register_forward_pre_hook(down_proj_pre_hook),
+            mlp.down_proj.register_forward_hook(down_proj_hook),
+        ]
+
     def post_attention_layernorm_hook(_module, _inputs, output):
         nonlocal first_layer_post_attention_layernorm_output
         nonlocal decode_first_layer_post_attention_layernorm_output
@@ -1231,6 +1350,20 @@ def main() -> None:
                 f"trace-linear-layer={trace_linear_layer_idx} is not a linear-attention layer"
             )
         trace_linear_handles = make_trace_linear_hooks(trace_linear_layer_idx)
+    trace_full_handles: list[Any] = []
+    if trace_full_layer_idx is not None:
+        if not hasattr(model.model.layers[trace_full_layer_idx], "self_attn"):
+            raise RuntimeError(
+                f"trace-full-layer={trace_full_layer_idx} is not a full-attention layer"
+            )
+        trace_full_handles = make_trace_full_hooks(trace_full_layer_idx)
+    trace_mlp_handles: list[Any] = []
+    if trace_mlp_layer_idx is not None:
+        if trace_mlp_layer_idx < 0 or trace_mlp_layer_idx >= len(model.model.layers):
+            raise RuntimeError(
+                f"trace-mlp-layer={trace_mlp_layer_idx} is out of range for {len(model.model.layers)} layers"
+            )
+        trace_mlp_handles = make_trace_mlp_hooks(trace_mlp_layer_idx)
     try:
         with torch.no_grad():
             outputs = model(input_ids=input_ids, use_cache=True, output_hidden_states=True)
@@ -1309,10 +1442,40 @@ def main() -> None:
         layer23_handle.remove()
         for handle in trace_linear_handles:
             handle.remove()
+        for handle in trace_full_handles:
+            handle.remove()
+        for handle in trace_mlp_handles:
+            handle.remove()
         for handle in mid_layer_handles:
             handle.remove()
         for handle in decoder_layer_handles:
             handle.remove()
+
+    if trace_full_q_and_gate_output is not None and trace_full_k_proj_output is not None:
+        trace_full_attn = model.model.layers[trace_full_layer_idx].self_attn
+        head_dim = int(trace_full_attn.head_dim)
+        num_heads = trace_full_q_and_gate_output.shape[-1] // (head_dim * 2)
+        num_kv_heads = trace_full_k_proj_output.shape[-1] // head_dim
+        q = trace_full_q_and_gate_output.reshape(
+            input_ids.shape[0], input_ids.shape[1], num_heads, head_dim * 2
+        )[..., :head_dim]
+        k = trace_full_k_proj_output.reshape(
+            input_ids.shape[0], input_ids.shape[1], num_kv_heads, head_dim
+        )
+        q_weight = trace_full_attn.q_norm.weight.detach().to(dtype=torch.float32)
+        k_weight = trace_full_attn.k_norm.weight.detach().to(dtype=torch.float32)
+        q_eps = getattr(trace_full_attn.q_norm, "variance_epsilon", getattr(trace_full_attn.q_norm, "eps"))
+        k_eps = getattr(trace_full_attn.k_norm, "variance_epsilon", getattr(trace_full_attn.k_norm, "eps"))
+        q_ms = q.pow(2).mean(dim=-1, keepdim=True)
+        k_ms = k.pow(2).mean(dim=-1, keepdim=True)
+        q_normed = q * torch.rsqrt(q_ms + q_eps)
+        k_normed = k * torch.rsqrt(k_ms + k_eps)
+        trace_full_prepared_query_output = (
+            q_normed * (q_weight + 1.0)
+        ).transpose(1, 2).contiguous().cpu()
+        trace_full_prepared_key_output = (
+            k_normed * (k_weight + 1.0)
+        ).transpose(1, 2).contiguous().cpu()
 
     if layer3_q_and_gate_output is not None and layer3_k_proj_output is not None:
         layer3_attn = model.model.layers[3].self_attn
@@ -1628,6 +1791,8 @@ def main() -> None:
         "decode_layer23_mlp_output": decode_layer23_mlp_output.tolist() if decode_layer23_mlp_output is not None else None,
         "decode_layer23_output": decode_layer23_output.tolist() if decode_layer23_output is not None else None,
         "trace_linear_layer": trace_linear_layer_idx,
+        "trace_full_layer": trace_full_layer_idx,
+        "trace_mlp_layer": trace_mlp_layer_idx,
         "trace_linear_input_layernorm_output": trace_linear_input_layernorm_output.tolist() if trace_linear_input_layernorm_output is not None else None,
         "trace_linear_qkv_output": trace_linear_qkv_output.tolist() if trace_linear_qkv_output is not None else None,
         "trace_linear_z_output": trace_linear_z_output.tolist() if trace_linear_z_output is not None else None,
@@ -1640,6 +1805,19 @@ def main() -> None:
         "trace_linear_direct_recurrent_output": trace_linear_direct_recurrent_output.tolist() if trace_linear_direct_recurrent_output is not None else None,
         "trace_linear_norm_output": trace_linear_norm_output.tolist() if trace_linear_norm_output is not None else None,
         "trace_linear_token_mixer_output": trace_linear_token_mixer_output.tolist() if trace_linear_token_mixer_output is not None else None,
+        "trace_full_q_and_gate_output": trace_full_q_and_gate_output.tolist() if trace_full_q_and_gate_output is not None else None,
+        "trace_full_gate_output": trace_full_gate_output.tolist() if trace_full_gate_output is not None else None,
+        "trace_full_k_proj_output": trace_full_k_proj_output.tolist() if trace_full_k_proj_output is not None else None,
+        "trace_full_v_proj_output": trace_full_v_proj_output.tolist() if trace_full_v_proj_output is not None else None,
+        "trace_full_prepared_query_output": trace_full_prepared_query_output.tolist() if trace_full_prepared_query_output is not None else None,
+        "trace_full_prepared_key_output": trace_full_prepared_key_output.tolist() if trace_full_prepared_key_output is not None else None,
+        "trace_full_prepared_value_output": trace_full_prepared_value_output.tolist() if trace_full_prepared_value_output is not None else None,
+        "trace_full_attention_output": trace_full_attention_output.tolist() if trace_full_attention_output is not None else None,
+        "trace_mlp_post_attention_layernorm_output": trace_mlp_post_attention_layernorm_output.tolist() if trace_mlp_post_attention_layernorm_output is not None else None,
+        "trace_mlp_gate_proj_output": trace_mlp_gate_proj_output.tolist() if trace_mlp_gate_proj_output is not None else None,
+        "trace_mlp_up_proj_output": trace_mlp_up_proj_output.tolist() if trace_mlp_up_proj_output is not None else None,
+        "trace_mlp_activated_hidden": trace_mlp_activated_hidden.tolist() if trace_mlp_activated_hidden is not None else None,
+        "trace_mlp_down_proj_output": trace_mlp_down_proj_output.tolist() if trace_mlp_down_proj_output is not None else None,
     }
     for lid in mid_layer_ids:
         for suffix in [
