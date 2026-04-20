@@ -77,6 +77,9 @@ section_keys = [
     "persistent_full_attn_out_ms",
     "persistent_linear_proj_ms",
     "persistent_linear_core_ms",
+    "persistent_linear_core_conv_ms",
+    "persistent_linear_core_recurrent_ms",
+    "persistent_linear_core_post_ms",
     "persistent_linear_out_ms",
     "persistent_mlp_gate_up_ms",
     "persistent_mlp_down_ms",
@@ -193,6 +196,9 @@ print(
     f"full_attn_out={section_means['persistent_full_attn_out_ms']:.3f} "
     f"linear_proj={section_means['persistent_linear_proj_ms']:.3f} "
     f"linear_core={section_means['persistent_linear_core_ms']:.3f} "
+    f"linear_core_conv={section_means['persistent_linear_core_conv_ms']:.3f} "
+    f"linear_core_recurrent={section_means['persistent_linear_core_recurrent_ms']:.3f} "
+    f"linear_core_post={section_means['persistent_linear_core_post_ms']:.3f} "
     f"linear_out={section_means['persistent_linear_out_ms']:.3f} "
     f"mlp_gate_up={section_means['persistent_mlp_gate_up_ms']:.3f} "
     f"mlp_down={section_means['persistent_mlp_down_ms']:.3f}"

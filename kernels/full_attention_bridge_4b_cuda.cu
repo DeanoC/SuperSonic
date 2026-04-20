@@ -4561,7 +4561,7 @@ extern "C" int dotcache_qwen35_4b_hip_standalone_matvec(
     }
 }
 
-template <typename T>
+template <typename T, bool SINGLE_STREAM_BF16_SPECIALIZED = false>
 int persistent_decode_device(
     int device_ordinal,
     int num_layers,
@@ -4596,14 +4596,15 @@ int persistent_decode_device(
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
-    const size_t input_cache = static_cast<size_t>(hidden_dim) * batch_size > static_cast<size_t>(intermediate_size)
-        ? static_cast<size_t>(hidden_dim) * batch_size
+    const int effective_batch_size = SINGLE_STREAM_BF16_SPECIALIZED ? 1 : batch_size;
+    const size_t input_cache = static_cast<size_t>(hidden_dim) * effective_batch_size > static_cast<size_t>(intermediate_size)
+        ? static_cast<size_t>(hidden_dim) * effective_batch_size
         : static_cast<size_t>(intermediate_size);
-    const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
+    const size_t fp8_lut_size = SINGLE_STREAM_BF16_SPECIALIZED ? 0 : 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
+        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T, SINGLE_STREAM_BF16_SPECIALIZED>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         shared_bytes,
@@ -4664,7 +4665,56 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     const void* int4_scales) {
     switch (dtype) {
     case 2:
-        return persistent_decode_device<hip_bfloat16>(
+        return persistent_decode_device<hip_bfloat16, false>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(num_layers),
+            static_cast<int>(hidden_dim),
+            static_cast<int>(intermediate_size),
+            static_cast<int>(seqlen_offset),
+            layers, hidden_io, workspace, counters,
+            barrier_counter, barrier_flag, timing_slots,
+            cos_table, sin_table, static_cast<int>(rotary_dim),
+            static_cast<int>(proj_buf_floats),
+            static_cast<int>(attn_scratch_floats),
+            enable_attention_trace,
+            fp8_scales,
+            kv_fp8_descs,
+            static_cast<int>(batch_size),
+            batch_descs,
+            int4_scales);
+    default:
+        return 256;
+    }
+}
+
+extern "C" int dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
+    int dtype,
+    size_t device_ordinal,
+    size_t num_layers,
+    size_t hidden_dim,
+    size_t intermediate_size,
+    size_t seqlen_offset,
+    const void* layers,
+    void* hidden_io,
+    float* workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    unsigned long long* timing_slots,
+    const void* cos_table,
+    const void* sin_table,
+    size_t rotary_dim,
+    size_t proj_buf_floats,
+    size_t attn_scratch_floats,
+    int enable_attention_trace,
+    const void* fp8_scales,
+    const void* kv_fp8_descs,
+    size_t batch_size,
+    const void* batch_descs,
+    const void* int4_scales) {
+    switch (dtype) {
+    case 2:
+        return persistent_decode_device<hip_bfloat16, true>(
             static_cast<int>(device_ordinal),
             static_cast<int>(num_layers),
             static_cast<int>(hidden_dim),

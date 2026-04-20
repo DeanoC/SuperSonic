@@ -94,6 +94,33 @@ unsafe extern "C" {
         num_taps: usize,              // 0 when tap_workspace is nullptr
     ) -> c_int;
 
+    fn dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_dim: usize,
+        intermediate_size: usize,
+        seqlen_offset: usize,
+        layers: *const c_void,
+        hidden_io: *mut c_void,
+        workspace: *mut c_void,
+        counters: *mut c_void,
+        barrier_counter: *mut c_void,
+        barrier_flag: *mut c_void,
+        timing_slots: *mut c_void,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        rotary_dim: usize,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
+        enable_attention_trace: c_int,
+        fp8_scales: *const c_void,
+        kv_fp8_descs: *const c_void,
+        batch_size: usize,
+        batch_descs: *const c_void,
+        int4_scales: *const c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_4b_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
@@ -486,6 +513,113 @@ pub fn persistent_decode_4b(
     };
     if status != 0 {
         return Err(backend_error(backend, "persistent_decode_4b kernel", status));
+    }
+    Ok(())
+}
+
+pub fn persistent_decode_4b_qwen35_sm86_specialized(
+    ordinal: usize,
+    dtype: ScalarType,
+    num_layers: usize,
+    hidden_dim: usize,
+    intermediate_size: usize,
+    seqlen_offset: usize,
+    layer_descs_device: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    rotary_dim: usize,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
+    fp8_scale_descs: Option<&GpuBuffer>,
+    kv_fp8_descs: Option<&GpuBuffer>,
+    batch_size: usize,
+    batch_descs: Option<&GpuBuffer>,
+    int4_scale_descs: Option<&GpuBuffer>,
+    enable_timing_slots: bool,
+    enable_attention_trace: bool,
+    tap_workspace: Option<&mut GpuBuffer>,
+    tap_layers: Option<&GpuBuffer>,
+) -> Result<(), GpuError> {
+    if tap_workspace.is_some() || tap_layers.is_some() {
+        return Err(GpuError::InvalidArg(
+            "persistent_decode_4b_qwen35_sm86_specialized does not support DFlash taps".into(),
+        ));
+    }
+    let backend = layer_descs_device.backend();
+    let counters = sync_buf.as_mut_ptr();
+    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
+    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_void };
+    let timing_slots = if enable_timing_slots {
+        unsafe { (counters as *mut u8).add(24) as *mut c_void }
+    } else {
+        std::ptr::null_mut()
+    };
+
+    let fp8_scales_ptr = fp8_scale_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let kv_fp8_descs_ptr = kv_fp8_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let batch_descs_ptr = batch_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let int4_scales_ptr = int4_scale_descs
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
+
+    let status = match backend {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    num_layers,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_descs_device.as_ptr(),
+                    hidden_io.as_mut_ptr(),
+                    workspace.as_mut_ptr(),
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    timing_slots,
+                    cos_table.as_ptr(),
+                    sin_table.as_ptr(),
+                    rotary_dim,
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    if enable_attention_trace { 1 } else { 0 },
+                    fp8_scales_ptr,
+                    kv_fp8_descs_ptr,
+                    batch_size,
+                    batch_descs_ptr,
+                    int4_scales_ptr,
+                )
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b_qwen35_sm86_specialized is CUDA-only".into(),
+            ))
+        }
+    };
+
+    if status != 0 {
+        return Err(backend_error(
+            backend,
+            "persistent_decode_4b_qwen35_sm86_specialized kernel",
+            status,
+        ));
     }
     Ok(())
 }

@@ -4,7 +4,7 @@ use std::mem;
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
 
-pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 37;
+pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 43;
 pub const PERSISTENT_SYNC_COUNTER_BYTES: usize = 24;
 /// Required floats in the kernel's `attn_scratch` region for a given model
 /// and context ceiling. The 4B persistent decode kernel lays out
@@ -29,8 +29,8 @@ pub struct PersistentDecodeScratch {
     ordinal: usize,
     /// F32 workspace for projections, MLP, attention scratch.
     pub workspace: GpuBuffer,
-    /// Sync region: counters[4×u32=16B] + barrier_counter[u32=4B] + barrier_flag[u32=4B]
-    /// plus persistent 4B timing slots [6×u64].
+    /// Sync region: counters[4×u32=16B] + barrier_counter[u32=4B] +
+    /// barrier_flag[u32=4B] plus per-layer persistent 4B timing slots.
     pub sync_buf: GpuBuffer,
     /// Device copy of Vec<DecodeLayerDesc>.
     pub desc_device: GpuBuffer,

@@ -262,6 +262,9 @@ pub struct DecodeStageTimings {
     pub persistent_full_attn_out_ms: f64,
     pub persistent_linear_proj_ms: f64,
     pub persistent_linear_core_ms: f64,
+    pub persistent_linear_core_conv_ms: f64,
+    pub persistent_linear_core_recurrent_ms: f64,
+    pub persistent_linear_core_post_ms: f64,
     pub persistent_linear_out_ms: f64,
     pub persistent_mlp_gate_up_ms: f64,
     pub persistent_mlp_down_ms: f64,
@@ -282,6 +285,9 @@ impl DecodeStageTimings {
         self.persistent_full_attn_out_ms += rhs.persistent_full_attn_out_ms;
         self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
         self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
+        self.persistent_linear_core_conv_ms += rhs.persistent_linear_core_conv_ms;
+        self.persistent_linear_core_recurrent_ms += rhs.persistent_linear_core_recurrent_ms;
+        self.persistent_linear_core_post_ms += rhs.persistent_linear_core_post_ms;
         self.persistent_linear_out_ms += rhs.persistent_linear_out_ms;
         self.persistent_mlp_gate_up_ms += rhs.persistent_mlp_gate_up_ms;
         self.persistent_mlp_down_ms += rhs.persistent_mlp_down_ms;
@@ -352,8 +358,11 @@ const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
 const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
 const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
 const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 27;
-const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 35;
-const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 36;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE: usize = 35;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE: usize = 37;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE: usize = 39;
+const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 41;
+const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 42;
 
 fn persistent_4b_clock_cycles_to_ms(cycles: u64, clock_rate_khz: u32) -> f64 {
     if cycles == 0 || clock_rate_khz == 0 {
@@ -391,10 +400,14 @@ fn decode_persistent_4b_timing_slots(
     let mut full_attn_out_cycles = 0u64;
     let mut linear_proj_cycles = 0u64;
     let mut linear_core_cycles = 0u64;
+    let mut linear_core_conv_cycles = 0u64;
+    let mut linear_core_recurrent_cycles = 0u64;
+    let mut linear_core_post_cycles = 0u64;
     let mut linear_out_cycles = 0u64;
     let mut mlp_gate_up_cycles = 0u64;
     let mut mlp_down_cycles = 0u64;
     let section_batches = batch_size.min(8);
+    let split_batches = batch_size.min(2);
     for layer in 0..num_layers {
         let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
         full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
@@ -411,6 +424,14 @@ fn decode_persistent_4b_timing_slots(
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
             linear_out_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+        }
+        for b in 0..split_batches {
+            linear_core_conv_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + b);
+            linear_core_recurrent_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + b);
+            linear_core_post_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + b);
         }
     }
 
@@ -439,6 +460,18 @@ fn decode_persistent_4b_timing_slots(
             linear_core_cycles,
             clock_rate_khz,
         ),
+        persistent_linear_core_conv_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_conv_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_recurrent_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_recurrent_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_post_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_post_cycles,
+            clock_rate_khz,
+        ),
         persistent_linear_out_ms: persistent_4b_clock_cycles_to_ms(
             linear_out_cycles,
             clock_rate_khz,
@@ -452,6 +485,58 @@ fn decode_persistent_4b_timing_slots(
             clock_rate_khz,
         ),
         ..DecodeStageTimings::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qwen35::scratch::PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
+
+    #[test]
+    fn persistent_4b_timing_ranges_do_not_overlap() {
+        let full_attn_core = PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE
+            ..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
+        let full_attn_out = PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE
+            ..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
+        let linear_core =
+            PERSISTENT_4B_TIMING_LINEAR_CORE_BASE..PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + 8;
+        let linear_out =
+            PERSISTENT_4B_TIMING_LINEAR_OUT_BASE..PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + 8;
+        let linear_core_conv = PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + 2;
+        let linear_core_recurrent = PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + 2;
+        let linear_core_post = PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + 2;
+        let singleton_slots = [
+            PERSISTENT_4B_TIMING_FULL_ATTN,
+            PERSISTENT_4B_TIMING_FULL_ATTN_PROJ,
+            PERSISTENT_4B_TIMING_LINEAR_PROJ,
+            PERSISTENT_4B_TIMING_MLP_GATE_UP,
+            PERSISTENT_4B_TIMING_MLP_DOWN,
+        ];
+
+        let mut used = [false; PERSISTENT_4B_TIMING_SLOTS_PER_LAYER];
+        for slot in singleton_slots {
+            assert!(!used[slot], "slot {slot} overlaps");
+            used[slot] = true;
+        }
+        for range in [
+            full_attn_core,
+            full_attn_out,
+            linear_core,
+            linear_out,
+            linear_core_conv,
+            linear_core_recurrent,
+            linear_core_post,
+        ] {
+            for slot in range {
+                assert!(slot < PERSISTENT_4B_TIMING_SLOTS_PER_LAYER);
+                assert!(!used[slot], "slot {slot} overlaps");
+                used[slot] = true;
+            }
+        }
     }
 }
 
@@ -3499,33 +3584,69 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
-        kernel_ffi::persistent_decode_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-            seqlen_offset,
-            &self.scratch.desc_device,
-            &mut self.hidden_io,
-            &mut self.scratch.workspace,
-            &mut self.scratch.sync_buf,
-            &self.rotary.cos,
-            &self.rotary.sin,
-            self.rotary.rotary_dim,
-            self.proj_buf_floats,
-            self.attn_scratch_floats,
-            self.fp8_scale_device.as_ref(),
-            self.scratch.kv_fp8_desc_device.as_ref(),
-            b,
-            self.scratch.batch_seq_desc_device.as_ref(),
-            self.int4_scale_device.as_ref(),
-            enable_timing_slots,
-            false,
-            None, // tap_workspace: DFlash-only, off in batched decode
-            None, // tap_layers: DFlash-only, off in batched decode
-        )
-        .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let persist_result = if use_qwen35_4b_cuda_hero {
+            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                enable_timing_slots,
+                false,
+                None, // tap_workspace: DFlash-only, off in batched decode
+                None, // tap_layers: DFlash-only, off in batched decode
+            )
+        } else {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                enable_timing_slots,
+                false,
+                None, // tap_workspace: DFlash-only, off in batched decode
+                None, // tap_layers: DFlash-only, off in batched decode
+            )
+        };
+        persist_result
+            .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         if enable_timing_slots {
             let clock_rate_khz = match self.hidden_io.backend() {

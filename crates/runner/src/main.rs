@@ -1695,7 +1695,7 @@ fn main() -> Result<()> {
     if cli.emit_stage_timings {
         if native_decode_timing_steps > 0 {
             eprintln!(
-                "[stage-timings] steps={} persistent_ms={:.3} rms_norm_ms={:.3} lm_head_ms={:.3} logits_d2h_ms={:.3} host_sampling_ms={:.3} gpu_argmax_ms={:.3} token_d2h_ms={:.3} total_native_decode_ms={:.3} persistent_full_attn_ms={:.3} persistent_full_attn_proj_ms={:.3} persistent_full_attn_core_ms={:.3} persistent_full_attn_out_ms={:.3} persistent_linear_proj_ms={:.3} persistent_linear_core_ms={:.3} persistent_linear_out_ms={:.3} persistent_mlp_gate_up_ms={:.3} persistent_mlp_down_ms={:.3}",
+                "[stage-timings] steps={} persistent_ms={:.3} rms_norm_ms={:.3} lm_head_ms={:.3} logits_d2h_ms={:.3} host_sampling_ms={:.3} gpu_argmax_ms={:.3} token_d2h_ms={:.3} total_native_decode_ms={:.3} persistent_full_attn_ms={:.3} persistent_full_attn_proj_ms={:.3} persistent_full_attn_core_ms={:.3} persistent_full_attn_out_ms={:.3} persistent_linear_proj_ms={:.3} persistent_linear_core_ms={:.3} persistent_linear_core_conv_ms={:.3} persistent_linear_core_recurrent_ms={:.3} persistent_linear_core_post_ms={:.3} persistent_linear_out_ms={:.3} persistent_mlp_gate_up_ms={:.3} persistent_mlp_down_ms={:.3}",
                 native_decode_timing_steps,
                 native_decode_timings.persistent_ms,
                 native_decode_timings.rms_norm_ms,
@@ -1711,6 +1711,9 @@ fn main() -> Result<()> {
                 native_decode_timings.persistent_full_attn_out_ms,
                 native_decode_timings.persistent_linear_proj_ms,
                 native_decode_timings.persistent_linear_core_ms,
+                native_decode_timings.persistent_linear_core_conv_ms,
+                native_decode_timings.persistent_linear_core_recurrent_ms,
+                native_decode_timings.persistent_linear_core_post_ms,
                 native_decode_timings.persistent_linear_out_ms,
                 native_decode_timings.persistent_mlp_gate_up_ms,
                 native_decode_timings.persistent_mlp_down_ms,

@@ -42,18 +42,24 @@ set — add them here when next measured.
 24 GB VRAM, 936 GB/s memory bandwidth. Current behavior depends on whether
 the path is using replayed prefill for correctness.
 
-With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
+Quick checked paths (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 
-| Model                              | Path                      | Prefill       | Decode        |
-|------------------------------------|---------------------------|---------------|---------------|
-| qwen3.5-0.8b                       | default (hero)            | 563 tok/s     | 29.9 tok/s    |
-| qwen3.5-4b `--batch-size 2`        | default (batched)         | 124 tok/s     | 21.6 tok/s    |
-| qwen3.5-4b `--batch-size 1`        | replay-prefill correctness| 124 tok/s     | 1.1 tok/s     |
-| qwen3.5-4b `--batch-size 1`        | `--force-kernel-decode`   | 119 tok/s     | 10.6 tok/s    |
+| Model                       | Path                         | Prefill   | Decode     |
+|----------------------------|------------------------------|-----------|------------|
+| qwen3.5-0.8b              | default (hero)               | 563 tok/s | 29.9 tok/s |
+| qwen3.5-4b `--batch-size 2` | default (batched)            | 124 tok/s | 21.6 tok/s |
+| qwen3.5-4b `--batch-size 1` | replay-prefill correctness   | 124 tok/s | 1.1 tok/s  |
 
-CUDA `sm86` tracks detailed kernel-level optimization history in
-[qwen35-sm86-optimization.md](qwen35-sm86-optimization.md) (0.8B hero lane)
-and [qwen35-4b-sm86-optimization.md](qwen35-4b-sm86-optimization.md) (4B).
+Warmed native single-stream `4B` hero lane
+(`./tests/sm86/bench_qwen4b_single.sh`, `pp533 / tg128`, commit `e5f244d`):
+
+| Model                       | Path                    | Prefill   | Decode     | Persistent |
+|----------------------------|-------------------------|-----------|------------|------------|
+| qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 118.5 tok/s | 15.2 tok/s | 7714 ms    |
+
+CUDA `sm86` tracks detailed kernel-level optimization history for both the
+`0.8B` and `4B` hero lanes in
+[qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
 
 ## How to reproduce
 

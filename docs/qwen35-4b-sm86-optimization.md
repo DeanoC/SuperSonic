@@ -966,3 +966,163 @@ Additional validation for the single-sequence native-kernel staging lane:
 - baked `--validate --force-kernel-decode` passed with `decode_max_delta=0.3047`
 - baked `--gpu-validate --force-kernel-decode` passed with token agreement and
   `gpu_oracle_max_delta=0.3125`
+
+## Latest Kept Single-Stream Pass
+
+The next kept pass stays inside the `B == 1 && bs == 256 && hd == 256` CUDA
+hero attention-core path, but changes how the KV-time loop is partitioned:
+
+- keeps the existing packed BF16 attention math and online softmax update
+- keeps the debug trace path on the old implementation
+- keeps FP8-KV, batch decode, and non-hero shapes unchanged
+- splits the hero KV-token loop across warps instead of having one warp walk
+  the whole sequence serially
+- accumulates per-warp online-softmax partials in registers
+- reduces those per-warp partials once at the end in warp `0`
+
+Why this pass was chosen:
+
+- the current single-stream bottleneck was still `full_attn_core`, not
+  projection or host-side work
+- the hero lane already had a shape-specific guard, so this was a bounded
+  place to make the schedule more aggressive
+- the prior kept passes reduced score-side overhead, but the hero path was
+  still serializing the KV walk through one warp
+- this directly attacks that serialization without changing the validated
+  batch path
+
+Short screening result (`pp533` / `tg16`) against the previous single-stream
+baseline:
+
+- prefill was effectively flat at `4489.2 ms`
+- decode improved from about `1509.0 ms` to `1097.8 ms`
+- decode throughput improved from about `10.6 tok/s` to `14.6 tok/s`
+- persistent decode improved from about `1419.2 ms` to `1006.135 ms`
+- full attention improved from about `563.464 ms` to `82.204 ms`
+- full-attention core improved from about `530.211 ms` to `65.636 ms`
+
+Full warmed result (`pp533` / `tg128`) against the previous single-stream
+baseline:
+
+- prefill moved from `4486.2 ms` to `4514.8 ms`
+- decode improved from `12086.1 ms` to `8823.0 ms`
+- decode throughput improved from `10.6 tok/s` to `14.5 tok/s`
+- native decode total improved from `11875.697 ms` to `8613.553 ms`
+- persistent decode improved from `11353.590 ms` to `8091.387 ms`
+- full attention improved from `4374.394 ms` to `705.827 ms`
+- full-attention core improved from `4241.684 ms` to `573.292 ms`
+- linear core remained essentially flat at `3236.450 ms` to `3238.595 ms`
+
+Verification notes:
+
+- `tests/sm86/run_4b.sh` baked path passed with token agreement and
+  `decode_max_delta=0.2812`
+- `tests/sm86/run_4b_long.sh` passed `4 / 4`
+- `tests/sm86/run_batch.sh` baked batch path passed with `decode_max_delta=0.3047`
+- the `--no-bake` subtests in `run_4b.sh` and `run_batch.sh` still fail on
+  this machine because `/workspace/models/Qwen3.5-4B` does not contain raw
+  `safetensors`
+
+What this changes about the bottleneck:
+
+- this pass is large enough that `full_attn_core` is no longer the dominant
+  wall-time section in the single-stream hero lane
+- the next single-stream bottleneck is now the linear-attention recurrent/core
+  body, especially `linear_core`
+- the next bounded pass should instrument and specialize the single-stream
+  `linear_core` work instead of continuing to push on the already-collapsed
+  attention core
+
+## Refreshed Linear-Core Split
+
+After the warp-split full-attention pass, the single-stream hero lane refreshed
+the internal `linear_core` split using unused per-layer timing slots instead of
+guessing from the older pre-attention numbers.
+
+Short diagnostic run (`pp533` / `tg16`) on the current kept baseline:
+
+- total `linear_core`: `406.459 ms`
+- conv front-end: `12.553 ms`
+- recurrent update body: `389.508 ms`
+- post/gating tail: `4.036 ms`
+
+What that clarifies now:
+
+- the attention rewrite changed the overall hero-lane balance, but it did not
+  change the nature of the linear bottleneck
+- the recurrent-state walk is still consuming essentially all of `linear_core`
+- the next bounded structural pass should target the recurrent body directly;
+  optimizing conv or post/gating first would be the wrong order
+
+## Latest Kept Linear-Recurrent Pass
+
+The next kept pass stayed inside the same single-stream `4B` linear recurrent
+body, but removed an unnecessary intermediate state write on the hero lane:
+
+- left the hero lane unchanged:
+  `CUDA + sm86 + qwen3.5-4b + BF16 + batch-size 1 + baked load + --force-kernel-decode`
+- left the warp-split full-attention hero path unchanged
+- left batch scheduling, FP8-KV, and non-hero linear shapes untouched
+- on the single-stream linear hero shape, changed the first recurrent pass to
+  treat state as read-only while accumulating `kv_mem`
+- kept the same two-pass recurrent math, but applied the decay only when the
+  final updated state is written back in the second pass
+- preserved the original arithmetic order explicitly with a materialized
+  `state_decay` temporary so the long-context path stays numerically aligned
+
+Why this pass was chosen:
+
+- the refreshed split showed `389.508 ms` out of `406.459 ms` still sitting in
+  the recurrent walk
+- broader remaps had already been tried and dropped as flat or unsafe
+- this is the smallest traffic-focused change left in the recurrent body:
+  remove the write-then-read-back of the decayed state without reopening the
+  lane mapping question
+
+Short screening result (`pp533` / `tg16`) against commit `80cc1b0`:
+
+- prefill moved from `4455.0 ms` to `4453.5 ms`
+- decode improved from `1098.5 ms` to `1096.0 ms`
+- native decode total improved from `1072.286 ms` to `1069.755 ms`
+- persistent decode improved from `1007.010 ms` to `1004.468 ms`
+- full attention stayed flat: `81.674 ms` to `81.677 ms`
+- linear projection stayed flat: `139.639 ms` to `139.683 ms`
+- linear core improved from `406.459 ms` to `403.615 ms`
+- linear recurrent split improved from `389.508 ms` to `386.721 ms`
+- linear conv stayed flat: `12.553 ms` to `12.559 ms`
+- linear post/gating stayed flat: `4.036 ms` to `4.047 ms`
+
+Full warmed result (`pp533` / `tg128`) against commit `80cc1b0`:
+
+- prefill moved from `4514.8 ms` to `4475.0 ms`
+- decode improved from `8823.0 ms` to `8806.2 ms`
+- decode throughput held at `14.5 tok/s`, but with lower decode wall time
+- native decode total improved from `8613.553 ms` to `8598.505 ms`
+- persistent decode improved from `8091.387 ms` to `8076.377 ms`
+- full attention improved from `705.827 ms` to `701.482 ms`
+- full-attention core improved from `573.292 ms` to `568.832 ms`
+- linear projection improved from `1118.455 ms` to `1117.395 ms`
+- linear core improved from `3238.595 ms` to `3229.544 ms`
+- linear recurrent split measured `3094.334 ms`
+- linear conv split measured `100.522 ms`
+- linear post/gating split measured `32.386 ms`
+
+Verification notes:
+
+- `tests/sm86/run_4b.sh` baked path passed with token agreement and
+  `decode_max_delta=0.2812`
+- `tests/sm86/run_4b_long.sh` passed `4 / 4`
+- `tests/sm86/run_batch.sh` baked batch path passed with `decode_max_delta=0.3047`
+- the `--no-bake` subtests in `run_4b.sh` and `run_batch.sh` still fail on
+  this machine because `/workspace/models/Qwen3.5-4B` does not contain raw
+  `safetensors`
+
+What this changes about the next step:
+
+- the current single-stream `4B` bottleneck is still the recurrent body, but
+  the remaining easy in-place traffic wins are getting small
+- the next kept pass probably needs a more structural recurrent remap or a
+  stronger compiler/resource read before changing code again
+- the measured workflow is still paying off: the pass stayed because it was a
+  small but real win and it cleared the correctness gates, while the flat or
+  regressing variants around it were dropped
