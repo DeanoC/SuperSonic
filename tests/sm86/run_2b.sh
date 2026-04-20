@@ -150,16 +150,27 @@ else
 fi
 
 GOLDEN="$REPO_ROOT/tests/corpus/golden_2b.json"
+GOLDEN_MODEL_ID=""
+GOLDEN_MODEL_MATCH=0
 if [ -f "$GOLDEN" ]; then
+    GOLDEN_MODEL_ID="$(python3 -c "import json; print(json.load(open('$GOLDEN')).get('model_id', ''))")"
+    GOLDEN_MODEL_BASENAME="$(basename "$GOLDEN_MODEL_ID")"
+    if [ "$GOLDEN_MODEL_ID" = "Qwen/Qwen3.5-2B" ] || [ "$GOLDEN_MODEL_BASENAME" = "Qwen3.5-2B" ]; then
+        GOLDEN_MODEL_MATCH=1
+    fi
+fi
+if [ -f "$GOLDEN" ] && [ "$GOLDEN_MODEL_MATCH" -eq 1 ]; then
     CORPUS_TIMEOUT="${CORPUS_TIMEOUT:-600}" \
         "$REPO_ROOT/tests/corpus/run_golden.sh" \
         qwen3.5-2b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC" \
         --backend cuda --oracle-device cuda:0
+elif [ -f "$GOLDEN" ]; then
+    echo "--- Skipping golden corpus: $GOLDEN targets $GOLDEN_MODEL_ID, not Qwen/Qwen3.5-2B ---"
 else
     echo "--- Skipping golden corpus (not found: $GOLDEN) ---"
 fi
 
-if [ -f "$GOLDEN" ] && [ "$HAS_SAFETENSORS" -eq 1 ]; then
+if [ -f "$GOLDEN" ] && [ "$GOLDEN_MODEL_MATCH" -eq 1 ] && [ "$HAS_SAFETENSORS" -eq 1 ]; then
     CORPUS_TIMEOUT="${CORPUS_TIMEOUT:-600}" \
         "$REPO_ROOT/tests/corpus/run_golden.sh" \
         qwen3.5-2b "$MODEL_DIR" "$GOLDEN" "$SUPERSONIC" \

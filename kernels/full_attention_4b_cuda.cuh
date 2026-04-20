@@ -3968,6 +3968,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     constexpr bool hero_specialized = SINGLE_STREAM_BF16_SPECIALIZED;
     const int B = hero_specialized ? 1 : batch_size;
     const bool emit_attention_trace = hero_specialized ? false : (enable_attention_trace != 0);
+    const bool runtime_qwen35_4b_shape =
+        hidden_dim == 2560 &&
+        intermediate_size == 9216 &&
+        num_layers == 32;
 
     // Workspace layout (F32 unless noted).
     // Each section is multiplied by batch_size. Per-batch offset: section + b * section_size.
@@ -4350,6 +4354,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                 float* proj_b = proj_buf + b * proj_buf_floats;
                 const bool qwen4b_full_attn_core_hero =
+                    runtime_qwen35_4b_shape &&
                     B == 2 &&
                     bs == 256 &&
                     hd == 256 &&
@@ -4805,6 +4810,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* cv = static_cast<const T*>(kv_v_b);
                     T* q_head_bf16 = reinterpret_cast<T*>(lds_input);
                     const bool qwen4b_single_bf16_attn_core_hero =
+                        runtime_qwen35_4b_shape &&
                         B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
 
                     if (qwen4b_single_bf16_attn_core_hero) {
@@ -5506,6 +5512,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const int v_val_offset = key_dim * 2;
                     const int v = tid % hvd;          // v-dimension for this thread
                     const bool qwen4b_single_linear_decayless_store_hero =
+                        runtime_qwen35_4b_shape &&
                         B == 1 && bs == 256 && kern == 4 &&
                         nv == 16 && nk == 16 && hkd == 128 && hvd == 128;
 

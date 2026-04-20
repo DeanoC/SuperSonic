@@ -3584,8 +3584,17 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
+        // The CUDA single-stream hero specialization is only validated for the
+        // exact Qwen3.5-4B geometry. 2B/9B share the generic persistent path,
+        // but routing them through the specialized launch changes numerics.
+        let is_qwen35_4b_shape = config.hidden_size == 2560 &&
+            config.intermediate_size == 9216 &&
+            config.num_hidden_layers == 32 &&
+            config.num_attention_heads == 16 &&
+            config.num_key_value_heads == 4;
         let use_qwen35_4b_cuda_hero =
             self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape &&
             b == 1 &&
             self.fp8_scale_device.is_none() &&
             self.int4_scale_device.is_none() &&
