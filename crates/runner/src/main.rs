@@ -243,6 +243,9 @@ pub(crate) struct Cli {
 
     /// Debug-only: force single-sequence 4B decode to use the actual kernel path
     /// instead of the replayed prefill correctness path.
+    /// (Historical — `replayed prefill` is no longer the default; the kernel
+    /// path is used by default. This flag is kept as a no-op for callers
+    /// that still pass it explicitly.)
     #[arg(long, hide = true)]
     force_kernel_decode: bool,
 
@@ -250,6 +253,14 @@ pub(crate) struct Cli {
     /// instead of replayed prefill or the persistent kernel.
     #[arg(long, hide = true)]
     force_component_decode: bool,
+
+    /// Debug-only: restore the legacy "replay prefill each decode step" path
+    /// that was the default before 2026-04-20. Scales O(N) per token with
+    /// context length and was ~7x slower than the persistent megakernel path,
+    /// so retained only for parity validation. Mutually exclusive with
+    /// --force-kernel-decode / --force-component-decode.
+    #[arg(long, hide = true)]
+    force_replay_decode: bool,
 
     /// Debug-only: allow unstable CUDA KV-FP8 experiments on the 4B kernel path.
     /// This is intentionally hidden until the path is validated.
@@ -1162,8 +1173,16 @@ fn main() -> Result<()> {
         }
         false
     };
+    // Replay-prefill path used to be the default for 4B single-seq decode
+    // (safety net for numerical-parity work during the CUDA sm86 bring-up)
+    // but it scales O(N) per step with context length and was ~7x slower
+    // than the persistent megakernel at 64-token generations. Default is now
+    // the megakernel; --force-replay-decode re-enables the replay path for
+    // the rare case where someone genuinely wants to reproduce the older
+    // numeric semantics.
     let replay_decode_enabled = cli.batch_size == 1
         && params.use_4b_kernel
+        && cli.force_replay_decode
         && !cli.force_kernel_decode
         && !cli.force_component_decode
         && !cli.kv_fp8;
@@ -1173,8 +1192,15 @@ fn main() -> Result<()> {
         && !cli.force_kernel_decode;
     let component_single_decode_enabled =
         cli.batch_size == 1 && params.use_4b_kernel && cli.force_component_decode;
-    let kernel_single_decode_enabled =
-        cli.batch_size == 1 && params.use_4b_kernel && (cli.force_kernel_decode || cli.kv_fp8);
+    // Use the batched persistent megakernel path (decode_step_batch with b=1)
+    // for 4B single-seq decode by default — measured ~300 ms/tok on gfx1150
+    // vs ~500 ms/tok for decode_step() and ~2500 ms/tok for the legacy
+    // replay path. Opt-out via --force-replay-decode (legacy parity) or
+    // --force-component-decode (primitive-chain correctness).
+    let kernel_single_decode_enabled = cli.batch_size == 1
+        && params.use_4b_kernel
+        && !cli.force_replay_decode
+        && !cli.force_component_decode;
     let cuda_08b_hero_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();
     let cuda_08b_hero_enabled = backend == Backend::Cuda
         && gpu_arch == GpuArch::Sm86
