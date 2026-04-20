@@ -372,11 +372,51 @@ fn persistent_4b_clock_cycles_to_ms(cycles: u64, clock_rate_khz: u32) -> f64 {
     }
 }
 
+/// HIP `clock64()` on gfx1150 does not tick at the rate reported by
+/// `hipDeviceProp_t::clockRate`, so the raw `cycles / clock_rate_khz`
+/// conversion is off by a large, unknown factor. The cycle counts
+/// themselves are self-consistent — per-section ratios match reality —
+/// so we calibrate the scale against the wall-clock `persistent_ms`
+/// measured on the Rust side.
+///
+/// `total_cycles` is the sum of per-section cycle counts across all
+/// non-overlapping subsections (proj + core + out + MLP), i.e. the
+/// cycle budget that should add up to wall-clock. The returned scale
+/// converts one cycle into one millisecond such that applying it to
+/// each section's cycles redistributes `persistent_ms` proportionally.
+///
+/// Returns 0.0 when calibration is impossible (no cycles or no wall
+/// time captured); the caller then gets all-zero section ms, which is
+/// correct — it surfaces the missing data instead of hiding it behind
+/// a plausible-looking but wrong number.
+fn persistent_4b_wall_clock_scale(persistent_ms: f64, total_cycles: u64) -> f64 {
+    if persistent_ms <= 0.0 || total_cycles == 0 {
+        0.0
+    } else {
+        persistent_ms / total_cycles as f64
+    }
+}
+
+fn persistent_4b_scaled_ms(cycles: u64, ms_per_cycle: f64) -> f64 {
+    cycles as f64 * ms_per_cycle
+}
+
+/// Calibration source for converting persistent-kernel cycle counts to
+/// milliseconds. The CUDA path has a reliable `clockRate` so we use it
+/// directly. The HIP path's `clock64()` doesn't tick at the reported rate
+/// on gfx1150, so we anchor on the Rust-side wall-clock `persistent_ms`
+/// instead and redistribute it proportionally across non-overlapping
+/// subsection cycle counts.
+enum PersistentTimingCalibration {
+    ClockRateKhz(u32),
+    WallClockMs(f64),
+}
+
 fn decode_persistent_4b_timing_slots(
     sync_bytes: &[u8],
     num_layers: usize,
     batch_size: usize,
-    clock_rate_khz: u32,
+    calibration: PersistentTimingCalibration,
 ) -> DecodeStageTimings {
     let timing_bytes =
         num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();
@@ -386,12 +426,24 @@ fn decode_persistent_4b_timing_slots(
         return DecodeStageTimings::default();
     }
 
+    // HIP `clock64()` on gfx1150 is not reliably monotonic — `clock64() -
+    // start` occasionally wraps when the second sample lands lower than the
+    // first (suspected wave-migration / counter-rollover). Once any block in
+    // a layer hits that wrap, the slot's `atomicMax` locks in a near-2^64
+    // value for the rest of the run. Treat those clearly-bogus reads as zero
+    // so they don't poison the calibration. A real cycle count even at a 5
+    // GHz tick rate over a full 1-second slot would be ~5e9 cycles; a
+    // 60-bit ceiling (~1.15e18) is many orders of magnitude beyond anything
+    // physical and unambiguously catches the wraps we've observed without
+    // risking false positives on legitimate counts.
+    const WRAP_FILTER_CEILING: u64 = 1 << 60;
     let load_slot = |idx: usize| -> u64 {
         let byte_start = start + idx * std::mem::size_of::<u64>();
         let byte_end = byte_start + std::mem::size_of::<u64>();
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&sync_bytes[byte_start..byte_end]);
-        u64::from_le_bytes(raw)
+        let v = u64::from_le_bytes(raw);
+        if v >= WRAP_FILTER_CEILING { 0 } else { v }
     };
 
     let mut full_attn_cycles = 0u64;
@@ -435,55 +487,42 @@ fn decode_persistent_4b_timing_slots(
         }
     }
 
+    // Pick a cycles→ms conversion. CUDA uses the reported clockRate
+    // directly; HIP anchors on wall-clock persistent_ms and redistributes
+    // it proportionally across the non-overlapping subsection cycle
+    // totals. The umbrella FULL_ATTN slot overlaps with PROJ/CORE/OUT, so
+    // exclude it from the calibration denominator to avoid double-count.
+    let cvt: Box<dyn Fn(u64) -> f64> = match calibration {
+        PersistentTimingCalibration::ClockRateKhz(khz) => {
+            Box::new(move |cycles| persistent_4b_clock_cycles_to_ms(cycles, khz))
+        }
+        PersistentTimingCalibration::WallClockMs(ms) => {
+            let total_non_overlapping: u64 = full_attn_proj_cycles
+                .saturating_add(full_attn_core_cycles)
+                .saturating_add(full_attn_out_cycles)
+                .saturating_add(linear_proj_cycles)
+                .saturating_add(linear_core_cycles)
+                .saturating_add(linear_out_cycles)
+                .saturating_add(mlp_gate_up_cycles)
+                .saturating_add(mlp_down_cycles);
+            let ms_per_cycle = persistent_4b_wall_clock_scale(ms, total_non_overlapping);
+            Box::new(move |cycles| persistent_4b_scaled_ms(cycles, ms_per_cycle))
+        }
+    };
+
     DecodeStageTimings {
-        persistent_full_attn_ms: persistent_4b_clock_cycles_to_ms(
-            full_attn_cycles,
-            clock_rate_khz,
-        ),
-        persistent_full_attn_proj_ms: persistent_4b_clock_cycles_to_ms(
-            full_attn_proj_cycles,
-            clock_rate_khz,
-        ),
-        persistent_full_attn_core_ms: persistent_4b_clock_cycles_to_ms(
-            full_attn_core_cycles,
-            clock_rate_khz,
-        ),
-        persistent_full_attn_out_ms: persistent_4b_clock_cycles_to_ms(
-            full_attn_out_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_proj_ms: persistent_4b_clock_cycles_to_ms(
-            linear_proj_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_core_ms: persistent_4b_clock_cycles_to_ms(
-            linear_core_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_core_conv_ms: persistent_4b_clock_cycles_to_ms(
-            linear_core_conv_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_core_recurrent_ms: persistent_4b_clock_cycles_to_ms(
-            linear_core_recurrent_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_core_post_ms: persistent_4b_clock_cycles_to_ms(
-            linear_core_post_cycles,
-            clock_rate_khz,
-        ),
-        persistent_linear_out_ms: persistent_4b_clock_cycles_to_ms(
-            linear_out_cycles,
-            clock_rate_khz,
-        ),
-        persistent_mlp_gate_up_ms: persistent_4b_clock_cycles_to_ms(
-            mlp_gate_up_cycles,
-            clock_rate_khz,
-        ),
-        persistent_mlp_down_ms: persistent_4b_clock_cycles_to_ms(
-            mlp_down_cycles,
-            clock_rate_khz,
-        ),
+        persistent_full_attn_ms: cvt(full_attn_cycles),
+        persistent_full_attn_proj_ms: cvt(full_attn_proj_cycles),
+        persistent_full_attn_core_ms: cvt(full_attn_core_cycles),
+        persistent_full_attn_out_ms: cvt(full_attn_out_cycles),
+        persistent_linear_proj_ms: cvt(linear_proj_cycles),
+        persistent_linear_core_ms: cvt(linear_core_cycles),
+        persistent_linear_core_conv_ms: cvt(linear_core_conv_cycles),
+        persistent_linear_core_recurrent_ms: cvt(linear_core_recurrent_cycles),
+        persistent_linear_core_post_ms: cvt(linear_core_post_cycles),
+        persistent_linear_out_ms: cvt(linear_out_cycles),
+        persistent_mlp_gate_up_ms: cvt(mlp_gate_up_cycles),
+        persistent_mlp_down_ms: cvt(mlp_down_cycles),
         ..DecodeStageTimings::default()
     }
 }
@@ -3649,14 +3688,22 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         if enable_timing_slots {
-            let clock_rate_khz = match self.hidden_io.backend() {
+            // CUDA's reported clockRate matches clock64()'s actual tick rate,
+            // so use it directly. HIP's clockRate on gfx1150 does NOT match
+            // what clock64() produces — calibrate against wall-clock instead.
+            let calibration = match self.hidden_io.backend() {
                 gpu_hal::Backend::Cuda => {
-                    gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
-                        .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
-                        .clock_rate_khz
+                    let khz = gpu_hal::query_device_info(
+                        gpu_hal::Backend::Cuda,
+                        self.ordinal,
+                    )
+                    .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
+                    .clock_rate_khz;
+                    PersistentTimingCalibration::ClockRateKhz(khz)
                 }
-                gpu_hal::Backend::Hip => kernel_ffi::query_hip_device_clock_khz(self.ordinal)
-                    .map_err(|e| anyhow::anyhow!("query HIP device clock rate: {e}"))?,
+                gpu_hal::Backend::Hip => {
+                    PersistentTimingCalibration::WallClockMs(timings.persistent_ms)
+                }
             };
             let sync_bytes = self
                 .scratch
@@ -3667,7 +3714,7 @@ impl DecodeEngine {
                 &sync_bytes,
                 config.num_hidden_layers,
                 b,
-                clock_rate_khz,
+                calibration,
             ));
         }
 
