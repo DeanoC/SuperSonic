@@ -69,6 +69,65 @@ shipping path for E4B on gfx1150.
 | phi4-mini    | BF16  |  597   | 1.68  |
 | phi4-mini    | INT4  |  359   | 2.78  |
 
+### Scaling with context length
+
+Qwen3.5 BF16, 8-token generation, prefill ms + decode ms/tok at varying
+prompt size. Decode grows slowly with KV size; prefill grows linearly
+with prompt tokens:
+
+| Variant            | 66 tok prefill | 258 tok prefill | 1026 tok prefill | decode @66 | decode @258 | decode @1026 |
+|--------------------|---------------:|----------------:|-----------------:|-----------:|------------:|-------------:|
+| qwen3.5-0.8b BF16  |     555 ms     |     2230 ms     |     11299 ms     |  77 ms/tok |  84 ms/tok  | 122 ms/tok   |
+| qwen3.5-2b  BF16   |    1310 ms     |     5412 ms     |     23963 ms     | 167 ms/tok | 233 ms/tok  | 229 ms/tok   |
+
+At 1026-token prompts **prefill is 11-13× the total decode time for an
+8-token reply**. Any further decode optimization (cooperative launch
+tweaks, VGPR reduction, etc.) is invisible to long-prompt users
+compared to a prefill win.
+
+### Where time goes at 1026-token context
+
+Per-decode-step breakdown from `--emit-stage-timings` (sum across
+layers, divided by step count to give ms/step-of-that-section):
+
+**qwen3.5-0.8b BF16 decode @1026 ctx** (95 ms/step persistent):
+| Section           | ms/step | share |
+|-------------------|-------:|------:|
+| linear_out        |  21.9  |  23%  |
+| mlp_gate_up       |  18.3  |  19%  |
+| linear_proj       |  15.8  |  17%  |
+| linear_core       |  14.2  |  15%  |
+| mlp_down          |   7.7  |   8%  |
+| full_attn_proj    |   7.3  |   8%  |
+| full_attn_out     |   5.1  |   5%  |
+| full_attn_core    |   4.4  |   5%  |
+
+**qwen3.5-2b BF16 decode @1026 ctx** (185 ms/step persistent):
+| Section           | ms/step | share |
+|-------------------|-------:|------:|
+| mlp_gate_up       |  38.2  |  21%  |
+| mlp_down          |  34.9  |  19%  |
+| linear_core       |  30.3  |  16%  |
+| linear_out        |  30.0  |  16%  |
+| linear_proj       |  19.4  |  10%  |
+| full_attn_out     |  13.0  |   7%  |
+| full_attn_core    |   9.7  |   5%  |
+| full_attn_proj    |   9.6  |   5%  |
+
+Implications for future work:
+
+- **Qwen3.5 decode is linear-attention-dominated**, not full-attention
+  (linear_proj + linear_core + linear_out = 55% on 0.8B, 42% on 2B).
+  A `--kv-fp8` win would only touch `full_attn_core` which is ≤5%;
+  that's a VRAM feature, not a throughput feature on Qwen.
+- `full_attn_core` grows quadratically with KV size (1.1 → 4.4 ms/step
+  on 0.8B from 64→1024 ctx) but stays small in absolute terms.
+- Prefill is the big lever. 80% of its time is
+  `matmul_rhs_transposed_tiled_kernel`, a naive scalar-FMA
+  shared-memory tiled matmul with no WMMA. RDNA3's
+  `v_wmma_f32_16x16x16_bf16` (wavefront matrix op) would potentially
+  give 2-4× on that kernel and ~60-70% on prefill overall.
+
 ## CUDA — `sm86` (NVIDIA RTX 3090-class)
 
 24 GB VRAM, 936 GB/s memory bandwidth. Current behavior depends on whether
