@@ -3843,8 +3843,16 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     int group_size,
     void* out) {
     switch (dtype) {
-    case 2:
-        if (device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
+    case 2: {
+        // WMMA path dequantizes a full 16-wide K chunk with one scale/zero
+        // fetch, which is only correct when a 16-value chunk is guaranteed
+        // to stay inside one quantization group. That requires
+        // `group_size % 16 == 0` (holds for the shipped GPTQ bakes at
+        // group_size=128, but weights.rs reads the value from metadata so a
+        // custom bake could land something else). Fall back to the scalar
+        // kernel otherwise.
+        if (group_size % 16 == 0 &&
+            device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
             return matmul_int4_dequant_wmma_bf16_device(
                 static_cast<int>(device_ordinal), batch_elems, m, n, k,
                 lhs, rhs_int4, scale, zero, group_size, out);
@@ -3852,6 +3860,7 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
             lhs, rhs_int4, scale, zero, group_size, out);
+    }
     default:
         return 272;
     }
