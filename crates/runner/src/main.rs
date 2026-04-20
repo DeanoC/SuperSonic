@@ -3266,6 +3266,16 @@ fn trace_persistent_linear_layer(
         .get(..token_ids.len().saturating_sub(1))
         .ok_or_else(|| anyhow::anyhow!("missing prefix token ids for persistent linear trace"))?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
+    let pre_step_conv = engine
+        .state_for_batch(0)
+        .layers
+        .get(trace_layer)
+        .ok_or_else(|| anyhow::anyhow!("missing pre-step layer {trace_layer}"))?
+        .conv_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing pre-step conv state for layer {trace_layer}"))?
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("pre-step conv D2H layer {trace_layer}: {e}"))?;
     engine.set_hidden_from_bytes(&native_hidden)?;
     let (native_comp_trace, native_comp_conv, native_comp_recurrent, native_comp_hidden) =
         engine.component_trace_linear_layer_from_current_hidden(trace_layer)?;
@@ -3351,6 +3361,26 @@ fn trace_persistent_linear_layer(
         validate::max_abs_delta(&decode_f32_le(&native_token_mixer), &decode_bf16_le(&native_comp_layer.attn_hidden));
     let native_vs_comp_mlp_down =
         validate::max_abs_delta(&decode_f32_le(&native_mlp_down), &decode_bf16_le(&native_comp_layer.mlp_out));
+    let conv_state_len = cfg.linear_conv_kernel_dim - 1;
+    let expected_conv_tail = {
+        let start = decode_bf16_le(&pre_step_conv);
+        let qkv = decode_bf16_le(&native_comp_trace.qkv);
+        let mut expected = vec![0.0f32; qkv_dim * conv_state_len];
+        for c in 0..qkv_dim {
+            let base = c * conv_state_len;
+            for t in 0..conv_state_len.saturating_sub(1) {
+                expected[base + t] = start[base + t + 1];
+            }
+            expected[base + conv_state_len - 1] = qkv[c];
+        }
+        expected
+    };
+    let native_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&native_conv), &expected_conv_tail);
+    let comp_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&native_comp_conv), &expected_conv_tail);
+    let replay_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&replay_conv), &expected_conv_tail);
     let native_vs_replay_post_norm =
         validate::max_abs_delta(&decode_f32_le(&native_post_norm), &decode_bf16_le(replay_post));
     let native_vs_replay_gated =
@@ -3396,7 +3426,7 @@ fn trace_persistent_linear_layer(
     let sample_z_comp = comp_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
 
     eprintln!(
-        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
+        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
     );
     Ok(())
 }
