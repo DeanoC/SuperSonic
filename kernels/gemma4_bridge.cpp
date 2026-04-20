@@ -3,7 +3,9 @@
 
 #include "gemma4.hip"
 
+#include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
 
 namespace {
@@ -211,6 +213,58 @@ int rms_norm_rows_device(int device_ordinal, int n_rows, int n_cols, float eps,
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 461;
     if (hipDeviceSynchronize() != hipSuccess) return 462;
+    return 0;
+}
+
+// Does this device support RDNA3 WMMA intrinsics? See
+// kernels/full_attention_bridge_4b.cpp for the analogous helper on the Qwen
+// side — the helper is duplicated here (not shared) to keep Gemma 4 in its
+// own compilation unit (gemma4.hip codegen has historically been sensitive
+// to cross-contamination with the Qwen bridge). `std::call_once` protects
+// against data races from concurrent `supersonic-serve` request threads;
+// `SUPERSONIC_GEMMA4_DISABLE_WMMA=1` forces the scalar path for A/B compare.
+static bool g4_device_supports_wmma_bf16(int device_ordinal) {
+    static std::once_flag env_once;
+    static bool env_disabled = false;
+    std::call_once(env_once, [] {
+        const char* env = std::getenv("SUPERSONIC_GEMMA4_DISABLE_WMMA");
+        env_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+    });
+    if (env_disabled) return false;
+
+    auto probe_arch = [](int ordinal) -> bool {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
+        const char* arch = props.gcnArchName;
+        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+               arch[3] == '1' && arch[4] == '1';
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) return probe_arch(device_ordinal);
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
+    return cached[device_ordinal];
+}
+
+static int matvec_batched_wmma_bf16_device(int device_ordinal,
+                                           int seq_len, int in_dim, int out_dim,
+                                           const void* x, const void* W, void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    const int grid_x = (out_dim + 15) / 16;
+    const int grid_y = (seq_len + 15) / 16;
+    constexpr int threads = 32;  // one wavefront per tile
+    hipLaunchKernelGGL(
+        g4_matvec_batched_wmma_bf16_kernel,
+        dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
+        seq_len, in_dim, out_dim,
+        static_cast<const hip_bfloat16*>(x),
+        static_cast<const hip_bfloat16*>(W),
+        static_cast<hip_bfloat16*>(out));
+    if (hipGetLastError() != hipSuccess) return 474;
+    if (hipDeviceSynchronize() != hipSuccess) return 475;
     return 0;
 }
 
@@ -1077,9 +1131,18 @@ extern "C" int dotcache_gemma4_hip_matvec_batched(
     case 1: return matvec_batched_device<float>(static_cast<int>(device_ordinal),
                 static_cast<int>(seq_len), static_cast<int>(in_dim),
                 static_cast<int>(out_dim), x, W, out, counter);
-    case 2: return matvec_batched_device<hip_bfloat16>(static_cast<int>(device_ordinal),
-                static_cast<int>(seq_len), static_cast<int>(in_dim),
-                static_cast<int>(out_dim), x, W, out, counter);
+    case 2: {
+        const int ordinal = static_cast<int>(device_ordinal);
+        const int s = static_cast<int>(seq_len);
+        const int id = static_cast<int>(in_dim);
+        const int od = static_cast<int>(out_dim);
+        // WMMA pays off only once we have enough rows to fill a 16-row tile —
+        // below that the work-stealing scalar kernel uses more of the wave.
+        if (s >= 16 && g4_device_supports_wmma_bf16(ordinal)) {
+            return matvec_batched_wmma_bf16_device(ordinal, s, id, od, x, W, out);
+        }
+        return matvec_batched_device<hip_bfloat16>(ordinal, s, id, od, x, W, out, counter);
+    }
     default: return 469;
     }
 }
