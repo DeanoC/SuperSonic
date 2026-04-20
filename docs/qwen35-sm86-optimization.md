@@ -1,23 +1,23 @@
 # Qwen3.5 CUDA `sm86` Optimization Status
 
 This document records the current optimization state of the CUDA `sm86`
-Qwen3.5 decode path, the benchmark target, the commits that moved the needle,
-and the experiments that were tried and discarded.
+Qwen3.5 decode paths, the benchmark targets, the commits that moved the
+needle, and the experiments that were tried and discarded.
 
-It is meant to be the handoff doc for applying the same process to the other
-CUDA-supported Qwen3.5 models.
+It is meant to be the handoff doc for applying the same process across the
+supported CUDA Qwen3.5 models.
 
 ## Scope
 
-Current optimization work is focused on:
+Current hero lanes:
 
 - backend: CUDA
 - arch: `sm86`
-- hero lane: `qwen3.5-0.8b`
-- mode: batch-1, BF16, normal generation
+- `qwen3.5-0.8b`: batch-1, BF16, normal generation
+- `qwen3.5-4b`: batch-1, BF16, baked load, `--force-kernel-decode`
 
-The hero lane is intentionally specialized. Validation, tracing, and other
-models still keep their fallback paths.
+These lanes are intentionally specialized. Validation, tracing, replay-based
+correctness, and other models still keep their fallback paths.
 
 ## Benchmark Target
 
@@ -192,6 +192,73 @@ Do not assume:
 - the same head packing or lane mapping will be optimal
 - the same failed experiments will become wins on a larger model
 - a generic `512`-thread rewrite is automatically better
+
+## 4B Hero Lane
+
+Exact lane:
+
+- CUDA
+- `sm86`
+- `qwen3.5-4b`
+- BF16
+- baked load
+- `--force-kernel-decode`
+- `--batch-size 1`
+- warmed `pp533 / tg128`
+
+Current best verified commit:
+
+- `e5f244d` `Specialize qwen4b sm86 single-stream decode`
+
+Current warmed result on this box:
+
+- prefill: `118.5 tok/s`
+- decode: `15.2 tok/s`
+- decode wall time: `8443.0 ms`
+- persistent decode stage: `7714.213 ms`
+- `linear_core_recurrent`: `3080.145 ms`
+
+Validated behavior at this checkpoint:
+
+- `tests/sm86/run_4b_long.sh`: `4/4` pass
+- `tests/sm86/run_4b.sh`: baked path pass
+- `tests/sm86/run_batch.sh`: baked path pass
+- the local `--no-bake` legs still depend on raw safetensors existing under the
+  model dir
+
+Kept progression on the `4B` hero lane:
+
+| Commit | Change | Result |
+| --- | --- | --- |
+| `db26c08` | parallelize the single-stream full-attention hero schedule across warps | established the first kept 4B attention-side win |
+| `553c292` | trim recurrent-state traffic in the serial linear-attention core | reduced warmed `linear_core` and persistent time |
+| `e5f244d` | add a true CUDA-only single-stream BF16 specialized 4B kernel entrypoint | improved warmed decode from about `14.5 tok/s` to `15.2 tok/s` |
+
+What the latest kept pass changed structurally:
+
+- added a dedicated CUDA-only 4B specialized bridge for the exact single-stream
+  BF16 lane
+- compiled out dead batch / FP8 / INT4 / trace control flow for that
+  instantiation
+- reduced the specialized kernel resource line from `REG:175 STACK:128` to
+  `REG:147 STACK:0`
+
+Things tried on the `4B` hero lane and not kept:
+
+- forcing higher block residency with register caps
+- a noinline block-0 linear-core outline
+- compile-time recurrent-loop rewrites that lowered register count but regressed
+  wall-clock decode
+- corrected single-stream BF16 MLP specializations that still regressed the
+  short warmed lane
+
+Current 4B bottleneck read:
+
+- the dominant remaining cost is still inside the persistent kernel
+- `linear_core_recurrent` is still the largest single timing bucket
+- after ruling out a few “cleaner SASS” recurrent rewrites, the next likely
+  meaningful gain is a different lever, not more of the same register-pruning
+  inside that loop
 
 ## Commands
 

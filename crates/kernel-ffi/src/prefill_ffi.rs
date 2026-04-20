@@ -1083,6 +1083,96 @@ pub fn rms_norm_rows(
     Ok(())
 }
 
+/// Multi-row RMSNorm WITHOUT add_unit_offset. Qwen3 (the dflash draft base)
+/// uses plain `x * rms * w`, not `x * rms * (w + 1)`. The underlying kernel
+/// already supports this via a template flag; this wrapper just passes 0.
+pub fn rms_norm_rows_plain(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_hip_rms_norm(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            0,
+            input.as_ptr(),
+            weight.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("rms_norm_rows_plain failed: {status}")));
+    }
+    Ok(())
+}
+
+/// In-place variant of [`rms_norm_rows_plain`]. The underlying kernel reads
+/// each row before writing it, so aliasing input/output is safe. Avoids the
+/// borrow-checker dance at callsites that normalize into their own buffer.
+pub fn rms_norm_rows_plain_inplace(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    data: &mut GpuBuffer,
+    weight: &GpuBuffer,
+) -> Result<(), GpuError> {
+    let ptr = data.as_mut_ptr();
+    let status = unsafe {
+        dotcache_qwen35_hip_rms_norm(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_rows,
+            n_cols,
+            eps,
+            0,
+            ptr,
+            weight.as_ptr(),
+            ptr,
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("rms_norm_rows_plain_inplace failed: {status}")));
+    }
+    Ok(())
+}
+
+/// In-place `lhs += rhs`. Aliasing lhs and out in the underlying kernel is
+/// fine — it reads both operands into registers before the store.
+pub fn element_add_inplace(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    lhs_out: &mut GpuBuffer,
+    rhs: &GpuBuffer,
+) -> Result<(), GpuError> {
+    let ptr = lhs_out.as_mut_ptr();
+    let status = unsafe {
+        dotcache_qwen35_hip_element_add(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            total_elems,
+            ptr,
+            rhs.as_ptr(),
+            ptr,
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("element_add_inplace failed: {status}")));
+    }
+    Ok(())
+}
+
 // ---- Cast between dtypes ----
 
 /// Cast all elements from one dtype to another on GPU.

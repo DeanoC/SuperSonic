@@ -395,9 +395,16 @@ def quantize_gemma4(
     # `per_layer_inputs_list` is the biggest host-side cache at large
     # calibrations: [1, S, num_layers, ple_hidden] BF16 per sample. At 128×2048
     # on E2B that's ~4.5 GiB. On a shared-memory APU we can't afford to keep
-    # it resident — spill to /tmp and reload the current layer's slice on demand.
+    # it resident, so spill it to disk and reload the current layer's slice on
+    # demand. Keep the spill under the bake output tree so cleanup is local to
+    # the run rather than leaking large `/tmp` directories across retries.
+    import atexit
+    import shutil
     import tempfile
-    pli_cache_dir = Path(tempfile.mkdtemp(prefix="gemma4_int4_pli_"))
+    pli_cache_root = ckpt_path.parent if ckpt_path is not None else Path(tempfile.gettempdir())
+    pli_cache_root.mkdir(parents=True, exist_ok=True)
+    pli_cache_dir = Path(tempfile.mkdtemp(prefix="gemma4_int4_pli_", dir=pli_cache_root))
+    atexit.register(shutil.rmtree, pli_cache_dir, ignore_errors=True)
     log(f"[gptq] spilling per_layer_inputs cache to {pli_cache_dir}")
     log(f"[gptq] capturing pre-layer state for {num_samples} samples...")
     hiddens: list[torch.Tensor] = []
@@ -406,6 +413,9 @@ def quantize_gemma4(
     shared_mask: dict = {}
     shared_pos_ids: torch.Tensor | None = None
 
+    def save_large_torch_obj(obj, path: Path) -> None:
+        torch.save(obj, path, _use_new_zipfile_serialization=False)
+
     for s in range(num_samples):
         ids = calib_ids[s:s + 1].to(device)
         with torch.no_grad():
@@ -413,7 +423,7 @@ def quantize_gemma4(
         hiddens.append(h.detach().cpu())
         if pli is not None:
             pli_path = pli_cache_dir / f"pli_{s:05d}.pt"
-            torch.save(pli.detach().cpu(), pli_path)
+            save_large_torch_obj(pli.detach().cpu(), pli_path)
             pli_paths.append(pli_path)
             del pli
         else:
@@ -464,12 +474,15 @@ def quantize_gemma4(
         if ckpt_path is None:
             return
         tmp = ckpt_path.with_suffix(ckpt_path.suffix + ".new")
-        torch.save({
-            "layer_idx": next_layer,
-            "quantized": quantized,
-            "hiddens": hiddens,
-            "kv_dicts": kv_dicts,
-        }, tmp)
+        save_large_torch_obj(
+            {
+                "layer_idx": next_layer,
+                "quantized": quantized,
+                "hiddens": hiddens,
+                "kv_dicts": kv_dicts,
+            },
+            tmp,
+        )
         tmp.replace(ckpt_path)
         log(f"[ckpt] saved at layer {next_layer}/{num_layers} -> {ckpt_path}")
 

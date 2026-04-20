@@ -28,6 +28,7 @@ TIMEOUT="${TIMEOUT:-120}"
 
 MODEL_DIR_4B="${MODEL_DIR_4B:-${SUPERSONIC_MODEL_DIR_4B:-}}"
 MODEL_DIR_2B="${MODEL_DIR_2B:-${SUPERSONIC_MODEL_DIR_2B:-}}"
+MODEL_DIR_08B="${MODEL_DIR_08B:-${SUPERSONIC_MODEL_DIR_08B:-}}"
 
 if [ ! -x "$SUPERSONIC" ]; then
     echo "ERROR: $SUPERSONIC not found. Run: cargo build --release"
@@ -87,9 +88,17 @@ check_case "4B --int4 --kv-fp8"     qwen3.5-4b "$MODEL_DIR_4B" "33075 888 279 15
 echo ""
 echo "--- 2B ---"
 check_case "2B bf16"                qwen3.5-2b "$MODEL_DIR_2B" "33075 888 279 15217 5388 13"
-check_case "2B --int4"              qwen3.5-2b "$MODEL_DIR_2B" "369 264 220 17 15 16" --int4
+check_case "2B --int4"              qwen3.5-2b "$MODEL_DIR_2B" "369 264 42140 3542 494 279" --int4
 check_case "2B --kv-fp8"            qwen3.5-2b "$MODEL_DIR_2B" "33075 888 279 15217 5388 13" --kv-fp8
-check_case "2B --int4 --kv-fp8"     qwen3.5-2b "$MODEL_DIR_2B" "369 264 220 17 15 16" --int4 --kv-fp8
+check_case "2B --int4 --kv-fp8"     qwen3.5-2b "$MODEL_DIR_2B" "369 264 42140 3542 494 279" --int4 --kv-fp8
+
+echo ""
+echo "--- 0.8B ---"
+# 0.8B-native decode kernel has no INT4 megakernel path; --int4 forces use_4b_kernel.
+# Guards against two regressions: (a) the 0.8B INT4 memory-fault bug fixed 2026-04-18
+# (commit 5b27c41) and (b) any future silent fall-through where the dispatch reverts
+# to the BF16-only 0.8B kernel.
+check_case "0.8B --int4"            qwen3.5-0.8b "$MODEL_DIR_08B" "369 264 1865 9572 303 279" --int4
 
 echo ""
 echo "Quant regression: $PASSED passed, $FAILED failed"

@@ -89,6 +89,9 @@ unsafe extern "C" {
         batch_size: usize,            // 1 for single-sequence (default), >1 for batched
         batch_descs: *const c_void,   // nullptr for single-sequence, BatchSeqDesc[] for batched
         int4_scales: *const c_void,   // nullptr for non-INT4, pointer to INT4ScaleDesc[] for INT4
+        tap_workspace: *mut c_void,   // nullptr for non-DFlash, [num_taps * hidden_dim] T for DFlash
+        tap_layers: *const c_int,     // nullptr when tap_workspace is nullptr
+        num_taps: usize,              // 0 when tap_workspace is nullptr
     ) -> c_int;
 
     fn dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
@@ -158,6 +161,17 @@ unsafe extern "C" {
         arch_name_out: *mut u8,
         arch_name_len: usize,
         total_vram_out: *mut u64,
+    ) -> c_int;
+}
+
+// HIP-only: the clock-rate bridge lives in `full_attention_bridge.cpp` and has
+// no CUDA counterpart (CUDA timing paths get clockRate via
+// `cudaGetDeviceProperties` on the Rust side).
+#[cfg(supersonic_backend_hip)]
+unsafe extern "C" {
+    fn dotcache_hip_device_clock_khz(
+        device_ordinal: c_int,
+        clock_rate_khz_out: *mut u32,
     ) -> c_int;
 }
 
@@ -347,6 +361,11 @@ pub fn persistent_decode_qwen08_sm86_specialized(
 /// `batch_size`: number of sequences (1 = single-sequence, default).
 /// `batch_descs`: when Some, contains BatchSeqDesc array on GPU for per-sequence state.
 /// `int4_scale_descs`: when Some, contains INT4ScaleDesc array on GPU for INT4 dequant.
+/// `tap_workspace` / `tap_layers`: DFlash hidden-state taps. When `tap_workspace` is Some,
+///   the kernel mirrors the per-layer post-MLP residual hidden state for each layer in
+///   `tap_layers` into `tap_workspace` at offset `i * hidden_dim` (i = tap index, not layer
+///   index). Both must be Some together or both None. The kernel body short-circuits the
+///   tap write when `tap_workspace` is null to preserve gfx1150 codegen on the hot path.
 pub fn persistent_decode_4b(
     ordinal: usize,
     dtype: ScalarType,
@@ -370,6 +389,8 @@ pub fn persistent_decode_4b(
     int4_scale_descs: Option<&GpuBuffer>,
     enable_timing_slots: bool,
     enable_attention_trace: bool,
+    tap_workspace: Option<&mut GpuBuffer>,
+    tap_layers: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr();
@@ -396,6 +417,21 @@ pub fn persistent_decode_4b(
     let int4_scales_ptr = int4_scale_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
+
+    // num_taps is derived from tap_layers length (4-byte ints). Both must be Some or both None.
+    let (tap_ws_ptr, tap_layers_ptr, num_taps) = match (tap_workspace, tap_layers) {
+        (Some(ws), Some(layers)) => (
+            ws.as_mut_ptr(),
+            layers.as_ptr() as *const c_int,
+            layers.len_bytes() / std::mem::size_of::<c_int>(),
+        ),
+        (None, None) => (std::ptr::null_mut(), std::ptr::null::<c_int>(), 0),
+        _ => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b: tap_workspace and tap_layers must both be Some or both None".into(),
+            ));
+        }
+    };
 
     let status = match backend {
         Backend::Hip => {
@@ -426,6 +462,9 @@ pub fn persistent_decode_4b(
                     batch_size,
                     batch_descs_ptr,
                     int4_scales_ptr,
+                    tap_ws_ptr,
+                    tap_layers_ptr,
+                    num_taps,
                 )
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -461,6 +500,9 @@ pub fn persistent_decode_4b(
                     batch_size,
                     batch_descs_ptr,
                     int4_scales_ptr,
+                    tap_ws_ptr,
+                    tap_layers_ptr,
+                    num_taps,
                 )
             }
             #[cfg(not(supersonic_backend_cuda))]
@@ -498,7 +540,14 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
     int4_scale_descs: Option<&GpuBuffer>,
     enable_timing_slots: bool,
     enable_attention_trace: bool,
+    tap_workspace: Option<&mut GpuBuffer>,
+    tap_layers: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
+    if tap_workspace.is_some() || tap_layers.is_some() {
+        return Err(GpuError::InvalidArg(
+            "persistent_decode_4b_qwen35_sm86_specialized does not support DFlash taps".into(),
+        ));
+    }
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr();
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_void };
@@ -755,6 +804,13 @@ pub fn rms_norm_4b(
     Ok(())
 }
 
+/// Maximum `in_dim` the standalone matvec kernels support. The kernels allocate
+/// a fixed `__shared__ float shared_input[STANDALONE_MATVEC_MAX_IN_DIM]` for the
+/// F32-cached input vector; anything larger overruns LDS and faults the same
+/// way the 2B attn_scratch crash did (c.f. 338b939). Keep in sync with the
+/// `shared_input[...]` declaration in every `full_attention*.hip`/`.cuh`.
+pub const STANDALONE_MATVEC_MAX_IN_DIM: usize = 4096;
+
 /// 4B variant of standalone matvec (same logic, separate compilation).
 pub fn standalone_matvec_4b(
     ordinal: usize,
@@ -766,6 +822,14 @@ pub fn standalone_matvec_4b(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if in_dim > STANDALONE_MATVEC_MAX_IN_DIM {
+        return Err(GpuError::InvalidArg(format!(
+            "standalone_matvec_4b in_dim={in_dim} exceeds kernel LDS bound \
+             STANDALONE_MATVEC_MAX_IN_DIM={STANDALONE_MATVEC_MAX_IN_DIM}. \
+             Raise `shared_input[...]` in full_attention_4b.hip + \
+             full_attention_4b_cuda.cuh and bump the constant."
+        )));
+    }
     let backend = output.backend();
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
     let status = match backend {
@@ -1011,6 +1075,14 @@ pub fn standalone_matvec(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if in_dim > STANDALONE_MATVEC_MAX_IN_DIM {
+        return Err(GpuError::InvalidArg(format!(
+            "standalone_matvec in_dim={in_dim} exceeds kernel LDS bound \
+             STANDALONE_MATVEC_MAX_IN_DIM={STANDALONE_MATVEC_MAX_IN_DIM}. \
+             Raise `shared_input[...]` in full_attention.hip + \
+             full_attention_cuda.cuh and bump the constant."
+        )));
+    }
     let backend = output.backend();
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
@@ -1083,4 +1155,29 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
         .to_string_lossy()
         .into_owned();
     Ok((arch_name, total_vram))
+}
+
+/// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.
+///
+/// On non-HIP builds this returns `GpuError::InvalidArg`; the caller is
+/// responsible for only invoking it when the active backend is HIP.
+pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = ordinal;
+        return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+    }
+    #[cfg(supersonic_backend_hip)]
+    {
+    let mut clock_khz: u32 = 0;
+    let status = unsafe {
+        dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz)
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "hip_device_clock_khz failed with status {status}"
+        )));
+    }
+    Ok(clock_khz)
+    }
 }

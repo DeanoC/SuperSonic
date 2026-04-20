@@ -1,22 +1,49 @@
 # SuperSonic
 
-Optimized LLM inference with persistent decode megakernels. Each supported (model, backend, GPU) combination gets a hand-tuned kernel — no fallback to generic slow paths.
+Optimized LLM inference with persistent decode megakernels. Each supported
+(model, backend, GPU) combination gets a hand-tuned kernel — no fallback to
+generic slow paths.
 
-Currently supports:
-
-- Qwen3.5-0.8B and Qwen3.5-4B on AMD `gfx1150` (RDNA 3.5) via HIP
-- Gemma 4 E2B and E4B on AMD `gfx1150` (RDNA 3.5) via HIP
-- Qwen3.5-0.8B and Qwen3.5-4B on NVIDIA `sm86` (RTX 3090-class) via CUDA
-
-CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` remain unsupported on CUDA. A hidden unstable CUDA `--kv-fp8` debug path exists for targeted validation work on `qwen3.5-4b`, but it is not part of the public supported surface.
+Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-| Backend | GPU arch | Models | Status |
-| --- | --- | --- | --- |
-| HIP | `gfx1150` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
-| HIP | `gfx1150` | `gemma4-e2b`, `gemma4-e4b` | upstream validated |
-| CUDA | `sm86` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
+Two backends are validated today:
+
+- **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
+- **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
+
+### HIP on `gfx1150`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-9b       |  ✅  |  ✅¹ |      ✅     |   ✅   |
+| gemma4-e2b       |  ✅  |  ✅  |      —      |    —   |
+| gemma4-e4b       |  ✅  |  —²  |      —      |    —   |
+| phi4-mini        |  ✅  |  ✅  |      —      |    —   |
+
+¹ GPTQ calibration for 9B INT4 needs ≥24 GiB; consumers pull the released
+  bake from GitHub releases. See [docs/bake-distribution.md](docs/bake-distribution.md).
+² Gemma E4B INT4 calibration is parked.
+
+DFlash speculative decode is available for `qwen3.5-9b` INT4 on HIP —
+see [docs/dflash.md](docs/dflash.md).
+
+### CUDA on `sm86`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
+| qwen3.5-4b       |  ✅  |  —   |      —      |   🔒³  |
+
+³ `qwen3.5-4b` has a hidden `--allow-unstable-cuda-kv-fp8` debug surface for
+  parity-sensitive validation work. It is not part of the public supported
+  surface — see the CUDA section below for the narrow validated shape.
+
+CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` are rejected at runtime.
 
 CUDA support is currently a narrow v1 surface:
 
@@ -96,8 +123,14 @@ GEMMA_E4B_DIR=/models/gemma-4-E4B \
 ```
 
 By default this produces INT4-GPTQ bakes for every configured model. Add
-`--bf16` to also publish Qwen BF16 bakes, `--force` to rebuild, or drop
-`--upload` to keep the output local.
+`--bf16` to also publish Qwen BF16 bakes, `--fp8-native` for FP8-native
+bakes (Qwen only; source checkpoint must ship FP8 tensors), `--force` to
+rebuild, or drop `--upload` to keep the output local.
+
+**9B INT4 note:** `qwen3.5-9b` GPTQ calibration loads the full BF16 model
+(~18 GiB) into GPU memory, so it OOMs on ≤16 GiB cards (including gfx1150).
+Run it on a box with ≥24 GiB GPU RAM — the small-VRAM consumer then pulls
+the resulting bake from the release. Leave `QWEN_9B_DIR` unset to skip.
 
 ## CUDA
 
@@ -213,20 +246,17 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/profile_qwen08_decode.sh \
 Set `PROFILE_MODE=fast` to disable the hero path while keeping CUDA fast-greedy,
 or `PROFILE_MODE=legacy` to force the old host-logits decode path.
 
-Current behavior on this `sm86` box now depends on whether the path is using replayed prefill for correctness.
+Current behavior on this `sm86` box depends on whether the path is using
+replayed prefill for correctness.
+
 With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 
 - `qwen3.5-0.8b`: prefill `199 ms` for 112 prompt tokens (`563 tok/s`), decode `268 ms` for 8 generated tokens (`29.9 tok/s`)
-- `qwen3.5-4b` single-sequence: prefill `901 ms` for 112 prompt tokens (`124 tok/s`), decode `7486 ms` for 8 generated tokens (`1.1 tok/s`)
+- `qwen3.5-4b` single-sequence replay path: prefill `901 ms` for 112 prompt tokens (`124 tok/s`), decode `7486 ms` for 8 generated tokens (`1.1 tok/s`)
 - `qwen3.5-4b --batch-size 2`: prefill `906 ms` for 112 prompt tokens (`124 tok/s`), decode `741 ms` for 16 aggregate generated tokens (`21.6 tok/s`)
 
-So the current CUDA `4B` story on this box is split:
-
-- single-sequence decode is correctness-first and much slower because it replays prefill
-- batched decode remains the fast path and is still the better place to do performance work
-
-There is now also an explicit native single-sequence hero lane for `4B`
-behind `--force-kernel-decode`. The exact lane is:
+There is also an explicit native single-sequence `4B` CUDA hero lane behind
+`--force-kernel-decode`. The exact lane is:
 
 - CUDA + `sm86`
 - `qwen3.5-4b`
@@ -235,41 +265,17 @@ behind `--force-kernel-decode`. The exact lane is:
 - `--force-kernel-decode`
 - `--batch-size 1`
 - warmed `pp533 / tg128`
-- hero attention guard `B == 1 && bs == 256 && hd == 256`
 
-The current warmed result on this box comes in at roughly:
+Current best verified result on this box for that lane is commit `e5f244d`:
 
-- prefill `4484 ms` (`119 tok/s`)
-- decode `12095 ms` (`10.6 tok/s`)
+- prefill `4499 ms` (`118.5 tok/s`)
+- decode `8443 ms` (`15.2 tok/s`)
+- persistent decode stage `7714 ms`
 
-The first kept single-stream `4B` CUDA pass on this lane removed
-unconditional full-attention trace-buffer writes from the hot path and left
-those writes enabled only for the explicit trace workflow. The next two kept
-passes then tightened the single-stream BF16 attention-core inner loop: first
-by moving to packed two-dimension BF16 score/value work inside the existing
-`B == 1` schedule, and then by raising that packed path to four dimensions per
-active thread. The latest kept pass then stopped the idle threads in that same
-hero branch from doing useless BF16 query staging plus zero-value score/softmax
-work. The next kept pass then moved off attention entirely once the temporary
-split showed `linear_core` was now mostly recurrent-state traffic: it fused the
-serial recurrent update from four state walks down to two and reduced the
-warmed single-lane linear core from about `3471 ms` to `3275 ms` on this
-machine while leaving the attention core flat at about `4600 ms`. The latest
-kept pass then staged the normalized per-head `q/k` vectors for that serial
-linear-attention loop into shared memory once per head pair, trimming the
-warmed single-lane linear core again from about `3275 ms` to `3236 ms`. The
-next kept pass temporarily split the single-stream attention core and showed
-the real remaining cost was score-side work, not value accumulation, then
-collapsed the hero branch from a two-wave `64 x 4` score reduction to a
-one-wave `32 x 8` mapping. That cut warmed single-lane full-attention core
-from about `4600 ms` to `4166 ms` and improved warmed decode from about
-`12463 ms` to `12097 ms` on this machine. The latest kept pass then reduced
-hot projection live state for `B <= 2`, dropping the persistent kernel's
-static footprint from `170` to `164` registers and nudging warmed decode to
-about `12095 ms` on this box.
-
-That lane is intended for Lucebox-style single-stream optimization work; the
-validated production throughput lane remains `qwen3.5-4b --batch-size 2`.
+That single-stream lane is for Lucebox-style native-kernel optimization work.
+The validated production-throughput lane remains `qwen3.5-4b --batch-size 2`.
+Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
+[docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
 
 ## E2E Tests
 

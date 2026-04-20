@@ -18,8 +18,13 @@ pub struct GpuBuffer {
 }
 
 // GPU pointers are not thread-safe by default, but access is serialized by the
-// decode forward pass. Mark Send so GpuBuffer can be held across await points.
+// decode forward pass (CLI is single-threaded; the HTTP server guards every
+// session with a `tokio::sync::Mutex`). Mark Send so `GpuBuffer` can cross
+// `spawn_blocking` boundaries, and Sync so buffers wrapped in `Arc<_>` —
+// notably `Qwen35Weights::{embed_tokens, lm_head}` — can be carried through
+// an `Arc<Mutex<…>>` shared across axum handler tasks.
 unsafe impl Send for GpuBuffer {}
+unsafe impl Sync for GpuBuffer {}
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {

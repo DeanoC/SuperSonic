@@ -6,6 +6,22 @@ use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
 
 pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 37;
 pub const PERSISTENT_SYNC_COUNTER_BYTES: usize = 24;
+/// Required floats in the kernel's `attn_scratch` region for a given model
+/// and context ceiling. The 4B persistent decode kernel lays out
+/// `saved_q [nh*hd] + saved_gate [nh*hd] + saved_pre_gate [nh*hd] +
+/// saved_scores [nh*kv_max_t]` per batch item. The caller must size the
+/// workspace so the largest `kv_max_t` reached during the run fits.
+pub fn required_attn_scratch_floats(
+    num_attention_heads: usize,
+    head_dim: usize,
+    max_context_tokens: usize,
+    kv_chunk_size: usize,
+) -> usize {
+    let aligned_kv_t = max_context_tokens
+        .div_ceil(kv_chunk_size.max(1))
+        * kv_chunk_size.max(1);
+    3 * num_attention_heads * head_dim + num_attention_heads * aligned_kv_t
+}
 
 /// Pre-allocated device scratch buffers for the persistent decode kernel.
 /// Avoids per-token hipMalloc/hipFree overhead.

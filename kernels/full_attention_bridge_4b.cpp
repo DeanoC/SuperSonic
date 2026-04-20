@@ -4575,14 +4575,48 @@ int persistent_decode_device(
     const void* kv_fp8_descs,
     int batch_size,
     const void* batch_descs,
-    const void* int4_scales
+    const void* int4_scales,
+    void* tap_workspace,
+    const int* tap_layers,
+    int num_taps
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    // rocprofv3 on gfx1150 revealed `multiProcessorCount` reports 8 (WGP
+    // count on RDNA3, not CU count) while the device has 16 CUs — the
+    // original 1x grid left half the GPU idle with only 1 block/CU, and
+    // register pressure (VGPR=128) prevents a second resident block.
+    // Oversubscribing 2x on RDNA3 (= one block per CU) is a proven safe
+    // win: ~1.57x faster on qwen3.5-0.8b BF16, no hangs across tested
+    // Qwen variants.
+    //
+    // HIP docs note `multiProcessorCount` reports CUs on CDNA (MI-series)
+    // and WGPs on RDNA. On arches where it already reports CU count, 2x
+    // would over-subscribe and can deadlock via `grid_barrier` when only
+    // one block/CU is resident. Restrict the default multiplier to the
+    // arches we've actually validated (gfx11xx RDNA3/3.5 at time of
+    // writing); other arches get the conservative 1x default.
+    //
+    // Higher multipliers (3x+) hang silently on models with more
+    // transformer layers (qwen3.5-2b at 4x produces no output) —
+    // suspected grid_barrier scaling issue. Env var
+    // `SUPERSONIC_QWEN4B_BLOCKS` allows runtime override for tuning.
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
+        int override_val = std::atoi(bs_env);
+        if (override_val > 0) num_blocks = override_val;
+    } else {
+        const char* arch = props.gcnArchName;
+        const bool is_rdna3_wgp_arch =
+            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+            arch[3] == '1' && arch[4] == '1';
+        if (is_rdna3_wgp_arch) {
+            num_blocks *= 2;
+        }
+    }
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
@@ -4619,7 +4653,10 @@ int persistent_decode_device(
         static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
         batch_size,
         static_cast<const BatchSeqDesc*>(batch_descs),
-        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales));
+        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
+        static_cast<T*>(tap_workspace),
+        tap_layers,
+        num_taps);
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4627,6 +4664,10 @@ int persistent_decode_device(
     return 0;
 }
 
+// tap_workspace/tap_layers/num_taps: DFlash hidden-state taps (M1 plumbing).
+//   tap_workspace = nullptr, tap_layers = nullptr, num_taps = 0 disables; the kernel body
+//   must short-circuit when tap_workspace is nullptr so existing decode callers see no
+//   change in observable behavior or runtime (gfx1150 codegen-sensitivity guard).
 extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     int dtype,
     size_t device_ordinal,
@@ -4651,7 +4692,10 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     const void* kv_fp8_descs,
     size_t batch_size,
     const void* batch_descs,
-    const void* int4_scales) {
+    const void* int4_scales,
+    void* tap_workspace,
+    const int* tap_layers,
+    size_t num_taps) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4670,7 +4714,10 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             kv_fp8_descs,
             static_cast<int>(batch_size),
             batch_descs,
-            int4_scales);
+            int4_scales,
+            tap_workspace,
+            tap_layers,
+            static_cast<int>(num_taps));
     default:
         return 256;
     }
