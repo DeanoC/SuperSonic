@@ -1178,3 +1178,205 @@ pub(crate) fn delta_recurrent_prefill(
 
     Ok(())
 }
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use gpu_hal::{set_backend, Backend};
+
+    fn use_metal_backend() {
+        set_backend(Backend::Metal);
+    }
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
+        bytes.chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    fn read_f32(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download f32 buffer");
+        bytes.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+
+    fn assert_close(actual: &[f32], expected: &[f32], tol: f32) {
+        assert_eq!(actual.len(), expected.len(), "length mismatch");
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= tol,
+                "idx {idx}: expected {e}, got {a}, delta {delta} > tol {tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_host_matmul_rhs_transposed_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 3],
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .expect("upload lhs");
+        let rhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0]),
+        )
+        .expect("upload rhs");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2, 2]).expect("allocate out");
+
+        matmul_rhs_transposed(ScalarType::BF16, 1, 2, 2, 3, &lhs, &rhs, &mut out)
+            .expect("run matmul_rhs_transposed");
+
+        let actual = read_bf16(&out);
+        let expected = vec![4.0, 4.5, 10.0, 9.0];
+        assert_close(&actual, &expected, 0.02);
+    }
+
+    #[test]
+    fn metal_host_full_attention_prefill_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 1.0]),
+        )
+        .expect("upload query");
+        let key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 1.0]),
+        )
+        .expect("upload key");
+        let value = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[10.0, 1.0, 1.0, 20.0]),
+        )
+        .expect("upload value");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
+
+        full_attention_prefill(
+            ScalarType::BF16,
+            1,
+            1,
+            1,
+            2,
+            2,
+            2,
+            1.0,
+            0,
+            &query,
+            &key,
+            &value,
+            &mut out,
+        )
+        .expect("run full_attention_prefill");
+
+        let actual = read_f32(&out);
+        let prob0 = 1.0f32 / (1.0 + 1.0f32.exp());
+        let prob1 = 1.0 - prob0;
+        let expected = vec![
+            10.0,
+            1.0,
+            prob0 * 10.0 + prob1 * 1.0,
+            prob0 * 1.0 + prob1 * 20.0,
+        ];
+        assert_close(&actual, &expected, 1e-4);
+    }
+
+    #[test]
+    fn metal_host_delta_recurrent_prefill_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let initial_state = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 1],
+            &f32_bytes(&[0.5]),
+        )
+        .expect("upload initial_state");
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 1],
+            &f32_bytes(&[2.0, 3.0]),
+        )
+        .expect("upload query");
+        let key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 1],
+            &f32_bytes(&[1.0, 2.0]),
+        )
+        .expect("upload key");
+        let value = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 1],
+            &f32_bytes(&[1.0, 4.0]),
+        )
+        .expect("upload value");
+        let beta = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2],
+            &f32_bytes(&[0.25, 0.5]),
+        )
+        .expect("upload beta");
+        let g = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2],
+            &f32_bytes(&[0.0, 0.0]),
+        )
+        .expect("upload g");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 3, 1]).expect("allocate out");
+
+        delta_recurrent_prefill(
+            ScalarType::F32,
+            1,
+            2,
+            1,
+            1,
+            &initial_state,
+            &query,
+            &key,
+            &value,
+            &beta,
+            &g,
+            &mut out,
+        )
+        .expect("run delta_recurrent_prefill");
+
+        let actual = read_f32(&out);
+        let expected = vec![1.25, 10.125, 3.375];
+        assert_close(&actual, &expected, 1e-6);
+    }
+}

@@ -8,6 +8,7 @@ unsafe extern "C" {
         buffer_out: *mut *mut c_void,
         offset_out: *mut usize,
     ) -> c_int;
+    pub fn supersonic_metal_compile_shader_smoke() -> c_int;
     pub fn supersonic_metal_query_device_info(
         ordinal: usize,
         arch_name_out: *mut c_char,

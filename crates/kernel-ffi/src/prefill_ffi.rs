@@ -1706,3 +1706,69 @@ pub fn quantize_kv_to_fp8(
     }
     Ok(())
 }
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use gpu_hal::{set_backend, Backend};
+    use half::bf16;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
+        bytes.chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn metal_prefill_rms_norm_rows_applies_qwen_unit_offset() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2],
+            &bf16_bytes(&[3.0, 4.0]),
+        )
+        .expect("upload input");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2],
+            &bf16_bytes(&[0.5, -0.5]),
+        )
+        .expect("upload weight");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2]).expect("alloc output");
+
+        rms_norm_rows(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            2,
+            0.0,
+            &input,
+            &weight,
+            &mut output,
+        )
+        .expect("run rms_norm_rows");
+
+        let actual = read_bf16(&output);
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        let expected = vec![3.0 * inv_rms * 1.5, 4.0 * inv_rms * 0.5];
+        for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (got - want).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {want}, got {got}, delta {delta}"
+            );
+        }
+    }
+}

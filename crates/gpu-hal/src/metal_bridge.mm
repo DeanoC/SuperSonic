@@ -112,6 +112,33 @@ extern "C" int supersonic_metal_lookup_buffer(
     return 2;
 }
 
+extern "C" int supersonic_metal_compile_shader_smoke() {
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            return 1;
+        }
+        NSString* source =
+            @"#include <metal_stdlib>\n"
+             "using namespace metal;\n"
+             "kernel void supersonic_smoke(device bfloat* out [[buffer(0)]],\n"
+             "                             uint tid [[thread_position_in_grid]]) {\n"
+             "    out[tid] = bfloat(1.0);\n"
+             "}\n";
+        NSError* error = nil;
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        id<MTLLibrary> library = [device newLibraryWithSource:source options:options error:&error];
+        if (library == nil || error != nil) {
+            return 2;
+        }
+        id<MTLFunction> function = [library newFunctionWithName:@"supersonic_smoke"];
+        if (function == nil) {
+            return 3;
+        }
+        return 0;
+    }
+}
+
 extern "C" int supersonic_metal_query_device_info(
     size_t ordinal,
     char* arch_name_out,

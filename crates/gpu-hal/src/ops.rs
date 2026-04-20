@@ -673,6 +673,15 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
     }
 }
 
+#[cfg(supersonic_backend_metal)]
+fn metal_runtime_compile_smoke() -> Result<()> {
+    let status = unsafe { supersonic_metal_compile_shader_smoke() };
+    if status != 0 {
+        return Err(metal_error("metalCompileShaderSmoke", status));
+    }
+    Ok(())
+}
+
 /// Dtype-aware element count from shape.
 pub fn elem_count(shape: &[usize]) -> usize {
     shape.iter().product()
@@ -681,4 +690,65 @@ pub fn elem_count(shape: &[usize]) -> usize {
 /// Byte size for a given dtype and element count.
 pub fn byte_len(dtype: ScalarType, elems: usize) -> usize {
     elems * dtype.size_in_bytes()
+}
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use crate::{set_backend, Backend, GpuBuffer, ScalarType};
+
+    fn use_metal_backend() {
+        set_backend(Backend::Metal);
+    }
+
+    #[test]
+    fn metal_device_info_reports_expected_shape() {
+        use_metal_backend();
+        let info = query_device_info(Backend::Metal, 0).expect("query metal device info");
+        assert!(
+            info.arch_name.contains("apple"),
+            "unexpected metal arch name: {}",
+            info.arch_name
+        );
+        assert!(info.total_vram_bytes > 0, "missing working set budget");
+        assert_eq!(info.warp_size, 32);
+    }
+
+    #[test]
+    fn metal_buffer_round_trip_copy_zero_and_sync() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let host = [1.0f32, -2.5, 3.25, 4.5];
+        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let src = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[host.len()], &host_bytes)
+            .expect("upload source buffer");
+        let mut dst = GpuBuffer::zeros(ordinal, ScalarType::F32, &[host.len()])
+            .expect("allocate zero destination");
+
+        copy_d2d(ordinal, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes()).expect("copy_d2d");
+        sync(ordinal).expect("sync after copy_d2d");
+        let copied = dst.to_host_bytes().expect("download copied bytes");
+        assert_eq!(copied, host_bytes);
+
+        memset_zeros(ordinal, dst.as_mut_ptr(), dst.len_bytes()).expect("memset zeros");
+        sync(ordinal).expect("sync after memset");
+        let zeroed = dst.to_host_bytes().expect("download zeroed bytes");
+        assert!(zeroed.iter().all(|&b| b == 0), "destination buffer not zeroed");
+    }
+
+    #[test]
+    fn metal_runtime_shader_compile_smoke_succeeds() {
+        use_metal_backend();
+        metal_runtime_compile_smoke().expect("runtime Metal shader compilation should succeed");
+    }
+
+    #[test]
+    fn metal_rejects_nonzero_ordinal() {
+        use_metal_backend();
+        let err = alloc(1, 16).expect_err("metal ordinal 1 should be rejected");
+        assert!(
+            err.to_string().contains("ordinal 0"),
+            "unexpected error: {err}"
+        );
+    }
 }
