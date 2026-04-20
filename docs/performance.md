@@ -98,6 +98,13 @@ with prompt tokens. Prefill numbers reflect the RDNA3 WMMA
 | qwen3.5-0.8b BF16  |        5879 ms          |        11244 ms           |   1.91×      |
 | qwen3.5-2b  BF16   |        9206 ms          |        24963 ms           |   2.71×      |
 | qwen3.5-4b  BF16   |       29891 ms          |        70075 ms           |   2.34×      |
+| qwen3.5-2b  INT4   |        6681 ms          |        24532 ms           |   3.67×      |
+| qwen3.5-4b  INT4   |       18669 ms          |        73065 ms           |   3.91×      |
+| qwen3.5-9b  INT4   |       33486 ms          |       126646 ms           |   3.78×      |
+
+INT4 gains more than BF16 because the scalar INT4 kernel also pays the
+dequant cost every iteration — moving the loop body to WMMA BF16 with the
+dequant bundled into the B-matrix load amortizes both savings together.
 
 At 1026-token prompts **prefill is 11-13× the total decode time for an
 8-token reply**. Any further decode optimization (cooperative launch

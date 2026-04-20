@@ -2947,6 +2947,162 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matmul (wave32, 16x16x16 f32-accumulate).
+//
+// Same input layout as dotcache_qwen35_matmul_int4_dequant_kernel:
+//   lhs  [batch, m, k]          BF16
+//   rhs  [batch, n, k/2]        packed INT4 (low nibble = even k index)
+//   scl  [n/group, k/group]     BF16 scale
+//   zro  [n/group, k/group]     BF16 zero
+//   out  [batch, m, n]          BF16
+//
+// Each block runs one wavefront computing a single 16x16 output tile; each
+// lane holds one row of A (lhs) or B (dequantized rhs). K is accumulated in
+// 16-wide chunks. Since group_size is 128 in the Qwen GPTQ bake and k-chunks
+// are 16, every 16-K chunk lies entirely inside one group — the scale/zero
+// fetch happens once per chunk per lane.
+//
+// Same WMMA gotcha as the BF16 kernel: the intrinsic assembles its operand
+// matrix from every lane's registers, so the call must be uniform across
+// the wave. Only the loads are guarded; zero-padding lanes that are out of
+// range participate as no-ops.
+// =============================================================================
+
+__global__ void dotcache_qwen35_matmul_int4_dequant_wmma_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,    // [batch, m, k]
+    const uint8_t* __restrict__ rhs_int4,    // [batch, n, k/2]
+    const hip_bfloat16* __restrict__ scale,  // [n/group, k/group]
+    const hip_bfloat16* __restrict__ zero,   // [n/group, k/group]
+    int group_size,
+    hip_bfloat16* __restrict__ out           // [batch, m, n]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_row = blockIdx.y * 16;
+    const int tile_col = blockIdx.x * 16;
+
+    const int lhs_row_idx = tile_row + lane_row;
+    const int rhs_row_idx = tile_col + lane_row;
+    const bool lhs_in_range = lhs_row_idx < m;
+    const bool rhs_in_range = rhs_row_idx < n;
+
+    const int k_packed = k / 2;
+    const int scale_cols = (k + group_size - 1) / group_size;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * m * k +
+                                static_cast<size_t>(lhs_row_idx) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * k_packed +
+                                static_cast<size_t>(rhs_row_idx) * k_packed;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t*  rhs_row_u8  = rhs_int4 + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = k & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        // --- A (lhs, BF16) ---
+        supersonic_short16 a;
+        if (lhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(lhs_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        // --- B (rhs, INT4 → BF16) ---
+        supersonic_short16 b;
+        if (rhs_in_range) {
+            const int group_id = kk / group_size;
+            const int scale_idx = rhs_row_idx / group_size * scale_cols + group_id;
+            const float s = static_cast<float>(scale[scale_idx]);
+            const float z = static_cast<float>(zero[scale_idx]);
+            const float zs = z * s;
+            // 16 K values = 8 packed bytes. kk is a multiple of 16 so the byte
+            // offset is always aligned on a nibble boundary (low nibble = even k).
+            const int byte_base = kk >> 1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint8_t packed = rhs_row_u8[byte_base + i];
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                b[2 * i]     = static_cast<short>(b0 >> 16);
+                b[2 * i + 1] = static_cast<short>(b1 >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    // Tail (k % 16 != 0): Qwen hidden/intermediate sizes are all multiples of
+    // 128, so this branch is unreachable in practice — keep defensive.
+    if (k_main != k) {
+        supersonic_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        supersonic_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (lhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < k) a[i] = static_cast<short>(lhs_row_u16[kc]);
+            }
+        }
+        if (rhs_in_range) {
+            const int group_id0 = k_main / group_size;
+            const int scale_idx = rhs_row_idx / group_size * scale_cols + group_id0;
+            const float s = static_cast<float>(scale[scale_idx]);
+            const float z = static_cast<float>(zero[scale_idx]);
+            const float zs = z * s;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < k) {
+                    uint8_t packed = rhs_row_u8[kc >> 1];
+                    int nib = (kc & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+                    float v = bf16_round_rne_f32_finite(static_cast<float>(nib) * s - zs);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    b[i] = static_cast<short>(bits >> 16);
+                }
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    // Store: lane L writes C[2*i + lane_half, lane_row] = acc[i] for i in 0..8.
+    const int out_col = tile_col + lane_row;
+    if (out_col < n) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < m) {
+                out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs_int4; (void)scale; (void)zero; (void)group_size; (void)out;
+#endif
+}
+
 template <typename T>
 __global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
     int batch_heads,
