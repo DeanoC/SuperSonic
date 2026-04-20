@@ -3461,6 +3461,39 @@ fn trace_persistent_linear_layer(
             best.1
         )
     };
+    let append_mismatch_samples = {
+        let native = decode_bf16_le(&native_conv);
+        let mut mismatches = Vec::with_capacity(qkv_dim);
+        for c in 0..qkv_dim {
+            let idx = c * conv_state_len + (conv_state_len - 1);
+            mismatches.push((c, native[idx], expected_conv_tail[idx], (native[idx] - expected_conv_tail[idx]).abs()));
+        }
+        mismatches.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        mismatches
+            .into_iter()
+            .take(8)
+            .map(|(channel, native_last, expected_last, delta)| {
+                let mut nearest_qkv = (0usize, f32::INFINITY);
+                for (i, &v) in native_qkv_proj_f32.iter().enumerate() {
+                    let qkv_delta = (v - native_last).abs();
+                    if qkv_delta < nearest_qkv.1 {
+                        nearest_qkv = (i, qkv_delta);
+                    }
+                }
+                format!(
+                    "c{channel}->q{} native={:.6} expected={:.6} self_q={:.6} match_q={:.6} match_delta={:.6} delta={:.6}",
+                    nearest_qkv.0,
+                    native_last,
+                    expected_last,
+                    native_qkv_proj_f32[channel],
+                    native_qkv_proj_f32[nearest_qkv.0],
+                    nearest_qkv.1,
+                    delta
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
     let comp_conv_tap_deltas = {
         let comp = decode_bf16_le(&native_comp_conv);
         let mut deltas = vec![0.0f32; conv_state_len];
@@ -3517,7 +3550,7 @@ fn trace_persistent_linear_layer(
     let sample_z_comp = comp_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
 
     eprintln!(
-        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_conv_tap_deltas=[{native_conv_tap_deltas}] comp_conv_tap_deltas=[{comp_conv_tap_deltas}] max_append_mismatch=({max_append_mismatch}) native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
+        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_conv_tap_deltas=[{native_conv_tap_deltas}] comp_conv_tap_deltas=[{comp_conv_tap_deltas}] max_append_mismatch=({max_append_mismatch}) append_mismatch_samples=[{append_mismatch_samples}] native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
     );
     Ok(())
 }
