@@ -2621,6 +2621,7 @@ impl DecodeEngine {
     pub fn prefill_native_with_trace(
         &mut self,
         prompt_ids: &[u32],
+        debug_linear_layer: Option<usize>,
     ) -> Result<prefill_engine::PrefillResult> {
         let result = prefill_engine::prefill(
             &self.weights,
@@ -2633,7 +2634,7 @@ impl DecodeEngine {
             self.kv_fp8,
             self.use_4b_kernel,
             true,
-            None,
+            debug_linear_layer,
         )?;
 
         self.scratch
@@ -2798,17 +2799,36 @@ impl DecodeEngine {
             DecodeSamplingMode::CudaFastGreedy | DecodeSamplingMode::HostLogits => {
                 // 8. lm_head projection → logits (work-stealing matvec)
                 let start = Instant::now();
-                kernel_ffi::standalone_matvec(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    &mut self.logits_buf,
-                    &self.normed_buf,
-                    &*self.weights.lm_head,
-                    config.hidden_size,
-                    config.vocab_size,
-                    &mut self.matvec_counter,
-                )
-                .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+                let metal_host_logits = if sampling_mode == DecodeSamplingMode::HostLogits
+                    && self.hidden_io.backend() == gpu_hal::Backend::Metal
+                {
+                    Some(
+                        kernel_ffi::qwen_rms_norm_standalone_matvec_host_f32(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &self.hidden_io,
+                            &self.weights.norm_weight,
+                            config.rms_norm_eps as f32,
+                            &*self.weights.lm_head,
+                            config.hidden_size,
+                            config.vocab_size,
+                        )
+                        .map_err(|e| anyhow::anyhow!("lm_head host-f32 matvec: {e}"))?,
+                    )
+                } else {
+                    kernel_ffi::standalone_matvec(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        &mut self.logits_buf,
+                        &self.normed_buf,
+                        &*self.weights.lm_head,
+                        config.hidden_size,
+                        config.vocab_size,
+                        &mut self.matvec_counter,
+                    )
+                    .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+                    None
+                };
                 timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 if sampling_mode == DecodeSamplingMode::CudaFastGreedy {
@@ -2842,18 +2862,22 @@ impl DecodeEngine {
                 }
 
                 // 9. Copy logits to CPU and convert BF16 → F32
+                let logits_f32: Vec<f32> = if let Some(logits) = metal_host_logits {
+                    timings.logits_d2h_ms = 0.0;
+                    logits
+                } else {
+                    let start = Instant::now();
+                    let logits_bytes = self
+                        .logits_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
+                    timings.logits_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    logits_bytes
+                        .chunks_exact(2)
+                        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                        .collect()
+                };
                 let start = Instant::now();
-                let logits_bytes = self
-                    .logits_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
-                timings.logits_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-                let start = Instant::now();
-                let logits_f32: Vec<f32> = logits_bytes
-                    .chunks_exact(2)
-                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-                    .collect();
                 let sampled_token = Self::greedy_sample(&logits_f32);
                 timings.host_sampling_ms = start.elapsed().as_secs_f64() * 1000.0;
 

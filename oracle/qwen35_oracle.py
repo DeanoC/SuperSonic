@@ -17,6 +17,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, required=True)
     parser.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     parser.add_argument("--device", default="cpu", help="device to run on (cpu, cuda:0, etc.)")
+    parser.add_argument(
+        "--trace-linear-layer",
+        type=int,
+        help="Optional Qwen linear-attention layer index to dump prefill internals for.",
+    )
     return parser.parse_args()
 
 
@@ -159,6 +164,19 @@ def main() -> None:
     layer4_post_attention_layernorm_output = None
     layer4_mlp_output = None
     layer4_output = None
+    trace_linear_layer_idx = args.trace_linear_layer
+    trace_linear_qkv_output = None
+    trace_linear_z_output = None
+    trace_linear_input_layernorm_output = None
+    trace_linear_post_conv_output = None
+    trace_linear_prepared_query_output = None
+    trace_linear_prepared_key_output = None
+    trace_linear_prepared_value_output = None
+    trace_linear_prepared_beta_output = None
+    trace_linear_prepared_g_output = None
+    trace_linear_direct_recurrent_output = None
+    trace_linear_norm_output = None
+    trace_linear_token_mixer_output = None
 
     # Dictionary-based capture for middle decode layers (15-18)
     mid_layer_captures: dict[str, Any] = {}
@@ -197,6 +215,88 @@ def main() -> None:
     def capture_tensor(output):
         tensor = output[0] if isinstance(output, tuple) else output
         return tensor.detach().to(dtype=torch.float32).cpu()
+
+    def focus_token_head(tensor: torch.Tensor, token_axis: int = 1, head_axis: int = 2) -> torch.Tensor:
+        token_idx = min(2, tensor.shape[token_axis] - 1)
+        head_idx = min(6, tensor.shape[head_axis] - 1)
+        return tensor.select(token_axis, token_idx).select(head_axis - 1, head_idx).cpu()
+
+    def compute_linear_prefill_trace(
+        layer_idx: int,
+        z_tensor: torch.Tensor,
+        b_tensor: torch.Tensor,
+        a_tensor: torch.Tensor,
+        conv_output: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        linear_attn = model.model.layers[layer_idx].linear_attn
+        value_dim = z_tensor.shape[-1]
+        key_dim = (conv_output.shape[-1] - value_dim) // 2
+        num_k_heads = int(linear_attn.num_k_heads)
+        num_v_heads = int(linear_attn.num_v_heads)
+        head_k_dim = int(linear_attn.head_k_dim)
+        head_v_dim = int(linear_attn.head_v_dim)
+        batch_size = input_ids.shape[0]
+        seq_len = input_ids.shape[1]
+
+        query = conv_output[..., :key_dim].reshape(
+            batch_size, seq_len, num_k_heads, head_k_dim
+        )
+        key = conv_output[..., key_dim : key_dim * 2].reshape(
+            batch_size, seq_len, num_k_heads, head_k_dim
+        )
+        value = conv_output[..., key_dim * 2 : key_dim * 2 + value_dim].reshape(
+            batch_size, seq_len, num_v_heads, head_v_dim
+        )
+        query = F.normalize(query, p=2.0, dim=-1, eps=1e-6)
+        key = F.normalize(key, p=2.0, dim=-1, eps=1e-6)
+
+        head_repeat = num_v_heads // num_k_heads
+        if head_repeat > 1:
+            query = query.repeat_interleave(head_repeat, dim=2)
+            key = key.repeat_interleave(head_repeat, dim=2)
+
+        beta = torch.sigmoid(b_tensor).to(dtype=torch.float32)
+        dt_bias = linear_attn.dt_bias.detach().to(dtype=torch.float32).reshape(1, 1, num_v_heads)
+        a_log_exp = linear_attn.A_log.detach().to(dtype=torch.float32).exp().reshape(1, 1, num_v_heads)
+        g = -torch.log1p(torch.exp(a_tensor.to(dtype=torch.float32) + dt_bias)) * a_log_exp
+
+        q = query.transpose(1, 2).contiguous() * (1.0 / (head_k_dim ** 0.5))
+        k = key.transpose(1, 2).contiguous()
+        v = value.transpose(1, 2).contiguous()
+        beta_t = beta.transpose(1, 2).contiguous()
+        g_t = g.transpose(1, 2).contiguous()
+        state = torch.zeros(
+            (batch_size, num_v_heads, head_k_dim, head_v_dim), dtype=torch.float32
+        )
+        outputs = []
+        for step in range(seq_len):
+            q_step = q[:, :, step, :]
+            k_step = k[:, :, step, :]
+            v_step = v[:, :, step, :]
+            beta_step = beta_t[:, :, step].unsqueeze(-1)
+            g_step = g_t[:, :, step].exp().unsqueeze(-1).unsqueeze(-1)
+            state = state * g_step
+            kv_mem = (state * k_step.unsqueeze(-1)).sum(dim=2)
+            delta = (v_step - kv_mem) * beta_step
+            state = state + k_step.unsqueeze(-1) * delta.unsqueeze(2)
+            out_step = (state * q_step.unsqueeze(-1)).sum(dim=2)
+            outputs.append(out_step.unsqueeze(2))
+
+        direct_recurrent = (
+            torch.cat(outputs, dim=2)
+            .transpose(1, 2)
+            .contiguous()
+            .reshape(batch_size, seq_len, -1)
+            .cpu()
+        )
+        return {
+            "query": query.cpu(),
+            "key": key.cpu(),
+            "value": value.cpu(),
+            "beta": beta.cpu(),
+            "g": g.cpu(),
+            "direct_recurrent": direct_recurrent,
+        }
 
     def reconstruct_decode_linear_outputs():
         nonlocal decode_first_layer_linear_prepared_query_output
@@ -338,7 +438,7 @@ def main() -> None:
         value = qkv[..., key_dim * 2 : key_dim * 2 + value_dim].reshape(
             input_ids.shape[0], input_ids.shape[1], num_v_heads, head_v_dim
         )
-        first_layer_linear_pre_conv_value_focus_head_output = value[0, 2, 6].cpu()
+        first_layer_linear_pre_conv_value_focus_head_output = focus_token_head(value)
 
     def linear_z_hook(_module, _inputs, output):
         nonlocal first_layer_linear_z_output
@@ -504,7 +604,7 @@ def main() -> None:
         first_layer_linear_direct_recurrent_output = (
             torch.cat(outputs, dim=2).transpose(1, 2).contiguous().reshape(batch_size, seq_len, -1).cpu()
         )
-        first_layer_linear_prepared_value_focus_head_output = value[0, 2, 6].cpu()
+        first_layer_linear_prepared_value_focus_head_output = focus_token_head(value)
 
     def linear_norm_hook(_module, _inputs, output):
         nonlocal first_layer_linear_norm_output
@@ -540,7 +640,7 @@ def main() -> None:
         rsqrt = torch.rsqrt(mean_square + _module.variance_epsilon)
         first_layer_linear_pre_norm_mean_square = mean_square.squeeze(-1).cpu()
         first_layer_linear_pre_norm_rsqrt = rsqrt.squeeze(-1).cpu()
-        first_layer_linear_pre_norm_focus_head_output = hidden_heads[0, 2, 6].cpu()
+        first_layer_linear_pre_norm_focus_head_output = focus_token_head(hidden_heads)
         nonlocal first_layer_linear_norm_gate_input
         gate_tensor = capture_tensor(inputs[1])
         first_layer_linear_norm_gate_input = gate_tensor.reshape(
@@ -562,6 +662,98 @@ def main() -> None:
         first_layer_linear_norm_silu_gate = silu_gate.reshape(
             input_ids.shape[0], input_ids.shape[1], -1
         ).cpu()
+
+    def make_trace_linear_hooks(layer_idx: int):
+        layer = model.model.layers[layer_idx]
+        linear_attn = layer.linear_attn
+
+        def input_layernorm_hook(_module, _inputs, output):
+            nonlocal trace_linear_input_layernorm_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_input_layernorm_output = capture_tensor(output)
+
+        def qkv_hook(_module, _inputs, output):
+            nonlocal trace_linear_qkv_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_qkv_output = capture_tensor(output)
+
+        def z_hook(_module, _inputs, output):
+            nonlocal trace_linear_z_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_z_output = capture_tensor(output)
+
+        def b_hook(_module, _inputs, output):
+            nonlocal trace_linear_prepared_beta_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_prepared_beta_output = capture_tensor(output)
+
+        def a_hook(_module, _inputs, output):
+            nonlocal trace_linear_prepared_g_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_prepared_g_output = capture_tensor(output)
+
+        def conv_hook(_module, _inputs, output):
+            nonlocal trace_linear_post_conv_output
+            nonlocal trace_linear_prepared_query_output
+            nonlocal trace_linear_prepared_key_output
+            nonlocal trace_linear_prepared_value_output
+            nonlocal trace_linear_prepared_beta_output
+            nonlocal trace_linear_prepared_g_output
+            nonlocal trace_linear_direct_recurrent_output
+            if capture_phase != "prefill":
+                return
+            if (
+                trace_linear_z_output is None
+                or trace_linear_prepared_beta_output is None
+                or trace_linear_prepared_g_output is None
+            ):
+                raise RuntimeError("trace linear projections must run before trace linear conv hook")
+            tensor = capture_tensor(output)
+            seq_len = input_ids.shape[1]
+            post_conv = F.silu(tensor[:, :, :seq_len]).transpose(1, 2).contiguous()
+            trace_linear_post_conv_output = post_conv.cpu()
+            trace = compute_linear_prefill_trace(
+                layer_idx,
+                trace_linear_z_output,
+                trace_linear_prepared_beta_output,
+                trace_linear_prepared_g_output,
+                post_conv,
+            )
+            trace_linear_prepared_query_output = trace["query"]
+            trace_linear_prepared_key_output = trace["key"]
+            trace_linear_prepared_value_output = trace["value"]
+            trace_linear_prepared_beta_output = trace["beta"]
+            trace_linear_prepared_g_output = trace["g"]
+            trace_linear_direct_recurrent_output = trace["direct_recurrent"]
+
+        def norm_hook(_module, _inputs, output):
+            nonlocal trace_linear_norm_output
+            if capture_phase != "prefill":
+                return
+            tensor = capture_tensor(output)
+            trace_linear_norm_output = tensor.reshape(input_ids.shape[0], input_ids.shape[1], -1)
+
+        def token_mixer_hook(_module, _inputs, output):
+            nonlocal trace_linear_token_mixer_output
+            if capture_phase != "prefill":
+                return
+            trace_linear_token_mixer_output = capture_tensor(output)
+
+        return [
+            layer.input_layernorm.register_forward_hook(input_layernorm_hook),
+            linear_attn.in_proj_qkv.register_forward_hook(qkv_hook),
+            linear_attn.in_proj_z.register_forward_hook(z_hook),
+            linear_attn.in_proj_b.register_forward_hook(b_hook),
+            linear_attn.in_proj_a.register_forward_hook(a_hook),
+            linear_attn.conv1d.register_forward_hook(conv_hook),
+            linear_attn.norm.register_forward_hook(norm_hook),
+            linear_attn.register_forward_hook(token_mixer_hook),
+        ]
 
     def post_attention_layernorm_hook(_module, _inputs, output):
         nonlocal first_layer_post_attention_layernorm_output
@@ -1032,6 +1224,13 @@ def main() -> None:
     )
     layer23_mlp_handle = model.model.layers[23].mlp.register_forward_hook(layer23_mlp_hook)
     layer23_handle = model.model.layers[23].register_forward_hook(layer23_hook)
+    trace_linear_handles: list[Any] = []
+    if trace_linear_layer_idx is not None:
+        if not hasattr(model.model.layers[trace_linear_layer_idx], "linear_attn"):
+            raise RuntimeError(
+                f"trace-linear-layer={trace_linear_layer_idx} is not a linear-attention layer"
+            )
+        trace_linear_handles = make_trace_linear_hooks(trace_linear_layer_idx)
     try:
         with torch.no_grad():
             outputs = model(input_ids=input_ids, use_cache=True, output_hidden_states=True)
@@ -1108,6 +1307,8 @@ def main() -> None:
         layer23_mlp_down_proj_handle.remove()
         layer23_mlp_handle.remove()
         layer23_handle.remove()
+        for handle in trace_linear_handles:
+            handle.remove()
         for handle in mid_layer_handles:
             handle.remove()
         for handle in decoder_layer_handles:
@@ -1426,6 +1627,19 @@ def main() -> None:
         "decode_layer23_mlp_down_proj_output": decode_layer23_mlp_down_proj_output.tolist() if decode_layer23_mlp_down_proj_output is not None else None,
         "decode_layer23_mlp_output": decode_layer23_mlp_output.tolist() if decode_layer23_mlp_output is not None else None,
         "decode_layer23_output": decode_layer23_output.tolist() if decode_layer23_output is not None else None,
+        "trace_linear_layer": trace_linear_layer_idx,
+        "trace_linear_input_layernorm_output": trace_linear_input_layernorm_output.tolist() if trace_linear_input_layernorm_output is not None else None,
+        "trace_linear_qkv_output": trace_linear_qkv_output.tolist() if trace_linear_qkv_output is not None else None,
+        "trace_linear_z_output": trace_linear_z_output.tolist() if trace_linear_z_output is not None else None,
+        "trace_linear_post_conv_output": trace_linear_post_conv_output.tolist() if trace_linear_post_conv_output is not None else None,
+        "trace_linear_prepared_query_output": trace_linear_prepared_query_output.tolist() if trace_linear_prepared_query_output is not None else None,
+        "trace_linear_prepared_key_output": trace_linear_prepared_key_output.tolist() if trace_linear_prepared_key_output is not None else None,
+        "trace_linear_prepared_value_output": trace_linear_prepared_value_output.tolist() if trace_linear_prepared_value_output is not None else None,
+        "trace_linear_prepared_beta_output": trace_linear_prepared_beta_output.tolist() if trace_linear_prepared_beta_output is not None else None,
+        "trace_linear_prepared_g_output": trace_linear_prepared_g_output.tolist() if trace_linear_prepared_g_output is not None else None,
+        "trace_linear_direct_recurrent_output": trace_linear_direct_recurrent_output.tolist() if trace_linear_direct_recurrent_output is not None else None,
+        "trace_linear_norm_output": trace_linear_norm_output.tolist() if trace_linear_norm_output is not None else None,
+        "trace_linear_token_mixer_output": trace_linear_token_mixer_output.tolist() if trace_linear_token_mixer_output is not None else None,
     }
     for lid in mid_layer_ids:
         for suffix in [

@@ -260,6 +260,119 @@ pub(crate) fn standalone_matvec(
     matmul_rhs_transposed(dtype, 1, 1, out_dim, in_dim, input, weight, output)
 }
 
+pub(crate) fn standalone_matvec_host_f32(
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    match dtype {
+        ScalarType::BF16 => {
+            let input = unsafe { bf16_slice(input.as_ptr(), in_dim) };
+            let weight = unsafe { bf16_slice(weight.as_ptr(), out_dim * in_dim) };
+            let mut out = vec![0.0f32; out_dim];
+            for row in 0..out_dim {
+                let weight_row_base = row * in_dim;
+                let mut acc = 0.0f32;
+                for col in 0..in_dim {
+                    acc += bf16_to_f32(input[col]) * bf16_to_f32(weight[weight_row_base + col]);
+                }
+                out[row] = acc;
+            }
+            Ok(out)
+        }
+        ScalarType::F32 => {
+            let input = unsafe { f32_slice(input.as_ptr(), in_dim) };
+            let weight = unsafe { f32_slice(weight.as_ptr(), out_dim * in_dim) };
+            let mut out = vec![0.0f32; out_dim];
+            for row in 0..out_dim {
+                let weight_row_base = row * in_dim;
+                let mut acc = 0.0f32;
+                for col in 0..in_dim {
+                    acc += input[col] * weight[weight_row_base + col];
+                }
+                out[row] = acc;
+            }
+            Ok(out)
+        }
+        other => Err(unsupported(
+            "standalone_matvec_host_f32",
+            format!("unsupported dtype {other:?}"),
+        )),
+    }
+}
+
+pub(crate) fn qwen_rms_norm_standalone_matvec_host_f32(
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    norm_weight: &GpuBuffer,
+    eps: f32,
+    weight: &GpuBuffer,
+    hidden_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    match dtype {
+        ScalarType::BF16 => {
+            let input = unsafe { bf16_slice(input.as_ptr(), hidden_dim) };
+            let weight = unsafe { bf16_slice(weight.as_ptr(), out_dim * hidden_dim) };
+            let mut mean_sq = 0.0f32;
+            for &value_bits in input.iter() {
+                let value = bf16_to_f32(value_bits);
+                mean_sq += value * value;
+            }
+            let inv_rms = 1.0 / ((mean_sq / hidden_dim as f32) + eps).sqrt();
+
+            let mut normed = vec![0.0f32; hidden_dim];
+            for col in 0..hidden_dim {
+                let scale = read_weight_f32(norm_weight, col)? + 1.0;
+                normed[col] = bf16_to_f32(input[col]) * inv_rms * scale;
+            }
+
+            let mut out = vec![0.0f32; out_dim];
+            for row in 0..out_dim {
+                let weight_row_base = row * hidden_dim;
+                let mut acc = 0.0f32;
+                for col in 0..hidden_dim {
+                    acc += normed[col] * bf16_to_f32(weight[weight_row_base + col]);
+                }
+                out[row] = acc;
+            }
+            Ok(out)
+        }
+        ScalarType::F32 => {
+            let input = unsafe { f32_slice(input.as_ptr(), hidden_dim) };
+            let weight = unsafe { f32_slice(weight.as_ptr(), out_dim * hidden_dim) };
+            let mut mean_sq = 0.0f32;
+            for &value in input.iter() {
+                mean_sq += value * value;
+            }
+            let inv_rms = 1.0 / ((mean_sq / hidden_dim as f32) + eps).sqrt();
+
+            let mut normed = vec![0.0f32; hidden_dim];
+            for col in 0..hidden_dim {
+                let scale = read_weight_f32(norm_weight, col)? + 1.0;
+                normed[col] = input[col] * inv_rms * scale;
+            }
+
+            let mut out = vec![0.0f32; out_dim];
+            for row in 0..out_dim {
+                let weight_row_base = row * hidden_dim;
+                let mut acc = 0.0f32;
+                for col in 0..hidden_dim {
+                    acc += normed[col] * weight[weight_row_base + col];
+                }
+                out[row] = acc;
+            }
+            Ok(out)
+        }
+        other => Err(unsupported(
+            "qwen_rms_norm_standalone_matvec_host_f32",
+            format!("unsupported dtype {other:?}"),
+        )),
+    }
+}
+
 pub(crate) fn rms_norm_rows(
     dtype: ScalarType,
     n_rows: usize,
@@ -1379,4 +1492,76 @@ mod tests {
         let expected = vec![1.25, 10.125, 3.375];
         assert_close(&actual, &expected, 1e-6);
     }
+
+    #[test]
+    fn metal_host_standalone_matvec_host_f32_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[1.0, -2.0, 0.5]),
+        )
+        .expect("upload input");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[2.0, 1.0, -1.0, -3.0, 0.5, 4.0]),
+        )
+        .expect("upload weight");
+
+        let actual = standalone_matvec_host_f32(ScalarType::BF16, &input, &weight, 3, 2)
+            .expect("run standalone_matvec_host_f32");
+        let expected = vec![-0.5, -2.0];
+        assert_close(&actual, &expected, 1e-6);
+    }
+
+    #[test]
+    fn metal_host_qwen_rms_norm_standalone_matvec_host_f32_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2],
+            &bf16_bytes(&[3.0, 4.0]),
+        )
+        .expect("upload input");
+        let norm_weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2],
+            &bf16_bytes(&[0.5, -0.5]),
+        )
+        .expect("upload norm weight");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 2],
+            &bf16_bytes(&[2.0, -1.0, 0.25, 3.0]),
+        )
+        .expect("upload weight");
+
+        let actual = qwen_rms_norm_standalone_matvec_host_f32(
+            ScalarType::BF16,
+            &input,
+            &norm_weight,
+            0.0,
+            &weight,
+            2,
+            2,
+        )
+        .expect("run qwen_rms_norm_standalone_matvec_host_f32");
+
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        let normed = [3.0 * inv_rms * 1.5, 4.0 * inv_rms * 0.5];
+        let expected = vec![
+            normed[0] * 2.0 + normed[1] * -1.0,
+            normed[0] * 0.25 + normed[1] * 3.0,
+        ];
+        assert_close(&actual, &expected, 1e-6);
+    }
+
 }

@@ -242,6 +242,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     trace_prefill_layers: bool,
 
+    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
+    /// linear-attention layer's internal tensors against the Python oracle.
+    /// Defaults to a later linear layer to localize the current drift.
+    #[arg(long, hide = true)]
+    trace_prefill_linear_layer: Option<usize>,
+
     /// Batch size for decode (number of sequences decoded in parallel).
     /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
     /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
@@ -984,10 +990,38 @@ fn main() -> Result<()> {
     if cli.trace_prefill_layers && !cli.validate {
         anyhow::bail!("--trace-prefill-layers requires --validate");
     }
+    let trace_prefill_linear_layer = if cli.trace_prefill_layers
+        && model_variant.family() == ModelFamily::Qwen35
+    {
+        let layer = cli.trace_prefill_linear_layer.unwrap_or(20);
+        let config = &engine.weights().config;
+        if layer >= config.num_hidden_layers {
+            anyhow::bail!(
+                "--trace-prefill-linear-layer {} out of range for {} layers",
+                layer,
+                config.num_hidden_layers
+            );
+        }
+        if config.is_full_attention(layer) {
+            anyhow::bail!(
+                "--trace-prefill-linear-layer {} selects a full-attention layer; choose a linear-attention layer",
+                layer
+            );
+        }
+        Some(layer)
+    } else {
+        None
+    };
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
-    let (prefill_logits, native_prefill_trace, mut next_token) = if cli.oracle_prefill {
+    let (
+        prefill_logits,
+        native_prefill_trace,
+        native_linear_debug_trace,
+        native_layer3_full_attn_trace,
+        mut next_token,
+    ) = if cli.oracle_prefill {
         let model_id = cli
             .model_id
             .clone()
@@ -1005,10 +1039,10 @@ fn main() -> Result<()> {
         engine.load_prefill_state(&output)?;
         let first = output.generated_token_ids[0];
         eprintln!("[prefill] oracle prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
-        (output.prefill_logits, None, first)
+        (output.prefill_logits, None, None, None, first)
     } else {
         let prefill_result = if cli.trace_prefill_layers {
-            engine.prefill_native_with_trace(&prompt_ids)?
+            engine.prefill_native_with_trace(&prompt_ids, trace_prefill_linear_layer)?
         } else {
             prefill_engine::PrefillResult {
                 logits: engine.prefill_native(&prompt_ids)?,
@@ -1020,6 +1054,7 @@ fn main() -> Result<()> {
                 layer_hidden_trace: None,
                 tap_hiddens: None,
                 linear_debug_trace: None,
+                layer3_full_attn_trace: None,
             }
         };
         let first = DecodeEngine::greedy_sample(&prefill_result.logits);
@@ -1033,6 +1068,8 @@ fn main() -> Result<()> {
                 prefill_result.layer_mlp_out_trace,
                 prefill_result.layer_hidden_trace,
             )),
+            prefill_result.linear_debug_trace,
+            prefill_result.layer3_full_attn_trace,
             first,
         )
     };
@@ -1063,6 +1100,27 @@ fn main() -> Result<()> {
         // Compare prefill logits
         let prefill_delta = validate::max_abs_delta(&prefill_logits, &output.prefill_logits);
         eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
+
+        let qwen35_trace_output = if cli.trace_prefill_layers
+            && model_variant.family() == ModelFamily::Qwen35
+        {
+            let qwen35_trace_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap()
+                .join("oracle/qwen35_oracle.py");
+            Some(oracle::run_qwen35_trace_oracle(
+                &qwen35_trace_script,
+                &model_id,
+                &prompt_ids,
+                cli.max_new_tokens,
+                &cli.oracle_dtype,
+                &oracle_device,
+                trace_prefill_linear_layer,
+            )?)
+        } else {
+            None
+        };
 
         if let (Some((native_final_norm_trace, ..)), Some(oracle_final_norm_b64)) = (
             native_prefill_trace.as_ref(),
@@ -1173,6 +1231,235 @@ fn main() -> Result<()> {
                 }
             } else {
                 eprintln!("[trace-prefill] missing native or oracle layer trace data");
+            }
+
+            if let (Some(native), Some(trace)) = (
+                native_linear_debug_trace.as_ref(),
+                qwen35_trace_output.as_ref(),
+            ) {
+                let trace_linear_layer = trace
+                    .trace_linear_layer
+                    .or(trace_prefill_linear_layer)
+                    .unwrap_or(0);
+                if let (
+                    Some(oracle_normed),
+                    Some(oracle_qkv),
+                    Some(oracle_z),
+                    Some(oracle_post_conv),
+                    Some(oracle_q),
+                    Some(oracle_k),
+                    Some(oracle_v),
+                    Some(oracle_beta),
+                    Some(oracle_g),
+                    Some(oracle_attn),
+                    Some(oracle_gated),
+                    Some(oracle_proj_out),
+                ) = (
+                    trace.trace_linear_input_layernorm_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_qkv_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_z_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_post_conv_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_prepared_query_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bshd),
+                    trace.trace_linear_prepared_key_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bshd),
+                    trace.trace_linear_prepared_value_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bshd),
+                    trace.trace_linear_prepared_beta_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_prepared_g_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_direct_recurrent_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_norm_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                    trace.trace_linear_token_mixer_output
+                        .as_ref()
+                        .and_then(flatten_last_token_bsd),
+                ) {
+                    let native_normed = decode_bf16_le(&native.normed);
+                    let native_qkv = decode_bf16_le(&native.qkv);
+                    let native_z = decode_bf16_le(&native.z);
+                    let native_post_conv = decode_bf16_le(&native.post_conv);
+                    let native_packed = decode_f32_le(&native.packed);
+                    let native_attn = decode_bf16_le(&native.attn);
+                    let native_gated = decode_bf16_le(&native.gated);
+                    let native_proj_out = decode_bf16_le(&native.proj_out);
+
+                    let cfg = &engine.weights().config;
+                    let nv = cfg.linear_num_value_heads;
+                    let khd = cfg.linear_key_head_dim;
+                    let vhd = cfg.linear_value_head_dim;
+                    let key_dim = cfg.linear_num_key_heads * khd;
+                    let val_dim = nv * vhd;
+                    let packed_width = 2 * khd + vhd + 2;
+                    let q_scale = 1.0f32 / (khd as f32).sqrt();
+                    let mut oracle_packed = vec![0.0f32; nv * packed_width];
+                    for head in 0..nv {
+                        let out_base = head * packed_width;
+                        let q_base = head * khd;
+                        let k_base = head * khd;
+                        let v_base = head * vhd;
+                        for i in 0..khd {
+                            oracle_packed[out_base + i] = oracle_q[q_base + i] * q_scale;
+                            oracle_packed[out_base + khd + i] = oracle_k[k_base + i];
+                        }
+                        for i in 0..vhd {
+                            oracle_packed[out_base + 2 * khd + i] = oracle_v[v_base + i];
+                        }
+                        oracle_packed[out_base + 2 * khd + vhd] = oracle_beta[head];
+                        oracle_packed[out_base + 2 * khd + vhd + 1] = oracle_g[head].exp();
+                    }
+                    let mut q_delta = 0.0f32;
+                    let mut k_delta = 0.0f32;
+                    let mut v_delta = 0.0f32;
+                    let conv_q_delta = validate::max_abs_delta(
+                        &native_post_conv[..key_dim],
+                        &oracle_post_conv[..key_dim],
+                    );
+                    let conv_k_delta = validate::max_abs_delta(
+                        &native_post_conv[key_dim..key_dim * 2],
+                        &oracle_post_conv[key_dim..key_dim * 2],
+                    );
+                    let conv_v_delta = validate::max_abs_delta(
+                        &native_post_conv[key_dim * 2..key_dim * 2 + val_dim],
+                        &oracle_post_conv[key_dim * 2..key_dim * 2 + val_dim],
+                    );
+                    let mut beta_delta = 0.0f32;
+                    let mut gexp_delta = 0.0f32;
+                    for head in 0..nv {
+                        let base = head * packed_width;
+                        q_delta = q_delta.max(validate::max_abs_delta(
+                            &native_packed[base..base + khd],
+                            &oracle_packed[base..base + khd],
+                        ));
+                        k_delta = k_delta.max(validate::max_abs_delta(
+                            &native_packed[base + khd..base + 2 * khd],
+                            &oracle_packed[base + khd..base + 2 * khd],
+                        ));
+                        v_delta = v_delta.max(validate::max_abs_delta(
+                            &native_packed[base + 2 * khd..base + 2 * khd + vhd],
+                            &oracle_packed[base + 2 * khd..base + 2 * khd + vhd],
+                        ));
+                        beta_delta = beta_delta.max(
+                            (native_packed[base + 2 * khd + vhd]
+                                - oracle_packed[base + 2 * khd + vhd])
+                                .abs(),
+                        );
+                        gexp_delta = gexp_delta.max(
+                            (native_packed[base + 2 * khd + vhd + 1]
+                                - oracle_packed[base + 2 * khd + vhd + 1])
+                                .abs(),
+                        );
+                    }
+
+                    eprintln!(
+                        "[trace-prefill-linear] layer={} normed_delta={:.4} qkv_delta={:.4} z_delta={:.4} post_conv_delta={:.4} conv_q_delta={:.4} conv_k_delta={:.4} conv_v_delta={:.4} packed_delta={:.4} q_delta={:.4} k_delta={:.4} v_delta={:.4} beta_delta={:.4} gexp_delta={:.4} attn_delta={:.4} gated_delta={:.4} proj_out_delta={:.4}",
+                        trace_linear_layer,
+                        validate::max_abs_delta(&native_normed, &oracle_normed),
+                        validate::max_abs_delta(&native_qkv, &oracle_qkv),
+                        validate::max_abs_delta(&native_z, &oracle_z),
+                        validate::max_abs_delta(&native_post_conv, &oracle_post_conv),
+                        conv_q_delta,
+                        conv_k_delta,
+                        conv_v_delta,
+                        validate::max_abs_delta(&native_packed, &oracle_packed),
+                        q_delta,
+                        k_delta,
+                        v_delta,
+                        beta_delta,
+                        gexp_delta,
+                        validate::max_abs_delta(&native_attn, &oracle_attn),
+                        validate::max_abs_delta(&native_gated, &oracle_gated),
+                        validate::max_abs_delta(&native_proj_out, &oracle_proj_out),
+                    );
+                } else {
+                    eprintln!(
+                        "[trace-prefill-linear] layer={} missing flattenable qwen35 trace tensors",
+                        trace_linear_layer
+                    );
+                }
+            } else if model_variant.family() == ModelFamily::Qwen35 {
+                let layer = trace_prefill_linear_layer.unwrap_or(0);
+                eprintln!(
+                    "[trace-prefill-linear] layer={} missing native or qwen35 trace data",
+                    layer
+                );
+            }
+
+            if let (Some(native), Some(trace)) = (
+                native_layer3_full_attn_trace.as_ref(),
+                qwen35_trace_output.as_ref(),
+            ) {
+                if let (
+                    Some(oracle_q_and_gate),
+                    Some(oracle_gate_proj),
+                    Some(oracle_k_proj),
+                    Some(oracle_v_proj),
+                    Some(oracle_q_prepared),
+                    Some(oracle_k_prepared),
+                    Some(oracle_v_prepared),
+                    Some(oracle_attn),
+                ) = (
+                    flatten_last_token_bsd(&trace.layer3_q_and_gate_output),
+                    flatten_last_token_bsd(&trace.layer3_gate_output),
+                    flatten_last_token_bsd(&trace.layer3_k_proj_output),
+                    flatten_last_token_bsd(&trace.layer3_v_proj_output),
+                    flatten_last_token_bhsd(&trace.layer3_prepared_query_output),
+                    flatten_last_token_bhsd(&trace.layer3_prepared_key_output),
+                    flatten_last_token_bhsd(&trace.layer3_prepared_value_output),
+                    flatten_last_token_bsd(&trace.layer3_attention_output),
+                ) {
+                    let native_q_proj = decode_bf16_le(&native.q_proj);
+                    let native_gate_proj = decode_bf16_le(&native.gate_proj);
+                    let native_k_proj = decode_bf16_le(&native.k_proj);
+                    let native_v_proj = decode_bf16_le(&native.v_proj);
+                    let native_q_prepared = decode_bf16_le(&native.q_prepared);
+                    let native_k_prepared = decode_bf16_le(&native.k_prepared);
+                    let native_v_prepared = decode_bf16_le(&native.v_prepared);
+                    let native_attn = decode_bf16_le(&native.attn_output);
+                    let cfg = &engine.weights().config;
+                    let num_heads = cfg.num_attention_heads;
+                    let head_dim = cfg.head_dim;
+                    let q_dim = num_heads * head_dim;
+                    let mut oracle_q_proj = vec![0.0f32; q_dim];
+                    for head in 0..num_heads {
+                        let src_base = head * head_dim * 2;
+                        let dst_base = head * head_dim;
+                        oracle_q_proj[dst_base..dst_base + head_dim]
+                            .copy_from_slice(&oracle_q_and_gate[src_base..src_base + head_dim]);
+                    }
+                    eprintln!(
+                        "[trace-prefill-layer3-full] q_proj_delta={:.4} gate_proj_delta={:.4} k_proj_delta={:.4} v_proj_delta={:.4} q_prepared_delta={:.4} k_prepared_delta={:.4} v_prepared_delta={:.4} attn_output_delta={:.4}",
+                        validate::max_abs_delta(&native_q_proj, &oracle_q_proj),
+                        validate::max_abs_delta(&native_gate_proj, &oracle_gate_proj),
+                        validate::max_abs_delta(&native_k_proj, &oracle_k_proj),
+                        validate::max_abs_delta(&native_v_proj, &oracle_v_proj),
+                        validate::max_abs_delta(&native_q_prepared, &oracle_q_prepared),
+                        validate::max_abs_delta(&native_k_prepared, &oracle_k_prepared),
+                        validate::max_abs_delta(&native_v_prepared, &oracle_v_prepared),
+                        validate::max_abs_delta(&native_attn, &oracle_attn),
+                    );
+                } else {
+                    eprintln!("[trace-prefill-layer3-full] missing flattenable qwen35 trace tensors");
+                }
+            } else if model_variant.family() == ModelFamily::Qwen35 {
+                eprintln!("[trace-prefill-layer3-full] missing native or qwen35 trace data");
             }
         }
 
@@ -2238,6 +2525,50 @@ fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(2)
         .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
         .collect()
+}
+
+fn flatten_json_numbers(value: &serde_json::Value, out: &mut Vec<f32>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                flatten_json_numbers(value, out);
+            }
+        }
+        serde_json::Value::Number(number) => {
+            if let Some(value) = number.as_f64() {
+                out.push(value as f32);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn flatten_last_token_bsd(value: &serde_json::Value) -> Option<Vec<f32>> {
+    let batch = value.as_array()?.first()?.as_array()?;
+    let token = batch.last()?;
+    let mut out = Vec::new();
+    flatten_json_numbers(token, &mut out);
+    Some(out)
+}
+
+fn flatten_last_token_bhsd(value: &serde_json::Value) -> Option<Vec<f32>> {
+    let batch = value.as_array()?.first()?.as_array()?;
+    let mut out = Vec::new();
+    for head in batch {
+        let token = head.as_array()?.last()?;
+        flatten_json_numbers(token, &mut out);
+    }
+    Some(out)
+}
+
+fn flatten_last_token_bshd(value: &serde_json::Value) -> Option<Vec<f32>> {
+    let batch = value.as_array()?.first()?.as_array()?;
+    let token = batch.last()?.as_array()?;
+    let mut out = Vec::new();
+    for head in token {
+        flatten_json_numbers(head, &mut out);
+    }
+    Some(out)
 }
 
 fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {

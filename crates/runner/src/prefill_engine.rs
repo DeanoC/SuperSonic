@@ -131,9 +131,9 @@ pub fn compute_logits_for_range(
 
     // lm_head projection. For count=1 the standalone matvec is competitive with
     // the tiled path on gfx1150; for count>1 we must use the tiled matmul.
-    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
-        .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-    if use_4b_kernel || count > 1 {
+    let logits_per_pos = if use_4b_kernel || count > 1 {
+        let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
+            .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal, ScalarType::BF16,
             1,         // batch
@@ -143,32 +143,44 @@ pub fn compute_logits_for_range(
             &normed, &*weights.lm_head, &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
-    } else {
-        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("range matvec counter: {e}"))?;
-        kernel_ffi::standalone_matvec(
-            ordinal, ScalarType::BF16,
-            &mut logits_buf, &normed, &*weights.lm_head,
-            hidden_dim, vocab_size, &mut counter,
+        let host_bytes = logits_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("range logits D2H: {e}"))?;
+        let row_elems = vocab_size;
+        let mut logits_per_pos: Vec<Vec<f32>> = Vec::with_capacity(count);
+        for row in 0..count {
+            let start_byte = row * row_elems * elem_bytes;
+            let end_byte = start_byte + row_elems * elem_bytes;
+            let row_vec: Vec<f32> = host_bytes[start_byte..end_byte]
+                .chunks_exact(2)
+                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect();
+            logits_per_pos.push(row_vec);
+        }
+        logits_per_pos
+    } else if hidden.backend() == gpu_hal::Backend::Metal {
+        vec![kernel_ffi::qwen_rms_norm_standalone_matvec_host_f32(
+            ordinal,
+            ScalarType::BF16,
+            &slice,
+            &weights.norm_weight,
+            config.rms_norm_eps as f32,
+            &*weights.lm_head,
+            hidden_dim,
+            vocab_size,
         )
-        .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
-    }
-
-    // D2H + split into one Vec<f32> per position.
-    let host_bytes = logits_buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("range logits D2H: {e}"))?;
-    let row_elems = vocab_size;
-    let mut logits_per_pos: Vec<Vec<f32>> = Vec::with_capacity(count);
-    for row in 0..count {
-        let start_byte = row * row_elems * elem_bytes;
-        let end_byte = start_byte + row_elems * elem_bytes;
-        let row_vec: Vec<f32> = host_bytes[start_byte..end_byte]
-            .chunks_exact(2)
-            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-            .collect();
-        logits_per_pos.push(row_vec);
-    }
+        .map_err(|e| anyhow::anyhow!("range fused host-f32 lm_head: {e}"))?]
+    } else {
+        vec![kernel_ffi::standalone_matvec_host_f32(
+            ordinal,
+            ScalarType::BF16,
+            &normed,
+            &*weights.lm_head,
+            hidden_dim,
+            vocab_size,
+        )
+        .map_err(|e| anyhow::anyhow!("range lm_head host-f32 matvec: {e}"))?]
+    };
 
     Ok((logits_per_pos, normed))
 }
@@ -197,17 +209,32 @@ pub struct PrefillResult {
     pub tap_hiddens: Option<Vec<Vec<u8>>>,
     /// Optional last-token debug trace for one selected linear-attention layer.
     pub linear_debug_trace: Option<LinearLayerDebugTrace>,
+    /// Optional layer-3 full-attention stage trace for the last prompt token.
+    pub layer3_full_attn_trace: Option<Layer3FullAttentionTrace>,
 }
 
 pub struct LinearLayerDebugTrace {
+    pub normed: Vec<u8>,
     pub qkv: Vec<u8>,
     pub qkv_tail: Vec<u8>,
     pub z: Vec<u8>,
+    pub post_conv: Vec<u8>,
     pub packed: Vec<u8>,
     pub rec_apply: Vec<u8>,
     pub attn: Vec<u8>,
     pub gated: Vec<u8>,
     pub proj_out: Vec<u8>,
+}
+
+pub struct Layer3FullAttentionTrace {
+    pub q_proj: Vec<u8>,
+    pub gate_proj: Vec<u8>,
+    pub k_proj: Vec<u8>,
+    pub v_proj: Vec<u8>,
+    pub q_prepared: Vec<u8>,
+    pub k_prepared: Vec<u8>,
+    pub v_prepared: Vec<u8>,
+    pub attn_output: Vec<u8>,
 }
 
 /// Scratch buffers for prefill (larger than decode — seq_len > 1).
@@ -425,6 +452,7 @@ fn prefill_inner(
         None
     };
     let mut linear_debug_trace = None;
+    let mut layer3_full_attn_trace = None;
 
     // DFlash hidden-state taps: pre-allocate one slot per requested layer.
     // Validate indices up front so we fail loudly before doing prefill work.
@@ -527,6 +555,7 @@ fn prefill_inner(
                 prefill_full_attention_layer(
                     weights, state, rotary, &mut scratch, config, idx,
                     chunk_len, chunk_start, ordinal, kv_chunk_size,
+                    &mut layer3_full_attn_trace,
                     /* commit_kv_filled */ true,
                 )?;
             } else {
@@ -732,6 +761,7 @@ fn prefill_inner(
         layer_hidden_trace,
         tap_hiddens,
         linear_debug_trace,
+        layer3_full_attn_trace,
     })
 }
 
@@ -909,6 +939,7 @@ fn prefill_full_attention_layer(
     chunk_start: usize,
     ordinal: usize,
     kv_chunk_size: usize,
+    layer3_trace: &mut Option<Layer3FullAttentionTrace>,
     commit_kv_filled: bool,
 ) -> Result<()> {
     let fw = weights.layers[idx]
@@ -952,28 +983,24 @@ fn prefill_full_attention_layer(
     )?;
 
     // 4. Q normalization
-    {
-        let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal, ScalarType::BF16, chunk_len * num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
-        ).map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, query_buf.as_ptr() as *mut c_void, q_normed.as_ptr(), chunk_len * q_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
-    }
+    let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_q_heads, head_dim])
+        .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
+    prefill_ffi::rms_norm_rows(
+        ordinal, ScalarType::BF16, chunk_len * num_q_heads, head_dim, 1e-6,
+        &query_buf, &fw.q_norm_w, &mut q_normed,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
+    gpu_hal::copy_d2d(ordinal, query_buf.as_ptr() as *mut c_void, q_normed.as_ptr(), chunk_len * q_dim * elem_bytes)
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
 
     // 5. K normalization
-    {
-        let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal, ScalarType::BF16, chunk_len * num_kv_heads, head_dim, 1e-6,
-            &scratch.proj_buf2, &fw.k_norm_w, &mut k_normed,
-        ).map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, scratch.proj_buf2.as_ptr() as *mut c_void, k_normed.as_ptr(), chunk_len * kv_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
-    }
+    let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_kv_heads, head_dim])
+        .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
+    prefill_ffi::rms_norm_rows(
+        ordinal, ScalarType::BF16, chunk_len * num_kv_heads, head_dim, 1e-6,
+        &scratch.proj_buf2, &fw.k_norm_w, &mut k_normed,
+    ).map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
+    gpu_hal::copy_d2d(ordinal, scratch.proj_buf2.as_ptr() as *mut c_void, k_normed.as_ptr(), chunk_len * kv_dim * elem_bytes)
+        .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
 
     // 6. RoPE on query and K — use pos_offset = chunk_start for correct position indexing
     prefill_ffi::apply_rope_prefill(
@@ -1127,6 +1154,52 @@ fn prefill_full_attention_layer(
     residual_add(ordinal, chunk_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf2)
         .map_err(|e| anyhow::anyhow!("layer {idx} attention residual: {e}"))?;
 
+    if idx == 3 {
+        let copy_last_row = |src: &GpuBuffer, row_elems: usize, name: &str| -> Result<Vec<u8>> {
+            let row_bytes = row_elems * ScalarType::BF16.size_in_bytes();
+            let offset = (chunk_len - 1) * row_bytes;
+            let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, row_elems])
+                .map_err(|e| anyhow::anyhow!("layer {idx} {name} alloc: {e}"))?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                row.as_ptr() as *mut c_void,
+                src.offset_ptr(offset),
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} {name} copy: {e}"))?;
+            row.to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} {name} D2H: {e}"))
+        };
+
+        let copy_last_token_heads =
+            |src: &GpuBuffer, heads: usize, name: &str| -> Result<Vec<u8>> {
+                let row_bytes = heads * head_dim * ScalarType::BF16.size_in_bytes();
+                let offset = (chunk_len - 1) * row_bytes;
+                let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[heads, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} {name} alloc: {e}"))?;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    row.as_ptr() as *mut c_void,
+                    src.offset_ptr(offset),
+                    row_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} {name} copy: {e}"))?;
+                row.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} {name} D2H: {e}"))
+            };
+
+        *layer3_trace = Some(Layer3FullAttentionTrace {
+            q_proj: copy_last_row(&query_buf, q_dim, "q_proj")?,
+            gate_proj: copy_last_row(&gate_buf, q_dim, "gate_proj")?,
+            k_proj: copy_last_row(&scratch.proj_buf2, kv_dim, "k_proj")?,
+            v_proj: copy_last_row(&v_buf, kv_dim, "v_proj")?,
+            q_prepared: copy_last_token_heads(&q_normed, num_q_heads, "q_prepared")?,
+            k_prepared: copy_last_token_heads(&k_normed, num_kv_heads, "k_prepared")?,
+            v_prepared: copy_last_row(&v_buf, kv_dim, "v_prepared")?,
+            attn_output: copy_last_row(&scratch.proj_buf, q_dim, "attn_output")?,
+        });
+    }
+
     Ok(())
 }
 
@@ -1168,6 +1241,12 @@ fn prefill_linear_attention_layer(
         lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
     if trace_linear_debug {
+        let normed_bytes = scratch
+            .normed
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug normed D2H: {e}"))?;
+        let normed_row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let normed_start = (chunk_len - 1) * normed_row_bytes;
         let bytes = scratch
             .proj_buf
             .to_host_bytes()
@@ -1175,9 +1254,11 @@ fn prefill_linear_attention_layer(
         let row_bytes = qkv_dim * ScalarType::BF16.size_in_bytes();
         let start = (chunk_len - 1) * row_bytes;
         *linear_debug_trace = Some(LinearLayerDebugTrace {
+            normed: normed_bytes[normed_start..normed_start + normed_row_bytes].to_vec(),
             qkv: bytes[start..start + row_bytes].to_vec(),
             qkv_tail: Vec::new(),
             z: Vec::new(),
+            post_conv: Vec::new(),
             packed: Vec::new(),
             rec_apply: Vec::new(),
             attn: Vec::new(),
@@ -1348,6 +1429,16 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} conv: {e}"))?;
+    if trace_linear_debug {
+        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let bytes = scratch
+            .proj_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug post_conv D2H: {e}"))?;
+        let row_bytes = qkv_dim * ScalarType::BF16.size_in_bytes();
+        let start = (chunk_len - 1) * row_bytes;
+        trace.post_conv = bytes[start..start + row_bytes].to_vec();
+    }
 
     // 7. Split conv output [S, qkv_dim] into Q [S, key_dim], K [S, key_dim], V [S, val_dim]
     //    Layout within qkv_dim: [Q(key_dim) | K(key_dim) | V(val_dim)]

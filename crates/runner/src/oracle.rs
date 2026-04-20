@@ -3,6 +3,7 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct OracleOutput {
@@ -57,6 +58,54 @@ pub struct OracleOutput {
     /// validator skip implementing `project_per_layer_inputs` itself.
     #[serde(default)]
     pub per_layer_inputs_by_step: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct Qwen35TraceOutput {
+    #[serde(default)]
+    pub trace_linear_layer: Option<usize>,
+    #[serde(default)]
+    pub trace_linear_input_layernorm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_qkv_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_z_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_post_conv_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_query_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_key_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_value_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_beta_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_g_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_direct_recurrent_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_norm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_token_mixer_output: Option<Value>,
+    pub first_layer_linear_qkv_output: Value,
+    pub first_layer_linear_z_output: Value,
+    pub first_layer_linear_prepared_query_output: Value,
+    pub first_layer_linear_prepared_key_output: Value,
+    pub first_layer_linear_prepared_value_output: Value,
+    pub first_layer_linear_prepared_beta_output: Value,
+    pub first_layer_linear_prepared_g_output: Value,
+    pub first_layer_linear_direct_recurrent_output: Value,
+    pub first_layer_linear_norm_output: Value,
+    pub first_layer_token_mixer_output: Value,
+    pub layer3_q_and_gate_output: Value,
+    pub layer3_gate_output: Value,
+    pub layer3_k_proj_output: Value,
+    pub layer3_v_proj_output: Value,
+    pub layer3_prepared_query_output: Value,
+    pub layer3_prepared_key_output: Value,
+    pub layer3_prepared_value_output: Value,
+    pub layer3_attention_output: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,6 +175,57 @@ pub fn run_oracle(
         oracle.load_ms, oracle.prefill_ms, oracle.decode_ms, oracle.generated_tokens
     );
     Ok(oracle)
+}
+
+/// Run the richer Qwen3.5 trace oracle used for layer-by-layer parity
+/// investigation. This is intentionally separate from `run_oracle`: the
+/// debugging script emits large JSON tensor dumps, not the compact state export
+/// used by the normal validation flow.
+pub fn run_qwen35_trace_oracle(
+    oracle_script: &Path,
+    model_id: &str,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    dtype: &str,
+    device: &str,
+    trace_linear_layer: Option<usize>,
+) -> Result<Qwen35TraceOutput> {
+    let ids_str = prompt_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut cmd = Command::new("python3");
+    cmd
+        .arg(oracle_script)
+        .arg("--model-id")
+        .arg(model_id)
+        .arg("--prompt-ids")
+        .arg(&ids_str)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--dtype")
+        .arg(dtype)
+        .arg("--device")
+        .arg(device);
+    if let Some(layer) = trace_linear_layer {
+        cmd.arg("--trace-linear-layer").arg(layer.to_string());
+    }
+    let output = cmd
+        .output()
+        .context("failed to start qwen35 trace oracle process")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "qwen35 trace oracle failed (exit {}): {stderr}",
+            output.status
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("qwen35 trace oracle stdout not UTF-8")?;
+    serde_json::from_str(&stdout).context("failed to parse qwen35 trace oracle JSON output")
 }
 
 /// Run the Phi-4 oracle (`oracle/phi4_oracle.py`) for a single prompt.

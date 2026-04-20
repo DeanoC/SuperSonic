@@ -1242,6 +1242,85 @@ pub fn standalone_matvec(
     Ok(())
 }
 
+pub fn standalone_matvec_host_f32(
+    ordinal: usize,
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    let backend = input.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim);
+    }
+
+    let mut output = GpuBuffer::zeros(ordinal, dtype, &[out_dim])?;
+    let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])?;
+    standalone_matvec(
+        ordinal,
+        dtype,
+        &mut output,
+        input,
+        weight,
+        in_dim,
+        out_dim,
+        &mut counter,
+    )?;
+    let bytes = output.to_host_bytes()?;
+    match dtype {
+        ScalarType::BF16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .collect()),
+        ScalarType::F32 => Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()),
+        other => Err(GpuError::InvalidArg(format!(
+            "standalone_matvec_host_f32 unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+pub fn qwen_rms_norm_standalone_matvec_host_f32(
+    ordinal: usize,
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    norm_weight: &GpuBuffer,
+    eps: f32,
+    weight: &GpuBuffer,
+    hidden_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    let backend = input.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::qwen_rms_norm_standalone_matvec_host_f32(
+            dtype,
+            input,
+            norm_weight,
+            eps,
+            weight,
+            hidden_dim,
+            out_dim,
+        );
+    }
+
+    let mut normed = GpuBuffer::zeros(ordinal, dtype, &[hidden_dim])?;
+    rms_norm(
+        ordinal,
+        dtype,
+        &mut normed,
+        input,
+        norm_weight,
+        eps,
+        hidden_dim,
+    )?;
+    standalone_matvec_host_f32(ordinal, dtype, &normed, weight, hidden_dim, out_dim)
+}
+
 /// Query GPU architecture name and total VRAM for a given device ordinal.
 pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
     let backend = gpu_hal::current_backend();
