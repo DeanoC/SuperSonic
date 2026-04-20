@@ -757,6 +757,90 @@ int persistent_decode_device(int device_ordinal,
 }
 
 template <typename T>
+int persistent_decode_batch_device(int device_ordinal,
+                                   int num_layers, int hidden_size, int ple_hidden,
+                                   float eps, float scale,
+                                   int batch_size, int ws_stride,
+                                   const void* layers,
+                                   const void* batch_descs,
+                                   void* hidden_io,
+                                   const void* per_layer_inputs,
+                                   void* workspace,
+                                   unsigned int* matvec_counter,
+                                   unsigned int* barrier_counter,
+                                   unsigned int* barrier_flag) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 721;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 722;
+    if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 723;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_persistent_decode_batch_kernel<T>),
+        dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
+        num_layers, hidden_size, ple_hidden, eps, scale,
+        batch_size, ws_stride,
+        static_cast<const Gemma4DecodeLayerDesc*>(layers),
+        static_cast<const Gemma4BatchSeqDesc*>(batch_descs),
+        static_cast<T*>(hidden_io),
+        static_cast<const T*>(per_layer_inputs),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag);
+    if (hipGetLastError() != hipSuccess) return 724;
+    if (hipDeviceSynchronize() != hipSuccess) return 725;
+    return 0;
+}
+
+template <typename T>
+int persistent_decode_batch_int4_device(int device_ordinal,
+                                        int num_layers, int hidden_size, int ple_hidden,
+                                        float eps, float scale,
+                                        int batch_size, int ws_stride,
+                                        const void* layers,
+                                        const void* int4_scales,
+                                        const void* batch_descs,
+                                        void* hidden_io,
+                                        const void* per_layer_inputs,
+                                        void* workspace,
+                                        unsigned int* matvec_counter,
+                                        unsigned int* barrier_counter,
+                                        unsigned int* barrier_flag) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 731;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 732;
+    if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 733;
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(g4_persistent_decode_batch_int4_kernel<T>),
+        dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
+        num_layers, hidden_size, ple_hidden, eps, scale,
+        batch_size, ws_stride,
+        static_cast<const Gemma4DecodeLayerDesc*>(layers),
+        static_cast<const Gemma4Int4ScaleDesc*>(int4_scales),
+        static_cast<const Gemma4BatchSeqDesc*>(batch_descs),
+        static_cast<T*>(hidden_io),
+        static_cast<const T*>(per_layer_inputs),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag);
+    if (hipGetLastError() != hipSuccess) return 734;
+    if (hipDeviceSynchronize() != hipSuccess) return 735;
+    return 0;
+}
+
+template <typename T>
 int persistent_decode_int4_device(int device_ordinal,
                                   int num_layers, int hidden_size, int ple_hidden,
                                   int position, float eps, float scale,
@@ -1349,6 +1433,65 @@ extern "C" int dotcache_gemma4_hip_persistent_decode(
     default: return 700;
     }
     #undef G4_PERSIST_ARGS
+}
+
+extern "C" int dotcache_gemma4_hip_persistent_decode_batch(
+    int dtype, size_t device_ordinal,
+    size_t num_layers, size_t hidden_size, size_t ple_hidden,
+    float eps, float scale,
+    size_t batch_size, size_t ws_stride,
+    const void* layers,
+    const void* batch_descs,
+    void* hidden_io, const void* per_layer_inputs,
+    void* workspace,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_PERSIST_BATCH_ARGS                                                \
+        static_cast<int>(device_ordinal),                                        \
+        static_cast<int>(num_layers), static_cast<int>(hidden_size),             \
+        static_cast<int>(ple_hidden), eps, scale,                                \
+        static_cast<int>(batch_size), static_cast<int>(ws_stride),               \
+        layers, batch_descs, hidden_io, per_layer_inputs, workspace,             \
+        matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return persistent_decode_batch_device<__half>(G4_PERSIST_BATCH_ARGS);
+    case 1: return persistent_decode_batch_device<float>(G4_PERSIST_BATCH_ARGS);
+    case 2: return persistent_decode_batch_device<hip_bfloat16>(G4_PERSIST_BATCH_ARGS);
+    default: return 720;
+    }
+    #undef G4_PERSIST_BATCH_ARGS
+}
+
+extern "C" int dotcache_gemma4_hip_persistent_decode_batch_int4(
+    int dtype, size_t device_ordinal,
+    size_t num_layers, size_t hidden_size, size_t ple_hidden,
+    float eps, float scale,
+    size_t batch_size, size_t ws_stride,
+    const void* layers,
+    const void* int4_scales,
+    const void* batch_descs,
+    void* hidden_io, const void* per_layer_inputs,
+    void* workspace,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_PERSIST_BATCH_INT4_ARGS                                           \
+        static_cast<int>(device_ordinal),                                        \
+        static_cast<int>(num_layers), static_cast<int>(hidden_size),             \
+        static_cast<int>(ple_hidden), eps, scale,                                \
+        static_cast<int>(batch_size), static_cast<int>(ws_stride),               \
+        layers, int4_scales, batch_descs, hidden_io, per_layer_inputs,           \
+        workspace, matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return persistent_decode_batch_int4_device<__half>(G4_PERSIST_BATCH_INT4_ARGS);
+    case 1: return persistent_decode_batch_int4_device<float>(G4_PERSIST_BATCH_INT4_ARGS);
+    case 2: return persistent_decode_batch_int4_device<hip_bfloat16>(G4_PERSIST_BATCH_INT4_ARGS);
+    default: return 730;
+    }
+    #undef G4_PERSIST_BATCH_INT4_ARGS
 }
 
 extern "C" int dotcache_gemma4_hip_persistent_decode_int4(

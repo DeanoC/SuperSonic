@@ -24,10 +24,8 @@ use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
-use kernel_ffi::gemma4::{Gemma4DecodeLayerDesc, Gemma4Int4ScaleDesc};
+use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4Int4ScaleDesc};
 use model_store::BakedStore;
-
-const INT4_GROUP_SIZE: usize = 128;
 
 fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
@@ -51,6 +49,34 @@ fn upload_bf16(device: usize, shape: &[usize], host: &[f32]) -> Result<GpuBuffer
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
     Ok(bf16_bytes_to_f32(&buf.to_host_bytes()?))
+}
+
+/// Copy the last row of a `[seq_len, hidden_size]` BF16 buffer to host as
+/// F32. Used by the diagnostic capture path in `prefill_with_capture` to
+/// snapshot each layer's output at the last prompt-token position.
+fn extract_last_row_bf16(
+    device: usize,
+    buf: &GpuBuffer,
+    seq_len: usize,
+    hidden_size: usize,
+) -> Result<Vec<f32>> {
+    let dtype = ScalarType::BF16;
+    let mut tmp = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+    let byte_off = (seq_len - 1) * hidden_size * 2;
+    let src = buf.offset_ptr(byte_off);
+    gpu_hal::copy_d2d(device, tmp.as_mut_ptr(), src, hidden_size * 2)
+        .map_err(|e| anyhow!("extract_last_row_bf16: {e}"))?;
+    download_bf16(&tmp)
+}
+
+/// Per-layer capture produced by [`Gemma4Int4Engine::prefill_with_capture`].
+/// Each entry in `per_layer_hidden` is the last-token post-PLE hidden state
+/// for one layer, BF16→F32 host values of length `hidden_size`.
+/// `final_norm_hidden` is the output of the final RMSNorm applied to layer
+/// N-1's output at the last prompt-token (the input to the lm-head).
+pub struct PerLayerCapture {
+    pub per_layer_hidden: Vec<Vec<f32>>,
+    pub final_norm_hidden: Vec<f32>,
 }
 
 fn build_rope_table_from_inv_freq(
@@ -113,11 +139,11 @@ fn build_proportional_rope_table(
 }
 
 /// A single INT4-quantized projection weight.
-/// `group_size` is fixed at 128 by the bake format.
 struct Int4Weight {
     packed: GpuBuffer,
     scale: GpuBuffer,
     zero: GpuBuffer,
+    group_size: usize,
 }
 
 impl Int4Weight {
@@ -139,24 +165,47 @@ impl Int4Weight {
         }
         let out_dim = packed_shape[0];
         let in_dim = packed_shape[1] * 2;
-        if in_dim % INT4_GROUP_SIZE != 0 || out_dim % INT4_GROUP_SIZE != 0 {
+        let scale_shape = scale.shape().to_vec();
+        let zero_shape = zero.shape().to_vec();
+        if scale_shape.len() != 2 || zero_shape.len() != 2 {
             bail!(
-                "{base_name}: shape [{out_dim}, {in_dim}] not aligned to group_size={INT4_GROUP_SIZE}"
+                "{base_name}: scale/zero rank mismatch (scale={:?} zero={:?})",
+                scale_shape,
+                zero_shape
             );
         }
-        let expected_scale = &[out_dim / INT4_GROUP_SIZE, in_dim / INT4_GROUP_SIZE];
-        if scale.shape() != expected_scale || zero.shape() != expected_scale {
+        if scale_shape != zero_shape {
             bail!(
-                "{base_name}: scale/zero shape mismatch (expected {:?}, got scale={:?} zero={:?})",
-                expected_scale,
-                scale.shape(),
-                zero.shape()
+                "{base_name}: scale/zero shape mismatch (scale={:?} zero={:?})",
+                scale_shape,
+                zero_shape
             );
         }
-        // out_dim / in_dim are validated against the shape; they're not
-        // retained since each call site already knows the projection's shape.
-        let _ = (in_dim, out_dim);
-        Ok(Self { packed, scale, zero })
+        let scale_rows = scale_shape[0];
+        let scale_cols = scale_shape[1];
+        if scale_rows == 0 || scale_cols == 0 {
+            bail!("{base_name}: invalid empty scale shape {:?}", scale_shape);
+        }
+        if out_dim % scale_rows != 0 || in_dim % scale_cols != 0 {
+            bail!(
+                "{base_name}: cannot infer group_size from packed [{out_dim}, {in_dim}] and scale {:?}",
+                scale_shape
+            );
+        }
+        let row_group = out_dim / scale_rows;
+        let col_group = in_dim / scale_cols;
+        if row_group != col_group {
+            bail!(
+                "{base_name}: non-square INT4 grouping inferred from packed [{out_dim}, {in_dim}] and scale {:?}",
+                scale_shape
+            );
+        }
+        Ok(Self {
+            packed,
+            scale,
+            zero,
+            group_size: row_group,
+        })
     }
 }
 
@@ -319,6 +368,7 @@ pub struct Gemma4Int4Engine {
     max_t: usize,
     #[allow(dead_code)]
     device: usize,
+    int4_group_size: usize,
 
     // `store` outlives `embed_tokens` + `embed_tokens_per_layer` which we
     // mmap-row-slice per token at compute time (the tables are ~1.3 GiB and
@@ -334,8 +384,25 @@ pub struct Gemma4Int4Engine {
     full_cos: GpuBuffer,
     full_sin: GpuBuffer,
 
+    // Sequence-0 KV caches — also the single-seq path's only KV state.
     k_caches: Vec<GpuBuffer>,
     v_caches: Vec<GpuBuffer>,
+
+    // Sequences 1..batch_size: `extra_k_caches[seq-1][layer]`. Empty when
+    // `batch_size == 1`. Populated by [`replicate_seq0_kv`] after a prefill
+    // call and read by [`decode_step_batch`] through `batch_descs_gpu`.
+    extra_k_caches: Vec<Vec<GpuBuffer>>,
+    extra_v_caches: Vec<Vec<GpuBuffer>>,
+
+    batch_size: usize,
+    /// `[num_layers]` per-sequence descriptor array on GPU (populated when
+    /// `batch_size > 1`). Read by the batched INT4 megakernel for KV pointers
+    /// and `seqlen_offset[b]` per decode step.
+    batch_descs_host: Vec<Gemma4BatchSeqDesc>,
+    batch_descs_gpu: Option<GpuBuffer>,
+    /// Per-sequence slice stride into `fused_workspace` for the batched
+    /// megakernel (= [`g4::persistent_decode_workspace_elems`]).
+    fused_ws_stride: usize,
 
     counter: GpuBuffer,
 
@@ -361,12 +428,38 @@ pub struct Gemma4Int4Engine {
 }
 
 impl Gemma4Int4Engine {
+    /// Convenience wrapper for single-sequence loads (preserves original
+    /// signature). Delegates to [`Self::load_with_batch`] with `batch_size=1`.
     pub fn load(
         model_dir: &Path,
         weight_prefix: &str,
         max_t: usize,
         device: usize,
     ) -> Result<Self> {
+        Self::load_with_batch(model_dir, weight_prefix, max_t, device, 1)
+    }
+
+    /// Load an INT4 GPTQ bake and initialize GPU state for `batch_size`
+    /// parallel sequences. `batch_size == 1` matches the legacy single-seq
+    /// behaviour; `batch_size > 1` allocates B-1 additional per-layer K/V
+    /// cache sets and builds the batched-megakernel descriptor array.
+    pub fn load_with_batch(
+        model_dir: &Path,
+        weight_prefix: &str,
+        max_t: usize,
+        device: usize,
+        batch_size: usize,
+    ) -> Result<Self> {
+        if batch_size == 0 {
+            bail!("Gemma4Int4Engine: batch_size must be >= 1");
+        }
+        if batch_size > kernel_ffi::MAX_BATCH_SIZE {
+            bail!(
+                "Gemma4Int4Engine: batch_size {} > MAX_BATCH_SIZE {}",
+                batch_size,
+                kernel_ffi::MAX_BATCH_SIZE
+            );
+        }
         gpu_hal::set_device(device).map_err(|e| anyhow!("set_device: {e}"))?;
         let config: Config = ::gemma4::config::load_config(model_dir)
             .map_err(|e| anyhow!("load_config: {e}"))?;
@@ -390,6 +483,35 @@ impl Gemma4Int4Engine {
         let mut layers: Vec<Int4LayerWeights> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(load_layer_weights_int4(&store, device, &tcfg, weight_prefix, i)?);
+        }
+        let int4_group_size = layers
+            .first()
+            .map(|l| l.q_proj.group_size)
+            .ok_or_else(|| anyhow!("Gemma4Int4Engine: no layers in INT4 bake"))?;
+        for (layer_idx, w) in layers.iter().enumerate() {
+            let expect = |name: &str, iw: &Int4Weight| -> Result<()> {
+                if iw.group_size != int4_group_size {
+                    bail!(
+                        "layer {layer_idx} {name}: group_size {} != {}",
+                        iw.group_size,
+                        int4_group_size
+                    );
+                }
+                Ok(())
+            };
+            expect("q_proj", &w.q_proj)?;
+            if let Some(k_proj) = &w.k_proj {
+                expect("k_proj", k_proj)?;
+            }
+            if let Some(v_proj) = &w.v_proj {
+                expect("v_proj", v_proj)?;
+            }
+            expect("o_proj", &w.o_proj)?;
+            expect("gate_proj", &w.gate_proj)?;
+            expect("up_proj", &w.up_proj)?;
+            expect("down_proj", &w.down_proj)?;
+            expect("per_layer_input_gate", &w.per_layer_input_gate)?;
+            expect("per_layer_projection", &w.per_layer_projection)?;
         }
 
         let lm_head_w = store.load_to_gpu(
@@ -454,8 +576,14 @@ impl Gemma4Int4Engine {
             tcfg.hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
             intermediate_max, ple_hidden,
         );
-        let fused_workspace =
-            GpuBuffer::zeros(device, ScalarType::F32, &[fused_workspace_elems])?;
+        let fused_ws_stride = fused_workspace_elems;
+        // Workspace is sized `batch_size * ws_stride`; the single-seq path
+        // only uses the first slice, the batched path uses all B slices.
+        let fused_workspace = GpuBuffer::zeros(
+            device,
+            ScalarType::F32,
+            &[batch_size * fused_workspace_elems],
+        )?;
         let fused_matvec_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let fused_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let fused_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
@@ -546,7 +674,7 @@ impl Gemma4Int4Engine {
                 per_layer_input_gate_zero: w.per_layer_input_gate.zero.as_ptr(),
                 per_layer_projection_scale: w.per_layer_projection.scale.as_ptr(),
                 per_layer_projection_zero: w.per_layer_projection.zero.as_ptr(),
-                group_size: INT4_GROUP_SIZE as c_int,
+                group_size: int4_group_size as c_int,
             });
         }
         let layers_bytes: &[u8] = unsafe {
@@ -568,12 +696,62 @@ impl Gemma4Int4Engine {
             device, ScalarType::U8, &[int4_scales_bytes.len()], int4_scales_bytes,
         )?;
 
+        // --- Per-sequence KV caches and batched-seq descriptor array.
+        // Extras exist only for seq 1..batch_size. Shared-KV layers inherit
+        // the source layer's per-sequence pointer (same rule as seq 0's
+        // aliasing in `layer_descs` above).
+        let mut extra_k_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size - 1);
+        let mut extra_v_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size - 1);
+        for _ in 1..batch_size {
+            let mut ks: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            let mut vs: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            for l in 0..num_layers {
+                let hd = layers[l].head_dim;
+                ks.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+                vs.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+            }
+            extra_k_caches.push(ks);
+            extra_v_caches.push(vs);
+        }
+
+        let mut batch_descs_host: Vec<Gemma4BatchSeqDesc> =
+            vec![Gemma4BatchSeqDesc::default(); num_layers];
+        for l in 0..num_layers {
+            let src_idx = if layers[l].shared_kv { layers[l].kv_source } else { l };
+            let d = &mut batch_descs_host[l];
+            // Seq 0: use the main k_caches/v_caches. Seqs 1..B: use extras.
+            d.seqlen_offset[0] = 0;
+            d.kv_cache_k[0] = k_caches[src_idx].as_ptr() as *mut c_void;
+            d.kv_cache_v[0] = v_caches[src_idx].as_ptr() as *mut c_void;
+            d.kv_max_t[0] = max_t as c_int;
+            for b in 1..batch_size {
+                d.seqlen_offset[b] = 0;
+                d.kv_cache_k[b] = extra_k_caches[b - 1][src_idx].as_ptr() as *mut c_void;
+                d.kv_cache_v[b] = extra_v_caches[b - 1][src_idx].as_ptr() as *mut c_void;
+                d.kv_max_t[b] = max_t as c_int;
+            }
+        }
+        let batch_descs_gpu = if batch_size > 1 {
+            let desc_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    batch_descs_host.as_ptr() as *const u8,
+                    batch_descs_host.len() * std::mem::size_of::<Gemma4BatchSeqDesc>(),
+                )
+            };
+            Some(GpuBuffer::from_host_bytes(
+                device, ScalarType::U8, &[desc_bytes.len()], desc_bytes,
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             tcfg,
             store,
             weight_prefix: weight_prefix.to_string(),
             max_t,
             device,
+            int4_group_size,
             layers,
             lm_head_w,
             final_norm_w,
@@ -585,6 +763,12 @@ impl Gemma4Int4Engine {
             full_sin,
             k_caches,
             v_caches,
+            extra_k_caches,
+            extra_v_caches,
+            batch_size,
+            batch_descs_host,
+            batch_descs_gpu,
+            fused_ws_stride,
             counter,
             fused_workspace,
             fused_matvec_counter,
@@ -595,6 +779,35 @@ impl Gemma4Int4Engine {
             int4_scale_descs,
             int4_scales_gpu,
         })
+    }
+
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// D2D-copy sequence 0's K/V cache contents into every other sequence's
+    /// caches. Use after `prefill` when all `B` sequences share the prompt.
+    pub fn replicate_seq0_kv(&mut self) -> Result<()> {
+        if self.batch_size <= 1 {
+            return Ok(());
+        }
+        let num_layers = self.tcfg.num_hidden_layers;
+        let device = self.device;
+        for l in 0..num_layers {
+            let bytes = self.k_caches[l].len_bytes();
+            let v_bytes = self.v_caches[l].len_bytes();
+            let src_k = self.k_caches[l].as_ptr();
+            let src_v = self.v_caches[l].as_ptr();
+            for b in 1..self.batch_size {
+                let dst_k = self.extra_k_caches[b - 1][l].as_mut_ptr();
+                let dst_v = self.extra_v_caches[b - 1][l].as_mut_ptr();
+                gpu_hal::copy_d2d(device, dst_k, src_k, bytes)
+                    .map_err(|e| anyhow!("int4 replicate_seq0_kv k layer {l} → seq {b}: {e}"))?;
+                gpu_hal::copy_d2d(device, dst_v, src_v, v_bytes)
+                    .map_err(|e| anyhow!("int4 replicate_seq0_kv v layer {l} → seq {b}: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     pub fn text_config(&self) -> &TextConfig {
@@ -780,8 +993,60 @@ impl Gemma4Int4Engine {
         Ok(pli)
     }
 
+    /// Reset per-session state so the engine is ready for a fresh prompt.
+    /// Callers pass `pos` to `decode_step`, so there's no internal position
+    /// counter — this just zero-memsets the K/V caches as a defensive measure.
+    /// Weights and scratch untouched.
+    pub fn reset(&mut self) -> Result<()> {
+        for buf in self.k_caches.iter_mut() {
+            gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                .map_err(|e| anyhow!("reset: zero k cache: {e}"))?;
+        }
+        for buf in self.v_caches.iter_mut() {
+            gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                .map_err(|e| anyhow!("reset: zero v cache: {e}"))?;
+        }
+        for seq in self.extra_k_caches.iter_mut() {
+            for buf in seq.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero extra k cache: {e}"))?;
+            }
+        }
+        for seq in self.extra_v_caches.iter_mut() {
+            for buf in seq.iter_mut() {
+                gpu_hal::memset_zeros(self.device, buf.as_mut_ptr() as *mut c_void, buf.len_bytes())
+                    .map_err(|e| anyhow!("reset: zero extra v cache: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Batched INT4 prefill; returns softcapped logits at the last position.
     pub fn prefill(&mut self, prompt_token_ids: &[u32]) -> Result<Vec<f32>> {
+        let (logits, _caps) = self.prefill_inner(prompt_token_ids, false)?;
+        Ok(logits)
+    }
+
+    /// Diagnostic-only variant of [`Self::prefill`] that additionally captures
+    /// every layer's post-PLE hidden state at the last prompt-token position
+    /// plus the post-final-norm hidden before lm-head. Returns
+    /// `(softcapped_logits, PerLayerCapture)`. Math is bit-identical to
+    /// [`Self::prefill`] — the capture is a `copy_d2d` of a single row per
+    /// layer, never writes into `h_running`.
+    pub fn prefill_with_capture(
+        &mut self,
+        prompt_token_ids: &[u32],
+    ) -> Result<(Vec<f32>, PerLayerCapture)> {
+        let (logits, caps) = self.prefill_inner(prompt_token_ids, true)?;
+        let caps = caps.ok_or_else(|| anyhow!("prefill_with_capture: captures missing"))?;
+        Ok((logits, caps))
+    }
+
+    fn prefill_inner(
+        &mut self,
+        prompt_token_ids: &[u32],
+        capture: bool,
+    ) -> Result<(Vec<f32>, Option<PerLayerCapture>)> {
         let seq_len = prompt_token_ids.len();
         if seq_len == 0 {
             bail!("prefill: empty prompt");
@@ -794,6 +1059,7 @@ impl Gemma4Int4Engine {
         let hidden_size = self.tcfg.hidden_size;
         let num_q_heads = self.tcfg.num_attention_heads;
         let num_kv_heads = self.tcfg.num_key_value_heads;
+        let int4_group_size = self.int4_group_size;
         let eps = self.tcfg.rms_norm_eps as f32;
         let ple_hidden = self.tcfg.hidden_size_per_layer_input;
         let num_layers = self.tcfg.num_hidden_layers;
@@ -815,6 +1081,12 @@ impl Gemma4Int4Engine {
         )?;
 
         let pli = self.compute_per_layer_inputs_batched(&token_ids_gpu, prompt_token_ids)?;
+
+        let mut per_layer_capture: Vec<Vec<f32>> = if capture {
+            Vec::with_capacity(num_layers)
+        } else {
+            Vec::new()
+        };
 
         for layer_idx in 0..num_layers {
             let w = &self.layers[layer_idx];
@@ -843,7 +1115,7 @@ impl Gemma4Int4Engine {
             g4::matvec_batched_int4(
                 device, dtype, &mut q, &x,
                 &w.q_proj.packed, &w.q_proj.scale, &w.q_proj.zero,
-                seq_len, hidden_size, q_dim, INT4_GROUP_SIZE, &mut self.counter,
+                seq_len, hidden_size, q_dim, int4_group_size, &mut self.counter,
             )?;
             let mut q_normed =
                 GpuBuffer::zeros(device, dtype, &[seq_len, num_q_heads, head_dim])?;
@@ -865,13 +1137,13 @@ impl Gemma4Int4Engine {
                 g4::matvec_batched_int4(
                     device, dtype, &mut k, &x,
                     &k_proj.packed, &k_proj.scale, &k_proj.zero,
-                    seq_len, hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    seq_len, hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
                 let mut v = GpuBuffer::zeros(device, dtype, &[seq_len, num_kv_heads, head_dim])?;
                 g4::matvec_batched_int4(
                     device, dtype, &mut v, &x,
                     &v_proj.packed, &v_proj.scale, &v_proj.zero,
-                    seq_len, hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    seq_len, hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
 
                 let mut k_normed =
@@ -931,7 +1203,7 @@ impl Gemma4Int4Engine {
             g4::matvec_batched_int4(
                 device, dtype, &mut o, &attn_out,
                 &w.o_proj.packed, &w.o_proj.scale, &w.o_proj.zero,
-                seq_len, q_dim, hidden_size, INT4_GROUP_SIZE, &mut self.counter,
+                seq_len, q_dim, hidden_size, int4_group_size, &mut self.counter,
             )?;
 
             let mut x2 = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
@@ -957,14 +1229,14 @@ impl Gemma4Int4Engine {
                 device, dtype, &mut gate, &x3,
                 &w.gate_proj.packed, &w.gate_proj.scale, &w.gate_proj.zero,
                 seq_len, hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut up_buf = GpuBuffer::zeros(device, dtype, &[seq_len, w.intermediate_size])?;
             g4::matvec_batched_int4(
                 device, dtype, &mut up_buf, &x3,
                 &w.up_proj.packed, &w.up_proj.scale, &w.up_proj.zero,
                 seq_len, hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut y = GpuBuffer::zeros(device, dtype, &[seq_len, w.intermediate_size])?;
             g4::gelu_tanh_gate_mul(
@@ -976,7 +1248,7 @@ impl Gemma4Int4Engine {
                 device, dtype, &mut m, &y,
                 &w.down_proj.packed, &w.down_proj.scale, &w.down_proj.zero,
                 seq_len, w.intermediate_size, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
 
             let mut x4 = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
@@ -1002,7 +1274,7 @@ impl Gemma4Int4Engine {
                 &w.per_layer_input_gate.scale,
                 &w.per_layer_input_gate.zero,
                 seq_len, hidden_size, ple_hidden,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut gated_act = GpuBuffer::zeros(device, dtype, &[seq_len, ple_hidden])?;
             g4::gelu_tanh_gate_mul(
@@ -1015,7 +1287,7 @@ impl Gemma4Int4Engine {
                 &w.per_layer_projection.scale,
                 &w.per_layer_projection.zero,
                 seq_len, ple_hidden, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut normed = GpuBuffer::zeros(device, dtype, &[seq_len, hidden_size])?;
             g4::rms_norm_rows(
@@ -1028,6 +1300,11 @@ impl Gemma4Int4Engine {
                 w.layer_scalar, seq_len * hidden_size,
             )?;
             h_running = h_new;
+
+            if capture {
+                per_layer_capture
+                    .push(extract_last_row_bf16(device, &h_running, seq_len, hidden_size)?);
+            }
         }
 
         let last_byte_off = (seq_len - 1) * hidden_size * 2;
@@ -1040,6 +1317,11 @@ impl Gemma4Int4Engine {
             device, dtype, &mut post_norm, &last_hidden, Some(&self.final_norm_w),
             eps, hidden_size,
         )?;
+        let final_norm_capture = if capture {
+            Some(download_bf16(&post_norm)?)
+        } else {
+            None
+        };
         let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
             device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
@@ -1050,7 +1332,16 @@ impl Gemma4Int4Engine {
         for v in logits_host.iter_mut() {
             *v = cap * (*v / cap).tanh();
         }
-        Ok(logits_host)
+        let caps = if capture {
+            Some(PerLayerCapture {
+                per_layer_hidden: per_layer_capture,
+                final_norm_hidden: final_norm_capture
+                    .expect("capture=true populates final_norm_capture"),
+            })
+        } else {
+            None
+        };
+        Ok((logits_host, caps))
     }
 
     /// Single INT4 decode step — full 35-layer forward pass in ONE kernel
@@ -1109,6 +1400,145 @@ impl Gemma4Int4Engine {
         Ok(logits_host)
     }
 
+    /// Run one INT4 decode step on every sequence in the batch via the
+    /// batched persistent megakernel. Returns softcapped logits per seq.
+    ///
+    /// When `batch_size == 1`, delegates to [`Self::decode_step`]. When
+    /// `batch_size > 1`, one launch of `g4::persistent_decode_batch_int4`
+    /// folds the B forward passes — weight reads *and* INT4 dequant are
+    /// amortized across sequences.
+    pub fn decode_step_batch(
+        &mut self,
+        input_tokens: &[u32],
+        positions: &[usize],
+    ) -> Result<Vec<Vec<f32>>> {
+        if input_tokens.len() != self.batch_size {
+            bail!(
+                "decode_step_batch: got {} tokens, batch_size is {}",
+                input_tokens.len(), self.batch_size
+            );
+        }
+        if positions.len() != self.batch_size {
+            bail!(
+                "decode_step_batch: got {} positions, batch_size is {}",
+                positions.len(), self.batch_size
+            );
+        }
+        for (b, &pos) in positions.iter().enumerate() {
+            if pos >= self.max_t {
+                bail!("decode_step_batch: seq {b} pos {pos} >= max_t {}", self.max_t);
+            }
+        }
+
+        if self.batch_size == 1 {
+            return Ok(vec![self.decode_step(input_tokens[0], positions[0])?]);
+        }
+
+        let device = self.device;
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+        let num_layers = self.tcfg.num_hidden_layers;
+        let vocab_size = self.tcfg.vocab_size;
+        let b = self.batch_size;
+
+        // Stack per-seq embedded hidden inputs → [B, hidden_size] BF16.
+        let mut hidden_host_f32: Vec<f32> = Vec::with_capacity(b * hidden_size);
+        for &tok in input_tokens {
+            let row = self.load_scaled_embed_row(tok)?;
+            hidden_host_f32.extend_from_slice(&row);
+        }
+        let mut hidden_io = upload_bf16(device, &[b, hidden_size], &hidden_host_f32)?;
+
+        // Stack per-seq PLIs → [B, num_layers, ple_hidden] BF16.
+        let expected_pli_bytes = num_layers * ple_hidden * 2;
+        let mut pli_bytes: Vec<u8> = Vec::with_capacity(b * expected_pli_bytes);
+        for &tok in input_tokens {
+            let per_seq = self.compute_per_layer_inputs_single(tok)?;
+            if per_seq.len() != expected_pli_bytes {
+                bail!(
+                    "compute_per_layer_inputs_single returned {} bytes, expected {}",
+                    per_seq.len(), expected_pli_bytes
+                );
+            }
+            pli_bytes.extend_from_slice(&per_seq);
+        }
+        let pli_gpu = GpuBuffer::from_host_bytes(
+            device, dtype, &[b, num_layers, ple_hidden], &pli_bytes,
+        )?;
+
+        // Update per-step `seqlen_offset[b]` in each layer's batch desc, then
+        // re-upload the whole [num_layers] array.
+        for l in 0..num_layers {
+            for (i, &pos) in positions.iter().enumerate() {
+                self.batch_descs_host[l].seqlen_offset[i] = pos as c_int;
+            }
+        }
+        let batch_descs_gpu = self
+            .batch_descs_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow!("int4 decode_step_batch: batch_descs_gpu missing"))?;
+        let desc_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.batch_descs_host.as_ptr() as *const u8,
+                self.batch_descs_host.len() * std::mem::size_of::<Gemma4BatchSeqDesc>(),
+            )
+        };
+        gpu_hal::copy_h2d(
+            device,
+            batch_descs_gpu.as_mut_ptr(),
+            desc_bytes.as_ptr() as *const c_void,
+            desc_bytes.len(),
+        )
+        .map_err(|e| anyhow!("int4 upload batch_descs: {e}"))?;
+
+        g4::persistent_decode_batch_int4(
+            device, dtype,
+            &self.layers_gpu,
+            &self.int4_scales_gpu,
+            batch_descs_gpu,
+            &mut hidden_io,
+            &pli_gpu,
+            &mut self.fused_workspace,
+            &mut self.fused_matvec_counter,
+            &mut self.fused_barrier_counter,
+            &mut self.fused_barrier_flag,
+            num_layers, hidden_size, ple_hidden,
+            b, self.fused_ws_stride,
+            eps, 1.0f32,
+        )?;
+
+        // Per-seq final norm + lm_head + softcap.
+        let cap = self.tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
+        let mut outs: Vec<Vec<f32>> = Vec::with_capacity(b);
+        for seq in 0..b {
+            let row_off_bytes = seq * hidden_size * 2;
+            let mut seq_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+            unsafe {
+                let src_ptr = hidden_io.offset_ptr(row_off_bytes);
+                gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+                    .map_err(|e| anyhow!("int4 copy seq {seq} hidden: {e}"))?;
+            }
+            let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
+            g4::rms_norm(
+                device, dtype, &mut post_norm, &seq_hidden, Some(&self.final_norm_w),
+                eps, hidden_size,
+            )?;
+            let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
+            g4::matvec(
+                device, dtype, &mut logits_gpu, &post_norm, &self.lm_head_w,
+                hidden_size, vocab_size, &mut self.counter,
+            )?;
+            let mut logits_host = download_bf16(&logits_gpu)?;
+            for v in logits_host.iter_mut() {
+                *v = cap * (*v / cap).tanh();
+            }
+            outs.push(logits_host);
+        }
+        Ok(outs)
+    }
+
     /// Per-layer fused INT4 decode step (Step 29/30 path) — retained for
     /// benchmarking the megakernel's launch-overhead savings. Runs each
     /// layer as two fused launches (attn + mlp/ple) plus host-side PLI
@@ -1125,6 +1555,7 @@ impl Gemma4Int4Engine {
         let hidden_size = self.tcfg.hidden_size;
         let num_q_heads = self.tcfg.num_attention_heads;
         let num_kv_heads = self.tcfg.num_key_value_heads;
+        let int4_group_size = self.int4_group_size;
         let eps = self.tcfg.rms_norm_eps as f32;
         let ple_hidden = self.tcfg.hidden_size_per_layer_input;
         let num_layers = self.tcfg.num_hidden_layers;
@@ -1166,13 +1597,13 @@ impl Gemma4Int4Engine {
                 g4::matvec_int4(
                     device, dtype, &mut k, &x,
                     &k_proj.packed, &k_proj.scale, &k_proj.zero,
-                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
                 let mut v = GpuBuffer::zeros(device, dtype, &[num_kv_heads, head_dim])?;
                 g4::matvec_int4(
                     device, dtype, &mut v, &x,
                     &v_proj.packed, &v_proj.scale, &v_proj.zero,
-                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
 
                 let mut k_normed = GpuBuffer::zeros(device, dtype, &[num_kv_heads, head_dim])?;
@@ -1235,7 +1666,7 @@ impl Gemma4Int4Engine {
                 hidden_size, num_q_heads, num_kv_heads, head_dim, rotary_dim,
                 sliding_window, pos, max_t,
                 w.shared_kv,
-                INT4_GROUP_SIZE,
+                int4_group_size,
                 eps, 1.0,
             )?;
 
@@ -1267,7 +1698,7 @@ impl Gemma4Int4Engine {
                 &mut self.fused_barrier_counter,
                 &mut self.fused_barrier_flag,
                 hidden_size, w.intermediate_size, ple_hidden,
-                INT4_GROUP_SIZE,
+                int4_group_size,
                 eps, w.layer_scalar,
             )?;
             h_running = h_new;
@@ -1306,6 +1737,7 @@ impl Gemma4Int4Engine {
         let hidden_size = self.tcfg.hidden_size;
         let num_q_heads = self.tcfg.num_attention_heads;
         let num_kv_heads = self.tcfg.num_key_value_heads;
+        let int4_group_size = self.int4_group_size;
         let eps = self.tcfg.rms_norm_eps as f32;
         let ple_hidden = self.tcfg.hidden_size_per_layer_input;
         let num_layers = self.tcfg.num_hidden_layers;
@@ -1341,7 +1773,7 @@ impl Gemma4Int4Engine {
             g4::matvec_int4(
                 device, dtype, &mut q, &x,
                 &w.q_proj.packed, &w.q_proj.scale, &w.q_proj.zero,
-                hidden_size, q_dim, INT4_GROUP_SIZE, &mut self.counter,
+                hidden_size, q_dim, int4_group_size, &mut self.counter,
             )?;
             let mut q_normed = GpuBuffer::zeros(device, dtype, &[num_q_heads, head_dim])?;
             g4::rms_norm_per_row(
@@ -1361,13 +1793,13 @@ impl Gemma4Int4Engine {
                 g4::matvec_int4(
                     device, dtype, &mut k, &x,
                     &k_proj.packed, &k_proj.scale, &k_proj.zero,
-                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
                 let mut v = GpuBuffer::zeros(device, dtype, &[num_kv_heads, head_dim])?;
                 g4::matvec_int4(
                     device, dtype, &mut v, &x,
                     &v_proj.packed, &v_proj.scale, &v_proj.zero,
-                    hidden_size, kv_dim, INT4_GROUP_SIZE, &mut self.counter,
+                    hidden_size, kv_dim, int4_group_size, &mut self.counter,
                 )?;
 
                 let mut k_normed = GpuBuffer::zeros(device, dtype, &[num_kv_heads, head_dim])?;
@@ -1421,7 +1853,7 @@ impl Gemma4Int4Engine {
             g4::matvec_int4(
                 device, dtype, &mut o, &attn_flat,
                 &w.o_proj.packed, &w.o_proj.scale, &w.o_proj.zero,
-                q_dim, hidden_size, INT4_GROUP_SIZE, &mut self.counter,
+                q_dim, hidden_size, int4_group_size, &mut self.counter,
             )?;
 
             let mut x2 = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
@@ -1441,14 +1873,14 @@ impl Gemma4Int4Engine {
                 device, dtype, &mut gate, &x3,
                 &w.gate_proj.packed, &w.gate_proj.scale, &w.gate_proj.zero,
                 hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut up_buf = GpuBuffer::zeros(device, dtype, &[w.intermediate_size])?;
             g4::matvec_int4(
                 device, dtype, &mut up_buf, &x3,
                 &w.up_proj.packed, &w.up_proj.scale, &w.up_proj.zero,
                 hidden_size, w.intermediate_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut y = GpuBuffer::zeros(device, dtype, &[w.intermediate_size])?;
             g4::gelu_tanh_gate_mul(device, dtype, &mut y, &gate, &up_buf, w.intermediate_size)?;
@@ -1458,7 +1890,7 @@ impl Gemma4Int4Engine {
                 device, dtype, &mut m, &y,
                 &w.down_proj.packed, &w.down_proj.scale, &w.down_proj.zero,
                 w.intermediate_size, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
 
             let mut x4 = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
@@ -1484,7 +1916,7 @@ impl Gemma4Int4Engine {
                 &w.per_layer_input_gate.scale,
                 &w.per_layer_input_gate.zero,
                 hidden_size, ple_hidden,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut gated_act = GpuBuffer::zeros(device, dtype, &[ple_hidden])?;
             g4::gelu_tanh_gate_mul(
@@ -1497,7 +1929,7 @@ impl Gemma4Int4Engine {
                 &w.per_layer_projection.scale,
                 &w.per_layer_projection.zero,
                 ple_hidden, hidden_size,
-                INT4_GROUP_SIZE, &mut self.counter,
+                int4_group_size, &mut self.counter,
             )?;
             let mut normed = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
             g4::rms_norm(

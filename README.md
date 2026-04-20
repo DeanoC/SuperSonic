@@ -96,8 +96,14 @@ GEMMA_E4B_DIR=/models/gemma-4-E4B \
 ```
 
 By default this produces INT4-GPTQ bakes for every configured model. Add
-`--bf16` to also publish Qwen BF16 bakes, `--force` to rebuild, or drop
-`--upload` to keep the output local.
+`--bf16` to also publish Qwen BF16 bakes, `--fp8-native` for FP8-native
+bakes (Qwen only; source checkpoint must ship FP8 tensors), `--force` to
+rebuild, or drop `--upload` to keep the output local.
+
+**9B INT4 note:** `qwen3.5-9b` GPTQ calibration loads the full BF16 model
+(~18 GiB) into GPU memory, so it OOMs on ≤16 GiB cards (including gfx1150).
+Run it on a box with ≥24 GiB GPU RAM — the small-VRAM consumer then pulls
+the resulting bake from the release. Leave `QWEN_9B_DIR` unset to skip.
 
 ## CUDA
 

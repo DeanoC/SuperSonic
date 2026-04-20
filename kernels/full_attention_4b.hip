@@ -3916,7 +3916,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
     int batch_size,                      // 1 for single-sequence, >1 for batched
     const BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
-    const Qwen35INT4ScaleDesc* __restrict__ int4_scales  // nullptr for non-INT4, else [num_layers]
+    const Qwen35INT4ScaleDesc* __restrict__ int4_scales,  // nullptr for non-INT4, else [num_layers]
+    // DFlash hidden-state taps (M1, currently plumbing-only): when tap_workspace != nullptr,
+    // the per-layer post-MLP residual hidden state for each layer in tap_layers[0..num_taps]
+    // is mirrored into tap_workspace at offset i * hidden_dim (i = tap index, not layer index).
+    // All three default to nullptr/0 from non-DFlash callers — the kernel body must treat
+    // them as no-op when tap_workspace == nullptr to preserve gfx1150 codegen on the hot path.
+    T* __restrict__ tap_workspace,       // nullptr disables; else [num_taps * hidden_dim]
+    const int* __restrict__ tap_layers,  // nullptr when tap_workspace is nullptr
+    int num_taps                         // 0 when tap_workspace is nullptr
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -5324,6 +5332,30 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         } // end for (b) down_proj batch loop
 
         // Residual add for MLP is fused into down_proj above.
+
+        // === DFlash hidden-state tap (M1.2) ===
+        // When the host requests it, mirror the post-MLP residual hidden state
+        // into tap_workspace for any tap layer matching `layer`. Layout is
+        // [num_taps, B, hidden_dim]. The branch is runtime-gated; we rely on
+        // the kernel never being launched with non-null tap params unless the
+        // workspace is sized for [num_taps * B * hidden_dim] T elements.
+        // hidden_f32 is settled at this point (last grid_barrier completed for
+        // the down_proj batch above); the new grid_barrier inside the if-branch
+        // serializes the tap write with the next layer's hidden_f32 mutations.
+        if (tap_workspace != nullptr) {
+            for (int t = 0; t < num_taps; ++t) {
+                if (tap_layers[t] == layer) {
+                    for (int b = 0; b < B; ++b) {
+                        for (int c = tid + blockIdx.x * bs; c < hidden_dim; c += bs * nb) {
+                            tap_workspace[(t * B + b) * hidden_dim + c] =
+                                dotcache_qwen35_from_float<T>(hidden_f32[b * hidden_dim + c]);
+                        }
+                    }
+                }
+            }
+            __syncthreads();
+            grid_barrier(barrier_counter, barrier_flag, nb);
+        }
     }
 
     // Write back F32 → BF16 for all batch items

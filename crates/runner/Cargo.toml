@@ -55,12 +55,18 @@ path = "src/bin/gemma4_int4_matvec_test.rs"
 name = "gemma4_fused_int4_validate"
 path = "src/bin/gemma4_fused_int4_validate.rs"
 
+[[bin]]
+name = "gemma4_int4_layer_diag"
+path = "src/bin/gemma4_int4_layer_diag.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }
 qwen35 = { path = "../qwen35" }
+qwen35_dflash = { path = "../qwen35_dflash" }
 gemma4 = { path = "../gemma4" }
+phi4 = { path = "../phi4" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

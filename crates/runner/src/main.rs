@@ -2,7 +2,9 @@ mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod oracle;
+mod phi4_engine;
 mod prefill_engine;
+mod qwen35_dflash_engine;
 mod registry;
 mod validate;
 
@@ -37,6 +39,37 @@ impl Gemma4Runtime {
         match self {
             Self::Bf16(e) => e.decode_step(token, pos),
             Self::Int4(e) => e.decode_step(token, pos),
+        }
+    }
+
+    /// Run one decode step on every sequence in the batch. Both BF16 and
+    /// INT4 engines honour `--batch-size > 1` via their batched persistent
+    /// megakernels (BF16: `g4::persistent_decode_batch`, INT4:
+    /// `g4::persistent_decode_batch_int4`).
+    fn decode_step_batch(
+        &mut self,
+        input_tokens: &[u32],
+        positions: &[usize],
+    ) -> anyhow::Result<Vec<Vec<f32>>> {
+        match self {
+            Self::Bf16(e) => e.decode_step_batch(input_tokens, positions),
+            Self::Int4(e) => e.decode_step_batch(input_tokens, positions),
+        }
+    }
+
+    /// Replicate seq 0's K/V cache contents into every other sequence's
+    /// caches. Applies to both BF16 and INT4 engines.
+    fn replicate_seq0_kv(&mut self) -> anyhow::Result<()> {
+        match self {
+            Self::Bf16(e) => e.replicate_seq0_kv(),
+            Self::Int4(e) => e.replicate_seq0_kv(),
+        }
+    }
+
+    fn batch_size(&self) -> usize {
+        match self {
+            Self::Bf16(e) => e.batch_size(),
+            Self::Int4(e) => e.batch_size(),
         }
     }
 
@@ -112,7 +145,7 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
-struct Cli {
+pub(crate) struct Cli {
     /// Model variant (e.g. "qwen3.5-0.8b")
     #[arg(long, default_value = "qwen3.5-0.8b")]
     model: String,
@@ -203,8 +236,8 @@ struct Cli {
     trace_prefill_layers: bool,
 
     /// Batch size for decode (number of sequences decoded in parallel).
-    /// Default 1. B=2 is supported on the 4B kernel and can improve aggregate throughput.
-    /// Requires 4B kernel (2B/4B/9B models).
+    /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
+    /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
     #[arg(long, default_value = "1")]
     batch_size: usize,
 
@@ -295,6 +328,34 @@ struct Cli {
     /// Override the GitHub release/tag used for bake downloads.
     #[arg(long)]
     bake_release: Option<String>,
+
+    /// Enable DFlash speculative decoding. Requires `--model qwen3.5-9b`,
+    /// `--int4`, and `--dflash-draft-dir`. Target is the Qwen3.5-9B INT4
+    /// bake; draft is the DFlash 5-layer checkpoint shared via Arc.
+    #[arg(long)]
+    dflash: bool,
+
+    /// Path to the DFlash draft checkpoint directory (e.g.
+    /// `z-lab/Qwen3.5-9B-DFlash` extracted locally). Must contain
+    /// `config.json` and `model.safetensors`.
+    #[arg(long)]
+    dflash_draft_dir: Option<PathBuf>,
+
+    /// Override the DFlash block size (draft candidates per round). Must
+    /// be 1..=draft_config.block_size. Default is 3 — the fused verify
+    /// megakernel on Qwen3.5-9B is LDS-bound and caps B at 3 on gfx1150
+    /// (block_size + B*hidden + fp8_lut must fit in 64 KiB shared mem).
+    /// Launches with B >= 4 fail fast with a shared-memory diagnostic.
+    #[arg(long)]
+    dflash_block: Option<usize>,
+
+    /// Override the DFlash tap layers as a comma-separated list of
+    /// target-model layer indices (e.g. `1,8,15,22,29`). Must match the
+    /// count implied by the draft's `fc.in_features`. Defaults to the
+    /// checkpoint's `dflash_config.target_layer_ids`.
+    #[arg(long)]
+    dflash_tap_layers: Option<String>,
+
 }
 
 fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
@@ -492,13 +553,86 @@ fn main() -> Result<()> {
         }
     };
 
-    if model_variant.family() == ModelFamily::Gemma4 {
-        return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram);
+    // DFlash validation runs BEFORE the family dispatch so a misconfig on
+    // non-Qwen families fails fast. The dispatch below returns for Gemma4/
+    // Phi4 — if we deferred these checks until the Qwen branch, callers
+    // would see --dflash / --dflash-draft-dir / etc. silently ignored on
+    // other model families and think speculative decoding was enabled
+    // when it wasn't.
+    if cli.dflash && !matches!(model_variant.family(), ModelFamily::Qwen35) {
+        anyhow::bail!(
+            "--dflash is only supported on Qwen3.5 family models (got family={:?}, model={model_variant}).",
+            model_variant.family(),
+        );
     }
+    if !cli.dflash
+        && (cli.dflash_draft_dir.is_some()
+            || cli.dflash_block.is_some()
+            || cli.dflash_tap_layers.is_some())
+    {
+        anyhow::bail!("--dflash-* flags require --dflash");
+    }
+
+    match model_variant.family() {
+        ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
+        ModelFamily::Phi4 => {
+            return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
+        }
+        ModelFamily::Qwen35 => {}
+    }
+
+    if cli.dflash {
+        // DFlash needs the target's HF metadata (config.json + tokenizer.json)
+        // and the INT4 bake. Reuse the same download hooks as the regular
+        // Qwen35 path so the dflash dispatch is self-contained on a fresh
+        // machine: ensure_hf_metadata_present fetches HF metadata from the
+        // bake tarball if config.json is missing, then we verify or download
+        // the INT4 bake itself.
+        ensure_hf_metadata_present(&cli, &model_variant)?;
+        if !cli.no_bake {
+            let variant = model_store::fetch::BakeVariant::Int4Gptq;
+            let bake_dir = variant.bake_dir(&cli.model_dir);
+            let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+                .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
+            if cli.download_bake || !model_store::version_ok(&bake_dir) {
+                let canonical_model = model_variant.to_string();
+                match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
+                    Ok(true) => {
+                        eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
+                    }
+                    Ok(false) => {
+                        anyhow::bail!(
+                            "no INT4 bake at {} and --no-download set.\n\
+                             Run:\n  python oracle/bake_int4.py --model-dir {}",
+                            bake_dir.display(),
+                            cli.model_dir.display(),
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!(
+                            "could not obtain INT4 bake for --dflash: {e}\n\n\
+                             INT4 baking requires a GPTQ calibration pass in Python. \
+                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
+                            cli.model_dir.display(),
+                        );
+                    }
+                }
+            }
+        }
+        return qwen35_dflash_engine::run_qwen35_dflash(
+            &cli,
+            &model_variant,
+            entry,
+            ordinal,
+            total_vram,
+        );
+    }
+    // --dflash-* guard already ran before the family dispatch above.
 
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+        FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
     };
 
     // INT4 decode only lives in full_attention_4b.hip; the 0.8B-native kernel
@@ -776,12 +910,28 @@ fn main() -> Result<()> {
         anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
     }
 
+    // attn_scratch_floats must cover saved_q+gate+pre_gate+scores for the largest
+    // kv_max_t the run will hit. Registry value is the floor; scale up with context.
+    let required_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
+        text_config.num_attention_heads,
+        text_config.head_dim,
+        context_tokens,
+        params.kv_chunk_size,
+    );
+    let attn_scratch_floats = params.attn_scratch_floats.max(required_attn_scratch);
+    if attn_scratch_floats > params.attn_scratch_floats {
+        eprintln!(
+            "[scratch] context={} → attn_scratch_floats={} (registry floor {})",
+            context_tokens, attn_scratch_floats, params.attn_scratch_floats
+        );
+    }
+
     // Create decode engine
     let mut engine = DecodeEngine::new(
         weights,
         ordinal,
         params.proj_buf_floats,
-        params.attn_scratch_floats,
+        attn_scratch_floats,
         params.kv_chunk_size,
         params.use_4b_kernel,
         cli.prefill_chunk_size,
@@ -834,6 +984,7 @@ fn main() -> Result<()> {
                 layer_mlp_swiglu_trace: None,
                 layer_mlp_out_trace: None,
                 layer_hidden_trace: None,
+                tap_hiddens: None,
                 linear_debug_trace: None,
             }
         };
@@ -1568,13 +1719,17 @@ fn run_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {
         anyhow::bail!("Gemma 4 does not yet support --fp8-runtime / --kv-fp8");
     }
-    if cli.batch_size != 1 {
-        anyhow::bail!("Gemma 4 does not yet support --batch-size > 1");
+    if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
+        anyhow::bail!(
+            "--batch-size must be 1..{}",
+            kernel_ffi::MAX_BATCH_SIZE
+        );
     }
     if cli.oracle_prefill || cli.gpu_validate {
         anyhow::bail!("Gemma 4 does not yet support --oracle-prefill / --gpu-validate");
@@ -1651,21 +1806,33 @@ fn run_gemma4(
             kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
         }
     }
-    let kv_bytes = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    // Both BF16 and INT4 engines allocate `batch_size` parallel KV cache sets
+    // (one per decode sequence); scale accordingly so `--batch-size > 1` can't
+    // pass the preflight check and then OOM during engine load.
+    let batch_size_u64 = cli.batch_size as u64;
+    let kv_bytes_per_seq = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    let kv_bytes = kv_bytes_per_seq * batch_size_u64;
     let estimated_vram =
         ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
-        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok x B={}) available={:.1}GiB",
         gib(estimated_vram),
         gib(entry.vram.fixed_bytes),
         gib(kv_bytes),
         context_tokens,
+        cli.batch_size,
         gib(total_vram),
     );
     if estimated_vram > total_vram {
+        let reduce_hint = if cli.batch_size > 1 {
+            "Reduce --context-size, --max-new-tokens, or --batch-size."
+        } else {
+            "Reduce --context-size or --max-new-tokens."
+        };
         anyhow::bail!(
-            "Insufficient VRAM for {context_tokens}-token context: need ~{:.2}GiB, GPU has {:.1}GiB. Reduce --context-size or --max-new-tokens.",
+            "Insufficient VRAM for {context_tokens}-token context at batch_size={}: need ~{:.2}GiB, GPU has {:.1}GiB. {reduce_hint}",
+            cli.batch_size,
             gib(estimated_vram),
             gib(total_vram),
         );
@@ -1703,18 +1870,20 @@ fn run_gemma4(
             }
         }
         eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
-        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load(
+        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load_with_batch(
             &cli.model_dir,
             params.weight_prefix,
             context_tokens,
             ordinal,
+            cli.batch_size,
         )?)
     } else {
-        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load(
+        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_batch(
             &cli.model_dir,
             params.weight_prefix,
             context_tokens,
             ordinal,
+            cli.batch_size,
         )?)
     };
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
@@ -1746,42 +1915,71 @@ fn run_gemma4(
 
     let prefill_start = Instant::now();
     let prefill_logits = engine.prefill(&prompt_ids)?;
-    let mut next_token = Gemma4Runtime::greedy_sample(&prefill_logits);
+    let prefill_token = Gemma4Runtime::greedy_sample(&prefill_logits);
     eprintln!(
         "[prefill] native GPU prefill done in {:.0}ms",
         prefill_start.elapsed().as_millis()
     );
 
+    let batch_size = engine.batch_size();
+    if batch_size > 1 {
+        eprintln!(
+            "[batch] replicating prefill K/V across {} sequences",
+            batch_size
+        );
+        engine.replicate_seq0_kv()?;
+    }
+
     if let Some(ref oracle) = oracle_output {
         let prefill_delta = validate::max_abs_delta(&prefill_logits, &oracle.prefill_logits);
         eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
         if let Some(&oracle_first) = oracle.generated_token_ids.first() {
-            if oracle_first != next_token {
+            if oracle_first != prefill_token {
                 eprintln!(
-                    "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+                    "[validate] WARNING: prefill token mismatch! native={prefill_token} oracle={oracle_first}"
                 );
             }
+        }
+        if batch_size > 1 {
+            eprintln!("[validate] WARNING: --validate compares oracle vs sequence 0 only when --batch-size > 1");
         }
     }
 
     let seqlen_start = prompt_ids.len();
-    let mut generated_ids: Vec<u32> = Vec::new();
     let eos_ids = t.eos_token_ids();
     let mut max_delta = 0.0f32;
     let mut token_mismatches = 0usize;
 
+    // Per-sequence decode state. All sequences start from the same prefill
+    // token; greedy sampling will keep them identical unless something
+    // diverges (useful sanity check until Phase 2 adds true per-sequence
+    // prompts).
+    let mut next_tokens: Vec<u32> = vec![prefill_token; batch_size];
+    let mut generated_per_seq: Vec<Vec<u32>> = vec![Vec::new(); batch_size];
+    let mut seq_done: Vec<bool> = vec![false; batch_size];
+    let mut steps_done: usize = 0;
+
     let decode_start = Instant::now();
     for step in 0..cli.max_new_tokens {
-        if eos_ids.contains(&next_token) {
+        // Mark any newly-EOSed sequences but keep stepping until ALL sequences
+        // have stopped — the megakernel still has to handle the active ones.
+        for b in 0..batch_size {
+            if !seq_done[b] && eos_ids.contains(&next_tokens[b]) {
+                seq_done[b] = true;
+            }
+        }
+        if seq_done.iter().all(|d| *d) {
             break;
         }
         let pos = seqlen_start + step;
-        let logits = engine.decode_step(next_token, pos)?;
+        let positions: Vec<usize> = vec![pos; batch_size];
+        let logits_per_seq = engine.decode_step_batch(&next_tokens, &positions)?;
 
         if let Some(ref oracle) = oracle_output {
             if step < oracle.decode_logits.len() {
                 let oracle_logits = &oracle.decode_logits[step];
-                let delta = validate::max_abs_delta(&logits, oracle_logits);
+                // Always compare against sequence 0 (canonical run).
+                let delta = validate::max_abs_delta(&logits_per_seq[0], oracle_logits);
                 if delta > max_delta {
                     max_delta = delta;
                 }
@@ -1790,7 +1988,7 @@ fn run_gemma4(
                 } else {
                     None
                 };
-                let rust_next = Gemma4Runtime::greedy_sample(&logits);
+                let rust_next = Gemma4Runtime::greedy_sample(&logits_per_seq[0]);
                 let mismatch_tag = match oracle_next {
                     Some(ot) if ot != rust_next => {
                         token_mismatches += 1;
@@ -1799,43 +1997,69 @@ fn run_gemma4(
                     _ => String::new(),
                 };
                 eprintln!(
-                    "[validate] step={step} pos={pos} delta={delta:.4} input_tok={next_token} rust_next={rust_next}{mismatch_tag}"
+                    "[validate] step={step} pos={pos} delta={delta:.4} input_tok={} rust_next={rust_next}{mismatch_tag}",
+                    next_tokens[0]
                 );
             }
         }
 
-        let sampled = Gemma4Runtime::greedy_sample(&logits);
-        generated_ids.push(next_token);
-        next_token = sampled;
+        // Sample per sequence and roll forward — but only record sampled
+        // tokens for sequences that haven't already hit EOS.
+        for b in 0..batch_size {
+            if seq_done[b] {
+                continue;
+            }
+            let sampled = Gemma4Runtime::greedy_sample(&logits_per_seq[b]);
+            generated_per_seq[b].push(next_tokens[b]);
+            next_tokens[b] = sampled;
+        }
+        steps_done = step + 1;
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-    let all_ids: Vec<u32> = prompt_ids
-        .iter()
-        .copied()
-        .chain(generated_ids.iter().copied())
-        .collect();
-    let text = tokenizer
-        .decode(&all_ids, true)
-        .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
-
-    println!("{text}");
-    println!(
-        "[tokens] {}",
-        generated_ids
+    // Print every sequence. For batch_size == 1 the output matches the
+    // pre-batched format (no `[seq=N]` prefix).
+    for b in 0..batch_size {
+        let all_ids: Vec<u32> = prompt_ids
             .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+            .copied()
+            .chain(generated_per_seq[b].iter().copied())
+            .collect();
+        let text = tokenizer
+            .decode(&all_ids, true)
+            .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+        if batch_size == 1 {
+            println!("{text}");
+            println!(
+                "[tokens] {}",
+                generated_per_seq[b]
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        } else {
+            println!("[seq={b}] {text}");
+            println!(
+                "[seq={b}][tokens] {}",
+                generated_per_seq[b]
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+
+    let total_generated: usize = generated_per_seq.iter().map(|v| v.len()).sum();
     eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0}{}",
+        "[result] prompt_tokens={} generated_tokens={} steps={steps_done} batch_size={batch_size} decode_ms={decode_ms:.0} ms_per_step={:.0}{}",
         prompt_ids.len(),
-        generated_ids.len(),
-        if generated_ids.is_empty() {
+        total_generated,
+        if steps_done == 0 {
             0.0
         } else {
-            decode_ms / generated_ids.len() as f64
+            decode_ms / steps_done as f64
         },
         if oracle_output.is_some() {
             format!(" decode_max_delta={max_delta:.4} token_mismatches={token_mismatches}")
@@ -1846,11 +2070,7 @@ fn run_gemma4(
     Ok(())
 }
 
-fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
+use decode_engine::decode_f32_le;
 
 fn bf16_residual_sum(lhs_bf16: &[u8], rhs_bf16: &[u8]) -> Vec<f32> {
     lhs_bf16

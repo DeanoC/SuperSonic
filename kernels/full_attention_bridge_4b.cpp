@@ -4575,7 +4575,10 @@ int persistent_decode_device(
     const void* kv_fp8_descs,
     int batch_size,
     const void* batch_descs,
-    const void* int4_scales
+    const void* int4_scales,
+    void* tap_workspace,
+    const int* tap_layers,
+    int num_taps
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -4619,7 +4622,10 @@ int persistent_decode_device(
         static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
         batch_size,
         static_cast<const BatchSeqDesc*>(batch_descs),
-        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales));
+        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
+        static_cast<T*>(tap_workspace),
+        tap_layers,
+        num_taps);
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
@@ -4627,6 +4633,10 @@ int persistent_decode_device(
     return 0;
 }
 
+// tap_workspace/tap_layers/num_taps: DFlash hidden-state taps (M1 plumbing).
+//   tap_workspace = nullptr, tap_layers = nullptr, num_taps = 0 disables; the kernel body
+//   must short-circuit when tap_workspace is nullptr so existing decode callers see no
+//   change in observable behavior or runtime (gfx1150 codegen-sensitivity guard).
 extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     int dtype,
     size_t device_ordinal,
@@ -4651,7 +4661,10 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
     const void* kv_fp8_descs,
     size_t batch_size,
     const void* batch_descs,
-    const void* int4_scales) {
+    const void* int4_scales,
+    void* tap_workspace,
+    const int* tap_layers,
+    size_t num_taps) {
     switch (dtype) {
     case 2:
         return persistent_decode_device<hip_bfloat16>(
@@ -4670,7 +4683,10 @@ extern "C" int dotcache_qwen35_4b_hip_persistent_decode(
             kv_fp8_descs,
             static_cast<int>(batch_size),
             batch_descs,
-            int4_scales);
+            int4_scales,
+            tap_workspace,
+            tap_layers,
+            static_cast<int>(num_taps));
     default:
         return 256;
     }

@@ -57,6 +57,7 @@ OPTIONAL_HF_FILES = [
 KNOWN_MODELS = {
     "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b",
     "gemma4-e2b", "gemma4-e4b",
+    "phi4-mini",
 }
 
 VARIANT_DIR_SUFFIX = {
@@ -72,6 +73,7 @@ FAMILY_FOR = {
     "qwen3.5-9b": "qwen35",
     "gemma4-e2b": "gemma4",
     "gemma4-e4b": "gemma4",
+    "phi4-mini": "phi4",
 }
 
 

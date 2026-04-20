@@ -1,7 +1,9 @@
 mod ffi;
 mod layer_desc;
+pub mod dflash;
 pub mod prefill_ffi;
 pub mod gemma4;
+pub mod phi4;
 
 pub use ffi::{
     cuda_argmax_bf16, cuda_lm_head_argmax_bf16, matmul_rhs_transposed_4b,

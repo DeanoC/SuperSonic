@@ -66,6 +66,157 @@ pub fn fp8_dequant_to_bf16(
     (out, weight_shape.to_vec())
 }
 
+/// Split a fused qkv_proj weight into (q, k, v) slices along row-major dim 0.
+///
+/// Phi-3 / Phi-4 stores `[q_rows + k_rows + v_rows, hidden]` where
+/// - q_rows = num_attention_heads * head_dim
+/// - k_rows = v_rows = num_key_value_heads * head_dim
+///
+/// Bytes are contiguous in row-major order (Q first, then K, then V). This
+/// helper slices them into three owned `Vec<u8>` with accompanying shapes.
+pub fn split_qkv_proj(
+    bytes: &[u8],
+    shape: &[usize],
+    q_rows: usize,
+    k_rows: usize,
+    v_rows: usize,
+    dtype_bytes: usize,
+) -> (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>) {
+    assert_eq!(shape.len(), 2, "split_qkv_proj: expected 2D, got {shape:?}");
+    assert_eq!(
+        shape[0],
+        q_rows + k_rows + v_rows,
+        "split_qkv_proj: dim0 {} != q {} + k {} + v {}",
+        shape[0],
+        q_rows,
+        k_rows,
+        v_rows
+    );
+    let cols = shape[1];
+    let row_stride = cols * dtype_bytes;
+    assert_eq!(
+        bytes.len(),
+        shape[0] * row_stride,
+        "split_qkv_proj: byte count mismatch"
+    );
+    let q_end = q_rows * row_stride;
+    let k_end = q_end + k_rows * row_stride;
+    let v_end = k_end + v_rows * row_stride;
+    (
+        bytes[..q_end].to_vec(),
+        vec![q_rows, cols],
+        bytes[q_end..k_end].to_vec(),
+        vec![k_rows, cols],
+        bytes[k_end..v_end].to_vec(),
+        vec![v_rows, cols],
+    )
+}
+
+/// Split a fused `gate_up_proj` weight into (gate, up) slices along row-major dim 0.
+///
+/// Phi-3 / Phi-4 stores `[2 * intermediate_size, hidden]` with gate first, then up.
+pub fn split_gate_up_proj(
+    bytes: &[u8],
+    shape: &[usize],
+    intermediate_size: usize,
+    dtype_bytes: usize,
+) -> (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>) {
+    assert_eq!(shape.len(), 2, "split_gate_up_proj: expected 2D, got {shape:?}");
+    assert_eq!(
+        shape[0],
+        2 * intermediate_size,
+        "split_gate_up_proj: dim0 {} != 2 * intermediate_size {}",
+        shape[0],
+        intermediate_size
+    );
+    let cols = shape[1];
+    let row_stride = cols * dtype_bytes;
+    assert_eq!(
+        bytes.len(),
+        shape[0] * row_stride,
+        "split_gate_up_proj: byte count mismatch"
+    );
+    let mid = intermediate_size * row_stride;
+    (
+        bytes[..mid].to_vec(),
+        vec![intermediate_size, cols],
+        bytes[mid..].to_vec(),
+        vec![intermediate_size, cols],
+    )
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    #[test]
+    fn qkv_split_preserves_row_order() {
+        // Simulate Phi-4-mini qkv_proj: q_rows=3072, k_rows=v_rows=1024, hidden=3072, dtype=bf16.
+        // Use small sizes: q=6, k=v=2, hidden=4, bf16 (2 bytes each) → rows 0..10, each row 8 bytes.
+        let q_rows = 6;
+        let k_rows = 2;
+        let v_rows = 2;
+        let hidden = 4;
+        let dt_bytes = 2;
+        let total_rows = q_rows + k_rows + v_rows;
+        let mut bytes = Vec::with_capacity(total_rows * hidden * dt_bytes);
+        for r in 0..total_rows {
+            for c in 0..hidden {
+                // Encode (r,c) as two-byte value: hi=r, lo=c, so we can validate ordering.
+                bytes.push(r as u8);
+                bytes.push(c as u8);
+            }
+        }
+        let shape = vec![total_rows, hidden];
+        let (qb, qs, kb, ks, vb, vs) =
+            split_qkv_proj(&bytes, &shape, q_rows, k_rows, v_rows, dt_bytes);
+        assert_eq!(qs, vec![q_rows, hidden]);
+        assert_eq!(ks, vec![k_rows, hidden]);
+        assert_eq!(vs, vec![v_rows, hidden]);
+        assert_eq!(qb.len(), q_rows * hidden * dt_bytes);
+        assert_eq!(kb.len(), k_rows * hidden * dt_bytes);
+        assert_eq!(vb.len(), v_rows * hidden * dt_bytes);
+        // First row of Q is (r=0, c=0..hidden).
+        assert_eq!(qb[0], 0);
+        assert_eq!(qb[1], 0);
+        assert_eq!(qb[2], 0);
+        assert_eq!(qb[3], 1);
+        // First row of K is row index q_rows=6.
+        assert_eq!(kb[0], 6);
+        // First row of V is row index q_rows + k_rows = 8.
+        assert_eq!(vb[0], 8);
+    }
+
+    #[test]
+    fn gate_up_split_preserves_row_order() {
+        let intermediate = 4;
+        let hidden = 3;
+        let dt_bytes = 2;
+        let total_rows = 2 * intermediate;
+        let mut bytes = Vec::with_capacity(total_rows * hidden * dt_bytes);
+        for r in 0..total_rows {
+            for c in 0..hidden {
+                bytes.push(r as u8);
+                bytes.push(c as u8);
+            }
+        }
+        let shape = vec![total_rows, hidden];
+        let (gb, gs, ub, us) = split_gate_up_proj(&bytes, &shape, intermediate, dt_bytes);
+        assert_eq!(gs, vec![intermediate, hidden]);
+        assert_eq!(us, vec![intermediate, hidden]);
+        assert_eq!(gb[0], 0, "gate starts at row 0");
+        assert_eq!(ub[0], intermediate as u8, "up starts at row intermediate");
+    }
+
+    #[test]
+    #[should_panic(expected = "dim0")]
+    fn qkv_split_rejects_wrong_total_rows() {
+        let bytes = vec![0u8; 4 * 2 * 2];
+        let shape = vec![4, 2];
+        split_qkv_proj(&bytes, &shape, 2, 2, 2, 2); // q+k+v = 6 != 4
+    }
+}
+
 /// Transform A_log (F32) to exp(A_log) (BF16) and reshape [H] to [1, 1, H].
 pub fn a_log_to_exp_bf16(bytes: &[u8], shape: &[usize]) -> (Vec<u8>, Vec<usize>) {
     assert_eq!(shape.len(), 1, "a_log_to_exp_bf16: expected 1D shape, got {shape:?}");
