@@ -120,8 +120,12 @@ Implications for future work:
   (linear_proj + linear_core + linear_out = 55% on 0.8B, 42% on 2B).
   A `--kv-fp8` win would only touch `full_attn_core` which is ≤5%;
   that's a VRAM feature, not a throughput feature on Qwen.
-- `full_attn_core` grows quadratically with KV size (1.1 → 4.4 ms/step
-  on 0.8B from 64→1024 ctx) but stays small in absolute terms.
+- `full_attn_core` grows with KV size as expected for per-decode-step
+  attention (one query × kv_len past positions is O(kv_len)): 1.1 →
+  4.4 ms/step on 0.8B from 64 → 1024 ctx. The measured 4× at 16× ctx
+  is sub-linear because fixed kernel-launch and barrier overhead
+  dominates at small KV sizes. In absolute terms it stays small
+  (≤5% of decode step time across tested contexts).
 - Prefill is the big lever. 80% of its time is
   `matmul_rhs_transposed_tiled_kernel`, a naive scalar-FMA
   shared-memory tiled matmul with no WMMA. RDNA3's
