@@ -3525,6 +3525,21 @@ fn trace_oracle_prefill_layer(
             &oracle_full.traced_full_attn_gated_actual,
             "traced_full_attn_gated_actual",
         )?;
+        let (prefix_k_bytes, prefix_v_bytes, prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        let oracle_prefix_kv = prefix_oracle
+            .kv_caches
+            .as_ref()
+            .and_then(|caches| caches.iter().find(|kv| kv.layer == trace_layer))
+            .ok_or_else(|| anyhow::anyhow!("prefix oracle missing kv cache for layer {trace_layer}"))?;
+        let oracle_prefix_k = decode_bf16_le(
+            &b64.decode(&oracle_prefix_kv.k)
+                .map_err(|e| anyhow::anyhow!("decode prefix oracle K cache layer {trace_layer}: {e}"))?,
+        );
+        let oracle_prefix_v = decode_bf16_le(
+            &b64.decode(&oracle_prefix_kv.v)
+                .map_err(|e| anyhow::anyhow!("decode prefix oracle V cache layer {trace_layer}: {e}"))?,
+        );
 
         let stage = engine.trace_full_attention_stages_from_hidden(trace_layer, &oracle_input_bytes, prefix_ids.len())?;
         let stage_out = engine.trace_full_attention_layer_output_from_hidden_current_state(
@@ -3550,7 +3565,124 @@ fn trace_oracle_prefill_layer(
             validate::max_abs_delta(&oracle_gated, &oracle_gated_actual);
         let head_dim = engine.weights().config.head_dim;
         let num_heads = engine.weights().config.num_attention_heads;
+        let num_kv_heads = engine.weights().config.num_key_value_heads;
+        let kv_groups = num_heads / num_kv_heads;
         let pre_gate_host = decode_bf16_le(&stage_out.pre_gate);
+        let q_rope_host = decode_bf16_le(&stage.q_rope);
+        let k_rope_step = decode_bf16_le(&stage.k_rope);
+        let v_step = decode_bf16_le(&stage.v_proj);
+        let prefix_k = decode_bf16_le(&prefix_k_bytes);
+        let prefix_v = decode_bf16_le(&prefix_v_bytes);
+        anyhow::ensure!(
+            prefix_len == prefix_ids.len(),
+            "trace layer {trace_layer} prefix len {} != prompt prefix len {}",
+            prefix_len,
+            prefix_ids.len(),
+        );
+        let kv_len = prefix_len + 1;
+        let mut full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        let mut full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        for kvh in 0..num_kv_heads {
+            let prefix_base = kvh * prefix_len * head_dim;
+            let full_base = kvh * kv_len * head_dim;
+            let step_base = kvh * head_dim;
+            full_k[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
+            full_v[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
+            full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&k_rope_step[step_base..step_base + head_dim]);
+            full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&v_step[step_base..step_base + head_dim]);
+        }
+        let mut host_attn_pre_gate = vec![0.0f32; num_heads * head_dim];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        for qh in 0..num_heads {
+            let kvh = qh / kv_groups;
+            let q_base = qh * head_dim;
+            let mut scores = vec![0.0f32; kv_len];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_base = (kvh * kv_len + t) * head_dim;
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += q_rope_host[q_base + d] * full_k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            let mut weights = vec![0.0f32; kv_len];
+            for (idx, score) in scores.iter().copied().enumerate() {
+                let w = (score - row_max).exp();
+                weights[idx] = w;
+                denom += w;
+            }
+            let out_base = qh * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, &w) in weights.iter().enumerate() {
+                    let v_base = (kvh * kv_len + t) * head_dim;
+                    acc += w * full_v[v_base + d];
+                }
+                host_attn_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
+            }
+        }
+        let mut oracle_host_pre_gate = vec![0.0f32; num_heads * head_dim];
+        let mut oracle_full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        let mut oracle_full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        for kvh in 0..num_kv_heads {
+            let prefix_base = kvh * prefix_len * head_dim;
+            let full_base = kvh * kv_len * head_dim;
+            let step_base = kvh * head_dim;
+            oracle_full_k[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&oracle_prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
+            oracle_full_v[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&oracle_prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
+            oracle_full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&oracle_k_rope[step_base..step_base + head_dim]);
+            oracle_full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&oracle_v_proj[step_base..step_base + head_dim]);
+        }
+        for qh in 0..num_heads {
+            let kvh = qh / kv_groups;
+            let q_base = qh * head_dim;
+            let mut scores = vec![0.0f32; kv_len];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_base = (kvh * kv_len + t) * head_dim;
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += oracle_q_rope[q_base + d] * oracle_full_k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            let mut weights = vec![0.0f32; kv_len];
+            for (idx, score) in scores.iter().copied().enumerate() {
+                let w = (score - row_max).exp();
+                weights[idx] = w;
+                denom += w;
+            }
+            let out_base = qh * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, &w) in weights.iter().enumerate() {
+                    let v_base = (kvh * kv_len + t) * head_dim;
+                    acc += w * oracle_full_v[v_base + d];
+                }
+                oracle_host_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
+            }
+        }
+        let host_pre_gate_vs_stage =
+            validate::max_abs_delta(&host_attn_pre_gate, &pre_gate_host);
+        let host_pre_gate_vs_oracle =
+            validate::max_abs_delta(&host_attn_pre_gate, &oracle_pre_gate);
+        let oracle_host_pre_gate_vs_oracle =
+            validate::max_abs_delta(&oracle_host_pre_gate, &oracle_pre_gate);
+        let loaded_prefix_k_vs_oracle =
+            validate::max_abs_delta(&prefix_k, &oracle_prefix_k);
+        let loaded_prefix_v_vs_oracle =
+            validate::max_abs_delta(&prefix_v, &oracle_prefix_v);
         let mut head_deltas = Vec::with_capacity(num_heads);
         for head in 0..num_heads {
             let start = head * head_dim;
@@ -3561,7 +3693,7 @@ fn trace_oracle_prefill_layer(
             ));
         }
         eprintln!(
-            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
+            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} host_pre_gate_vs_stage={host_pre_gate_vs_stage:.6} host_pre_gate_vs_oracle={host_pre_gate_vs_oracle:.6} oracle_host_pre_gate_vs_oracle={oracle_host_pre_gate_vs_oracle:.6} loaded_prefix_k_vs_oracle={loaded_prefix_k_vs_oracle:.6} loaded_prefix_v_vs_oracle={loaded_prefix_v_vs_oracle:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
         );
     }
     Ok(())
