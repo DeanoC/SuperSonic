@@ -73,12 +73,15 @@ shipping path for E4B on gfx1150.
 
 Qwen3.5 BF16, 8-token generation, prefill ms + decode ms/tok at varying
 prompt size. Decode grows slowly with KV size; prefill grows linearly
-with prompt tokens:
+with prompt tokens. Prefill numbers reflect the RDNA3 WMMA
+(`v_wmma_f32_16x16x16_bf16`) matmul shipped 2026-04-20; set
+`SUPERSONIC_QWEN4B_DISABLE_WMMA=1` to fall back to the scalar kernel.
 
-| Variant            | 66 tok prefill | 258 tok prefill | 1026 tok prefill | decode @66 | decode @258 | decode @1026 |
-|--------------------|---------------:|----------------:|-----------------:|-----------:|------------:|-------------:|
-| qwen3.5-0.8b BF16  |     555 ms     |     2230 ms     |     11299 ms     |  77 ms/tok |  84 ms/tok  | 122 ms/tok   |
-| qwen3.5-2b  BF16   |    1310 ms     |     5412 ms     |     23963 ms     | 167 ms/tok | 233 ms/tok  | 229 ms/tok   |
+| Variant            | 1020 tok prefill (WMMA) | 1020 tok prefill (scalar) | WMMA speedup |
+|--------------------|------------------------:|--------------------------:|:-------------|
+| qwen3.5-0.8b BF16  |        5879 ms          |        11244 ms           |   1.91×      |
+| qwen3.5-2b  BF16   |        9206 ms          |        24963 ms           |   2.71×      |
+| qwen3.5-4b  BF16   |       29891 ms          |        70075 ms           |   2.34×      |
 
 At 1026-token prompts **prefill is 11-13× the total decode time for an
 8-token reply**. Any further decode optimization (cooperative launch
@@ -126,11 +129,13 @@ Implications for future work:
   is sub-linear because fixed kernel-launch and barrier overhead
   dominates at small KV sizes. In absolute terms it stays small
   (≤5% of decode step time across tested contexts).
-- Prefill is the big lever. 80% of its time is
-  `matmul_rhs_transposed_tiled_kernel`, a naive scalar-FMA
-  shared-memory tiled matmul with no WMMA. RDNA3's
-  `v_wmma_f32_16x16x16_bf16` (wavefront matrix op) would potentially
-  give 2-4× on that kernel and ~60-70% on prefill overall.
+- Prefill's dominant matmul used to be a naive scalar-FMA tiled kernel
+  eating ~80% of prefill time. As of 2026-04-20 it runs on a WMMA
+  (`v_wmma_f32_16x16x16_bf16`) port that lands 1.9–2.7× on prefill
+  end-to-end for the three BF16 Qwen variants (see the table above).
+  Further wins on top are possible — shared-memory tiling across
+  multiple waves, larger output tiles per block, dual-issue packing —
+  but require a second pass.
 
 ## CUDA — `sm86` (NVIDIA RTX 3090-class)
 
