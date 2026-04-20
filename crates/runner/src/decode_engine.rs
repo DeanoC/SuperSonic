@@ -2828,31 +2828,65 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
-        kernel_ffi::persistent_decode_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            config.num_hidden_layers,
-            config.hidden_size,
-            config.intermediate_size,
-            seqlen_offset,
-            &self.scratch.desc_device,
-            &mut self.hidden_io,
-            &mut self.scratch.workspace,
-            &mut self.scratch.sync_buf,
-            &self.rotary.cos,
-            &self.rotary.sin,
-            self.rotary.rotary_dim,
-            self.proj_buf_floats,
-            self.attn_scratch_floats,
-            self.fp8_scale_device.as_ref(),
-            self.scratch.kv_fp8_desc_device.as_ref(),
-            b,
-            self.scratch.batch_seq_desc_device.as_ref(),
-            self.int4_scale_device.as_ref(),
-            enable_timing_slots,
-            false,
-        )
-        .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let persist_result = if use_qwen35_4b_cuda_hero {
+            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                enable_timing_slots,
+                false,
+            )
+        } else {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                enable_timing_slots,
+                false,
+            )
+        };
+        persist_result
+            .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         if enable_timing_slots {
             let clock_rate_khz = gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
