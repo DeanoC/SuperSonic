@@ -681,6 +681,120 @@ __global__ void g4_matvec_batched_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA BF16 kernel for Gemma 4 prefill matvec.
+//
+// `g4_matvec_batched_kernel` is work-stealing and reduces one output element
+// per thread block — fine for decode (seq_len=1) where parallelism comes from
+// the `out_dim` axis, but it leaves the matrix units idle on prefill where
+// seq_len >> 1 and the work naturally has a matmul shape
+// (seq_len × in_dim × out_dim).
+//
+// This kernel consumes the same data layout (x: [seq_len, in_dim],
+// W: [out_dim, in_dim]) and produces the same output ([seq_len, out_dim]),
+// but runs as a tiled WMMA matmul instead. Each wavefront computes one
+// 16×16 output tile, accumulating along the in_dim axis in 16-wide chunks
+// with an F32 accumulator.
+//
+// Grid  : (ceil(out_dim/16), ceil(seq_len/16), 1)
+// Block : 32 threads (one wavefront)
+//
+// WMMA is a cross-lane instruction: every lane must participate with
+// well-defined A/B inputs. We keep the WMMA call uniform across the wave
+// and only guard the loads (zero-pad out-of-range lanes) — divergent WMMA
+// returns garbage on the in-range lanes too because it assembles its
+// operand matrix from every lane's registers.
+// =============================================================================
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__)
+#define G4_HAS_WMMA_BF16 1
+#endif
+
+typedef short  g4_short16 __attribute__((ext_vector_type(16)));
+typedef float  g4_float8  __attribute__((ext_vector_type(8)));
+
+__global__ void g4_matvec_batched_wmma_bf16_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    const hip_bfloat16* __restrict__ x,    // [seq_len, in_dim]
+    const hip_bfloat16* __restrict__ W,    // [out_dim, in_dim]
+    hip_bfloat16* __restrict__ out         // [seq_len, out_dim]
+) {
+#ifdef G4_HAS_WMMA_BF16
+    const int lane = threadIdx.x;             // 0..31
+    const int lane_row = lane & 15;           // which row this lane owns
+    const int lane_half = lane >> 4;          // 0 for lanes 0-15, 1 for lanes 16-31
+    const int tile_row = blockIdx.y * 16;     // seq_len axis
+    const int tile_col = blockIdx.x * 16;     // out_dim axis
+
+    const int x_row_idx = tile_row + lane_row;
+    const int w_row_idx = tile_col + lane_row;
+    const bool x_in_range = x_row_idx < seq_len;
+    const bool w_in_range = w_row_idx < out_dim;
+
+    const uint16_t* x_row_u16 = reinterpret_cast<const uint16_t*>(x) +
+                                static_cast<size_t>(x_row_idx) * in_dim;
+    const uint16_t* w_row_u16 = reinterpret_cast<const uint16_t*>(W) +
+                                static_cast<size_t>(w_row_idx) * in_dim;
+
+    g4_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = in_dim & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        g4_short16 a;
+        g4_short16 b;
+        if (x_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(x_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+        if (w_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = static_cast<short>(w_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    // Tail (in_dim % 16 != 0): pad with zeros. Unlikely for Gemma 4.
+    if (k_main != in_dim) {
+        g4_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        g4_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            int kc = k_main + i;
+            if (kc < in_dim) {
+                if (x_in_range) a[i] = static_cast<short>(x_row_u16[kc]);
+                if (w_in_range) b[i] = static_cast<short>(w_row_u16[kc]);
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    // Store: lane L writes out[2*i + lane_half, lane_row] = acc[i] for i in 0..8.
+    const int out_col = tile_col + lane_row;
+    if (out_col < out_dim) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < seq_len) {
+                out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)seq_len; (void)in_dim; (void)out_dim;
+    (void)x; (void)W; (void)out;
+#endif
+}
+
 // Batched INT4 matvec. Computes `out[s, r] = dot(dequant(W[r, :]), x[s, :])`
 // for every (s, r) pair. Work-stealing block claims one (s, r) item at a time
 // from `counter`. Same runtime format as the single-token INT4 kernel.
