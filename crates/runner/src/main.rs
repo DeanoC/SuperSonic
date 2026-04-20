@@ -975,6 +975,7 @@ fn main() -> Result<()> {
             &oracle_script, &model_id, &prompt_ids, cli.max_new_tokens,
             &cli.oracle_dtype, &oracle_device, true,
             fp8_oracle_dir.as_deref(),
+            None,
         )?;
         engine.load_prefill_state(&output)?;
         let first = output.generated_token_ids[0];
@@ -1033,6 +1034,8 @@ fn main() -> Result<()> {
             &oracle_device,
             emit_state,
             fp8_oracle_dir.as_deref(),
+            cli.trace_oracle_prefill_layer
+                .filter(|layer| text_config.is_full_attention(*layer)),
         )?;
 
         // Compare prefill logits
@@ -3330,7 +3333,34 @@ fn trace_oracle_prefill_layer(
         oracle_device,
         true,
         fp8_oracle_dir,
+        None,
     )?;
+    let mut native_prefix_k_delta = None;
+    let mut native_prefix_v_delta = None;
+    if engine.weights().config.is_full_attention(trace_layer) {
+        engine.reset()?;
+        let _ = engine.prefill_native(prefix_ids)?;
+        let (native_prefix_k, native_prefix_v, native_prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        engine.reset()?;
+        engine.load_prefill_state(&prefix_oracle)?;
+        let (oracle_prefix_k, oracle_prefix_v, oracle_prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        anyhow::ensure!(
+            native_prefix_len == oracle_prefix_len,
+            "trace layer {trace_layer} native prefix len {} != oracle prefix len {}",
+            native_prefix_len,
+            oracle_prefix_len,
+        );
+        native_prefix_k_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_prefix_k),
+            &decode_bf16_le(&oracle_prefix_k),
+        ));
+        native_prefix_v_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_prefix_v),
+            &decode_bf16_le(&oracle_prefix_v),
+        ));
+    }
     engine.reset()?;
     engine.load_prefill_state(&prefix_oracle)?;
 
@@ -3401,6 +3431,73 @@ fn trace_oracle_prefill_layer(
     eprintln!(
         "[trace-oracle-prefill-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
     );
+    if let (Some(k_delta), Some(v_delta)) = (native_prefix_k_delta, native_prefix_v_delta) {
+        eprintln!(
+            "[trace-oracle-prefix-kv] layer={trace_layer} k_delta={k_delta:.6} v_delta={v_delta:.6}"
+        );
+    }
+
+    if engine.weights().config.is_full_attention(trace_layer)
+        && oracle_full.traced_full_attn_layer == Some(trace_layer)
+    {
+        let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
+            let bytes = b64
+                .decode(field.as_ref().ok_or_else(|| anyhow::anyhow!("oracle output missing {label}"))?)
+                .map_err(|e| anyhow::anyhow!("decode oracle {label}: {e}"))?;
+            Ok(decode_bf16_le(&bytes))
+        };
+        let oracle_normed = decode_opt_bf16(&oracle_full.traced_full_attn_normed, "traced_full_attn_normed")?;
+        let oracle_q_proj = decode_opt_bf16(&oracle_full.traced_full_attn_q_proj, "traced_full_attn_q_proj")?;
+        let oracle_gate = decode_opt_bf16(&oracle_full.traced_full_attn_gate_proj, "traced_full_attn_gate_proj")?;
+        let oracle_k_proj = decode_opt_bf16(&oracle_full.traced_full_attn_k_proj, "traced_full_attn_k_proj")?;
+        let oracle_v_proj = decode_opt_bf16(&oracle_full.traced_full_attn_v_proj, "traced_full_attn_v_proj")?;
+        let oracle_q_rope = decode_opt_bf16(&oracle_full.traced_full_attn_q_rope, "traced_full_attn_q_rope")?;
+        let oracle_k_rope = decode_opt_bf16(&oracle_full.traced_full_attn_k_rope, "traced_full_attn_k_rope")?;
+        let oracle_pre_gate = decode_opt_bf16(&oracle_full.traced_full_attn_pre_gate, "traced_full_attn_pre_gate")?;
+        let oracle_gated = decode_opt_bf16(&oracle_full.traced_full_attn_gated, "traced_full_attn_gated")?;
+        let oracle_gated_actual = decode_opt_bf16(
+            &oracle_full.traced_full_attn_gated_actual,
+            "traced_full_attn_gated_actual",
+        )?;
+
+        let stage = engine.trace_full_attention_stages_from_hidden(trace_layer, &oracle_input_bytes, prefix_ids.len())?;
+        let stage_out = engine.trace_full_attention_layer_output_from_hidden_current_state(
+            trace_layer,
+            0,
+            &oracle_input_bytes,
+            prefix_ids.len(),
+        )?;
+        let normed_delta = validate::max_abs_delta(&decode_bf16_le(&stage.normed), &oracle_normed);
+        let q_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_proj), &oracle_q_proj);
+        let gate_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.gate_proj), &oracle_gate);
+        let k_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_proj), &oracle_k_proj);
+        let v_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.v_proj), &oracle_v_proj);
+        let q_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_rope), &oracle_q_rope);
+        let k_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_rope), &oracle_k_rope);
+        let pre_gate_stage_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.pre_gate), &oracle_pre_gate);
+        let gated_stage_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.gated), &oracle_gated);
+        let gated_actual_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.gated), &oracle_gated_actual);
+        let gated_reconstruct_delta =
+            validate::max_abs_delta(&oracle_gated, &oracle_gated_actual);
+        let head_dim = engine.weights().config.head_dim;
+        let num_heads = engine.weights().config.num_attention_heads;
+        let pre_gate_host = decode_bf16_le(&stage_out.pre_gate);
+        let mut head_deltas = Vec::with_capacity(num_heads);
+        for head in 0..num_heads {
+            let start = head * head_dim;
+            let end = start + head_dim;
+            head_deltas.push(validate::max_abs_delta(
+                &pre_gate_host[start..end],
+                &oracle_pre_gate[start..end],
+            ));
+        }
+        eprintln!(
+            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
+        );
+    }
     Ok(())
 }
 
