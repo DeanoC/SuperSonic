@@ -135,6 +135,11 @@ unsafe extern "C" {
         arch_name_len: usize,
         total_vram_out: *mut u64,
     ) -> c_int;
+
+    fn dotcache_hip_device_clock_khz(
+        device_ordinal: c_int,
+        clock_rate_khz_out: *mut u32,
+    ) -> c_int;
 }
 
 #[cfg(supersonic_backend_cuda)]
@@ -1010,4 +1015,18 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
         .to_string_lossy()
         .into_owned();
     Ok((arch_name, total_vram))
+}
+
+/// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.
+pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
+    let mut clock_khz: u32 = 0;
+    let status = unsafe {
+        dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz)
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "hip_device_clock_khz failed with status {status}"
+        )));
+    }
+    Ok(clock_khz)
 }
