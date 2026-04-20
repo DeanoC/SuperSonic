@@ -4958,7 +4958,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // b_proj and a_proj have linear_num_v_heads rows (not num_k_heads)
             const int nv_heads = L.linear_num_v_heads;
             const int total_proj = L.qkv_out_dim + L.z_out_dim + nv_heads + nv_heads;
-            {
+            // INT4 path keeps block-level reduction for bit-exact numerics on
+            // small models (0.8B INT4 argmax was knife-edge sensitive to the
+            // wave-per-row reassociation). BF16/FP8 use wave-per-row.
+            if (int4_scales != nullptr) {
                 for (;;) {
                     unsigned int sr;
                     if (tid == 0) sr = atomicAdd(&counters[0], 1u);
@@ -4969,36 +4972,37 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
 
                     const void* w_raw;
-                    const void* w_scale = nullptr;
+                    const void* w_scale = nullptr;      // FP8 scale (may coexist)
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
                         w_raw = L.qkv_proj_w;
                         row = sr;
+                        w_i4_scale = int4_scales[layer].qkv_proj_scale;
+                        w_i4_zero = int4_scales[layer].qkv_proj_zero;
                         if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
+                        w_i4_scale = int4_scales[layer].z_proj_scale;
+                        w_i4_zero = int4_scales[layer].z_proj_zero;
                         if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
+                        // b_proj: no INT4 variant
                         if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
-                        // b_proj: keep BF16 (only 16 rows, no INT4)
                     } else {
                         w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                        // a_proj: no INT4 variant
                         if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
-                        // a_proj: keep BF16 (only 16 rows, no INT4)
                     }
 
                     float p[MAX_BATCH_SIZE];
                     for (int b = 0; b < B; b++) p[b] = 0.0f;
-                    if (int4_scales != nullptr && w_i4_scale != nullptr) {
-                        // INT4 dequant path for qkv/z projections
+                    if (w_i4_scale != nullptr) {
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = hidden_dim / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
@@ -5022,7 +5026,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
-                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                    } else if (w_scale != nullptr) {
                         for (int c = tid; c < hidden_dim; c += bs) {
                             float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
                             for (int b = 0; b < B; b++)
@@ -5057,6 +5061,68 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (tid == 0)
                             proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(lds[0]);
                         __syncthreads();
+                    }
+                }
+            } else {
+                const int lane_p = tid % warpSize;
+                for (;;) {
+                    unsigned int sr;
+                    if (lane_p == 0) sr = atomicAdd(&counters[0], 1u);
+                    sr = __shfl(sr, 0);
+                    if (sr >= static_cast<unsigned int>(total_proj)) break;
+
+                    const void* w_raw;
+                    const void* w_scale = nullptr;
+                    int row;
+                    if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
+                        w_raw = L.qkv_proj_w;
+                        row = sr;
+                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
+                        w_raw = L.z_proj_w;
+                        row = sr - L.qkv_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
+                        w_raw = L.b_proj_w;
+                        row = sr - L.qkv_out_dim - L.z_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
+                    } else {
+                        w_raw = L.a_proj_w;
+                        row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
+                    }
+
+                    float p[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) p[b] = 0.0f;
+                    if (fp8_scales != nullptr && w_scale != nullptr) {
+                        for (int c = lane_p; c < hidden_dim; c += warpSize) {
+                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    } else {
+                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                        const int vd4 = hidden_dim & ~3;
+                        for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                            float w0 = dotcache_qwen35_to_float(wr[c]);
+                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                            }
+                        }
+                        for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                            float w = dotcache_qwen35_to_float(wr[c]);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    }
+                    for (int b = 0; b < B; b++) {
+                        float result = wave_reduce_sum_f32(p[b]);
+                        if (lane_p == 0)
+                            proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(result);
                     }
                 }
             }
@@ -5314,17 +5380,22 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
-                for (;;) {
-                    unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __shared__ unsigned int shared_sr;
-                    if (tid == 0) shared_sr = sr;
-                    __syncthreads();
-                    sr = shared_sr;
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+                // INT4 keeps block-level reduction for bit-exact numerics;
+                // BF16/FP8 use wave-per-row.
+                const bool out_int4 =
+                    (int4_scales != nullptr &&
+                     int4_scales[layer].linear_out_proj_scale != nullptr);
+                if (out_int4) {
+                    for (;;) {
+                        unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __shared__ unsigned int shared_sr;
+                        if (tid == 0) shared_sr = sr;
+                        __syncthreads();
+                        sr = shared_sr;
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    float p = 0.0f;
-                    if (int4_scales != nullptr && int4_scales[layer].linear_out_proj_scale != nullptr) {
+                        float p = 0.0f;
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = vd / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
@@ -5342,34 +5413,61 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         for (int c = vd8 + tid; c < vd; c += bs)
                             p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
-                    } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
-                        for (int c = tid; c < vd; c += bs)
-                            p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
-                    } else {
-                        const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
-                        if (kv_fp8 != nullptr) {
-                            if (tid == 0) {
-                                for (int c = 0; c < vd; ++c) {
-                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                                }
-                            }
-                        } else {
-                            for (int c = tid; c < vd; c += bs)
-                                p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
+                            if (tid < stride) lds[tid] += lds[tid + stride];
+                            __syncthreads();
                         }
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
+                        if (tid == 0) {
+                            float add = bf16_round_rne_f32_finite(lds[0]);
+                            hidden_f32[b * hidden_dim + sr] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                        }
                         __syncthreads();
                     }
-                    if (tid == 0) {
-                        float add = bf16_round_rne_f32_finite(lds[0]);
-                        hidden_f32[b * hidden_dim + sr] =
-                            bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                } else {
+                    const int lane_o = tid % warpSize;
+                    for (;;) {
+                        unsigned int sr;
+                        if (lane_o == 0) sr = atomicAdd(&counters[0], 1u);
+                        sr = __shfl(sr, 0);
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        float p = 0.0f;
+                        if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
+                            for (int c = lane_o; c < vd; c += warpSize)
+                                p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
+                        } else {
+                            const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
+                            if (kv_fp8 != nullptr) {
+                                if (lane_o == 0) {
+                                    for (int c = 0; c < vd; ++c) {
+                                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                                    }
+                                }
+                            } else {
+                                const int vd4 = vd & ~3;
+                                for (int c = lane_o * 4; c < vd4; c += warpSize * 4) {
+                                    float w0 = dotcache_qwen35_to_float(wr[c]);
+                                    float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                    float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                    float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                    p += w0 * lds_input[c]   + w1 * lds_input[c+1]
+                                       + w2 * lds_input[c+2] + w3 * lds_input[c+3];
+                                }
+                                for (int c = vd4 + lane_o; c < vd; c += warpSize)
+                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                            }
+                        }
+                        float result = wave_reduce_sum_f32(p);
+                        if (lane_o == 0) {
+                            float add = bf16_round_rne_f32_finite(result);
+                            hidden_f32[b * hidden_dim + sr] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                        }
                     }
-                    __syncthreads();
                 }
             }
             __syncthreads();
