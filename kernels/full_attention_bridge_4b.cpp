@@ -6,6 +6,27 @@
 
 namespace {
 
+// Per-model launch preset, set once at startup by the Rust registry via
+// `dotcache_qwen35_4b_hip_set_launch_preset`. Read by the persistent-decode
+// bridge when the user hasn't supplied `SUPERSONIC_QWEN4B_BLOCKS`. Zero
+// means "no preset, use the hardcoded gfx11xx default".
+int g_preset_blocks = 0;
+int g_preset_coop = 0;
+
+inline void qwen4b_get_launch_preset(int& blocks, int& coop) {
+    blocks = g_preset_blocks;
+    coop = g_preset_coop;
+}
+
+} // anonymous namespace
+
+extern "C" void dotcache_qwen35_4b_hip_set_launch_preset(int blocks, int coop) {
+    g_preset_blocks = blocks;
+    g_preset_coop = coop;
+}
+
+namespace {
+
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -4603,28 +4624,32 @@ int persistent_decode_device(
     // Higher multipliers (3x+) hang silently on models with more
     // transformer layers (qwen3.5-2b at 4x produces no output) —
     // suspected grid_barrier scaling issue. Env var
-    // `SUPERSONIC_QWEN4B_BLOCKS` allows runtime override for tuning.
-    // Default grid size: 2x multiProcessorCount on RDNA3/gfx11xx (empirically
-    // safe on every tested Qwen variant, ~1.5-1.6x decode speedup over 1x).
-    // SUPERSONIC_QWEN4B_BLOCKS overrides the grid. SUPERSONIC_QWEN4B_COOP
-    // (set when overriding past 2x) promotes the launch to
-    // hipLaunchCooperativeKernel so the runtime rejects rather than
-    // deadlocks when the grid exceeds hardware concurrent capacity. This
-    // is the only safe way to explore higher multipliers — the homebrew
-    // grid_barrier assumes every block is co-resident for the entire
-    // kernel, and non-cooperative launch can queue excess blocks behind
-    // resident ones, causing a deadlock at the first grid_barrier.
+    // Grid-size priority (first match wins):
+    //   1. SUPERSONIC_QWEN4B_BLOCKS env var (explicit user override).
+    //   2. Per-model preset set via `dotcache_qwen35_4b_hip_set_launch_preset`
+    //      from the Rust registry (e.g. 0.8B gets 32 + cooperative).
+    //   3. 2x multiProcessorCount default on RDNA3/gfx11xx (empirically
+    //      safe at non-cooperative launch on every tested Qwen variant).
     //
-    // Cooperative launch queries `hipOccupancyMaxActiveBlocksPerMultiprocessor`
-    // which is conservative: on 4B the cap is 1 block/MP vs. 2 that
-    // non-cooperative launch handles empirically, so cooperative launch
-    // regresses 4B throughput. We therefore stay non-cooperative at the
-    // default 2x and only opt in when the user explicitly requests it.
+    // Cooperative launch is enabled when SUPERSONIC_QWEN4B_COOP is set OR
+    // when the active preset opts in. The homebrew `grid_barrier` assumes
+    // every block is co-resident; cooperative launch enforces that and
+    // fails cleanly on over-subscription instead of deadlocking.
+    //
+    // Why cooperative is opt-in rather than always-on: `hipOccupancyMax-
+    // ActiveBlocksPerMultiprocessor` is strictly conservative — on 4B it
+    // reports 1 block/MP while non-cooperative launch empirically handles
+    // 2. Cooperative-by-default would regress 4B throughput.
     int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
-    bool env_override = false;
+    int preset_blocks = 0, preset_coop = 0;
+    qwen4b_get_launch_preset(preset_blocks, preset_coop);
+    bool preset_coop_hint = false;
     if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
         int override_val = std::atoi(bs_env);
-        if (override_val > 0) { num_blocks = override_val; env_override = true; }
+        if (override_val > 0) { num_blocks = override_val; }
+    } else if (preset_blocks > 0) {
+        num_blocks = preset_blocks;
+        preset_coop_hint = preset_coop != 0;
     } else {
         const char* arch = props.gcnArchName;
         const bool is_rdna3_wgp_arch =
@@ -4635,7 +4660,7 @@ int persistent_decode_device(
         }
     }
     const bool coop_requested =
-        env_override && std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr;
+        std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr || preset_coop_hint;
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
