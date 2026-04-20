@@ -77,7 +77,20 @@ int full_attention_prefill_device(
     if (hipMalloc(&d_row_counter, sizeof(unsigned int)) != hipSuccess) return 2;
     if (hipMemset(d_row_counter, 0, sizeof(unsigned int)) != hipSuccess) return 10;
 
-    const int grid = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    // On RDNA3/gfx11xx `multiProcessorCount` reports WGPs (half the CU
+    // count), leaving half the device idle when we grid the prefill
+    // attention against it directly. Oversubscribe 2x on those arches,
+    // matching the decode default. The atomic row-counter inside the
+    // kernel already balances work across blocks, so extra blocks are
+    // harmless on arches where `multiProcessorCount` already reports CUs.
+    int grid = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    {
+        const char* arch = props.gcnArchName;
+        const bool is_rdna3_wgp_arch =
+            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+            arch[3] == '1' && arch[4] == '1';
+        if (is_rdna3_wgp_arch) grid *= 2;
+    }
     const int block = props.warpSize > 0 ? props.warpSize : 32;
     if (head_dim > block * 8) return 14;
     hipLaunchKernelGGL(
