@@ -135,7 +135,13 @@ unsafe extern "C" {
         arch_name_len: usize,
         total_vram_out: *mut u64,
     ) -> c_int;
+}
 
+// HIP-only: the clock-rate bridge lives in `full_attention_bridge.cpp` and has
+// no CUDA counterpart (CUDA timing paths get clockRate via
+// `cudaGetDeviceProperties` on the Rust side).
+#[cfg(supersonic_backend_hip)]
+unsafe extern "C" {
     fn dotcache_hip_device_clock_khz(
         device_ordinal: c_int,
         clock_rate_khz_out: *mut u32,
@@ -1018,7 +1024,17 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
 }
 
 /// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.
+///
+/// On non-HIP builds this returns `GpuError::InvalidArg`; the caller is
+/// responsible for only invoking it when the active backend is HIP.
 pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = ordinal;
+        return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+    }
+    #[cfg(supersonic_backend_hip)]
+    {
     let mut clock_khz: u32 = 0;
     let status = unsafe {
         dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz)
@@ -1029,4 +1045,5 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
         )));
     }
     Ok(clock_khz)
+    }
 }
