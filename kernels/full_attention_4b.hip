@@ -4972,6 +4972,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
 
                     const void* w_raw;
+                    const void* w_scale = nullptr;      // FP8 scale (may coexist)
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
                     int row;
@@ -4980,19 +4981,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         row = sr;
                         w_i4_scale = int4_scales[layer].qkv_proj_scale;
                         w_i4_zero = int4_scales[layer].qkv_proj_zero;
+                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
                         w_i4_scale = int4_scales[layer].z_proj_scale;
                         w_i4_zero = int4_scales[layer].z_proj_zero;
+                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
-                        // b_proj: BF16 (16 rows, no INT4)
+                        // b_proj: no INT4 variant
+                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
                     } else {
                         w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
-                        // a_proj: BF16 (16 rows, no INT4)
+                        // a_proj: no INT4 variant
+                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
                     }
 
                     float p[MAX_BATCH_SIZE];
@@ -5018,6 +5023,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         for (int c = vd8 + tid; c < hidden_dim; c += bs) {
                             float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    } else if (w_scale != nullptr) {
+                        for (int c = tid; c < hidden_dim; c += bs) {
+                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
