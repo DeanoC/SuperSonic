@@ -195,6 +195,7 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
         let obj_path = out_dir.join(obj_name);
         cmd.arg("-std=c++17")
             .arg("-O3")
+            .arg("--use_fast_math")
             .arg("-Xcompiler")
             .arg("-fPIC")
             .arg("-I")

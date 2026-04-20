@@ -14,7 +14,7 @@ use anyhow::Result;
 use base64::Engine as _;
 use clap::Parser;
 
-use decode_engine::DecodeEngine;
+use decode_engine::{DecodeEngine, DecodeStageTimings};
 use qwen35::state::{LayerState, ModelState};
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 
@@ -141,6 +141,10 @@ struct Cli {
     /// Device ordinal on the selected backend
     #[arg(long, default_value = "0")]
     device: usize,
+
+    /// Emit aggregated native decode stage timings at the end of the run.
+    #[arg(long)]
+    emit_stage_timings: bool,
 
     /// Run PyTorch oracle and compare logits
     #[arg(long)]
@@ -1020,6 +1024,33 @@ fn main() -> Result<()> {
         cli.batch_size == 1 && params.use_4b_kernel && cli.force_component_decode;
     let kernel_single_decode_enabled =
         cli.batch_size == 1 && params.use_4b_kernel && (cli.force_kernel_decode || cli.kv_fp8);
+    let cuda_08b_hero_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();
+    let cuda_08b_hero_enabled = backend == Backend::Cuda
+        && gpu_arch == GpuArch::Sm86
+        && model_variant == ModelVariant::Qwen3_5_0_8B
+        && !params.use_4b_kernel
+        && cli.batch_size == 1
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !cli.force_component_decode
+        && !cli.force_kernel_decode
+        && !cli.kv_fp8
+        && oracle_output.is_none()
+        && !engine.weights().is_fp8
+        && !engine.weights().is_int4
+        && !cuda_08b_hero_disabled;
+    let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
+    let cuda_fast_greedy_enabled = backend == Backend::Cuda
+        && !params.use_4b_kernel
+        && cli.batch_size == 1
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !cli.force_component_decode
+        && !cli.force_kernel_decode
+        && !cli.kv_fp8
+        && oracle_output.is_none()
+        && !cuda_08b_hero_enabled
+        && !cuda_fast_greedy_disabled;
     if replay_decode_enabled {
         eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
@@ -1032,6 +1063,10 @@ fn main() -> Result<()> {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.kv_fp8 {
         eprintln!("[decode] WARNING: experimental single-sequence KV-FP8 uses the b=1 kernel path");
+    } else if cuda_08b_hero_enabled {
+        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled (fused lm_head argmax)");
+    } else if cuda_fast_greedy_enabled {
+        eprintln!("[decode] CUDA fast greedy sampling enabled for the non-4B native decode path");
     }
 
     // Decode loop
@@ -1039,6 +1074,8 @@ fn main() -> Result<()> {
     let mut generated_ids: Vec<u32> = Vec::new();
     let mut max_delta = 0.0f32;
     let mut gpu_max_delta = 0.0f32;
+    let mut native_decode_timings = DecodeStageTimings::default();
+    let mut native_decode_timing_steps = 0usize;
     let eos_ids = text_config.eos_token_ids();
 
     // For batched decode, track per-sequence tokens
@@ -1147,7 +1184,7 @@ fn main() -> Result<()> {
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
-            let batch_logits = if replay_kv_fp8_enabled {
+            let (batch_logits, batch_timings) = if replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -1155,11 +1192,19 @@ fn main() -> Result<()> {
                     .chain(std::iter::once(next_token))
                     .collect();
                 let logits = engine.rebuild_prefill_state(&token_ids, true)?;
-                vec![logits; cli.batch_size]
+                (vec![logits; cli.batch_size], None)
+            } else if cli.emit_stage_timings {
+                let (logits, timings) =
+                    engine.decode_step_batch_with_timings(&batch_next_tokens, seqlen_offset)?;
+                (logits, Some(timings))
             } else {
                 // Batched decode
-                engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?
+                (engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?, None)
             };
+            if let Some(timings) = batch_timings {
+                native_decode_timings.add_assign(timings);
+                native_decode_timing_steps += 1;
+            }
 
             // Use sequence 0's logits for output and validation
             let logits = &batch_logits[0];
@@ -1177,8 +1222,13 @@ fn main() -> Result<()> {
             }
 
             // Sample next tokens for all sequences
+            let sampling_start = Instant::now();
             for (bi, seq_logits) in batch_logits.iter().enumerate() {
                 batch_next_tokens[bi] = DecodeEngine::greedy_sample(seq_logits);
+            }
+            if batch_timings.is_some() {
+                native_decode_timings.host_sampling_ms +=
+                    sampling_start.elapsed().as_secs_f64() * 1000.0;
             }
 
             generated_ids.push(next_token);
@@ -1203,7 +1253,20 @@ fn main() -> Result<()> {
             next_token = batch_next_tokens[0];
         } else {
             // Single-sequence decode (original path)
-            let logits = if replay_decode_enabled {
+            let mut maybe_fast_token = None;
+            let logits = if cuda_fast_greedy_enabled {
+                let (token, timings) = engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
+                native_decode_timings.add_assign(timings);
+                native_decode_timing_steps += 1;
+                maybe_fast_token = Some(token);
+                Vec::new()
+            } else if cuda_08b_hero_enabled {
+                let (token, timings) = engine.decode_step_cuda_08b_hero(next_token, seqlen_offset)?;
+                native_decode_timings.add_assign(timings);
+                native_decode_timing_steps += 1;
+                maybe_fast_token = Some(token);
+                Vec::new()
+            } else if replay_decode_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -1357,11 +1420,24 @@ fn main() -> Result<()> {
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
-                engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
+                if cli.emit_stage_timings {
+                    let (logits, timings) =
+                        engine.decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
+                    native_decode_timings.add_assign(timings);
+                    native_decode_timing_steps += 1;
+                    logits
+                } else {
+                    engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
+                }
+            } else if cli.emit_stage_timings {
+                let (logits, timings) = engine.decode_step_with_timings(next_token, seqlen_offset)?;
+                native_decode_timings.add_assign(timings);
+                native_decode_timing_steps += 1;
+                logits
             } else {
                 engine.decode_step(next_token, seqlen_offset)?
             };
-            let native_token = DecodeEngine::greedy_sample(&logits);
+            let native_token = maybe_fast_token.unwrap_or_else(|| DecodeEngine::greedy_sample(&logits));
 
             if let Some(ref oracle) = oracle_output {
                 if step < oracle.decode_logits.len() {
@@ -1451,6 +1527,33 @@ fn main() -> Result<()> {
         if generated_ids.is_empty() { 0.0 } else { decode_ms / generated_ids.len() as f64 },
         cli.batch_size,
     );
+    if cli.emit_stage_timings {
+        if native_decode_timing_steps > 0 {
+            eprintln!(
+                "[stage-timings] steps={} persistent_ms={:.3} rms_norm_ms={:.3} lm_head_ms={:.3} logits_d2h_ms={:.3} host_sampling_ms={:.3} gpu_argmax_ms={:.3} token_d2h_ms={:.3} total_native_decode_ms={:.3} persistent_full_attn_ms={:.3} persistent_full_attn_proj_ms={:.3} persistent_full_attn_core_ms={:.3} persistent_full_attn_out_ms={:.3} persistent_linear_proj_ms={:.3} persistent_linear_core_ms={:.3} persistent_linear_out_ms={:.3} persistent_mlp_gate_up_ms={:.3} persistent_mlp_down_ms={:.3}",
+                native_decode_timing_steps,
+                native_decode_timings.persistent_ms,
+                native_decode_timings.rms_norm_ms,
+                native_decode_timings.lm_head_ms,
+                native_decode_timings.logits_d2h_ms,
+                native_decode_timings.host_sampling_ms,
+                native_decode_timings.gpu_argmax_ms,
+                native_decode_timings.token_d2h_ms,
+                native_decode_timings.total_ms(),
+                native_decode_timings.persistent_full_attn_ms,
+                native_decode_timings.persistent_full_attn_proj_ms,
+                native_decode_timings.persistent_full_attn_core_ms,
+                native_decode_timings.persistent_full_attn_out_ms,
+                native_decode_timings.persistent_linear_proj_ms,
+                native_decode_timings.persistent_linear_core_ms,
+                native_decode_timings.persistent_linear_out_ms,
+                native_decode_timings.persistent_mlp_gate_up_ms,
+                native_decode_timings.persistent_mlp_down_ms,
+            );
+        } else {
+            eprintln!("[stage-timings] steps=0 note=no native decode stage timings collected for this path");
+        }
+    }
 
     Ok(())
 }

@@ -143,6 +143,8 @@ Each `sm86` script currently validates:
 - golden corpus coverage
 
 `tests/sm86/run_batch.sh` adds `qwen3.5-4b --batch-size 2` coverage on the same `sm86` target.
+`tests/sm86/run_fast_greedy.sh` checks that the CUDA fast-greedy 0.8B path
+matches the legacy host-logits sampling path on short, medium, and long prompts.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference
@@ -174,6 +176,43 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
   /path/to/Qwen3.5-4B
 ```
 
+For a warmed Lucebox-style `qwen3.5-0.8b` parity run on `sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen08.sh \
+  /path/to/Qwen3.5-0.8B
+```
+
+That harness defaults to batch-1 BF16, a roughly `pp520` prompt target,
+`tg128`, `10` warmup runs, `20` timed runs, and prints aggregated native decode
+stage timings from `--emit-stage-timings`.
+
+For a warmed single-sequence native-kernel `qwen3.5-4b` run on `sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
+  /path/to/Qwen3.5-4B
+```
+
+That harness forces `--force-kernel-decode` so the run measures the native
+single-sequence `4B` kernel instead of the default replayed-prefill
+correctness path.
+
+The current `qwen3.5-0.8b` CUDA `sm86` optimization record, benchmark progression,
+remaining gap to Lucebox, and carry-forward process for the other supported Qwen3.5
+CUDA models are tracked in [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
+
+For a one-token Nsight Compute pass over the non-4B persistent decode kernel on
+`sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/profile_qwen08_decode.sh \
+  /path/to/Qwen3.5-0.8B
+```
+
+Set `PROFILE_MODE=fast` to disable the hero path while keeping CUDA fast-greedy,
+or `PROFILE_MODE=legacy` to force the old host-logits decode path.
+
 Current behavior on this `sm86` box now depends on whether the path is using replayed prefill for correctness.
 With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 
@@ -185,6 +224,52 @@ So the current CUDA `4B` story on this box is split:
 
 - single-sequence decode is correctness-first and much slower because it replays prefill
 - batched decode remains the fast path and is still the better place to do performance work
+
+There is now also an explicit native single-sequence hero lane for `4B`
+behind `--force-kernel-decode`. The exact lane is:
+
+- CUDA + `sm86`
+- `qwen3.5-4b`
+- BF16
+- baked load
+- `--force-kernel-decode`
+- `--batch-size 1`
+- warmed `pp533 / tg128`
+- hero attention guard `B == 1 && bs == 256 && hd == 256`
+
+The current warmed result on this box comes in at roughly:
+
+- prefill `4484 ms` (`119 tok/s`)
+- decode `12095 ms` (`10.6 tok/s`)
+
+The first kept single-stream `4B` CUDA pass on this lane removed
+unconditional full-attention trace-buffer writes from the hot path and left
+those writes enabled only for the explicit trace workflow. The next two kept
+passes then tightened the single-stream BF16 attention-core inner loop: first
+by moving to packed two-dimension BF16 score/value work inside the existing
+`B == 1` schedule, and then by raising that packed path to four dimensions per
+active thread. The latest kept pass then stopped the idle threads in that same
+hero branch from doing useless BF16 query staging plus zero-value score/softmax
+work. The next kept pass then moved off attention entirely once the temporary
+split showed `linear_core` was now mostly recurrent-state traffic: it fused the
+serial recurrent update from four state walks down to two and reduced the
+warmed single-lane linear core from about `3471 ms` to `3275 ms` on this
+machine while leaving the attention core flat at about `4600 ms`. The latest
+kept pass then staged the normalized per-head `q/k` vectors for that serial
+linear-attention loop into shared memory once per head pair, trimming the
+warmed single-lane linear core again from about `3275 ms` to `3236 ms`. The
+next kept pass temporarily split the single-stream attention core and showed
+the real remaining cost was score-side work, not value accumulation, then
+collapsed the hero branch from a two-wave `64 x 4` score reduction to a
+one-wave `32 x 8` mapping. That cut warmed single-lane full-attention core
+from about `4600 ms` to `4166 ms` and improved warmed decode from about
+`12463 ms` to `12097 ms` on this machine. The latest kept pass then reduced
+hot projection live state for `B <= 2`, dropping the persistent kernel's
+static footprint from `170` to `164` registers and nudging warmed decode to
+about `12095 ms` on this box.
+
+That lane is intended for Lucebox-style single-stream optimization work; the
+validated production throughput lane remains `qwen3.5-4b --batch-size 2`.
 
 ## E2E Tests
 

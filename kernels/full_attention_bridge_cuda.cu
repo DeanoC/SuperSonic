@@ -54,6 +54,19 @@ int linear_prefill_block_override() {
     return static_cast<int>(parsed);
 }
 
+int qwen08_hero_blocks_override() {
+    const char* value = std::getenv("SUPERSONIC_QWEN08_HERO_BLOCKS");
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) {
+        return 0;
+    }
+    return static_cast<int>(parsed);
+}
+
 template <typename T>
 int full_attention_prefill_device(
     int device_ordinal,
@@ -4397,7 +4410,7 @@ extern "C" int dotcache_qwen35_hip_standalone_matvec(
     }
 }
 
-template <typename T>
+template <typename T, bool HERO_MODE>
 int persistent_decode_device(
     int device_ordinal,
     int num_layers,
@@ -4412,24 +4425,37 @@ int persistent_decode_device(
     unsigned int* barrier_flag,
     const void* cos_table,
     const void* sin_table,
-    int rotary_dim
+    int rotary_dim,
+    int num_blocks_override
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if constexpr (HERO_MODE) {
+        // The qwen3.5-0.8b sm86 hero path benefits from oversubscribing the grid so
+        // the static row-stride loops keep more blocks resident between barriers.
+        const int tuned_blocks = num_blocks * 2;
+        num_blocks = tuned_blocks < 160 ? tuned_blocks : 160;
+    }
+    if (num_blocks_override > 0) {
+        num_blocks = num_blocks_override;
+    }
     constexpr int block_size = 256;
     // LDS layout: [block_size] reduction scratch + [intermediate_size] input vector cache
-    const size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
+    size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
+    if constexpr (HERO_MODE) {
+        shared_bytes += static_cast<size_t>(intermediate_size) * sizeof(T);
+    }
 
     // Barrier counters zeroed on first allocation by Rust PersistentDecodeCache.
     // Grid barrier self-resets between uses (barrier_counter reset by last block,
     // barrier_flag monotonically increments and wraps safely).
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
+        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T, HERO_MODE>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         shared_bytes,
@@ -4472,7 +4498,7 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
     size_t rotary_dim) {
     switch (dtype) {
     case 2:
-        return persistent_decode_device<hip_bfloat16>(
+        return persistent_decode_device<hip_bfloat16, false>(
             static_cast<int>(device_ordinal),
             static_cast<int>(num_layers),
             static_cast<int>(hidden_dim),
@@ -4480,7 +4506,39 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
             static_cast<int>(seqlen_offset),
             layers, hidden_io, workspace, counters,
             barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim));
+            cos_table, sin_table, static_cast<int>(rotary_dim), 0);
+    default:
+        return 256;
+    }
+}
+
+extern "C" int dotcache_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
+    int dtype,
+    size_t device_ordinal,
+    size_t num_layers,
+    size_t hidden_dim,
+    size_t intermediate_size,
+    size_t seqlen_offset,
+    const void* layers,
+    void* hidden_io,
+    float* workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    const void* cos_table,
+    const void* sin_table,
+    size_t rotary_dim) {
+    switch (dtype) {
+    case 2:
+        return persistent_decode_device<hip_bfloat16, true>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(num_layers),
+            static_cast<int>(hidden_dim),
+            static_cast<int>(intermediate_size),
+            static_cast<int>(seqlen_offset),
+            layers, hidden_io, workspace, counters,
+            barrier_counter, barrier_flag,
+            cos_table, sin_table, static_cast<int>(rotary_dim), qwen08_hero_blocks_override());
     default:
         return 256;
     }

@@ -3,6 +3,7 @@
 # Run the validated CUDA sm86 suite in one command:
 #   - Qwen3.5-0.8B
 #   - Qwen3.5-0.8B long-context CPU oracle
+#   - Qwen3.5-0.8B fast-greedy regression
 #   - Qwen3.5-4B
 #   - Qwen3.5-4B long-context CPU oracle
 #   - Qwen3.5-4B batch_size=2
@@ -36,6 +37,8 @@ echo ""
 TIMEOUT="${TIMEOUT:-600}" "$SCRIPT_DIR/run.sh" "$MODEL_DIR_0_8B"
 echo ""
 TIMEOUT="${TIMEOUT:-900}" "$SCRIPT_DIR/run_long.sh" "$MODEL_DIR_0_8B"
+echo ""
+TIMEOUT="${TIMEOUT:-300}" "$SCRIPT_DIR/run_fast_greedy.sh" "$MODEL_DIR_0_8B"
 echo ""
 TIMEOUT="${TIMEOUT:-900}" "$SCRIPT_DIR/run_4b.sh" "$MODEL_DIR_4B"
 echo ""

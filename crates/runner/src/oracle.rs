@@ -9,6 +9,8 @@ pub struct OracleOutput {
     pub load_ms: f64,
     pub prefill_ms: f64,
     pub decode_ms: f64,
+    #[serde(default)]
+    pub prompt_tokens: usize,
     pub generated_tokens: usize,
     pub prefill_logits: Vec<f32>,
     pub decode_logits: Vec<Vec<f32>>,

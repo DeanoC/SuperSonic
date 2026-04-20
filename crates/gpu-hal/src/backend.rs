@@ -46,6 +46,7 @@ pub struct DeviceInfo {
     pub arch_name: String,
     pub total_vram_bytes: u64,
     pub warp_size: u32,
+    pub clock_rate_khz: u32,
 }
 
 static DEFAULT_BACKEND: AtomicU8 = AtomicU8::new(0);

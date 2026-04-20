@@ -252,6 +252,205 @@ int repeat_interleave_heads_device(int device_ordinal,
     return 0;
 }
 
+// ---- single-row argmax (BF16 logits) ----
+
+__global__ void pfx_argmax_bf16_kernel(
+    const hip_bfloat16* __restrict__ logits,
+    size_t n,
+    uint32_t* __restrict__ out_index
+) {
+    __shared__ float shared_vals[256];
+    __shared__ uint32_t shared_idx[256];
+
+    const unsigned int tid = threadIdx.x;
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+
+    for (size_t idx = tid; idx < n; idx += blockDim.x) {
+        const float val = __bfloat162float(logits[idx]);
+        if (val > best_val || (val == best_val && static_cast<uint32_t>(idx) < best_idx)) {
+            best_val = val;
+            best_idx = static_cast<uint32_t>(idx);
+        }
+    }
+
+    shared_vals[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            const float rhs_val = shared_vals[tid + offset];
+            const uint32_t rhs_idx = shared_idx[tid + offset];
+            if (rhs_val > shared_vals[tid] ||
+                (rhs_val == shared_vals[tid] && rhs_idx < shared_idx[tid])) {
+                shared_vals[tid] = rhs_val;
+                shared_idx[tid] = rhs_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *out_index = shared_idx[0];
+    }
+}
+
+__global__ void pfx_lm_head_argmax_blocks_bf16_kernel(
+    const hip_bfloat16* __restrict__ hidden,
+    const hip_bfloat16* __restrict__ weight,
+    int hidden_dim,
+    int vocab_size,
+    float* __restrict__ block_best_vals,
+    uint32_t* __restrict__ block_best_idxs
+) {
+    __shared__ float shared_hidden[1024];
+    __shared__ float warp_best_vals[8];
+    __shared__ uint32_t warp_best_idxs[8];
+
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp_id = tid / 32;
+    const unsigned int lane = tid % 32;
+    const unsigned int warps_per_block = blockDim.x / 32;
+
+    for (int col = static_cast<int>(tid); col < hidden_dim; col += static_cast<int>(blockDim.x)) {
+        shared_hidden[col] = __bfloat162float(hidden[col]);
+    }
+    __syncthreads();
+
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+
+    for (int row = static_cast<int>(blockIdx.x * warps_per_block + warp_id);
+         row < vocab_size;
+         row += static_cast<int>(gridDim.x * warps_per_block)) {
+        const hip_bfloat16* row_weight = weight + static_cast<size_t>(row) * hidden_dim;
+        float partial = 0.0f;
+        for (int col = static_cast<int>(lane); col < hidden_dim; col += 32) {
+            partial += __bfloat162float(row_weight[col]) * shared_hidden[col];
+        }
+
+        for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down_sync(0xffffffffu, partial, offset);
+        }
+
+        if (lane == 0 && (partial > best_val || (partial == best_val && static_cast<uint32_t>(row) < best_idx))) {
+            best_val = partial;
+            best_idx = static_cast<uint32_t>(row);
+        }
+    }
+
+    if (lane == 0) {
+        warp_best_vals[warp_id] = best_val;
+        warp_best_idxs[warp_id] = best_idx;
+    }
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float block_best_val = (lane < warps_per_block) ? warp_best_vals[lane] : -1.0e30f;
+        uint32_t block_best_idx = (lane < warps_per_block) ? warp_best_idxs[lane] : 0;
+        for (unsigned int offset = 16; offset > 0; offset >>= 1) {
+            const float rhs_val = __shfl_down_sync(0xffffffffu, block_best_val, offset);
+            const uint32_t rhs_idx = __shfl_down_sync(0xffffffffu, block_best_idx, offset);
+            if (rhs_val > block_best_val || (rhs_val == block_best_val && rhs_idx < block_best_idx)) {
+                block_best_val = rhs_val;
+                block_best_idx = rhs_idx;
+            }
+        }
+        if (lane == 0) {
+            block_best_vals[blockIdx.x] = block_best_val;
+            block_best_idxs[blockIdx.x] = block_best_idx;
+        }
+    }
+}
+
+__global__ void pfx_argmax_blocks_kernel(
+    const float* __restrict__ block_best_vals,
+    const uint32_t* __restrict__ block_best_idxs,
+    size_t nblocks,
+    uint32_t* __restrict__ out_index
+) {
+    __shared__ float shared_vals[256];
+    __shared__ uint32_t shared_idx[256];
+
+    const unsigned int tid = threadIdx.x;
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+
+    for (size_t idx = tid; idx < nblocks; idx += blockDim.x) {
+        const float val = block_best_vals[idx];
+        const uint32_t row = block_best_idxs[idx];
+        if (val > best_val || (val == best_val && row < best_idx)) {
+            best_val = val;
+            best_idx = row;
+        }
+    }
+
+    shared_vals[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            const float rhs_val = shared_vals[tid + offset];
+            const uint32_t rhs_idx = shared_idx[tid + offset];
+            if (rhs_val > shared_vals[tid] ||
+                (rhs_val == shared_vals[tid] && rhs_idx < shared_idx[tid])) {
+                shared_vals[tid] = rhs_val;
+                shared_idx[tid] = rhs_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        *out_index = shared_idx[0];
+    }
+}
+
+int argmax_bf16_device(int device_ordinal, size_t n, const void* logits, void* out_index) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    pfx_argmax_bf16_kernel<<<1, block>>>(
+        static_cast<const hip_bfloat16*>(logits),
+        n,
+        static_cast<uint32_t*>(out_index));
+    if (cudaGetLastError() != cudaSuccess) return 401;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 402;
+    return 0;
+}
+
+int lm_head_argmax_bf16_device(
+    int device_ordinal,
+    int hidden_dim,
+    int vocab_size,
+    const void* hidden,
+    const void* weight,
+    void* block_best_vals,
+    void* block_best_idxs,
+    void* out_index
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    constexpr int lm_blocks = 512;
+    pfx_lm_head_argmax_blocks_bf16_kernel<<<lm_blocks, block>>>(
+        static_cast<const hip_bfloat16*>(hidden),
+        static_cast<const hip_bfloat16*>(weight),
+        hidden_dim,
+        vocab_size,
+        static_cast<float*>(block_best_vals),
+        static_cast<uint32_t*>(block_best_idxs));
+    if (cudaGetLastError() != cudaSuccess) return 411;
+    pfx_argmax_blocks_kernel<<<1, block>>>(
+        static_cast<const float*>(block_best_vals),
+        static_cast<const uint32_t*>(block_best_idxs),
+        lm_blocks,
+        static_cast<uint32_t*>(out_index));
+    if (cudaGetLastError() != cudaSuccess) return 412;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 413;
+    return 0;
+}
+
 } // namespace
 
 // ---- extern "C" wrappers ----
@@ -417,4 +616,34 @@ extern "C" int dotcache_qwen35_hip_repeat_interleave_heads(
                 static_cast<int>(repeats), src, dst);
     default: return 390;
     }
+}
+
+extern "C" int dotcache_qwen35_cuda_argmax_bf16(
+    size_t device_ordinal,
+    size_t n,
+    const void* logits,
+    void* out_index
+) {
+    return argmax_bf16_device(static_cast<int>(device_ordinal), n, logits, out_index);
+}
+
+extern "C" int dotcache_qwen35_cuda_lm_head_argmax_bf16(
+    size_t device_ordinal,
+    size_t hidden_dim,
+    size_t vocab_size,
+    const void* hidden,
+    const void* weight,
+    void* block_best_vals,
+    void* block_best_idxs,
+    void* out_index
+) {
+    return lm_head_argmax_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(hidden_dim),
+        static_cast<int>(vocab_size),
+        hidden,
+        weight,
+        block_best_vals,
+        block_best_idxs,
+        out_index);
 }
