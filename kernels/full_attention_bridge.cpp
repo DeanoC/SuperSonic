@@ -4387,93 +4387,35 @@ extern "C" int dotcache_qwen35_hip_standalone_matvec(
     }
 }
 
-template <typename T>
-int persistent_decode_device(
-    int device_ordinal,
-    int num_layers,
-    int hidden_dim,
-    int intermediate_size,
-    int seqlen_offset,
-    const void* layers,
-    void* hidden_io,
-    float* workspace,
-    unsigned int* counters,
-    unsigned int* barrier_counter,
-    unsigned int* barrier_flag,
-    const void* cos_table,
-    const void* sin_table,
-    int rotary_dim
-) {
-    ScopedHipDevice scoped(device_ordinal);
-
-    hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
-
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
-    constexpr int block_size = 256;
-    // LDS layout: [block_size] reduction scratch + [intermediate_size] input vector cache
-    const size_t shared_bytes = (block_size + intermediate_size) * sizeof(float);
-
-    // Barrier counters zeroed on first allocation by Rust PersistentDecodeCache.
-    // Grid barrier self-resets between uses (barrier_counter reset by last block,
-    // barrier_flag monotonically increments and wraps safely).
-
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
-        dim3(static_cast<unsigned int>(num_blocks)),
-        dim3(block_size),
-        shared_bytes,
-        0,
-        num_layers,
-        hidden_dim,
-        intermediate_size,
-        seqlen_offset,
-        static_cast<const Qwen35DecodeLayerDesc*>(layers),
-        static_cast<T*>(hidden_io),
-        workspace,
-        counters,
-        barrier_counter,
-        barrier_flag,
-        static_cast<const T*>(cos_table),
-        static_cast<const T*>(sin_table),
-        rotary_dim);
-    hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
-    return 0;
-}
-
+// The HIP 0.8B-native persistent decode kernel was deleted on 2026-04-20 —
+// it had no INT4/FP8 path and ran ~2.8x slower than routing 0.8B through
+// `full_attention_4b.hip`. All HIP Qwen3.5 variants now set
+// `use_4b_kernel = true` in the registry, so `persistent_decode` (non-4B)
+// is never dispatched to HIP at runtime. The symbol below is kept as a
+// linker-visible stub: the Rust FFI wrapper `kernel_ffi::persistent_decode`
+// is shared with CUDA (which still has a non-4B 0.8B path), so the HIP
+// build needs to resolve the reference even though it's unreachable.
 extern "C" int dotcache_qwen35_hip_persistent_decode(
-    int dtype,
-    size_t device_ordinal,
-    size_t num_layers,
-    size_t hidden_dim,
-    size_t intermediate_size,
-    size_t seqlen_offset,
-    const void* layers,
-    void* hidden_io,
-    float* workspace,
-    unsigned int* counters,
-    unsigned int* barrier_counter,
-    unsigned int* barrier_flag,
-    const void* cos_table,
-    const void* sin_table,
-    size_t rotary_dim) {
-    switch (dtype) {
-    case 2:
-        return persistent_decode_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal),
-            static_cast<int>(num_layers),
-            static_cast<int>(hidden_dim),
-            static_cast<int>(intermediate_size),
-            static_cast<int>(seqlen_offset),
-            layers, hidden_io, workspace, counters,
-            barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim));
-    default:
-        return 256;
-    }
+    int /*dtype*/,
+    size_t /*device_ordinal*/,
+    size_t /*num_layers*/,
+    size_t /*hidden_dim*/,
+    size_t /*intermediate_size*/,
+    size_t /*seqlen_offset*/,
+    const void* /*layers*/,
+    void* /*hidden_io*/,
+    float* /*workspace*/,
+    unsigned int* /*counters*/,
+    unsigned int* /*barrier_counter*/,
+    unsigned int* /*barrier_flag*/,
+    const void* /*cos_table*/,
+    const void* /*sin_table*/,
+    size_t /*rotary_dim*/) {
+    // Non-zero: clearly distinct from the live kernel's launch/sync error
+    // codes (254/255) and the dtype-unsupported code (256). If something
+    // ever does dispatch to this on HIP, the caller gets a distinct error
+    // it can grep for.
+    return 260;
 }
 
 extern "C" int dotcache_query_gpu_info(
