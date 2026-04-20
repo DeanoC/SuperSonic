@@ -5417,6 +5417,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const int k_key_offset = key_dim;
                     const int v_val_offset = key_dim * 2;
                     const int v = tid % hvd;          // v-dimension for this thread
+                    const bool qwen4b_single_linear_decayless_store_hero =
+                        B == 1 && bs == 256 && kern == 4 &&
+                        nv == 16 && nk == 16 && hkd == 128 && hvd == 128;
 
                     // Process 2 heads per iteration (256 threads / 128 hvd)
                     for (int hp = 0; hp < nv; hp += 2) {
@@ -5453,14 +5456,24 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const float* qh = q_stage + pair_head * hkd;
                             const float* kh = k_stage + pair_head * hkd;
 
-                            // First pass: apply decay and accumulate kv_mem from the
-                            // decayed state so we do not reload the recurrent tile.
+                            // First pass: accumulate kv_mem from the decayed state.
+                            // On the single-stream hero lane we skip the intermediate
+                            // "write decayed state" step and apply decay only when the
+                            // final updated state is written back in the second pass.
                             float kv_mem_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                float* state_kv = sh + k * hvd + v;
-                                const float state_decay = (*state_kv) * decay;
-                                *state_kv = state_decay;
-                                kv_mem_v += state_decay * kh[k];
+                            if (qwen4b_single_linear_decayless_store_hero) {
+                                for (int k = 0; k < 128; ++k) {
+                                    const float state_orig = sh[k * 128 + v];
+                                    const float state_decay = state_orig * decay;
+                                    kv_mem_v += state_decay * kh[k];
+                                }
+                            } else {
+                                for (int k = 0; k < hkd; ++k) {
+                                    float* state_kv = sh + k * hvd + v;
+                                    const float state_decay = (*state_kv) * decay;
+                                    *state_kv = state_decay;
+                                    kv_mem_v += state_decay * kh[k];
+                                }
                             }
 
                             // delta = (value - kv_mem) * beta
@@ -5470,11 +5483,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             // Second pass: update the state and accumulate the output
                             // from the updated value in the same walk.
                             float out_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                float* state_kv = sh + k * hvd + v;
-                                const float state_update = (*state_kv) + kh[k] * delta;
-                                *state_kv = state_update;
-                                out_v += state_update * qh[k];
+                            if (qwen4b_single_linear_decayless_store_hero) {
+                                for (int k = 0; k < 128; ++k) {
+                                    float* state_kv = sh + k * 128 + v;
+                                    const float state_orig = *state_kv;
+                                    const float state_decay = state_orig * decay;
+                                    const float state_update =
+                                        state_decay + kh[k] * delta;
+                                    *state_kv = state_update;
+                                    out_v += state_update * qh[k];
+                                }
+                            } else {
+                                for (int k = 0; k < hkd; ++k) {
+                                    float* state_kv = sh + k * hvd + v;
+                                    const float state_update = (*state_kv) + kh[k] * delta;
+                                    *state_kv = state_update;
+                                    out_v += state_update * qh[k];
+                                }
                             }
 
                             attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
