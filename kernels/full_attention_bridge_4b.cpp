@@ -4690,6 +4690,16 @@ int persistent_decode_device(
         }
     }
 
+    // If the caller asked for cooperative launch but the device or runtime
+    // can't actually provide it, refuse rather than fall back to the
+    // non-cooperative path. A `SUPERSONIC_QWEN4B_BLOCKS=128` with `COOP=1`
+    // expects the cooperative cap to keep it safe; silently running the
+    // non-coop launcher with 128 blocks is exactly the grid_barrier
+    // oversubscription hang the opt-in was designed to prevent.
+    if (coop_requested && (!coop_supported || max_blocks_per_mp <= 0)) {
+        return 261;
+    }
+
     hipError_t launch_err;
     if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
         // Args for cooperative launch: void** where each entry points to
