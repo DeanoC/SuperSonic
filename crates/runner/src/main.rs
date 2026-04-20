@@ -9,6 +9,7 @@ mod registry;
 mod validate;
 
 use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -234,6 +235,11 @@ pub(crate) struct Cli {
     /// Debug-only path intended to localize long-context divergence.
     #[arg(long)]
     trace_prefill_layers: bool,
+
+    /// Debug-only: run one prompt-prefill layer from the oracle's exact prefix
+    /// state and compare our component layer outputs against the oracle.
+    #[arg(long, hide = true)]
+    trace_oracle_prefill_layer: Option<usize>,
 
     /// Batch size for decode (number of sequences decoded in parallel).
     /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
@@ -949,6 +955,9 @@ fn main() -> Result<()> {
     if cli.trace_prefill_layers && !cli.validate {
         anyhow::bail!("--trace-prefill-layers requires --validate");
     }
+    if cli.trace_oracle_prefill_layer.is_some() && !cli.validate {
+        anyhow::bail!("--trace-oracle-prefill-layer requires --validate");
+    }
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
@@ -1014,6 +1023,7 @@ fn main() -> Result<()> {
             .unwrap()
             .join("oracle/run_oracle.py");
 
+        let emit_state = cli.trace_prefill_layers || cli.trace_oracle_prefill_layer.is_some();
         let output = oracle::run_oracle(
             &oracle_script,
             &model_id,
@@ -1021,7 +1031,7 @@ fn main() -> Result<()> {
             cli.max_new_tokens,
             &cli.oracle_dtype,
             &oracle_device,
-            cli.trace_prefill_layers,
+            emit_state,
             fp8_oracle_dir.as_deref(),
         )?;
 
@@ -1139,6 +1149,20 @@ fn main() -> Result<()> {
             } else {
                 eprintln!("[trace-prefill] missing native or oracle layer trace data");
             }
+        }
+
+        if let Some(trace_layer) = cli.trace_oracle_prefill_layer {
+            trace_oracle_prefill_layer(
+                &mut engine,
+                trace_layer,
+                &prompt_ids,
+                &oracle_script,
+                &model_id,
+                &cli.oracle_dtype,
+                &oracle_device,
+                fp8_oracle_dir.as_deref(),
+                &output,
+            )?;
         }
 
         Some(output)
@@ -3279,6 +3303,103 @@ fn trace_component_layer(
     let hidden_delta = validate::max_abs_delta(&decode_bf16_le(&native.layer_hidden), &decode_bf16_le(hidden));
     eprintln!(
         "[trace-component-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
+    );
+    Ok(())
+}
+
+fn trace_oracle_prefill_layer(
+    engine: &mut DecodeEngine,
+    trace_layer: usize,
+    prompt_ids: &[u32],
+    oracle_script: &Path,
+    model_id: &str,
+    oracle_dtype: &str,
+    oracle_device: &str,
+    fp8_oracle_dir: Option<&Path>,
+    oracle_full: &oracle::OracleOutput,
+) -> Result<()> {
+    anyhow::ensure!(trace_layer > 0, "--trace-oracle-prefill-layer currently requires layer > 0");
+    anyhow::ensure!(prompt_ids.len() >= 2, "prompt must contain at least 2 tokens for oracle prefix trace");
+    let prefix_ids = &prompt_ids[..prompt_ids.len() - 1];
+    let prefix_oracle = oracle::run_oracle(
+        oracle_script,
+        model_id,
+        prefix_ids,
+        1,
+        oracle_dtype,
+        oracle_device,
+        true,
+        fp8_oracle_dir,
+    )?;
+    engine.reset()?;
+    engine.load_prefill_state(&prefix_oracle)?;
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let oracle_inputs = oracle_full
+        .layer_hidden_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_hidden_states"))?;
+    let oracle_attn = oracle_full
+        .layer_attn_residual_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_attn_residual_states"))?;
+    let oracle_post = oracle_full
+        .layer_post_attn_norm_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_post_attn_norm_states"))?;
+    let oracle_mlp = oracle_full
+        .layer_mlp_outputs
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_mlp_outputs"))?;
+
+    let oracle_input_bytes = b64
+        .decode(
+            oracle_inputs
+                .get(trace_layer - 1)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {}", trace_layer - 1))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?;
+    let oracle_attn_bytes = b64
+        .decode(
+            oracle_attn
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?;
+    let oracle_post_bytes = b64
+        .decode(
+            oracle_post
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?;
+    let oracle_mlp_bytes = b64
+        .decode(
+            oracle_mlp
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_mlp_outputs missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?;
+    let oracle_hidden_bytes = b64
+        .decode(
+            oracle_inputs
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?;
+
+    engine.set_hidden_from_bytes(&oracle_input_bytes)?;
+    let trace = engine.component_trace_full_layer_from_current_hidden(trace_layer)?;
+    let attn_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.attn_hidden), &decode_bf16_le(&oracle_attn_bytes));
+    let post_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.post_attn_norm), &decode_bf16_le(&oracle_post_bytes));
+    let mlp_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.mlp_out), &decode_bf16_le(&oracle_mlp_bytes));
+    let hidden_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.layer_hidden), &decode_bf16_le(&oracle_hidden_bytes));
+    eprintln!(
+        "[trace-oracle-prefill-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
     );
     Ok(())
 }
