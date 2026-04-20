@@ -3657,6 +3657,7 @@ impl DecodeEngine {
                 }
                 gpu_hal::Backend::Hip => kernel_ffi::query_hip_device_clock_khz(self.ordinal)
                     .map_err(|e| anyhow::anyhow!("query HIP device clock rate: {e}"))?,
+                gpu_hal::Backend::Metal => 0,
             };
             let sync_bytes = self
                 .scratch

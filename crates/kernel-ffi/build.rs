@@ -230,6 +230,15 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
     println!("cargo:rustc-cfg=supersonic_backend_cuda");
 }
 
+fn compile_metal_stubs(manifest_dir: &Path) {
+    cc::Build::new()
+        .cpp(true)
+        .file(manifest_dir.join("src/metal_link_stubs.cc"))
+        .flag_if_supported("-std=c++17")
+        .compile("kernel_ffi_metal_stubs");
+    println!("cargo:rustc-cfg=supersonic_backend_metal");
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
@@ -239,6 +248,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_cuda)");
+    println!("cargo:rustc-check-cfg=cfg(supersonic_backend_metal)");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
@@ -269,16 +279,25 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/metal_link_stubs.cc").display()
+    );
 
     let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
     let want_hip = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "hip");
     let want_cuda = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "cuda");
+    let want_metal = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "metal");
     let have_hip_toolchain = want_hip && command_exists("hipcc");
     let have_cuda_toolchain = want_cuda && command_exists("nvcc");
+    let have_metal_backend = want_metal
+        && env::var("CARGO_CFG_TARGET_OS")
+            .map(|os| os == "macos")
+            .unwrap_or(false);
 
     assert!(
-        have_hip_toolchain || have_cuda_toolchain,
+        have_hip_toolchain || have_cuda_toolchain || have_metal_backend,
         "No supported kernel toolchain found for SUPERSONIC_BACKENDS={requested}. \
          Install hipcc and/or nvcc, or set SUPERSONIC_BACKENDS to an available backend."
     );
@@ -296,9 +315,13 @@ fn main() {
         compile_hip(&kernel_dir, &out_dir);
     } else if normalized == "cuda" {
         compile_cuda(&kernel_dir, &out_dir);
+    } else if normalized == "metal" {
+        compile_metal_stubs(&manifest_dir);
     } else if have_cuda_toolchain {
         compile_cuda(&kernel_dir, &out_dir);
-    } else {
+    } else if have_hip_toolchain {
         compile_hip(&kernel_dir, &out_dir);
+    } else {
+        compile_metal_stubs(&manifest_dir);
     }
 }

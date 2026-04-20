@@ -90,6 +90,7 @@ impl BackendChoice {
             "auto" => Some(Self::Auto),
             "hip" => Some(Self::Explicit(Backend::Hip)),
             "cuda" => Some(Self::Explicit(Backend::Cuda)),
+            "metal" => Some(Self::Explicit(Backend::Metal)),
             _ => None,
         }
     }
@@ -121,6 +122,11 @@ fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
             {
                 return Ok(Backend::Hip);
             }
+            if gpu_hal::is_backend_compiled(Backend::Metal)
+                && gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok()
+            {
+                return Ok(Backend::Metal);
+            }
             anyhow::bail!(
                 "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
                 gpu_hal::compiled_backends()
@@ -138,6 +144,7 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
         "auto" => match backend {
             Backend::Cuda => format!("cuda:{ordinal}"),
             Backend::Hip => "cpu".to_string(),
+            Backend::Metal => "cpu".to_string(),
         },
         other => other.to_string(),
     }
@@ -167,7 +174,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     context_size: Option<usize>,
 
-    /// Compute backend (`auto`, `hip`, or `cuda`)
+    /// Compute backend (`auto`, `hip`, `cuda`, or `metal`)
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -497,7 +504,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let ordinal = cli.device;
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
-        anyhow::anyhow!("Unknown backend '{}'. Expected one of: auto, hip, cuda", cli.backend)
+        anyhow::anyhow!(
+            "Unknown backend '{}'. Expected one of: auto, hip, cuda, metal",
+            cli.backend
+        )
     })?;
     let backend = resolve_backend(backend_choice, ordinal)?;
     gpu_hal::set_backend(backend);
@@ -519,6 +529,11 @@ fn main() -> Result<()> {
             (arch_name, total_vram, 32)
         }
         Backend::Cuda => {
+            let info = gpu_hal::query_device_info(backend, ordinal)
+                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
+            (info.arch_name, info.total_vram_bytes, info.warp_size)
+        }
+        Backend::Metal => {
             let info = gpu_hal::query_device_info(backend, ordinal)
                 .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)
@@ -722,6 +737,26 @@ fn main() -> Result<()> {
             eprintln!(
                 "[cuda] WARNING: enabling unstable CUDA KV-FP8 debug path; correctness is not guaranteed"
             );
+        }
+    }
+    if backend == Backend::Metal {
+        if model_variant != ModelVariant::Qwen3_5_0_8B {
+            anyhow::bail!("Metal v1 only supports --model qwen3.5-0.8b");
+        }
+        if cli.int4 {
+            anyhow::bail!("Metal v1 does not support --int4");
+        }
+        if cli.fp8_runtime {
+            anyhow::bail!("Metal v1 does not support --fp8-runtime");
+        }
+        if cli.kv_fp8 {
+            anyhow::bail!("Metal v1 does not support --kv-fp8");
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("Metal v1 only supports --batch-size 1");
+        }
+        if cli.force_kernel_decode || cli.force_component_decode {
+            anyhow::bail!("Metal v1 only supports replay-prefill decode");
         }
     }
 
@@ -1169,11 +1204,11 @@ fn main() -> Result<()> {
     // the rare case where someone genuinely wants to reproduce the older
     // numeric semantics.
     let replay_decode_enabled = cli.batch_size == 1
-        && params.use_4b_kernel
-        && cli.force_replay_decode
         && !cli.force_kernel_decode
         && !cli.force_component_decode
-        && !cli.kv_fp8;
+        && !cli.kv_fp8
+        && (backend == Backend::Metal
+            || (params.use_4b_kernel && cli.force_replay_decode));
     let replay_kv_fp8_enabled = params.use_4b_kernel
         && cli.kv_fp8
         && cli.allow_unstable_cuda_kv_fp8
@@ -1217,7 +1252,11 @@ fn main() -> Result<()> {
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
     if replay_decode_enabled {
-        eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
+        if backend == Backend::Metal {
+            eprintln!("[decode] Metal v1 replays native prefill for each decode step");
+        } else {
+            eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
+        }
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
         eprintln!("[decode] experimental single-sequence KV-FP8 uses replayed GPU prefill for correctness");
     } else if replay_kv_fp8_enabled && cli.batch_size > 1 {

@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
+half = "2"
 thiserror = "2"
 
 [build-dependencies]

@@ -259,6 +259,11 @@ pub fn rms_norm(
                 "phi4::rms_norm: CUDA backend not yet wired".into(),
             ));
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "phi4::rms_norm: Metal backend not yet wired".into(),
+            ));
+        }
     };
     if status != 0 {
         return Err(phi4_backend_error(backend, "phi4 rms_norm kernel", status));
@@ -270,6 +275,7 @@ fn phi4_backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
         Backend::Hip => GpuError::Hip(format!("{what} failed with status {status}")),
         Backend::Cuda => GpuError::Cuda(format!("{what} failed with status {status}")),
+        Backend::Metal => GpuError::Metal(format!("{what} failed with status {status}")),
     }
 }
 
@@ -361,6 +367,11 @@ pub fn persistent_decode(
         Backend::Cuda => {
             return Err(GpuError::InvalidArg(
                 "phi4::persistent_decode: CUDA backend not yet wired for Phi-4".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "phi4::persistent_decode: Metal backend not yet wired for Phi-4".into(),
             ));
         }
     };

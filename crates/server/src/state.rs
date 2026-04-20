@@ -53,6 +53,9 @@ pub struct LoaderConfig {
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
+    if backend == Backend::Metal {
+        bail!("supersonic-serve does not support --backend metal yet; use the supersonic CLI for Metal v1");
+    }
     gpu_hal::set_backend(backend);
 
     let variant = ModelVariant::from_cli_str(&cfg.model).ok_or_else(|| {
@@ -74,6 +77,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
                 .map_err(|e| anyhow!("GPU query failed for device {}: {}", cfg.device, e))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)
         }
+        Backend::Metal => unreachable!("metal backend is rejected above"),
     };
     let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
     tracing::info!(
@@ -256,22 +260,23 @@ fn resolve_backend(choice: &str, ordinal: usize) -> Result<Backend> {
     match choice.to_ascii_lowercase().as_str() {
         "hip" => Ok(Backend::Hip),
         "cuda" => Ok(Backend::Cuda),
+        "metal" => Ok(Backend::Metal),
         "auto" | "" => {
-            // Prefer HIP when a HIP device is reachable; otherwise try
-            // CUDA. Failing both is a hard error here rather than later —
-            // keeps the "no usable backend" case actionable.
-            if kernel_ffi::query_gpu_info(ordinal).is_ok() {
-                return Ok(Backend::Hip);
-            }
             if gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok() {
                 return Ok(Backend::Cuda);
             }
+            if kernel_ffi::query_gpu_info(ordinal).is_ok() {
+                return Ok(Backend::Hip);
+            }
+            if gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok() {
+                return Ok(Backend::Metal);
+            }
             bail!(
-                "--backend auto: neither HIP nor CUDA device is reachable at ordinal {ordinal}; \
-                 pass --backend hip or --backend cuda explicitly if you know one is available"
+                "--backend auto: neither CUDA, HIP, nor Metal device is reachable at ordinal {ordinal}; \
+                 pass --backend cuda, --backend hip, or --backend metal explicitly if you know one is available"
             )
         }
-        other => bail!("unknown --backend '{other}' (auto | hip | cuda)"),
+        other => bail!("unknown --backend '{other}' (auto | hip | cuda | metal)"),
     }
 }
 

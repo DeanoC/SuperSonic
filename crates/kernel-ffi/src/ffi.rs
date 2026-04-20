@@ -1,5 +1,6 @@
 use std::ffi::{c_int, c_uint, c_void};
 
+use crate::metal_host;
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -200,6 +201,7 @@ fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
         Backend::Hip => GpuError::Hip(format!("{what} failed with status {status}")),
         Backend::Cuda => GpuError::Cuda(format!("{what} failed with status {status}")),
+        Backend::Metal => GpuError::Metal(format!("{what} failed with status {status}")),
     }
 }
 
@@ -207,6 +209,7 @@ fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
         Backend::Cuda => GpuError::Cuda(msg),
+        Backend::Metal => GpuError::Metal(msg),
     }
 }
 
@@ -284,6 +287,11 @@ pub fn persistent_decode(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode is not supported on Metal v1".into(),
+            ))
+        }
     };
     if status != 0 {
         return Err(backend_error(backend, "persistent_decode kernel", status));
@@ -339,6 +347,11 @@ pub fn persistent_decode_qwen08_sm86_specialized(
             }
         }
         Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_qwen08_sm86_specialized is CUDA-only".into(),
+            ))
+        }
+        Backend::Metal => {
             return Err(GpuError::InvalidArg(
                 "persistent_decode_qwen08_sm86_specialized is CUDA-only".into(),
             ))
@@ -510,6 +523,11 @@ pub fn persistent_decode_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b is not supported on Metal v1".into(),
+            ))
+        }
     };
     if status != 0 {
         return Err(backend_error(backend, "persistent_decode_4b kernel", status));
@@ -608,6 +626,11 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
             }
         }
         Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b_qwen35_sm86_specialized is CUDA-only".into(),
+            ))
+        }
+        Backend::Metal => {
             return Err(GpuError::InvalidArg(
                 "persistent_decode_4b_qwen35_sm86_specialized is CUDA-only".into(),
             ))
@@ -797,6 +820,11 @@ pub fn rms_norm_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "rms_norm_4b is not supported on Metal v1".into(),
+            ))
+        }
     };
     if status != 0 {
         return Err(backend_error(backend, "rms_norm_4b kernel", status));
@@ -871,6 +899,11 @@ pub fn standalone_matvec_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "standalone_matvec_4b is not supported on Metal v1".into(),
+            ))
+        }
     };
     if status != 0 {
         return Err(backend_error(backend, "standalone_matvec_4b kernel", status));
@@ -930,6 +963,11 @@ pub fn rms_norm_4b_multirow(
             {
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "rms_norm_4b_multirow is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
@@ -992,6 +1030,11 @@ pub fn matmul_rhs_transposed_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "matmul_rhs_transposed_4b is not supported on Metal v1".into(),
+            ))
+        }
     };
     if status != 0 {
         return Err(backend_error(
@@ -1014,6 +1057,10 @@ pub fn rms_norm(
     hidden_dim: usize,
 ) -> Result<(), GpuError> {
     let backend = output.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::rms_norm_rows(dtype, 1, hidden_dim, eps, true, input, weight, output);
+    }
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -1055,6 +1102,7 @@ pub fn rms_norm(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(backend, "rms_norm kernel", status));
@@ -1084,6 +1132,10 @@ pub fn standalone_matvec(
         )));
     }
     let backend = output.backend();
+    if backend == Backend::Metal {
+        let _ = (ordinal, counter_buf);
+        return metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim);
+    }
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
 
@@ -1126,6 +1178,7 @@ pub fn standalone_matvec(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(backend, "standalone_matvec kernel", status));
@@ -1135,26 +1188,9 @@ pub fn standalone_matvec(
 
 /// Query GPU architecture name and total VRAM for a given device ordinal.
 pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
-    let mut arch_buf = [0u8; 64];
-    let mut total_vram: u64 = 0;
-    let status = unsafe {
-        dotcache_query_gpu_info(
-            ordinal as c_int,
-            arch_buf.as_mut_ptr(),
-            arch_buf.len(),
-            &mut total_vram,
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "query_gpu_info failed with status {status}"
-        )));
-    }
-    let arch_name = std::ffi::CStr::from_bytes_until_nul(&arch_buf)
-        .map_err(|_| ffi_error("query_gpu_info: arch name not null-terminated".into()))?
-        .to_string_lossy()
-        .into_owned();
-    Ok((arch_name, total_vram))
+    let backend = gpu_hal::current_backend();
+    let info = gpu_hal::query_device_info(backend, ordinal)?;
+    Ok((info.arch_name, info.total_vram_bytes))
 }
 
 /// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.

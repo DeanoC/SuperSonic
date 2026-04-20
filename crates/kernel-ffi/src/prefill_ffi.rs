@@ -3,12 +3,15 @@
 //! orchestrates them layer by layer.
 
 use std::ffi::{c_int, c_void};
+
+use crate::metal_host;
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
         Backend::Cuda => GpuError::Cuda(msg),
+        Backend::Metal => GpuError::Metal(msg),
     }
 }
 
@@ -427,6 +430,17 @@ pub fn embedding_lookup(
     indexes: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if embeddings.backend() == Backend::Metal {
+        let _ = (ordinal, dtype);
+        return metal_host::embedding_lookup(
+            token_count,
+            vocab_size,
+            hidden_size,
+            embeddings,
+            indexes,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_embedding_lookup(
             dtype.kernel_dtype_code(),
@@ -459,6 +473,10 @@ pub fn batched_matmul(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out);
+    }
     // Simple rank-1 batch (no broadcasting)
     let batch_dims = [batch_elems as c_int];
     let status = unsafe {
@@ -501,6 +519,24 @@ pub fn full_attention_prefill(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::full_attention_prefill(
+            dtype,
+            batch_size,
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key,
+            value,
+            out,
+        );
+    }
     let num_kv_groups = q_heads / kv_heads;
     let status = unsafe {
         dotcache_qwen35_hip_full_attention_prefill(
@@ -540,6 +576,20 @@ pub fn linear_prefill_conv_pack(
     weights: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::linear_prefill_conv_pack(
+            dtype,
+            batch_size,
+            conv_dim,
+            total_len,
+            seq_len,
+            kernel_size,
+            mixed_qkv,
+            weights,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_linear_prefill_conv_pack(
             dtype.kernel_dtype_code(),
@@ -768,6 +818,23 @@ pub fn delta_recurrent_prefill(
     g: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::delta_recurrent_prefill(
+            dtype,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_delta_recurrent_prefill(
             dtype.kernel_dtype_code(),
@@ -801,6 +868,10 @@ pub fn l2norm(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_l2norm(
             dtype.kernel_dtype_code(),
@@ -827,6 +898,10 @@ pub fn swiglu_mul(
     up: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::swiglu_mul(dtype, elem_count, gate, up, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_swiglu_mul(
             dtype.kernel_dtype_code(),
@@ -855,6 +930,19 @@ pub fn rms_norm_gated(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::rms_norm_gated(
+            dtype,
+            n_rows,
+            n_cols,
+            eps,
+            hidden,
+            gate,
+            weight,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm_gated(
             dtype.kernel_dtype_code(),
@@ -883,6 +971,10 @@ pub fn mul_scalar(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::mul_scalar(dtype, total_elems, scalar, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_mul_scalar(
             dtype.kernel_dtype_code(),
@@ -959,6 +1051,10 @@ pub fn matmul_rhs_transposed(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out);
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             dtype.kernel_dtype_code(),
@@ -1064,6 +1160,10 @@ pub fn rms_norm_rows(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -1096,6 +1196,10 @@ pub fn rms_norm_rows_plain(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -1127,6 +1231,11 @@ pub fn rms_norm_rows_plain_inplace(
     data: &mut GpuBuffer,
     weight: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    if data.backend() == Backend::Metal {
+        let _ = ordinal;
+        let input = unsafe { &*(data as *const GpuBuffer) };
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, data);
+    }
     let ptr = data.as_mut_ptr();
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
@@ -1156,6 +1265,11 @@ pub fn element_add_inplace(
     lhs_out: &mut GpuBuffer,
     rhs: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    if lhs_out.backend() == Backend::Metal {
+        let _ = ordinal;
+        let lhs = unsafe { &*(lhs_out as *const GpuBuffer) };
+        return metal_host::element_add(dtype, total_elems, lhs, rhs, lhs_out);
+    }
     let ptr = lhs_out.as_mut_ptr();
     let status = unsafe {
         dotcache_qwen35_hip_element_add(
@@ -1184,6 +1298,10 @@ pub fn cast(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::cast(input_dtype, output_dtype, total_elems, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_cast(
             input_dtype.kernel_dtype_code(),
@@ -1211,6 +1329,10 @@ pub fn element_add(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::element_add(dtype, total_elems, lhs, rhs, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_element_add(
             dtype.kernel_dtype_code(),
@@ -1246,6 +1368,20 @@ pub fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if data.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::apply_rope_prefill(
+            dtype,
+            seq_len,
+            num_heads,
+            head_dim,
+            rotary_dim,
+            cos_table,
+            sin_table,
+            pos_offset,
+            data,
+        );
+    }
     let half_rot = rotary_dim / 2;
     // Offset cos/sin table pointers by pos_offset positions.
     // Table layout: [max_positions, half_rot] BF16 → stride = half_rot * 2 bytes per position
@@ -1283,6 +1419,10 @@ pub fn transpose_shd_hsd(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_shd_hsd(
             dtype.kernel_dtype_code(),
@@ -1311,6 +1451,10 @@ pub fn transpose_pad_conv(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_pad_conv(
             dtype.kernel_dtype_code(),
@@ -1338,6 +1482,10 @@ pub fn extract_conv_state(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_extract_conv_state(
             dtype.kernel_dtype_code(),
@@ -1364,6 +1512,10 @@ pub fn sigmoid_mul(
     gate: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::sigmoid_mul(dtype, total_elems, data, gate, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_sigmoid_mul(
             dtype.kernel_dtype_code(), ordinal, total_elems,
@@ -1393,6 +1545,20 @@ pub fn compute_beta_g(
     beta: &mut GpuBuffer,
     g: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if beta.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::compute_beta_g(
+            dtype,
+            seq_len,
+            nv,
+            b,
+            a,
+            dt_bias,
+            a_log_exp,
+            beta,
+            g,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_compute_beta_g(
             dtype.kernel_dtype_code(), ordinal, seq_len, nv,
@@ -1419,6 +1585,10 @@ pub fn split_qgate(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if query_out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_split_qgate(
             dtype.kernel_dtype_code(), ordinal, s, num_heads, head_dim,
@@ -1446,6 +1616,10 @@ pub fn split_qkv(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if q.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_split_qkv(
             dtype.kernel_dtype_code(), ordinal, s, key_dim, val_dim,
@@ -1472,6 +1646,18 @@ pub fn repeat_interleave_heads(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::repeat_interleave_heads(
+            dtype,
+            s,
+            n_heads,
+            head_dim,
+            repeats,
+            src,
+            dst,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_repeat_interleave_heads(
             dtype.kernel_dtype_code(), ordinal,
