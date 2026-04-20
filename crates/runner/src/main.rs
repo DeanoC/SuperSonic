@@ -3195,7 +3195,10 @@ fn trace_persistent_linear_layer(
         engine.component_trace_linear_layer_from_current_hidden(trace_layer)?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
     engine.set_hidden_from_bytes(&native_hidden)?;
-    let native_comp_layer = engine.component_trace_full_layer_from_current_hidden(trace_layer)?;
+    let native_comp_layer = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
+        trace_layer,
+        seqlen_offset,
+    )?;
 
     engine.rebuild_prefill_state(prefix_ids, true)?;
     let native_hidden_out = engine
@@ -3485,7 +3488,10 @@ fn trace_oracle_prefill_layer(
         .map_err(|e| anyhow::anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?;
 
     engine.set_hidden_from_bytes(&oracle_input_bytes)?;
-    let trace = engine.component_trace_full_layer_from_current_hidden(trace_layer)?;
+    let trace = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
+        trace_layer,
+        prefix_ids.len(),
+    )?;
     let attn_delta =
         validate::max_abs_delta(&decode_bf16_le(&trace.attn_hidden), &decode_bf16_le(&oracle_attn_bytes));
     let post_delta =
@@ -3506,6 +3512,13 @@ fn trace_oracle_prefill_layer(
     if engine.weights().config.is_full_attention(trace_layer)
         && oracle_full.traced_full_attn_layer == Some(trace_layer)
     {
+        // `component_trace_full_layer_from_current_hidden()` reuses the mutable
+        // component decode path and overwrites slot 0 of the full-attention KV
+        // cache for `trace_layer`. Reload the prefix oracle state so the deeper
+        // attention trace below sees the original prefix cache, not the
+        // trace-mutated one.
+        engine.reset()?;
+        engine.load_prefill_state(&prefix_oracle)?;
         let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
             let bytes = b64
                 .decode(field.as_ref().ok_or_else(|| anyhow::anyhow!("oracle output missing {label}"))?)
@@ -3573,6 +3586,27 @@ fn trace_oracle_prefill_layer(
         let v_step = decode_bf16_le(&stage.v_proj);
         let prefix_k = decode_bf16_le(&prefix_k_bytes);
         let prefix_v = decode_bf16_le(&prefix_v_bytes);
+        let loaded_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing loaded layer {trace_layer}"))?;
+        let loaded_raw_k = decode_bf16_le(
+            &loaded_layer
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loaded layer {trace_layer} missing K cache"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("loaded layer {trace_layer} K cache D2H: {e}"))?,
+        );
+        let loaded_raw_v = decode_bf16_le(
+            &loaded_layer
+                .kv_cache_v
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loaded layer {trace_layer} missing V cache"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("loaded layer {trace_layer} V cache D2H: {e}"))?,
+        );
         anyhow::ensure!(
             prefix_len == prefix_ids.len(),
             "trace layer {trace_layer} prefix len {} != prompt prefix len {}",
@@ -3679,10 +3713,70 @@ fn trace_oracle_prefill_layer(
             validate::max_abs_delta(&host_attn_pre_gate, &oracle_pre_gate);
         let oracle_host_pre_gate_vs_oracle =
             validate::max_abs_delta(&oracle_host_pre_gate, &oracle_pre_gate);
+        let kernel_pre_gate_direct = {
+            let ordinal = engine.ordinal();
+            let q_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_heads, 1, head_dim],
+                &f32_to_bf16_bytes(q_rope_host.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn q H2D: {e}"))?;
+            let k_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &f32_to_bf16_bytes(full_k.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn k H2D: {e}"))?;
+            let v_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &f32_to_bf16_bytes(full_v.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn v H2D: {e}"))?;
+            let mut out_gpu = gpu_hal::GpuBuffer::zeros(
+                ordinal,
+                gpu_hal::ScalarType::F32,
+                &[num_heads, 1, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn out alloc: {e}"))?;
+            kernel_ffi::prefill_ffi::full_attention_prefill(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                1,
+                num_heads,
+                num_kv_heads,
+                1,
+                kv_len,
+                head_dim,
+                scale,
+                prefix_len,
+                &q_gpu,
+                &k_gpu,
+                &v_gpu,
+                &mut out_gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn kernel: {e}"))?;
+            decode_f32_le(
+                &out_gpu
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("trace direct attn out D2H: {e}"))?,
+            )
+        };
+        let direct_kernel_vs_host =
+            validate::max_abs_delta(&kernel_pre_gate_direct, &host_attn_pre_gate);
+        let direct_kernel_vs_oracle =
+            validate::max_abs_delta(&kernel_pre_gate_direct, &oracle_pre_gate);
         let loaded_prefix_k_vs_oracle =
             validate::max_abs_delta(&prefix_k, &oracle_prefix_k);
         let loaded_prefix_v_vs_oracle =
             validate::max_abs_delta(&prefix_v, &oracle_prefix_v);
+        let loaded_raw_k_vs_oracle =
+            validate::max_abs_delta(&loaded_raw_k, &oracle_prefix_k);
+        let loaded_raw_v_vs_oracle =
+            validate::max_abs_delta(&loaded_raw_v, &oracle_prefix_v);
         let mut head_deltas = Vec::with_capacity(num_heads);
         for head in 0..num_heads {
             let start = head * head_dim;
@@ -3693,7 +3787,7 @@ fn trace_oracle_prefill_layer(
             ));
         }
         eprintln!(
-            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} host_pre_gate_vs_stage={host_pre_gate_vs_stage:.6} host_pre_gate_vs_oracle={host_pre_gate_vs_oracle:.6} oracle_host_pre_gate_vs_oracle={oracle_host_pre_gate_vs_oracle:.6} loaded_prefix_k_vs_oracle={loaded_prefix_k_vs_oracle:.6} loaded_prefix_v_vs_oracle={loaded_prefix_v_vs_oracle:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
+            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} host_pre_gate_vs_stage={host_pre_gate_vs_stage:.6} host_pre_gate_vs_oracle={host_pre_gate_vs_oracle:.6} oracle_host_pre_gate_vs_oracle={oracle_host_pre_gate_vs_oracle:.6} direct_kernel_vs_host={direct_kernel_vs_host:.6} direct_kernel_vs_oracle={direct_kernel_vs_oracle:.6} loaded_prefix_k_vs_oracle={loaded_prefix_k_vs_oracle:.6} loaded_prefix_v_vs_oracle={loaded_prefix_v_vs_oracle:.6} loaded_raw_k_vs_oracle={loaded_raw_k_vs_oracle:.6} loaded_raw_v_vs_oracle={loaded_raw_v_vs_oracle:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
         );
     }
     Ok(())

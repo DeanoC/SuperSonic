@@ -1025,19 +1025,6 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope: {e}"))?;
 
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &k_buf, &mut step_k,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &v_buf, &mut step_v,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v transpose: {e}"))?;
-
         let (prefix_k_host, prefix_v_host, prefix_len) =
             self.assemble_full_attention_prefix_cache_bf16_host_for_state(state, idx)?;
         anyhow::ensure!(
@@ -1046,49 +1033,54 @@ impl DecodeEngine {
             prefix_len,
             seqlen_offset
         );
+        let q_rope_bytes = query_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q rope D2H: {e}"))?;
+        let k_step_bytes = k_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope D2H: {e}"))?;
+        let v_step_bytes = v_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v step D2H: {e}"))?;
+        let mut full_k_bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
+        let mut full_v_bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
+        let prefix_row_bytes = prefix_len * head_dim * elem_bytes;
+        let kv_row_bytes = kv_len * head_dim * elem_bytes;
+        let step_row_bytes = head_dim * elem_bytes;
+        for h in 0..num_kv_heads {
+            let prefix_src = h * prefix_row_bytes;
+            let full_dst = h * kv_row_bytes;
+            let step_src = h * step_row_bytes;
+            full_k_bytes[full_dst..full_dst + prefix_row_bytes]
+                .copy_from_slice(&prefix_k_host[prefix_src..prefix_src + prefix_row_bytes]);
+            full_v_bytes[full_dst..full_dst + prefix_row_bytes]
+                .copy_from_slice(&prefix_v_host[prefix_src..prefix_src + prefix_row_bytes]);
+            full_k_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
+                .copy_from_slice(&k_step_bytes[step_src..step_src + step_row_bytes]);
+            full_v_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
+                .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
+        }
+        let attn_q = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[num_q_heads, 1, head_dim],
+            &q_rope_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q H2D: {e}"))?;
         let kv_k_contig = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             &[num_kv_heads, kv_len, head_dim],
-            &{
-                let mut bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
-                let copy = prefix_k_host.len();
-                bytes[..copy].copy_from_slice(&prefix_k_host);
-                bytes
-            },
+            &full_k_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_k_contig H2D: {e}"))?;
         let kv_v_contig = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             &[num_kv_heads, kv_len, head_dim],
-            &{
-                let mut bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
-                let copy = prefix_v_host.len();
-                bytes[..copy].copy_from_slice(&prefix_v_host);
-                bytes
-            },
+            &full_v_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_v_contig H2D: {e}"))?;
-        let contig_stride = kv_len * head_dim * elem_bytes;
-        let step_stride = head_dim * elem_bytes;
-        let dst_offset = seqlen_offset * head_dim * elem_bytes;
-        for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                kv_k_contig.offset_ptr(h * contig_stride + dst_offset) as *mut c_void,
-                step_k.offset_ptr(h * step_stride),
-                step_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv K append h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                kv_v_contig.offset_ptr(h * contig_stride + dst_offset) as *mut c_void,
-                step_v.offset_ptr(h * step_stride),
-                step_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv V append h={h}: {e}"))?;
-        }
 
         kernel_ffi::prefill_ffi::full_attention_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
@@ -1100,10 +1092,15 @@ impl DecodeEngine {
             self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn cast: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
+        attn_flat = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[1, q_dim],
+            &attn_out_bf16
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn bf16 D2H: {e}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn transpose: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat H2D: {e}"))?;
         kernel_ffi::prefill_ffi::sigmoid_mul(
             self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
         )
@@ -1225,6 +1222,15 @@ impl DecodeEngine {
         &mut self,
         idx: usize,
     ) -> Result<ComponentLayerTrace> {
+        self.component_trace_full_layer_from_current_hidden_with_seqlen(idx, 0)
+    }
+
+    pub fn component_trace_full_layer_from_current_hidden_with_seqlen(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+    ) -> Result<ComponentLayerTrace> {
+        let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
             ScalarType::BF16,
@@ -1238,11 +1244,26 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer input rms_norm: {e}"))?;
 
         if self.weights.config.is_full_attention(idx) {
-            self.component_decode_full_attention_layer(idx, 0)?;
+            let hidden_in = self
+                .hidden_io
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer hidden D2H: {e}"))?;
+            let attn_trace = self.trace_full_attention_layer_output_from_hidden_current_state(
+                idx,
+                0,
+                &hidden_in[..row_bytes],
+                seqlen_offset,
+            )?;
+            self.hidden_io = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[1, self.weights.config.hidden_size],
+                &attn_trace.attn_hidden,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden H2D: {e}"))?;
         } else {
             self.component_decode_linear_attention_layer(idx, false)?;
         }
-        let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
         let attn_hidden = self
             .hidden_io
             .to_host_bytes()
