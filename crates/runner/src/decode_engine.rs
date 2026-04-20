@@ -358,11 +358,11 @@ const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
 const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
 const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
 const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 27;
-const PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE: usize = 29;
-const PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE: usize = 31;
-const PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE: usize = 33;
-const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 35;
-const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 36;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE: usize = 35;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE: usize = 37;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE: usize = 39;
+const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 41;
+const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 42;
 
 fn persistent_4b_clock_cycles_to_ms(cycles: u64, clock_rate_khz: u32) -> f64 {
     if cycles == 0 || clock_rate_khz == 0 {
@@ -485,6 +485,58 @@ fn decode_persistent_4b_timing_slots(
             clock_rate_khz,
         ),
         ..DecodeStageTimings::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qwen35::scratch::PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
+
+    #[test]
+    fn persistent_4b_timing_ranges_do_not_overlap() {
+        let full_attn_core = PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE
+            ..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
+        let full_attn_out = PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE
+            ..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
+        let linear_core =
+            PERSISTENT_4B_TIMING_LINEAR_CORE_BASE..PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + 8;
+        let linear_out =
+            PERSISTENT_4B_TIMING_LINEAR_OUT_BASE..PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + 8;
+        let linear_core_conv = PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + 2;
+        let linear_core_recurrent = PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + 2;
+        let linear_core_post = PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE
+            ..PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + 2;
+        let singleton_slots = [
+            PERSISTENT_4B_TIMING_FULL_ATTN,
+            PERSISTENT_4B_TIMING_FULL_ATTN_PROJ,
+            PERSISTENT_4B_TIMING_LINEAR_PROJ,
+            PERSISTENT_4B_TIMING_MLP_GATE_UP,
+            PERSISTENT_4B_TIMING_MLP_DOWN,
+        ];
+
+        let mut used = [false; PERSISTENT_4B_TIMING_SLOTS_PER_LAYER];
+        for slot in singleton_slots {
+            assert!(!used[slot], "slot {slot} overlaps");
+            used[slot] = true;
+        }
+        for range in [
+            full_attn_core,
+            full_attn_out,
+            linear_core,
+            linear_out,
+            linear_core_conv,
+            linear_core_recurrent,
+            linear_core_post,
+        ] {
+            for slot in range {
+                assert!(slot < PERSISTENT_4B_TIMING_SLOTS_PER_LAYER);
+                assert!(!used[slot], "slot {slot} overlaps");
+                used[slot] = true;
+            }
+        }
     }
 }
 
