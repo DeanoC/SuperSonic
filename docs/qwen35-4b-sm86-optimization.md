@@ -966,3 +966,69 @@ Additional validation for the single-sequence native-kernel staging lane:
 - baked `--validate --force-kernel-decode` passed with `decode_max_delta=0.3047`
 - baked `--gpu-validate --force-kernel-decode` passed with token agreement and
   `gpu_oracle_max_delta=0.3125`
+
+## Latest Kept Single-Stream Pass
+
+The next kept pass stays inside the `B == 1 && bs == 256 && hd == 256` CUDA
+hero attention-core path, but changes how the KV-time loop is partitioned:
+
+- keeps the existing packed BF16 attention math and online softmax update
+- keeps the debug trace path on the old implementation
+- keeps FP8-KV, batch decode, and non-hero shapes unchanged
+- splits the hero KV-token loop across warps instead of having one warp walk
+  the whole sequence serially
+- accumulates per-warp online-softmax partials in registers
+- reduces those per-warp partials once at the end in warp `0`
+
+Why this pass was chosen:
+
+- the current single-stream bottleneck was still `full_attn_core`, not
+  projection or host-side work
+- the hero lane already had a shape-specific guard, so this was a bounded
+  place to make the schedule more aggressive
+- the prior kept passes reduced score-side overhead, but the hero path was
+  still serializing the KV walk through one warp
+- this directly attacks that serialization without changing the validated
+  batch path
+
+Short screening result (`pp533` / `tg16`) against the previous single-stream
+baseline:
+
+- prefill was effectively flat at `4489.2 ms`
+- decode improved from about `1509.0 ms` to `1097.8 ms`
+- decode throughput improved from about `10.6 tok/s` to `14.6 tok/s`
+- persistent decode improved from about `1419.2 ms` to `1006.135 ms`
+- full attention improved from about `563.464 ms` to `82.204 ms`
+- full-attention core improved from about `530.211 ms` to `65.636 ms`
+
+Full warmed result (`pp533` / `tg128`) against the previous single-stream
+baseline:
+
+- prefill moved from `4486.2 ms` to `4514.8 ms`
+- decode improved from `12086.1 ms` to `8823.0 ms`
+- decode throughput improved from `10.6 tok/s` to `14.5 tok/s`
+- native decode total improved from `11875.697 ms` to `8613.553 ms`
+- persistent decode improved from `11353.590 ms` to `8091.387 ms`
+- full attention improved from `4374.394 ms` to `705.827 ms`
+- full-attention core improved from `4241.684 ms` to `573.292 ms`
+- linear core remained essentially flat at `3236.450 ms` to `3238.595 ms`
+
+Verification notes:
+
+- `tests/sm86/run_4b.sh` baked path passed with token agreement and
+  `decode_max_delta=0.2812`
+- `tests/sm86/run_4b_long.sh` passed `4 / 4`
+- `tests/sm86/run_batch.sh` baked batch path passed with `decode_max_delta=0.3047`
+- the `--no-bake` subtests in `run_4b.sh` and `run_batch.sh` still fail on
+  this machine because `/workspace/models/Qwen3.5-4B` does not contain raw
+  `safetensors`
+
+What this changes about the bottleneck:
+
+- this pass is large enough that `full_attn_core` is no longer the dominant
+  wall-time section in the single-stream hero lane
+- the next single-stream bottleneck is now the linear-attention recurrent/core
+  body, especially `linear_core`
+- the next bounded pass should instrument and specialize the single-stream
+  `linear_core` work instead of continuing to push on the already-collapsed
+  attention core

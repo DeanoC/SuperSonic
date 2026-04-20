@@ -4766,7 +4766,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* cv = static_cast<const T*>(kv_v_b);
                     T* q_head_bf16 = reinterpret_cast<T*>(lds_input);
                     const bool qwen4b_single_bf16_attn_core_hero =
-                        B == 1 && bs == 256 && hd == 256;
+                        B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
 
                     if (qwen4b_single_bf16_attn_core_hero) {
                         for (int qh = 0; qh < nh; ++qh) {
@@ -4774,10 +4774,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const float* q_head = q_f32 + qh * hd * 2;
                             const size_t kv_head_base =
                                 static_cast<size_t>(kvh) * kv_max_b * hd;
-                            const bool attn_lane_active = tid < (hd / 8);
+                            const int hero_warps = bs / warpSize;
+                            const int hero_warp = tid / warpSize;
+                            const int hero_lane = tid % warpSize;
+                            const bool attn_lane_active = hero_lane < (hd / 8);
 
-                            if (attn_lane_active) {
-                                const int d0 = tid * 8;
+                            if (tid < hd) {
+                                saved_gate[qh * hd + tid] = bf16_round_rne_f32_finite(
+                                    q_f32[qh * hd * 2 + hd + tid]);
+                            }
+                            if (tid < warpSize) {
+                                const int d0 = hero_lane * 8;
                                 q_head_bf16[d0] = dotcache_qwen35_from_float<T>(q_head[d0]);
                                 q_head_bf16[d0 + 1] = dotcache_qwen35_from_float<T>(q_head[d0 + 1]);
                                 q_head_bf16[d0 + 2] = dotcache_qwen35_from_float<T>(q_head[d0 + 2]);
@@ -4787,14 +4794,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 q_head_bf16[d0 + 6] = dotcache_qwen35_from_float<T>(q_head[d0 + 6]);
                                 q_head_bf16[d0 + 7] = dotcache_qwen35_from_float<T>(q_head[d0 + 7]);
                             }
-                            __syncwarp();
+                            __syncthreads();
 
                             float2 qv0 = make_float2(0.0f, 0.0f);
                             float2 qv1 = make_float2(0.0f, 0.0f);
                             float2 qv2 = make_float2(0.0f, 0.0f);
                             float2 qv3 = make_float2(0.0f, 0.0f);
                             if (attn_lane_active) {
-                                const int d0 = tid * 8;
+                                const int d0 = hero_lane * 8;
                                 const __nv_bfloat162 q_pack0 =
                                     *reinterpret_cast<const __nv_bfloat162*>(q_head_bf16 + d0);
                                 const __nv_bfloat162 q_pack1 =
@@ -4820,20 +4827,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float my_max = -1e30f;
                             float my_sum = 0.0f;
 
-                            for (int t = 0; t < kv_len_b; ++t) {
-                                const size_t pos_base =
-                                    kv_head_base + static_cast<size_t>(t) * hd;
-                                float partial = 0.0f;
-                                float v0 = 0.0f;
-                                float v1 = 0.0f;
-                                float v2 = 0.0f;
-                                float v3 = 0.0f;
-                                float v4 = 0.0f;
-                                float v5 = 0.0f;
-                                float v6 = 0.0f;
-                                float v7 = 0.0f;
-                                if (attn_lane_active) {
-                                    const int d0 = tid * 8;
+                            if (attn_lane_active) {
+                                for (int t = hero_warp; t < kv_len_b; t += hero_warps) {
+                                    const size_t pos_base =
+                                        kv_head_base + static_cast<size_t>(t) * hd;
+                                    const int d0 = hero_lane * 8;
                                     const __nv_bfloat162 k_pack0 =
                                         *reinterpret_cast<const __nv_bfloat162*>(ck + pos_base + d0);
                                     const __nv_bfloat162 k_pack1 =
@@ -4858,61 +4856,100 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     const float2 vv1 = __bfloat1622float2(v_pack1);
                                     const float2 vv2 = __bfloat1622float2(v_pack2);
                                     const float2 vv3 = __bfloat1622float2(v_pack3);
-                                    partial =
+                                    const float partial =
                                         qv0.x * kv0.x + qv0.y * kv0.y +
                                         qv1.x * kv1.x + qv1.y * kv1.y +
                                         qv2.x * kv2.x + qv2.y * kv2.y +
                                         qv3.x * kv3.x + qv3.y * kv3.y;
-                                    v0 = vv0.x;
-                                    v1 = vv0.y;
-                                    v2 = vv1.x;
-                                    v3 = vv1.y;
-                                    v4 = vv2.x;
-                                    v5 = vv2.y;
-                                    v6 = vv3.x;
-                                    v7 = vv3.y;
-                                }
-                                if (attn_lane_active) {
-                                    float wave_sum = wave_reduce_sum_f32(partial);
-                                    float score_val = __shfl_sync(0xffffffffu, wave_sum, 0) * scale;
-                                    if (tid == 0 && emit_attention_trace) {
-                                        saved_scores[qh * kv_max_b + t] = score_val;
-                                    }
-                                    float old_max = my_max;
+                                    const float wave_sum = wave_reduce_sum_f32(partial);
+                                    const float score_val =
+                                        __shfl_sync(0xffffffffu, wave_sum, 0) * scale;
+                                    const float old_max = my_max;
                                     my_max = fmaxf(my_max, score_val);
-                                    float rescale = expf(old_max - my_max);
-                                    float w = expf(score_val - my_max);
-                                    my_acc0 = my_acc0 * rescale + w * v0;
-                                    my_acc1 = my_acc1 * rescale + w * v1;
-                                    my_acc2 = my_acc2 * rescale + w * v2;
-                                    my_acc3 = my_acc3 * rescale + w * v3;
-                                    my_acc4 = my_acc4 * rescale + w * v4;
-                                    my_acc5 = my_acc5 * rescale + w * v5;
-                                    my_acc6 = my_acc6 * rescale + w * v6;
-                                    my_acc7 = my_acc7 * rescale + w * v7;
+                                    const float rescale = expf(old_max - my_max);
+                                    const float w = expf(score_val - my_max);
+                                    my_acc0 = my_acc0 * rescale + w * vv0.x;
+                                    my_acc1 = my_acc1 * rescale + w * vv0.y;
+                                    my_acc2 = my_acc2 * rescale + w * vv1.x;
+                                    my_acc3 = my_acc3 * rescale + w * vv1.y;
+                                    my_acc4 = my_acc4 * rescale + w * vv2.x;
+                                    my_acc5 = my_acc5 * rescale + w * vv2.y;
+                                    my_acc6 = my_acc6 * rescale + w * vv3.x;
+                                    my_acc7 = my_acc7 * rescale + w * vv3.y;
                                     my_sum = my_sum * rescale + w;
                                 }
                             }
 
-                            if (attn_lane_active) {
-                                const int d0 = tid * 8;
-                                const float inv_sum = (my_sum > 0.0f) ? (1.0f / my_sum) : 0.0f;
+                            float* hero_max_buf = lds_input;
+                            float* hero_sum_buf = hero_max_buf + hero_warps * warpSize;
+                            float* hero_acc0_buf = hero_sum_buf + hero_warps * warpSize;
+                            float* hero_acc1_buf = hero_acc0_buf + hero_warps * warpSize;
+                            float* hero_acc2_buf = hero_acc1_buf + hero_warps * warpSize;
+                            float* hero_acc3_buf = hero_acc2_buf + hero_warps * warpSize;
+                            float* hero_acc4_buf = hero_acc3_buf + hero_warps * warpSize;
+                            float* hero_acc5_buf = hero_acc4_buf + hero_warps * warpSize;
+                            float* hero_acc6_buf = hero_acc5_buf + hero_warps * warpSize;
+                            float* hero_acc7_buf = hero_acc6_buf + hero_warps * warpSize;
+                            const int hero_idx = hero_warp * warpSize + hero_lane;
+                            hero_max_buf[hero_idx] = my_max;
+                            hero_sum_buf[hero_idx] = my_sum;
+                            hero_acc0_buf[hero_idx] = my_acc0;
+                            hero_acc1_buf[hero_idx] = my_acc1;
+                            hero_acc2_buf[hero_idx] = my_acc2;
+                            hero_acc3_buf[hero_idx] = my_acc3;
+                            hero_acc4_buf[hero_idx] = my_acc4;
+                            hero_acc5_buf[hero_idx] = my_acc5;
+                            hero_acc6_buf[hero_idx] = my_acc6;
+                            hero_acc7_buf[hero_idx] = my_acc7;
+                            __syncthreads();
+
+                            if (hero_warp == 0) {
+                                float final_max = -1e30f;
+                                float final_sum = 0.0f;
+                                float final_acc0 = 0.0f;
+                                float final_acc1 = 0.0f;
+                                float final_acc2 = 0.0f;
+                                float final_acc3 = 0.0f;
+                                float final_acc4 = 0.0f;
+                                float final_acc5 = 0.0f;
+                                float final_acc6 = 0.0f;
+                                float final_acc7 = 0.0f;
+                                for (int w = 0; w < hero_warps; ++w) {
+                                    const int idx = w * warpSize + hero_lane;
+                                    const float local_max = hero_max_buf[idx];
+                                    const float local_sum = hero_sum_buf[idx];
+                                    const float old_max = final_max;
+                                    final_max = fmaxf(final_max, local_max);
+                                    const float old_rescale = expf(old_max - final_max);
+                                    const float new_rescale = expf(local_max - final_max);
+                                    final_acc0 = final_acc0 * old_rescale + hero_acc0_buf[idx] * new_rescale;
+                                    final_acc1 = final_acc1 * old_rescale + hero_acc1_buf[idx] * new_rescale;
+                                    final_acc2 = final_acc2 * old_rescale + hero_acc2_buf[idx] * new_rescale;
+                                    final_acc3 = final_acc3 * old_rescale + hero_acc3_buf[idx] * new_rescale;
+                                    final_acc4 = final_acc4 * old_rescale + hero_acc4_buf[idx] * new_rescale;
+                                    final_acc5 = final_acc5 * old_rescale + hero_acc5_buf[idx] * new_rescale;
+                                    final_acc6 = final_acc6 * old_rescale + hero_acc6_buf[idx] * new_rescale;
+                                    final_acc7 = final_acc7 * old_rescale + hero_acc7_buf[idx] * new_rescale;
+                                    final_sum = final_sum * old_rescale + local_sum * new_rescale;
+                                }
+                                const int d0 = hero_lane * 8;
+                                const float inv_sum = (final_sum > 0.0f) ? (1.0f / final_sum) : 0.0f;
                                 attn_flat[qh * hd + d0] =
-                                    bf16_round_rne_f32_finite(my_acc0 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc0 * inv_sum);
                                 attn_flat[qh * hd + d0 + 1] =
-                                    bf16_round_rne_f32_finite(my_acc1 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc1 * inv_sum);
                                 attn_flat[qh * hd + d0 + 2] =
-                                    bf16_round_rne_f32_finite(my_acc2 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc2 * inv_sum);
                                 attn_flat[qh * hd + d0 + 3] =
-                                    bf16_round_rne_f32_finite(my_acc3 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc3 * inv_sum);
                                 attn_flat[qh * hd + d0 + 4] =
-                                    bf16_round_rne_f32_finite(my_acc4 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc4 * inv_sum);
                                 attn_flat[qh * hd + d0 + 5] =
-                                    bf16_round_rne_f32_finite(my_acc5 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc5 * inv_sum);
                                 attn_flat[qh * hd + d0 + 6] =
-                                    bf16_round_rne_f32_finite(my_acc6 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc6 * inv_sum);
                                 attn_flat[qh * hd + d0 + 7] =
-                                    bf16_round_rne_f32_finite(my_acc7 * inv_sum);
+                                    bf16_round_rne_f32_finite(final_acc7 * inv_sum);
                             }
                             __syncthreads();
                         }
