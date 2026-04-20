@@ -656,6 +656,24 @@ fn main() -> Result<()> {
         );
         params.use_4b_kernel = true;
     }
+    // qwen3.5-0.8b BF16 decode through the native full_attention.hip kernel
+    // reproducibly page-faults immediately after prefill on gfx1150 (null-
+    // pointer dereference inside the kernel; pre-existing bug, feedback memory
+    // `qwen08_bf16_fault`). The 4B megakernel has identical semantics for
+    // 0.8B shapes and is proven to work via the INT4 routing above, so route
+    // BF16 0.8B through it too. Removing this forcing once the native 0.8B
+    // kernel fault is diagnosed is safe.
+    if matches!(model_variant, registry::ModelVariant::Qwen3_5_0_8B)
+        && !params.use_4b_kernel
+        && backend == Backend::Hip
+    {
+        eprintln!(
+            "[perf] {} routing through 4B kernel (full_attention_4b.hip) \
+             to avoid pre-existing native 0.8B decode kernel page-fault",
+            model_variant
+        );
+        params.use_4b_kernel = true;
+    }
     let params = &params;
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
