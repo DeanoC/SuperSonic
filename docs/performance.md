@@ -1,0 +1,73 @@
+# Performance
+
+Measured decode throughput for the shipping kernels. Numbers are steady-state
+tokens/second, single-sequence (`--batch-size 1`) unless noted, recorded with
+a 16-token generation on the 6-token `"The quick brown fox jumps over"` prompt.
+
+If you reproduce these and get materially different results, please open an
+issue with your GPU arch, ROCm/CUDA versions, and the exact command line.
+
+## HIP — `gfx1150` (AMD Radeon 890M iGPU)
+
+16 CUs, 2.9 GHz core, shared with system memory. Measurements from
+2026-04-20 on commit `d91a993` (2× grid oversubscription merged).
+
+| Model              | Quant | ms/tok | tok/s |
+|--------------------|-------|-------:|------:|
+| qwen3.5-0.8b       | BF16  | 91     | 11.0  |
+| qwen3.5-0.8b       | INT4  | 78     | 12.8  |
+| qwen3.5-2b         | BF16  | 159    | 6.3   |
+| qwen3.5-2b         | INT4  | 118    | 8.5   |
+| qwen3.5-4b         | BF16  | 514    | 1.9   |
+| qwen3.5-4b         | INT4  | 286    | 3.5   |
+| qwen3.5-9b         | FP8   | 697    | 1.4   |
+
+Notes:
+
+- `qwen3.5-0.8b` decode (both BF16 and INT4) routes through the 4B persistent
+  megakernel. The native 0.8B decode kernel has a documented page-fault on
+  this machine and is not on the shipping path.
+- `qwen3.5-9b` INT4 bake runs out of VRAM during GPTQ calibration on 16 GiB
+  cards. Consumers pull the released bake from GitHub releases (see
+  [bake-distribution.md](bake-distribution.md)); the INT4 runtime itself is
+  supported.
+- FP8-runtime and FP8-KV paths (`--fp8-runtime`, `--kv-fp8`) are only wired
+  for the Qwen family on HIP. Gemma 4 and Phi-4-mini reject both flags.
+
+Gemma 4 and Phi-4-mini timings on gfx1150 are not in the current measurement
+set — add them here when next measured.
+
+## CUDA — `sm86` (NVIDIA RTX 3090-class)
+
+24 GB VRAM, 936 GB/s memory bandwidth. Current behavior depends on whether
+the path is using replayed prefill for correctness.
+
+With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
+
+| Model                              | Path                      | Prefill       | Decode        |
+|------------------------------------|---------------------------|---------------|---------------|
+| qwen3.5-0.8b                       | default (hero)            | 563 tok/s     | 29.9 tok/s    |
+| qwen3.5-4b `--batch-size 2`        | default (batched)         | 124 tok/s     | 21.6 tok/s    |
+| qwen3.5-4b `--batch-size 1`        | replay-prefill correctness| 124 tok/s     | 1.1 tok/s     |
+| qwen3.5-4b `--batch-size 1`        | `--force-kernel-decode`   | 119 tok/s     | 10.6 tok/s    |
+
+CUDA `sm86` tracks detailed kernel-level optimization history in
+[qwen35-sm86-optimization.md](qwen35-sm86-optimization.md) (0.8B hero lane)
+and [qwen35-4b-sm86-optimization.md](qwen35-4b-sm86-optimization.md) (4B).
+
+## How to reproduce
+
+```bash
+# HIP / gfx1150
+cargo build --release --bin supersonic
+./target/release/supersonic --model qwen3.5-0.8b \
+  --model-dir /path/to/Qwen3.5-0.8B \
+  --prompt "The quick brown fox jumps over" \
+  --max-new-tokens 16
+
+# Add --int4 / --fp8-runtime / --kv-fp8 as supported per the matrix in README.md.
+
+# CUDA / sm86
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
+  /path/to/Qwen3.5-0.8B /path/to/Qwen3.5-4B
+```

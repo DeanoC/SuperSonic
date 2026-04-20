@@ -1,22 +1,49 @@
 # SuperSonic
 
-Optimized LLM inference with persistent decode megakernels. Each supported (model, backend, GPU) combination gets a hand-tuned kernel — no fallback to generic slow paths.
+Optimized LLM inference with persistent decode megakernels. Each supported
+(model, backend, GPU) combination gets a hand-tuned kernel — no fallback to
+generic slow paths.
 
-Currently supports:
-
-- Qwen3.5-0.8B and Qwen3.5-4B on AMD `gfx1150` (RDNA 3.5) via HIP
-- Gemma 4 E2B and E4B on AMD `gfx1150` (RDNA 3.5) via HIP
-- Qwen3.5-0.8B and Qwen3.5-4B on NVIDIA `sm86` (RTX 3090-class) via CUDA
-
-CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` remain unsupported on CUDA. A hidden unstable CUDA `--kv-fp8` debug path exists for targeted validation work on `qwen3.5-4b`, but it is not part of the public supported surface.
+Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-| Backend | GPU arch | Models | Status |
-| --- | --- | --- | --- |
-| HIP | `gfx1150` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
-| HIP | `gfx1150` | `gemma4-e2b`, `gemma4-e4b` | upstream validated |
-| CUDA | `sm86` | `qwen3.5-0.8b`, `qwen3.5-4b` | validated |
+Two backends are validated today:
+
+- **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
+- **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
+
+### HIP on `gfx1150`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-9b       |  ✅  |  ✅¹ |      ✅     |   ✅   |
+| gemma4-e2b       |  ✅  |  ✅  |      —      |    —   |
+| gemma4-e4b       |  ✅  |  —²  |      —      |    —   |
+| phi4-mini        |  ✅  |  ✅  |      —      |    —   |
+
+¹ GPTQ calibration for 9B INT4 needs ≥24 GiB; consumers pull the released
+  bake from GitHub releases. See [docs/bake-distribution.md](docs/bake-distribution.md).
+² Gemma E4B INT4 calibration is parked.
+
+DFlash speculative decode is available for `qwen3.5-9b` INT4 on HIP —
+see [docs/dflash.md](docs/dflash.md).
+
+### CUDA on `sm86`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
+| qwen3.5-4b       |  ✅  |  —   |      —      |   🔒³  |
+
+³ `qwen3.5-4b` has a hidden `--allow-unstable-cuda-kv-fp8` debug surface for
+  parity-sensitive validation work. It is not part of the public supported
+  surface — see the CUDA section below for the narrow validated shape.
+
+CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` are rejected at runtime.
 
 CUDA support is currently a narrow v1 surface:
 
