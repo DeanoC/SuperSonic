@@ -24,6 +24,9 @@ enum Qwen35Persistent4BTimingSlot {
     QWEN35_4B_TIMING_LINEAR_PROJ = 18,
     QWEN35_4B_TIMING_LINEAR_CORE_BASE = 19,
     QWEN35_4B_TIMING_LINEAR_OUT_BASE = 27,
+    QWEN35_4B_TIMING_LINEAR_CORE_CONV_BASE = 29,
+    QWEN35_4B_TIMING_LINEAR_CORE_RECURRENT_BASE = 31,
+    QWEN35_4B_TIMING_LINEAR_CORE_POST_BASE = 33,
     QWEN35_4B_TIMING_MLP_GATE_UP = 35,
     QWEN35_4B_TIMING_MLP_DOWN = 36,
     QWEN35_4B_TIMING_COUNT = 37,
@@ -5284,6 +5287,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 const int hvd = L.linear_head_v_dim;
                 const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
                 const int val_dim = L.linear_value_dim; // 2048
+                const unsigned long long linear_conv_clock = clock64();
 
                 // Step B: Conv1d stateful update
                 // conv_state: [conv_dim, kern-1] BF16 (sliding window of past values)
@@ -5384,6 +5388,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
                 }
+                qwen35_record_persistent_4b_timing(
+                    layer_timing_slots,
+                    QWEN35_4B_TIMING_LINEAR_CORE_CONV_BASE + min(b, 1),
+                    linear_conv_clock);
+
+                const unsigned long long linear_recurrent_clock = clock64();
 
                 // Step C: Parallel delta recurrent state update
                 // state: [nv, hkd, hvd] F32 — the recurrent memory
@@ -5474,6 +5484,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
 
                 __syncthreads();
+                qwen35_record_persistent_4b_timing(
+                    layer_timing_slots,
+                    QWEN35_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + min(b, 1),
+                    linear_recurrent_clock);
+
+                const unsigned long long linear_post_clock = clock64();
 
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
                 {
@@ -5499,6 +5515,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
                 }
+                qwen35_record_persistent_4b_timing(
+                    layer_timing_slots,
+                    QWEN35_4B_TIMING_LINEAR_CORE_POST_BASE + min(b, 1),
+                    linear_post_clock);
 
             } // end if (blockIdx.x == 0) for linear attention core
             // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj

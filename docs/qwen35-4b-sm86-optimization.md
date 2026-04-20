@@ -1032,3 +1032,24 @@ What this changes about the bottleneck:
 - the next bounded pass should instrument and specialize the single-stream
   `linear_core` work instead of continuing to push on the already-collapsed
   attention core
+
+## Refreshed Linear-Core Split
+
+After the warp-split full-attention pass, the single-stream hero lane refreshed
+the internal `linear_core` split using unused per-layer timing slots instead of
+guessing from the older pre-attention numbers.
+
+Short diagnostic run (`pp533` / `tg16`) on the current kept baseline:
+
+- total `linear_core`: `406.459 ms`
+- conv front-end: `12.553 ms`
+- recurrent update body: `389.508 ms`
+- post/gating tail: `4.036 ms`
+
+What that clarifies now:
+
+- the attention rewrite changed the overall hero-lane balance, but it did not
+  change the nature of the linear bottleneck
+- the recurrent-state walk is still consuming essentially all of `linear_core`
+- the next bounded structural pass should target the recurrent body directly;
+  optimizing conv or post/gating first would be the wrong order

@@ -146,6 +146,9 @@ pub struct DecodeStageTimings {
     pub persistent_full_attn_out_ms: f64,
     pub persistent_linear_proj_ms: f64,
     pub persistent_linear_core_ms: f64,
+    pub persistent_linear_core_conv_ms: f64,
+    pub persistent_linear_core_recurrent_ms: f64,
+    pub persistent_linear_core_post_ms: f64,
     pub persistent_linear_out_ms: f64,
     pub persistent_mlp_gate_up_ms: f64,
     pub persistent_mlp_down_ms: f64,
@@ -166,6 +169,9 @@ impl DecodeStageTimings {
         self.persistent_full_attn_out_ms += rhs.persistent_full_attn_out_ms;
         self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
         self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
+        self.persistent_linear_core_conv_ms += rhs.persistent_linear_core_conv_ms;
+        self.persistent_linear_core_recurrent_ms += rhs.persistent_linear_core_recurrent_ms;
+        self.persistent_linear_core_post_ms += rhs.persistent_linear_core_post_ms;
         self.persistent_linear_out_ms += rhs.persistent_linear_out_ms;
         self.persistent_mlp_gate_up_ms += rhs.persistent_mlp_gate_up_ms;
         self.persistent_mlp_down_ms += rhs.persistent_mlp_down_ms;
@@ -236,6 +242,9 @@ const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
 const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
 const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
 const PERSISTENT_4B_TIMING_LINEAR_OUT_BASE: usize = 27;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE: usize = 29;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE: usize = 31;
+const PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE: usize = 33;
 const PERSISTENT_4B_TIMING_MLP_GATE_UP: usize = 35;
 const PERSISTENT_4B_TIMING_MLP_DOWN: usize = 36;
 
@@ -275,10 +284,14 @@ fn decode_persistent_4b_timing_slots(
     let mut full_attn_out_cycles = 0u64;
     let mut linear_proj_cycles = 0u64;
     let mut linear_core_cycles = 0u64;
+    let mut linear_core_conv_cycles = 0u64;
+    let mut linear_core_recurrent_cycles = 0u64;
+    let mut linear_core_post_cycles = 0u64;
     let mut linear_out_cycles = 0u64;
     let mut mlp_gate_up_cycles = 0u64;
     let mut mlp_down_cycles = 0u64;
     let section_batches = batch_size.min(8);
+    let split_batches = batch_size.min(2);
     for layer in 0..num_layers {
         let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
         full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
@@ -295,6 +308,14 @@ fn decode_persistent_4b_timing_slots(
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
             linear_out_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+        }
+        for b in 0..split_batches {
+            linear_core_conv_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + b);
+            linear_core_recurrent_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + b);
+            linear_core_post_cycles +=
+                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + b);
         }
     }
 
@@ -321,6 +342,18 @@ fn decode_persistent_4b_timing_slots(
         ),
         persistent_linear_core_ms: persistent_4b_clock_cycles_to_ms(
             linear_core_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_conv_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_conv_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_recurrent_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_recurrent_cycles,
+            clock_rate_khz,
+        ),
+        persistent_linear_core_post_ms: persistent_4b_clock_cycles_to_ms(
+            linear_core_post_cycles,
             clock_rate_khz,
         ),
         persistent_linear_out_ms: persistent_4b_clock_cycles_to_ms(
