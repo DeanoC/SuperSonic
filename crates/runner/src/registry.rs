@@ -177,7 +177,12 @@ static REGISTRY: &[RegistryEntry] = &[
             attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
-            use_4b_kernel: false,
+            // 0.8B on HIP permanently runs through the 4B persistent megakernel.
+            // The dedicated 0.8B kernel (full_attention.hip) was deleted: it had
+            // no INT4/FP8 path, was ~2.8x slower than the 4B-routed path, and
+            // the BF16 page-fault + hipcc codegen sensitivity warnings were
+            // both found stale in the 2026-04-20 diagnostic pass.
+            use_4b_kernel: true,
         }),
     },
     RegistryEntry {
