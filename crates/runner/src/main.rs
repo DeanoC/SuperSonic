@@ -3396,10 +3396,27 @@ fn trace_persistent_linear_layer(
             .collect::<Vec<_>>()
             .join(",")
     };
+    let native_qkv_proj_f32 = decode_f32_le(&native_qkv_proj);
+    let native_z_proj_f32 = decode_f32_le(&native_z_proj);
+    let comp_qkv_proj_f32 = decode_bf16_le(&native_comp_trace.qkv);
+    let comp_z_proj_f32 = decode_bf16_le(&native_comp_trace.z);
     let max_append_mismatch = {
         let native = decode_bf16_le(&native_conv);
         let start = decode_bf16_le(&pre_step_conv);
         let qkv = decode_bf16_le(&native_comp_trace.qkv);
+        let conv_w = decode_bf16_le(
+            &engine
+                .weights()
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing weights for layer {trace_layer}"))?
+                .linear
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {trace_layer} is not linear"))?
+                .conv1d_w
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("conv1d_w D2H layer {trace_layer}: {e}"))?,
+        );
         let mut best = (0usize, 0.0f32);
         for c in 0..qkv_dim {
             let idx = c * conv_state_len + (conv_state_len - 1);
@@ -3410,12 +3427,37 @@ fn trace_persistent_linear_layer(
         }
         let channel = best.0;
         let idx = channel * conv_state_len + (conv_state_len - 1);
+        let weight_base = channel * cfg.linear_conv_kernel_dim;
+        let state_base = channel * conv_state_len;
+        let mut conv_acc = 0.0f32;
+        for tap in 0..cfg.linear_conv_kernel_dim {
+            let x = if tap + 1 == cfg.linear_conv_kernel_dim {
+                qkv[channel]
+            } else {
+                start[state_base + tap]
+            };
+            conv_acc += x * conv_w[weight_base + tap];
+        }
+        let conv_out = bf16_round(conv_acc * sigmoid_fast(conv_acc));
+        let native_last = native[idx];
+        let mut nearest_qkv = (0usize, f32::INFINITY);
+        for (i, &v) in native_qkv_proj_f32.iter().enumerate() {
+            let delta = (v - native_last).abs();
+            if delta < nearest_qkv.1 {
+                nearest_qkv = (i, delta);
+            }
+        }
         format!(
-            "channel={channel},native={:.6},expected={:.6},prev_last={:.6},qkv={:.6},delta={:.6}",
+            "channel={channel},native={:.6},expected={:.6},prev_last={:.6},qkv_comp={:.6},qkv_native={:.6},conv_out={:.6},nearest_qkv=(channel={},value={:.6},delta={:.6}),delta={:.6}",
             native[idx],
             expected_conv_tail[idx],
             start[idx],
             qkv[channel],
+            native_qkv_proj_f32[channel],
+            conv_out,
+            nearest_qkv.0,
+            native_qkv_proj_f32[nearest_qkv.0],
+            nearest_qkv.1,
             best.1
         )
     };
@@ -3469,10 +3511,6 @@ fn trace_persistent_linear_layer(
         validate::max_abs_delta(&decode_bf16_le(&native_hidden_out), &decode_bf16_le(&native_comp_layer.layer_hidden));
     let native_vs_replay_hidden =
         validate::max_abs_delta(&decode_bf16_le(&native_hidden_out), &decode_bf16_le(replay_hidden_out));
-    let native_qkv_proj_f32 = decode_f32_le(&native_qkv_proj);
-    let native_z_proj_f32 = decode_f32_le(&native_z_proj);
-    let comp_qkv_proj_f32 = decode_bf16_le(&native_comp_trace.qkv);
-    let comp_z_proj_f32 = decode_bf16_le(&native_comp_trace.z);
     let sample_qkv_native = native_qkv_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
     let sample_qkv_comp = comp_qkv_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
     let sample_z_native = native_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
