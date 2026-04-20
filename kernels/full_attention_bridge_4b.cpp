@@ -4585,7 +4585,38 @@ int persistent_decode_device(
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    // rocprofv3 on gfx1150 revealed `multiProcessorCount` reports 8 (WGP
+    // count on RDNA3, not CU count) while the device has 16 CUs — the
+    // original 1x grid left half the GPU idle with only 1 block/CU, and
+    // register pressure (VGPR=128) prevents a second resident block.
+    // Oversubscribing 2x on RDNA3 (= one block per CU) is a proven safe
+    // win: ~1.57x faster on qwen3.5-0.8b BF16, no hangs across tested
+    // Qwen variants.
+    //
+    // HIP docs note `multiProcessorCount` reports CUs on CDNA (MI-series)
+    // and WGPs on RDNA. On arches where it already reports CU count, 2x
+    // would over-subscribe and can deadlock via `grid_barrier` when only
+    // one block/CU is resident. Restrict the default multiplier to the
+    // arches we've actually validated (gfx11xx RDNA3/3.5 at time of
+    // writing); other arches get the conservative 1x default.
+    //
+    // Higher multipliers (3x+) hang silently on models with more
+    // transformer layers (qwen3.5-2b at 4x produces no output) —
+    // suspected grid_barrier scaling issue. Env var
+    // `SUPERSONIC_QWEN4B_BLOCKS` allows runtime override for tuning.
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
+        int override_val = std::atoi(bs_env);
+        if (override_val > 0) num_blocks = override_val;
+    } else {
+        const char* arch = props.gcnArchName;
+        const bool is_rdna3_wgp_arch =
+            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+            arch[3] == '1' && arch[4] == '1';
+        if (is_rdna3_wgp_arch) {
+            num_blocks *= 2;
+        }
+    }
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
@@ -4595,12 +4626,6 @@ int persistent_decode_device(
     const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
-    // HIP kernel does not yet support per-section timing slots (CUDA sm86
-    // bring-up added `timing_slots` to the bridge/CUDA kernel but the HIP
-    // `.hip` signature was not updated). Silently drop the arg on HIP to
-    // keep the bridge ABI stable without risking gfx1150 codegen churn from
-    // mutating the kernel signature.
-    (void)timing_slots;
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
@@ -4617,6 +4642,7 @@ int persistent_decode_device(
         counters,
         barrier_counter,
         barrier_flag,
+        timing_slots,
         static_cast<const T*>(cos_table),
         static_cast<const T*>(sin_table),
         rotary_dim,

@@ -3528,9 +3528,15 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         if enable_timing_slots {
-            let clock_rate_khz = gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
-                .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
-                .clock_rate_khz;
+            let clock_rate_khz = match self.hidden_io.backend() {
+                gpu_hal::Backend::Cuda => {
+                    gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
+                        .clock_rate_khz
+                }
+                gpu_hal::Backend::Hip => kernel_ffi::query_hip_device_clock_khz(self.ordinal)
+                    .map_err(|e| anyhow::anyhow!("query HIP device clock rate: {e}"))?,
+            };
             let sync_bytes = self
                 .scratch
                 .sync_buf

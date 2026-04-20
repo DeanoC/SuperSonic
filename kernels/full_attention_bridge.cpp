@@ -4490,3 +4490,15 @@ extern "C" int dotcache_query_gpu_info(
     *total_vram_out = static_cast<uint64_t>(props.totalGlobalMem);
     return 0;
 }
+
+extern "C" int dotcache_hip_device_clock_khz(
+    int device_ordinal,
+    uint32_t* clock_rate_khz_out) {
+    hipDeviceProp_t props;
+    hipError_t err = hipGetDeviceProperties(&props, device_ordinal);
+    if (err != hipSuccess) {
+        return static_cast<int>(err);
+    }
+    *clock_rate_khz_out = static_cast<uint32_t>(props.clockRate);
+    return 0;
+}
