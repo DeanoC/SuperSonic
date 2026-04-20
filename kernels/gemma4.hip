@@ -860,6 +860,146 @@ __global__ void g4_matvec_batched_int4_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matvec (wave32, 16x16x16 f32-accumulate).
+//
+// Same input layout as g4_matvec_batched_int4_kernel:
+//   x        [seq_len, in_dim]               BF16
+//   W_packed [out_dim, in_dim/2]             packed INT4 (low nibble = even col)
+//   W_scale  [out_dim/gsz, in_dim/gsz]       BF16
+//   W_zero   [out_dim/gsz, in_dim/gsz]       BF16
+//   out      [seq_len, out_dim]              BF16
+//
+// Each block runs one wavefront computing a 16x16 output tile. Per 16-wide
+// K-chunk, each lane loads 16 bf16 activations (A) and dequantizes 16 int4
+// weights (B) via one scale/zero fetch — valid only when gsz is a multiple
+// of 16, which the bridge guards. Same uniform-WMMA discipline as the BF16
+// kernel: loads are guarded per-lane, but every lane enters the intrinsic
+// with a well-defined operand register.
+// =============================================================================
+
+__global__ void g4_matvec_batched_int4_wmma_bf16_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    int gsz,
+    const hip_bfloat16* __restrict__ x,          // [seq_len, in_dim]
+    const uint8_t* __restrict__ W_packed,        // [out_dim, in_dim/2]
+    const hip_bfloat16* __restrict__ W_scale,    // [out_dim/gsz, in_dim/gsz]
+    const hip_bfloat16* __restrict__ W_zero,     // [out_dim/gsz, in_dim/gsz]
+    hip_bfloat16* __restrict__ out               // [seq_len, out_dim]
+) {
+#ifdef G4_HAS_WMMA_BF16
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+    const int tile_row = blockIdx.y * 16;         // seq_len axis
+    const int tile_col = blockIdx.x * 16;         // out_dim axis
+
+    const int x_row_idx = tile_row + lane_row;
+    const int w_row_idx = tile_col + lane_row;
+    const bool x_in_range = x_row_idx < seq_len;
+    const bool w_in_range = w_row_idx < out_dim;
+
+    const int byte_cols = in_dim / 2;
+    const int scale_cols = (in_dim + gsz - 1) / gsz;
+
+    const uint16_t* x_row_u16 = reinterpret_cast<const uint16_t*>(x) +
+                                static_cast<size_t>(x_row_idx) * in_dim;
+    const uint8_t*  w_row_u8  = W_packed +
+                                static_cast<size_t>(w_row_idx) * byte_cols;
+    const int scale_row_base  = (w_row_idx / gsz) * scale_cols;
+
+    g4_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = in_dim & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        // A (activations)
+        g4_short16 a;
+        if (x_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(x_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        // B (weights, INT4 → BF16)
+        g4_short16 b;
+        if (w_in_range) {
+            const int scale_idx = scale_row_base + (kk / gsz);
+            const float s = static_cast<float>(W_scale[scale_idx]);
+            const float zs = static_cast<float>(W_zero[scale_idx]) * s;
+            const int byte_base = kk >> 1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint8_t packed = w_row_u8[byte_base + i];
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = g4_bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = g4_bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                b[2 * i]     = static_cast<short>(b0 >> 16);
+                b[2 * i + 1] = static_cast<short>(b1 >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    // Tail (in_dim % 16 != 0): Gemma 4 layers use multiples of 128, so this
+    // is defensive only.
+    if (k_main != in_dim) {
+        g4_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        g4_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (x_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < in_dim) a[i] = static_cast<short>(x_row_u16[kc]);
+            }
+        }
+        if (w_in_range) {
+            const int scale_idx = scale_row_base + (k_main / gsz);
+            const float s = static_cast<float>(W_scale[scale_idx]);
+            const float zs = static_cast<float>(W_zero[scale_idx]) * s;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < in_dim) {
+                    uint8_t packed = w_row_u8[kc >> 1];
+                    int nib = (kc & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+                    float v = g4_bf16_round_rne_f32_finite(static_cast<float>(nib) * s - zs);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    b[i] = static_cast<short>(bits >> 16);
+                }
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    const int out_col = tile_col + lane_row;
+    if (out_col < out_dim) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < seq_len) {
+                out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)seq_len; (void)in_dim; (void)out_dim; (void)gsz;
+    (void)x; (void)W_packed; (void)W_scale; (void)W_zero; (void)out;
+#endif
+}
+
 // Prefill split-half RoPE. Rotates a `[seq_len, num_heads, head_dim]` tensor
 // where token `s` uses position `pos_base + s`. One thread per (s, h, i) with
 // i ∈ [0, rotary_dim/2); like the single-token kernel, nope lanes (>=
