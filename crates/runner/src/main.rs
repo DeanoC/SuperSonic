@@ -1100,9 +1100,12 @@ fn main() -> Result<()> {
                     native_layer_trace.as_ref(),
                 )
                 {
-                let b64 = base64::engine::general_purpose::STANDARD;
-                let mut first_bad = None;
-                for layer in 0..native_layer_trace.len().min(oracle_layer_trace.len()) {
+	                let b64 = base64::engine::general_purpose::STANDARD;
+	                let oracle_kv = output.kv_caches.as_ref();
+	                let oracle_conv = output.conv_states.as_ref();
+	                let oracle_recurrent = output.recurrent_states.as_ref();
+	                let mut first_bad = None;
+	                for layer in 0..native_layer_trace.len().min(oracle_layer_trace.len()) {
                     let decode_bf16 = |bytes: &[u8]| -> Vec<f32> {
                         bytes.chunks_exact(2)
                             .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
@@ -1128,17 +1131,70 @@ fn main() -> Result<()> {
                     let oracle_post_norm_f32 = decode_bf16(&oracle_post_norm_bytes);
                     let oracle_mlp_out_f32 = decode_bf16(&oracle_mlp_out_bytes);
                     let oracle_layer_f32 = decode_bf16(&oracle_layer_bytes);
-                    let attn_delta = validate::max_abs_delta(&native_attn_f32, &oracle_attn_f32);
-                    let post_norm_delta = validate::max_abs_delta(&native_post_norm_f32, &oracle_post_norm_f32);
-                    let mlp_out_delta = validate::max_abs_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
-                    let layer_delta = validate::max_abs_delta(&native_layer_f32, &oracle_layer_f32);
-                    if first_bad.is_none() && layer_delta > 0.5 {
-                        first_bad = Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta));
-                    }
-                    eprintln!(
-                        "[trace-prefill] layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
-                    );
-                }
+	                    let attn_delta = validate::max_abs_delta(&native_attn_f32, &oracle_attn_f32);
+	                    let post_norm_delta = validate::max_abs_delta(&native_post_norm_f32, &oracle_post_norm_f32);
+	                    let mlp_out_delta = validate::max_abs_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
+	                    let layer_delta = validate::max_abs_delta(&native_layer_f32, &oracle_layer_f32);
+	                    let state_delta = if text_config.is_full_attention(layer) {
+	                        let native = engine.full_attention_prefix_cache_bf16_host(layer, 0);
+	                        match (native, oracle_kv.and_then(|caches| caches.iter().find(|kv| kv.layer == layer))) {
+	                            (Ok((native_k, native_v, _)), Some(oracle_kv)) => {
+	                                let oracle_k = b64
+	                                    .decode(&oracle_kv.k)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle kv k[{layer}]: {e}"))?;
+	                                let oracle_v = b64
+	                                    .decode(&oracle_kv.v)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle kv v[{layer}]: {e}"))?;
+	                                format!(
+	                                    " kv_k_delta={:.4} kv_v_delta={:.4}",
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_k), &decode_bf16_le(&oracle_k)),
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_v), &decode_bf16_le(&oracle_v)),
+	                                )
+	                            }
+	                            _ => String::new(),
+	                        }
+	                    } else {
+	                        let native_layer = engine.state_for_batch(0).layers.get(layer);
+	                        match (
+	                            native_layer,
+	                            oracle_conv.and_then(|states| states.iter().find(|state| state.layer == layer)),
+	                            oracle_recurrent.and_then(|states| states.iter().find(|state| state.layer == layer)),
+	                        ) {
+	                            (Some(native_layer), Some(oracle_conv), Some(oracle_recurrent)) => {
+	                                let native_conv = native_layer
+	                                    .conv_state
+	                                    .as_ref()
+	                                    .ok_or_else(|| anyhow::anyhow!("native linear layer {layer} missing conv_state"))?
+	                                    .to_host_bytes()
+	                                    .map_err(|e| anyhow::anyhow!("native conv D2H layer {layer}: {e}"))?;
+	                                let native_recurrent = native_layer
+	                                    .recurrent_state
+	                                    .as_ref()
+	                                    .ok_or_else(|| anyhow::anyhow!("native linear layer {layer} missing recurrent_state"))?
+	                                    .to_host_bytes()
+	                                    .map_err(|e| anyhow::anyhow!("native recurrent D2H layer {layer}: {e}"))?;
+	                                let oracle_conv = b64
+	                                    .decode(&oracle_conv.data)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle conv[{layer}]: {e}"))?;
+	                                let oracle_recurrent = b64
+	                                    .decode(&oracle_recurrent.data)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle recurrent[{layer}]: {e}"))?;
+	                                format!(
+	                                    " conv_delta={:.4} recurrent_delta={:.4}",
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_conv), &decode_bf16_le(&oracle_conv)),
+	                                    validate::max_abs_delta(&decode_f32_le(&native_recurrent), &decode_f32_le(&oracle_recurrent)),
+	                                )
+	                            }
+	                            _ => String::new(),
+	                        }
+	                    };
+	                    if first_bad.is_none() && layer_delta > 0.5 {
+	                        first_bad = Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta));
+	                    }
+	                    eprintln!(
+	                        "[trace-prefill] layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}{state_delta}"
+	                    );
+	                }
                 if let Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta)) = first_bad {
                     eprintln!(
                         "[trace-prefill] first_bad_layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
@@ -1620,6 +1676,26 @@ fn main() -> Result<()> {
                         .chain(std::iter::once(next_token))
                         .collect();
                     trace_persistent_full_attn_layer(
+                        &mut engine,
+                        trace_layer,
+                        trace_token_ids.as_slice(),
+                        &[next_token],
+                        seqlen_offset,
+                        ordinal,
+                        params.kv_chunk_size,
+                        cli.prefill_chunk_size,
+                        params.use_4b_kernel,
+                    )?;
+                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
+                }
+                if let Some(trace_layer) = cli.trace_persistent_linear_layer {
+                    let trace_token_ids: Vec<u32> = prompt_ids
+                        .iter()
+                        .copied()
+                        .chain(generated_ids.iter().copied())
+                        .chain(std::iter::once(next_token))
+                        .collect();
+                    trace_persistent_linear_layer(
                         &mut engine,
                         trace_layer,
                         trace_token_ids.as_slice(),
@@ -3391,22 +3467,29 @@ fn trace_oracle_prefill_layer(
     oracle_full: &oracle::OracleOutput,
 ) -> Result<()> {
     anyhow::ensure!(trace_layer > 0, "--trace-oracle-prefill-layer currently requires layer > 0");
-    anyhow::ensure!(prompt_ids.len() >= 2, "prompt must contain at least 2 tokens for oracle prefix trace");
+    let row_bytes = engine.weights().config.hidden_size * 2;
     let prefix_ids = &prompt_ids[..prompt_ids.len() - 1];
-    let prefix_oracle = oracle::run_oracle(
-        oracle_script,
-        model_id,
-        prefix_ids,
-        1,
-        oracle_dtype,
-        oracle_device,
-        true,
-        fp8_oracle_dir,
-        None,
-    )?;
+    let prefix_oracle = if prefix_ids.is_empty() {
+        None
+    } else {
+        Some(oracle::run_oracle(
+            oracle_script,
+            model_id,
+            prefix_ids,
+            1,
+            oracle_dtype,
+            oracle_device,
+            true,
+            fp8_oracle_dir,
+            None,
+        )?)
+    };
     let mut native_prefix_k_delta = None;
     let mut native_prefix_v_delta = None;
+    let mut native_prefix_conv_delta = None;
+    let mut native_prefix_recurrent_delta = None;
     if engine.weights().config.is_full_attention(trace_layer) {
+        if let Some(prefix_oracle) = prefix_oracle.as_ref() {
         engine.reset()?;
         let _ = engine.prefill_native(prefix_ids)?;
         let (native_prefix_k, native_prefix_v, native_prefix_len) =
@@ -3429,11 +3512,78 @@ fn trace_oracle_prefill_layer(
             &decode_bf16_le(&native_prefix_v),
             &decode_bf16_le(&oracle_prefix_v),
         ));
+        }
+    } else {
+        if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.reset()?;
+        let _ = engine.prefill_native(prefix_ids)?;
+        let native_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing native prefix layer {trace_layer}"))?;
+        let native_conv = native_layer
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native prefix layer {trace_layer} missing conv_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("native prefix conv D2H layer {trace_layer}: {e}"))?;
+        let native_recurrent = native_layer
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native prefix layer {trace_layer} missing recurrent_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("native prefix recurrent D2H layer {trace_layer}: {e}"))?;
+
+        engine.reset()?;
+        engine.load_prefill_state(&prefix_oracle)?;
+        let oracle_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing oracle prefix layer {trace_layer}"))?;
+        let oracle_conv = oracle_layer
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("oracle prefix layer {trace_layer} missing conv_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("oracle prefix conv D2H layer {trace_layer}: {e}"))?;
+        let oracle_recurrent = oracle_layer
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("oracle prefix layer {trace_layer} missing recurrent_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("oracle prefix recurrent D2H layer {trace_layer}: {e}"))?;
+
+        native_prefix_conv_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_conv),
+            &decode_bf16_le(&oracle_conv),
+        ));
+        native_prefix_recurrent_delta = Some(validate::max_abs_delta(
+            &decode_f32_le(&native_recurrent),
+            &decode_f32_le(&oracle_recurrent),
+        ));
+        }
     }
     engine.reset()?;
-    engine.load_prefill_state(&prefix_oracle)?;
+    if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.load_prefill_state(prefix_oracle)?;
+    }
 
     let b64 = base64::engine::general_purpose::STANDARD;
+    let last_row = |bytes: Vec<u8>, label: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            bytes.len() % row_bytes == 0,
+            "{label} bytes {} not divisible by row_bytes {}",
+            bytes.len(),
+            row_bytes,
+        );
+        if bytes.len() == row_bytes {
+            return Ok(bytes);
+        }
+        let start = bytes.len() - row_bytes;
+        Ok(bytes[start..].to_vec())
+    };
     let oracle_inputs = oracle_full
         .layer_hidden_states
         .as_ref()
@@ -3451,41 +3601,51 @@ fn trace_oracle_prefill_layer(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_mlp_outputs"))?;
 
-    let oracle_input_bytes = b64
-        .decode(
+    let oracle_input_bytes = last_row(
+        b64.decode(
             oracle_inputs
                 .get(trace_layer - 1)
                 .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {}", trace_layer - 1))?,
         )
-        .map_err(|e| anyhow::anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?;
-    let oracle_attn_bytes = b64
-        .decode(
+        .map_err(|e| anyhow::anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?,
+        "oracle input hidden",
+    )?;
+    let oracle_attn_bytes = last_row(
+        b64.decode(
             oracle_attn
                 .get(trace_layer)
                 .ok_or_else(|| anyhow::anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?;
-    let oracle_post_bytes = b64
-        .decode(
+        .map_err(|e| anyhow::anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?,
+        "oracle attn",
+    )?;
+    let oracle_post_bytes = last_row(
+        b64.decode(
             oracle_post
                 .get(trace_layer)
                 .ok_or_else(|| anyhow::anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?;
-    let oracle_mlp_bytes = b64
-        .decode(
+        .map_err(|e| anyhow::anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?,
+        "oracle post-norm",
+    )?;
+    let oracle_mlp_bytes = last_row(
+        b64.decode(
             oracle_mlp
                 .get(trace_layer)
                 .ok_or_else(|| anyhow::anyhow!("oracle layer_mlp_outputs missing layer {trace_layer}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?;
-    let oracle_hidden_bytes = b64
-        .decode(
+        .map_err(|e| anyhow::anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?,
+        "oracle mlp",
+    )?;
+    let oracle_hidden_bytes = last_row(
+        b64.decode(
             oracle_inputs
                 .get(trace_layer)
                 .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {trace_layer}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?,
+        "oracle hidden",
+    )?;
 
     engine.set_hidden_from_bytes(&oracle_input_bytes)?;
     let trace = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
@@ -3508,17 +3668,29 @@ fn trace_oracle_prefill_layer(
             "[trace-oracle-prefix-kv] layer={trace_layer} k_delta={k_delta:.6} v_delta={v_delta:.6}"
         );
     }
+    if let (Some(conv_delta), Some(recurrent_delta)) =
+        (native_prefix_conv_delta, native_prefix_recurrent_delta)
+    {
+        eprintln!(
+            "[trace-oracle-prefix-linear] layer={trace_layer} conv_delta={conv_delta:.6} recurrent_delta={recurrent_delta:.6}"
+        );
+    }
 
     if engine.weights().config.is_full_attention(trace_layer)
         && oracle_full.traced_full_attn_layer == Some(trace_layer)
     {
+        let prefix_oracle = if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+            prefix_oracle
+        } else {
+            return Ok(());
+        };
         // `component_trace_full_layer_from_current_hidden()` reuses the mutable
         // component decode path and overwrites slot 0 of the full-attention KV
         // cache for `trace_layer`. Reload the prefix oracle state so the deeper
         // attention trace below sees the original prefix cache, not the
         // trace-mutated one.
         engine.reset()?;
-        engine.load_prefill_state(&prefix_oracle)?;
+        engine.load_prefill_state(prefix_oracle)?;
         let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
             let bytes = b64
                 .decode(field.as_ref().ok_or_else(|| anyhow::anyhow!("oracle output missing {label}"))?)

@@ -4606,9 +4606,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const size_t cos_off =
                         static_cast<size_t>(seq_off_b) * half_rot;
 
-                    if (tid < nh * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* qh = q_f32 + h * hd * 2;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -4619,9 +4619,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    if (tid < nkv * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* kh = k_f32 + h * hd;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);

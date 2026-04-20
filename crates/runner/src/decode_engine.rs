@@ -1,3 +1,4 @@
+use std::env;
 use std::ffi::c_void;
 use std::time::Instant;
 
@@ -107,6 +108,16 @@ fn is_qwen35_4b_shape(config: &TextConfig) -> bool {
         && config.num_hidden_layers == 32
         && config.num_attention_heads == 16
         && config.num_key_value_heads == 4
+}
+
+fn qwen35_4b_cuda_hero_enabled() -> bool {
+    match env::var("SUPERSONIC_DISABLE_QWEN35_4B_CUDA_HERO") {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty() || value == "0"
+        }
+        Err(_) => true,
+    }
 }
 
 pub struct DecodeEngine {
@@ -3619,6 +3630,7 @@ impl DecodeEngine {
         let use_qwen35_4b_cuda_hero =
             self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
             is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
             b == 1 &&
             self.fp8_scale_device.is_none() &&
             self.int4_scale_device.is_none() &&
@@ -3861,6 +3873,7 @@ impl DecodeEngine {
         let use_qwen35_4b_cuda_hero =
             self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
             is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
             b == 1 &&
             self.fp8_scale_device.is_none() &&
             self.int4_scale_device.is_none() &&
