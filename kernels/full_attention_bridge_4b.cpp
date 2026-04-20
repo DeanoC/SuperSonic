@@ -3796,6 +3796,41 @@ int matmul_int4_dequant_device(
     return 0;
 }
 
+static int matmul_int4_dequant_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    int group_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = 32;  // one wavefront per tile
+    hipLaunchKernelGGL(
+        dotcache_qwen35_matmul_int4_dequant_wmma_kernel,
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const uint8_t*>(rhs_int4),
+        static_cast<const hip_bfloat16*>(scale),
+        static_cast<const hip_bfloat16*>(zero),
+        group_size,
+        static_cast<hip_bfloat16*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 290;
+    if (sync_err != hipSuccess) return 291;
+    return 0;
+}
+
 extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     int dtype,
     size_t device_ordinal,
@@ -3808,10 +3843,24 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     int group_size,
     void* out) {
     switch (dtype) {
-    case 2:
+    case 2: {
+        // WMMA path dequantizes a full 16-wide K chunk with one scale/zero
+        // fetch, which is only correct when a 16-value chunk is guaranteed
+        // to stay inside one quantization group. That requires
+        // `group_size % 16 == 0` (holds for the shipped GPTQ bakes at
+        // group_size=128, but weights.rs reads the value from metadata so a
+        // custom bake could land something else). Fall back to the scalar
+        // kernel otherwise.
+        if (group_size % 16 == 0 &&
+            device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
+            return matmul_int4_dequant_wmma_bf16_device(
+                static_cast<int>(device_ordinal), batch_elems, m, n, k,
+                lhs, rhs_int4, scale, zero, group_size, out);
+        }
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
             lhs, rhs_int4, scale, zero, group_size, out);
+    }
     default:
         return 272;
     }
