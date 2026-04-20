@@ -4604,10 +4604,27 @@ int persistent_decode_device(
     // transformer layers (qwen3.5-2b at 4x produces no output) —
     // suspected grid_barrier scaling issue. Env var
     // `SUPERSONIC_QWEN4B_BLOCKS` allows runtime override for tuning.
+    // Default grid size: 2x multiProcessorCount on RDNA3/gfx11xx (empirically
+    // safe on every tested Qwen variant, ~1.5-1.6x decode speedup over 1x).
+    // SUPERSONIC_QWEN4B_BLOCKS overrides the grid. SUPERSONIC_QWEN4B_COOP
+    // (set when overriding past 2x) promotes the launch to
+    // hipLaunchCooperativeKernel so the runtime rejects rather than
+    // deadlocks when the grid exceeds hardware concurrent capacity. This
+    // is the only safe way to explore higher multipliers — the homebrew
+    // grid_barrier assumes every block is co-resident for the entire
+    // kernel, and non-cooperative launch can queue excess blocks behind
+    // resident ones, causing a deadlock at the first grid_barrier.
+    //
+    // Cooperative launch queries `hipOccupancyMaxActiveBlocksPerMultiprocessor`
+    // which is conservative: on 4B the cap is 1 block/MP vs. 2 that
+    // non-cooperative launch handles empirically, so cooperative launch
+    // regresses 4B throughput. We therefore stay non-cooperative at the
+    // default 2x and only opt in when the user explicitly requests it.
     int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    bool env_override = false;
     if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
         int override_val = std::atoi(bs_env);
-        if (override_val > 0) num_blocks = override_val;
+        if (override_val > 0) { num_blocks = override_val; env_override = true; }
     } else {
         const char* arch = props.gcnArchName;
         const bool is_rdna3_wgp_arch =
@@ -4617,6 +4634,8 @@ int persistent_decode_device(
             num_blocks *= 2;
         }
     }
+    const bool coop_requested =
+        env_override && std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr;
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
@@ -4626,38 +4645,101 @@ int persistent_decode_device(
     const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
-        dim3(static_cast<unsigned int>(num_blocks)),
-        dim3(block_size),
-        shared_bytes,
-        0,
-        num_layers,
-        hidden_dim,
-        intermediate_size,
-        seqlen_offset,
-        static_cast<const Qwen35DecodeLayerDesc*>(layers),
-        static_cast<T*>(hidden_io),
-        workspace,
-        counters,
-        barrier_counter,
-        barrier_flag,
-        timing_slots,
-        static_cast<const T*>(cos_table),
-        static_cast<const T*>(sin_table),
-        rotary_dim,
-        proj_buf_floats,
-        attn_scratch_floats,
-        enable_attention_trace,
-        static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
-        static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
-        batch_size,
-        static_cast<const BatchSeqDesc*>(batch_descs),
-        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
-        static_cast<T*>(tap_workspace),
-        tap_layers,
-        num_taps);
-    hipError_t launch_err = hipGetLastError();
+    int coop_supported = 0;
+    int max_blocks_per_mp = 0;
+    const void* kernel_fp = reinterpret_cast<const void*>(
+        &dotcache_qwen35_persistent_decode_kernel<T>);
+    if (coop_requested) {
+        (void)hipDeviceGetAttribute(
+            &coop_supported, hipDeviceAttributeCooperativeLaunch, device_ordinal);
+        if (coop_supported) {
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_mp, kernel_fp, block_size, shared_bytes) !=
+                hipSuccess) {
+                max_blocks_per_mp = 0;
+            }
+            if (max_blocks_per_mp > 0) {
+                int coop_max_grid = props.multiProcessorCount * max_blocks_per_mp;
+                if (num_blocks > coop_max_grid) num_blocks = coop_max_grid;
+            }
+        }
+    }
+
+    hipError_t launch_err;
+    if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
+        // Args for cooperative launch: void** where each entry points to
+        // local storage holding one argument value. Locals must stay alive
+        // through the launch — they're destroyed at function exit, and
+        // we call hipDeviceSynchronize before returning.
+        const Qwen35DecodeLayerDesc* layers_typed =
+            static_cast<const Qwen35DecodeLayerDesc*>(layers);
+        T* hidden_io_typed = static_cast<T*>(hidden_io);
+        const T* cos_typed = static_cast<const T*>(cos_table);
+        const T* sin_typed = static_cast<const T*>(sin_table);
+        const Qwen35FP8ScaleDesc* fp8_typed =
+            static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales);
+        const KVCacheFp8Desc* kv_fp8_typed =
+            static_cast<const KVCacheFp8Desc*>(kv_fp8_descs);
+        const BatchSeqDesc* batch_descs_typed =
+            static_cast<const BatchSeqDesc*>(batch_descs);
+        const Qwen35INT4ScaleDesc* int4_typed =
+            static_cast<const Qwen35INT4ScaleDesc*>(int4_scales);
+        T* tap_ws_typed = static_cast<T*>(tap_workspace);
+
+        void* args[] = {
+            &num_layers, &hidden_dim, &intermediate_size, &seqlen_offset,
+            &layers_typed, &hidden_io_typed, &workspace, &counters,
+            &barrier_counter, &barrier_flag,
+            &timing_slots,
+            &cos_typed, &sin_typed, &rotary_dim,
+            &proj_buf_floats, &attn_scratch_floats, &enable_attention_trace,
+            &fp8_typed, &kv_fp8_typed, &batch_size,
+            &batch_descs_typed, &int4_typed,
+            &tap_ws_typed, &tap_layers, &num_taps,
+        };
+
+        launch_err = hipLaunchCooperativeKernel(
+            kernel_fp,
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            args,
+            static_cast<uint32_t>(shared_bytes),
+            0);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            shared_bytes,
+            0,
+            num_layers,
+            hidden_dim,
+            intermediate_size,
+            seqlen_offset,
+            static_cast<const Qwen35DecodeLayerDesc*>(layers),
+            static_cast<T*>(hidden_io),
+            workspace,
+            counters,
+            barrier_counter,
+            barrier_flag,
+            timing_slots,
+            static_cast<const T*>(cos_table),
+            static_cast<const T*>(sin_table),
+            rotary_dim,
+            proj_buf_floats,
+            attn_scratch_floats,
+            enable_attention_trace,
+            static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+            static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+            batch_size,
+            static_cast<const BatchSeqDesc*>(batch_descs),
+            static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
+            static_cast<T*>(tap_workspace),
+            tap_layers,
+            num_taps);
+        launch_err = hipGetLastError();
+    }
+
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
