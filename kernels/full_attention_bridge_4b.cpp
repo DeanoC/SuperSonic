@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
 
 namespace {
@@ -3614,36 +3615,38 @@ int matmul_rhs_transposed_tiled_device(
 // (gfx10, gfx9, CDNA gfx9xx) do not, and gfx12 uses a different opcode the
 // kernel isn't compiled for yet. Env var SUPERSONIC_QWEN4B_DISABLE_WMMA=1
 // forces the scalar path for debugging / perf comparison.
+//
+// `supersonic-serve` can call this concurrently from multiple request threads,
+// so initialization goes through `std::call_once` — plain non-atomic writes
+// would be a data race.
 static bool device_supports_wmma_bf16(int device_ordinal) {
-    static bool cached[16] = {false};
-    static bool cached_set[16] = {false};
+    static std::once_flag env_once;
     static bool env_disabled = false;
-    static bool env_checked = false;
-    if (!env_checked) {
+    std::call_once(env_once, [] {
         const char* env = std::getenv("SUPERSONIC_QWEN4B_DISABLE_WMMA");
         env_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
-        env_checked = true;
-    }
+    });
     if (env_disabled) return false;
-    if (device_ordinal < 0 || device_ordinal >= 16) {
-        // Fallback: uncached lookup for unusual ordinals.
+
+    auto probe_arch = [](int ordinal) -> bool {
         hipDeviceProp_t props;
-        if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return false;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
         const char* arch = props.gcnArchName;
         return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
                arch[3] == '1' && arch[4] == '1';
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) {
+        // Uncached lookup for unusual ordinals — happens at most once per call
+        // for a device outside the cached range.
+        return probe_arch(device_ordinal);
     }
-    if (!cached_set[device_ordinal]) {
-        hipDeviceProp_t props;
-        if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) {
-            cached[device_ordinal] = false;
-        } else {
-            const char* arch = props.gcnArchName;
-            cached[device_ordinal] = arch && arch[0] == 'g' && arch[1] == 'f' &&
-                                     arch[2] == 'x' && arch[3] == '1' && arch[4] == '1';
-        }
-        cached_set[device_ordinal] = true;
-    }
+
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
     return cached[device_ordinal];
 }
 
