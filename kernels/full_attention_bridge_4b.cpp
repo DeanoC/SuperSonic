@@ -4595,6 +4595,12 @@ int persistent_decode_device(
     const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
+    // HIP kernel does not yet support per-section timing slots (CUDA sm86
+    // bring-up added `timing_slots` to the bridge/CUDA kernel but the HIP
+    // `.hip` signature was not updated). Silently drop the arg on HIP to
+    // keep the bridge ABI stable without risking gfx1150 codegen churn from
+    // mutating the kernel signature.
+    (void)timing_slots;
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
@@ -4611,7 +4617,6 @@ int persistent_decode_device(
         counters,
         barrier_counter,
         barrier_flag,
-        timing_slots,
         static_cast<const T*>(cos_table),
         static_cast<const T*>(sin_table),
         rotary_dim,
