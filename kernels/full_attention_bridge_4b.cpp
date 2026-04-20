@@ -4585,7 +4585,23 @@ int persistent_decode_device(
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    // rocprofv3 on gfx1150 revealed `multiProcessorCount` reports 8 (WGP
+    // count on RDNA3, not CU count) while the device has 16 CUs — the
+    // original 1x grid left half the GPU idle with only 1 block/CU, and
+    // register pressure (VGPR=128) prevents a second resident block.
+    // Oversubscribing 2x (= one block per CU) is a proven safe win:
+    // ~1.57x faster on qwen3.5-0.8b BF16, no hangs across tested models.
+    // Higher multipliers (3x+) hang silently on models with more
+    // transformer layers (e.g. qwen3.5-2b) — suspected grid_barrier
+    // scaling issue. Env var `SUPERSONIC_QWEN4B_BLOCKS` allows override
+    // for tuning, but do not push past 2x without testing every model.
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
+        int override_val = std::atoi(bs_env);
+        if (override_val > 0) num_blocks = override_val;
+    } else {
+        num_blocks *= 2;
+    }
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
