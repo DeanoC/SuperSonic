@@ -5345,7 +5345,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 __syncthreads();
                             }
                             if (tid == 0)
-                                proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(lds[0]);
+                                proj_buf[b * proj_buf_floats + sr] = lds[0];
                             __syncthreads();
                         }
                     }
