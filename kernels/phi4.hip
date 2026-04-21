@@ -4564,7 +4564,11 @@ __global__ void phi4_persistent_decode_kernel(
         __syncthreads();
 
         // === Fused MLP gate+up+SwiGLU (all blocks work-steal, BATCHED) ===
-        // Use full-block reductions here for parity with the component path.
+        // Wave-per-row: each wave steals a row, accumulates with 4-wide /
+        // 8-wide loads, reduces with wave_reduce_sum_f32. Mirrors Qwen
+        // PR #20/#21/#23 pattern. Phi-4-mini has hidden_dim=3072 so the
+        // INT4 drift concern from PR #20 (which only affected 0.8B's
+        // hidden_dim=1024) does not apply.
         if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4573,12 +4577,12 @@ __global__ void phi4_persistent_decode_kernel(
             const bool up_fp8 = (fp8_scales != nullptr && fp8_scales[layer].up_proj_scale != nullptr);
             const bool gate_int4 = (int4_scales != nullptr && int4_scales[layer].gate_proj_scale != nullptr);
             const bool up_int4 = (int4_scales != nullptr && int4_scales[layer].up_proj_scale != nullptr);
-            __shared__ unsigned int shared_row_mlp;
+            const int lane_p = tid % warpSize;
 
             for (;;) {
-                if (tid == 0) shared_row_mlp = atomicAdd(&counters[0], 1u);
-                __syncthreads();
-                unsigned int my_row = shared_row_mlp;
+                unsigned int my_row;
+                if (lane_p == 0) my_row = atomicAdd(&counters[0], 1u);
+                my_row = __shfl(my_row, 0);
                 if (my_row >= static_cast<unsigned int>(L.intermediate_size)) break;
 
                 float gp[MAX_BATCH_SIZE];
@@ -4597,7 +4601,7 @@ __global__ void phi4_persistent_decode_kernel(
                     const int g_sr = my_row / gsz;
                     const int sc_cols = (hidden_dim + gsz - 1) / gsz;
                     const int vd8 = hidden_dim & ~7;
-                    for (int c = tid * 8; c < vd8; c += bs * 8) {
+                    for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
                         uint32_t gpk = *reinterpret_cast<const uint32_t*>(&g_i4[c / 2]);
                         uint32_t upk = *reinterpret_cast<const uint32_t*>(&u_i4[c / 2]);
                         float gw[8], uw[8];
@@ -4611,7 +4615,7 @@ __global__ void phi4_persistent_decode_kernel(
                                    + uw[4]*inp[4] + uw[5]*inp[5] + uw[6]*inp[6] + uw[7]*inp[7];
                         }
                     }
-                    for (int c = vd8 + tid; c < hidden_dim; c += bs) {
+                    for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
                         float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz);
                         float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz);
                         for (int b = 0; b < B; b++) {
@@ -4629,7 +4633,7 @@ __global__ void phi4_persistent_decode_kernel(
                     const int g_scale_row = my_row / bsz;
                     const int scale_cols = (hidden_dim + bsz - 1) / bsz;
                     const int vd4 = hidden_dim & ~3;
-                    for (int c = tid * 4; c < vd4; c += bs * 4) {
+                    for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
                         uint32_t gp4 = *reinterpret_cast<const uint32_t*>(&g_fp8[c]);
                         uint32_t up4 = *reinterpret_cast<const uint32_t*>(&u_fp8[c]);
                         const int sb = g_scale_row * scale_cols;
@@ -4655,7 +4659,7 @@ __global__ void phi4_persistent_decode_kernel(
                             up[b] += uw0*inp[0] + uw1*inp[1] + uw2*inp[2] + uw3*inp[3];
                         }
                     }
-                    for (int c = vd4 + tid; c < hidden_dim; c += bs) {
+                    for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
                         float gw = fp8_dequant_weight_lut(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
                         float uw = fp8_dequant_weight_lut(L.up_proj_w, fp8_scales[layer].up_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
                         for (int b = 0; b < B; b++) {
@@ -4668,7 +4672,7 @@ __global__ void phi4_persistent_decode_kernel(
                     const T* gr = static_cast<const T*>(L.gate_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
                     const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
                     const int vec_dim = hidden_dim & ~3;
-                    for (int c = tid * 4; c < vec_dim; c += bs * 4) {
+                    for (int c = lane_p * 4; c < vec_dim; c += warpSize * 4) {
                         float gw0 = phi4_to_float(gr[c]);
                         float gw1 = phi4_to_float(gr[c+1]);
                         float gw2 = phi4_to_float(gr[c+2]);
@@ -4683,7 +4687,7 @@ __global__ void phi4_persistent_decode_kernel(
                             up[b] += uw0 * inp[0] + uw1 * inp[1] + uw2 * inp[2] + uw3 * inp[3];
                         }
                     }
-                    for (int c = vec_dim + tid; c < hidden_dim; c += bs) {
+                    for (int c = vec_dim + lane_p; c < hidden_dim; c += warpSize) {
                         float gw = phi4_to_float(gr[c]);
                         float uw = phi4_to_float(ur[c]);
                         for (int b = 0; b < B; b++) {
@@ -4695,29 +4699,19 @@ __global__ void phi4_persistent_decode_kernel(
                 }
 
                 for (int b = 0; b < B; b++) {
-                    lds[tid] = gp[b];
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
-                    }
-                    float g = bf16_round_rne_f32_finite(lds[0]);
-                    lds[tid] = up[b];
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
-                    }
-                    float u = bf16_round_rne_f32_finite(lds[0]);
-                    if (tid == 0) {
-                        float silu = g / (1.0f + expf(-g));
+                    float g = wave_reduce_sum_f32(gp[b]);
+                    float u = wave_reduce_sum_f32(up[b]);
+                    if (lane_p == 0) {
+                        float gr = bf16_round_rne_f32_finite(g);
+                        float ur = bf16_round_rne_f32_finite(u);
+                        float silu = gr / (1.0f + expf(-gr));
                         gate_up[b * intermediate_size * 2 + my_row] =
-                            bf16_round_rne_f32_finite(silu * u);
+                            bf16_round_rne_f32_finite(silu * ur);
                     }
-                    __syncthreads();
                 }
             }
         }
+        __syncthreads();
         grid_barrier(barrier_counter, barrier_flag, nb);
 
         // === MLP down_proj (all blocks work-steal, per-sequence) ===
@@ -4733,11 +4727,11 @@ __global__ void phi4_persistent_decode_kernel(
             {
                 const bool down_fp8 = (fp8_scales != nullptr && fp8_scales[layer].down_proj_scale != nullptr);
                 const bool down_int4 = (int4_scales != nullptr && int4_scales[layer].down_proj_scale != nullptr);
-                __shared__ unsigned int shared_row_down;
+                const int lane_d = tid % warpSize;
                 for (;;) {
-                    if (tid == 0) shared_row_down = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    unsigned int my_row = shared_row_down;
+                    unsigned int my_row;
+                    if (lane_d == 0) my_row = atomicAdd(&counters[0], 1u);
+                    my_row = __shfl(my_row, 0);
                     if (my_row >= static_cast<unsigned int>(hidden_dim)) break;
 
                     float p = 0.0f;
@@ -4750,14 +4744,14 @@ __global__ void phi4_persistent_decode_kernel(
                         const int sr_g = my_row / gsz;
                         const int sc_cols = (L.intermediate_size + gsz - 1) / gsz;
                         const int is8 = L.intermediate_size & ~7;
-                        for (int c = tid * 8; c < is8; c += bs * 8) {
+                        for (int c = lane_d * 8; c < is8; c += warpSize * 8) {
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
                             p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                         }
-                        for (int c = is8 + tid; c < L.intermediate_size; c += bs)
+                        for (int c = is8 + lane_d; c < L.intermediate_size; c += warpSize)
                             p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) * lds_input[c];
                     } else if (down_fp8) {
                         const uint8_t* d_fp8 = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
@@ -4766,7 +4760,7 @@ __global__ void phi4_persistent_decode_kernel(
                         const int d_scale_row = my_row / bsz;
                         const int d_scale_cols = (L.intermediate_size + bsz - 1) / bsz;
                         const int is4 = L.intermediate_size & ~3;
-                        for (int c = tid * 4; c < is4; c += bs * 4) {
+                        for (int c = lane_d * 4; c < is4; c += warpSize * 4) {
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&d_fp8[c]);
                             const int sb = d_scale_row * d_scale_cols;
                             float w0 = bf16_round_rne_f32_finite((fp8_lut[pk & 0xFF] * static_cast<float>(d_scales[sb + c / bsz])));
@@ -4775,26 +4769,29 @@ __global__ void phi4_persistent_decode_kernel(
                             float w3 = bf16_round_rne_f32_finite((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
                             p += w0*lds_input[c] + w1*lds_input[c+1] + w2*lds_input[c+2] + w3*lds_input[c+3];
                         }
-                        for (int c = is4 + tid; c < L.intermediate_size; c += bs)
+                        for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
                             p += fp8_dequant_weight_lut(L.down_proj_w, fp8_scales[layer].down_proj_scale, my_row, c, L.intermediate_size, bsz, fp8_lut) * lds_input[c];
                     } else {
                         const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
-                        for (int c = tid; c < L.intermediate_size; c += bs)
+                        const int is4 = L.intermediate_size & ~3;
+                        for (int c = lane_d * 4; c < is4; c += warpSize * 4) {
+                            float w0 = phi4_to_float(wr[c]);
+                            float w1 = phi4_to_float(wr[c+1]);
+                            float w2 = phi4_to_float(wr[c+2]);
+                            float w3 = phi4_to_float(wr[c+3]);
+                            p += w0*lds_input[c]   + w1*lds_input[c+1]
+                               + w2*lds_input[c+2] + w3*lds_input[c+3];
+                        }
+                        for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
                             p += phi4_to_float(wr[c]) * lds_input[c];
                     }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
-                    }
-                    if (tid == 0) {
-                        float add = bf16_round_rne_f32_finite(lds[0]);
+                    float result = wave_reduce_sum_f32(p);
+                    if (lane_d == 0) {
+                        float add = bf16_round_rne_f32_finite(result);
                         mlp_out[b * hidden_dim + my_row] = add;
                         hidden_f32[b * hidden_dim + my_row] =
                             bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + my_row] + add);
                     }
-                    __syncthreads();
                 }
             }
             // Need syncthreads before grid barrier since waves may finish at different times
