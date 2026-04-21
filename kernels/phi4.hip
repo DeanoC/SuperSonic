@@ -3711,13 +3711,14 @@ __global__ void phi4_norm_multi_proj_kernel(
 // eliminating syncthreads from the hot matvec loop.
 // =============================================================================
 
-// Wave-level sum reduction using DPP/shuffle (Wave32 on RDNA3.5)
+// Wave-level sum reduction using shuffle. Uses runtime warpSize so this
+// agrees with matvec loops that partition columns by `warpSize * N`.
+// On gfx1150 (wave32) the loop unrolls to the same 5 __shfl_xor ops;
+// on CDNA (wave64) it covers all 64 lanes.
 __device__ inline float wave_reduce_sum_f32(float val) {
-    val += __shfl_xor(val, 16);
-    val += __shfl_xor(val, 8);
-    val += __shfl_xor(val, 4);
-    val += __shfl_xor(val, 2);
-    val += __shfl_xor(val, 1);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset);
+    }
     return val;
 }
 
