@@ -3397,7 +3397,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // Step B-G: QK-norm, RoPE, KV cache, attention, gating, o_proj
             // Block 0 handles the per-head sequential ops.
             // O_proj uses all blocks via work-stealing.
-            const bool qwen08_attn_hero = qwen08_hero && nb >= 8;
+            // The 0.8B full-attention hero subpath is intentionally disabled:
+            // it regressed golden-corpus parity even though the surrounding
+            // hero specializations are correct and materially faster.
+            const bool qwen08_attn_hero = false;
 
             if (qwen08_attn_hero) {
                 float* q_f32 = proj_buf;

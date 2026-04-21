@@ -1413,7 +1413,6 @@ fn main() -> Result<()> {
         && !cli.force_replay_decode
         && !cli.force_component_decode;
     let cuda_08b_hero_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();
-    let cuda_08b_hero_opt_in = env::var_os("SUPERSONIC_ENABLE_CUDA_08B_HERO").is_some();
     let cuda_08b_hero_enabled = backend == Backend::Cuda
         && gpu_arch == GpuArch::Sm86
         && model_variant == ModelVariant::Qwen3_5_0_8B
@@ -1427,7 +1426,6 @@ fn main() -> Result<()> {
         && oracle_output.is_none()
         && !engine.weights().is_fp8
         && !engine.weights().is_int4
-        && cuda_08b_hero_opt_in
         && !cuda_08b_hero_disabled;
     let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
     let cuda_fast_greedy_enabled = backend == Backend::Cuda
@@ -1460,7 +1458,7 @@ fn main() -> Result<()> {
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.kv_fp8 {
         eprintln!("[decode] WARNING: single-sequence CUDA KV-FP8 uses the b=1 kernel path");
     } else if cuda_08b_hero_enabled {
-        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled (experimental opt-in)");
+        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
     } else if cuda_fast_greedy_enabled {
         eprintln!("[decode] CUDA fast greedy sampling enabled for the non-4B native decode path");
     }

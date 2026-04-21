@@ -7,7 +7,7 @@
 #   ./tests/sm86/profile_qwen08_decode.sh [model_dir]
 #
 # Environment:
-#   PROFILE_MODE=hero        hero path (default)
+#   PROFILE_MODE=hero        default CUDA 0.8B hero path
 #   PROFILE_MODE=fast        disable hero, keep CUDA fast-greedy
 #   PROFILE_MODE=legacy      disable hero and fast-greedy
 #   PROMPT=Hello             prompt text
@@ -42,7 +42,7 @@ export SUPERSONIC_BACKENDS="${SUPERSONIC_BACKENDS:-cuda}"
 
 case "$PROFILE_MODE" in
     hero)
-        export SUPERSONIC_ENABLE_CUDA_08B_HERO=1
+        unset SUPERSONIC_ENABLE_CUDA_08B_HERO || true
         unset SUPERSONIC_DISABLE_CUDA_08B_HERO || true
         unset SUPERSONIC_DISABLE_CUDA_FAST_GREEDY || true
         ;;
