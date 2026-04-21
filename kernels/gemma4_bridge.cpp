@@ -337,11 +337,43 @@ static int matvec_batched_int4_wmma_bf16_device(int device_ordinal,
                                                 void* out) {
     ScopedHipDevice scoped(device_ordinal);
     if (seq_len <= 0) return 0;
+
+    // Dispatch between the 64x64 tiled kernel and the one-wave-per-tile
+    // fallback. Same tradeoff as the Qwen INT4 pair: INT4 already reads
+    // ~4x less weight data than BF16, so tiling's bandwidth amortization
+    // is smaller, and the 4x compute waste from 64-row tile overhang at
+    // small seq_len can regress short-prompt prefill. The tiled kernel
+    // also requires gsz to be a multiple of BK (=64) so every K-slab stays
+    // in one GPTQ group; shipped Gemma 4 bakes use gsz=128.
+    constexpr int TILED_M_THRESHOLD = 32;
+    constexpr int TILED_BK = 64;
+    if (seq_len >= TILED_M_THRESHOLD && gsz % TILED_BK == 0) {
+        constexpr int TILE_M = 64;
+        constexpr int TILE_N = 64;
+        const int grid_x = (out_dim + TILE_N - 1) / TILE_N;
+        const int grid_y = (seq_len + TILE_M - 1) / TILE_M;
+        constexpr int threads = 128;  // 4 wavefronts arranged 2x2
+        hipLaunchKernelGGL(
+            g4_matvec_batched_int4_wmma_bf16_kernel,
+            dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
+            seq_len, in_dim, out_dim, gsz,
+            static_cast<const hip_bfloat16*>(x),
+            static_cast<const uint8_t*>(W_packed),
+            static_cast<const hip_bfloat16*>(W_scale),
+            static_cast<const hip_bfloat16*>(W_zero),
+            static_cast<hip_bfloat16*>(out));
+        if (hipGetLastError() != hipSuccess) return 494;
+        if (hipDeviceSynchronize() != hipSuccess) return 495;
+        return 0;
+    }
+
+    // Small-M fallback: one wavefront per 16x16 tile (previous shipping
+    // kernel, preserved under the _small_m suffix).
     const int grid_x = (out_dim + 15) / 16;
     const int grid_y = (seq_len + 15) / 16;
-    constexpr int threads = 32;  // one wavefront per 16x16 tile
+    constexpr int threads = 32;
     hipLaunchKernelGGL(
-        g4_matvec_batched_int4_wmma_bf16_kernel,
+        g4_matvec_batched_int4_wmma_bf16_small_m_kernel,
         dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
         seq_len, in_dim, out_dim, gsz,
         static_cast<const hip_bfloat16*>(x),
