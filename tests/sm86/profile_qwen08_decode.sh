@@ -42,14 +42,17 @@ export SUPERSONIC_BACKENDS="${SUPERSONIC_BACKENDS:-cuda}"
 
 case "$PROFILE_MODE" in
     hero)
+        export SUPERSONIC_ENABLE_CUDA_08B_HERO=1
         unset SUPERSONIC_DISABLE_CUDA_08B_HERO || true
         unset SUPERSONIC_DISABLE_CUDA_FAST_GREEDY || true
         ;;
     fast)
+        unset SUPERSONIC_ENABLE_CUDA_08B_HERO || true
         export SUPERSONIC_DISABLE_CUDA_08B_HERO=1
         unset SUPERSONIC_DISABLE_CUDA_FAST_GREEDY || true
         ;;
     legacy)
+        unset SUPERSONIC_ENABLE_CUDA_08B_HERO || true
         export SUPERSONIC_DISABLE_CUDA_08B_HERO=1
         export SUPERSONIC_DISABLE_CUDA_FAST_GREEDY=1
         ;;
