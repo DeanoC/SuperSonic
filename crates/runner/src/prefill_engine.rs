@@ -97,7 +97,7 @@ pub fn compute_logits_for_range(
     config: &TextConfig,
     start: usize,
     count: usize,
-    use_4b_kernel: bool,
+    _use_4b_kernel: bool,
     ordinal: usize,
 ) -> Result<(Vec<Vec<f32>>, GpuBuffer)> {
     if count == 0 {
@@ -129,11 +129,12 @@ pub fn compute_logits_for_range(
     )
     .map_err(|e| anyhow::anyhow!("range final norm: {e}"))?;
 
-    // lm_head projection. For count=1 the standalone matvec is competitive with
-    // the tiled path on gfx1150; for count>1 we must use the tiled matmul.
+    // lm_head projection. For count=1, prefer the standalone matvec even on
+    // 4B-capable models: it avoids the tiled matmul path's extra packing and
+    // keeps the single-row score path numerically aligned with decode.
     let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
         .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-    if use_4b_kernel || count > 1 {
+    if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal, ScalarType::BF16,
             1,         // batch
