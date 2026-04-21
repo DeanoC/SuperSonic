@@ -83,7 +83,7 @@ scalar path was a one-block-per-output-element work-stealing matvec
 
 | Model        | Quant | ms/tok | tok/s |
 |--------------|-------|-------:|------:|
-| phi4-mini    | BF16  |  597   | 1.68  |
+| phi4-mini    | BF16  |  298   | 3.36  |
 | phi4-mini    | INT4  |  359   | 2.78  |
 
 ### Scaling with context length
