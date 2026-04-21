@@ -51,16 +51,16 @@
       "prompt_tokens": 542,
       "max_new_tokens": 8,
       "expected_token_ids": [
+        561,
+        23513,
+        15698,
+        369,
         796,
         529,
         2176,
-        13,
-        28732,
-        4202,
-        20956,
-        16067
+        13
       ],
-      "expected_text": " saffron. Archive entry gamma describes",
+      "expected_text": " The audit keyword is saffron.",
       "prefill_top5": []
     },
     {
