@@ -682,7 +682,7 @@ __global__ void g4_matvec_batched_kernel(
 }
 
 // =============================================================================
-// RDNA3 WMMA BF16 kernel for Gemma 4 prefill matvec.
+// RDNA3 WMMA BF16 kernel for Gemma 4 prefill matvec, shared-memory tiled.
 //
 // `g4_matvec_batched_kernel` is work-stealing and reduces one output element
 // per thread block — fine for decode (seq_len=1) where parallelism comes from
@@ -690,20 +690,19 @@ __global__ void g4_matvec_batched_kernel(
 // seq_len >> 1 and the work naturally has a matmul shape
 // (seq_len × in_dim × out_dim).
 //
-// This kernel consumes the same data layout (x: [seq_len, in_dim],
-// W: [out_dim, in_dim]) and produces the same output ([seq_len, out_dim]),
-// but runs as a tiled WMMA matmul instead. Each wavefront computes one
-// 16×16 output tile, accumulating along the in_dim axis in 16-wide chunks
-// with an F32 accumulator.
+// This kernel runs the same operation as a 2D tiled WMMA GEMM: 64x64 output
+// tile, 4 wavefronts per block arranged 2x2 (each wave owns a 32x32
+// sub-region, a 2x2 grid of 16x16 WMMA sub-tiles), K-step 64, A/B staged
+// through LDS. The previous one-wave-per-16x16-tile version was bandwidth-
+// bound (~100x global-read amplification on Gemma prefill shapes).
 //
-// Grid  : (ceil(out_dim/16), ceil(seq_len/16), 1)
-// Block : 32 threads (one wavefront)
+// Grid  : (ceil(out_dim/64), ceil(seq_len/64), 1)
+// Block : 128 threads (4 wavefronts)
 //
 // WMMA is a cross-lane instruction: every lane must participate with
 // well-defined A/B inputs. We keep the WMMA call uniform across the wave
-// and only guard the loads (zero-pad out-of-range lanes) — divergent WMMA
-// returns garbage on the in-range lanes too because it assembles its
-// operand matrix from every lane's registers.
+// and zero-pad out-of-range elements in LDS so divergent input can't
+// corrupt in-range lanes' outputs.
 // =============================================================================
 
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
@@ -715,7 +714,16 @@ __global__ void g4_matvec_batched_kernel(
 typedef short  g4_short16 __attribute__((ext_vector_type(16)));
 typedef float  g4_float8  __attribute__((ext_vector_type(8)));
 
-__global__ void g4_matvec_batched_wmma_bf16_kernel(
+// Tile dimensions. Shared by the BF16 and INT4 WMMA prefill kernels.
+constexpr int G4_TILED_WMMA_BM = 64;
+constexpr int G4_TILED_WMMA_BN = 64;
+constexpr int G4_TILED_WMMA_BK = 64;
+// LDS row padded by 1 DWORD (2 BF16) to reduce 32-bank aliasing on the
+// WMMA operand gather.
+constexpr int G4_TILED_WMMA_LDS_STRIDE = G4_TILED_WMMA_BK + 2;
+
+__global__ __launch_bounds__(128, 2)
+void g4_matvec_batched_wmma_bf16_kernel(
     int seq_len,
     int in_dim,
     int out_dim,
@@ -724,71 +732,177 @@ __global__ void g4_matvec_batched_wmma_bf16_kernel(
     hip_bfloat16* __restrict__ out         // [seq_len, out_dim]
 ) {
 #ifdef G4_HAS_WMMA_BF16
-    const int lane = threadIdx.x;             // 0..31
-    const int lane_row = lane & 15;           // which row this lane owns
-    const int lane_half = lane >> 4;          // 0 for lanes 0-15, 1 for lanes 16-31
-    const int tile_row = blockIdx.y * 16;     // seq_len axis
-    const int tile_col = blockIdx.x * 16;     // out_dim axis
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;       // 0..3
+    const int wave_row = wid >> 1;       // 0 or 1
+    const int wave_col = wid & 1;        // 0 or 1
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
 
-    const int x_row_idx = tile_row + lane_row;
-    const int w_row_idx = tile_col + lane_row;
-    const bool x_in_range = x_row_idx < seq_len;
-    const bool w_in_range = w_row_idx < out_dim;
+    const int blk_row = blockIdx.y * G4_TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * G4_TILED_WMMA_BN;
 
-    const uint16_t* x_row_u16 = reinterpret_cast<const uint16_t*>(x) +
-                                static_cast<size_t>(x_row_idx) * in_dim;
-    const uint16_t* w_row_u16 = reinterpret_cast<const uint16_t*>(W) +
-                                static_cast<size_t>(w_row_idx) * in_dim;
+    __shared__ uint16_t s_x[G4_TILED_WMMA_BM * G4_TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_w[G4_TILED_WMMA_BN * G4_TILED_WMMA_LDS_STRIDE];
 
-    g4_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x);
+    const uint16_t* w_u16 = reinterpret_cast<const uint16_t*>(W);
 
-    const int k_main = in_dim & ~15;
-    for (int kk = 0; kk < k_main; kk += 16) {
-        g4_short16 a;
-        g4_short16 b;
-        if (x_in_range) {
+    g4_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(G4_TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32 (lane count)");
+    constexpr int K_COL_HALVES = G4_TILED_WMMA_BK / 32;
+    constexpr int K_CHUNKS     = G4_TILED_WMMA_BK / 16;
+
+    const int k_main = in_dim & ~(G4_TILED_WMMA_BK - 1);
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += G4_TILED_WMMA_BK) {
+        // Load A (x) tile [BM, BK]: wave wid loads rows wid*16..wid*16+15,
+        // lane L loads col L across those rows. Coalesced global read.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
             #pragma unroll
-            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(x_row_u16[kk + i]);
-        } else {
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) a[i] = 0;
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < seq_len) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + gk];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
         }
-        if (w_in_range) {
+        // Load B (W) tile [BN, BK] — W is [out_dim, in_dim] row-major
+        // which matches the "virtual transpose" layout for the output dim.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
             #pragma unroll
-            for (int i = 0; i < 16; ++i) b[i] = static_cast<short>(w_row_u16[kk + i]);
-        } else {
-            #pragma unroll
-            for (int i = 0; i < 16; ++i) b[i] = 0;
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gc < out_dim) {
+                    v = w_u16[static_cast<size_t>(gc) * in_dim + gk];
+                }
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        __syncthreads();
+
+        // Compute: K_CHUNKS 16-K chunks, 4 WMMAs each (2x2 sub-tiles).
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
     }
-    // Tail (in_dim % 16 != 0): pad with zeros. Unlikely for Gemma 4.
+
+    // Defensive K-tail when in_dim % BK != 0. Gemma hidden/intermediate
+    // dims are multiples of 256 so this branch is unreachable in practice.
     if (k_main != in_dim) {
-        g4_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-        g4_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        const int k_rem = in_dim - k_main;
         #pragma unroll
-        for (int i = 0; i < 16; ++i) {
-            int kc = k_main + i;
-            if (kc < in_dim) {
-                if (x_in_range) a[i] = static_cast<short>(x_row_u16[kc]);
-                if (w_in_range) b[i] = static_cast<short>(w_row_u16[kc]);
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < seq_len && col < k_rem) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + k_main + col];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gc < out_dim && col < k_rem) {
+                    v = w_u16[static_cast<size_t>(gc) * in_dim + k_main + col];
+                }
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
     }
 
-    // Store: lane L writes out[2*i + lane_half, lane_row] = acc[i] for i in 0..8.
-    const int out_col = tile_col + lane_row;
-    if (out_col < out_dim) {
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            int out_row = tile_row + 2 * i + lane_half;
-            if (out_row < seq_len) {
-                out[static_cast<size_t>(out_row) * out_dim + out_col] =
-                    hip_bfloat16(acc[i]);
+    // Store 4 sub-tiles. RDNA3 wave32 WMMA acc layout:
+    //   acc[i] -> C[2*i + lane_half, lane_row] relative to sub-tile (0,0).
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const g4_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < out_dim) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < seq_len) {
+                    out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
             }
         }
-    }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
 #else
     (void)seq_len; (void)in_dim; (void)out_dim;
     (void)x; (void)W; (void)out;

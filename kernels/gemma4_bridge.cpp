@@ -253,9 +253,12 @@ static int matvec_batched_wmma_bf16_device(int device_ordinal,
                                            int seq_len, int in_dim, int out_dim,
                                            const void* x, const void* W, void* out) {
     ScopedHipDevice scoped(device_ordinal);
-    const int grid_x = (out_dim + 15) / 16;
-    const int grid_y = (seq_len + 15) / 16;
-    constexpr int threads = 32;  // one wavefront per tile
+    // Must match G4_TILED_WMMA_B{M,N} in gemma4.hip.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (out_dim + TILE_N - 1) / TILE_N;
+    const int grid_y = (seq_len + TILE_M - 1) / TILE_M;
+    constexpr int threads = 128;  // 4 wavefronts per block, arranged 2x2
     hipLaunchKernelGGL(
         g4_matvec_batched_wmma_bf16_kernel,
         dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
