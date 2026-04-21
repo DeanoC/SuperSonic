@@ -62,6 +62,8 @@ struct Qwen35DecodeLayerDesc {
     void* kv_shadow_k;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     void* kv_shadow_v;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     int kv_shadow_start;               // first position covered by the sidecar, -1 when disabled
+    void* debug_linear_trace_out;      // optional F32[(kern-1)+2] export for one linear channel's Step-B state
+    int debug_linear_trace_channel;    // selected linear channel for debug_linear_trace_out, -1 disables
 };
 
 template <typename T>
@@ -3127,4 +3129,3 @@ __device__ inline void block_rms_norm_global(
     }
     __syncthreads();
 }
-
