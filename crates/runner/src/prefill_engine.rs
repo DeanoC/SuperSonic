@@ -10,7 +10,7 @@ use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
@@ -813,7 +813,9 @@ pub fn convert_kv_caches_to_fp8(
         if kv_fp8_bf16_sidecar_enabled() {
             ls.kv_shadow_k = Some(bf16_k);
             ls.kv_shadow_v = Some(bf16_v);
-            ls.kv_shadow_start = 0;
+            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| kv_len.saturating_sub(window))
+                .unwrap_or(0);
         } else {
             ls.kv_shadow_k = None;
             ls.kv_shadow_v = None;

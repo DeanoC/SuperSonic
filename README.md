@@ -37,11 +37,11 @@ see [docs/dflash.md](docs/dflash.md).
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
 |------------------|:----:|:----:|:-----------:|:------:|
 | qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
-| qwen3.5-4b       |  ✅  |  —   |      —      |   🔒³  |
+| qwen3.5-4b       |  ✅  |  —   |      —      |   ✅³  |
 
-³ `qwen3.5-4b` has a hidden `--allow-unstable-cuda-kv-fp8` debug surface for
-  parity-sensitive validation work. It is not part of the public supported
-  surface — see the CUDA section below for the narrow validated shape.
+³ CUDA `--kv-fp8` is currently validated only for `qwen3.5-4b` on `sm86`.
+  Single-sequence decode keeps the replayed-prefill correctness path by
+  default; batched `--batch-size 2` uses the persistent kernel path.
 
 CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` are rejected at runtime.
 
@@ -51,20 +51,21 @@ CUDA support is currently a narrow v1 surface:
 - BF16 decode path only
 - validated on NVIDIA `sm86` hardware (RTX 3090-class)
 - validated for both baked weights and direct `--no-bake` safetensors loads
-- hidden unstable CUDA `--kv-fp8` debug coverage currently exists only for `qwen3.5-4b` on `sm86`
+- CUDA `--kv-fp8` support is currently limited to `qwen3.5-4b` on `sm86`
 
 CUDA v1 does not currently support:
 
 - `--int4`
 - `--fp8-runtime`
 
-CUDA KV-FP8 is currently a debug-only surface:
+CUDA KV-FP8 is currently a narrow supported surface:
 
-- hidden behind `--allow-unstable-cuda-kv-fp8`
 - validated only on `qwen3.5-4b` / `sm86`
-- exercised on the real persistent kernel path with `--force-kernel-decode`
-- checked against the CPU oracle, not presented as a general CUDA v1 feature
+- checked against the CPU oracle on the CUDA test machine
+- batched `--batch-size 2` uses the real persistent kernel path
+- single-sequence decode uses replayed prefill by default for correctness
 - the BF16 KV sidecar is a bring-up aid for parity-sensitive reads/debugging, not part of normal BF16 CUDA runs
+- CUDA caps that sidecar to the most recent 128 KV positions by default for `--kv-fp8`, because full-prefix sidecar reads destabilized long-context parity on `sm86`; opt back into the full-prefix debug sidecar with `SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR=1`
 - normal CUDA BF16 runs do not allocate or use the sidecar
 - the sidecar can be disabled for A/B work with `SUPERSONIC_DEBUG_DISABLE_KV_FP8_BF16_SIDECAR=1`
 
@@ -174,6 +175,7 @@ Each `sm86` script currently validates:
 - oracle logit deltas
 - replay-based `--gpu-validate` deltas and token agreement
 - golden corpus coverage
+- CUDA `4B --kv-fp8` on the validated `sm86` lane
 
 `tests/sm86/run_batch.sh` adds `qwen3.5-4b --batch-size 2` coverage on the same `sm86` target.
 `tests/sm86/run_fast_greedy.sh` checks that the CUDA fast-greedy 0.8B path
@@ -185,18 +187,18 @@ for longer `4B` prompts today.
 `tests/sm86/run_long.sh` and `tests/sm86/run_4b_long.sh` add explicit long-context coverage
 against the CPU oracle using focused long-only golden corpora.
 
-The hidden CUDA KV-FP8 debug surface is validated separately with commands like:
+The CUDA KV-FP8 lane is validated separately with commands like:
 
 ```bash
 target/release/supersonic --backend cuda --oracle-device cpu \
   --model qwen3.5-4b --model-dir /path/to/Qwen3.5-4B \
   --prompt '中国的首都是' --max-new-tokens 8 \
-  --batch-size 2 --kv-fp8 --allow-unstable-cuda-kv-fp8 --force-kernel-decode --validate
+  --batch-size 2 --kv-fp8 --validate
 
 CORPUS_TIMEOUT=1200 tests/corpus/run_golden.sh \
   qwen3.5-4b /path/to/Qwen3.5-4B tests/corpus/golden_4b_batch2.json \
   target/release/supersonic --backend cuda --oracle-device cpu \
-  --batch-size 2 --kv-fp8 --allow-unstable-cuda-kv-fp8 --force-kernel-decode
+  --batch-size 2 --kv-fp8
 ```
 
 ### Benchmark baseline

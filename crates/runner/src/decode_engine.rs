@@ -13,7 +13,7 @@ use qwen35::rotary::RotaryTables;
 use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
 };
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use crate::oracle::OracleOutput;
@@ -911,7 +911,9 @@ impl DecodeEngine {
                 )
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V copy h={h}: {e}"))?;
             }
-            ls.kv_shadow_start = 0;
+            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| prefix_len.saturating_sub(window))
+                .unwrap_or(0);
         }
 
         Ok(())

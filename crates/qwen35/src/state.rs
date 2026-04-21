@@ -7,6 +7,12 @@ pub fn kv_fp8_bf16_sidecar_enabled() -> bool {
     std::env::var_os("SUPERSONIC_DEBUG_DISABLE_KV_FP8_BF16_SIDECAR").is_none()
 }
 
+pub fn kv_fp8_bf16_sidecar_window_tokens() -> Option<usize> {
+    std::env::var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
 /// Mutable per-layer state (KV cache, conv state, recurrent state).
 pub struct LayerState {
     pub kind: LayerKind,

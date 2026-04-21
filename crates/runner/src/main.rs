@@ -268,8 +268,8 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     force_replay_decode: bool,
 
-    /// Debug-only: allow unstable CUDA KV-FP8 experiments on the 4B kernel path.
-    /// This is intentionally hidden until the path is validated.
+    /// Legacy compatibility switch for older CUDA KV-FP8 bring-up commands.
+    /// No longer required now that the validated 4B sm86 lane is public.
     #[arg(long, hide = true)]
     allow_unstable_cuda_kv_fp8: bool,
 
@@ -717,17 +717,17 @@ fn main() -> Result<()> {
             anyhow::bail!("CUDA v1 does not support --fp8-runtime yet");
         }
         if cli.kv_fp8 {
-            if !cli.allow_unstable_cuda_kv_fp8 {
-                anyhow::bail!("CUDA v1 does not support --kv-fp8 yet");
+            if model_variant != ModelVariant::Qwen3_5_4B || gpu_arch != GpuArch::Sm86 {
+                anyhow::bail!("CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86");
             }
-            if !params.use_4b_kernel {
-                anyhow::bail!(
-                    "--allow-unstable-cuda-kv-fp8 only supports the CUDA 4B kernel path"
+            if env::var_os("SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR").is_none() {
+                env::set_var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW", "128");
+                eprintln!(
+                    "[cuda] KV-FP8 BF16 sidecar window capped to the most recent 128 tokens on CUDA; \
+                     set SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR=1 \
+                     to restore full-prefix debug sidecar coverage"
                 );
             }
-            eprintln!(
-                "[cuda] WARNING: enabling unstable CUDA KV-FP8 debug path; correctness is not guaranteed"
-            );
         }
     }
 
@@ -1259,7 +1259,7 @@ fn main() -> Result<()> {
         && !cli.kv_fp8;
     let replay_kv_fp8_enabled = params.use_4b_kernel
         && cli.kv_fp8
-        && cli.allow_unstable_cuda_kv_fp8
+        && cli.batch_size == 1
         && !cli.force_kernel_decode;
     let component_single_decode_enabled =
         cli.batch_size == 1 && params.use_4b_kernel && cli.force_component_decode;
@@ -1302,15 +1302,15 @@ fn main() -> Result<()> {
     if replay_decode_enabled {
         eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
-        eprintln!("[decode] experimental single-sequence KV-FP8 uses replayed GPU prefill for correctness");
-    } else if replay_kv_fp8_enabled && cli.batch_size > 1 {
-        eprintln!("[decode] experimental batched KV-FP8 rebuilds state from replayed GPU prefill each step");
+        eprintln!("[decode] single-sequence CUDA KV-FP8 uses replayed GPU prefill for correctness");
+    } else if cli.batch_size > 1 && params.use_4b_kernel && cli.kv_fp8 {
+        eprintln!("[decode] batched CUDA KV-FP8 uses the persistent kernel path");
     } else if component_single_decode_enabled {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the component decode path");
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.force_kernel_decode {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] WARNING: experimental single-sequence KV-FP8 uses the b=1 kernel path");
+        eprintln!("[decode] WARNING: single-sequence CUDA KV-FP8 uses the b=1 kernel path");
     } else if cuda_08b_hero_enabled {
         eprintln!("[decode] CUDA 0.8B sm86 hero path enabled (fused lm_head argmax)");
     } else if cuda_fast_greedy_enabled {
