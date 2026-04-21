@@ -51,9 +51,9 @@ Notes:
 
 | Model        | Quant | ms/tok | tok/s |
 |--------------|-------|-------:|------:|
-| gemma4-e2b   | BF16  |  673   | 1.49  |
-| gemma4-e2b   | INT4¹ |  418   | 2.39  |
-| gemma4-e4b   | BF16  | 1256   | 0.80  |
+| gemma4-e2b   | BF16  |  246   | 4.07  |
+| gemma4-e2b   | INT4¹ |  230   | 4.35  |
+| gemma4-e4b   | BF16  |  425   | 2.35  |
 
 ¹ Gemma 4 E2B INT4 runs but quality is degraded — the GPTQ bake is
 distributed from releases and produces coherent first tokens but
