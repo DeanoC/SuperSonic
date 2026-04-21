@@ -9,6 +9,7 @@ mod registry;
 mod validate;
 
 use std::env;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -18,6 +19,7 @@ use base64::Engine as _;
 use clap::Parser;
 
 use decode_engine::{DecodeEngine, DecodeStageTimings};
+use qwen35::loader::WeightLoader;
 use qwen35::state::{LayerState, ModelState};
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 
@@ -142,6 +144,136 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
         },
         other => other.to_string(),
     }
+}
+
+fn model_dir_has_raw_safetensors(model_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(model_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".safetensors") || name.ends_with(".safetensors.index.json")
+    })
+}
+
+fn resolve_qwen_oracle_model_id(
+    explicit_model_id: Option<&str>,
+    model_dir: &Path,
+    model_variant: &ModelVariant,
+) -> String {
+    if let Some(model_id) = explicit_model_id {
+        return model_id.to_string();
+    }
+    if model_dir_has_raw_safetensors(model_dir) {
+        return model_dir.to_string_lossy().into_owned();
+    }
+    model_variant.hf_model_id().to_string()
+}
+
+struct HostLmHeadRescorer {
+    loader: WeightLoader,
+    tensor_name: String,
+}
+
+impl HostLmHeadRescorer {
+    fn from_model_dir(model_dir: &Path) -> Result<Option<Self>> {
+        if !model_dir_has_raw_safetensors(model_dir) {
+            return Ok(None);
+        }
+        let loader = WeightLoader::from_dir(model_dir)
+            .map_err(|e| anyhow::anyhow!("open raw lm_head weights: {e}"))?;
+        let tensor_name = if loader.contains("lm_head.weight") {
+            "lm_head.weight".to_string()
+        } else if loader.contains("model.embed_tokens.weight") {
+            "model.embed_tokens.weight".to_string()
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(Self { loader, tensor_name }))
+    }
+
+    fn rescore(&self, normed: &[f32], candidate_ids: &[usize]) -> Result<u32> {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for &candidate in candidate_ids {
+            let row = self
+                .loader
+                .load_bf16_row_f32(&self.tensor_name, candidate)
+                .map_err(|e| anyhow::anyhow!("load lm_head row {candidate}: {e}"))?;
+            anyhow::ensure!(
+                row.len() == normed.len(),
+                "lm_head row len {} != normed len {}",
+                row.len(),
+                normed.len()
+            );
+            let score = row
+                .iter()
+                .zip(normed.iter())
+                .map(|(w, x)| w * x)
+                .sum::<f32>();
+            if score > best_val {
+                best_val = score;
+                best_idx = candidate;
+            }
+        }
+        Ok(best_idx as u32)
+    }
+}
+
+fn top_k_candidate_ids(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut best: Vec<(usize, f32)> = Vec::new();
+    for (idx, &val) in logits.iter().enumerate() {
+        let pos = best
+            .iter()
+            .position(|&(_, best_val)| val > best_val)
+            .unwrap_or(best.len());
+        if pos < k {
+            best.insert(pos, (idx, val));
+            if best.len() > k {
+                best.pop();
+            }
+        }
+    }
+    best.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn sample_qwen_logits_with_rescore(
+    logits: &[f32],
+    normed: Option<&[f32]>,
+    rescorer: Option<&HostLmHeadRescorer>,
+) -> Result<u32> {
+    let greedy = DecodeEngine::greedy_sample(logits);
+    let Some(normed) = normed else {
+        return Ok(greedy);
+    };
+    let Some(rescorer) = rescorer else {
+        return Ok(greedy);
+    };
+
+    const RESCORE_MARGIN: f32 = 0.25;
+    const RESCORE_TOP_K: usize = 4;
+
+    let candidates = top_k_candidate_ids(logits, RESCORE_TOP_K);
+    if candidates.len() < 2 {
+        return Ok(greedy);
+    }
+    let top0 = logits[candidates[0]];
+    let top1 = logits[candidates[1]];
+    if top0 - top1 > RESCORE_MARGIN {
+        return Ok(greedy);
+    }
+
+    let rescored = rescorer.rescore(normed, &candidates)?;
+    if rescored != greedy {
+        eprintln!(
+            "[sample-rescore] token {} -> {} (top_margin={:.4})",
+            greedy,
+            rescored,
+            top0 - top1
+        );
+    }
+    Ok(rescored)
 }
 
 #[derive(Parser)]
@@ -651,6 +783,7 @@ fn main() -> Result<()> {
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
     };
+    let host_lm_head_rescorer = HostLmHeadRescorer::from_model_dir(&cli.model_dir)?;
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
         anyhow::bail!("--trace-kv-fp8-cache requires --kv-fp8");
@@ -962,10 +1095,11 @@ fn main() -> Result<()> {
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
     let (prefill_logits, native_prefill_trace, mut next_token) = if cli.oracle_prefill {
-        let model_id = cli
-            .model_id
-            .clone()
-            .unwrap_or_else(|| model_variant.hf_model_id().to_string());
+        let model_id = resolve_qwen_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            &model_variant,
+        );
         let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -985,19 +1119,17 @@ fn main() -> Result<()> {
         let prefill_result = if cli.trace_prefill_layers {
             engine.prefill_native_with_trace(&prompt_ids)?
         } else {
-            prefill_engine::PrefillResult {
-                logits: engine.prefill_native(&prompt_ids)?,
-                final_norm_trace: None,
-                layer_attn_trace: None,
-                layer_post_attn_norm_trace: None,
-                layer_mlp_swiglu_trace: None,
-                layer_mlp_out_trace: None,
-                layer_hidden_trace: None,
-                tap_hiddens: None,
-                linear_debug_trace: None,
-            }
+            engine.prefill_native_with_final_norm(&prompt_ids)?
         };
-        let first = DecodeEngine::greedy_sample(&prefill_result.logits);
+        let prefill_normed = prefill_result
+            .final_norm_trace
+            .as_deref()
+            .map(decode_bf16_le);
+        let first = sample_qwen_logits_with_rescore(
+            &prefill_result.logits,
+            prefill_normed.as_deref(),
+            host_lm_head_rescorer.as_ref(),
+        )?;
         eprintln!("[prefill] native GPU prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
         (
             prefill_result.logits,
@@ -1014,10 +1146,11 @@ fn main() -> Result<()> {
 
     // Optionally run oracle for validation
     let oracle_output = if cli.validate {
-        let model_id = cli
-            .model_id
-            .clone()
-            .unwrap_or_else(|| model_variant.hf_model_id().to_string());
+        let model_id = resolve_qwen_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            &model_variant,
+        );
         let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -1251,9 +1384,16 @@ fn main() -> Result<()> {
     // the megakernel; --force-replay-decode re-enables the replay path for
     // the rare case where someone genuinely wants to reproduce the older
     // numeric semantics.
+    let cuda_qwen2b_replay_default = backend == Backend::Cuda
+        && model_variant == ModelVariant::Qwen3_5_2B
+        && cli.batch_size == 1
+        && params.use_4b_kernel
+        && !cli.kv_fp8
+        && !cli.force_kernel_decode
+        && !cli.force_component_decode;
     let replay_decode_enabled = cli.batch_size == 1
         && params.use_4b_kernel
-        && cli.force_replay_decode
+        && (cli.force_replay_decode || cuda_qwen2b_replay_default)
         && !cli.force_kernel_decode
         && !cli.force_component_decode
         && !cli.kv_fp8;
@@ -1300,7 +1440,13 @@ fn main() -> Result<()> {
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
     if replay_decode_enabled {
-        eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
+        if cuda_qwen2b_replay_default {
+            eprintln!(
+                "[decode] single-sequence CUDA qwen3.5-2b uses replayed GPU prefill for correctness"
+            );
+        } else {
+            eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
+        }
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
         eprintln!("[decode] single-sequence CUDA KV-FP8 uses replayed GPU prefill for correctness");
     } else if cli.batch_size > 1 && params.use_4b_kernel && cli.kv_fp8 {
@@ -1725,7 +1871,20 @@ fn main() -> Result<()> {
             } else {
                 engine.decode_step(next_token, seqlen_offset)?
             };
-            let native_token = maybe_fast_token.unwrap_or_else(|| DecodeEngine::greedy_sample(&logits));
+            let native_token = if let Some(token) = maybe_fast_token {
+                token
+            } else {
+                let normed = if host_lm_head_rescorer.is_some() {
+                    Some(engine.last_normed_host_f32()?)
+                } else {
+                    None
+                };
+                sample_qwen_logits_with_rescore(
+                    &logits,
+                    normed.as_deref(),
+                    host_lm_head_rescorer.as_ref(),
+                )?
+            };
 
             if let Some(ref oracle) = oracle_output {
                 if step < oracle.decode_logits.len() {

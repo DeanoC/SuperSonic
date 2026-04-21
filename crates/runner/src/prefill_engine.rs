@@ -705,15 +705,11 @@ fn prefill_inner(
         ordinal,
     )?;
     let logits = logits_per_pos.pop().expect("count=1 produces exactly one row");
-    let final_norm_trace = if trace_layers {
-        Some(
-            normed_last
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("final norm D2H: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let final_norm_trace = Some(
+        normed_last
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("final norm D2H: {e}"))?,
+    );
 
     // Post-prefill: convert BF16 KV caches to FP8 if requested.
     // During prefill we use BF16 KV so the attention kernel can read them directly.

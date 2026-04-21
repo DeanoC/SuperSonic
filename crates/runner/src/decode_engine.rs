@@ -2890,6 +2890,29 @@ impl DecodeEngine {
         Ok(result.logits)
     }
 
+    pub fn prefill_native_with_final_norm(
+        &mut self,
+        prompt_ids: &[u32],
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            false,
+            None,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
+        Ok(result)
+    }
+
     /// Rebuild sequence-0 state from scratch by replaying native GPU prefill
     /// over the provided token history. Optionally replicates that state across
     /// extra batch slots for lockstep batch decoding.
@@ -3780,12 +3803,26 @@ impl DecodeEngine {
 
     /// Greedy argmax over logits.
     pub fn greedy_sample(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(idx, _)| idx as u32)
-            .unwrap_or(0)
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &val) in logits.iter().enumerate() {
+            if val > best_val {
+                best_idx = idx;
+                best_val = val;
+            }
+        }
+        best_idx as u32
+    }
+
+    pub fn last_normed_host_f32(&self) -> Result<Vec<f32>> {
+        let bytes = self
+            .normed_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("normed D2H: {e}"))?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect())
     }
 
     /// Copy prefill state from sequence 0 to all extra batch sequences.
