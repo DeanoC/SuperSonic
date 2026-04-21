@@ -3740,6 +3740,45 @@ int matmul_fp8_dequant_device(
     return 0;
 }
 
+// WMMA-tiled FP8 dequant matmul for BF16 activations. Same 64x64 block tile
+// shape as the BF16 tiled path; reads FP8 bytes from global, dequantizes
+// into LDS as BF16, then runs WMMAs from LDS. Only activated when
+// block_size is a multiple of TILED_WMMA_BK=64 so every BK-aligned K slab
+// (and the 64-row N slab) lies inside a single FP8 scale block. The
+// shipped lovedheart Qwen FP8 bakes use block_size=128.
+static int matmul_fp8_dequant_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_fp8,
+    const void* scale,
+    int block_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    constexpr int threads = 128;  // 4 wavefronts 2x2
+    hipLaunchKernelGGL(
+        dotcache_qwen35_matmul_fp8_dequant_wmma_kernel,
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const uint8_t*>(rhs_fp8),
+        static_cast<const hip_bfloat16*>(scale),
+        block_size,
+        static_cast<hip_bfloat16*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 262;
+    if (sync_err != hipSuccess) return 263;
+    return 0;
+}
+
 extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
     int dtype,
     size_t device_ordinal,
@@ -3751,10 +3790,24 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
     int block_size,
     void* out) {
     switch (dtype) {
-    case 2:
+    case 2: {
+        // WMMA fast path when block_size is a multiple of the tile's K slab
+        // (= 64), and m is large enough that the 64-row tile doesn't waste
+        // most of its compute on overhang. Otherwise fall back to the scalar
+        // FP32-accumulate tiled kernel (which is what shipped before WMMA).
+        constexpr int TILED_BK = 64;
+        constexpr int TILED_M_THRESHOLD = 32;
+        const int ordinal = static_cast<int>(device_ordinal);
+        if (m >= TILED_M_THRESHOLD && block_size % TILED_BK == 0 &&
+            device_supports_wmma_bf16(ordinal)) {
+            return matmul_fp8_dequant_wmma_bf16_device(
+                ordinal, batch_elems, m, n, k,
+                lhs, rhs_fp8, scale, block_size, out);
+        }
         return matmul_fp8_dequant_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            ordinal, batch_elems, m, n, k,
             lhs, rhs_fp8, scale, block_size, out);
+    }
     default:
         return 262;
     }
