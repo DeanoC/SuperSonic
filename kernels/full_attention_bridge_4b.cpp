@@ -3659,12 +3659,13 @@ static int matmul_rhs_transposed_tiled_wmma_bf16_device(
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
-    constexpr int TILE_M = 16;
-    constexpr int TILE_N = 16;
+    // Must match the TILED_WMMA_B{M,N} constants in full_attention_4b.hip.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
     const int grid_x = (n + TILE_N - 1) / TILE_N;
     const int grid_y = (m + TILE_M - 1) / TILE_M;
     const int grid_z = static_cast<int>(batch_elems);
-    const int threads = 32;  // one wavefront per tile
+    const int threads = 128;  // 4 wavefronts per block, arranged 2x2
     hipLaunchKernelGGL(
         dotcache_qwen35_matmul_rhs_transposed_tiled_wmma_kernel,
         dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
