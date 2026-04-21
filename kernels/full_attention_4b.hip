@@ -5716,6 +5716,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 }
             }
         }
+        // Waves finish independent rows at different times under wave-per-row;
+        // sync before thread-0 records the timing so it reflects the slowest wave.
+        __syncthreads();
         qwen35_4b_hip_record_timing(
             layer_timing_slots, QWEN35_4B_TIMING_MLP_GATE_UP, mlp_gate_up_clock);
         grid_barrier(barrier_counter, barrier_flag, nb);
