@@ -5260,107 +5260,112 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                 }
 
-                // Step C: Parallel delta recurrent state update
-                // state: [nv, hkd, hvd] F32 — the recurrent memory
-                // 256 threads process 2 heads at a time: threads 0-127 → head h,
-                // threads 128-255 → head h+1. Each thread owns one v-dimension.
-                // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
-                //           state += outer(key, delta), output = state @ query
-                {
-                    float* conv_out = gate_up_b;  // reused
-                    float* state = static_cast<float*>(rec_b);
+            } // end if (blockIdx.x == 0) for conv1d + L2-norm (steps B + C0)
+            // Sync so all blocks see conv_out (gate_up_b) populated before the
+            // multi-block delta recurrent step below.
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                    const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
-                    const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
+            // Step C: Parallel delta recurrent state update — multi-block.
+            // state: [nv, hkd, hvd] F32 — the recurrent memory.
+            // Each thread owns one (head, v) pair. Block bid processes heads
+            // h = bid, bid+nb, bid+2*nb, ... — a stride loop so 4B's nv=32
+            // still fits in nb=16 blocks (each block handles 2 heads).
+            // State slices are disjoint across heads so no cross-block races.
+            if (tid < L.linear_head_v_dim) {
+                float* proj_b_ = proj_buf + b * proj_buf_floats;
+                float* b_f32_ = proj_b_ + L.qkv_out_dim + L.z_out_dim;
+                float* a_f32_ = b_f32_ + nv_heads;
+                float* conv_out = gate_up + b * intermediate_size * 2;
+                float* state = static_cast<float*>(rec_b);
+                float* attn_scratch_b_ = attn_scratch + b * attn_scratch_floats;
 
-                    const int q_key_offset = 0;
-                    const int k_key_offset = key_dim;
-                    const int v_val_offset = key_dim * 2;
-                    const int v = tid % hvd;          // v-dimension for this thread
+                const int nv = L.linear_num_v_heads;
+                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
+                const int hkd = L.linear_head_k_dim;
+                const int hvd = L.linear_head_v_dim;
+                const int key_dim = nk * hkd;
+                const int q_key_offset = 0;
+                const int k_key_offset = key_dim;
+                const int v_val_offset = key_dim * 2;
 
-                    // Process 2 heads per iteration (256 threads / 128 hvd)
-                    for (int hp = 0; hp < nv; hp += 2) {
-                        const int h = hp + (tid >= hvd ? 1 : 0);
+                const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
+                const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
 
-                        if (h < nv) {
-                            float* sh = state + h * hkd * hvd;
-                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
-                            float decay = 1.0f;
-                            if (dt_bw != nullptr && ale_w != nullptr) {
-                                const float sp = logf(1.0f + expf(
-                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
-                            }
+                const int v = tid;
+                for (int h = blockIdx.x; h < nv; h += nb) {
+                    float* sh = state + h * hkd * hvd;
 
-                            // Apply decay: state *= exp(g)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] *= decay;
-                            }
-
-                            // Map value head to key head for Q/K indexing
-                            // nk key heads shared among nv value heads
-                            const int h_k = h * nk / nv;
-
-                            // kv_mem[v] = sum_k(state[k, v] * key[k])
-                            float kv_mem_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                kv_mem_v += sh[k * hvd + v]
-                                          * conv_out[k_key_offset + h_k * hkd + k];
-                            }
-
-                            // delta = (value - kv_mem) * beta
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            const float delta = (val - kv_mem_v) * beta;
-
-                            // state[k, v] += key[k] * delta (each thread owns its v)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] +=
-                                    conv_out[k_key_offset + h_k * hkd + k] * delta;
-                            }
-
-                            // output[v] = sum_k(state[k, v] * query[k])
-                            float out_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                out_v += sh[k * hvd + v]
-                                       * conv_out[q_key_offset + h_k * hkd + k];
-                            }
-
-                            attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
-                        }
-                        __syncthreads();
+                    const float beta = 1.0f / (1.0f + expf(-b_f32_[h]));
+                    float decay = 1.0f;
+                    if (dt_bw != nullptr && ale_w != nullptr) {
+                        const float sp = logf(1.0f + expf(
+                            a_f32_[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                        decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                     }
+
+                    for (int k = 0; k < hkd; ++k) {
+                        sh[k * hvd + v] *= decay;
+                    }
+
+                    const int h_k = h * nk / nv;
+
+                    float kv_mem_v = 0.0f;
+                    for (int k = 0; k < hkd; ++k) {
+                        kv_mem_v += sh[k * hvd + v]
+                                  * conv_out[k_key_offset + h_k * hkd + k];
+                    }
+
+                    const float val = conv_out[v_val_offset + h * hvd + v];
+                    const float delta = (val - kv_mem_v) * beta;
+
+                    for (int k = 0; k < hkd; ++k) {
+                        sh[k * hvd + v] +=
+                            conv_out[k_key_offset + h_k * hkd + k] * delta;
+                    }
+
+                    float out_v = 0.0f;
+                    for (int k = 0; k < hkd; ++k) {
+                        out_v += sh[k * hvd + v]
+                               * conv_out[q_key_offset + h_k * hkd + k];
+                    }
+
+                    attn_scratch_b_[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
                 }
+            }
+            // Sync so all blocks see attn_scratch_b populated before block 0
+            // runs the gated RMSNorm in step D.
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                __syncthreads();
-
+            if (blockIdx.x == 0) {
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
-                {
-                    const float* nw = static_cast<const float*>(L.linear_norm_w);
-                    if (tid < nv) {
-                        const int h = tid;
-                        const float* ho = attn_scratch_b + h * hvd;
-                        float sq = 0.0f;
-                        for (int j = 0; j < hvd; ++j)
-                            sq += ho[j] * ho[j];
-                        lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
-                    }
-                    __syncthreads();
-                    for (int d = tid; d < val_dim; d += bs) {
-                        const int h = d / hvd;
-                        const int hd_idx = d % hvd;
-                        float rms_inv = lds[h];
-                        float n = attn_scratch_b[d] * rms_inv;
-                        float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
-                        float zv = z_f32[d];
-                        attn_scratch_b[d] = bf16_round_rne_f32_finite(
-                            n * w * (zv * dotcache_qwen35_sigmoid_fast(zv)));
-                    }
-                    __syncthreads();
+                const int nv = L.linear_num_v_heads;
+                const int hvd = L.linear_head_v_dim;
+                const int val_dim_ = L.linear_value_dim;
+                const float* nw = static_cast<const float*>(L.linear_norm_w);
+                float* z_f32_ = proj_b + L.qkv_out_dim;
+                float* attn_scratch_bd = attn_scratch + b * attn_scratch_floats;
+                if (tid < nv) {
+                    const int h = tid;
+                    const float* ho = attn_scratch_bd + h * hvd;
+                    float sq = 0.0f;
+                    for (int j = 0; j < hvd; ++j)
+                        sq += ho[j] * ho[j];
+                    lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
                 }
-
-            } // end if (blockIdx.x == 0) for linear attention core
-            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+                __syncthreads();
+                for (int d = tid; d < val_dim_; d += bs) {
+                    const int h = d / hvd;
+                    const int hd_idx = d % hvd;
+                    float rms_inv = lds[h];
+                    float n = attn_scratch_bd[d] * rms_inv;
+                    float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
+                    float zv = z_f32_[d];
+                    attn_scratch_bd[d] = bf16_round_rne_f32_finite(
+                        n * w * (zv * dotcache_qwen35_sigmoid_fast(zv)));
+                }
+                __syncthreads();
+            }
+            // Final grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
             grid_barrier(barrier_counter, barrier_flag, nb);
             qwen35_4b_hip_record_timing(
                 layer_timing_slots,
