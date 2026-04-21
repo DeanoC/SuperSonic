@@ -120,21 +120,19 @@ fn qwen35_4b_cuda_hero_enabled() -> bool {
     }
 }
 
-// Temporary correctness split for the CUDA Qwen3.5-4B persistent decode path.
-// Diagnostic traces show the layer-4 linear state is only later clobbered when
-// the same launch executes layer 4 and then continues onward. Relaunching from
-// layer 5 onward preserves correctness, so split the long-lived launch there
-// until the underlying in-kernel lifetime bug is fixed.
+// Keep the early split for the CUDA Qwen3.5-4B path. It remains part of the
+// validated long-context lane even after removing the default component
+// fallback.
 const QWEN35_4B_CUDA_SPLIT_LAYER: usize = 5;
 const QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS: usize = 512;
 
 fn qwen35_4b_cuda_long_context_component_fallback_enabled() -> bool {
-    match env::var("SUPERSONIC_DISABLE_QWEN35_4B_CUDA_LONG_FALLBACK") {
+    match env::var("SUPERSONIC_ENABLE_QWEN35_4B_CUDA_LONG_FALLBACK") {
         Ok(value) => {
             let value = value.trim();
-            value.is_empty() || value == "0"
+            value.is_empty() || value == "1"
         }
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 

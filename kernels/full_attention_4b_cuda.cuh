@@ -4490,7 +4490,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* cv = static_cast<const T*>(kv_v_b);
                     const size_t kv_head_base =
                         static_cast<size_t>(kvh) * kv_max_b * hd;
-
                     float my_acc = 0.0f;
                     float my_max = -1e30f;
                     float my_sum = 0.0f;
@@ -5007,7 +5006,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         for (int qh = 0; qh < nh; ++qh) {
                             const int kvh = qh / kv_groups;
                             const float* q_head = q_f32 + qh * hd * 2;
-
                             float my_acc = 0.0f;
                             float my_max = -1e30f;
                             float my_sum = 0.0f;
@@ -5257,7 +5255,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             __syncthreads();
                         }
                         if (tid == 0)
-                            proj_buf[sr] = bf16_round_rne_f32_finite(lds[0]);
+                            proj_buf[sr] = lds[0];
                         __syncthreads();
                     } else {
                     const void* w_raw;
