@@ -467,6 +467,10 @@ pub struct FullAttentionLayerOutputTrace {
 struct Persistent4BLayerTiming {
     full_attn_ms: f64,
     full_attn_core_ms: f64,
+    full_attn_hero_prep_ms: f64,
+    full_attn_hero_loop_ms: f64,
+    full_attn_hero_merge_ms: f64,
+    full_attn_hero_gate_ms: f64,
     linear_proj_ms: f64,
     linear_core_ms: f64,
     linear_core_recurrent_ms: f64,
@@ -479,6 +483,10 @@ impl Persistent4BLayerTiming {
     fn add_assign(&mut self, rhs: &Self) {
         self.full_attn_ms += rhs.full_attn_ms;
         self.full_attn_core_ms += rhs.full_attn_core_ms;
+        self.full_attn_hero_prep_ms += rhs.full_attn_hero_prep_ms;
+        self.full_attn_hero_loop_ms += rhs.full_attn_hero_loop_ms;
+        self.full_attn_hero_merge_ms += rhs.full_attn_hero_merge_ms;
+        self.full_attn_hero_gate_ms += rhs.full_attn_hero_gate_ms;
         self.linear_proj_ms += rhs.linear_proj_ms;
         self.linear_core_ms += rhs.linear_core_ms;
         self.linear_core_recurrent_ms += rhs.linear_core_recurrent_ms;
@@ -530,11 +538,15 @@ fn maybe_dump_qwen35_4b_layer_timings(
     for layer in order.into_iter().take(emit) {
         let timing = &layer_timings[layer];
         eprintln!(
-            "[layer-timings] layer={} total_ms={:.3} full_attn_ms={:.3} full_attn_core_ms={:.3} linear_proj_ms={:.3} linear_core_ms={:.3} linear_core_recurrent_ms={:.3} linear_out_ms={:.3} mlp_ms={:.3} mlp_gate_up_ms={:.3} mlp_down_ms={:.3}",
+            "[layer-timings] layer={} total_ms={:.3} full_attn_ms={:.3} full_attn_core_ms={:.3} full_attn_hero_prep_ms={:.3} full_attn_hero_loop_ms={:.3} full_attn_hero_merge_ms={:.3} full_attn_hero_gate_ms={:.3} linear_proj_ms={:.3} linear_core_ms={:.3} linear_core_recurrent_ms={:.3} linear_out_ms={:.3} mlp_ms={:.3} mlp_gate_up_ms={:.3} mlp_down_ms={:.3}",
             layer,
             timing.total_ms(),
             timing.full_attn_ms,
             timing.full_attn_core_ms,
+            timing.full_attn_hero_prep_ms,
+            timing.full_attn_hero_loop_ms,
+            timing.full_attn_hero_merge_ms,
+            timing.full_attn_hero_gate_ms,
             timing.linear_proj_ms,
             timing.linear_core_ms,
             timing.linear_core_recurrent_ms,
@@ -549,6 +561,10 @@ fn maybe_dump_qwen35_4b_layer_timings(
 const PERSISTENT_4B_TIMING_FULL_ATTN: usize = 0;
 const PERSISTENT_4B_TIMING_FULL_ATTN_PROJ: usize = 1;
 const PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE: usize = 2;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_PREP: usize = 3;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_LOOP: usize = 5;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_MERGE: usize = 6;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_GATE: usize = 7;
 const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
 const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
 const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
@@ -610,6 +626,14 @@ fn decode_persistent_4b_timing_slots(
         let layer_full_attn_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
         let layer_full_attn_proj_cycles =
             load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
+        let layer_full_attn_hero_prep_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_PREP);
+        let layer_full_attn_hero_loop_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_LOOP);
+        let layer_full_attn_hero_merge_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_MERGE);
+        let layer_full_attn_hero_gate_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_GATE);
         let layer_linear_proj_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
         let layer_mlp_gate_up_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
         let layer_mlp_down_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
@@ -654,6 +678,22 @@ fn decode_persistent_4b_timing_slots(
                 ),
                 full_attn_core_ms: persistent_4b_clock_cycles_to_ms(
                     layer_full_attn_core_cycles,
+                    clock_rate_khz,
+                ),
+                full_attn_hero_prep_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_hero_prep_cycles,
+                    clock_rate_khz,
+                ),
+                full_attn_hero_loop_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_hero_loop_cycles,
+                    clock_rate_khz,
+                ),
+                full_attn_hero_merge_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_hero_merge_cycles,
+                    clock_rate_khz,
+                ),
+                full_attn_hero_gate_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_hero_gate_cycles,
                     clock_rate_khz,
                 ),
                 linear_proj_ms: persistent_4b_clock_cycles_to_ms(

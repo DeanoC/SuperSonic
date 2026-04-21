@@ -20,6 +20,13 @@ enum Qwen35Persistent4BTimingSlot {
     QWEN35_4B_TIMING_FULL_ATTN = 0,
     QWEN35_4B_TIMING_FULL_ATTN_PROJ = 1,
     QWEN35_4B_TIMING_FULL_ATTN_CORE_BASE = 2,
+    // Slots 3..7 are otherwise unused on the validated single-batch CUDA 4B
+    // hero lane. Reuse them there for deeper full-attention-core attribution.
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_PREP = 3,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_UNUSED = 4,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_LOOP = 5,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_MERGE = 6,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_GATE = 7,
     QWEN35_4B_TIMING_FULL_ATTN_OUT_BASE = 10,
     QWEN35_4B_TIMING_LINEAR_PROJ = 18,
     QWEN35_4B_TIMING_LINEAR_CORE_BASE = 19,
@@ -3973,10 +3980,13 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     // allow debug tracing to force the trace-capable fallback path in this same
     // kernel so the exported attention scratch is valid on 4B CUDA.
     const bool emit_attention_trace = (enable_attention_trace != 0);
+    // The validated CUDA 4B lane runs in split windows on long context, so
+    // `num_layers` is the current window size there rather than the full model
+    // depth. Gate the 4B specializations on the stable hidden/intermediate
+    // geometry instead of the launch window length.
     const bool runtime_qwen35_4b_shape =
         hidden_dim == 2560 &&
-        intermediate_size == 9216 &&
-        num_layers == 32;
+        intermediate_size == 9216;
 
     // Workspace layout (F32 unless noted).
     // Each section is multiplied by batch_size. Per-batch offset: section + b * section_size.
@@ -4549,6 +4559,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* q_f32 = proj_b;
                 float* k_f32 = proj_b + L.q_out_dim;
                 float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
+                const bool qwen4b_single_bf16_attn_core_hero =
+                    runtime_qwen35_4b_shape &&
+                    B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
+                const unsigned long long hero_prep_clock =
+                    qwen4b_single_bf16_attn_core_hero ? clock64() : 0;
 
                 // Step B: QK-norm — RMSNorm per head on head_dim
                 // Wave-level reduce + cross-wave LDS reduce (2 syncthreads vs 8)
@@ -4725,6 +4740,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         q_f32[h * hd * 2 + hd + d]);
                 }
                 __syncthreads();
+                if (qwen4b_single_bf16_attn_core_hero) {
+                    qwen35_record_persistent_4b_timing(
+                        layer_timing_slots,
+                        QWEN35_4B_TIMING_FULL_ATTN_HERO_PREP,
+                        hero_prep_clock);
+                }
 
                 // Step E: Parallel attention — Flash-style online softmax
                 float* attn_flat = proj_b;  // reuse projection buffer
@@ -4813,9 +4834,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* ck = static_cast<const T*>(kv_k_b);
                     const T* cv = static_cast<const T*>(kv_v_b);
                     T* q_head_bf16 = reinterpret_cast<T*>(lds_input);
-                    const bool qwen4b_single_bf16_attn_core_hero =
-                        runtime_qwen35_4b_shape &&
-                        B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
 
                     if (qwen4b_single_bf16_attn_core_hero) {
                         for (int qh = 0; qh < nh; ++qh) {
@@ -4823,10 +4841,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const float* q_head = q_f32 + qh * hd * 2;
                             const size_t kv_head_base =
                                 static_cast<size_t>(kvh) * kv_max_b * hd;
-                            const int hero_warps = bs / warpSize;
+                            // Short contexts were stable with the original 8-warp striping,
+                            // while long contexts needed a tighter 4-warp merge to keep the
+                            // softmax numerics on the right side of the token boundary.
+                            const int hero_warps = (kv_len_b >= 256) ? 4 : (bs / warpSize);
                             const int hero_warp = tid / warpSize;
                             const int hero_lane = tid % warpSize;
-                            const bool attn_lane_active = hero_lane < (hd / 8);
+                            const bool hero_warp_active = hero_warp < hero_warps;
+                            const bool attn_lane_active =
+                                hero_warp_active && hero_lane < (hd / 8);
 
                             if (tid < hd) {
                                 saved_gate[qh * hd + tid] = bf16_round_rne_f32_finite(
@@ -4845,6 +4868,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             }
                             __syncthreads();
 
+                            const unsigned long long hero_loop_clock = clock64();
                             float2 qv0 = make_float2(0.0f, 0.0f);
                             float2 qv1 = make_float2(0.0f, 0.0f);
                             float2 qv2 = make_float2(0.0f, 0.0f);
@@ -4928,7 +4952,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     my_sum = my_sum * rescale + w;
                                 }
                             }
+                            if (qh == 0) {
+                                qwen35_record_persistent_4b_timing(
+                                    layer_timing_slots,
+                                    QWEN35_4B_TIMING_FULL_ATTN_HERO_LOOP,
+                                    hero_loop_clock);
+                            }
 
+                            const unsigned long long hero_merge_clock = clock64();
                             float* hero_max_buf = lds_input;
                             float* hero_sum_buf = hero_max_buf + hero_warps * warpSize;
                             float* hero_acc0_buf = hero_sum_buf + hero_warps * warpSize;
@@ -4939,17 +4970,19 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float* hero_acc5_buf = hero_acc4_buf + hero_warps * warpSize;
                             float* hero_acc6_buf = hero_acc5_buf + hero_warps * warpSize;
                             float* hero_acc7_buf = hero_acc6_buf + hero_warps * warpSize;
-                            const int hero_idx = hero_warp * warpSize + hero_lane;
-                            hero_max_buf[hero_idx] = my_max;
-                            hero_sum_buf[hero_idx] = my_sum;
-                            hero_acc0_buf[hero_idx] = my_acc0;
-                            hero_acc1_buf[hero_idx] = my_acc1;
-                            hero_acc2_buf[hero_idx] = my_acc2;
-                            hero_acc3_buf[hero_idx] = my_acc3;
-                            hero_acc4_buf[hero_idx] = my_acc4;
-                            hero_acc5_buf[hero_idx] = my_acc5;
-                            hero_acc6_buf[hero_idx] = my_acc6;
-                            hero_acc7_buf[hero_idx] = my_acc7;
+                            if (hero_warp_active) {
+                                const int hero_idx = hero_warp * warpSize + hero_lane;
+                                hero_max_buf[hero_idx] = my_max;
+                                hero_sum_buf[hero_idx] = my_sum;
+                                hero_acc0_buf[hero_idx] = my_acc0;
+                                hero_acc1_buf[hero_idx] = my_acc1;
+                                hero_acc2_buf[hero_idx] = my_acc2;
+                                hero_acc3_buf[hero_idx] = my_acc3;
+                                hero_acc4_buf[hero_idx] = my_acc4;
+                                hero_acc5_buf[hero_idx] = my_acc5;
+                                hero_acc6_buf[hero_idx] = my_acc6;
+                                hero_acc7_buf[hero_idx] = my_acc7;
+                            }
                             __syncthreads();
 
                             if (hero_warp == 0) {
@@ -5001,6 +5034,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     bf16_round_rne_f32_finite(final_acc7 * inv_sum);
                             }
                             __syncthreads();
+                            if (qh == 0) {
+                                qwen35_record_persistent_4b_timing(
+                                    layer_timing_slots,
+                                    QWEN35_4B_TIMING_FULL_ATTN_HERO_MERGE,
+                                    hero_merge_clock);
+                            }
                         }
                     } else {
                         for (int qh = 0; qh < nh; ++qh) {
@@ -5063,12 +5102,20 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
 
                 // Step F: Gate
+                const unsigned long long hero_gate_clock =
+                    qwen4b_single_bf16_attn_core_hero ? clock64() : 0;
                 for (int i = tid; i < nh * hd; i += bs) {
                     float gate_val = saved_gate[i];
                     float sigmoid_gate = dotcache_qwen35_sigmoid_fast(gate_val);
                     attn_flat[i] = bf16_round_rne_f32_finite(attn_flat[i] * sigmoid_gate);
                 }
                 __syncthreads();
+                if (qwen4b_single_bf16_attn_core_hero) {
+                    qwen35_record_persistent_4b_timing(
+                        layer_timing_slots,
+                        QWEN35_4B_TIMING_FULL_ATTN_HERO_GATE,
+                        hero_gate_clock);
+                }
 
                 } // end if (blockIdx.x == 0)
                 // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
