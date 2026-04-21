@@ -3945,6 +3945,192 @@ impl DecodeEngine {
         Ok(hidden[start..end].to_vec())
     }
 
+    /// Debug-only: run the real 4B persistent decode kernel for the first
+    /// `num_layers` layers and export one selected linear layer/channel's
+    /// post-Step-B conv-state taps as F32 bytes.
+    ///
+    /// Output layout is `[state_len taps..., qkv_bf16, conv_out_bf16]`, all
+    /// widened to F32 by the kernel.
+    pub fn trace_persistent_linear_step_b_after_layers(
+        &mut self,
+        token_ids: &[u32],
+        seqlen_offset: usize,
+        num_layers: usize,
+        trace_layer: usize,
+        trace_channel: usize,
+    ) -> Result<Vec<u8>> {
+        assert_eq!(token_ids.len(), self.batch_size);
+        assert!(self.use_4b_kernel, "persistent trace requires 4b kernel");
+        let config = &self.weights.config;
+        let b = self.batch_size;
+        anyhow::ensure!(
+            num_layers <= config.num_hidden_layers,
+            "trace layer count {} exceeds model layers {}",
+            num_layers,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            trace_layer < num_layers,
+            "trace layer {} out of range for num_layers {}",
+            trace_layer,
+            num_layers
+        );
+        anyhow::ensure!(
+            !config.is_full_attention(trace_layer),
+            "trace layer {} is not linear-attention",
+            trace_layer
+        );
+
+        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        anyhow::ensure!(
+            trace_channel < qkv_dim,
+            "trace channel {} out of range for qkv_dim {}",
+            trace_channel,
+            qkv_dim
+        );
+
+        let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
+        for (bi, &tid_val) in token_ids.iter().enumerate() {
+            let src_offset = tid_val as usize * row_bytes;
+            let dst_offset = bi * row_bytes;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                unsafe { (self.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
+                self.weights.embed_tokens.offset_ptr(src_offset),
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("linear step-b trace embedding lookup batch {bi}: {e}"))?;
+        }
+
+        let seqlen_offsets: Vec<usize> = vec![seqlen_offset; b];
+        for bi in 0..b {
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
+            for (i, ls) in st.layers.iter_mut().enumerate() {
+                if config.is_full_attention(i) {
+                    ls.ensure_kv_capacity(
+                        seqlen_offset,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("linear step-b trace ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                }
+            }
+        }
+
+        let state_len = config.linear_conv_kernel_dim - 1;
+        let mut debug_buf = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[state_len + 2])
+            .map_err(|e| anyhow::anyhow!("alloc linear step-b debug buffer: {e}"))?;
+
+        let mut descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        descs[trace_layer].debug_linear_trace_out = debug_buf.as_mut_ptr();
+        descs[trace_layer].debug_linear_trace_channel = trace_channel as i32;
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("linear step-b trace upload descs: {e}"))?;
+
+        let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
+            .chain(self.extra_states.iter())
+            .collect();
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+            self.scratch
+                .upload_batch_seq_descs(&batch_descs)
+                .map_err(|e| anyhow::anyhow!("linear step-b trace upload batch seq descs: {e}"))?;
+        }
+
+        if let Some(kv_fp8_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
+            self.scratch
+                .upload_kv_fp8_descs(&kv_fp8_descs)
+                .map_err(|e| anyhow::anyhow!("linear step-b trace upload kv fp8 descs: {e}"))?;
+        }
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.scratch.workspace.as_mut_ptr(),
+            self.scratch.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("linear step-b trace clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("linear step-b trace reset sync: {e}"))?;
+
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let persist_result = if use_qwen35_4b_cuda_hero {
+            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                false,
+                None,
+                None,
+            )
+        } else {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                false,
+                None,
+                None,
+            )
+        };
+        persist_result
+            .map_err(|e| anyhow::anyhow!("linear step-b trace persistent_decode_4b kernel: {e}"))?;
+
+        debug_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("linear step-b trace D2H: {e}"))
+    }
+
     pub fn trace_persistent_linear_proj_buf_after_layers(
         &self,
         batch_index: usize,
