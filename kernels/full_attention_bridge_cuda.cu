@@ -67,6 +67,19 @@ int qwen08_hero_blocks_override() {
     return static_cast<int>(parsed);
 }
 
+int qwen35_persistent_blocks_override() {
+    const char* value = std::getenv("SUPERSONIC_QWEN35_PERSISTENT_BLOCKS");
+    if (value == nullptr || *value == '\0') {
+        return 0;
+    }
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || parsed <= 0) {
+        return 0;
+    }
+    return static_cast<int>(parsed);
+}
+
 template <typename T>
 int full_attention_prefill_device(
     int device_ordinal,
@@ -4506,7 +4519,8 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
             static_cast<int>(seqlen_offset),
             layers, hidden_io, workspace, counters,
             barrier_counter, barrier_flag,
-            cos_table, sin_table, static_cast<int>(rotary_dim), 0);
+            cos_table, sin_table, static_cast<int>(rotary_dim),
+            qwen35_persistent_blocks_override());
     default:
         return 256;
     }

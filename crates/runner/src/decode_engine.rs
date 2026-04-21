@@ -128,6 +128,78 @@ fn qwen35_4b_cuda_hero_enabled() -> bool {
 const QWEN35_4B_CUDA_SPLIT_LAYER: usize = 5;
 const QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS: usize = 512;
 
+fn qwen35_4b_cuda_long_context_component_fallback_enabled() -> bool {
+    match env::var("SUPERSONIC_DISABLE_QWEN35_4B_CUDA_LONG_FALLBACK") {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty() || value == "0"
+        }
+        Err(_) => true,
+    }
+}
+
+fn qwen35_4b_cuda_split_windows(total_layers: usize) -> Vec<(usize, usize)> {
+    fn default_windows(total_layers: usize) -> Vec<(usize, usize)> {
+        if total_layers <= QWEN35_4B_CUDA_SPLIT_LAYER {
+            return vec![(0, total_layers)];
+        }
+        vec![
+            (0, QWEN35_4B_CUDA_SPLIT_LAYER),
+            (
+                QWEN35_4B_CUDA_SPLIT_LAYER,
+                total_layers - QWEN35_4B_CUDA_SPLIT_LAYER,
+            ),
+        ]
+    }
+
+    let raw = match env::var("SUPERSONIC_QWEN35_4B_CUDA_SPLIT_POINTS") {
+        Ok(value) => value,
+        Err(_) => return default_windows(total_layers),
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return default_windows(total_layers);
+    }
+
+    let mut split_points = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Ok(point) = part.parse::<usize>() else {
+            return default_windows(total_layers);
+        };
+        if point == 0 || point >= total_layers {
+            return default_windows(total_layers);
+        }
+        split_points.push(point);
+    }
+    if split_points.is_empty() {
+        return default_windows(total_layers);
+    }
+
+    split_points.sort_unstable();
+    split_points.dedup();
+
+    let mut windows = Vec::with_capacity(split_points.len() + 1);
+    let mut start = 0usize;
+    for point in split_points {
+        if point > start {
+            windows.push((start, point - start));
+            start = point;
+        }
+    }
+    if start < total_layers {
+        windows.push((start, total_layers - start));
+    }
+    if windows.is_empty() {
+        default_windows(total_layers)
+    } else {
+        windows
+    }
+}
+
 pub struct DecodeEngine {
     weights: Qwen35Weights,
     state: ModelState,
@@ -3573,6 +3645,7 @@ impl DecodeEngine {
             self.fp8_scale_device.is_none() &&
             self.int4_scale_device.is_none() &&
             !self.kv_fp8 &&
+            qwen35_4b_cuda_long_context_component_fallback_enabled() &&
             seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
         if use_qwen35_4b_cuda_long_context_component_fallback {
             let logits = self.component_decode_step_4b(token_ids[0], seqlen_offset)?;
@@ -3681,13 +3754,7 @@ impl DecodeEngine {
             !self.kv_fp8 &&
             config.num_hidden_layers > QWEN35_4B_CUDA_SPLIT_LAYER;
         if use_qwen35_4b_cuda_split {
-            let windows = [
-                (0usize, QWEN35_4B_CUDA_SPLIT_LAYER),
-                (
-                    QWEN35_4B_CUDA_SPLIT_LAYER,
-                    config.num_hidden_layers - QWEN35_4B_CUDA_SPLIT_LAYER,
-                ),
-            ];
+            let windows = qwen35_4b_cuda_split_windows(config.num_hidden_layers);
             for (window_start, window_layers) in windows {
                 self.scratch
                     .upload_descs(&descs[window_start..window_start + window_layers])
@@ -4648,13 +4715,23 @@ impl DecodeEngine {
             .workspace
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
+        let score_cols = self
+            .attn_scratch_floats
+            .saturating_sub(q_dim * 3)
+            / self.weights.config.num_attention_heads;
+        anyhow::ensure!(
+            kv_len <= score_cols,
+            "persistent full-attn scores kv_len {} exceeds scratch score columns {}",
+            kv_len,
+            score_cols,
+        );
         let start =
             (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
-        let end = start + self.weights.config.num_attention_heads * self.kv_chunk_size * 4;
+        let end = start + self.weights.config.num_attention_heads * score_cols * 4;
         anyhow::ensure!(end <= bytes.len(), "persistent full-attn scores slice out of bounds");
         let full = &bytes[start..end];
         let mut out = Vec::with_capacity(self.weights.config.num_attention_heads * kv_len * 4);
-        let stride = self.kv_chunk_size * 4;
+        let stride = score_cols * 4;
         for h in 0..self.weights.config.num_attention_heads {
             let row = h * stride;
             out.extend_from_slice(&full[row..row + kv_len * 4]);
