@@ -120,6 +120,14 @@ fn qwen35_4b_cuda_hero_enabled() -> bool {
     }
 }
 
+// Temporary correctness split for the CUDA Qwen3.5-4B persistent decode path.
+// Diagnostic traces show the layer-4 linear state is only later clobbered when
+// the same launch executes layer 4 and then continues onward. Relaunching from
+// layer 5 onward preserves correctness, so split the long-lived launch there
+// until the underlying in-kernel lifetime bug is fixed.
+const QWEN35_4B_CUDA_SPLIT_LAYER: usize = 5;
+const QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS: usize = 512;
+
 pub struct DecodeEngine {
     weights: Qwen35Weights,
     state: ModelState,
@@ -3558,6 +3566,18 @@ impl DecodeEngine {
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
         let config = &self.weights.config;
         let b = self.batch_size;
+        let use_qwen35_4b_cuda_long_context_component_fallback =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8 &&
+            seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
+        if use_qwen35_4b_cuda_long_context_component_fallback {
+            let logits = self.component_decode_step_4b(token_ids[0], seqlen_offset)?;
+            return Ok((vec![logits], DecodeStageTimings::default()));
+        }
         let mut timings = DecodeStageTimings::default();
 
         // 1. Embedding lookup: place each sequence's embedding at offset b * hidden_size
@@ -3628,6 +3648,19 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
+        let clock_rate_khz = if enable_timing_slots {
+            Some(match self.hidden_io.backend() {
+                gpu_hal::Backend::Cuda => {
+                    gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
+                        .clock_rate_khz
+                }
+                gpu_hal::Backend::Hip => kernel_ffi::query_hip_device_clock_khz(self.ordinal)
+                    .map_err(|e| anyhow::anyhow!("query HIP device clock rate: {e}"))?,
+            })
+        } else {
+            None
+        };
         // The CUDA single-stream hero specialization is only validated for the
         // exact Qwen3.5-4B geometry. 2B/9B share the generic persistent path,
         // but routing them through the specialized launch changes numerics.
@@ -3639,86 +3672,200 @@ impl DecodeEngine {
             self.fp8_scale_device.is_none() &&
             self.int4_scale_device.is_none() &&
             !self.kv_fp8;
-        let persist_result = if use_qwen35_4b_cuda_hero {
-            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
-                self.ordinal,
-                ScalarType::BF16,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.intermediate_size,
-                seqlen_offset,
-                &self.scratch.desc_device,
-                &mut self.hidden_io,
-                &mut self.scratch.workspace,
-                &mut self.scratch.sync_buf,
-                &self.rotary.cos,
-                &self.rotary.sin,
-                self.rotary.rotary_dim,
-                self.proj_buf_floats,
-                self.attn_scratch_floats,
-                self.fp8_scale_device.as_ref(),
-                self.scratch.kv_fp8_desc_device.as_ref(),
-                b,
-                self.scratch.batch_seq_desc_device.as_ref(),
-                self.int4_scale_device.as_ref(),
-                enable_timing_slots,
-                false,
-                None, // tap_workspace: DFlash-only, off in batched decode
-                None, // tap_layers: DFlash-only, off in batched decode
-            )
-        } else {
-            kernel_ffi::persistent_decode_4b(
-                self.ordinal,
-                ScalarType::BF16,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.intermediate_size,
-                seqlen_offset,
-                &self.scratch.desc_device,
-                &mut self.hidden_io,
-                &mut self.scratch.workspace,
-                &mut self.scratch.sync_buf,
-                &self.rotary.cos,
-                &self.rotary.sin,
-                self.rotary.rotary_dim,
-                self.proj_buf_floats,
-                self.attn_scratch_floats,
-                self.fp8_scale_device.as_ref(),
-                self.scratch.kv_fp8_desc_device.as_ref(),
-                b,
-                self.scratch.batch_seq_desc_device.as_ref(),
-                self.int4_scale_device.as_ref(),
-                enable_timing_slots,
-                false,
-                None, // tap_workspace: DFlash-only, off in batched decode
-                None, // tap_layers: DFlash-only, off in batched decode
-            )
-        };
-        persist_result
-            .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
-        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if enable_timing_slots {
-            let clock_rate_khz = match self.hidden_io.backend() {
-                gpu_hal::Backend::Cuda => {
-                    gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
-                        .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
-                        .clock_rate_khz
+        let use_qwen35_4b_cuda_split =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8 &&
+            config.num_hidden_layers > QWEN35_4B_CUDA_SPLIT_LAYER;
+        if use_qwen35_4b_cuda_split {
+            let windows = [
+                (0usize, QWEN35_4B_CUDA_SPLIT_LAYER),
+                (
+                    QWEN35_4B_CUDA_SPLIT_LAYER,
+                    config.num_hidden_layers - QWEN35_4B_CUDA_SPLIT_LAYER,
+                ),
+            ];
+            for (window_start, window_layers) in windows {
+                self.scratch
+                    .upload_descs(&descs[window_start..window_start + window_layers])
+                    .map_err(|e| anyhow::anyhow!(
+                        "upload descs for split window [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    ))?;
+                gpu_hal::memset_zeros(
+                    self.ordinal,
+                    self.scratch.workspace.as_mut_ptr(),
+                    self.scratch.workspace.len_bytes(),
+                )
+                .map_err(|e| anyhow::anyhow!(
+                    "clear split decode workspace [{window_start}, {}): {e}",
+                    window_start + window_layers
+                ))?;
+                self.scratch
+                    .reset_sync()
+                    .map_err(|e| anyhow::anyhow!(
+                        "reset split decode sync [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    ))?;
+
+                let window_result = if use_qwen35_4b_cuda_hero {
+                    kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        window_layers,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        seqlen_offset,
+                        &self.scratch.desc_device,
+                        &mut self.hidden_io,
+                        &mut self.scratch.workspace,
+                        &mut self.scratch.sync_buf,
+                        &self.rotary.cos,
+                        &self.rotary.sin,
+                        self.rotary.rotary_dim,
+                        self.proj_buf_floats,
+                        self.attn_scratch_floats,
+                        self.fp8_scale_device.as_ref(),
+                        None,
+                        1,
+                        None,
+                        self.int4_scale_device.as_ref(),
+                        enable_timing_slots,
+                        false,
+                        None,
+                        None,
+                    )
+                } else {
+                    kernel_ffi::persistent_decode_4b(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        window_layers,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        seqlen_offset,
+                        &self.scratch.desc_device,
+                        &mut self.hidden_io,
+                        &mut self.scratch.workspace,
+                        &mut self.scratch.sync_buf,
+                        &self.rotary.cos,
+                        &self.rotary.sin,
+                        self.rotary.rotary_dim,
+                        self.proj_buf_floats,
+                        self.attn_scratch_floats,
+                        self.fp8_scale_device.as_ref(),
+                        None,
+                        1,
+                        None,
+                        self.int4_scale_device.as_ref(),
+                        enable_timing_slots,
+                        false,
+                        None,
+                        None,
+                    )
+                };
+                window_result.map_err(|e| {
+                    anyhow::anyhow!(
+                        "persistent_decode_4b split window [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    )
+                })?;
+
+                if let Some(clock_rate_khz) = clock_rate_khz {
+                    let sync_bytes = self
+                        .scratch
+                        .sync_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!(
+                            "split timing slots D2H [{window_start}, {}): {e}",
+                            window_start + window_layers
+                        ))?;
+                    timings.add_assign(decode_persistent_4b_timing_slots(
+                        &sync_bytes,
+                        window_layers,
+                        1,
+                        clock_rate_khz,
+                    ));
                 }
-                gpu_hal::Backend::Hip => kernel_ffi::query_hip_device_clock_khz(self.ordinal)
-                    .map_err(|e| anyhow::anyhow!("query HIP device clock rate: {e}"))?,
+            }
+            self.scratch
+                .upload_descs(&descs)
+                .map_err(|e| anyhow::anyhow!("restore full descs after split decode: {e}"))?;
+        } else {
+            let persist_result = if use_qwen35_4b_cuda_hero {
+                kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    config.intermediate_size,
+                    seqlen_offset,
+                    &self.scratch.desc_device,
+                    &mut self.hidden_io,
+                    &mut self.scratch.workspace,
+                    &mut self.scratch.sync_buf,
+                    &self.rotary.cos,
+                    &self.rotary.sin,
+                    self.rotary.rotary_dim,
+                    self.proj_buf_floats,
+                    self.attn_scratch_floats,
+                    self.fp8_scale_device.as_ref(),
+                    self.scratch.kv_fp8_desc_device.as_ref(),
+                    b,
+                    self.scratch.batch_seq_desc_device.as_ref(),
+                    self.int4_scale_device.as_ref(),
+                    enable_timing_slots,
+                    false,
+                    None, // tap_workspace: DFlash-only, off in batched decode
+                    None, // tap_layers: DFlash-only, off in batched decode
+                )
+            } else {
+                kernel_ffi::persistent_decode_4b(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    config.intermediate_size,
+                    seqlen_offset,
+                    &self.scratch.desc_device,
+                    &mut self.hidden_io,
+                    &mut self.scratch.workspace,
+                    &mut self.scratch.sync_buf,
+                    &self.rotary.cos,
+                    &self.rotary.sin,
+                    self.rotary.rotary_dim,
+                    self.proj_buf_floats,
+                    self.attn_scratch_floats,
+                    self.fp8_scale_device.as_ref(),
+                    self.scratch.kv_fp8_desc_device.as_ref(),
+                    b,
+                    self.scratch.batch_seq_desc_device.as_ref(),
+                    self.int4_scale_device.as_ref(),
+                    enable_timing_slots,
+                    false,
+                    None, // tap_workspace: DFlash-only, off in batched decode
+                    None, // tap_layers: DFlash-only, off in batched decode
+                )
             };
-            let sync_bytes = self
-                .scratch
-                .sync_buf
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
-            timings.add_assign(decode_persistent_4b_timing_slots(
-                &sync_bytes,
-                config.num_hidden_layers,
-                b,
-                clock_rate_khz,
-            ));
+            persist_result
+                .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+            if let Some(clock_rate_khz) = clock_rate_khz {
+                let sync_bytes = self
+                    .scratch
+                    .sync_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
+                timings.add_assign(decode_persistent_4b_timing_slots(
+                    &sync_bytes,
+                    config.num_hidden_layers,
+                    b,
+                    clock_rate_khz,
+                ));
+            }
         }
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;

@@ -3614,13 +3614,7 @@ fn trace_persistent_linear_layer(
     };
     let isolated_tail_windows = {
         let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
-        let starts = [
-            final_layer_idx,
-            final_layer_idx.saturating_sub(1),
-            final_layer_idx.saturating_sub(3),
-            final_layer_idx.saturating_sub(7),
-            final_layer_idx.saturating_sub(15),
-        ];
+        let starts = [4usize, 5, 6, 7, 8];
         let mut samples = Vec::new();
         for &start_layer in &starts {
             if start_layer >= text_config.num_hidden_layers {
