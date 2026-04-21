@@ -3809,12 +3809,45 @@ static int matmul_int4_dequant_wmma_bf16_device(
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
-    constexpr int TILE_M = 16;
-    constexpr int TILE_N = 16;
+
+    // INT4 tiled WMMA is a clear win when M is large enough to use most of
+    // the 64-row block tile (long-ctx prefill). For small M (short prompts,
+    // decode-like) the 4x compute waste from tile overhang outweighs the
+    // tiling bandwidth savings — INT4 saves 4x global data vs BF16 before
+    // any tiling, so there's less for tiling to recover. Dispatch to the
+    // one-wave-per-tile kernel in that regime.
+    constexpr int TILED_M_THRESHOLD = 32;
+    if (m < TILED_M_THRESHOLD) {
+        constexpr int TILE_M = 16;
+        constexpr int TILE_N = 16;
+        const int grid_x = (n + TILE_N - 1) / TILE_N;
+        const int grid_y = (m + TILE_M - 1) / TILE_M;
+        const int grid_z = static_cast<int>(batch_elems);
+        const int threads = 32;
+        hipLaunchKernelGGL(
+            dotcache_qwen35_matmul_int4_dequant_wmma_small_m_kernel,
+            dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+            batch_elems, m, n, k,
+            static_cast<const hip_bfloat16*>(lhs),
+            static_cast<const uint8_t*>(rhs_int4),
+            static_cast<const hip_bfloat16*>(scale),
+            static_cast<const hip_bfloat16*>(zero),
+            group_size,
+            static_cast<hip_bfloat16*>(out));
+        hipError_t launch_err = hipGetLastError();
+        hipError_t sync_err = hipDeviceSynchronize();
+        if (launch_err != hipSuccess) return 290;
+        if (sync_err != hipSuccess) return 291;
+        return 0;
+    }
+
+    // Large-M: tiled 64x64 block tile, 4 waves in 2x2.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
     const int grid_x = (n + TILE_N - 1) / TILE_N;
     const int grid_y = (m + TILE_M - 1) / TILE_M;
     const int grid_z = static_cast<int>(batch_elems);
-    const int threads = 32;  // one wavefront per tile
+    const int threads = 128;
     hipLaunchKernelGGL(
         dotcache_qwen35_matmul_int4_dequant_wmma_kernel,
         dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
@@ -3845,14 +3878,14 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     void* out) {
     switch (dtype) {
     case 2: {
-        // WMMA path dequantizes a full 16-wide K chunk with one scale/zero
-        // fetch, which is only correct when a 16-value chunk is guaranteed
-        // to stay inside one quantization group. That requires
-        // `group_size % 16 == 0` (holds for the shipped GPTQ bakes at
-        // group_size=128, but weights.rs reads the value from metadata so a
-        // custom bake could land something else). Fall back to the scalar
-        // kernel otherwise.
-        if (group_size % 16 == 0 &&
+        // The tiled WMMA kernel fetches one (scale, zero) pair per BK-wide
+        // K slab per row, so it's only correct when every BK-aligned slab
+        // stays inside a single quantization group. That requires
+        // group_size to be a multiple of TILED_WMMA_BK (= 64). The shipped
+        // GPTQ bakes use group_size=128, so this path activates in
+        // practice; other group sizes fall back to the scalar kernel.
+        constexpr int TILED_BK = 64;
+        if (group_size % TILED_BK == 0 &&
             device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
             return matmul_int4_dequant_wmma_bf16_device(
                 static_cast<int>(device_ordinal), batch_elems, m, n, k,
