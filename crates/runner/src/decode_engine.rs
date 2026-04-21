@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -133,6 +134,20 @@ fn qwen35_4b_cuda_long_context_component_fallback_enabled() -> bool {
             value.is_empty() || value == "1"
         }
         Err(_) => false,
+    }
+}
+
+fn qwen35_4b_cuda_dump_layer_timings_topn() -> Option<usize> {
+    match env::var("SUPERSONIC_QWEN35_4B_CUDA_DUMP_LAYER_TIMINGS") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Some(8)
+            } else {
+                value.parse::<usize>().ok().filter(|&topn| topn > 0)
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -448,6 +463,89 @@ pub struct FullAttentionLayerOutputTrace {
     pub attn_hidden: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct Persistent4BLayerTiming {
+    full_attn_ms: f64,
+    full_attn_core_ms: f64,
+    linear_proj_ms: f64,
+    linear_core_ms: f64,
+    linear_core_recurrent_ms: f64,
+    linear_out_ms: f64,
+    mlp_gate_up_ms: f64,
+    mlp_down_ms: f64,
+}
+
+impl Persistent4BLayerTiming {
+    fn add_assign(&mut self, rhs: &Self) {
+        self.full_attn_ms += rhs.full_attn_ms;
+        self.full_attn_core_ms += rhs.full_attn_core_ms;
+        self.linear_proj_ms += rhs.linear_proj_ms;
+        self.linear_core_ms += rhs.linear_core_ms;
+        self.linear_core_recurrent_ms += rhs.linear_core_recurrent_ms;
+        self.linear_out_ms += rhs.linear_out_ms;
+        self.mlp_gate_up_ms += rhs.mlp_gate_up_ms;
+        self.mlp_down_ms += rhs.mlp_down_ms;
+    }
+
+    fn total_ms(&self) -> f64 {
+        self.full_attn_ms
+            + self.linear_proj_ms
+            + self.linear_core_ms
+            + self.linear_out_ms
+            + self.mlp_gate_up_ms
+            + self.mlp_down_ms
+    }
+
+    fn mlp_total_ms(&self) -> f64 {
+        self.mlp_gate_up_ms + self.mlp_down_ms
+    }
+}
+
+static QWEN35_4B_CUDA_LAYER_TIMINGS_DUMPED: AtomicBool = AtomicBool::new(false);
+
+fn maybe_dump_qwen35_4b_layer_timings(
+    layer_timings: &[Persistent4BLayerTiming],
+    topn: usize,
+    seqlen_offset: usize,
+    batch_size: usize,
+) {
+    if layer_timings.is_empty() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..layer_timings.len()).collect();
+    order.sort_by(|&lhs, &rhs| {
+        layer_timings[rhs]
+            .total_ms()
+            .partial_cmp(&layer_timings[lhs].total_ms())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let emit = topn.min(order.len());
+    eprintln!(
+        "[layer-timings] seqlen_offset={} batch_size={} top_layers={} total_layers={}",
+        seqlen_offset,
+        batch_size,
+        emit,
+        layer_timings.len(),
+    );
+    for layer in order.into_iter().take(emit) {
+        let timing = &layer_timings[layer];
+        eprintln!(
+            "[layer-timings] layer={} total_ms={:.3} full_attn_ms={:.3} full_attn_core_ms={:.3} linear_proj_ms={:.3} linear_core_ms={:.3} linear_core_recurrent_ms={:.3} linear_out_ms={:.3} mlp_ms={:.3} mlp_gate_up_ms={:.3} mlp_down_ms={:.3}",
+            layer,
+            timing.total_ms(),
+            timing.full_attn_ms,
+            timing.full_attn_core_ms,
+            timing.linear_proj_ms,
+            timing.linear_core_ms,
+            timing.linear_core_recurrent_ms,
+            timing.linear_out_ms,
+            timing.mlp_total_ms(),
+            timing.mlp_gate_up_ms,
+            timing.mlp_down_ms,
+        );
+    }
+}
+
 const PERSISTENT_4B_TIMING_FULL_ATTN: usize = 0;
 const PERSISTENT_4B_TIMING_FULL_ATTN_PROJ: usize = 1;
 const PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE: usize = 2;
@@ -474,6 +572,8 @@ fn decode_persistent_4b_timing_slots(
     num_layers: usize,
     batch_size: usize,
     clock_rate_khz: u32,
+    mut layer_timings: Option<&mut [Persistent4BLayerTiming]>,
+    layer_offset: usize,
 ) -> DecodeStageTimings {
     let timing_bytes =
         num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();
@@ -507,28 +607,81 @@ fn decode_persistent_4b_timing_slots(
     let split_batches = batch_size.min(2);
     for layer in 0..num_layers {
         let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
-        full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
-        full_attn_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
-        linear_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
-        mlp_gate_up_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
-        mlp_down_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
+        let layer_full_attn_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
+        let layer_full_attn_proj_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
+        let layer_linear_proj_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
+        let layer_mlp_gate_up_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
+        let layer_mlp_down_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
+        full_attn_cycles += layer_full_attn_cycles;
+        full_attn_proj_cycles += layer_full_attn_proj_cycles;
+        linear_proj_cycles += layer_linear_proj_cycles;
+        mlp_gate_up_cycles += layer_mlp_gate_up_cycles;
+        mlp_down_cycles += layer_mlp_down_cycles;
+        let mut layer_full_attn_core_cycles = 0u64;
+        let mut layer_linear_core_cycles = 0u64;
+        let mut layer_linear_out_cycles = 0u64;
+        let mut layer_linear_core_recurrent_cycles = 0u64;
         for b in 0..section_batches {
-            full_attn_core_cycles +=
+            let full_attn_core =
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + b);
+            let linear_core = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
+            let linear_out = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+            layer_full_attn_core_cycles += full_attn_core;
+            layer_linear_core_cycles += linear_core;
+            layer_linear_out_cycles += linear_out;
+            full_attn_core_cycles += full_attn_core;
             full_attn_out_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + b);
-            linear_core_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
-            linear_out_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+            linear_core_cycles += linear_core;
+            linear_out_cycles += linear_out;
         }
         for b in 0..split_batches {
             linear_core_conv_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + b);
-            linear_core_recurrent_cycles +=
+            let linear_core_recurrent =
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + b);
+            layer_linear_core_recurrent_cycles += linear_core_recurrent;
+            linear_core_recurrent_cycles += linear_core_recurrent;
             linear_core_post_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + b);
+        }
+        if let Some(layer_timings) = layer_timings.as_mut() {
+            let layer_timing = Persistent4BLayerTiming {
+                full_attn_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_cycles,
+                    clock_rate_khz,
+                ),
+                full_attn_core_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_full_attn_core_cycles,
+                    clock_rate_khz,
+                ),
+                linear_proj_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_linear_proj_cycles,
+                    clock_rate_khz,
+                ),
+                linear_core_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_linear_core_cycles,
+                    clock_rate_khz,
+                ),
+                linear_core_recurrent_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_linear_core_recurrent_cycles,
+                    clock_rate_khz,
+                ),
+                linear_out_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_linear_out_cycles,
+                    clock_rate_khz,
+                ),
+                mlp_gate_up_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_mlp_gate_up_cycles,
+                    clock_rate_khz,
+                ),
+                mlp_down_ms: persistent_4b_clock_cycles_to_ms(
+                    layer_mlp_down_cycles,
+                    clock_rate_khz,
+                ),
+            };
+            layer_timings[layer_offset + layer].add_assign(&layer_timing);
         }
     }
 
@@ -3650,6 +3803,21 @@ impl DecodeEngine {
             return Ok((vec![logits], DecodeStageTimings::default()));
         }
         let mut timings = DecodeStageTimings::default();
+        let dump_layer_timings_topn = if enable_timing_slots
+            && self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+        {
+            qwen35_4b_cuda_dump_layer_timings_topn().and_then(|topn| {
+                QWEN35_4B_CUDA_LAYER_TIMINGS_DUMPED
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok()
+                    .map(|_| topn)
+            })
+        } else {
+            None
+        };
+        let mut persistent_layer_timings = dump_layer_timings_topn
+            .map(|_| vec![Persistent4BLayerTiming::default(); config.num_hidden_layers]);
 
         // 1. Embedding lookup: place each sequence's embedding at offset b * hidden_size
         let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
@@ -3852,6 +4020,8 @@ impl DecodeEngine {
                         window_layers,
                         1,
                         clock_rate_khz,
+                        persistent_layer_timings.as_deref_mut(),
+                        window_start,
                     ));
                 }
             }
@@ -3927,8 +4097,15 @@ impl DecodeEngine {
                     config.num_hidden_layers,
                     b,
                     clock_rate_khz,
+                    persistent_layer_timings.as_deref_mut(),
+                    0,
                 ));
             }
+        }
+        if let (Some(topn), Some(layer_timings)) =
+            (dump_layer_timings_topn, persistent_layer_timings.as_deref())
+        {
+            maybe_dump_qwen35_4b_layer_timings(layer_timings, topn, seqlen_offset, b);
         }
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
