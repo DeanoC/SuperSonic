@@ -2957,6 +2957,243 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA FP8-dequant prefill matmul (wave32, 16x16x16 f32-accumulate),
+// shared-memory tiled. Uses the same tile shape as the BF16 WMMA kernel
+// above (64x64 output, 4 waves in 2x2, BK=64 staged through LDS).
+//
+// B-tile load reads FP8 E4M3 bytes, multiplies by the per-block scale, and
+// rounds to BF16 before storing into LDS. The bridge gates this path on
+// `block_size % 64 == 0` so every BK-aligned K slab stays inside one scale
+// block (shipped FP8 bakes use block_size=128). Within one outer iter,
+// every row and every K-value in this block's 64x64 tile share one scalar
+// scale — BN=64 <= block_size=128 and blk_col is a multiple of 64, so the
+// 64 rows also lie inside a single scale_row.
+//
+// Bit-exactness note: the existing scalar FP8 kernel also rounds each
+// dequantized value to BF16 before accumulating, so the precision path is
+// equivalent (BF16 × BF16 → F32 WMMA accumulate here, vs F32 × BF16-rounded-F32
+// → F32 scalar accumulate there).
+// =============================================================================
+
+__global__ __launch_bounds__(128, 2)
+void dotcache_qwen35_matmul_fp8_dequant_wmma_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,   // [batch, m, k]
+    const uint8_t* __restrict__ rhs_fp8,    // [batch, n, k] FP8 E4M3
+    const hip_bfloat16* __restrict__ scale, // [n/block, k/block] BF16
+    int block_size,
+    hip_bfloat16* __restrict__ out          // [batch, m, n]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;
+    const int wave_row = wid >> 1;
+    const int wave_col = wid & 1;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+
+    const int batch   = blockIdx.z;
+    const int blk_row = blockIdx.y * TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * TILED_WMMA_BN;
+
+    __shared__ uint16_t s_lhs[TILED_WMMA_BM * TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_rhs[TILED_WMMA_BN * TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* lhs_u16 = reinterpret_cast<const uint16_t*>(lhs);
+
+    const int scale_cols = (k + block_size - 1) / block_size;
+    const size_t lhs_batch_base = static_cast<size_t>(batch) * m * k;
+    const size_t rhs_batch_base = static_cast<size_t>(batch) * n * k;
+
+    supersonic_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32");
+    constexpr int K_COL_HALVES = TILED_WMMA_BK / 32;
+    constexpr int K_CHUNKS     = TILED_WMMA_BK / 16;
+
+    const int k_main = k & ~(TILED_WMMA_BK - 1);
+
+    // Per-tile scale (constant across all rows and all K in this BK slab
+    // when block_size >= max(BN, BK) and block_size % both).
+    // Row index for the scale table is just blk_col / block_size since BN <= block_size.
+    const int scale_row = blk_col / block_size;
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += TILED_WMMA_BK) {
+        // Fetch the single scale for this tile's K slab. All 64 rows share
+        // the same scale_row; all BK K-values share the same scale_col.
+        float tile_scale = 0.f;
+        if (blk_col < n) {
+            int scale_col = kk0 / block_size;
+            tile_scale = static_cast<float>(scale[scale_row * scale_cols + scale_col]);
+        }
+
+        // Load A (lhs) tile BF16.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < m) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + gk];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // Load + dequantize B (rhs_fp8) tile (FP8 E4M3 -> BF16 via tile_scale).
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t stored = 0;
+                if (gc < n) {
+                    uint8_t fp8_byte = rhs_fp8[rhs_batch_base + static_cast<size_t>(gc) * k + gk];
+                    float fp8_val = fp8_e4m3_to_float(fp8_byte);
+                    float v = bf16_round_rne_f32_finite(fp8_val * tile_scale);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    stored = static_cast<uint16_t>(bits >> 16);
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = stored;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // Defensive K-tail (Qwen k is multiple of 128, so unreachable with BK=64).
+    if (k_main != k) {
+        const int k_rem = k - k_main;
+        float tile_scale = 0.f;
+        if (blk_col < n) {
+            int scale_col = k_main / block_size;
+            tile_scale = static_cast<float>(scale[scale_row * scale_cols + scale_col]);
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < m && col < k_rem) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + k_main + col];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t stored = 0;
+                if (gc < n && col < k_rem) {
+                    uint8_t fp8_byte = rhs_fp8[rhs_batch_base + static_cast<size_t>(gc) * k + k_main + col];
+                    float fp8_val = fp8_e4m3_to_float(fp8_byte);
+                    float v = bf16_round_rne_f32_finite(fp8_val * tile_scale);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    stored = static_cast<uint16_t>(bits >> 16);
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = stored;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles.
+    const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const supersonic_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < n) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < m) {
+                    out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs_fp8; (void)scale; (void)block_size; (void)out;
+#endif
+}
+
 // INT4 dequant tiled matmul for prefill.
 // out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_int4 [batch, n, k/2])^T
 // rhs_int4 is packed INT4 (2 weights per byte, low nibble = even k index).
