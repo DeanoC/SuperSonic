@@ -560,6 +560,10 @@ mod tests {
 }
 
 impl DecodeEngine {
+    pub fn scratch_debug_ptr(&self) -> usize {
+        self.scratch.workspace.as_ptr() as usize
+    }
+
     // Rebuild the BF16 sidecar from the current prefix cache when a KV-FP8 state
     // grows after prefill or is cloned for batched decode.
     fn load_kv_shadow_for_state_static(
@@ -748,7 +752,7 @@ impl DecodeEngine {
         hidden_bytes: &[u8],
         seqlen_offset: usize,
     ) -> Result<FullAttentionStageTrace> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
             .full
             .as_ref()
@@ -900,7 +904,7 @@ impl DecodeEngine {
         hidden_bytes: &[u8],
         seqlen_offset: usize,
     ) -> Result<FullAttentionLayerOutputTrace> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
             .full
             .as_ref()
@@ -1322,7 +1326,7 @@ impl DecodeEngine {
         batch_index: usize,
         seq_pos: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let ls = self.state_for_batch(batch_index)
             .layers
             .get(layer_idx)
@@ -3940,6 +3944,110 @@ impl DecodeEngine {
             .hidden_io
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("trace hidden D2H: {e}"))?;
+        let start = batch_index * row_bytes;
+        let end = start + row_bytes;
+        Ok(hidden[start..end].to_vec())
+    }
+
+    /// Debug-only: run a BF16 4B persistent-kernel window over a sliced layer
+    /// descriptor range starting from a caller-supplied hidden row.
+    pub fn debug_decode_window_from_hidden_bf16(
+        &mut self,
+        hidden_bytes: &[u8],
+        seqlen_offset: usize,
+        start_layer: usize,
+        num_layers: usize,
+        batch_index: usize,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.batch_size == 1, "debug window requires batch_size=1");
+        anyhow::ensure!(self.use_4b_kernel, "debug window requires 4b kernel");
+        anyhow::ensure!(self.fp8_scale_device.is_none(), "debug window is BF16-only");
+        anyhow::ensure!(self.int4_scale_device.is_none(), "debug window is BF16-only");
+        anyhow::ensure!(!self.kv_fp8, "debug window does not support kv_fp8");
+
+        let config = self.weights.config.clone();
+        anyhow::ensure!(
+            start_layer < config.num_hidden_layers,
+            "debug window start_layer {} exceeds model layers {}",
+            start_layer,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            start_layer + num_layers <= config.num_hidden_layers,
+            "debug window [{}, {}) exceeds model layers {}",
+            start_layer,
+            start_layer + num_layers,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            hidden_bytes.len() == config.hidden_size * ScalarType::BF16.size_in_bytes(),
+            "debug window hidden len {} != hidden row bytes {}",
+            hidden_bytes.len(),
+            config.hidden_size * ScalarType::BF16.size_in_bytes()
+        );
+        anyhow::ensure!(
+            batch_index < self.batch_size,
+            "debug window batch index {} out of range for batch {}",
+            batch_index,
+            self.batch_size
+        );
+
+        self.set_hidden_from_bytes(hidden_bytes)?;
+
+        let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        let window_descs = descs
+            .get(start_layer..start_layer + num_layers)
+            .ok_or_else(|| anyhow::anyhow!(
+                "debug window desc slice [{start_layer}, {}) missing",
+                start_layer + num_layers
+            ))?;
+        self.scratch
+            .upload_descs(window_descs)
+            .map_err(|e| anyhow::anyhow!("debug window upload descs: {e}"))?;
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.scratch.workspace.as_mut_ptr(),
+            self.scratch.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("debug window clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("debug window reset sync: {e}"))?;
+
+        kernel_ffi::persistent_decode_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            num_layers,
+            config.hidden_size,
+            config.intermediate_size,
+            seqlen_offset,
+            &self.scratch.desc_device,
+            &mut self.hidden_io,
+            &mut self.scratch.workspace,
+            &mut self.scratch.sync_buf,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            self.rotary.rotary_dim,
+            self.proj_buf_floats,
+            self.attn_scratch_floats,
+            None,
+            None,
+            self.batch_size,
+            None,
+            None,
+            false,
+            false,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("debug window persistent_decode_4b: {e}"))?;
+
+        let hidden = self
+            .hidden_io
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("debug window hidden D2H: {e}"))?;
+        let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
         let start = batch_index * row_bytes;
         let end = start + row_bytes;
         Ok(hidden[start..end].to_vec())

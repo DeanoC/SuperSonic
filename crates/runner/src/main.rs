@@ -3289,6 +3289,16 @@ fn trace_persistent_linear_layer(
     engine.rebuild_prefill_state(prefix_ids, true)?;
     let native_hidden_out = engine
         .decode_step_batch_trace_hidden_after_layers(trace_tokens, seqlen_offset, trace_layer + 1, 0)?;
+    let native_partial_conv = engine
+        .state_for_batch(0)
+        .layers
+        .get(trace_layer)
+        .ok_or_else(|| anyhow::anyhow!("missing native partial layer {trace_layer}"))?
+        .conv_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing native partial conv state for layer {trace_layer}"))?
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("native partial conv D2H layer {trace_layer}: {e}"))?;
     let cfg = engine.weights().config.clone();
     let qkv_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
         + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
@@ -3475,6 +3485,7 @@ fn trace_persistent_linear_layer(
     let step_b_debug = {
         let debug = decode_f32_le(&step_b_debug_raw);
         let native = decode_bf16_le(&native_conv);
+        let partial = decode_bf16_le(&native_partial_conv);
         let start = decode_bf16_le(&pre_step_conv);
         let base = max_append_channel * conv_state_len;
         let idx = base + (conv_state_len - 1);
@@ -3490,16 +3501,178 @@ fn trace_persistent_linear_layer(
             .unwrap_or_default();
         let step_b_vs_expected = (step_b_last - expected_conv_tail[idx]).abs();
         let final_vs_step_b = (native[idx] - step_b_last).abs();
+        let partial_vs_step_b = (partial[idx] - step_b_last).abs();
+        let partial_vs_expected = (partial[idx] - expected_conv_tail[idx]).abs();
         format!(
-            "channel={max_append_channel},state=[{state_values}],qkv={:.6},conv_out={:.6},shift0_expected={:.6},shift1_expected={:.6},append_expected={:.6},step_b_vs_expected={:.6},final_vs_step_b={:.6}",
+            "channel={max_append_channel},state=[{state_values}],qkv={:.6},conv_out={:.6},shift0_expected={:.6},shift1_expected={:.6},append_expected={:.6},step_b_vs_expected={:.6},partial_last={:.6},partial_vs_step_b={:.6},partial_vs_expected={:.6},final_vs_step_b={:.6}",
             debug.get(conv_state_len).copied().unwrap_or_default(),
             debug.get(conv_state_len + 1).copied().unwrap_or_default(),
             start.get(base + 1).copied().unwrap_or_default(),
             start.get(base + 2).copied().unwrap_or_default(),
             expected_conv_tail[idx],
             step_b_vs_expected,
+            partial[idx],
+            partial_vs_step_b,
+            partial_vs_expected,
             final_vs_step_b,
         )
+    };
+    let first_later_clobber = {
+        let native = decode_bf16_le(&native_conv);
+        let partial = decode_bf16_le(&native_partial_conv);
+        let base = max_append_channel * conv_state_len;
+        let idx = base + (conv_state_len - 1);
+        let step_b_last = partial[idx];
+        if (native[idx] - step_b_last).abs() == 0.0 || trace_layer + 1 >= text_config.num_hidden_layers {
+            "none".to_string()
+        } else {
+            let mut lo = trace_layer + 1;
+            let mut hi = text_config.num_hidden_layers;
+            let mut hi_last = native[idx];
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                engine.rebuild_prefill_state(prefix_ids, true)?;
+                let _ = engine.decode_step_batch_trace_hidden_after_layers(
+                    trace_tokens,
+                    seqlen_offset,
+                    mid,
+                    0,
+                )?;
+                let mid_conv = engine
+                    .state_for_batch(0)
+                    .layers
+                    .get(trace_layer)
+                    .ok_or_else(|| anyhow::anyhow!("missing binary-search layer {trace_layer}"))?
+                    .conv_state
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing binary-search conv state for layer {trace_layer}"))?
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("binary-search conv D2H layer {trace_layer}: {e}"))?;
+                let mid_vals = decode_bf16_le(&mid_conv);
+                let mid_last = mid_vals[idx];
+                if (mid_last - step_b_last).abs() > 0.0 {
+                    hi = mid;
+                    hi_last = mid_last;
+                } else {
+                    lo = mid;
+                }
+            }
+            format!(
+                "after_layers={hi},clobber_layer={},partial_last={:.6},clobbered_last={:.6},delta={:.6}",
+                hi - 1,
+                step_b_last,
+                hi_last,
+                (hi_last - step_b_last).abs()
+            )
+        }
+    };
+    let pointer_debug = {
+        let state0 = engine.state_for_batch(0);
+        let trace_layer_state = state0
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing trace layer state {trace_layer}"))?;
+        let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
+        let final_layer_state = state0
+            .layers
+            .get(final_layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing final layer state {final_layer_idx}"))?;
+        let trace_conv = trace_layer_state
+            .conv_state
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let trace_rec = trace_layer_state
+            .recurrent_state
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_k = final_layer_state
+            .kv_cache_k
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_v = final_layer_state
+            .kv_cache_v
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_shadow_k = final_layer_state
+            .kv_shadow_k
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_shadow_v = final_layer_state
+            .kv_shadow_v
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        format!(
+            "trace_conv=0x{trace_conv:x},trace_rec=0x{trace_rec:x},final_k=0x{final_k:x},final_v=0x{final_v:x},final_shadow_k=0x{final_shadow_k:x},final_shadow_v=0x{final_shadow_v:x},workspace=0x{:x}",
+            engine.scratch_debug_ptr(),
+        )
+    };
+    let isolated_tail_windows = {
+        let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
+        let starts = [
+            final_layer_idx,
+            final_layer_idx.saturating_sub(1),
+            final_layer_idx.saturating_sub(3),
+            final_layer_idx.saturating_sub(7),
+            final_layer_idx.saturating_sub(15),
+        ];
+        let mut samples = Vec::new();
+        for &start_layer in &starts {
+            if start_layer >= text_config.num_hidden_layers {
+                continue;
+            }
+            let window_layers = text_config.num_hidden_layers - start_layer;
+            engine.rebuild_prefill_state(prefix_ids, true)?;
+            let pre_hidden = engine.decode_step_batch_trace_hidden_after_layers(
+                trace_tokens,
+                seqlen_offset,
+                start_layer,
+                0,
+            )?;
+            let before_conv = engine
+                .state_for_batch(0)
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing pre-window layer {trace_layer}"))?
+                .conv_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing pre-window conv state for layer {trace_layer}"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("pre-window conv D2H layer {trace_layer}: {e}"))?;
+            let _ = engine.debug_decode_window_from_hidden_bf16(
+                &pre_hidden,
+                seqlen_offset,
+                start_layer,
+                window_layers,
+                0,
+            )?;
+            let after_conv = engine
+                .state_for_batch(0)
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing post-window layer {trace_layer}"))?
+                .conv_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing post-window conv state for layer {trace_layer}"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("post-window conv D2H layer {trace_layer}: {e}"))?;
+            let before_vals = decode_bf16_le(&before_conv);
+            let after_vals = decode_bf16_le(&after_conv);
+            let base = max_append_channel * conv_state_len;
+            let idx = base + (conv_state_len - 1);
+            samples.push(format!(
+                "{}:{}:{:.6}",
+                start_layer,
+                window_layers,
+                (after_vals[idx] - before_vals[idx]).abs()
+            ));
+        }
+        samples.join(",")
     };
     let append_mismatch_samples = {
         let native = decode_bf16_le(&native_conv);
@@ -3590,7 +3763,7 @@ fn trace_persistent_linear_layer(
     let sample_z_comp = comp_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
 
     eprintln!(
-        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_conv_tap_deltas=[{native_conv_tap_deltas}] comp_conv_tap_deltas=[{comp_conv_tap_deltas}] max_append_mismatch=({max_append_mismatch}) step_b_debug=({step_b_debug}) append_mismatch_samples=[{append_mismatch_samples}] native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
+        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_conv_tap_deltas=[{native_conv_tap_deltas}] comp_conv_tap_deltas=[{comp_conv_tap_deltas}] max_append_mismatch=({max_append_mismatch}) step_b_debug=({step_b_debug}) first_later_clobber=({first_later_clobber}) pointer_debug=({pointer_debug}) isolated_tail_windows=[{isolated_tail_windows}] append_mismatch_samples=[{append_mismatch_samples}] native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
     );
     Ok(())
 }
