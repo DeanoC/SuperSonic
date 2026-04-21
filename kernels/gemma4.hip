@@ -1269,15 +1269,14 @@ __global__ void g4_scalar_mul_inplace_kernel(
 // kernel to cover them follows the same pattern and is the natural next step.
 // =============================================================================
 
-// Wave-level shuffle reduction (5 __shfl_xor instead of 8 __syncthreads+LDS
-// tree). RDNA 3.5 wavefront is 32 lanes. Same helper as Qwen's
-// full_attention_4b.hip but namespaced to avoid ODR collisions.
+// Wave-level shuffle reduction (log2(warpSize) __shfl_xor instead of the
+// 8 __syncthreads + LDS tree). Uses runtime warpSize so the matvec loops
+// (which partition columns by warpSize * N) and this reduction agree on
+// wave width across both RDNA (32-lane) and CDNA (64-lane) backends.
 __device__ inline float g4_wave_reduce_sum_f32(float val) {
-    val += __shfl_xor(val, 16);
-    val += __shfl_xor(val, 8);
-    val += __shfl_xor(val, 4);
-    val += __shfl_xor(val, 2);
-    val += __shfl_xor(val, 1);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset);
+    }
     return val;
 }
 
