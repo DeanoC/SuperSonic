@@ -4768,7 +4768,11 @@ int persistent_decode_device(
     cudaDeviceProp props;
     if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
+        const int parsed = std::atoi(bs_env);
+        if (parsed > 0) num_blocks = parsed;
+    }
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
