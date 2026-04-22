@@ -208,15 +208,15 @@ Exact lane:
 
 Current best verified commit:
 
-- `e5f244d` `Specialize qwen4b sm86 single-stream decode`
+- `d8124c8` `cuda: parallelize qwen35 4b recurrent head pairs`
 
 Current warmed result on this box:
 
-- prefill: `118.5 tok/s`
-- decode: `15.2 tok/s`
-- decode wall time: `8443.0 ms`
-- persistent decode stage: `7714.213 ms`
-- `linear_core_recurrent`: `3080.145 ms`
+- prefill: `119.0 tok/s`
+- decode: `19.9 tok/s`
+- decode wall time: `804.7 ms`
+- persistent decode stage: `731.951 ms`
+- `linear_core_recurrent`: `24.775 ms`
 
 Validated behavior at this checkpoint:
 
@@ -233,15 +233,15 @@ Kept progression on the `4B` hero lane:
 | `db26c08` | parallelize the single-stream full-attention hero schedule across warps | established the first kept 4B attention-side win |
 | `553c292` | trim recurrent-state traffic in the serial linear-attention core | reduced warmed `linear_core` and persistent time |
 | `e5f244d` | add a true CUDA-only single-stream BF16 specialized 4B kernel entrypoint | improved warmed decode from about `14.5 tok/s` to `15.2 tok/s` |
+| `d8124c8` | parallelize recurrent head-pair work across hero blocks | improved warmed decode to about `19.9 tok/s` and cut `linear_core_recurrent` to about `24.8 ms` |
 
 What the latest kept pass changed structurally:
 
-- added a dedicated CUDA-only 4B specialized bridge for the exact single-stream
-  BF16 lane
-- compiled out dead batch / FP8 / INT4 / trace control flow for that
-  instantiation
-- reduced the specialized kernel resource line from `REG:175 STACK:128` to
-  `REG:147 STACK:0`
+- moved the single-stream BF16 hero recurrent update from one block onto a
+  head-pair-per-block schedule
+- kept the generic block-0-only recurrent implementation as the fallback path
+- disabled the decayless-store shortcut only in the cross-block recurrent hero
+  split, where it was not numerically safe enough
 
 Things tried on the `4B` hero lane and not kept:
 
@@ -255,10 +255,11 @@ Things tried on the `4B` hero lane and not kept:
 Current 4B bottleneck read:
 
 - the dominant remaining cost is still inside the persistent kernel
-- `linear_core_recurrent` is still the largest single timing bucket
-- after ruling out a few “cleaner SASS” recurrent rewrites, the next likely
-  meaningful gain is a different lever, not more of the same register-pruning
-  inside that loop
+- the recurrent bottleneck is no longer dominant after `d8124c8`
+- the biggest remaining timing buckets are now `mlp_down`, `mlp_gate_up`,
+  `full_attn_core`, `linear_proj`, and `linear_out`
+- the next likely win is another hero-lane scheduling change on one of those
+  wide row-dot families, not more surgery on the recurrent body
 
 ## Commands
 
