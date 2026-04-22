@@ -28,6 +28,7 @@ fn matmul_proj(
     lhs: &GpuBuffer,
     weight: &GpuBuffer,
     scale: Option<&GpuBuffer>,
+    int8_scale: Option<&GpuBuffer>,
     block_size: usize,
     out: &mut GpuBuffer,
     int4_scale: Option<&GpuBuffer>,
@@ -39,6 +40,11 @@ fn matmul_proj(
             ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
+    } else if let Some(sc) = int8_scale {
+        prefill_ffi::matmul_rhs_transposed_int8(
+            ordinal, batch, m, n, k, lhs, weight, sc, out,
+        )
+        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"))
     } else {
         match scale {
             Some(s) => prefill_ffi::matmul_rhs_transposed_fp8(
@@ -1017,7 +1023,7 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("q_full alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, q_proj_dim, hidden_dim,
-        &scratch.normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), weights.fp8_block_size, &mut q_full,
+        &scratch.normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut q_full,
         fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
@@ -1043,7 +1049,7 @@ fn prefill_full_attention_layer(
     // 3. K projection
     matmul_proj(
         ordinal, 1, chunk_len, kv_dim, hidden_dim,
-        &scratch.normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        &scratch.normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
@@ -1098,7 +1104,7 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("v_buf alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, kv_dim, hidden_dim,
-        &scratch.normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), weights.fp8_block_size, &mut v_buf,
+        &scratch.normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut v_buf,
         fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
@@ -1227,7 +1233,7 @@ fn prefill_full_attention_layer(
     // 15. O projection
     matmul_proj(
         ordinal, 1, chunk_len, hidden_dim, q_dim,
-        &scratch.proj_buf, &fw.o_proj_w, fw.o_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        &scratch.proj_buf, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
@@ -1272,7 +1278,7 @@ fn prefill_linear_attention_layer(
     // 1. QKV projection: normed [chunk, hidden] → [chunk, qkv_dim]
     matmul_proj(
         ordinal, 1, chunk_len, qkv_dim, hidden_dim,
-        &scratch.normed, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        &scratch.normed, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), lw.qkv_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
         lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -1376,7 +1382,7 @@ fn prefill_linear_attention_layer(
     // 2. Z projection: normed [chunk, hidden] → [chunk, z_dim]
     matmul_proj(
         ordinal, 1, chunk_len, z_dim, hidden_dim,
-        &scratch.normed, &lw.z_proj_w, lw.z_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        &scratch.normed, &lw.z_proj_w, lw.z_proj_scale.as_ref(), lw.z_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -1395,7 +1401,7 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("b_buf alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, nv, hidden_dim,
-        &scratch.normed, &lw.b_proj_w, lw.b_proj_scale.as_ref(), weights.fp8_block_size, &mut b_buf,
+        &scratch.normed, &lw.b_proj_w, lw.b_proj_scale.as_ref(), lw.b_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut b_buf,
         None, None, 0,
     )?;
 
@@ -1404,7 +1410,7 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("a_buf alloc: {e}"))?;
     matmul_proj(
         ordinal, 1, chunk_len, nv, hidden_dim,
-        &scratch.normed, &lw.a_proj_w, lw.a_proj_scale.as_ref(), weights.fp8_block_size, &mut a_buf,
+        &scratch.normed, &lw.a_proj_w, lw.a_proj_scale.as_ref(), lw.a_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut a_buf,
         None, None, 0,
     )?;
 
@@ -1870,7 +1876,7 @@ fn prefill_linear_attention_layer(
     // 16. O projection: [S, val_dim] × out_proj_w [hidden, val_dim]^T → [S, hidden]
     matmul_proj(
         ordinal, 1, chunk_len, hidden_dim, val_dim,
-        &gated_s_first, &lw.out_proj_w, lw.out_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        &gated_s_first, &lw.out_proj_w, lw.out_proj_scale.as_ref(), lw.out_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -1906,14 +1912,14 @@ fn prefill_mlp_layer(
     // gate_proj: normed [seq, hidden] × gate_w [intermediate, hidden]^T → [seq, intermediate]
     matmul_proj(
         ordinal, 1, seq_len, intermediate, hidden_dim,
-        &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
         lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
     matmul_proj(
         ordinal, 1, seq_len, intermediate, hidden_dim,
-        &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+        &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
         lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
@@ -1930,7 +1936,7 @@ fn prefill_mlp_layer(
     // down_proj: mlp_buf [seq, intermediate] × down_w [hidden, intermediate]^T → [seq, hidden]
     matmul_proj(
         ordinal, 1, seq_len, hidden_dim, intermediate,
-        &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+        &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
         lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 

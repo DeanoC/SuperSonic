@@ -1,9 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
+use model_store::BakedStore;
 use qwen35::config::{Activation, RopeParameters, TextConfig};
 use qwen35::loader::WeightLoader;
 use qwen35::rotary::RotaryTables;
@@ -195,6 +197,9 @@ fn load_weights(
             gate_proj_scale: None,
             up_proj_scale: None,
             down_proj_scale: None,
+            gate_proj_int8_scale: None,
+            up_proj_int8_scale: None,
+            down_proj_int8_scale: None,
             gate_proj_int4_scale: None,
             gate_proj_int4_zero: None,
             up_proj_int4_scale: None,
@@ -221,6 +226,10 @@ fn load_weights(
                 k_proj_scale: None,
                 v_proj_scale: None,
                 o_proj_scale: None,
+                q_proj_int8_scale: None,
+                k_proj_int8_scale: None,
+                v_proj_int8_scale: None,
+                o_proj_int8_scale: None,
                 q_proj_int4_scale: None,
                 q_proj_int4_zero: None,
                 k_proj_int4_scale: None,
@@ -244,6 +253,133 @@ fn load_weights(
         fp8_block_size: 0,
         is_int4: false,
         int4_group_size: 0,
+        is_int8: false,
+    })
+}
+
+fn scb_name(weight_name: &str) -> String {
+    weight_name
+        .strip_suffix(".weight")
+        .map(|prefix| format!("{prefix}.SCB"))
+        .unwrap_or_else(|| format!("{weight_name}.SCB"))
+}
+
+fn load_baked_weight_raw(store: &BakedStore, name: &str, ordinal: usize) -> Result<GpuBuffer> {
+    store
+        .load_to_gpu(name, ordinal)
+        .map_err(|e| anyhow!("load {name}: {e}"))
+}
+
+fn load_baked_scb(store: &BakedStore, weight_name: &str, ordinal: usize) -> Result<Option<GpuBuffer>> {
+    let name = scb_name(weight_name);
+    if !store.contains(&name) {
+        return Ok(None);
+    }
+    store
+        .load_to_gpu(&name, ordinal)
+        .map(Some)
+        .map_err(|e| anyhow!("load {name}: {e}"))
+}
+
+fn load_baked_int8_weights(
+    model_dir: &Path,
+    store: &BakedStore,
+    text_config: &TextConfig,
+    ordinal: usize,
+    weight_prefix: &str,
+) -> Result<Qwen35Weights> {
+    let raw_loader =
+        WeightLoader::from_dir(model_dir).map_err(|e| anyhow!("open safetensors: {e}"))?;
+    let load_name = |name: &str| -> Result<GpuBuffer> {
+        if store.contains(name) {
+            load_baked_weight_raw(store, name, ordinal)
+        } else {
+            raw_loader
+                .load_to_gpu(name, ordinal)
+                .map_err(|e| anyhow!("load {name}: {e}"))
+        }
+    };
+
+    let embed_name = format!("{weight_prefix}.embed_tokens.weight");
+    let embed_tokens = Arc::new(load_name(&embed_name)?);
+
+    let lm_head = if store.contains("lm_head.weight") {
+        Arc::new(load_baked_weight_raw(store, "lm_head.weight", ordinal)?)
+    } else {
+        Arc::new(
+            raw_loader
+                .load_to_gpu("lm_head.weight", ordinal)
+                .map_err(|e| anyhow!("load lm_head.weight: {e}"))?,
+        )
+    };
+
+    let norm_name = format!("{weight_prefix}.norm.weight");
+    let norm_weight = load_name(&norm_name)?;
+
+    let mut layers = Vec::with_capacity(text_config.num_hidden_layers);
+    for idx in 0..text_config.num_hidden_layers {
+        let lp = format!("{weight_prefix}.layers.{idx}");
+        let fa = format!("{lp}.self_attn");
+        let mlp = format!("{lp}.mlp");
+        layers.push(LayerWeights {
+            kind: LayerKind::Full,
+            input_norm_w: load_name(&format!("{lp}.input_layernorm.weight"))?,
+            post_attn_norm_w: load_name(&format!("{lp}.post_attention_layernorm.weight"))?,
+            gate_proj_w: load_name(&format!("{mlp}.gate_proj.weight"))?,
+            up_proj_w: load_name(&format!("{mlp}.up_proj.weight"))?,
+            down_proj_w: load_name(&format!("{mlp}.down_proj.weight"))?,
+            gate_proj_scale: None,
+            up_proj_scale: None,
+            down_proj_scale: None,
+            gate_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.gate_proj.weight"), ordinal)?,
+            up_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.up_proj.weight"), ordinal)?,
+            down_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.down_proj.weight"), ordinal)?,
+            gate_proj_int4_scale: None,
+            gate_proj_int4_zero: None,
+            up_proj_int4_scale: None,
+            up_proj_int4_zero: None,
+            down_proj_int4_scale: None,
+            down_proj_int4_zero: None,
+            linear: None,
+            full: Some(FullWeights {
+                q_proj_w: load_name(&format!("{fa}.q_proj.weight"))?,
+                k_proj_w: load_name(&format!("{fa}.k_proj.weight"))?,
+                v_proj_w: load_name(&format!("{fa}.v_proj.weight"))?,
+                o_proj_w: load_name(&format!("{fa}.o_proj.weight"))?,
+                q_norm_w: None,
+                k_norm_w: None,
+                q_proj_scale: None,
+                k_proj_scale: None,
+                v_proj_scale: None,
+                o_proj_scale: None,
+                q_proj_int8_scale: load_baked_scb(store, &format!("{fa}.q_proj.weight"), ordinal)?,
+                k_proj_int8_scale: load_baked_scb(store, &format!("{fa}.k_proj.weight"), ordinal)?,
+                v_proj_int8_scale: load_baked_scb(store, &format!("{fa}.v_proj.weight"), ordinal)?,
+                o_proj_int8_scale: load_baked_scb(store, &format!("{fa}.o_proj.weight"), ordinal)?,
+                q_proj_int4_scale: None,
+                q_proj_int4_zero: None,
+                k_proj_int4_scale: None,
+                k_proj_int4_zero: None,
+                v_proj_int4_scale: None,
+                v_proj_int4_zero: None,
+                o_proj_int4_scale: None,
+                o_proj_int4_zero: None,
+            }),
+        });
+    }
+
+    Ok(Qwen35Weights {
+        config: text_config.clone(),
+        embed_tokens,
+        lm_head,
+        lm_head_scale: None,
+        norm_weight,
+        layers,
+        is_fp8: false,
+        fp8_block_size: 0,
+        is_int4: false,
+        int4_group_size: 0,
+        is_int8: true,
     })
 }
 
@@ -283,9 +419,15 @@ pub fn run_llama31(
         bail!("Llama 3.1 CUDA path has no --oracle-prefill path yet");
     }
     if cli.fp8_runtime || cli.int4 || cli.kv_fp8 {
-        bail!("Llama 3.1 CUDA path is BF16 raw-safetensors only at launch");
+        bail!("Llama 3.1 CUDA path does not support --fp8-runtime, --int4, or --kv-fp8");
     }
-    if cli.download_bake {
+    if cli.int8 && cli.no_bake {
+        bail!("--int8 requires the baked path; drop --no-bake");
+    }
+    if cli.int8 && cli.download_bake {
+        bail!("Llama 3.1 INT8 currently supports only local baking, not --download-bake");
+    }
+    if !cli.int8 && cli.download_bake {
         bail!("Llama 3.1 CUDA path has no release-hosted bake yet; point --model-dir at raw safetensors");
     }
     if !cli.model_dir.join("config.json").exists() {
@@ -370,6 +512,7 @@ pub fn run_llama31(
             &cli.oracle_dtype,
             &oracle_device,
             false,
+            cli.int8,
             None,
             None,
         )?;
@@ -388,8 +531,50 @@ pub fn run_llama31(
     gpu_hal::set_device(ordinal).map_err(|e| anyhow!("set_device: {e}"))?;
 
     let t0 = Instant::now();
-    eprintln!("[weights] loading raw BF16 safetensors");
-    let weights = load_weights(&cli.model_dir, &text_config, ordinal, params.weight_prefix)?;
+    let weights = if cli.int8 {
+        let bake_dir = model_store::bake_dir_int8(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        if !model_store::version_ok(&bake_dir) {
+            let bake_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .ok_or_else(|| anyhow!("could not derive bake script path from CARGO_MANIFEST_DIR"))?
+                .join("oracle/bake_int8_llama31.py");
+            eprintln!("[weights] baking local INT8 package at {}", bake_dir.display());
+            let output = Command::new("python3")
+                .arg(&bake_script)
+                .arg("--model-dir")
+                .arg(&cli.model_dir)
+                .arg("--device")
+                .arg(format!("cuda:{ordinal}"))
+                .output()
+                .with_context(|| format!("start {}", bake_script.display()))?;
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                bail!(
+                    "INT8 bake failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
+                    output.status,
+                    stdout.trim(),
+                    stderr.trim()
+                );
+            }
+        }
+        eprintln!("[weights] loading baked INT8 package {}", bake_dir.display());
+        let store = BakedStore::open(&bake_dir)
+            .map_err(|e| anyhow!("open INT8 bake {}: {e}", bake_dir.display()))?;
+        load_baked_int8_weights(
+            &cli.model_dir,
+            &store,
+            &text_config,
+            ordinal,
+            params.weight_prefix,
+        )?
+    } else {
+        eprintln!("[weights] loading raw BF16 safetensors");
+        load_weights(&cli.model_dir, &text_config, ordinal, params.weight_prefix)?
+    };
     let rotary = build_rotary_tables(&config, ordinal)?;
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 

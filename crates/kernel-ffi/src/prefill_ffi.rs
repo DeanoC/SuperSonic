@@ -202,6 +202,19 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_4b_hip_matmul_int8(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_int8: *const c_void,
+        scale: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     // BF16 → FP8 KV cache quantization
     fn dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
@@ -1046,6 +1059,37 @@ pub fn matmul_rhs_transposed_int4(
     };
     if status != 0 {
         return Err(ffi_error(format!("matmul_rhs_transposed_int4 failed: {status}")));
+    }
+    Ok(())
+}
+
+pub fn matmul_rhs_transposed_int8(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int8: &GpuBuffer,
+    scale: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_matmul_int8(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            lhs.as_ptr(),
+            rhs_int8.as_ptr(),
+            scale.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("matmul_rhs_transposed_int8 failed: {status}")));
     }
     Ok(())
 }

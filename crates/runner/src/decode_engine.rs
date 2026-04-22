@@ -37,6 +37,7 @@ fn matmul_proj(
     lhs: &GpuBuffer,
     weight: &GpuBuffer,
     scale: Option<&GpuBuffer>,
+    int8_scale: Option<&GpuBuffer>,
     block_size: usize,
     out: &mut GpuBuffer,
     int4_scale: Option<&GpuBuffer>,
@@ -48,6 +49,11 @@ fn matmul_proj(
             ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
+    } else if let Some(sc) = int8_scale {
+        kernel_ffi::prefill_ffi::matmul_rhs_transposed_int8(
+            ordinal, batch, m, n, k, lhs, weight, sc, out,
+        )
+        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"))
     } else {
         match scale {
             Some(s) => kernel_ffi::prefill_ffi::matmul_rhs_transposed_fp8(
@@ -1176,7 +1182,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         if has_attn_gate {
@@ -1203,12 +1209,12 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
             fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
 
@@ -1382,7 +1388,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         if has_attn_gate {
@@ -1408,12 +1414,12 @@ impl DecodeEngine {
         }
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
             fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         maybe_attn_rms_norm_rows(
@@ -1553,7 +1559,7 @@ impl DecodeEngine {
         }
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
+            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
             fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut hidden_out, &proj_out)?;
@@ -2066,7 +2072,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+            &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         if has_attn_gate {
@@ -2093,12 +2099,12 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+            &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
             fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+            &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
 
@@ -2263,7 +2269,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
+            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
             fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
@@ -2313,7 +2319,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, qkv_dim, hidden_dim,
-            &self.normed_buf, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), self.weights.fp8_block_size, &mut qkv,
+            &self.normed_buf, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), lw.qkv_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut qkv,
             lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         let qkv_trace = if trace_output {
@@ -2323,7 +2329,7 @@ impl DecodeEngine {
         };
         matmul_proj(
             self.ordinal, 1, 1, val_dim, hidden_dim,
-            &self.normed_buf, &lw.z_proj_w, lw.z_proj_scale.as_ref(), self.weights.fp8_block_size, &mut z,
+            &self.normed_buf, &lw.z_proj_w, lw.z_proj_scale.as_ref(), lw.z_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut z,
             lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         let z_trace = if trace_output {
@@ -2333,12 +2339,12 @@ impl DecodeEngine {
         };
         matmul_proj(
             self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.a_proj_w, lw.a_proj_scale.as_ref(), self.weights.fp8_block_size, &mut a,
+            &self.normed_buf, &lw.a_proj_w, lw.a_proj_scale.as_ref(), lw.a_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut a,
             None, None, self.weights.int4_group_size,
         )?;
         matmul_proj(
             self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.b_proj_w, lw.b_proj_scale.as_ref(), self.weights.fp8_block_size, &mut b,
+            &self.normed_buf, &lw.b_proj_w, lw.b_proj_scale.as_ref(), lw.b_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut b,
             None, None, self.weights.int4_group_size,
         )?;
 
@@ -2661,7 +2667,7 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, val_dim,
-            &gated, &lw.out_proj_w, lw.out_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
+            &gated, &lw.out_proj_w, lw.out_proj_scale.as_ref(), lw.out_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
             lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         let proj_trace = if trace_output {
@@ -2712,12 +2718,12 @@ impl DecodeEngine {
 
         matmul_proj(
             self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
+            &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
             lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         matmul_proj(
             self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), self.weights.fp8_block_size, &mut up,
+            &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut up,
             lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::swiglu_mul(
@@ -2731,7 +2737,7 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, intermediate,
-            &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), self.weights.fp8_block_size, &mut down,
+            &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut down,
             lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         let trace = if trace_output {

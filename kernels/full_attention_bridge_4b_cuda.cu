@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cublas_v2.h>
 #include <stdint.h>
 #include <cstdio>
 
@@ -34,6 +35,34 @@ struct ScopedHipDevice {
         }
     }
 };
+
+struct CublasHandleCache {
+    int device = -1;
+    cublasHandle_t handle = nullptr;
+
+    ~CublasHandleCache() {
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+        }
+    }
+
+    cublasHandle_t get(int target_device) {
+        if (handle != nullptr && device == target_device) {
+            return handle;
+        }
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+            handle = nullptr;
+        }
+        if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        device = target_device;
+        return handle;
+    }
+};
+
+thread_local CublasHandleCache g_cublas_handle_cache;
 
 int linear_prefill_block_override() {
     const char* value = std::getenv("DOTCACHE_QWEN35_HIP_FUSED_PREFILL_BLOCK");
@@ -3718,6 +3747,153 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
             lhs, rhs_int4, scale, zero, group_size, out);
     default:
         return 272;
+    }
+}
+
+template <typename T>
+int matmul_int8_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* lhs,
+    const void* rhs_int8,
+    const void* scale,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    const int rows = static_cast<int>(batch_elems) * m;
+    const size_t lhs_i8_bytes =
+        static_cast<size_t>(rows) * static_cast<size_t>(k) * sizeof(int8_t);
+    const size_t out_i32_bytes =
+        static_cast<size_t>(rows) * static_cast<size_t>(n) * sizeof(int32_t);
+    const size_t row_stats_bytes = static_cast<size_t>(rows) * sizeof(float);
+
+    int8_t* d_lhs_i8 = nullptr;
+    int32_t* d_out_i32 = nullptr;
+    float* d_row_stats = nullptr;
+
+    if (cudaMalloc(&d_lhs_i8, lhs_i8_bytes) != cudaSuccess) return 280;
+    if (cudaMalloc(&d_out_i32, out_i32_bytes) != cudaSuccess) {
+        cudaFree(d_lhs_i8);
+        return 281;
+    }
+    if (cudaMalloc(&d_row_stats, row_stats_bytes) != cudaSuccess) {
+        cudaFree(d_lhs_i8);
+        cudaFree(d_out_i32);
+        return 282;
+    }
+
+    constexpr int quant_block = 256;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_quantize_int8_rowwise_kernel<T>),
+        dim3(rows),
+        dim3(quant_block),
+        0,
+        0,
+        rows,
+        k,
+        static_cast<const T*>(lhs),
+        d_lhs_i8,
+        d_row_stats);
+    if (cudaGetLastError() != cudaSuccess) {
+        cudaFree(d_lhs_i8);
+        cudaFree(d_out_i32);
+        cudaFree(d_row_stats);
+        return 283;
+    }
+
+    cublasHandle_t handle = g_cublas_handle_cache.get(device_ordinal);
+    if (handle == nullptr) {
+        cudaFree(d_lhs_i8);
+        cudaFree(d_out_i32);
+        cudaFree(d_row_stats);
+        return 284;
+    }
+    if (cublasSetStream(handle, 0) != CUBLAS_STATUS_SUCCESS) {
+        cudaFree(d_lhs_i8);
+        cudaFree(d_out_i32);
+        cudaFree(d_row_stats);
+        return 285;
+    }
+
+    const int32_t alpha = 1;
+    const int32_t beta = 0;
+    const cublasStatus_t gemm_status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        n,
+        rows,
+        k,
+        &alpha,
+        rhs_int8,
+        CUDA_R_8I,
+        k,
+        d_lhs_i8,
+        CUDA_R_8I,
+        k,
+        &beta,
+        d_out_i32,
+        CUDA_R_32I,
+        n,
+        CUBLAS_COMPUTE_32I,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (gemm_status != CUBLAS_STATUS_SUCCESS) {
+        cudaFree(d_lhs_i8);
+        cudaFree(d_out_i32);
+        cudaFree(d_row_stats);
+        return 286;
+    }
+
+    constexpr int dequant_block = 256;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    const unsigned int dequant_grid =
+        static_cast<unsigned int>((total + dequant_block - 1) / dequant_block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_dequant_int32_int8mm_kernel<T>),
+        dim3(dequant_grid),
+        dim3(dequant_block),
+        0,
+        0,
+        rows,
+        n,
+        d_out_i32,
+        d_row_stats,
+        static_cast<const float*>(scale),
+        static_cast<T*>(out));
+    cudaError_t launch_err = cudaGetLastError();
+    cudaError_t sync_err = cudaDeviceSynchronize();
+
+    cudaFree(d_lhs_i8);
+    cudaFree(d_out_i32);
+    cudaFree(d_row_stats);
+
+    if (launch_err != cudaSuccess) return 287;
+    if (sync_err != cudaSuccess) return 288;
+    return 0;
+}
+
+extern "C" int dotcache_qwen35_4b_hip_matmul_int8(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* lhs,
+    const void* rhs_int8,
+    const void* scale,
+    void* out
+) {
+    switch (dtype) {
+    case 2:
+        return matmul_int8_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k, lhs, rhs_int8, scale, out);
+    default:
+        return 289;
     }
 }
 

@@ -106,6 +106,7 @@ pub fn run_oracle(
     dtype: &str,
     device: &str,
     emit_state: bool,
+    load_in_8bit: bool,
     fp8_model_dir: Option<&Path>,
     trace_full_attn_layer: Option<usize>,
 ) -> Result<OracleOutput> {
@@ -125,6 +126,9 @@ pub fn run_oracle(
     if emit_state {
         cmd.arg("--emit-state");
     }
+    if load_in_8bit {
+        cmd.arg("--load-in-8bit");
+    }
     if let Some(dir) = fp8_model_dir {
         cmd.arg("--fp8-model-dir").arg(dir);
     }
@@ -133,10 +137,11 @@ pub fn run_oracle(
     }
 
     let fp8_flag = fp8_model_dir.map(|d| format!(" --fp8-model-dir {}", d.display())).unwrap_or_default();
+    let int8_flag = if load_in_8bit { " --load-in-8bit" } else { "" };
     let trace_flag = trace_full_attn_layer
         .map(|layer| format!(" --trace-full-attn-layer {layer}"))
         .unwrap_or_default();
-    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{fp8_flag}{trace_flag}",
+    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{int8_flag}{fp8_flag}{trace_flag}",
         oracle_script.display(),
         if emit_state { " --emit-state" } else { "" }
     );

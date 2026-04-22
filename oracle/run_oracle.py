@@ -26,7 +26,7 @@ import os
 import time
 
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 import safetensors.torch
 
@@ -95,6 +95,8 @@ def main():
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--emit-state", action="store_true",
                         help="Emit prefill hidden + layer states for Rust decode engine")
+    parser.add_argument("--load-in-8bit", action="store_true",
+                        help="Load the model with BitsAndBytes INT8 quantization")
     parser.add_argument("--fp8-model-dir",
                         help="Path to FP8 safetensors dir. Weights are dequanted to BF16 "
                              "and injected into --model-id's architecture.")
@@ -108,12 +110,23 @@ def main():
     t0 = time.perf_counter()
     if args.fp8_model_dir:
         model = _load_fp8_model(args.model_id, args.fp8_model_dir, torch_dtype)
+    elif args.load_in_8bit:
+        if args.device == "cpu":
+            raise SystemExit("--load-in-8bit requires a CUDA/XPU/HPU device, not cpu")
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_id,
+            quantization_config=quantization_config,
+            device_map={"": args.device},
+            torch_dtype=torch_dtype,
+            trust_remote_code=True,
+        )
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.model_id, torch_dtype=torch_dtype, trust_remote_code=True,
         )
     model.eval()
-    if args.device != "cpu":
+    if args.device != "cpu" and not args.load_in_8bit:
         model = model.to(args.device)
     load_ms = (time.perf_counter() - t0) * 1000
 

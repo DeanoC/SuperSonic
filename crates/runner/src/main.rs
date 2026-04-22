@@ -347,6 +347,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     int4: bool,
 
+    /// Load an INT8 bake produced from BitsAndBytes `load_in_8bit=True`.
+    /// Currently only supported for `llama3.1-8b` on CUDA.
+    #[arg(long)]
+    int8: bool,
+
     /// Process prompt in chunks of this size (0 = no chunking, process entire prompt at once).
     /// Reduces activation VRAM for long prompts. Typical values: 128, 256, 512.
     #[arg(long, default_value = "0")]
@@ -649,6 +654,13 @@ fn main() -> Result<()> {
             registry::supported_models_list().join(", ")
         )
     })?;
+
+    if cli.int8 && (cli.int4 || cli.fp8_runtime) {
+        anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
+    }
+    if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
+        anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");
+    }
 
     // 2. Detect GPU
     let (arch_name, total_vram, warp_size) = match backend {
@@ -1124,7 +1136,7 @@ fn main() -> Result<()> {
             .join("oracle/run_oracle.py");
         let output = oracle::run_oracle(
             &oracle_script, &model_id, &prompt_ids, cli.max_new_tokens,
-            &cli.oracle_dtype, &oracle_device, true,
+            &cli.oracle_dtype, &oracle_device, true, false,
             fp8_oracle_dir.as_deref(),
             None,
         )?;
@@ -1185,6 +1197,7 @@ fn main() -> Result<()> {
             &cli.oracle_dtype,
             &oracle_device,
             emit_state,
+            false,
             fp8_oracle_dir.as_deref(),
             cli.trace_oracle_prefill_layer
                 .filter(|layer| text_config.is_full_attention(*layer)),
@@ -4027,6 +4040,7 @@ fn trace_oracle_prefill_layer(
             oracle_dtype,
             oracle_device,
             true,
+            false,
             fp8_oracle_dir,
             None,
         )?)
