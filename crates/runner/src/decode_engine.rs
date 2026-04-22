@@ -1591,6 +1591,7 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate bypass copy: {e}"))?;
         }
+        let out_start = Instant::now();
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
             &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
@@ -1807,7 +1808,7 @@ impl DecodeEngine {
             &mut self.normed_buf,
             &format!("layer {idx} component full-attn input rms_norm"),
         )?;
-        self.component_decode_full_attention_layer(idx, seqlen_offset, true)?
+        self.component_decode_full_attention_layer(idx, seqlen_offset, true, None)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx} missing full-attention trace"))
     }
 
@@ -1918,7 +1919,12 @@ impl DecodeEngine {
 
             if self.weights.config.is_full_attention(i) {
                 let full_attn_start = Instant::now();
-                let _ = self.component_decode_full_attention_layer(i, seqlen_offset, false)?;
+                let _ = self.component_decode_full_attention_layer(
+                    i,
+                    seqlen_offset,
+                    false,
+                    timings.as_deref_mut(),
+                )?;
                 self.sync_stage_if_requested(collect_timings, &format!("layer {i} full attention"))?;
                 let elapsed = full_attn_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some(t) = timings.as_mut() {
@@ -2145,6 +2151,7 @@ impl DecodeEngine {
         idx: usize,
         seqlen_offset: usize,
         trace_output: bool,
+        mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
         let config = &self.weights.config;
         let fw = self.weights.layers[idx]
@@ -2180,6 +2187,7 @@ impl DecodeEngine {
             use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("k");
         let use_late_v_mixed =
             use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("v");
+        let collect_timings = timings.is_some();
         let mut q_proj_trace = None;
         let mut gate_proj_trace = None;
         let mut k_proj_trace = None;
@@ -2219,6 +2227,7 @@ impl DecodeEngine {
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
+        let proj_start = Instant::now();
         if use_late_q_mixed {
             if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
                 prefill_engine::matmul_int8_mixed_host(
@@ -2364,6 +2373,10 @@ impl DecodeEngine {
             kv_dim * elem_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
+        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention proj"))?;
+        if let Some(t) = timings.as_mut() {
+            t.persistent_full_attn_proj_ms += proj_start.elapsed().as_secs_f64() * 1000.0;
+        }
         if trace_output {
             q_proj_trace = Some(
                 query_buf
@@ -2489,6 +2502,7 @@ impl DecodeEngine {
             attn_v_ref = &kv_v_contig;
         }
 
+        let core_start = Instant::now();
         kernel_ffi::prefill_ffi::full_attention_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
             1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
@@ -2528,6 +2542,10 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate bypass copy: {e}"))?;
         }
+        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention core"))?;
+        if let Some(t) = timings.as_mut() {
+            t.persistent_full_attn_core_ms += core_start.elapsed().as_secs_f64() * 1000.0;
+        }
         if trace_output {
             gated_trace = Some(
                 gated
@@ -2536,6 +2554,7 @@ impl DecodeEngine {
             );
         }
 
+        let out_start = Instant::now();
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
             &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
@@ -2549,6 +2568,10 @@ impl DecodeEngine {
             );
         }
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
+        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention out"))?;
+        if let Some(t) = timings.as_mut() {
+            t.persistent_full_attn_out_ms += out_start.elapsed().as_secs_f64() * 1000.0;
+        }
         Ok(if trace_output {
             Some(ComponentFullAttentionTrace {
                 q_proj: q_proj_trace.unwrap_or_default(),
