@@ -181,6 +181,14 @@ Warmed native single-stream `4B` hero lane
 |----------------------------|-------------------------|-----------|------------|------------|
 | qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 101.5 tok/s | 22.0 tok/s | 654.6 ms   |
 
+Warmed native `llama3.1-8b` single-sequence lane
+(`./tests/sm86/bench_llama31_8b.sh`, `pp577 / tg128`, commit `9cd7e91` plus
+local benchmark script):
+
+| Model         | Path                    | Prefill   | Decode     |
+|---------------|-------------------------|-----------|------------|
+| llama3.1-8b   | default CUDA BF16 path  | 54.6 tok/s | 6.2 tok/s |
+
 Notes:
 
 - `qwen3.5-4b` batch-1 CUDA decode now defaults to the kernel path. The older
@@ -189,6 +197,10 @@ Notes:
 - The warmed `4B` hero-lane benchmark above also recorded these stage means:
   `full_attn_core=121.1 ms`, `linear_proj=35.1 ms`, `linear_out=78.7 ms`,
   `mlp_gate_up=160.6 ms`, `mlp_down=212.9 ms`.
+- `llama3.1-8b` currently runs through the shared component decode path, not a
+  dedicated persistent kernel. End-to-end throughput is recorded above, but
+  `--emit-stage-timings` still reports zeroed per-stage buckets on that path,
+  so there is no reliable section-by-section timing breakdown yet.
 - ¹ The batched decode figure is aggregate tokens/second across
   `--batch-size 2`.
 
@@ -215,4 +227,8 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
 # CUDA / sm86 warmed 4B single-sequence hero lane
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
   /path/to/Qwen3.5-4B
+
+# CUDA / sm86 warmed Llama 3.1 8B single-sequence lane
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_llama31_8b.sh \
+  /path/to/Meta-Llama-3.1-8B
 ```
