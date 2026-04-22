@@ -505,6 +505,8 @@ pub struct ComponentLayerTrace {
 }
 
 pub struct ComponentMlpTrace {
+    pub gate: Vec<u8>,
+    pub up: Vec<u8>,
     pub swiglu: Vec<u8>,
     pub down: Vec<u8>,
 }
@@ -2716,16 +2718,48 @@ impl DecodeEngine {
         let mut down = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} mlp down alloc: {e}"))?;
 
-        matmul_proj(
-            self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
-            lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
-        matmul_proj(
-            self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut up,
-            lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
+        if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
+            prefill_engine::matmul_int8_mixed_host(
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &self.weights,
+                &format!("{}.layers.{idx}.mlp.gate_proj.weight", self.weights.weight_prefix),
+                &lw.gate_proj_w,
+                sc,
+                &mut gate,
+            )?;
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, intermediate, hidden_dim,
+                &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
+                lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
+        if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
+            prefill_engine::matmul_int8_mixed_host(
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &self.weights,
+                &format!("{}.layers.{idx}.mlp.up_proj.weight", self.weights.weight_prefix),
+                &lw.up_proj_w,
+                sc,
+                &mut up,
+            )?;
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, intermediate, hidden_dim,
+                &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut up,
+                lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
         kernel_ffi::prefill_ffi::swiglu_mul(
             self.ordinal,
             ScalarType::BF16,
@@ -2735,13 +2769,35 @@ impl DecodeEngine {
             &mut mlp,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
-        matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, intermediate,
-            &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut down,
-            lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
+        if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
+            prefill_engine::matmul_int8_mixed_host(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                intermediate,
+                &mlp,
+                &self.weights,
+                &format!("{}.layers.{idx}.mlp.down_proj.weight", self.weights.weight_prefix),
+                &lw.down_proj_w,
+                sc,
+                &mut down,
+            )?;
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, hidden_dim, intermediate,
+                &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut down,
+                lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
         let trace = if trace_output {
             Some(ComponentMlpTrace {
+                gate: gate
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} mlp gate trace D2H: {e}"))?,
+                up: up
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} mlp up trace D2H: {e}"))?,
                 swiglu: mlp
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp swiglu trace D2H: {e}"))?,
@@ -2753,6 +2809,55 @@ impl DecodeEngine {
             None
         };
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &down)?;
+        Ok(trace)
+    }
+
+    pub fn component_trace_mlp_from_post_attn_norm(
+        &mut self,
+        idx: usize,
+        attn_hidden_bytes: &[u8],
+        post_attn_norm_bytes: &[u8],
+    ) -> Result<ComponentMlpTrace> {
+        let hidden_dim = self.weights.config.hidden_size;
+        let intermediate = self.weights.config.intermediate_size;
+        let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let intermediate_bytes = intermediate * ScalarType::BF16.size_in_bytes();
+        anyhow::ensure!(
+            attn_hidden_bytes.len() == hidden_bytes,
+            "layer {idx} attn_hidden_bytes {} != expected {}",
+            attn_hidden_bytes.len(),
+            hidden_bytes,
+        );
+        anyhow::ensure!(
+            post_attn_norm_bytes.len() == hidden_bytes,
+            "layer {idx} post_attn_norm_bytes {} != expected {}",
+            post_attn_norm_bytes.len(),
+            hidden_bytes,
+        );
+        self.hidden_io = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[1, hidden_dim],
+            attn_hidden_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} mlp trace attn_hidden H2D: {e}"))?;
+        self.normed_buf = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[1, hidden_dim],
+            post_attn_norm_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} mlp trace post_norm H2D: {e}"))?;
+        let trace = self
+            .component_decode_mlp_layer(idx, true)?
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} component mlp trace missing"))?;
+        anyhow::ensure!(
+            trace.gate.len() == intermediate_bytes
+                && trace.up.len() == intermediate_bytes
+                && trace.swiglu.len() == intermediate_bytes
+                && trace.down.len() == hidden_bytes,
+            "layer {idx} mlp trace returned unexpected sizes",
+        );
         Ok(trace)
     }
 

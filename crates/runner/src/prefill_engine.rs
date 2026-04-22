@@ -6,7 +6,8 @@
 use std::ffi::c_void;
 
 use anyhow::Result;
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{copy_h2d, GpuBuffer, ScalarType};
+use half::{bf16, f16};
 
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
@@ -14,6 +15,163 @@ use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_toke
 use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
+
+fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(2)
+        .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+        .collect()
+}
+
+fn encode_bf16_le(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 2);
+    for &v in values {
+        out.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+    }
+    out
+}
+
+fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn detect_outlier_cols(lhs_bf16: &[f32], rows: usize, cols: usize, threshold: f32) -> Vec<usize> {
+    let mut flags = vec![false; cols];
+    for r in 0..rows {
+        let row = &lhs_bf16[r * cols..(r + 1) * cols];
+        for c in 0..cols {
+            if f16::from_f32(row[c]).to_f32().abs() >= threshold {
+                flags[c] = true;
+            }
+        }
+    }
+    flags.into_iter()
+        .enumerate()
+        .filter_map(|(idx, hit)| hit.then_some(idx))
+        .collect()
+}
+
+fn host_bf16_addmm_inplace(
+    base: &mut [f32],
+    suba: &[f32],
+    rows: usize,
+    sub_cols: usize,
+    subb_t: &[f32],
+    out_dim: usize,
+) {
+    for r in 0..rows {
+        for o in 0..out_dim {
+            let mut acc = 0.0f32;
+            for kk in 0..sub_cols {
+                acc += suba[r * sub_cols + kk] * subb_t[o * sub_cols + kk];
+            }
+            base[r * out_dim + o] = bf16::from_f32(base[r * out_dim + o] + acc).to_f32();
+        }
+    }
+}
+
+pub(crate) fn matmul_int8_mixed_host(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weights: &Qwen35Weights,
+    weight_name: &str,
+    weight: &GpuBuffer,
+    int8_scale: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<()> {
+    let Some(store) = weights.int8_baked_store.as_ref() else {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    };
+    if weights.int8_outlier_threshold <= 0.0 {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    }
+
+    let rows = batch * m;
+    let lhs_host = decode_bf16_le(
+        &lhs.to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("int8 mixed lhs D2H: {e}"))?,
+    );
+    let outlier_cols = detect_outlier_cols(&lhs_host, rows, k, weights.int8_outlier_threshold);
+    if outlier_cols.is_empty() {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    }
+
+    let mut lhs_zeroed = lhs_host.clone();
+    for r in 0..rows {
+        for &col in &outlier_cols {
+            lhs_zeroed[r * k + col] = 0.0;
+        }
+    }
+    let lhs_zeroed_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        lhs.shape(),
+        &encode_bf16_le(&lhs_zeroed),
+    )
+    .map_err(|e| anyhow::anyhow!("int8 mixed lhs_zeroed H2D: {e}"))?;
+    prefill_ffi::matmul_rhs_transposed_int8(
+        ordinal,
+        batch,
+        m,
+        n,
+        k,
+        &lhs_zeroed_gpu,
+        weight,
+        int8_scale,
+        out,
+    )
+    .map_err(|e| anyhow::anyhow!("matmul_int8_zeroed: {e}"))?;
+
+    let scb_name = weight_name.replace(".weight", ".SCB");
+    let rhs_i8 = store
+        .raw_bytes(weight_name)
+        .ok_or_else(|| anyhow::anyhow!("missing baked raw bytes for {weight_name}"))?;
+    let scb = decode_f32_le(
+        store
+            .raw_bytes(&scb_name)
+            .ok_or_else(|| anyhow::anyhow!("missing baked raw bytes for {scb_name}"))?,
+    );
+    let mut base_host = decode_bf16_le(
+        &out.to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("int8 mixed base D2H: {e}"))?,
+    );
+
+    let sub_cols = outlier_cols.len();
+    let mut suba = vec![0.0f32; rows * sub_cols];
+    for r in 0..rows {
+        for (j, &col) in outlier_cols.iter().enumerate() {
+            suba[r * sub_cols + j] = lhs_host[r * k + col];
+        }
+    }
+    let mut subb_t = vec![0.0f32; n * sub_cols];
+    let inv_127 = 1.0f32 / 127.0;
+    for o in 0..n {
+        let row_scale = scb[o];
+        let row_base = o * k;
+        for (j, &col) in outlier_cols.iter().enumerate() {
+            let q = rhs_i8[row_base + col] as i8 as f32;
+            subb_t[o * sub_cols + j] = bf16::from_f32(q * row_scale * inv_127).to_f32();
+        }
+    }
+    host_bf16_addmm_inplace(&mut base_host, &suba, rows, sub_cols, &subb_t, n);
+    let final_bytes = encode_bf16_le(&base_host);
+    copy_h2d(
+        ordinal,
+        out.as_mut_ptr(),
+        final_bytes.as_ptr() as *const std::ffi::c_void,
+        final_bytes.len(),
+    )
+    .map_err(|e| anyhow::anyhow!("int8 mixed final H2D: {e}"))?;
+    Ok(())
+}
 
 /// Dispatch matmul to either BF16 or FP8 dequant path.
 /// When `scale` is Some, uses FP8 dequant matmul; otherwise standard BF16 matmul.
@@ -1910,18 +2068,50 @@ fn prefill_mlp_layer(
     let intermediate = config.intermediate_size;
 
     // gate_proj: normed [seq, hidden] × gate_w [intermediate, hidden]^T → [seq, intermediate]
-    matmul_proj(
-        ordinal, 1, seq_len, intermediate, hidden_dim,
-        &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
-        lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
-    )?;
+    if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
+        matmul_int8_mixed_host(
+            ordinal,
+            1,
+            seq_len,
+            intermediate,
+            hidden_dim,
+            &scratch.normed,
+            weights,
+            &format!("{}.layers.{idx}.mlp.gate_proj.weight", weights.weight_prefix),
+            &lw.gate_proj_w,
+            sc,
+            &mut scratch.proj_buf,
+        )?;
+    } else {
+        matmul_proj(
+            ordinal, 1, seq_len, intermediate, hidden_dim,
+            &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+            lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
+        )?;
+    }
 
     // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
-    matmul_proj(
-        ordinal, 1, seq_len, intermediate, hidden_dim,
-        &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-        lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
-    )?;
+    if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
+        matmul_int8_mixed_host(
+            ordinal,
+            1,
+            seq_len,
+            intermediate,
+            hidden_dim,
+            &scratch.normed,
+            weights,
+            &format!("{}.layers.{idx}.mlp.up_proj.weight", weights.weight_prefix),
+            &lw.up_proj_w,
+            sc,
+            &mut scratch.proj_buf2,
+        )?;
+    } else {
+        matmul_proj(
+            ordinal, 1, seq_len, intermediate, hidden_dim,
+            &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
+            lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
+        )?;
+    }
 
     // SwiGLU: out = silu(gate) * up
     prefill_ffi::swiglu_mul(
@@ -1934,11 +2124,27 @@ fn prefill_mlp_layer(
     )?;
 
     // down_proj: mlp_buf [seq, intermediate] × down_w [hidden, intermediate]^T → [seq, hidden]
-    matmul_proj(
-        ordinal, 1, seq_len, hidden_dim, intermediate,
-        &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
-        lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
-    )?;
+    if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
+        matmul_int8_mixed_host(
+            ordinal,
+            1,
+            seq_len,
+            hidden_dim,
+            intermediate,
+            &scratch.mlp_buf,
+            weights,
+            &format!("{}.layers.{idx}.mlp.down_proj.weight", weights.weight_prefix),
+            &lw.down_proj_w,
+            sc,
+            &mut scratch.proj_buf,
+        )?;
+    } else {
+        matmul_proj(
+            ordinal, 1, seq_len, hidden_dim, intermediate,
+            &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
+            lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
+        )?;
+    }
 
     // Residual: hidden += down_proj output
     residual_add(ordinal, seq_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf)

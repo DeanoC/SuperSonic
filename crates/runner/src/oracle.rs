@@ -60,6 +60,8 @@ pub struct OracleOutput {
     #[serde(default)]
     pub traced_full_attn_layer: Option<usize>,
     #[serde(default)]
+    pub traced_full_attn_input: Option<String>,
+    #[serde(default)]
     pub traced_full_attn_normed: Option<String>,
     #[serde(default)]
     pub traced_full_attn_q_proj: Option<String>,
@@ -79,6 +81,38 @@ pub struct OracleOutput {
     pub traced_full_attn_gated: Option<String>,
     #[serde(default)]
     pub traced_full_attn_gated_actual: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_gate: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_up: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_swiglu: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down_ca: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down_ca_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    pub traced_mlp_down_sca: Option<Vec<f32>>,
+    #[serde(default)]
+    pub traced_mlp_down_outlier_cols: Option<Vec<u32>>,
+    #[serde(default)]
+    pub traced_mlp_down_outlier_threshold: Option<f32>,
+    #[serde(default)]
+    pub traced_mlp_down_ca_dense: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down_ca_dense_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    pub traced_mlp_down_sca_dense: Option<Vec<f32>>,
+    #[serde(default)]
+    pub traced_mlp_down_suba: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down_suba_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    pub traced_mlp_down_subb_t: Option<String>,
+    #[serde(default)]
+    pub traced_mlp_down_subb_t_shape: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Deserialize)]

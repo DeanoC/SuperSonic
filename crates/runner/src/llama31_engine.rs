@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
 use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 use qwen35::config::{Activation, RopeParameters, TextConfig};
@@ -244,6 +245,7 @@ fn load_weights(
 
     Ok(Qwen35Weights {
         config: text_config.clone(),
+        weight_prefix: weight_prefix.to_string(),
         embed_tokens,
         lm_head,
         lm_head_scale: None,
@@ -254,6 +256,8 @@ fn load_weights(
         is_int4: false,
         int4_group_size: 0,
         is_int8: false,
+        int8_baked_store: None,
+        int8_outlier_threshold: 0.0,
     })
 }
 
@@ -283,7 +287,7 @@ fn load_baked_scb(store: &BakedStore, weight_name: &str, ordinal: usize) -> Resu
 
 fn load_baked_int8_weights(
     model_dir: &Path,
-    store: &BakedStore,
+    store: Arc<BakedStore>,
     text_config: &TextConfig,
     ordinal: usize,
     weight_prefix: &str,
@@ -292,7 +296,7 @@ fn load_baked_int8_weights(
         WeightLoader::from_dir(model_dir).map_err(|e| anyhow!("open safetensors: {e}"))?;
     let load_name = |name: &str| -> Result<GpuBuffer> {
         if store.contains(name) {
-            load_baked_weight_raw(store, name, ordinal)
+            load_baked_weight_raw(&store, name, ordinal)
         } else {
             raw_loader
                 .load_to_gpu(name, ordinal)
@@ -304,7 +308,7 @@ fn load_baked_int8_weights(
     let embed_tokens = Arc::new(load_name(&embed_name)?);
 
     let lm_head = if store.contains("lm_head.weight") {
-        Arc::new(load_baked_weight_raw(store, "lm_head.weight", ordinal)?)
+        Arc::new(load_baked_weight_raw(&store, "lm_head.weight", ordinal)?)
     } else {
         Arc::new(
             raw_loader
@@ -331,9 +335,9 @@ fn load_baked_int8_weights(
             gate_proj_scale: None,
             up_proj_scale: None,
             down_proj_scale: None,
-            gate_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.gate_proj.weight"), ordinal)?,
-            up_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.up_proj.weight"), ordinal)?,
-            down_proj_int8_scale: load_baked_scb(store, &format!("{mlp}.down_proj.weight"), ordinal)?,
+            gate_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.gate_proj.weight"), ordinal)?,
+            up_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.up_proj.weight"), ordinal)?,
+            down_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.down_proj.weight"), ordinal)?,
             gate_proj_int4_scale: None,
             gate_proj_int4_zero: None,
             up_proj_int4_scale: None,
@@ -352,10 +356,10 @@ fn load_baked_int8_weights(
                 k_proj_scale: None,
                 v_proj_scale: None,
                 o_proj_scale: None,
-                q_proj_int8_scale: load_baked_scb(store, &format!("{fa}.q_proj.weight"), ordinal)?,
-                k_proj_int8_scale: load_baked_scb(store, &format!("{fa}.k_proj.weight"), ordinal)?,
-                v_proj_int8_scale: load_baked_scb(store, &format!("{fa}.v_proj.weight"), ordinal)?,
-                o_proj_int8_scale: load_baked_scb(store, &format!("{fa}.o_proj.weight"), ordinal)?,
+                q_proj_int8_scale: load_baked_scb(&store, &format!("{fa}.q_proj.weight"), ordinal)?,
+                k_proj_int8_scale: load_baked_scb(&store, &format!("{fa}.k_proj.weight"), ordinal)?,
+                v_proj_int8_scale: load_baked_scb(&store, &format!("{fa}.v_proj.weight"), ordinal)?,
+                o_proj_int8_scale: load_baked_scb(&store, &format!("{fa}.o_proj.weight"), ordinal)?,
                 q_proj_int4_scale: None,
                 q_proj_int4_zero: None,
                 k_proj_int4_scale: None,
@@ -370,6 +374,7 @@ fn load_baked_int8_weights(
 
     Ok(Qwen35Weights {
         config: text_config.clone(),
+        weight_prefix: weight_prefix.to_string(),
         embed_tokens,
         lm_head,
         lm_head_scale: None,
@@ -380,6 +385,8 @@ fn load_baked_int8_weights(
         is_int4: false,
         int4_group_size: 0,
         is_int8: true,
+        int8_baked_store: Some(store),
+        int8_outlier_threshold: 6.0,
     })
 }
 
@@ -495,15 +502,15 @@ pub fn run_llama31(
         );
     }
 
+    let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow!("could not derive oracle script path from CARGO_MANIFEST_DIR"))?
+        .join("oracle/run_oracle.py");
+    let oracle_device = crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
+    let model_id = cli.model_dir.to_string_lossy().into_owned();
     let oracle_output = if cli.validate {
-        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .ok_or_else(|| anyhow!("could not derive oracle script path from CARGO_MANIFEST_DIR"))?
-            .join("oracle/run_oracle.py");
-        let oracle_device =
-            crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
-        let model_id = cli.model_dir.to_string_lossy().into_owned();
+        let emit_state = cli.trace_prefill_layers || cli.trace_oracle_prefill_layer.is_some();
         let oracle = oracle_mod::run_oracle(
             &oracle_script,
             &model_id,
@@ -511,10 +518,10 @@ pub fn run_llama31(
             cli.max_new_tokens,
             &cli.oracle_dtype,
             &oracle_device,
-            false,
+            emit_state,
             cli.int8,
             None,
-            None,
+            cli.trace_oracle_prefill_layer,
         )?;
         if let Some(ref oracle_ids) = oracle.prompt_token_ids {
             if oracle_ids != &prompt_ids {
@@ -562,11 +569,13 @@ pub fn run_llama31(
             }
         }
         eprintln!("[weights] loading baked INT8 package {}", bake_dir.display());
-        let store = BakedStore::open(&bake_dir)
-            .map_err(|e| anyhow!("open INT8 bake {}: {e}", bake_dir.display()))?;
+        let store = Arc::new(
+            BakedStore::open(&bake_dir)
+                .map_err(|e| anyhow!("open INT8 bake {}: {e}", bake_dir.display()))?
+        );
         load_baked_int8_weights(
             &cli.model_dir,
-            &store,
+            store,
             &text_config,
             ordinal,
             params.weight_prefix,
@@ -602,7 +611,11 @@ pub fn run_llama31(
     )?;
 
     let prefill_start = Instant::now();
-    let prefill = engine.prefill_native_with_final_norm(&prompt_ids)?;
+    let prefill = if cli.trace_prefill_layers {
+        engine.prefill_native_with_trace(&prompt_ids)?
+    } else {
+        engine.prefill_native_with_final_norm(&prompt_ids)?
+    };
     let eos_ids = text_config.eos_token_ids();
     let mut generated: Vec<u32> = Vec::with_capacity(cli.max_new_tokens);
     let mut next_token = DecodeEngine::greedy_sample(&prefill.logits);
@@ -629,6 +642,37 @@ pub fn run_llama31(
         eprintln!(
             "[validate] prefill delta={delta:.4} rust_next={next_token}{mismatch}"
         );
+
+        if let (Some(native_final_norm_trace), Some(oracle_final_norm_b64)) = (
+            prefill.final_norm_trace.as_deref(),
+            oracle.prefill_hidden.as_ref(),
+        ) {
+            let b64 = base64::engine::general_purpose::STANDARD;
+            let oracle_final_norm_bytes = b64
+                .decode(oracle_final_norm_b64)
+                .map_err(|e| anyhow!("decode oracle prefill_hidden: {e}"))?;
+            let final_norm_delta = validate::max_abs_delta(
+                &decode_bf16_le(native_final_norm_trace),
+                &decode_bf16_le(&oracle_final_norm_bytes),
+            );
+            eprintln!("[trace-prefill] final_norm_delta={final_norm_delta:.4}");
+        }
+
+        if cli.trace_prefill_layers {
+            trace_llama31_prefill_layers(&mut engine, &prefill, oracle)?;
+        }
+        if let Some(trace_layer) = cli.trace_oracle_prefill_layer {
+            trace_llama31_oracle_prefill_layer(
+                &mut engine,
+                trace_layer,
+                &prompt_ids,
+                &oracle_script,
+                &model_id,
+                &cli.oracle_dtype,
+                &oracle_device,
+                oracle,
+            )?;
+        }
     }
 
     if cli.max_new_tokens > 0 {
@@ -700,6 +744,333 @@ pub fn run_llama31(
     }
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
+    }
+
+    Ok(())
+}
+
+fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(2)
+        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .collect()
+}
+
+fn trace_llama31_prefill_layers(
+    engine: &mut DecodeEngine,
+    prefill: &crate::prefill_engine::PrefillResult,
+    oracle: &oracle_mod::OracleOutput,
+) -> Result<()> {
+    if let (
+        Some(native_attn_trace),
+        Some(native_post_norm_trace),
+        Some(native_mlp_out_trace),
+        Some(native_layer_trace),
+        Some(oracle_attn_trace),
+        Some(oracle_post_norm_trace),
+        Some(oracle_mlp_out_trace),
+        Some(oracle_layer_trace),
+    ) = (
+        prefill.layer_attn_trace.as_ref(),
+        prefill.layer_post_attn_norm_trace.as_ref(),
+        prefill.layer_mlp_out_trace.as_ref(),
+        prefill.layer_hidden_trace.as_ref(),
+        oracle.layer_attn_residual_states.as_ref(),
+        oracle.layer_post_attn_norm_states.as_ref(),
+        oracle.layer_mlp_outputs.as_ref(),
+        oracle.layer_hidden_states.as_ref(),
+    ) {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let oracle_kv = oracle.kv_caches.as_ref();
+        let mut first_bad = None;
+        for layer in 0..native_layer_trace.len().min(oracle_layer_trace.len()) {
+            let oracle_attn_bytes = b64
+                .decode(&oracle_attn_trace[layer])
+                .map_err(|e| anyhow!("decode oracle layer_attn_residual_states[{layer}]: {e}"))?;
+            let oracle_post_norm_bytes = b64
+                .decode(&oracle_post_norm_trace[layer])
+                .map_err(|e| anyhow!("decode oracle layer_post_attn_norm_states[{layer}]: {e}"))?;
+            let oracle_mlp_out_bytes = b64
+                .decode(&oracle_mlp_out_trace[layer])
+                .map_err(|e| anyhow!("decode oracle layer_mlp_outputs[{layer}]: {e}"))?;
+            let oracle_layer_bytes = b64
+                .decode(&oracle_layer_trace[layer])
+                .map_err(|e| anyhow!("decode oracle layer_hidden_states[{layer}]: {e}"))?;
+            let attn_delta = validate::max_abs_delta(
+                &decode_bf16_le(&native_attn_trace[layer]),
+                &decode_bf16_le(&oracle_attn_bytes),
+            );
+            let post_norm_delta = validate::max_abs_delta(
+                &decode_bf16_le(&native_post_norm_trace[layer]),
+                &decode_bf16_le(&oracle_post_norm_bytes),
+            );
+            let mlp_out_delta = validate::max_abs_delta(
+                &decode_bf16_le(&native_mlp_out_trace[layer]),
+                &decode_bf16_le(&oracle_mlp_out_bytes),
+            );
+            let layer_delta = validate::max_abs_delta(
+                &decode_bf16_le(&native_layer_trace[layer]),
+                &decode_bf16_le(&oracle_layer_bytes),
+            );
+            let state_delta = match (
+                engine.full_attention_prefix_cache_bf16_host(layer, 0),
+                oracle_kv.and_then(|caches| caches.iter().find(|kv| kv.layer == layer)),
+            ) {
+                (Ok((native_k, native_v, _)), Some(oracle_kv)) => {
+                    let oracle_k = b64
+                        .decode(&oracle_kv.k)
+                        .map_err(|e| anyhow!("decode oracle kv k[{layer}]: {e}"))?;
+                    let oracle_v = b64
+                        .decode(&oracle_kv.v)
+                        .map_err(|e| anyhow!("decode oracle kv v[{layer}]: {e}"))?;
+                    format!(
+                        " kv_k_delta={:.4} kv_v_delta={:.4}",
+                        validate::max_abs_delta(&decode_bf16_le(&native_k), &decode_bf16_le(&oracle_k)),
+                        validate::max_abs_delta(&decode_bf16_le(&native_v), &decode_bf16_le(&oracle_v)),
+                    )
+                }
+                _ => String::new(),
+            };
+            if first_bad.is_none() && layer_delta > 0.5 {
+                first_bad = Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta));
+            }
+            eprintln!(
+                "[trace-prefill] layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}{state_delta}"
+            );
+        }
+        if let Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta)) = first_bad {
+            eprintln!(
+                "[trace-prefill] first_bad_layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
+            );
+        } else {
+            eprintln!("[trace-prefill] no layer exceeded delta threshold");
+        }
+    } else {
+        eprintln!("[trace-prefill] missing native or oracle layer trace data");
+    }
+    Ok(())
+}
+
+fn trace_llama31_oracle_prefill_layer(
+    engine: &mut DecodeEngine,
+    trace_layer: usize,
+    prompt_ids: &[u32],
+    oracle_script: &Path,
+    model_id: &str,
+    oracle_dtype: &str,
+    oracle_device: &str,
+    oracle_full: &oracle_mod::OracleOutput,
+) -> Result<()> {
+    let row_bytes = engine.weights().config.hidden_size * 2;
+    let prefix_ids = &prompt_ids[..prompt_ids.len() - 1];
+    let prefix_oracle = if prefix_ids.is_empty() {
+        None
+    } else {
+        Some(oracle_mod::run_oracle(
+            oracle_script,
+            model_id,
+            prefix_ids,
+            1,
+            oracle_dtype,
+            oracle_device,
+            true,
+            engine.weights().is_int8,
+            None,
+            Some(trace_layer),
+        )?)
+    };
+
+    engine.reset()?;
+    if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.load_prefill_state(prefix_oracle)?;
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let last_row = |bytes: Vec<u8>, label: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            bytes.len() % row_bytes == 0,
+            "{label} bytes {} not divisible by row_bytes {}",
+            bytes.len(),
+            row_bytes,
+        );
+        if bytes.len() == row_bytes {
+            return Ok(bytes);
+        }
+        let start = bytes.len() - row_bytes;
+        Ok(bytes[start..].to_vec())
+    };
+    let oracle_inputs = oracle_full
+        .layer_hidden_states
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle output missing layer_hidden_states"))?;
+    let oracle_attn = oracle_full
+        .layer_attn_residual_states
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle output missing layer_attn_residual_states"))?;
+    let oracle_post = oracle_full
+        .layer_post_attn_norm_states
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle output missing layer_post_attn_norm_states"))?;
+    let oracle_mlp = oracle_full
+        .layer_mlp_outputs
+        .as_ref()
+        .ok_or_else(|| anyhow!("oracle output missing layer_mlp_outputs"))?;
+
+    let oracle_input_bytes = if trace_layer == 0 {
+        last_row(
+            b64.decode(
+                oracle_full
+                    .traced_full_attn_input
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("oracle output missing traced_full_attn_input"))?,
+            )
+            .map_err(|e| anyhow!("decode oracle input hidden for layer 0: {e}"))?,
+            "oracle input hidden",
+        )?
+    } else {
+        last_row(
+            b64.decode(
+                oracle_inputs
+                    .get(trace_layer - 1)
+                    .ok_or_else(|| anyhow!("oracle layer_hidden_states missing layer {}", trace_layer - 1))?,
+            )
+            .map_err(|e| anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?,
+            "oracle input hidden",
+        )?
+    };
+    let oracle_attn_bytes = last_row(
+        b64.decode(
+            oracle_attn
+                .get(trace_layer)
+                .ok_or_else(|| anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?,
+        "oracle attn",
+    )?;
+    let oracle_post_bytes = last_row(
+        b64.decode(
+            oracle_post
+                .get(trace_layer)
+                .ok_or_else(|| anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?,
+        "oracle post-norm",
+    )?;
+    let oracle_mlp_bytes = last_row(
+        b64.decode(
+            oracle_mlp
+                .get(trace_layer)
+                .ok_or_else(|| anyhow!("oracle layer_mlp_outputs missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?,
+        "oracle mlp",
+    )?;
+    let oracle_hidden_bytes = last_row(
+        b64.decode(
+            oracle_inputs
+                .get(trace_layer)
+                .ok_or_else(|| anyhow!("oracle layer_hidden_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?,
+        "oracle hidden",
+    )?;
+
+    engine.set_hidden_from_bytes(&oracle_input_bytes)?;
+    let trace = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
+        trace_layer,
+        prefix_ids.len(),
+    )?;
+    let attn_delta = validate::max_abs_delta(
+        &decode_bf16_le(&trace.attn_hidden),
+        &decode_bf16_le(&oracle_attn_bytes),
+    );
+    let post_delta = validate::max_abs_delta(
+        &decode_bf16_le(&trace.post_attn_norm),
+        &decode_bf16_le(&oracle_post_bytes),
+    );
+    let mlp_delta = validate::max_abs_delta(
+        &decode_bf16_le(&trace.mlp_out),
+        &decode_bf16_le(&oracle_mlp_bytes),
+    );
+    let hidden_delta = validate::max_abs_delta(
+        &decode_bf16_le(&trace.layer_hidden),
+        &decode_bf16_le(&oracle_hidden_bytes),
+    );
+    eprintln!(
+        "[trace-oracle-prefill-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
+    );
+
+    if oracle_full.traced_mlp_down.is_some() {
+        let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
+            let bytes = b64
+                .decode(field.as_ref().ok_or_else(|| anyhow!("oracle output missing {label}"))?)
+                .map_err(|e| anyhow!("decode oracle {label}: {e}"))?;
+            Ok(decode_bf16_le(&bytes))
+        };
+        let oracle_mlp_gate = decode_opt_bf16(&oracle_full.traced_mlp_gate, "traced_mlp_gate")?;
+        let oracle_mlp_up = decode_opt_bf16(&oracle_full.traced_mlp_up, "traced_mlp_up")?;
+        let oracle_mlp_swiglu =
+            decode_opt_bf16(&oracle_full.traced_mlp_swiglu, "traced_mlp_swiglu")?;
+        let oracle_mlp_down = decode_opt_bf16(&oracle_full.traced_mlp_down, "traced_mlp_down")?;
+        let mlp_trace = engine.component_trace_mlp_from_post_attn_norm(
+            trace_layer,
+            &oracle_attn_bytes,
+            &oracle_post_bytes,
+        )?;
+        let gate_delta =
+            validate::max_abs_delta(&decode_bf16_le(&mlp_trace.gate), &oracle_mlp_gate);
+        let up_delta = validate::max_abs_delta(&decode_bf16_le(&mlp_trace.up), &oracle_mlp_up);
+        let swiglu_delta =
+            validate::max_abs_delta(&decode_bf16_le(&mlp_trace.swiglu), &oracle_mlp_swiglu);
+        let down_delta =
+            validate::max_abs_delta(&decode_bf16_le(&mlp_trace.down), &oracle_mlp_down);
+        eprintln!(
+            "[trace-oracle-mlp] layer={trace_layer} gate_delta={gate_delta:.6} up_delta={up_delta:.6} swiglu_delta={swiglu_delta:.6} down_delta={down_delta:.6}"
+        );
+    }
+
+    if engine.weights().config.is_full_attention(trace_layer)
+        && oracle_full.traced_full_attn_layer == Some(trace_layer)
+    {
+        let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
+            let bytes = b64
+                .decode(field.as_ref().ok_or_else(|| anyhow!("oracle output missing {label}"))?)
+                .map_err(|e| anyhow!("decode oracle {label}: {e}"))?;
+            Ok(decode_bf16_le(&bytes))
+        };
+        let oracle_normed = decode_opt_bf16(&oracle_full.traced_full_attn_normed, "traced_full_attn_normed")?;
+        let oracle_q_proj = decode_opt_bf16(&oracle_full.traced_full_attn_q_proj, "traced_full_attn_q_proj")?;
+        let oracle_gate = decode_opt_bf16(&oracle_full.traced_full_attn_gate_proj, "traced_full_attn_gate_proj")?;
+        let oracle_k_proj = decode_opt_bf16(&oracle_full.traced_full_attn_k_proj, "traced_full_attn_k_proj")?;
+        let oracle_v_proj = decode_opt_bf16(&oracle_full.traced_full_attn_v_proj, "traced_full_attn_v_proj")?;
+        let oracle_q_rope = decode_opt_bf16(&oracle_full.traced_full_attn_q_rope, "traced_full_attn_q_rope")?;
+        let oracle_k_rope = decode_opt_bf16(&oracle_full.traced_full_attn_k_rope, "traced_full_attn_k_rope")?;
+        let oracle_pre_gate = decode_opt_bf16(&oracle_full.traced_full_attn_pre_gate, "traced_full_attn_pre_gate")?;
+        let oracle_gated = decode_opt_bf16(&oracle_full.traced_full_attn_gated, "traced_full_attn_gated")?;
+
+        let stage = engine.trace_full_attention_stages_from_hidden(
+            trace_layer,
+            &oracle_input_bytes,
+            prefix_ids.len(),
+        )?;
+        let stage_out = engine.trace_full_attention_layer_output_from_hidden_current_state(
+            trace_layer,
+            0,
+            &oracle_input_bytes,
+            prefix_ids.len(),
+        )?;
+        let normed_delta = validate::max_abs_delta(&decode_bf16_le(&stage.normed), &oracle_normed);
+        let q_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_proj), &oracle_q_proj);
+        let gate_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.gate_proj), &oracle_gate);
+        let k_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_proj), &oracle_k_proj);
+        let v_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.v_proj), &oracle_v_proj);
+        let q_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_rope), &oracle_q_rope);
+        let k_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_rope), &oracle_k_rope);
+        let pre_gate_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.pre_gate), &oracle_pre_gate);
+        let gated_delta = validate::max_abs_delta(&decode_bf16_le(&stage_out.gated), &oracle_gated);
+        eprintln!(
+            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_delta:.6} gated_delta={gated_delta:.6}"
+        );
     }
 
     Ok(())

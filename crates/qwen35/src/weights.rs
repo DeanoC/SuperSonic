@@ -34,6 +34,7 @@ fn ensure_f32_on_gpu(
 /// All immutable model weights on GPU.
 pub struct Qwen35Weights {
     pub config: TextConfig,
+    pub weight_prefix: String,
     pub embed_tokens: Arc<GpuBuffer>,
     pub lm_head: Arc<GpuBuffer>,
     pub lm_head_scale: Option<GpuBuffer>,
@@ -49,6 +50,10 @@ pub struct Qwen35Weights {
     pub int4_group_size: usize,
     /// True if weights use BitsAndBytes-style INT8 runtime matmul.
     pub is_int8: bool,
+    /// Optional baked INT8 store kept alive for host-side mixed-path access.
+    pub int8_baked_store: Option<Arc<model_store::BakedStore>>,
+    /// Outlier threshold used by the mixed INT8 path.
+    pub int8_outlier_threshold: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -269,6 +274,7 @@ impl Qwen35Weights {
 
         Ok(Self {
             config: config.clone(),
+            weight_prefix: prefix.to_string(),
             embed_tokens,
             lm_head,
             lm_head_scale: None,
@@ -279,6 +285,8 @@ impl Qwen35Weights {
             is_int4: false,
             int4_group_size: 0,
             is_int8: false,
+            int8_baked_store: None,
+            int8_outlier_threshold: 0.0,
         })
     }
 
@@ -484,6 +492,7 @@ impl Qwen35Weights {
 
         Ok(Self {
             config: config.clone(),
+            weight_prefix: prefix.to_string(),
             embed_tokens,
             lm_head,
             lm_head_scale,
@@ -494,6 +503,8 @@ impl Qwen35Weights {
             is_int4,
             int4_group_size,
             is_int8: false,
+            int8_baked_store: None,
+            int8_outlier_threshold: 0.0,
         })
     }
 }
