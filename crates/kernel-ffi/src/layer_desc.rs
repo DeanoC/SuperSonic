@@ -63,6 +63,11 @@ pub struct DecodeLayerDesc {
     pub kv_shadow_k: *mut c_void,
     pub kv_shadow_v: *mut c_void,
     pub kv_shadow_start: c_int,
+    // Optional linear Step-B debug export. When non-null on a linear layer,
+    // the kernel writes one selected channel's post-update conv-state taps,
+    // followed by qkv and conv_out scalars, into this F32 buffer.
+    pub debug_linear_trace_out: *mut c_void,
+    pub debug_linear_trace_channel: c_int,
 }
 
 unsafe impl Send for DecodeLayerDesc {}

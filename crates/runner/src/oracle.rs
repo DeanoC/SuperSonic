@@ -57,6 +57,28 @@ pub struct OracleOutput {
     /// validator skip implementing `project_per_layer_inputs` itself.
     #[serde(default)]
     pub per_layer_inputs_by_step: Option<Vec<String>>,
+    #[serde(default)]
+    pub traced_full_attn_layer: Option<usize>,
+    #[serde(default)]
+    pub traced_full_attn_normed: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_q_proj: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_gate_proj: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_k_proj: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_v_proj: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_q_rope: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_k_rope: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_pre_gate: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_gated: Option<String>,
+    #[serde(default)]
+    pub traced_full_attn_gated_actual: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +107,7 @@ pub fn run_oracle(
     device: &str,
     emit_state: bool,
     fp8_model_dir: Option<&Path>,
+    trace_full_attn_layer: Option<usize>,
 ) -> Result<OracleOutput> {
     let ids_str = prompt_ids
         .iter()
@@ -105,9 +128,15 @@ pub fn run_oracle(
     if let Some(dir) = fp8_model_dir {
         cmd.arg("--fp8-model-dir").arg(dir);
     }
+    if let Some(layer) = trace_full_attn_layer {
+        cmd.arg("--trace-full-attn-layer").arg(layer.to_string());
+    }
 
     let fp8_flag = fp8_model_dir.map(|d| format!(" --fp8-model-dir {}", d.display())).unwrap_or_default();
-    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{fp8_flag}",
+    let trace_flag = trace_full_attn_layer
+        .map(|layer| format!(" --trace-full-attn-layer {layer}"))
+        .unwrap_or_default();
+    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{fp8_flag}{trace_flag}",
         oracle_script.display(),
         if emit_state { " --emit-state" } else { "" }
     );

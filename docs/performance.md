@@ -163,23 +163,34 @@ Implications for future work:
 
 ## CUDA — `sm86` (NVIDIA RTX 3090-class)
 
-24 GB VRAM, 936 GB/s memory bandwidth. Current behavior depends on whether
-the path is using replayed prefill for correctness.
+24 GB VRAM, 936 GB/s memory bandwidth. Measurements below were refreshed on
+2026-04-22 at commit `5a34190`.
 
 Quick checked paths (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 
 | Model                       | Path                         | Prefill   | Decode     |
 |----------------------------|------------------------------|-----------|------------|
-| qwen3.5-0.8b              | default (hero)               | 563 tok/s | 29.9 tok/s |
-| qwen3.5-4b `--batch-size 2` | default (batched)            | 124 tok/s | 21.6 tok/s |
-| qwen3.5-4b `--batch-size 1` | replay-prefill correctness   | 124 tok/s | 1.1 tok/s  |
+| qwen3.5-0.8b              | default (hero)               | 544 tok/s | 106.7 tok/s |
+| qwen3.5-4b `--batch-size 1` | default (single kernel)      | 124.7 tok/s | 26.0 tok/s |
+| qwen3.5-4b `--batch-size 2` | default (batched kernel)     | 122.9 tok/s | 15.4 tok/s¹ |
 
 Warmed native single-stream `4B` hero lane
-(`./tests/sm86/bench_qwen4b_single.sh`, `pp533 / tg128`, commit `e5f244d`):
+(`./tests/sm86/bench_qwen4b_single.sh`, `pp533 / tg16`, commit `5a34190`):
 
 | Model                       | Path                    | Prefill   | Decode     | Persistent |
 |----------------------------|-------------------------|-----------|------------|------------|
-| qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 118.5 tok/s | 15.2 tok/s | 7714 ms    |
+| qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 101.5 tok/s | 22.0 tok/s | 654.6 ms   |
+
+Notes:
+
+- `qwen3.5-4b` batch-1 CUDA decode now defaults to the kernel path. The older
+  replayed-prefill decode path is legacy debugging behavior and must be
+  requested explicitly with `--force-replay-decode`.
+- The warmed `4B` hero-lane benchmark above also recorded these stage means:
+  `full_attn_core=121.1 ms`, `linear_proj=35.1 ms`, `linear_out=78.7 ms`,
+  `mlp_gate_up=160.6 ms`, `mlp_down=212.9 ms`.
+- ¹ The batched decode figure is aggregate tokens/second across
+  `--batch-size 2`.
 
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
@@ -200,4 +211,8 @@ cargo build --release --bin supersonic
 # CUDA / sm86
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
   /path/to/Qwen3.5-0.8B /path/to/Qwen3.5-4B
+
+# CUDA / sm86 warmed 4B single-sequence hero lane
+SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
+  /path/to/Qwen3.5-4B
 ```

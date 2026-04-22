@@ -1,4 +1,6 @@
+use std::env;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -11,7 +13,7 @@ use qwen35::rotary::RotaryTables;
 use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
 };
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use crate::oracle::OracleOutput;
@@ -99,6 +101,116 @@ fn f32_to_bf16_bytes_host(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
         .into_iter()
         .flat_map(|v| half::bf16::from_f32(v).to_le_bytes())
         .collect()
+}
+
+fn is_qwen35_4b_shape(config: &TextConfig) -> bool {
+    config.hidden_size == 2560
+        && config.intermediate_size == 9216
+        && config.num_hidden_layers == 32
+        && config.num_attention_heads == 16
+        && config.num_key_value_heads == 4
+}
+
+fn qwen35_4b_cuda_hero_enabled() -> bool {
+    match env::var("SUPERSONIC_DISABLE_QWEN35_4B_CUDA_HERO") {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty() || value == "0"
+        }
+        Err(_) => true,
+    }
+}
+
+// Keep the early split for the CUDA Qwen3.5-4B path. It remains part of the
+// validated long-context lane even after removing the default component
+// fallback.
+const QWEN35_4B_CUDA_SPLIT_LAYER: usize = 5;
+const QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS: usize = 512;
+
+fn qwen35_4b_cuda_long_context_component_fallback_enabled() -> bool {
+    match env::var("SUPERSONIC_ENABLE_QWEN35_4B_CUDA_LONG_FALLBACK") {
+        Ok(value) => {
+            let value = value.trim();
+            value.is_empty() || value == "1"
+        }
+        Err(_) => false,
+    }
+}
+
+fn qwen35_4b_cuda_dump_layer_timings_topn() -> Option<usize> {
+    match env::var("SUPERSONIC_QWEN35_4B_CUDA_DUMP_LAYER_TIMINGS") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Some(8)
+            } else {
+                value.parse::<usize>().ok().filter(|&topn| topn > 0)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+fn qwen35_4b_cuda_split_windows(total_layers: usize) -> Vec<(usize, usize)> {
+    fn default_windows(total_layers: usize) -> Vec<(usize, usize)> {
+        if total_layers <= QWEN35_4B_CUDA_SPLIT_LAYER {
+            return vec![(0, total_layers)];
+        }
+        vec![
+            (0, QWEN35_4B_CUDA_SPLIT_LAYER),
+            (
+                QWEN35_4B_CUDA_SPLIT_LAYER,
+                total_layers - QWEN35_4B_CUDA_SPLIT_LAYER,
+            ),
+        ]
+    }
+
+    let raw = match env::var("SUPERSONIC_QWEN35_4B_CUDA_SPLIT_POINTS") {
+        Ok(value) => value,
+        Err(_) => return default_windows(total_layers),
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return default_windows(total_layers);
+    }
+
+    let mut split_points = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Ok(point) = part.parse::<usize>() else {
+            return default_windows(total_layers);
+        };
+        if point == 0 || point >= total_layers {
+            return default_windows(total_layers);
+        }
+        split_points.push(point);
+    }
+    if split_points.is_empty() {
+        return default_windows(total_layers);
+    }
+
+    split_points.sort_unstable();
+    split_points.dedup();
+
+    let mut windows = Vec::with_capacity(split_points.len() + 1);
+    let mut start = 0usize;
+    for point in split_points {
+        if point > start {
+            windows.push((start, point - start));
+            start = point;
+        }
+    }
+    if start < total_layers {
+        windows.push((start, total_layers - start));
+    }
+    if windows.is_empty() {
+        default_windows(total_layers)
+    } else {
+        windows
+    }
 }
 
 pub struct DecodeEngine {
@@ -351,9 +463,108 @@ pub struct FullAttentionLayerOutputTrace {
     pub attn_hidden: Vec<u8>,
 }
 
+#[derive(Clone, Debug, Default)]
+struct Persistent4BLayerTiming {
+    full_attn_ms: f64,
+    full_attn_core_ms: f64,
+    full_attn_hero_prep_ms: f64,
+    full_attn_hero_loop_ms: f64,
+    full_attn_hero_merge_ms: f64,
+    full_attn_hero_gate_ms: f64,
+    linear_proj_ms: f64,
+    linear_core_ms: f64,
+    linear_core_recurrent_ms: f64,
+    linear_out_ms: f64,
+    mlp_gate_up_ms: f64,
+    mlp_down_ms: f64,
+}
+
+impl Persistent4BLayerTiming {
+    fn add_assign(&mut self, rhs: &Self) {
+        self.full_attn_ms += rhs.full_attn_ms;
+        self.full_attn_core_ms += rhs.full_attn_core_ms;
+        self.full_attn_hero_prep_ms += rhs.full_attn_hero_prep_ms;
+        self.full_attn_hero_loop_ms += rhs.full_attn_hero_loop_ms;
+        self.full_attn_hero_merge_ms += rhs.full_attn_hero_merge_ms;
+        self.full_attn_hero_gate_ms += rhs.full_attn_hero_gate_ms;
+        self.linear_proj_ms += rhs.linear_proj_ms;
+        self.linear_core_ms += rhs.linear_core_ms;
+        self.linear_core_recurrent_ms += rhs.linear_core_recurrent_ms;
+        self.linear_out_ms += rhs.linear_out_ms;
+        self.mlp_gate_up_ms += rhs.mlp_gate_up_ms;
+        self.mlp_down_ms += rhs.mlp_down_ms;
+    }
+
+    fn total_ms(&self) -> f64 {
+        self.full_attn_ms
+            + self.linear_proj_ms
+            + self.linear_core_ms
+            + self.linear_out_ms
+            + self.mlp_gate_up_ms
+            + self.mlp_down_ms
+    }
+
+    fn mlp_total_ms(&self) -> f64 {
+        self.mlp_gate_up_ms + self.mlp_down_ms
+    }
+}
+
+static QWEN35_4B_CUDA_LAYER_TIMINGS_DUMPED: AtomicBool = AtomicBool::new(false);
+
+fn maybe_dump_qwen35_4b_layer_timings(
+    layer_timings: &[Persistent4BLayerTiming],
+    topn: usize,
+    seqlen_offset: usize,
+    batch_size: usize,
+) {
+    if layer_timings.is_empty() {
+        return;
+    }
+    let mut order: Vec<usize> = (0..layer_timings.len()).collect();
+    order.sort_by(|&lhs, &rhs| {
+        layer_timings[rhs]
+            .total_ms()
+            .partial_cmp(&layer_timings[lhs].total_ms())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let emit = topn.min(order.len());
+    eprintln!(
+        "[layer-timings] seqlen_offset={} batch_size={} top_layers={} total_layers={}",
+        seqlen_offset,
+        batch_size,
+        emit,
+        layer_timings.len(),
+    );
+    for layer in order.into_iter().take(emit) {
+        let timing = &layer_timings[layer];
+        eprintln!(
+            "[layer-timings] layer={} total_ms={:.3} full_attn_ms={:.3} full_attn_core_ms={:.3} full_attn_hero_prep_ms={:.3} full_attn_hero_loop_ms={:.3} full_attn_hero_merge_ms={:.3} full_attn_hero_gate_ms={:.3} linear_proj_ms={:.3} linear_core_ms={:.3} linear_core_recurrent_ms={:.3} linear_out_ms={:.3} mlp_ms={:.3} mlp_gate_up_ms={:.3} mlp_down_ms={:.3}",
+            layer,
+            timing.total_ms(),
+            timing.full_attn_ms,
+            timing.full_attn_core_ms,
+            timing.full_attn_hero_prep_ms,
+            timing.full_attn_hero_loop_ms,
+            timing.full_attn_hero_merge_ms,
+            timing.full_attn_hero_gate_ms,
+            timing.linear_proj_ms,
+            timing.linear_core_ms,
+            timing.linear_core_recurrent_ms,
+            timing.linear_out_ms,
+            timing.mlp_total_ms(),
+            timing.mlp_gate_up_ms,
+            timing.mlp_down_ms,
+        );
+    }
+}
+
 const PERSISTENT_4B_TIMING_FULL_ATTN: usize = 0;
 const PERSISTENT_4B_TIMING_FULL_ATTN_PROJ: usize = 1;
 const PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE: usize = 2;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_PREP: usize = 3;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_LOOP: usize = 5;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_MERGE: usize = 6;
+const PERSISTENT_4B_TIMING_FULL_ATTN_HERO_GATE: usize = 7;
 const PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE: usize = 10;
 const PERSISTENT_4B_TIMING_LINEAR_PROJ: usize = 18;
 const PERSISTENT_4B_TIMING_LINEAR_CORE_BASE: usize = 19;
@@ -407,6 +618,7 @@ fn persistent_4b_scaled_ms(cycles: u64, ms_per_cycle: f64) -> f64 {
 /// on gfx1150, so we anchor on the Rust-side wall-clock `persistent_ms`
 /// instead and redistribute it proportionally across non-overlapping
 /// subsection cycle counts.
+#[derive(Clone, Copy)]
 enum PersistentTimingCalibration {
     ClockRateKhz(u32),
     WallClockMs(f64),
@@ -417,6 +629,8 @@ fn decode_persistent_4b_timing_slots(
     num_layers: usize,
     batch_size: usize,
     calibration: PersistentTimingCalibration,
+    mut layer_timings: Option<&mut [Persistent4BLayerTiming]>,
+    layer_offset: usize,
 ) -> DecodeStageTimings {
     let timing_bytes =
         num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();
@@ -462,28 +676,86 @@ fn decode_persistent_4b_timing_slots(
     let split_batches = batch_size.min(2);
     for layer in 0..num_layers {
         let layer_base = layer * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER;
-        full_attn_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
-        full_attn_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
-        linear_proj_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
-        mlp_gate_up_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
-        mlp_down_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
+        let layer_full_attn_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN);
+        let layer_full_attn_proj_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_PROJ);
+        let layer_full_attn_hero_prep_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_PREP);
+        let layer_full_attn_hero_loop_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_LOOP);
+        let layer_full_attn_hero_merge_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_MERGE);
+        let layer_full_attn_hero_gate_cycles =
+            load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_HERO_GATE);
+        let layer_linear_proj_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_PROJ);
+        let layer_mlp_gate_up_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_GATE_UP);
+        let layer_mlp_down_cycles = load_slot(layer_base + PERSISTENT_4B_TIMING_MLP_DOWN);
+        full_attn_cycles += layer_full_attn_cycles;
+        full_attn_proj_cycles += layer_full_attn_proj_cycles;
+        linear_proj_cycles += layer_linear_proj_cycles;
+        mlp_gate_up_cycles += layer_mlp_gate_up_cycles;
+        mlp_down_cycles += layer_mlp_down_cycles;
+        let mut layer_full_attn_core_cycles = 0u64;
+        let mut layer_linear_core_cycles = 0u64;
+        let mut layer_linear_out_cycles = 0u64;
+        let mut layer_linear_core_recurrent_cycles = 0u64;
         for b in 0..section_batches {
-            full_attn_core_cycles +=
+            let full_attn_core =
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + b);
+            let linear_core = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
+            let linear_out = load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+            layer_full_attn_core_cycles += full_attn_core;
+            layer_linear_core_cycles += linear_core;
+            layer_linear_out_cycles += linear_out;
+            full_attn_core_cycles += full_attn_core;
             full_attn_out_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + b);
-            linear_core_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
-            linear_out_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+            linear_core_cycles += linear_core;
+            linear_out_cycles += linear_out;
         }
         for b in 0..split_batches {
             linear_core_conv_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_CONV_BASE + b);
-            linear_core_recurrent_cycles +=
+            let linear_core_recurrent =
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + b);
+            layer_linear_core_recurrent_cycles += linear_core_recurrent;
+            linear_core_recurrent_cycles += linear_core_recurrent;
             linear_core_post_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_POST_BASE + b);
+        }
+        let cvt: Box<dyn Fn(u64) -> f64> = match calibration {
+            PersistentTimingCalibration::ClockRateKhz(khz) => {
+                Box::new(move |cycles| persistent_4b_clock_cycles_to_ms(cycles, khz))
+            }
+            PersistentTimingCalibration::WallClockMs(ms) => {
+                let total_non_overlapping: u64 = full_attn_proj_cycles
+                    .saturating_add(full_attn_core_cycles)
+                    .saturating_add(full_attn_out_cycles)
+                    .saturating_add(linear_proj_cycles)
+                    .saturating_add(linear_core_cycles)
+                    .saturating_add(linear_out_cycles)
+                    .saturating_add(mlp_gate_up_cycles)
+                    .saturating_add(mlp_down_cycles);
+                let ms_per_cycle = persistent_4b_wall_clock_scale(ms, total_non_overlapping);
+                Box::new(move |cycles| persistent_4b_scaled_ms(cycles, ms_per_cycle))
+            }
+        };
+        if let Some(layer_timings) = layer_timings.as_mut() {
+            let layer_timing = Persistent4BLayerTiming {
+                full_attn_ms: cvt(layer_full_attn_cycles),
+                full_attn_core_ms: cvt(layer_full_attn_core_cycles),
+                full_attn_hero_prep_ms: cvt(layer_full_attn_hero_prep_cycles),
+                full_attn_hero_loop_ms: cvt(layer_full_attn_hero_loop_cycles),
+                full_attn_hero_merge_ms: cvt(layer_full_attn_hero_merge_cycles),
+                full_attn_hero_gate_ms: cvt(layer_full_attn_hero_gate_cycles),
+                linear_proj_ms: cvt(layer_linear_proj_cycles),
+                linear_core_ms: cvt(layer_linear_core_cycles),
+                linear_core_recurrent_ms: cvt(layer_linear_core_recurrent_cycles),
+                linear_out_ms: cvt(layer_linear_out_cycles),
+                mlp_gate_up_ms: cvt(layer_mlp_gate_up_cycles),
+                mlp_down_ms: cvt(layer_mlp_down_cycles),
+            };
+            layer_timings[layer_offset + layer].add_assign(&layer_timing);
         }
     }
 
@@ -580,6 +852,10 @@ mod tests {
 }
 
 impl DecodeEngine {
+    pub fn scratch_debug_ptr(&self) -> usize {
+        self.scratch.workspace.as_ptr() as usize
+    }
+
     // Rebuild the BF16 sidecar from the current prefix cache when a KV-FP8 state
     // grows after prefill or is cloned for batched decode.
     fn load_kv_shadow_for_state_static(
@@ -656,7 +932,9 @@ impl DecodeEngine {
                 )
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V copy h={h}: {e}"))?;
             }
-            ls.kv_shadow_start = 0;
+            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| prefix_len.saturating_sub(window))
+                .unwrap_or(0);
         }
 
         Ok(())
@@ -768,7 +1046,7 @@ impl DecodeEngine {
         hidden_bytes: &[u8],
         seqlen_offset: usize,
     ) -> Result<FullAttentionStageTrace> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
             .full
             .as_ref()
@@ -920,7 +1198,7 @@ impl DecodeEngine {
         hidden_bytes: &[u8],
         seqlen_offset: usize,
     ) -> Result<FullAttentionLayerOutputTrace> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
             .full
             .as_ref()
@@ -1056,19 +1334,6 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope: {e}"))?;
 
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &k_buf, &mut step_k,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &v_buf, &mut step_v,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v transpose: {e}"))?;
-
         let (prefix_k_host, prefix_v_host, prefix_len) =
             self.assemble_full_attention_prefix_cache_bf16_host_for_state(state, idx)?;
         anyhow::ensure!(
@@ -1077,49 +1342,54 @@ impl DecodeEngine {
             prefix_len,
             seqlen_offset
         );
+        let q_rope_bytes = query_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q rope D2H: {e}"))?;
+        let k_step_bytes = k_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope D2H: {e}"))?;
+        let v_step_bytes = v_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v step D2H: {e}"))?;
+        let mut full_k_bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
+        let mut full_v_bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
+        let prefix_row_bytes = prefix_len * head_dim * elem_bytes;
+        let kv_row_bytes = kv_len * head_dim * elem_bytes;
+        let step_row_bytes = head_dim * elem_bytes;
+        for h in 0..num_kv_heads {
+            let prefix_src = h * prefix_row_bytes;
+            let full_dst = h * kv_row_bytes;
+            let step_src = h * step_row_bytes;
+            full_k_bytes[full_dst..full_dst + prefix_row_bytes]
+                .copy_from_slice(&prefix_k_host[prefix_src..prefix_src + prefix_row_bytes]);
+            full_v_bytes[full_dst..full_dst + prefix_row_bytes]
+                .copy_from_slice(&prefix_v_host[prefix_src..prefix_src + prefix_row_bytes]);
+            full_k_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
+                .copy_from_slice(&k_step_bytes[step_src..step_src + step_row_bytes]);
+            full_v_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
+                .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
+        }
+        let attn_q = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[num_q_heads, 1, head_dim],
+            &q_rope_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q H2D: {e}"))?;
         let kv_k_contig = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             &[num_kv_heads, kv_len, head_dim],
-            &{
-                let mut bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
-                let copy = prefix_k_host.len();
-                bytes[..copy].copy_from_slice(&prefix_k_host);
-                bytes
-            },
+            &full_k_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_k_contig H2D: {e}"))?;
         let kv_v_contig = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             &[num_kv_heads, kv_len, head_dim],
-            &{
-                let mut bytes = vec![0u8; num_kv_heads * kv_len * head_dim * elem_bytes];
-                let copy = prefix_v_host.len();
-                bytes[..copy].copy_from_slice(&prefix_v_host);
-                bytes
-            },
+            &full_v_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_v_contig H2D: {e}"))?;
-        let contig_stride = kv_len * head_dim * elem_bytes;
-        let step_stride = head_dim * elem_bytes;
-        let dst_offset = seqlen_offset * head_dim * elem_bytes;
-        for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                kv_k_contig.offset_ptr(h * contig_stride + dst_offset) as *mut c_void,
-                step_k.offset_ptr(h * step_stride),
-                step_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv K append h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                kv_v_contig.offset_ptr(h * contig_stride + dst_offset) as *mut c_void,
-                step_v.offset_ptr(h * step_stride),
-                step_stride,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv V append h={h}: {e}"))?;
-        }
 
         kernel_ffi::prefill_ffi::full_attention_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
@@ -1131,10 +1401,15 @@ impl DecodeEngine {
             self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn cast: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
+        attn_flat = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::BF16,
+            &[1, q_dim],
+            &attn_out_bf16
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn bf16 D2H: {e}"))?,
         )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn transpose: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat H2D: {e}"))?;
         kernel_ffi::prefill_ffi::sigmoid_mul(
             self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
         )
@@ -1256,6 +1531,15 @@ impl DecodeEngine {
         &mut self,
         idx: usize,
     ) -> Result<ComponentLayerTrace> {
+        self.component_trace_full_layer_from_current_hidden_with_seqlen(idx, 0)
+    }
+
+    pub fn component_trace_full_layer_from_current_hidden_with_seqlen(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+    ) -> Result<ComponentLayerTrace> {
+        let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
             ScalarType::BF16,
@@ -1269,11 +1553,26 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer input rms_norm: {e}"))?;
 
         if self.weights.config.is_full_attention(idx) {
-            self.component_decode_full_attention_layer(idx, 0)?;
+            let hidden_in = self
+                .hidden_io
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer hidden D2H: {e}"))?;
+            let attn_trace = self.trace_full_attention_layer_output_from_hidden_current_state(
+                idx,
+                0,
+                &hidden_in[..row_bytes],
+                seqlen_offset,
+            )?;
+            self.hidden_io = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[1, self.weights.config.hidden_size],
+                &attn_trace.attn_hidden,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden H2D: {e}"))?;
         } else {
             self.component_decode_linear_attention_layer(idx, false)?;
         }
-        let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
         let attn_hidden = self
             .hidden_io
             .to_host_bytes()
@@ -1321,7 +1620,7 @@ impl DecodeEngine {
         batch_index: usize,
         seq_pos: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
-        let config = &self.weights.config;
+        let config = self.weights.config.clone();
         let ls = self.state_for_batch(batch_index)
             .layers
             .get(layer_idx)
@@ -2612,6 +2911,29 @@ impl DecodeEngine {
         Ok(result.logits)
     }
 
+    pub fn prefill_native_with_final_norm(
+        &mut self,
+        prompt_ids: &[u32],
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            false,
+            None,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
+        Ok(result)
+    }
+
     /// Rebuild sequence-0 state from scratch by replaying native GPU prefill
     /// over the provided token history. Optionally replicates that state across
     /// extra batch slots for lockstep batch decoding.
@@ -3502,12 +3824,26 @@ impl DecodeEngine {
 
     /// Greedy argmax over logits.
     pub fn greedy_sample(logits: &[f32]) -> u32 {
-        logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(idx, _)| idx as u32)
-            .unwrap_or(0)
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for (idx, &val) in logits.iter().enumerate() {
+            if val > best_val {
+                best_idx = idx;
+                best_val = val;
+            }
+        }
+        best_idx as u32
+    }
+
+    pub fn last_normed_host_f32(&self) -> Result<Vec<f32>> {
+        let bytes = self
+            .normed_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("normed D2H: {e}"))?;
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect())
     }
 
     /// Copy prefill state from sequence 0 to all extra batch sequences.
@@ -3553,7 +3889,35 @@ impl DecodeEngine {
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
         let config = &self.weights.config;
         let b = self.batch_size;
+        let use_qwen35_4b_cuda_long_context_component_fallback =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8 &&
+            qwen35_4b_cuda_long_context_component_fallback_enabled() &&
+            seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
+        if use_qwen35_4b_cuda_long_context_component_fallback {
+            let logits = self.component_decode_step_4b(token_ids[0], seqlen_offset)?;
+            return Ok((vec![logits], DecodeStageTimings::default()));
+        }
         let mut timings = DecodeStageTimings::default();
+        let dump_layer_timings_topn = if enable_timing_slots
+            && self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+        {
+            qwen35_4b_cuda_dump_layer_timings_topn().and_then(|topn| {
+                QWEN35_4B_CUDA_LAYER_TIMINGS_DUMPED
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .ok()
+                    .map(|_| topn)
+            })
+        } else {
+            None
+        };
+        let mut persistent_layer_timings = dump_layer_timings_topn
+            .map(|_| vec![Persistent4BLayerTiming::default(); config.num_hidden_layers]);
 
         // 1. Embedding lookup: place each sequence's embedding at offset b * hidden_size
         let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
@@ -3622,76 +3986,8 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset batched decode sync: {e}"))?;
 
         // 5. Launch batched persistent decode kernel
-        let start = Instant::now();
-        let use_qwen35_4b_cuda_hero =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8;
-        let persist_result = if use_qwen35_4b_cuda_hero {
-            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
-                self.ordinal,
-                ScalarType::BF16,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.intermediate_size,
-                seqlen_offset,
-                &self.scratch.desc_device,
-                &mut self.hidden_io,
-                &mut self.scratch.workspace,
-                &mut self.scratch.sync_buf,
-                &self.rotary.cos,
-                &self.rotary.sin,
-                self.rotary.rotary_dim,
-                self.proj_buf_floats,
-                self.attn_scratch_floats,
-                self.fp8_scale_device.as_ref(),
-                self.scratch.kv_fp8_desc_device.as_ref(),
-                b,
-                self.scratch.batch_seq_desc_device.as_ref(),
-                self.int4_scale_device.as_ref(),
-                enable_timing_slots,
-                false,
-                None, // tap_workspace: DFlash-only, off in batched decode
-                None, // tap_layers: DFlash-only, off in batched decode
-            )
-        } else {
-            kernel_ffi::persistent_decode_4b(
-                self.ordinal,
-                ScalarType::BF16,
-                config.num_hidden_layers,
-                config.hidden_size,
-                config.intermediate_size,
-                seqlen_offset,
-                &self.scratch.desc_device,
-                &mut self.hidden_io,
-                &mut self.scratch.workspace,
-                &mut self.scratch.sync_buf,
-                &self.rotary.cos,
-                &self.rotary.sin,
-                self.rotary.rotary_dim,
-                self.proj_buf_floats,
-                self.attn_scratch_floats,
-                self.fp8_scale_device.as_ref(),
-                self.scratch.kv_fp8_desc_device.as_ref(),
-                b,
-                self.scratch.batch_seq_desc_device.as_ref(),
-                self.int4_scale_device.as_ref(),
-                enable_timing_slots,
-                false,
-                None, // tap_workspace: DFlash-only, off in batched decode
-                None, // tap_layers: DFlash-only, off in batched decode
-            )
-        };
-        persist_result
-            .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
-        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        if enable_timing_slots {
-            // CUDA's reported clockRate matches clock64()'s actual tick rate,
-            // so use it directly. HIP's clockRate on gfx1150 does NOT match
-            // what clock64() produces — calibrate against wall-clock instead.
-            let calibration = match self.hidden_io.backend() {
+        let timing_calibration = if enable_timing_slots {
+            Some(match self.hidden_io.backend() {
                 gpu_hal::Backend::Cuda => {
                     let khz = gpu_hal::query_device_info(
                         gpu_hal::Backend::Cuda,
@@ -3701,22 +3997,235 @@ impl DecodeEngine {
                     .clock_rate_khz;
                     PersistentTimingCalibration::ClockRateKhz(khz)
                 }
-                gpu_hal::Backend::Hip => {
-                    PersistentTimingCalibration::WallClockMs(timings.persistent_ms)
+                gpu_hal::Backend::Hip => PersistentTimingCalibration::WallClockMs(0.0),
+            })
+        } else {
+            None
+        };
+        // The CUDA single-stream hero specialization is only validated for the
+        // exact Qwen3.5-4B geometry. 2B/9B share the generic persistent path,
+        // but routing them through the specialized launch changes numerics.
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let use_qwen35_4b_cuda_split =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8 &&
+            config.num_hidden_layers > QWEN35_4B_CUDA_SPLIT_LAYER;
+        let mut persistent_kernel_ms = 0.0;
+        if use_qwen35_4b_cuda_split {
+            let windows = qwen35_4b_cuda_split_windows(config.num_hidden_layers);
+            for (window_start, window_layers) in windows {
+                self.scratch
+                    .upload_descs(&descs[window_start..window_start + window_layers])
+                    .map_err(|e| anyhow::anyhow!(
+                        "upload descs for split window [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    ))?;
+                gpu_hal::memset_zeros(
+                    self.ordinal,
+                    self.scratch.workspace.as_mut_ptr(),
+                    self.scratch.workspace.len_bytes(),
+                )
+                .map_err(|e| anyhow::anyhow!(
+                    "clear split decode workspace [{window_start}, {}): {e}",
+                    window_start + window_layers
+                ))?;
+                self.scratch
+                    .reset_sync()
+                    .map_err(|e| anyhow::anyhow!(
+                        "reset split decode sync [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    ))?;
+
+                let window_launch_start = Instant::now();
+                let window_result = if use_qwen35_4b_cuda_hero {
+                    kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        window_layers,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        seqlen_offset,
+                        &self.scratch.desc_device,
+                        &mut self.hidden_io,
+                        &mut self.scratch.workspace,
+                        &mut self.scratch.sync_buf,
+                        &self.rotary.cos,
+                        &self.rotary.sin,
+                        self.rotary.rotary_dim,
+                        self.proj_buf_floats,
+                        self.attn_scratch_floats,
+                        self.fp8_scale_device.as_ref(),
+                        None,
+                        1,
+                        None,
+                        self.int4_scale_device.as_ref(),
+                        enable_timing_slots,
+                        false,
+                        None,
+                        None,
+                    )
+                } else {
+                    kernel_ffi::persistent_decode_4b(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        window_layers,
+                        config.hidden_size,
+                        config.intermediate_size,
+                        seqlen_offset,
+                        &self.scratch.desc_device,
+                        &mut self.hidden_io,
+                        &mut self.scratch.workspace,
+                        &mut self.scratch.sync_buf,
+                        &self.rotary.cos,
+                        &self.rotary.sin,
+                        self.rotary.rotary_dim,
+                        self.proj_buf_floats,
+                        self.attn_scratch_floats,
+                        self.fp8_scale_device.as_ref(),
+                        None,
+                        1,
+                        None,
+                        self.int4_scale_device.as_ref(),
+                        enable_timing_slots,
+                        false,
+                        None,
+                        None,
+                    )
+                };
+                window_result.map_err(|e| {
+                    anyhow::anyhow!(
+                        "persistent_decode_4b split window [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    )
+                })?;
+                persistent_kernel_ms += window_launch_start.elapsed().as_secs_f64() * 1000.0;
+
+                if let Some(PersistentTimingCalibration::ClockRateKhz(clock_rate_khz)) =
+                    timing_calibration
+                {
+                    let sync_bytes = self
+                        .scratch
+                        .sync_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!(
+                            "split timing slots D2H [{window_start}, {}): {e}",
+                            window_start + window_layers
+                        ))?;
+                    timings.add_assign(decode_persistent_4b_timing_slots(
+                        &sync_bytes,
+                        window_layers,
+                        1,
+                        PersistentTimingCalibration::ClockRateKhz(clock_rate_khz),
+                        persistent_layer_timings.as_deref_mut(),
+                        window_start,
+                    ));
                 }
+            }
+            self.scratch
+                .upload_descs(&descs)
+                .map_err(|e| anyhow::anyhow!("restore full descs after split decode: {e}"))?;
+        } else {
+            let persist_start = Instant::now();
+            let persist_result = if use_qwen35_4b_cuda_hero {
+                kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    config.intermediate_size,
+                    seqlen_offset,
+                    &self.scratch.desc_device,
+                    &mut self.hidden_io,
+                    &mut self.scratch.workspace,
+                    &mut self.scratch.sync_buf,
+                    &self.rotary.cos,
+                    &self.rotary.sin,
+                    self.rotary.rotary_dim,
+                    self.proj_buf_floats,
+                    self.attn_scratch_floats,
+                    self.fp8_scale_device.as_ref(),
+                    self.scratch.kv_fp8_desc_device.as_ref(),
+                    b,
+                    self.scratch.batch_seq_desc_device.as_ref(),
+                    self.int4_scale_device.as_ref(),
+                    enable_timing_slots,
+                    false,
+                    None, // tap_workspace: DFlash-only, off in batched decode
+                    None, // tap_layers: DFlash-only, off in batched decode
+                )
+            } else {
+                kernel_ffi::persistent_decode_4b(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    config.num_hidden_layers,
+                    config.hidden_size,
+                    config.intermediate_size,
+                    seqlen_offset,
+                    &self.scratch.desc_device,
+                    &mut self.hidden_io,
+                    &mut self.scratch.workspace,
+                    &mut self.scratch.sync_buf,
+                    &self.rotary.cos,
+                    &self.rotary.sin,
+                    self.rotary.rotary_dim,
+                    self.proj_buf_floats,
+                    self.attn_scratch_floats,
+                    self.fp8_scale_device.as_ref(),
+                    self.scratch.kv_fp8_desc_device.as_ref(),
+                    b,
+                    self.scratch.batch_seq_desc_device.as_ref(),
+                    self.int4_scale_device.as_ref(),
+                    enable_timing_slots,
+                    false,
+                    None, // tap_workspace: DFlash-only, off in batched decode
+                    None, // tap_layers: DFlash-only, off in batched decode
+                )
             };
-            let sync_bytes = self
-                .scratch
-                .sync_buf
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
-            timings.add_assign(decode_persistent_4b_timing_slots(
-                &sync_bytes,
-                config.num_hidden_layers,
-                b,
-                calibration,
-            ));
+            persist_result
+                .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+            persistent_kernel_ms = persist_start.elapsed().as_secs_f64() * 1000.0;
+
+            if let Some(calibration) = timing_calibration {
+                let calibration = match calibration {
+                    PersistentTimingCalibration::ClockRateKhz(khz) => {
+                        PersistentTimingCalibration::ClockRateKhz(khz)
+                    }
+                    PersistentTimingCalibration::WallClockMs(_) => {
+                        PersistentTimingCalibration::WallClockMs(persistent_kernel_ms)
+                    }
+                };
+                let sync_bytes = self
+                    .scratch
+                    .sync_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("persistent timing slots D2H: {e}"))?;
+                timings.add_assign(decode_persistent_4b_timing_slots(
+                    &sync_bytes,
+                    config.num_hidden_layers,
+                    b,
+                    calibration,
+                    persistent_layer_timings.as_deref_mut(),
+                    0,
+                ));
+            }
         }
+        if let (Some(topn), Some(layer_timings)) =
+            (dump_layer_timings_topn, persistent_layer_timings.as_deref())
+        {
+            maybe_dump_qwen35_4b_layer_timings(layer_timings, topn, seqlen_offset, b);
+        }
+        timings.persistent_ms = persistent_kernel_ms;
 
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;
@@ -3872,6 +4381,147 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("trace reset batched decode sync: {e}"))?;
 
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let persist_result = if use_qwen35_4b_cuda_hero {
+            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                true,
+                None, // tap_workspace: DFlash-only, off in trace path
+                None, // tap_layers: DFlash-only, off in trace path
+            )
+        } else {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                true,
+                None, // tap_workspace: DFlash-only, off in trace path
+                None, // tap_layers: DFlash-only, off in trace path
+            )
+        };
+        persist_result
+            .map_err(|e| anyhow::anyhow!("trace persistent_decode_4b batch kernel: {e}"))?;
+
+        let hidden = self
+            .hidden_io
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("trace hidden D2H: {e}"))?;
+        let start = batch_index * row_bytes;
+        let end = start + row_bytes;
+        Ok(hidden[start..end].to_vec())
+    }
+
+    /// Debug-only: run a BF16 4B persistent-kernel window over a sliced layer
+    /// descriptor range starting from a caller-supplied hidden row.
+    pub fn debug_decode_window_from_hidden_bf16(
+        &mut self,
+        hidden_bytes: &[u8],
+        seqlen_offset: usize,
+        start_layer: usize,
+        num_layers: usize,
+        batch_index: usize,
+    ) -> Result<Vec<u8>> {
+        anyhow::ensure!(self.batch_size == 1, "debug window requires batch_size=1");
+        anyhow::ensure!(self.use_4b_kernel, "debug window requires 4b kernel");
+        anyhow::ensure!(self.fp8_scale_device.is_none(), "debug window is BF16-only");
+        anyhow::ensure!(self.int4_scale_device.is_none(), "debug window is BF16-only");
+        anyhow::ensure!(!self.kv_fp8, "debug window does not support kv_fp8");
+
+        let config = self.weights.config.clone();
+        anyhow::ensure!(
+            start_layer < config.num_hidden_layers,
+            "debug window start_layer {} exceeds model layers {}",
+            start_layer,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            start_layer + num_layers <= config.num_hidden_layers,
+            "debug window [{}, {}) exceeds model layers {}",
+            start_layer,
+            start_layer + num_layers,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            hidden_bytes.len() == config.hidden_size * ScalarType::BF16.size_in_bytes(),
+            "debug window hidden len {} != hidden row bytes {}",
+            hidden_bytes.len(),
+            config.hidden_size * ScalarType::BF16.size_in_bytes()
+        );
+        anyhow::ensure!(
+            batch_index < self.batch_size,
+            "debug window batch index {} out of range for batch {}",
+            batch_index,
+            self.batch_size
+        );
+
+        self.set_hidden_from_bytes(hidden_bytes)?;
+
+        let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        let window_descs = descs
+            .get(start_layer..start_layer + num_layers)
+            .ok_or_else(|| anyhow::anyhow!(
+                "debug window desc slice [{start_layer}, {}) missing",
+                start_layer + num_layers
+            ))?;
+        self.scratch
+            .upload_descs(window_descs)
+            .map_err(|e| anyhow::anyhow!("debug window upload descs: {e}"))?;
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.scratch.workspace.as_mut_ptr(),
+            self.scratch.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("debug window clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("debug window reset sync: {e}"))?;
+
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -3888,25 +4538,212 @@ impl DecodeEngine {
             self.rotary.rotary_dim,
             self.proj_buf_floats,
             self.attn_scratch_floats,
-            self.fp8_scale_device.as_ref(),
-            self.scratch.kv_fp8_desc_device.as_ref(),
-            b,
-            self.scratch.batch_seq_desc_device.as_ref(),
-            self.int4_scale_device.as_ref(),
+            None,
+            None,
+            self.batch_size,
+            None,
+            None,
             false,
-            true,
-            None, // tap_workspace: DFlash-only, off in trace path
-            None, // tap_layers: DFlash-only, off in trace path
+            false,
+            None,
+            None,
         )
-        .map_err(|e| anyhow::anyhow!("trace persistent_decode_4b batch kernel: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("debug window persistent_decode_4b: {e}"))?;
 
         let hidden = self
             .hidden_io
             .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("trace hidden D2H: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("debug window hidden D2H: {e}"))?;
+        let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
         let start = batch_index * row_bytes;
         let end = start + row_bytes;
         Ok(hidden[start..end].to_vec())
+    }
+
+    /// Debug-only: run the real 4B persistent decode kernel for the first
+    /// `num_layers` layers and export one selected linear layer/channel's
+    /// post-Step-B conv-state taps as F32 bytes.
+    ///
+    /// Output layout is `[state_len taps..., qkv_bf16, conv_out_bf16]`, all
+    /// widened to F32 by the kernel.
+    pub fn trace_persistent_linear_step_b_after_layers(
+        &mut self,
+        token_ids: &[u32],
+        seqlen_offset: usize,
+        num_layers: usize,
+        trace_layer: usize,
+        trace_channel: usize,
+    ) -> Result<Vec<u8>> {
+        assert_eq!(token_ids.len(), self.batch_size);
+        assert!(self.use_4b_kernel, "persistent trace requires 4b kernel");
+        let config = &self.weights.config;
+        let b = self.batch_size;
+        anyhow::ensure!(
+            num_layers <= config.num_hidden_layers,
+            "trace layer count {} exceeds model layers {}",
+            num_layers,
+            config.num_hidden_layers
+        );
+        anyhow::ensure!(
+            trace_layer < num_layers,
+            "trace layer {} out of range for num_layers {}",
+            trace_layer,
+            num_layers
+        );
+        anyhow::ensure!(
+            !config.is_full_attention(trace_layer),
+            "trace layer {} is not linear-attention",
+            trace_layer
+        );
+
+        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+        anyhow::ensure!(
+            trace_channel < qkv_dim,
+            "trace channel {} out of range for qkv_dim {}",
+            trace_channel,
+            qkv_dim
+        );
+
+        let row_bytes = config.hidden_size * ScalarType::BF16.size_in_bytes();
+        for (bi, &tid_val) in token_ids.iter().enumerate() {
+            let src_offset = tid_val as usize * row_bytes;
+            let dst_offset = bi * row_bytes;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                unsafe { (self.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
+                self.weights.embed_tokens.offset_ptr(src_offset),
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("linear step-b trace embedding lookup batch {bi}: {e}"))?;
+        }
+
+        let seqlen_offsets: Vec<usize> = vec![seqlen_offset; b];
+        for bi in 0..b {
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
+            for (i, ls) in st.layers.iter_mut().enumerate() {
+                if config.is_full_attention(i) {
+                    ls.ensure_kv_capacity(
+                        seqlen_offset,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("linear step-b trace ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                }
+            }
+        }
+
+        let state_len = config.linear_conv_kernel_dim - 1;
+        let mut debug_buf = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[state_len + 2])
+            .map_err(|e| anyhow::anyhow!("alloc linear step-b debug buffer: {e}"))?;
+
+        let mut descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
+        descs[trace_layer].debug_linear_trace_out = debug_buf.as_mut_ptr();
+        descs[trace_layer].debug_linear_trace_channel = trace_channel as i32;
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("linear step-b trace upload descs: {e}"))?;
+
+        let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
+            .chain(self.extra_states.iter())
+            .collect();
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+            self.scratch
+                .upload_batch_seq_descs(&batch_descs)
+                .map_err(|e| anyhow::anyhow!("linear step-b trace upload batch seq descs: {e}"))?;
+        }
+
+        if let Some(kv_fp8_descs) = build_kv_fp8_descs(&self.state, self.kv_fp8) {
+            self.scratch
+                .upload_kv_fp8_descs(&kv_fp8_descs)
+                .map_err(|e| anyhow::anyhow!("linear step-b trace upload kv fp8 descs: {e}"))?;
+        }
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.scratch.workspace.as_mut_ptr(),
+            self.scratch.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("linear step-b trace clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("linear step-b trace reset sync: {e}"))?;
+
+        let use_qwen35_4b_cuda_hero =
+            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
+            is_qwen35_4b_shape(config) &&
+            qwen35_4b_cuda_hero_enabled() &&
+            b == 1 &&
+            self.fp8_scale_device.is_none() &&
+            self.int4_scale_device.is_none() &&
+            !self.kv_fp8;
+        let persist_result = if use_qwen35_4b_cuda_hero {
+            kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                false,
+                None,
+                None,
+            )
+        } else {
+            kernel_ffi::persistent_decode_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                num_layers,
+                config.hidden_size,
+                config.intermediate_size,
+                seqlen_offset,
+                &self.scratch.desc_device,
+                &mut self.hidden_io,
+                &mut self.scratch.workspace,
+                &mut self.scratch.sync_buf,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                self.rotary.rotary_dim,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+                self.fp8_scale_device.as_ref(),
+                self.scratch.kv_fp8_desc_device.as_ref(),
+                b,
+                self.scratch.batch_seq_desc_device.as_ref(),
+                self.int4_scale_device.as_ref(),
+                false,
+                false,
+                None,
+                None,
+            )
+        };
+        persist_result
+            .map_err(|e| anyhow::anyhow!("linear step-b trace persistent_decode_4b kernel: {e}"))?;
+
+        debug_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("linear step-b trace D2H: {e}"))
     }
 
     pub fn trace_persistent_linear_proj_buf_after_layers(
@@ -4171,13 +5008,23 @@ impl DecodeEngine {
             .workspace
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
+        let score_cols = self
+            .attn_scratch_floats
+            .saturating_sub(q_dim * 3)
+            / self.weights.config.num_attention_heads;
+        anyhow::ensure!(
+            kv_len <= score_cols,
+            "persistent full-attn scores kv_len {} exceeds scratch score columns {}",
+            kv_len,
+            score_cols,
+        );
         let start =
             (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
-        let end = start + self.weights.config.num_attention_heads * self.kv_chunk_size * 4;
+        let end = start + self.weights.config.num_attention_heads * score_cols * 4;
         anyhow::ensure!(end <= bytes.len(), "persistent full-attn scores slice out of bounds");
         let full = &bytes[start..end];
         let mut out = Vec::with_capacity(self.weights.config.num_attention_heads * kv_len * 4);
-        let stride = self.kv_chunk_size * 4;
+        let stride = score_cols * 4;
         for h in 0..self.weights.config.num_attention_heads {
             let row = h * stride;
             out.extend_from_slice(&full[row..row + kv_len * 4]);

@@ -82,6 +82,8 @@ struct Qwen35DecodeLayerDesc {
     void* kv_shadow_k;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     void* kv_shadow_v;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     int kv_shadow_start;               // first position covered by the sidecar, -1 when disabled
+    void* debug_linear_trace_out;      // optional F32[(kern-1)+2] export for one linear channel's Step-B state
+    int debug_linear_trace_channel;    // selected linear channel for debug_linear_trace_out, -1 disables
 };
 
 // =============================================================================
@@ -5178,9 +5180,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const size_t cos_off =
                         static_cast<size_t>(seq_off_b) * half_rot;
 
-                    if (tid < nh * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* qh = q_f32 + h * hd * 2;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -5191,9 +5193,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    if (tid < nkv * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* kh = k_f32 + h * hd;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -5858,6 +5860,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             cs[c * (kern-1) + t] = cs[c * (kern-1) + t + 1];
                         }
                         cs[c * (kern-1) + (kern-2)] = qkv_bf16;
+
+                        if (L.debug_linear_trace_out != nullptr &&
+                            c == L.debug_linear_trace_channel) {
+                            float* debug = static_cast<float*>(L.debug_linear_trace_out);
+                            const int state_base = c * (kern - 1);
+                            for (int t = 0; t < kern - 1; ++t) {
+                                debug[t] = dotcache_qwen35_to_float(cs[state_base + t]);
+                            }
+                            debug[kern - 1] = dotcache_qwen35_to_float(qkv_bf16);
+                            debug[kern] = conv_out[c];
+                        }
                     }
                     __syncthreads();
 

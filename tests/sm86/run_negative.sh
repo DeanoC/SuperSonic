@@ -81,9 +81,9 @@ run_fail "Test 2: CUDA rejects --fp8-runtime" \
     "CUDA v1 does not support --fp8-runtime yet" \
     "${COMMON_4B[@]}" --fp8-runtime
 
-run_fail "Test 3: CUDA rejects --kv-fp8" \
-    "CUDA v1 does not support --kv-fp8 yet" \
-    "${COMMON_4B[@]}" --kv-fp8
+run_fail "Test 3: CUDA rejects --kv-fp8 on unsupported model" \
+    "CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86" \
+    "${COMMON_0_8B[@]}" --kv-fp8
 
 run_fail "Test 4: CUDA rejects batch on non-4B kernel" \
     "--batch-size > 1 requires 4B kernel" \
@@ -94,10 +94,10 @@ run_fail "Test 5: CUDA rejects out-of-range batch size" \
     "${COMMON_4B[@]}" --batch-size 0
 
 run_fail "Test 6: unknown CUDA override stays explicit on unsupported model" \
-    "--allow-untested-gpu=sm999: no registry entry for model=qwen3.5-2b backend=CUDA arch=sm999" \
+    "--allow-untested-gpu=sm999: no registry entry for model=gemma4-e2b backend=CUDA arch=sm999" \
     --backend cuda \
     --allow-untested-gpu sm999 \
-    --model qwen3.5-2b \
+    --model gemma4-e2b \
     --model-dir "$MODEL_DIR_4B" \
     --prompt "Hello" \
     --max-new-tokens 1

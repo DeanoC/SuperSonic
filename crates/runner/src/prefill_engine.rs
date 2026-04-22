@@ -10,7 +10,7 @@ use gpu_hal::{GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
@@ -97,7 +97,7 @@ pub fn compute_logits_for_range(
     config: &TextConfig,
     start: usize,
     count: usize,
-    use_4b_kernel: bool,
+    _use_4b_kernel: bool,
     ordinal: usize,
 ) -> Result<(Vec<Vec<f32>>, GpuBuffer)> {
     if count == 0 {
@@ -129,11 +129,12 @@ pub fn compute_logits_for_range(
     )
     .map_err(|e| anyhow::anyhow!("range final norm: {e}"))?;
 
-    // lm_head projection. For count=1 the standalone matvec is competitive with
-    // the tiled path on gfx1150; for count>1 we must use the tiled matmul.
+    // lm_head projection. For count=1, prefer the standalone matvec even on
+    // 4B-capable models: it avoids the tiled matmul path's extra packing and
+    // keeps the single-row score path numerically aligned with decode.
     let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
         .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-    if use_4b_kernel || count > 1 {
+    if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal, ScalarType::BF16,
             1,         // batch
@@ -705,15 +706,11 @@ fn prefill_inner(
         ordinal,
     )?;
     let logits = logits_per_pos.pop().expect("count=1 produces exactly one row");
-    let final_norm_trace = if trace_layers {
-        Some(
-            normed_last
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("final norm D2H: {e}"))?,
-        )
-    } else {
-        None
-    };
+    let final_norm_trace = Some(
+        normed_last
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("final norm D2H: {e}"))?,
+    );
 
     // Post-prefill: convert BF16 KV caches to FP8 if requested.
     // During prefill we use BF16 KV so the attention kernel can read them directly.
@@ -813,7 +810,9 @@ pub fn convert_kv_caches_to_fp8(
         if kv_fp8_bf16_sidecar_enabled() {
             ls.kv_shadow_k = Some(bf16_k);
             ls.kv_shadow_v = Some(bf16_v);
-            ls.kv_shadow_start = 0;
+            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| kv_len.saturating_sub(window))
+                .unwrap_or(0);
         } else {
             ls.kv_shadow_k = None;
             ls.kv_shadow_v = None;

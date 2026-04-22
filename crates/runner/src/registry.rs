@@ -269,11 +269,45 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_4B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
         vram: VramBudget {
             fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Qwen35(Qwen35KernelParams {
@@ -363,4 +397,25 @@ pub fn supported_archs_for(model: &ModelVariant, backend: &Backend) -> Vec<Strin
         .filter(|e| e.model == *model && e.backend == *backend)
         .map(|e| e.arch.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
+        assert!(lookup(
+            &ModelVariant::Qwen3_5_2B,
+            &Backend::Cuda,
+            &GpuArch::Sm86,
+        )
+        .is_some());
+        assert!(lookup(
+            &ModelVariant::Qwen3_5_9B,
+            &Backend::Cuda,
+            &GpuArch::Sm86,
+        )
+        .is_some());
+    }
 }

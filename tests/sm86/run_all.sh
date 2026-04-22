@@ -7,6 +7,7 @@
 #   - Qwen3.5-4B
 #   - Qwen3.5-4B long-context CPU oracle
 #   - Qwen3.5-4B batch_size=2
+#   - Qwen3.5-4B KV-FP8 batch_size=2
 #   - negative CUDA v1 coverage
 #
 # Usage:
@@ -45,5 +46,7 @@ echo ""
 TIMEOUT="${TIMEOUT:-1200}" "$SCRIPT_DIR/run_4b_long.sh" "$MODEL_DIR_4B"
 echo ""
 TIMEOUT="${TIMEOUT:-900}" "$SCRIPT_DIR/run_batch.sh" "$MODEL_DIR_4B"
+echo ""
+TIMEOUT="${TIMEOUT:-900}" CORPUS_TIMEOUT="${CORPUS_TIMEOUT:-1200}" "$SCRIPT_DIR/run_kv_fp8.sh" "$MODEL_DIR_4B"
 echo ""
 TIMEOUT="${TIMEOUT:-120}" "$SCRIPT_DIR/run_negative.sh" "$MODEL_DIR_0_8B" "$MODEL_DIR_4B"

@@ -72,6 +72,8 @@ struct Qwen35DecodeLayerDesc {
     void* kv_shadow_k;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     void* kv_shadow_v;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     int kv_shadow_start;               // first position covered by the sidecar, -1 when disabled
+    void* debug_linear_trace_out;      // optional F32[(kern-1)+2] export for one linear channel's Step-B state
+    int debug_linear_trace_channel;    // selected linear channel for debug_linear_trace_out, -1 disables
 };
 
 template <typename T>
@@ -3395,7 +3397,10 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // Step B-G: QK-norm, RoPE, KV cache, attention, gating, o_proj
             // Block 0 handles the per-head sequential ops.
             // O_proj uses all blocks via work-stealing.
-            const bool qwen08_attn_hero = qwen08_hero && nb >= 8;
+            // The 0.8B full-attention hero subpath is intentionally disabled:
+            // it regressed golden-corpus parity even though the surrounding
+            // hero specializations are correct and materially faster.
+            const bool qwen08_attn_hero = false;
 
             if (qwen08_attn_hero) {
                 float* q_f32 = proj_buf;
@@ -3600,10 +3605,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const size_t cos_off =
                         static_cast<size_t>(seqlen_offset) * half_rot;
 
-                    // Apply to all Q heads in parallel (nh * half_rot <= 256)
-                    if (tid < nh * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* qh = q_f32 + h * hd * 2;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -3614,10 +3618,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    // Apply to all K heads (nkv * half_rot threads)
-                    if (tid < nkv * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* kh = k_f32 + h * hd;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);

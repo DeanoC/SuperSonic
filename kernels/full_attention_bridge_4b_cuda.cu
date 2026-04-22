@@ -4601,7 +4601,15 @@ int persistent_decode_device(
         ? static_cast<size_t>(hidden_dim) * effective_batch_size
         : static_cast<size_t>(intermediate_size);
     const size_t fp8_lut_size = SINGLE_STREAM_BF16_SPECIALIZED ? 0 : 256;  // FP8 E4M3 → F32 lookup table
-    const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
+    size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
+    if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
+        shared_bytes += static_cast<size_t>(intermediate_size) * sizeof(T);
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T, SINGLE_STREAM_BF16_SPECIALIZED>),
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(shared_bytes));
+        if (attr_err != cudaSuccess) return 253;
+    }
 
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T, SINGLE_STREAM_BF16_SPECIALIZED>),
