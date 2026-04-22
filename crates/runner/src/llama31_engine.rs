@@ -621,11 +621,17 @@ pub fn run_llama31(
     let mut next_token = DecodeEngine::greedy_sample(&prefill.logits);
     let mut max_delta = 0.0f32;
     let mut token_mismatches = 0usize;
+    let gpu_validate_enabled = cli.gpu_validate;
+    let mut gpu_max_delta = 0.0f32;
+    let mut gpu_dumped_layer_trace = false;
     eprintln!(
         "[prefill] {} tokens in {:.0}ms",
         prompt_ids.len(),
         prefill_start.elapsed().as_millis()
     );
+    if gpu_validate_enabled {
+        eprintln!("[gpu-validate] replaying decode steps through GPU prefill reference");
+    }
 
     if let Some(ref oracle) = oracle_output {
         let delta = validate::max_abs_delta(&prefill.logits, &oracle.prefill_logits);
@@ -685,7 +691,7 @@ pub fn run_llama31(
         let pos = prompt_ids.len() + generated.len() - 1;
         let (logits, timings) = engine.decode_step_with_timings(next_token, pos)?;
         stage_totals.add_assign(timings);
-        next_token = DecodeEngine::greedy_sample(&logits);
+        let native_next = DecodeEngine::greedy_sample(&logits);
         if let Some(ref oracle) = oracle_output {
             let decode_idx = generated.len() - 1;
             if let Some(oracle_logits) = oracle.decode_logits.get(decode_idx) {
@@ -694,18 +700,125 @@ pub fn run_llama31(
                     max_delta = delta;
                 }
                 let mismatch = match oracle.generated_token_ids.get(decode_idx + 1).copied() {
-                    Some(o) if o != next_token => {
+                    Some(o) if o != native_next => {
                         token_mismatches += 1;
                         format!(" MISMATCH (oracle_next={o})")
                     }
                     _ => String::new(),
                 };
                 eprintln!(
-                    "[validate] step={decode_idx} pos={pos} delta={delta:.4} input_tok={} rust_next={next_token}{mismatch}",
+                    "[validate] step={decode_idx} pos={pos} delta={delta:.4} input_tok={} rust_next={native_next}{mismatch}",
                     generated[decode_idx]
                 );
             }
         }
+        if gpu_validate_enabled {
+            let gpu_token_ids: Vec<u32> = prompt_ids
+                .iter()
+                .copied()
+                .chain(generated.iter().copied())
+                .collect();
+            let gpu_logits = crate::prefill_engine::gpu_reference_replay_step(
+                &engine.weights(),
+                &engine.rotary(),
+                &gpu_token_ids,
+                ordinal,
+                params.kv_chunk_size,
+                cli.prefill_chunk_size,
+                true,
+            )?;
+            let delta = validate::max_abs_delta(&logits, &gpu_logits);
+            if delta > gpu_max_delta {
+                gpu_max_delta = delta;
+            }
+            let gpu_next = DecodeEngine::greedy_sample(&gpu_logits);
+            let mismatch = if gpu_next == native_next { "" } else { " MISMATCH" };
+            eprintln!(
+                "[gpu-validate] step={} pos={} input_tok={} delta={delta:.4} native_next={} gpu_next={}{}",
+                generated.len() - 1,
+                pos,
+                generated[generated.len() - 1],
+                native_next,
+                gpu_next,
+                mismatch
+            );
+            if gpu_next != native_next && !gpu_dumped_layer_trace {
+                let full_token_ids = gpu_token_ids.clone();
+                let prefix_token_ids = &full_token_ids[..full_token_ids.len().saturating_sub(1)];
+                let replay = engine.prefill_native_with_trace(&full_token_ids)?;
+                let replay_hidden = replay.layer_hidden_trace.as_ref().ok_or_else(|| {
+                    anyhow!("internal: llama31 gpu-validate replay hidden trace missing")
+                })?;
+                let mut first_bad = None;
+                for layer_idx in 0..engine.weights().config.num_hidden_layers {
+                    engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                    let (_trace_logits, layer_trace) =
+                        engine.component_decode_step_4b_trace_layer(next_token, pos, layer_idx)?;
+                    let layer_delta = validate::max_abs_delta(
+                        &decode_bf16_le(&layer_trace.layer_hidden),
+                        &decode_bf16_le(&replay_hidden[layer_idx]),
+                    );
+                    eprintln!(
+                        "[gpu-validate-layer] step={} layer={} hidden_delta={layer_delta:.6}",
+                        generated.len() - 1,
+                        layer_idx
+                    );
+                    if first_bad.is_none() && layer_delta > 0.25 {
+                        first_bad = Some((layer_idx, layer_delta));
+                    }
+                }
+                engine.rebuild_prefill_state(&full_token_ids, false)?;
+                if let Some((layer_idx, layer_delta)) = first_bad {
+                    eprintln!(
+                        "[gpu-validate-layer] first_bad_layer={} hidden_delta={layer_delta:.6}",
+                        layer_idx
+                    );
+                    let replay_attn = replay
+                        .layer_attn_trace
+                        .as_ref()
+                        .and_then(|layers| layers.get(layer_idx))
+                        .ok_or_else(|| anyhow!("internal: missing replay attn trace for layer {layer_idx}"))?;
+                    let replay_post = replay
+                        .layer_post_attn_norm_trace
+                        .as_ref()
+                        .and_then(|layers| layers.get(layer_idx))
+                        .ok_or_else(|| anyhow!("internal: missing replay post trace for layer {layer_idx}"))?;
+                    let replay_mlp = replay
+                        .layer_mlp_out_trace
+                        .as_ref()
+                        .and_then(|layers| layers.get(layer_idx))
+                        .ok_or_else(|| anyhow!("internal: missing replay mlp trace for layer {layer_idx}"))?;
+                    engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                    let (_trace_logits, layer_trace) =
+                        engine.component_decode_step_4b_trace_layer(next_token, pos, layer_idx)?;
+                    let attn_delta = validate::max_abs_delta(
+                        &decode_bf16_le(&layer_trace.attn_hidden),
+                        &decode_bf16_le(replay_attn),
+                    );
+                    let post_delta = validate::max_abs_delta(
+                        &decode_bf16_le(&layer_trace.post_attn_norm),
+                        &decode_bf16_le(replay_post),
+                    );
+                    let mlp_delta = validate::max_abs_delta(
+                        &decode_bf16_le(&layer_trace.mlp_out),
+                        &decode_bf16_le(replay_mlp),
+                    );
+                    let hidden_delta = validate::max_abs_delta(
+                        &decode_bf16_le(&layer_trace.layer_hidden),
+                        &decode_bf16_le(&replay_hidden[layer_idx]),
+                    );
+                    eprintln!(
+                        "[gpu-validate-layer] layer={} attn_delta={attn_delta:.6} post_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}",
+                        layer_idx
+                    );
+                    engine.rebuild_prefill_state(&full_token_ids, false)?;
+                } else {
+                    eprintln!("[gpu-validate-layer] no layer exceeded hidden_delta threshold");
+                }
+                gpu_dumped_layer_trace = true;
+            }
+        }
+        next_token = native_next;
         generated.push(next_token);
     }
 
@@ -741,6 +854,9 @@ pub fn run_llama31(
         eprintln!(
             "[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}"
         );
+    }
+    if gpu_validate_enabled {
+        eprintln!("[gpu-validate] max_delta={gpu_max_delta:.4}");
     }
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
