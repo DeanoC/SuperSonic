@@ -681,6 +681,234 @@ __global__ void g4_matvec_batched_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA BF16 kernel for Gemma 4 prefill matvec, shared-memory tiled.
+//
+// `g4_matvec_batched_kernel` is work-stealing and reduces one output element
+// per thread block — fine for decode (seq_len=1) where parallelism comes from
+// the `out_dim` axis, but it leaves the matrix units idle on prefill where
+// seq_len >> 1 and the work naturally has a matmul shape
+// (seq_len × in_dim × out_dim).
+//
+// This kernel runs the same operation as a 2D tiled WMMA GEMM: 64x64 output
+// tile, 4 wavefronts per block arranged 2x2 (each wave owns a 32x32
+// sub-region, a 2x2 grid of 16x16 WMMA sub-tiles), K-step 64, A/B staged
+// through LDS. The previous one-wave-per-16x16-tile version was bandwidth-
+// bound (~100x global-read amplification on Gemma prefill shapes).
+//
+// Grid  : (ceil(out_dim/64), ceil(seq_len/64), 1)
+// Block : 128 threads (4 wavefronts)
+//
+// WMMA is a cross-lane instruction: every lane must participate with
+// well-defined A/B inputs. We keep the WMMA call uniform across the wave
+// and zero-pad out-of-range elements in LDS so divergent input can't
+// corrupt in-range lanes' outputs.
+// =============================================================================
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__)
+#define G4_HAS_WMMA_BF16 1
+#endif
+
+typedef short  g4_short16 __attribute__((ext_vector_type(16)));
+typedef float  g4_float8  __attribute__((ext_vector_type(8)));
+
+// Tile dimensions. Shared by the BF16 and INT4 WMMA prefill kernels.
+constexpr int G4_TILED_WMMA_BM = 64;
+constexpr int G4_TILED_WMMA_BN = 64;
+constexpr int G4_TILED_WMMA_BK = 64;
+// LDS row padded by 1 DWORD (2 BF16) to reduce 32-bank aliasing on the
+// WMMA operand gather.
+constexpr int G4_TILED_WMMA_LDS_STRIDE = G4_TILED_WMMA_BK + 2;
+
+__global__ __launch_bounds__(128, 2)
+void g4_matvec_batched_wmma_bf16_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    const hip_bfloat16* __restrict__ x,    // [seq_len, in_dim]
+    const hip_bfloat16* __restrict__ W,    // [out_dim, in_dim]
+    hip_bfloat16* __restrict__ out         // [seq_len, out_dim]
+) {
+#ifdef G4_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;       // 0..3
+    const int wave_row = wid >> 1;       // 0 or 1
+    const int wave_col = wid & 1;        // 0 or 1
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+
+    const int blk_row = blockIdx.y * G4_TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * G4_TILED_WMMA_BN;
+
+    __shared__ uint16_t s_x[G4_TILED_WMMA_BM * G4_TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_w[G4_TILED_WMMA_BN * G4_TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x);
+    const uint16_t* w_u16 = reinterpret_cast<const uint16_t*>(W);
+
+    g4_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(G4_TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32 (lane count)");
+    constexpr int K_COL_HALVES = G4_TILED_WMMA_BK / 32;
+    constexpr int K_CHUNKS     = G4_TILED_WMMA_BK / 16;
+
+    const int k_main = in_dim & ~(G4_TILED_WMMA_BK - 1);
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += G4_TILED_WMMA_BK) {
+        // Load A (x) tile [BM, BK]: wave wid loads rows wid*16..wid*16+15,
+        // lane L loads col L across those rows. Coalesced global read.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < seq_len) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + gk];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // Load B (W) tile [BN, BK] — W is [out_dim, in_dim] row-major
+        // which matches the "virtual transpose" layout for the output dim.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gc < out_dim) {
+                    v = w_u16[static_cast<size_t>(gc) * in_dim + gk];
+                }
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        __syncthreads();
+
+        // Compute: K_CHUNKS 16-K chunks, 4 WMMAs each (2x2 sub-tiles).
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // Defensive K-tail when in_dim % BK != 0. Gemma hidden/intermediate
+    // dims are multiples of 256 so this branch is unreachable in practice.
+    if (k_main != in_dim) {
+        const int k_rem = in_dim - k_main;
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < seq_len && col < k_rem) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + k_main + col];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gc < out_dim && col < k_rem) {
+                    v = w_u16[static_cast<size_t>(gc) * in_dim + k_main + col];
+                }
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles. RDNA3 wave32 WMMA acc layout:
+    //   acc[i] -> C[2*i + lane_half, lane_row] relative to sub-tile (0,0).
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const g4_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < out_dim) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < seq_len) {
+                    out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)seq_len; (void)in_dim; (void)out_dim;
+    (void)x; (void)W; (void)out;
+#endif
+}
+
 // Batched INT4 matvec. Computes `out[s, r] = dot(dequant(W[r, :]), x[s, :])`
 // for every (s, r) pair. Work-stealing block claims one (s, r) item at a time
 // from `counter`. Same runtime format as the single-token INT4 kernel.
@@ -744,6 +972,401 @@ __global__ void g4_matvec_batched_int4_kernel(
         }
         __syncthreads();
     }
+}
+
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matvec (wave32, 16x16x16 f32-accumulate),
+// one-wavefront-per-16x16-tile. Kept as a small-M fallback since the tiled
+// version below suffers proportionally larger tile-overhang waste (4x)
+// when seq_len is much smaller than the 64-row tile, and INT4 already has
+// ~4x less bandwidth than BF16 for tiling to amortize — same tradeoff as
+// the Qwen INT4 kernels in kernels/full_attention_4b.hip.
+//
+//   x        [seq_len, in_dim]               BF16
+//   W_packed [out_dim, in_dim/2]             packed INT4 (low nibble = even col)
+//   W_scale  [out_dim/gsz, in_dim/gsz]       BF16
+//   W_zero   [out_dim/gsz, in_dim/gsz]       BF16
+//   out      [seq_len, out_dim]              BF16
+// =============================================================================
+
+__global__ void g4_matvec_batched_int4_wmma_bf16_small_m_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    int gsz,
+    const hip_bfloat16* __restrict__ x,          // [seq_len, in_dim]
+    const uint8_t* __restrict__ W_packed,        // [out_dim, in_dim/2]
+    const hip_bfloat16* __restrict__ W_scale,    // [out_dim/gsz, in_dim/gsz]
+    const hip_bfloat16* __restrict__ W_zero,     // [out_dim/gsz, in_dim/gsz]
+    hip_bfloat16* __restrict__ out               // [seq_len, out_dim]
+) {
+#ifdef G4_HAS_WMMA_BF16
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+    const int tile_row = blockIdx.y * 16;         // seq_len axis
+    const int tile_col = blockIdx.x * 16;         // out_dim axis
+
+    const int x_row_idx = tile_row + lane_row;
+    const int w_row_idx = tile_col + lane_row;
+    const bool x_in_range = x_row_idx < seq_len;
+    const bool w_in_range = w_row_idx < out_dim;
+
+    const int byte_cols = in_dim / 2;
+    const int scale_cols = (in_dim + gsz - 1) / gsz;
+
+    const uint16_t* x_row_u16 = reinterpret_cast<const uint16_t*>(x) +
+                                static_cast<size_t>(x_row_idx) * in_dim;
+    const uint8_t*  w_row_u8  = W_packed +
+                                static_cast<size_t>(w_row_idx) * byte_cols;
+    const int scale_row_base  = (w_row_idx / gsz) * scale_cols;
+
+    g4_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = in_dim & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        // A (activations)
+        g4_short16 a;
+        if (x_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(x_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        // B (weights, INT4 → BF16)
+        g4_short16 b;
+        if (w_in_range) {
+            const int scale_idx = scale_row_base + (kk / gsz);
+            const float s = static_cast<float>(W_scale[scale_idx]);
+            const float zs = static_cast<float>(W_zero[scale_idx]) * s;
+            const int byte_base = kk >> 1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint8_t packed = w_row_u8[byte_base + i];
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = g4_bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = g4_bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                b[2 * i]     = static_cast<short>(b0 >> 16);
+                b[2 * i + 1] = static_cast<short>(b1 >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    // Tail (in_dim % 16 != 0): Gemma 4 layers use multiples of 128, so this
+    // is defensive only.
+    if (k_main != in_dim) {
+        g4_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        g4_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (x_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < in_dim) a[i] = static_cast<short>(x_row_u16[kc]);
+            }
+        }
+        if (w_in_range) {
+            const int scale_idx = scale_row_base + (k_main / gsz);
+            const float s = static_cast<float>(W_scale[scale_idx]);
+            const float zs = static_cast<float>(W_zero[scale_idx]) * s;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < in_dim) {
+                    uint8_t packed = w_row_u8[kc >> 1];
+                    int nib = (kc & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+                    float v = g4_bf16_round_rne_f32_finite(static_cast<float>(nib) * s - zs);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    b[i] = static_cast<short>(bits >> 16);
+                }
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    const int out_col = tile_col + lane_row;
+    if (out_col < out_dim) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < seq_len) {
+                out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)seq_len; (void)in_dim; (void)out_dim; (void)gsz;
+    (void)x; (void)W_packed; (void)W_scale; (void)W_zero; (void)out;
+#endif
+}
+
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matvec (wave32, 16x16x16 f32-accumulate),
+// shared-memory tiled.
+//
+// Same input layout as the small_m variant above. Uses the same 64x64 tile
+// shape as g4_matvec_batched_wmma_bf16_kernel above — 4 waves per block in
+// 2x2, each owns a 32x32 sub-region; K-step = G4_TILED_WMMA_BK (64). The
+// B-tile load dequantizes packed INT4 into BF16 while staging into LDS, one
+// (scale, zero) fetch per BK-wide K slab per row.
+//
+// Bridge gates this kernel on (gsz % BK == 0) so every BK-aligned K slab
+// stays inside one GPTQ group; shipped Gemma 4 bakes use gsz=128 so this
+// holds.
+// =============================================================================
+
+__global__ __launch_bounds__(128, 2)
+void g4_matvec_batched_int4_wmma_bf16_kernel(
+    int seq_len,
+    int in_dim,
+    int out_dim,
+    int gsz,
+    const hip_bfloat16* __restrict__ x,
+    const uint8_t* __restrict__ W_packed,
+    const hip_bfloat16* __restrict__ W_scale,
+    const hip_bfloat16* __restrict__ W_zero,
+    hip_bfloat16* __restrict__ out
+) {
+#ifdef G4_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;
+    const int wave_row = wid >> 1;
+    const int wave_col = wid & 1;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+
+    const int blk_row = blockIdx.y * G4_TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * G4_TILED_WMMA_BN;
+
+    __shared__ uint16_t s_x[G4_TILED_WMMA_BM * G4_TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_w[G4_TILED_WMMA_BN * G4_TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* x_u16 = reinterpret_cast<const uint16_t*>(x);
+
+    const int byte_cols  = in_dim / 2;
+    const int scale_cols = (in_dim + gsz - 1) / gsz;
+
+    g4_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    g4_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(G4_TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32");
+    static_assert(G4_TILED_WMMA_BK % 64 == 0, "BK must be a multiple of 64 (INT4 packs 2 K/byte, 32 lanes)");
+    constexpr int K_COL_HALVES  = G4_TILED_WMMA_BK / 32;   // BF16 A load passes
+    constexpr int K_INT4_PASSES = G4_TILED_WMMA_BK / 64;   // INT4 B load passes
+    constexpr int K_CHUNKS      = G4_TILED_WMMA_BK / 16;
+
+    const int k_main = in_dim & ~(G4_TILED_WMMA_BK - 1);
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += G4_TILED_WMMA_BK) {
+        // Load A (x) tile [BM, BK] BF16.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < seq_len) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + gk];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // Load + dequantize B (W) tile [BN, BK] INT4 -> BF16.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            float s = 0.f;
+            float zs = 0.f;
+            if (gc < out_dim) {
+                int group_id = kk0 / gsz;
+                int scale_idx = (gc / gsz) * scale_cols + group_id;
+                float s_val = static_cast<float>(W_scale[scale_idx]);
+                float z_val = static_cast<float>(W_zero[scale_idx]);
+                s = s_val;
+                zs = z_val * s_val;
+            }
+            #pragma unroll
+            for (int pass = 0; pass < K_INT4_PASSES; ++pass) {
+                int lane_byte = pass * 32 + lane;
+                int col_lo    = lane_byte * 2;
+                int col_hi    = col_lo + 1;
+                uint8_t packed = 0;
+                if (gc < out_dim) {
+                    packed = W_packed[static_cast<size_t>(gc) * byte_cols +
+                                      (kk0 >> 1) + lane_byte];
+                }
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = g4_bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = g4_bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                uint16_t out_lo = (gc < out_dim) ? static_cast<uint16_t>(b0 >> 16) : 0;
+                uint16_t out_hi = (gc < out_dim) ? static_cast<uint16_t>(b1 >> 16) : 0;
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col_lo] = out_lo;
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col_hi] = out_hi;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // Defensive K-tail. Gemma dims are multiples of 256 so unreachable.
+    if (k_main != in_dim) {
+        const int k_rem = in_dim - k_main;
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < seq_len && col < k_rem) {
+                    v = x_u16[static_cast<size_t>(gr) * in_dim + k_main + col];
+                }
+                s_x[lds_row * G4_TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            float s = 0.f;
+            float zs = 0.f;
+            if (gc < out_dim) {
+                int group_id = k_main / gsz;
+                int scale_idx = (gc / gsz) * scale_cols + group_id;
+                float s_val = static_cast<float>(W_scale[scale_idx]);
+                float z_val = static_cast<float>(W_zero[scale_idx]);
+                s = s_val;
+                zs = z_val * s_val;
+            }
+            #pragma unroll
+            for (int pass = 0; pass < K_INT4_PASSES; ++pass) {
+                int lane_byte = pass * 32 + lane;
+                int col_lo = lane_byte * 2;
+                int col_hi = col_lo + 1;
+                uint16_t out_lo = 0;
+                uint16_t out_hi = 0;
+                if (gc < out_dim) {
+                    uint8_t packed = 0;
+                    if (col_lo < k_rem || col_hi < k_rem) {
+                        packed = W_packed[static_cast<size_t>(gc) * byte_cols +
+                                          (k_main >> 1) + lane_byte];
+                    }
+                    if (col_lo < k_rem) {
+                        int n0 = packed & 0xF;
+                        float v0 = g4_bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                        uint32_t b0;
+                        __builtin_memcpy(&b0, &v0, 4);
+                        out_lo = static_cast<uint16_t>(b0 >> 16);
+                    }
+                    if (col_hi < k_rem) {
+                        int n1 = (packed >> 4) & 0xF;
+                        float v1 = g4_bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                        uint32_t b1;
+                        __builtin_memcpy(&b1, &v1, 4);
+                        out_hi = static_cast<uint16_t>(b1 >> 16);
+                    }
+                }
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col_lo] = out_lo;
+                s_w[lds_row * G4_TILED_WMMA_LDS_STRIDE + col_hi] = out_hi;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            g4_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_x[a0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_x[a1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_w[b0_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_w[b1_row * G4_TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles.
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const g4_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < out_dim) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < seq_len) {
+                    out[static_cast<size_t>(out_row) * out_dim + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)seq_len; (void)in_dim; (void)out_dim; (void)gsz;
+    (void)x; (void)W_packed; (void)W_scale; (void)W_zero; (void)out;
+#endif
 }
 
 // Prefill split-half RoPE. Rotates a `[seq_len, num_heads, head_dim]` tensor
@@ -1014,6 +1637,17 @@ __global__ void g4_scalar_mul_inplace_kernel(
 // MLP + PLE remain as separate primitive launches for now; extending this
 // kernel to cover them follows the same pattern and is the natural next step.
 // =============================================================================
+
+// Wave-level shuffle reduction (log2(warpSize) __shfl_xor instead of the
+// 8 __syncthreads + LDS tree). Uses runtime warpSize so the matvec loops
+// (which partition columns by warpSize * N) and this reduction agree on
+// wave width across both RDNA (32-lane) and CDNA (64-lane) backends.
+__device__ inline float g4_wave_reduce_sum_f32(float val) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset);
+    }
+    return val;
+}
 
 __device__ inline void g4_grid_barrier(
     unsigned int* barrier_counter,
@@ -2567,13 +3201,16 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
+        // Wave-per-row QKV matmul: each wave independently steals a row via
+        // atomicAdd + __shfl broadcast, accumulates with 4-wide BF16 loads,
+        // reduces with wave shuffle. No __syncthreads per row.
         {
+            const int lane = tid % warpSize;
             const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
             while (true) {
-                __shared__ unsigned int claimed;
-                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-                __syncthreads();
-                const unsigned int row = claimed;
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_qkv)) break;
 
                 const T* w;
@@ -2592,17 +3229,20 @@ __global__ void g4_persistent_decode_kernel(
                     w + static_cast<size_t>(weight_row) * hidden_size;
 
                 float p = 0.0f;
-                for (int c = tid; c < hidden_size; c += bs) {
+                const int vd4 = hidden_size & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(w_row[c]);
+                    float w1 = g4_to_float(w_row[c+1]);
+                    float w2 = g4_to_float(w_row[c+2]);
+                    float w3 = g4_to_float(w_row[c+3]);
+                    p += w0 * normed_f32[c]   + w1 * normed_f32[c+1]
+                       + w2 * normed_f32[c+2] + w3 * normed_f32[c+3];
+                }
+                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
                     p += g4_to_float(w_row[c]) * normed_f32[c];
                 }
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs / 2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) proj_f32[row] = lds[0];
-                __syncthreads();
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) proj_f32[row] = result;
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -2723,25 +3363,31 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
-            const T* wr = o_proj_w + static_cast<size_t>(row) * q_dim;
-            float p = 0.0f;
-            for (int c = tid; c < q_dim; c += bs) {
-                p += g4_to_float(wr[c]) * attn_out_f32[c];
+        // A7 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
+                const T* wr = o_proj_w + static_cast<size_t>(row) * q_dim;
+                float p = 0.0f;
+                const int vd4 = q_dim & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c+1]);
+                    float w2 = g4_to_float(wr[c+2]);
+                    float w3 = g4_to_float(wr[c+3]);
+                    p += w0 * attn_out_f32[c]   + w1 * attn_out_f32[c+1]
+                       + w2 * attn_out_f32[c+2] + w3 * attn_out_f32[c+3];
+                }
+                for (int c = vd4 + lane; c < q_dim; c += warpSize) {
+                    p += g4_to_float(wr[c]) * attn_out_f32[c];
+                }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) oproj_f32[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) oproj_f32[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -2820,13 +3466,14 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
+        // B2 wave-per-row.
         {
+            const int lane = tid % warpSize;
             const int total_mlp1 = 2 * intermediate_size;
             while (true) {
-                __shared__ unsigned int claimed;
-                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-                __syncthreads();
-                const unsigned int row = claimed;
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_mlp1)) break;
 
                 const T* w = (row < static_cast<unsigned int>(intermediate_size))
@@ -2838,17 +3485,20 @@ __global__ void g4_persistent_decode_kernel(
                 const T* wr = w + static_cast<size_t>(weight_row) * hidden_size;
 
                 float p = 0.0f;
-                for (int c = tid; c < hidden_size; c += bs) {
+                const int vd4 = hidden_size & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c+1]);
+                    float w2 = g4_to_float(wr[c+2]);
+                    float w3 = g4_to_float(wr[c+3]);
+                    p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
+                       + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
+                }
+                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
                     p += g4_to_float(wr[c]) * b_normed_ff[c];
                 }
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs / 2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) b_gate_up[row] = lds[0];
-                __syncthreads();
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_gate_up[row] = result;
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -2870,27 +3520,33 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
+        // B4 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-            const T* wr = down_proj_w +
-                static_cast<size_t>(row) * intermediate_size;
-            float p = 0.0f;
-            for (int c = tid; c < intermediate_size; c += bs) {
-                p += g4_to_float(wr[c]) * b_gated_proj[c];
+                const T* wr = down_proj_w +
+                    static_cast<size_t>(row) * intermediate_size;
+                float p = 0.0f;
+                const int vd4 = intermediate_size & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c+1]);
+                    float w2 = g4_to_float(wr[c+2]);
+                    float w3 = g4_to_float(wr[c+3]);
+                    p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
+                       + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
+                }
+                for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
+                    p += g4_to_float(wr[c]) * b_gated_proj[c];
+                }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_down_out[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_down_out[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -2913,27 +3569,33 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(ple_hidden)) break;
+        // B7 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(ple_hidden)) break;
 
-            const T* wr = pli_gate_w +
-                static_cast<size_t>(row) * hidden_size;
-            float p = 0.0f;
-            for (int c = tid; c < hidden_size; c += bs) {
-                p += g4_to_float(wr[c]) * b_h_pre_ple[c];
+                const T* wr = pli_gate_w +
+                    static_cast<size_t>(row) * hidden_size;
+                float p = 0.0f;
+                const int vd4 = hidden_size & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c+1]);
+                    float w2 = g4_to_float(wr[c+2]);
+                    float w3 = g4_to_float(wr[c+3]);
+                    p += w0 * b_h_pre_ple[c]   + w1 * b_h_pre_ple[c+1]
+                       + w2 * b_h_pre_ple[c+2] + w3 * b_h_pre_ple[c+3];
+                }
+                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                    p += g4_to_float(wr[c]) * b_h_pre_ple[c];
+                }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_gated_ple[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_gated_ple[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -2950,27 +3612,33 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
+        // B9 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-            const T* wr = pli_proj_w +
-                static_cast<size_t>(row) * ple_hidden;
-            float p = 0.0f;
-            for (int c = tid; c < ple_hidden; c += bs) {
-                p += g4_to_float(wr[c]) * b_gated_act[c];
+                const T* wr = pli_proj_w +
+                    static_cast<size_t>(row) * ple_hidden;
+                float p = 0.0f;
+                const int vd4 = ple_hidden & ~3;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c+1]);
+                    float w2 = g4_to_float(wr[c+2]);
+                    float w3 = g4_to_float(wr[c+3]);
+                    p += w0 * b_gated_act[c]   + w1 * b_gated_act[c+1]
+                       + w2 * b_gated_act[c+2] + w3 * b_gated_act[c+3];
+                }
+                for (int c = vd4 + lane; c < ple_hidden; c += warpSize) {
+                    p += g4_to_float(wr[c]) * b_gated_act[c];
+                }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_projected[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_projected[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -3812,13 +4480,14 @@ __global__ void g4_persistent_decode_int4_kernel(
         const int scale_cols_in = (hidden_size + gsz - 1) / gsz;
         const int byte_cols_in  = hidden_size / 2;
 
+        // A2 INT4 wave-per-row.
         {
+            const int lane = tid % warpSize;
             const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
             while (true) {
-                __shared__ unsigned int claimed;
-                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-                __syncthreads();
-                const unsigned int row = claimed;
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_qkv)) break;
 
                 const uint8_t*      w_packed_base;
@@ -3846,7 +4515,7 @@ __global__ void g4_persistent_decode_int4_kernel(
                     w_packed_base + static_cast<size_t>(weight_row) * byte_cols_in;
 
                 float p = 0.0f;
-                for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
+                for (int c0 = lane * 8; c0 < hidden_size; c0 += warpSize * 8) {
                     uint32_t packed;
                     __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
                     float w[8];
@@ -3857,14 +4526,8 @@ __global__ void g4_persistent_decode_int4_kernel(
                         p += w[k] * normed_f32[c0 + k];
                     }
                 }
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs / 2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) proj_f32[row] = lds[0];
-                __syncthreads();
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) proj_f32[row] = result;
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3988,37 +4651,34 @@ __global__ void g4_persistent_decode_int4_kernel(
         const int scale_cols_o = (q_dim + gsz - 1) / gsz;
         const int byte_cols_o  = q_dim / 2;
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
+        // A7 INT4 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-            const int scale_row = static_cast<int>(row) / gsz;
-            const uint8_t* w_row_bytes =
-                o_proj_packed + static_cast<size_t>(row) * byte_cols_o;
+                const int scale_row = static_cast<int>(row) / gsz;
+                const uint8_t* w_row_bytes =
+                    o_proj_packed + static_cast<size_t>(row) * byte_cols_o;
 
-            float p = 0.0f;
-            for (int c0 = tid * 8; c0 < q_dim; c0 += bs * 8) {
-                uint32_t packed;
-                __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
-                float w[8];
-                g4_int4_dequant_8(packed, o_proj_scale, o_proj_zero,
-                                  scale_row, c0, scale_cols_o, gsz, w);
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    p += w[k] * attn_out_f32[c0 + k];
+                float p = 0.0f;
+                for (int c0 = lane * 8; c0 < q_dim; c0 += warpSize * 8) {
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+                    float w[8];
+                    g4_int4_dequant_8(packed, o_proj_scale, o_proj_zero,
+                                      scale_row, c0, scale_cols_o, gsz, w);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        p += w[k] * attn_out_f32[c0 + k];
+                    }
                 }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) oproj_f32[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) oproj_f32[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4094,13 +4754,14 @@ __global__ void g4_persistent_decode_int4_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
+        // B2 INT4 wave-per-row.
         {
+            const int lane = tid % warpSize;
             const int total_mlp1 = 2 * intermediate_size;
             while (true) {
-                __shared__ unsigned int claimed;
-                if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-                __syncthreads();
-                const unsigned int row = claimed;
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_mlp1)) break;
 
                 const uint8_t*      w_packed_base;
@@ -4123,7 +4784,7 @@ __global__ void g4_persistent_decode_int4_kernel(
                     w_packed_base + static_cast<size_t>(weight_row) * byte_cols_in;
 
                 float p = 0.0f;
-                for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
+                for (int c0 = lane * 8; c0 < hidden_size; c0 += warpSize * 8) {
                     uint32_t packed;
                     __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
                     float w[8];
@@ -4134,14 +4795,8 @@ __global__ void g4_persistent_decode_int4_kernel(
                         p += w[k] * b_normed_ff[c0 + k];
                     }
                 }
-                lds[tid] = p;
-                __syncthreads();
-                for (int s = bs / 2; s > 0; s >>= 1) {
-                    if (tid < s) lds[tid] += lds[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) b_gate_up[row] = lds[0];
-                __syncthreads();
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_gate_up[row] = result;
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -4166,37 +4821,34 @@ __global__ void g4_persistent_decode_int4_kernel(
         const int scale_cols_i = (intermediate_size + gsz - 1) / gsz;
         const int byte_cols_i  = intermediate_size / 2;
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
+        // B4 INT4 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-            const int scale_row = static_cast<int>(row) / gsz;
-            const uint8_t* w_row_bytes =
-                down_proj_packed + static_cast<size_t>(row) * byte_cols_i;
+                const int scale_row = static_cast<int>(row) / gsz;
+                const uint8_t* w_row_bytes =
+                    down_proj_packed + static_cast<size_t>(row) * byte_cols_i;
 
-            float p = 0.0f;
-            for (int c0 = tid * 8; c0 < intermediate_size; c0 += bs * 8) {
-                uint32_t packed;
-                __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
-                float w[8];
-                g4_int4_dequant_8(packed, down_proj_scale, down_proj_zero,
-                                  scale_row, c0, scale_cols_i, gsz, w);
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    p += w[k] * b_gated_proj[c0 + k];
+                float p = 0.0f;
+                for (int c0 = lane * 8; c0 < intermediate_size; c0 += warpSize * 8) {
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+                    float w[8];
+                    g4_int4_dequant_8(packed, down_proj_scale, down_proj_zero,
+                                      scale_row, c0, scale_cols_i, gsz, w);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        p += w[k] * b_gated_proj[c0 + k];
+                    }
                 }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_down_out[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_down_out[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4220,37 +4872,34 @@ __global__ void g4_persistent_decode_int4_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(ple_hidden)) break;
+        // B7 INT4 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(ple_hidden)) break;
 
-            const int scale_row = static_cast<int>(row) / gsz;
-            const uint8_t* w_row_bytes =
-                pli_gate_packed + static_cast<size_t>(row) * byte_cols_in;
+                const int scale_row = static_cast<int>(row) / gsz;
+                const uint8_t* w_row_bytes =
+                    pli_gate_packed + static_cast<size_t>(row) * byte_cols_in;
 
-            float p = 0.0f;
-            for (int c0 = tid * 8; c0 < hidden_size; c0 += bs * 8) {
-                uint32_t packed;
-                __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
-                float w[8];
-                g4_int4_dequant_8(packed, pli_gate_scale, pli_gate_zero,
-                                  scale_row, c0, scale_cols_in, gsz, w);
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    p += w[k] * b_h_pre_ple[c0 + k];
+                float p = 0.0f;
+                for (int c0 = lane * 8; c0 < hidden_size; c0 += warpSize * 8) {
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+                    float w[8];
+                    g4_int4_dequant_8(packed, pli_gate_scale, pli_gate_zero,
+                                      scale_row, c0, scale_cols_in, gsz, w);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        p += w[k] * b_h_pre_ple[c0 + k];
+                    }
                 }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_gated_ple[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_gated_ple[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4271,37 +4920,34 @@ __global__ void g4_persistent_decode_int4_kernel(
         const int scale_cols_ple = (ple_hidden + gsz - 1) / gsz;
         const int byte_cols_ple  = ple_hidden / 2;
 
-        while (true) {
-            __shared__ unsigned int claimed;
-            if (tid == 0) claimed = atomicAdd(matvec_counter, 1u);
-            __syncthreads();
-            const unsigned int row = claimed;
-            if (row >= static_cast<unsigned int>(hidden_size)) break;
+        // B9 INT4 wave-per-row.
+        {
+            const int lane = tid % warpSize;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl(row, 0);
+                if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-            const int scale_row = static_cast<int>(row) / gsz;
-            const uint8_t* w_row_bytes =
-                pli_proj_packed + static_cast<size_t>(row) * byte_cols_ple;
+                const int scale_row = static_cast<int>(row) / gsz;
+                const uint8_t* w_row_bytes =
+                    pli_proj_packed + static_cast<size_t>(row) * byte_cols_ple;
 
-            float p = 0.0f;
-            for (int c0 = tid * 8; c0 < ple_hidden; c0 += bs * 8) {
-                uint32_t packed;
-                __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
-                float w[8];
-                g4_int4_dequant_8(packed, pli_proj_scale, pli_proj_zero,
-                                  scale_row, c0, scale_cols_ple, gsz, w);
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) {
-                    p += w[k] * b_gated_act[c0 + k];
+                float p = 0.0f;
+                for (int c0 = lane * 8; c0 < ple_hidden; c0 += warpSize * 8) {
+                    uint32_t packed;
+                    __builtin_memcpy(&packed, w_row_bytes + (c0 / 2), 4);
+                    float w[8];
+                    g4_int4_dequant_8(packed, pli_proj_scale, pli_proj_zero,
+                                      scale_row, c0, scale_cols_ple, gsz, w);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) {
+                        p += w[k] * b_gated_act[c0 + k];
+                    }
                 }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) b_projected[row] = result;
             }
-            lds[tid] = p;
-            __syncthreads();
-            for (int s = bs / 2; s > 0; s >>= 1) {
-                if (tid < s) lds[tid] += lds[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) b_projected[row] = lds[0];
-            __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 

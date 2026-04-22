@@ -2569,6 +2569,235 @@ __global__ void dotcache_qwen35_matmul_rhs_transposed_tiled_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA BF16 prefill matmul (wave32, 16x16x16 f32-accumulate), tiled.
+//
+// Computes: out[batch, m, n] = lhs[batch, m, k] × rhs[batch, n, k]^T
+//
+// Grid  : (ceil(n/64), ceil(m/64), batch_elems)
+// Block : 128 threads = 4 wavefronts arranged 2x2
+//
+// Each block computes a 64x64 output tile. The four wavefronts cooperate
+// to stage A (lhs) and B (rhs) source tiles through LDS, then each wave
+// runs WMMAs over its 32x32 sub-region (a 2x2 grid of 16x16 sub-tiles).
+// This amortizes the global loads of A and B by 4x each vs the previous
+// one-wave-per-16x16-tile kernel, which was suffering ~100x read
+// amplification for typical Qwen prefill shapes.
+// =============================================================================
+
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__)
+#define SUPERSONIC_HAS_WMMA_BF16 1
+#endif
+
+typedef short  supersonic_short16 __attribute__((ext_vector_type(16)));
+typedef float  supersonic_float8  __attribute__((ext_vector_type(8)));
+
+// Tile dimensions.
+constexpr int TILED_WMMA_BM = 64;   // output tile rows (m)
+constexpr int TILED_WMMA_BN = 64;   // output tile cols (n)
+constexpr int TILED_WMMA_BK = 64;   // K-step per outer iteration
+// LDS row stride padded by 1 DWORD (2 BF16) to break the 32-bank-aligned
+// access pattern; reduces WMMA operand gather bank conflicts.
+constexpr int TILED_WMMA_LDS_STRIDE = TILED_WMMA_BK + 2;  // BF16 units
+
+__global__ __launch_bounds__(128, 2)
+void dotcache_qwen35_matmul_rhs_transposed_tiled_wmma_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,   // [batch, m, k]
+    const hip_bfloat16* __restrict__ rhs,   // [batch, n, k] (virtually transposed)
+    hip_bfloat16* __restrict__ out          // [batch, m, n]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;       // 0..3
+    const int wave_row = wid >> 1;       // 0 or 1
+    const int wave_col = wid & 1;        // 0 or 1
+    const int lane_row = lane & 15;      // 0..15 (duplicated across lane_half)
+    const int lane_half = lane >> 4;     // 0 for lanes 0-15, 1 for lanes 16-31
+
+    const int batch   = blockIdx.z;
+    const int blk_row = blockIdx.y * TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * TILED_WMMA_BN;
+
+    // LDS staging tiles. Stored as uint16_t; BF16 bit-patterns.
+    __shared__ uint16_t s_lhs[TILED_WMMA_BM * TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_rhs[TILED_WMMA_BN * TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* lhs_u16 = reinterpret_cast<const uint16_t*>(lhs);
+    const uint16_t* rhs_u16 = reinterpret_cast<const uint16_t*>(rhs);
+
+    const size_t lhs_batch_base = static_cast<size_t>(batch) * m * k;
+    const size_t rhs_batch_base = static_cast<size_t>(batch) * n * k;
+
+    // 2x2 sub-tile accumulators for this wave's 32x32 output region.
+    supersonic_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32 (lane count)");
+    constexpr int K_COL_HALVES = TILED_WMMA_BK / 32;  // 1 per 32 lanes
+    constexpr int K_CHUNKS = TILED_WMMA_BK / 16;      // WMMA chunks of 16
+
+    const int k_main = k & ~(TILED_WMMA_BK - 1);
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += TILED_WMMA_BK) {
+        // --- Load A tile [BM=64, BK] into s_lhs ---
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < m) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + gk];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // --- Load B tile [BN=64, BK] into s_rhs ---
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gc < n) {
+                    v = rhs_u16[rhs_batch_base + static_cast<size_t>(gc) * k + gk];
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        __syncthreads();
+
+        // --- Compute: K_CHUNKS WMMA chunks of 16, 4 WMMAs each chunk ---
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // K tail when k % BK != 0. Qwen hidden/intermediate dims are multiples of
+    // 128 so this branch is unreachable in practice; keep it defensive.
+    if (k_main != k) {
+        const int k_rem = k - k_main;
+        // Load partial K slab; zero-pad cols >= k_rem. Still full BK cols in LDS
+        // so the compute loop below is uniform.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < m && col < k_rem) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + k_main + col];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gc < n && col < k_rem) {
+                    v = rhs_u16[rhs_batch_base + static_cast<size_t>(gc) * k + k_main + col];
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles. RDNA3 wave32 WMMA acc layout:
+    //   acc[i] for i in 0..7 → C[2*i + lane_half, lane_row]
+    // relative to the sub-tile's (0,0) corner.
+    const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const supersonic_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < n) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < m) {
+                    out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs; (void)out;
+#endif
+}
+
 template <typename T>
 __global__ void dotcache_qwen35_batched_matmul_view_kernel(
     int batch_rank,
@@ -2730,6 +2959,243 @@ __global__ void dotcache_qwen35_matmul_fp8_dequant_kernel(
     }
 }
 
+// =============================================================================
+// RDNA3 WMMA FP8-dequant prefill matmul (wave32, 16x16x16 f32-accumulate),
+// shared-memory tiled. Uses the same tile shape as the BF16 WMMA kernel
+// above (64x64 output, 4 waves in 2x2, BK=64 staged through LDS).
+//
+// B-tile load reads FP8 E4M3 bytes, multiplies by the per-block scale, and
+// rounds to BF16 before storing into LDS. The bridge gates this path on
+// `block_size % 64 == 0` so every BK-aligned K slab stays inside one scale
+// block (shipped FP8 bakes use block_size=128). Within one outer iter,
+// every row and every K-value in this block's 64x64 tile share one scalar
+// scale — BN=64 <= block_size=128 and blk_col is a multiple of 64, so the
+// 64 rows also lie inside a single scale_row.
+//
+// Bit-exactness note: the existing scalar FP8 kernel also rounds each
+// dequantized value to BF16 before accumulating, so the precision path is
+// equivalent (BF16 × BF16 → F32 WMMA accumulate here, vs F32 × BF16-rounded-F32
+// → F32 scalar accumulate there).
+// =============================================================================
+
+__global__ __launch_bounds__(128, 2)
+void dotcache_qwen35_matmul_fp8_dequant_wmma_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,   // [batch, m, k]
+    const uint8_t* __restrict__ rhs_fp8,    // [batch, n, k] FP8 E4M3
+    const hip_bfloat16* __restrict__ scale, // [n/block, k/block] BF16
+    int block_size,
+    hip_bfloat16* __restrict__ out          // [batch, m, n]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;
+    const int wave_row = wid >> 1;
+    const int wave_col = wid & 1;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+
+    const int batch   = blockIdx.z;
+    const int blk_row = blockIdx.y * TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * TILED_WMMA_BN;
+
+    __shared__ uint16_t s_lhs[TILED_WMMA_BM * TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_rhs[TILED_WMMA_BN * TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* lhs_u16 = reinterpret_cast<const uint16_t*>(lhs);
+
+    const int scale_cols = (k + block_size - 1) / block_size;
+    const size_t lhs_batch_base = static_cast<size_t>(batch) * m * k;
+    const size_t rhs_batch_base = static_cast<size_t>(batch) * n * k;
+
+    supersonic_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32");
+    constexpr int K_COL_HALVES = TILED_WMMA_BK / 32;
+    constexpr int K_CHUNKS     = TILED_WMMA_BK / 16;
+
+    const int k_main = k & ~(TILED_WMMA_BK - 1);
+
+    // Per-tile scale (constant across all rows and all K in this BK slab
+    // when block_size >= max(BN, BK) and block_size % both).
+    // Row index for the scale table is just blk_col / block_size since BN <= block_size.
+    const int scale_row = blk_col / block_size;
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += TILED_WMMA_BK) {
+        // Fetch the single scale for this tile's K slab. All 64 rows share
+        // the same scale_row; all BK K-values share the same scale_col.
+        float tile_scale = 0.f;
+        if (blk_col < n) {
+            int scale_col = kk0 / block_size;
+            tile_scale = static_cast<float>(scale[scale_row * scale_cols + scale_col]);
+        }
+
+        // Load A (lhs) tile BF16.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < m) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + gk];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // Load + dequantize B (rhs_fp8) tile (FP8 E4M3 -> BF16 via tile_scale).
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t stored = 0;
+                if (gc < n) {
+                    uint8_t fp8_byte = rhs_fp8[rhs_batch_base + static_cast<size_t>(gc) * k + gk];
+                    float fp8_val = fp8_e4m3_to_float(fp8_byte);
+                    float v = bf16_round_rne_f32_finite(fp8_val * tile_scale);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    stored = static_cast<uint16_t>(bits >> 16);
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = stored;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // Defensive K-tail (Qwen k is multiple of 128, so unreachable with BK=64).
+    if (k_main != k) {
+        const int k_rem = k - k_main;
+        float tile_scale = 0.f;
+        if (blk_col < n) {
+            int scale_col = k_main / block_size;
+            tile_scale = static_cast<float>(scale[scale_row * scale_cols + scale_col]);
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < m && col < k_rem) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + k_main + col];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t stored = 0;
+                if (gc < n && col < k_rem) {
+                    uint8_t fp8_byte = rhs_fp8[rhs_batch_base + static_cast<size_t>(gc) * k + k_main + col];
+                    float fp8_val = fp8_e4m3_to_float(fp8_byte);
+                    float v = bf16_round_rne_f32_finite(fp8_val * tile_scale);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    stored = static_cast<uint16_t>(bits >> 16);
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = stored;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles.
+    const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const supersonic_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < n) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < m) {
+                    out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs_fp8; (void)scale; (void)block_size; (void)out;
+#endif
+}
+
 // INT4 dequant tiled matmul for prefill.
 // out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_int4 [batch, n, k/2])^T
 // rhs_int4 is packed INT4 (2 weights per byte, low nibble = even k index).
@@ -2827,6 +3293,435 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
                          static_cast<size_t>(row) * n + col;
         out[out_idx] = dotcache_qwen35_from_float<T>(acc);
     }
+}
+
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matmul (wave32, 16x16x16 f32-accumulate),
+// one-wavefront-per-16x16-tile. Kept as a small-M fallback since the tiled
+// version below suffers proportionally larger tile-overhang waste (4x) when
+// M is much smaller than the 64-row tile, and INT4 has little bandwidth to
+// save by tiling (~4x less than BF16 packed).
+//
+//   lhs  [batch, m, k]          BF16
+//   rhs  [batch, n, k/2]        packed INT4 (low nibble = even k index)
+//   scl  [n/group, k/group]     BF16 scale
+//   zro  [n/group, k/group]     BF16 zero
+//   out  [batch, m, n]          BF16
+// =============================================================================
+
+__global__ void dotcache_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_int4,
+    const hip_bfloat16* __restrict__ scale,
+    const hip_bfloat16* __restrict__ zero,
+    int group_size,
+    hip_bfloat16* __restrict__ out
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_row = blockIdx.y * 16;
+    const int tile_col = blockIdx.x * 16;
+
+    const int lhs_row_idx = tile_row + lane_row;
+    const int rhs_row_idx = tile_col + lane_row;
+    const bool lhs_in_range = lhs_row_idx < m;
+    const bool rhs_in_range = rhs_row_idx < n;
+
+    const int k_packed = k / 2;
+    const int scale_cols = (k + group_size - 1) / group_size;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * m * k +
+                                static_cast<size_t>(lhs_row_idx) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * k_packed +
+                                static_cast<size_t>(rhs_row_idx) * k_packed;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t*  rhs_row_u8  = rhs_int4 + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = k & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        supersonic_short16 a;
+        if (lhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = static_cast<short>(lhs_row_u16[kk + i]);
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        supersonic_short16 b;
+        if (rhs_in_range) {
+            const int group_id = kk / group_size;
+            const int scale_idx = rhs_row_idx / group_size * scale_cols + group_id;
+            const float s = static_cast<float>(scale[scale_idx]);
+            const float z = static_cast<float>(zero[scale_idx]);
+            const float zs = z * s;
+            const int byte_base = kk >> 1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint8_t packed = rhs_row_u8[byte_base + i];
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                b[2 * i]     = static_cast<short>(b0 >> 16);
+                b[2 * i + 1] = static_cast<short>(b1 >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+    if (k_main != k) {
+        supersonic_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        supersonic_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (lhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < k) a[i] = static_cast<short>(lhs_row_u16[kc]);
+            }
+        }
+        if (rhs_in_range) {
+            const int group_id0 = k_main / group_size;
+            const int scale_idx = rhs_row_idx / group_size * scale_cols + group_id0;
+            const float s = static_cast<float>(scale[scale_idx]);
+            const float z = static_cast<float>(zero[scale_idx]);
+            const float zs = z * s;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < k) {
+                    uint8_t packed = rhs_row_u8[kc >> 1];
+                    int nib = (kc & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
+                    float v = bf16_round_rne_f32_finite(static_cast<float>(nib) * s - zs);
+                    uint32_t bits;
+                    __builtin_memcpy(&bits, &v, 4);
+                    b[i] = static_cast<short>(bits >> 16);
+                }
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    const int out_col = tile_col + lane_row;
+    if (out_col < n) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < m) {
+                out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs_int4; (void)scale; (void)zero; (void)group_size; (void)out;
+#endif
+}
+
+// =============================================================================
+// RDNA3 WMMA INT4-dequant prefill matmul (wave32, 16x16x16 f32-accumulate),
+// shared-memory tiled.
+//
+// Input layout matches dotcache_qwen35_matmul_int4_dequant_kernel:
+//   lhs  [batch, m, k]          BF16
+//   rhs  [batch, n, k/2]        packed INT4 (low nibble = even k index)
+//   scl  [n/group, k/group]     BF16 scale
+//   zro  [n/group, k/group]     BF16 zero
+//   out  [batch, m, n]          BF16
+//
+// Same 64x64 output tile + 2x2 wave grid + LDS staging as the BF16 tiled
+// kernel above. The only differences are the B-tile load (which dequantizes
+// packed INT4 into BF16 on the way into LDS) and the per-row scale/zero
+// fetch.
+//
+// Bit-exactness requirement: the dequant must match the Python GPTQ bake
+// and the per-lane naive kernel, so the round-trip is:
+//   val = bf16_round_rne_f32_finite(nibble * scale - zero * scale)
+// stored as BF16 (top 16 bits of the float).
+//
+// Group constraint: the bridge only dispatches to this kernel when
+// group_size % TILED_WMMA_BK == 0 (so every BK-wide K-slab lies inside one
+// quantization group and needs exactly one scale/zero fetch). Scalar
+// fallback covers other group sizes.
+// =============================================================================
+
+__global__ __launch_bounds__(128, 2)
+void dotcache_qwen35_matmul_int4_dequant_wmma_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,    // [batch, m, k]
+    const uint8_t* __restrict__ rhs_int4,    // [batch, n, k/2]
+    const hip_bfloat16* __restrict__ scale,  // [n/group, k/group]
+    const hip_bfloat16* __restrict__ zero,   // [n/group, k/group]
+    int group_size,
+    hip_bfloat16* __restrict__ out           // [batch, m, n]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;       // 0..3
+    const int wave_row = wid >> 1;       // 0 or 1
+    const int wave_col = wid & 1;        // 0 or 1
+    const int lane_row = lane & 15;
+    const int lane_half = lane >> 4;
+
+    const int batch   = blockIdx.z;
+    const int blk_row = blockIdx.y * TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * TILED_WMMA_BN;
+
+    __shared__ uint16_t s_lhs[TILED_WMMA_BM * TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_rhs[TILED_WMMA_BN * TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* lhs_u16 = reinterpret_cast<const uint16_t*>(lhs);
+
+    const int k_packed = k / 2;
+    const int scale_cols = (k + group_size - 1) / group_size;
+
+    const size_t lhs_batch_base = static_cast<size_t>(batch) * m * k;
+    const size_t rhs_batch_base = static_cast<size_t>(batch) * n * k_packed;
+
+    supersonic_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    static_assert(TILED_WMMA_BK % 32 == 0, "BK must be a multiple of 32 (BF16 load lanes)");
+    static_assert(TILED_WMMA_BK % 64 == 0, "BK must be a multiple of 64 (INT4 packs 2 K/byte, 32 lanes)");
+    constexpr int K_COL_HALVES = TILED_WMMA_BK / 32;     // BF16 A load passes
+    constexpr int K_INT4_PASSES = TILED_WMMA_BK / 64;    // INT4 B load passes
+    constexpr int K_CHUNKS     = TILED_WMMA_BK / 16;
+
+    const int k_main = k & ~(TILED_WMMA_BK - 1);
+
+    for (int kk0 = 0; kk0 < k_main; kk0 += TILED_WMMA_BK) {
+        // --- Load A tile [BM, BK] BF16 into s_lhs ---
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                int gk = kk0 + col;
+                uint16_t v = 0;
+                if (gr < m) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + gk];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // --- Load + dequantize B tile (INT4 -> BF16) into s_rhs ---
+        // Each lane reads one packed byte covering 2 K-values (low + high
+        // nibble). 32 lanes cover 64 K-values per pass; K_INT4_PASSES passes
+        // cover the full BK. The bridge guarantees group_size is a multiple
+        // of BK so all BK K-values in one outer iter share one scale/zero
+        // pair per row.
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            float s = 0.f;
+            float zs = 0.f;
+            if (gc < n) {
+                int group_id = kk0 / group_size;
+                int scale_idx = gc / group_size * scale_cols + group_id;
+                float s_val = static_cast<float>(scale[scale_idx]);
+                float z_val = static_cast<float>(zero[scale_idx]);
+                s = s_val;
+                zs = z_val * s_val;
+            }
+            #pragma unroll
+            for (int pass = 0; pass < K_INT4_PASSES; ++pass) {
+                int lane_byte = pass * 32 + lane;
+                int col_lo    = lane_byte * 2;      // K column (low nibble)
+                int col_hi    = col_lo + 1;         // K column (high nibble)
+                uint8_t packed = 0;
+                if (gc < n) {
+                    packed = rhs_int4[rhs_batch_base +
+                                      static_cast<size_t>(gc) * k_packed +
+                                      (kk0 >> 1) + lane_byte];
+                }
+                int n0 = packed & 0xF;
+                int n1 = (packed >> 4) & 0xF;
+                float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                uint32_t b0, b1;
+                __builtin_memcpy(&b0, &v0, 4);
+                __builtin_memcpy(&b1, &v1, 4);
+                uint16_t out_lo = (gc < n) ? static_cast<uint16_t>(b0 >> 16) : 0;
+                uint16_t out_hi = (gc < n) ? static_cast<uint16_t>(b1 >> 16) : 0;
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col_lo] = out_lo;
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col_hi] = out_hi;
+            }
+        }
+        __syncthreads();
+
+        // --- Compute: K_CHUNKS chunks of 16, 4 WMMAs each ---
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    // Defensive K-tail path. Qwen K is always a multiple of 128 and BK=64,
+    // so k_main == k in practice and this branch is unreachable. Left in
+    // case of future bakes with unusual shapes.
+    if (k_main != k) {
+        const int k_rem = k - k_main;
+        // A tail
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < m && col < k_rem) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + k_main + col];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+        // B tail (dequantized)
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            int lds_row = wid * 16 + iter;
+            int gc = blk_col + lds_row;
+            float s = 0.f;
+            float zs = 0.f;
+            if (gc < n) {
+                int group_id = k_main / group_size;
+                int scale_idx = gc / group_size * scale_cols + group_id;
+                float s_val = static_cast<float>(scale[scale_idx]);
+                float z_val = static_cast<float>(zero[scale_idx]);
+                s = s_val;
+                zs = z_val * s_val;
+            }
+            #pragma unroll
+            for (int pass = 0; pass < K_INT4_PASSES; ++pass) {
+                int lane_byte = pass * 32 + lane;
+                int col_lo    = lane_byte * 2;
+                int col_hi    = col_lo + 1;
+                uint16_t out_lo = 0;
+                uint16_t out_hi = 0;
+                if (gc < n) {
+                    uint8_t packed = 0;
+                    if (col_lo < k_rem || col_hi < k_rem) {
+                        packed = rhs_int4[rhs_batch_base +
+                                          static_cast<size_t>(gc) * k_packed +
+                                          (k_main >> 1) + lane_byte];
+                    }
+                    if (col_lo < k_rem) {
+                        int n0 = packed & 0xF;
+                        float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                        uint32_t b0;
+                        __builtin_memcpy(&b0, &v0, 4);
+                        out_lo = static_cast<uint16_t>(b0 >> 16);
+                    }
+                    if (col_hi < k_rem) {
+                        int n1 = (packed >> 4) & 0xF;
+                        float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                        uint32_t b1;
+                        __builtin_memcpy(&b1, &v1, 4);
+                        out_hi = static_cast<uint16_t>(b1 >> 16);
+                    }
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col_lo] = out_lo;
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col_hi] = out_hi;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short16 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + 0  + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + 0  + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
+            }
+
+            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
+            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
+            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
+            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+        }
+    }
+
+    // Store 4 sub-tiles, same layout as the BF16 tiled kernel.
+    const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const supersonic_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < n) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                int out_row = sub_row_base + sub_row_off + 2 * i + lane_half;
+                if (out_row < m) {
+                    out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs_int4; (void)scale; (void)zero; (void)group_size; (void)out;
+#endif
 }
 
 template <typename T>
@@ -3773,11 +4668,12 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 
 // Wave-level sum reduction using DPP/shuffle (Wave32 on RDNA3.5)
 __device__ inline float wave_reduce_sum_f32(float val) {
-    val += __shfl_xor(val, 16);
-    val += __shfl_xor(val, 8);
-    val += __shfl_xor(val, 4);
-    val += __shfl_xor(val, 2);
-    val += __shfl_xor(val, 1);
+    // Use runtime warpSize so this agrees with matvec loops that partition
+    // columns by `warpSize * N`. On gfx1150 (wave32) the loop unrolls to
+    // the same 5 __shfl_xor ops; on CDNA (wave64) it covers all 64 lanes.
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset);
+    }
     return val;
 }
 
@@ -4684,7 +5580,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             // b_proj and a_proj have linear_num_v_heads rows (not num_k_heads)
             const int nv_heads = L.linear_num_v_heads;
             const int total_proj = L.qkv_out_dim + L.z_out_dim + nv_heads + nv_heads;
-            {
+            // INT4 on small models keeps block-level reduction for bit-exact
+            // numerics: 0.8B INT4 argmax was knife-edge sensitive to the
+            // wave-per-row reassociation (PR #20). 2B/4B/9B INT4 are
+            // token-exact under wave-per-row so they fall through to the
+            // fast path below alongside BF16/FP8.
+            if (int4_scales != nullptr && hidden_dim <= 1024) {
                 for (;;) {
                     unsigned int sr;
                     if (tid == 0) sr = atomicAdd(&counters[0], 1u);
@@ -4695,36 +5596,37 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     if (sr >= static_cast<unsigned int>(total_proj)) break;
 
                     const void* w_raw;
-                    const void* w_scale = nullptr;
+                    const void* w_scale = nullptr;      // FP8 scale (may coexist)
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
                         w_raw = L.qkv_proj_w;
                         row = sr;
+                        w_i4_scale = int4_scales[layer].qkv_proj_scale;
+                        w_i4_zero = int4_scales[layer].qkv_proj_zero;
                         if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
+                        w_i4_scale = int4_scales[layer].z_proj_scale;
+                        w_i4_zero = int4_scales[layer].z_proj_zero;
                         if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
+                        // b_proj: no INT4 variant
                         if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
-                        // b_proj: keep BF16 (only 16 rows, no INT4)
                     } else {
                         w_raw = L.a_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                        // a_proj: no INT4 variant
                         if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
-                        // a_proj: keep BF16 (only 16 rows, no INT4)
                     }
 
                     float p[MAX_BATCH_SIZE];
                     for (int b = 0; b < B; b++) p[b] = 0.0f;
-                    if (int4_scales != nullptr && w_i4_scale != nullptr) {
-                        // INT4 dequant path for qkv/z projections
+                    if (w_i4_scale != nullptr) {
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = hidden_dim / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
@@ -4748,7 +5650,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
-                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                    } else if (w_scale != nullptr) {
                         for (int c = tid; c < hidden_dim; c += bs) {
                             float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
                             for (int b = 0; b < B; b++)
@@ -4783,6 +5685,98 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         if (tid == 0)
                             proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(lds[0]);
                         __syncthreads();
+                    }
+                }
+            } else {
+                const int lane_p = tid % warpSize;
+                for (;;) {
+                    unsigned int sr;
+                    if (lane_p == 0) sr = atomicAdd(&counters[0], 1u);
+                    sr = __shfl(sr, 0);
+                    if (sr >= static_cast<unsigned int>(total_proj)) break;
+
+                    const void* w_raw;
+                    const void* w_scale = nullptr;
+                    const void* w_i4_scale = nullptr;
+                    const void* w_i4_zero = nullptr;
+                    int row;
+                    if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
+                        w_raw = L.qkv_proj_w;
+                        row = sr;
+                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
+                        w_raw = L.z_proj_w;
+                        row = sr - L.qkv_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
+                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
+                        w_raw = L.b_proj_w;
+                        row = sr - L.qkv_out_dim - L.z_out_dim;
+                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
+                        // b_proj: no INT4 variant
+                    } else {
+                        w_raw = L.a_proj_w;
+                        row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
+                        // a_proj: no INT4 variant
+                    }
+
+                    float p[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) p[b] = 0.0f;
+                    if (w_i4_scale != nullptr) {
+                        const int gsz = int4_scales[layer].group_size;
+                        const int byte_cols = hidden_dim / 2;
+                        const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
+                        const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(w_i4_scale);
+                        const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(w_i4_zero);
+                        const int sr_g = row / gsz;
+                        const int sc_cols = (hidden_dim + gsz - 1) / gsz;
+                        const int vd8 = hidden_dim & ~7;
+                        for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
+                            uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                            float w[8];
+                            int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
+                                      + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
+                            }
+                        }
+                        for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
+                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                        for (int c = lane_p; c < hidden_dim; c += warpSize) {
+                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    } else {
+                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                        const int vd4 = hidden_dim & ~3;
+                        for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                            float w0 = dotcache_qwen35_to_float(wr[c]);
+                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                            }
+                        }
+                        for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                            float w = dotcache_qwen35_to_float(wr[c]);
+                            for (int b = 0; b < B; b++)
+                                p[b] += w * lds_input[b * hidden_dim + c];
+                        }
+                    }
+                    for (int b = 0; b < B; b++) {
+                        float result = wave_reduce_sum_f32(p[b]);
+                        if (lane_p == 0)
+                            proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(result);
                     }
                 }
             }
@@ -4931,107 +5925,112 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     __syncthreads();
                 }
 
-                // Step C: Parallel delta recurrent state update
-                // state: [nv, hkd, hvd] F32 — the recurrent memory
-                // 256 threads process 2 heads at a time: threads 0-127 → head h,
-                // threads 128-255 → head h+1. Each thread owns one v-dimension.
-                // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
-                //           state += outer(key, delta), output = state @ query
-                {
-                    float* conv_out = gate_up_b;  // reused
-                    float* state = static_cast<float*>(rec_b);
+            } // end if (blockIdx.x == 0) for conv1d + L2-norm (steps B + C0)
+            // Sync so all blocks see conv_out (gate_up_b) populated before the
+            // multi-block delta recurrent step below.
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                    const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
-                    const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
+            // Step C: Parallel delta recurrent state update — multi-block.
+            // state: [nv, hkd, hvd] F32 — the recurrent memory.
+            // Each thread owns one (head, v) pair. Block bid processes heads
+            // h = bid, bid+nb, bid+2*nb, ... — a stride loop so 4B's nv=32
+            // still fits in nb=16 blocks (each block handles 2 heads).
+            // State slices are disjoint across heads so no cross-block races.
+            if (tid < L.linear_head_v_dim) {
+                float* proj_b_ = proj_buf + b * proj_buf_floats;
+                float* b_f32_ = proj_b_ + L.qkv_out_dim + L.z_out_dim;
+                float* a_f32_ = b_f32_ + nv_heads;
+                float* conv_out = gate_up + b * intermediate_size * 2;
+                float* state = static_cast<float*>(rec_b);
+                float* attn_scratch_b_ = attn_scratch + b * attn_scratch_floats;
 
-                    const int q_key_offset = 0;
-                    const int k_key_offset = key_dim;
-                    const int v_val_offset = key_dim * 2;
-                    const int v = tid % hvd;          // v-dimension for this thread
+                const int nv = L.linear_num_v_heads;
+                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
+                const int hkd = L.linear_head_k_dim;
+                const int hvd = L.linear_head_v_dim;
+                const int key_dim = nk * hkd;
+                const int q_key_offset = 0;
+                const int k_key_offset = key_dim;
+                const int v_val_offset = key_dim * 2;
 
-                    // Process 2 heads per iteration (256 threads / 128 hvd)
-                    for (int hp = 0; hp < nv; hp += 2) {
-                        const int h = hp + (tid >= hvd ? 1 : 0);
+                const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
+                const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
 
-                        if (h < nv) {
-                            float* sh = state + h * hkd * hvd;
-                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
-                            float decay = 1.0f;
-                            if (dt_bw != nullptr && ale_w != nullptr) {
-                                const float sp = logf(1.0f + expf(
-                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
-                            }
+                const int v = tid;
+                for (int h = blockIdx.x; h < nv; h += nb) {
+                    float* sh = state + h * hkd * hvd;
 
-                            // Apply decay: state *= exp(g)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] *= decay;
-                            }
-
-                            // Map value head to key head for Q/K indexing
-                            // nk key heads shared among nv value heads
-                            const int h_k = h * nk / nv;
-
-                            // kv_mem[v] = sum_k(state[k, v] * key[k])
-                            float kv_mem_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                kv_mem_v += sh[k * hvd + v]
-                                          * conv_out[k_key_offset + h_k * hkd + k];
-                            }
-
-                            // delta = (value - kv_mem) * beta
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            const float delta = (val - kv_mem_v) * beta;
-
-                            // state[k, v] += key[k] * delta (each thread owns its v)
-                            for (int k = 0; k < hkd; ++k) {
-                                sh[k * hvd + v] +=
-                                    conv_out[k_key_offset + h_k * hkd + k] * delta;
-                            }
-
-                            // output[v] = sum_k(state[k, v] * query[k])
-                            float out_v = 0.0f;
-                            for (int k = 0; k < hkd; ++k) {
-                                out_v += sh[k * hvd + v]
-                                       * conv_out[q_key_offset + h_k * hkd + k];
-                            }
-
-                            attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
-                        }
-                        __syncthreads();
+                    const float beta = 1.0f / (1.0f + expf(-b_f32_[h]));
+                    float decay = 1.0f;
+                    if (dt_bw != nullptr && ale_w != nullptr) {
+                        const float sp = logf(1.0f + expf(
+                            a_f32_[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                        decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
                     }
+
+                    for (int k = 0; k < hkd; ++k) {
+                        sh[k * hvd + v] *= decay;
+                    }
+
+                    const int h_k = h * nk / nv;
+
+                    float kv_mem_v = 0.0f;
+                    for (int k = 0; k < hkd; ++k) {
+                        kv_mem_v += sh[k * hvd + v]
+                                  * conv_out[k_key_offset + h_k * hkd + k];
+                    }
+
+                    const float val = conv_out[v_val_offset + h * hvd + v];
+                    const float delta = (val - kv_mem_v) * beta;
+
+                    for (int k = 0; k < hkd; ++k) {
+                        sh[k * hvd + v] +=
+                            conv_out[k_key_offset + h_k * hkd + k] * delta;
+                    }
+
+                    float out_v = 0.0f;
+                    for (int k = 0; k < hkd; ++k) {
+                        out_v += sh[k * hvd + v]
+                               * conv_out[q_key_offset + h_k * hkd + k];
+                    }
+
+                    attn_scratch_b_[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
                 }
+            }
+            // Sync so all blocks see attn_scratch_b populated before block 0
+            // runs the gated RMSNorm in step D.
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                __syncthreads();
-
+            if (blockIdx.x == 0) {
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
-                {
-                    const float* nw = static_cast<const float*>(L.linear_norm_w);
-                    if (tid < nv) {
-                        const int h = tid;
-                        const float* ho = attn_scratch_b + h * hvd;
-                        float sq = 0.0f;
-                        for (int j = 0; j < hvd; ++j)
-                            sq += ho[j] * ho[j];
-                        lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
-                    }
-                    __syncthreads();
-                    for (int d = tid; d < val_dim; d += bs) {
-                        const int h = d / hvd;
-                        const int hd_idx = d % hvd;
-                        float rms_inv = lds[h];
-                        float n = attn_scratch_b[d] * rms_inv;
-                        float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
-                        float zv = z_f32[d];
-                        attn_scratch_b[d] = bf16_round_rne_f32_finite(
-                            n * w * (zv * dotcache_qwen35_sigmoid_fast(zv)));
-                    }
-                    __syncthreads();
+                const int nv = L.linear_num_v_heads;
+                const int hvd = L.linear_head_v_dim;
+                const int val_dim_ = L.linear_value_dim;
+                const float* nw = static_cast<const float*>(L.linear_norm_w);
+                float* z_f32_ = proj_b + L.qkv_out_dim;
+                float* attn_scratch_bd = attn_scratch + b * attn_scratch_floats;
+                if (tid < nv) {
+                    const int h = tid;
+                    const float* ho = attn_scratch_bd + h * hvd;
+                    float sq = 0.0f;
+                    for (int j = 0; j < hvd; ++j)
+                        sq += ho[j] * ho[j];
+                    lds[h] = rsqrtf(sq / static_cast<float>(hvd) + L.linear_norm_eps);
                 }
-
-            } // end if (blockIdx.x == 0) for linear attention core
-            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+                __syncthreads();
+                for (int d = tid; d < val_dim_; d += bs) {
+                    const int h = d / hvd;
+                    const int hd_idx = d % hvd;
+                    float rms_inv = lds[h];
+                    float n = attn_scratch_bd[d] * rms_inv;
+                    float w = (nw != nullptr) ? bf16_round_rne_f32_finite(nw[hd_idx]) : 1.0f;
+                    float zv = z_f32_[d];
+                    attn_scratch_bd[d] = bf16_round_rne_f32_finite(
+                        n * w * (zv * dotcache_qwen35_sigmoid_fast(zv)));
+                }
+                __syncthreads();
+            }
+            // Final grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
             grid_barrier(barrier_counter, barrier_flag, nb);
             qwen35_4b_hip_record_timing(
                 layer_timing_slots,
@@ -5051,17 +6050,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
                 grid_barrier(barrier_counter, barrier_flag, nb);
 
-                for (;;) {
-                    unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __shared__ unsigned int shared_sr;
-                    if (tid == 0) shared_sr = sr;
-                    __syncthreads();
-                    sr = shared_sr;
-                    if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+                // INT4 on small models keeps block-level reduction (see
+                // PR #20 for the 0.8B argmax sensitivity). Larger hidden_dim
+                // (2B/4B/9B) falls through to wave-per-row.
+                const bool out_int4 =
+                    (int4_scales != nullptr &&
+                     int4_scales[layer].linear_out_proj_scale != nullptr);
+                if (out_int4 && hidden_dim <= 1024) {
+                    for (;;) {
+                        unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __shared__ unsigned int shared_sr;
+                        if (tid == 0) shared_sr = sr;
+                        __syncthreads();
+                        sr = shared_sr;
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    float p = 0.0f;
-                    if (int4_scales != nullptr && int4_scales[layer].linear_out_proj_scale != nullptr) {
+                        float p = 0.0f;
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = vd / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
@@ -5079,34 +6084,79 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         for (int c = vd8 + tid; c < vd; c += bs)
                             p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
-                    } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
-                        for (int c = tid; c < vd; c += bs)
-                            p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
-                    } else {
-                        const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
-                        if (kv_fp8 != nullptr) {
-                            if (tid == 0) {
-                                for (int c = 0; c < vd; ++c) {
-                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                                }
-                            }
-                        } else {
-                            for (int c = tid; c < vd; c += bs)
-                                p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
+                            if (tid < stride) lds[tid] += lds[tid + stride];
+                            __syncthreads();
                         }
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
+                        if (tid == 0) {
+                            float add = bf16_round_rne_f32_finite(lds[0]);
+                            hidden_f32[b * hidden_dim + sr] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                        }
                         __syncthreads();
                     }
-                    if (tid == 0) {
-                        float add = bf16_round_rne_f32_finite(lds[0]);
-                        hidden_f32[b * hidden_dim + sr] =
-                            bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                } else {
+                    const int lane_o = tid % warpSize;
+                    for (;;) {
+                        unsigned int sr;
+                        if (lane_o == 0) sr = atomicAdd(&counters[0], 1u);
+                        sr = __shfl(sr, 0);
+                        if (sr >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        float p = 0.0f;
+                        if (out_int4) {
+                            const int gsz = int4_scales[layer].group_size;
+                            const int byte_cols = vd / 2;
+                            const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
+                            const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_scale);
+                            const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_zero);
+                            const int sr_g = sr / gsz;
+                            const int sc_cols = (vd + gsz - 1) / gsz;
+                            const int vd8 = vd & ~7;
+                            for (int c = lane_o * 8; c < vd8; c += warpSize * 8) {
+                                uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                                float w[8];
+                                int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                                p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
+                                   + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
+                            }
+                            for (int c = vd8 + lane_o; c < vd; c += warpSize)
+                                p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
+                        } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
+                            for (int c = lane_o; c < vd; c += warpSize)
+                                p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
+                        } else {
+                            const T* wr = static_cast<const T*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * vd;
+                            if (kv_fp8 != nullptr) {
+                                if (lane_o == 0) {
+                                    for (int c = 0; c < vd; ++c) {
+                                        p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                                    }
+                                }
+                            } else {
+                                const int vd4 = vd & ~3;
+                                for (int c = lane_o * 4; c < vd4; c += warpSize * 4) {
+                                    float w0 = dotcache_qwen35_to_float(wr[c]);
+                                    float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                    float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                    float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                    p += w0 * lds_input[c]   + w1 * lds_input[c+1]
+                                       + w2 * lds_input[c+2] + w3 * lds_input[c+3];
+                                }
+                                for (int c = vd4 + lane_o; c < vd; c += warpSize)
+                                    p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                            }
+                        }
+                        float result = wave_reduce_sum_f32(p);
+                        if (lane_o == 0) {
+                            float add = bf16_round_rne_f32_finite(result);
+                            hidden_f32[b * hidden_dim + sr] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + sr] + add);
+                        }
                     }
-                    __syncthreads();
                 }
             }
             __syncthreads();
@@ -5171,7 +6221,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
         __syncthreads();
 
         // === Fused MLP gate+up+SwiGLU (all blocks work-steal, BATCHED) ===
-        // Use full-block reductions here for parity with the component path.
+        // BF16/FP8 use wave-per-row with shuffle reduction; INT4 keeps
+        // block-level reduction for bit-exact numerics (same reassociation
+        // sensitivity pattern as linear_proj/out, see PR #20).
         const unsigned long long mlp_gate_up_clock = clock64();
         if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
         grid_barrier(barrier_counter, barrier_flag, nb);
@@ -5181,19 +6233,20 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             const bool up_fp8 = (fp8_scales != nullptr && fp8_scales[layer].up_proj_scale != nullptr);
             const bool gate_int4 = (int4_scales != nullptr && int4_scales[layer].gate_proj_scale != nullptr);
             const bool up_int4 = (int4_scales != nullptr && int4_scales[layer].up_proj_scale != nullptr);
-            __shared__ unsigned int shared_row_mlp;
+            const bool mlp_int4 = (gate_int4 || up_int4);
 
-            for (;;) {
-                if (tid == 0) shared_row_mlp = atomicAdd(&counters[0], 1u);
-                __syncthreads();
-                unsigned int my_row = shared_row_mlp;
-                if (my_row >= static_cast<unsigned int>(L.intermediate_size)) break;
+            if (mlp_int4 && hidden_dim <= 1024) {
+                __shared__ unsigned int shared_row_mlp;
+                for (;;) {
+                    if (tid == 0) shared_row_mlp = atomicAdd(&counters[0], 1u);
+                    __syncthreads();
+                    unsigned int my_row = shared_row_mlp;
+                    if (my_row >= static_cast<unsigned int>(L.intermediate_size)) break;
 
-                float gp[MAX_BATCH_SIZE];
-                float up[MAX_BATCH_SIZE];
-                for (int b = 0; b < B; b++) { gp[b] = 0.0f; up[b] = 0.0f; }
+                    float gp[MAX_BATCH_SIZE];
+                    float up[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) { gp[b] = 0.0f; up[b] = 0.0f; }
 
-                if (gate_int4 || up_int4) {
                     const int gsz = int4_scales[layer].group_size;
                     const int byte_cols = hidden_dim / 2;
                     const uint8_t* g_i4 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * byte_cols;
@@ -5228,104 +6281,168 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             up[b] += uw * inp;
                         }
                     }
-                } else if (gate_fp8 || up_fp8) {
-                    const uint8_t* g_fp8 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
-                    const uint8_t* u_fp8 = static_cast<const uint8_t*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
-                    const hip_bfloat16* g_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].gate_proj_scale);
-                    const hip_bfloat16* u_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].up_proj_scale);
-                    const int bsz = fp8_scales[layer].block_size;
-                    const int g_scale_row = my_row / bsz;
-                    const int scale_cols = (hidden_dim + bsz - 1) / bsz;
-                    const int vd4 = hidden_dim & ~3;
-                    for (int c = tid * 4; c < vd4; c += bs * 4) {
-                        uint32_t gp4 = *reinterpret_cast<const uint32_t*>(&g_fp8[c]);
-                        uint32_t up4 = *reinterpret_cast<const uint32_t*>(&u_fp8[c]);
-                        const int sb = g_scale_row * scale_cols;
-                        float gs0 = static_cast<float>(g_scales[sb + c / bsz]);
-                        float gs1 = static_cast<float>(g_scales[sb + (c+1) / bsz]);
-                        float gs2 = static_cast<float>(g_scales[sb + (c+2) / bsz]);
-                        float gs3 = static_cast<float>(g_scales[sb + (c+3) / bsz]);
-                        float us0 = static_cast<float>(u_scales[sb + c / bsz]);
-                        float us1 = static_cast<float>(u_scales[sb + (c+1) / bsz]);
-                        float us2 = static_cast<float>(u_scales[sb + (c+2) / bsz]);
-                        float us3 = static_cast<float>(u_scales[sb + (c+3) / bsz]);
-                        float gw0 = bf16_round_rne_f32_finite((fp8_lut[gp4 & 0xFF] * gs0));
-                        float gw1 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>8) & 0xFF] * gs1));
-                        float gw2 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>16) & 0xFF] * gs2));
-                        float gw3 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>24)] * gs3));
-                        float uw0 = bf16_round_rne_f32_finite((fp8_lut[up4 & 0xFF] * us0));
-                        float uw1 = bf16_round_rne_f32_finite((fp8_lut[(up4>>8) & 0xFF] * us1));
-                        float uw2 = bf16_round_rne_f32_finite((fp8_lut[(up4>>16) & 0xFF] * us2));
-                        float uw3 = bf16_round_rne_f32_finite((fp8_lut[(up4>>24)] * us3));
-                        for (int b = 0; b < B; b++) {
-                            const float* inp = lds_input + b * hidden_dim + c;
-                            gp[b] += gw0*inp[0] + gw1*inp[1] + gw2*inp[2] + gw3*inp[3];
-                            up[b] += uw0*inp[0] + uw1*inp[1] + uw2*inp[2] + uw3*inp[3];
+
+                    for (int b = 0; b < B; b++) {
+                        lds[tid] = gp[b];
+                        __syncthreads();
+                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
+                            if (tid < stride) lds[tid] += lds[tid + stride];
+                            __syncthreads();
                         }
-                    }
-                    for (int c = vd4 + tid; c < hidden_dim; c += bs) {
-                        float gw = fp8_dequant_weight_lut(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
-                        float uw = fp8_dequant_weight_lut(L.up_proj_w, fp8_scales[layer].up_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
-                        for (int b = 0; b < B; b++) {
-                            float inp = lds_input[b * hidden_dim + c];
-                            gp[b] += gw * inp;
-                            up[b] += uw * inp;
+                        float g = bf16_round_rne_f32_finite(lds[0]);
+                        lds[tid] = up[b];
+                        __syncthreads();
+                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
+                            if (tid < stride) lds[tid] += lds[tid + stride];
+                            __syncthreads();
                         }
-                    }
-                } else {
-                    const T* gr = static_cast<const T*>(L.gate_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
-                    const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
-                    const int vec_dim = hidden_dim & ~3;
-                    for (int c = tid * 4; c < vec_dim; c += bs * 4) {
-                        float gw0 = dotcache_qwen35_to_float(gr[c]);
-                        float gw1 = dotcache_qwen35_to_float(gr[c+1]);
-                        float gw2 = dotcache_qwen35_to_float(gr[c+2]);
-                        float gw3 = dotcache_qwen35_to_float(gr[c+3]);
-                        float uw0 = dotcache_qwen35_to_float(ur[c]);
-                        float uw1 = dotcache_qwen35_to_float(ur[c+1]);
-                        float uw2 = dotcache_qwen35_to_float(ur[c+2]);
-                        float uw3 = dotcache_qwen35_to_float(ur[c+3]);
-                        for (int b = 0; b < B; b++) {
-                            const float* inp = lds_input + b * hidden_dim + c;
-                            gp[b] += gw0 * inp[0] + gw1 * inp[1] + gw2 * inp[2] + gw3 * inp[3];
-                            up[b] += uw0 * inp[0] + uw1 * inp[1] + uw2 * inp[2] + uw3 * inp[3];
+                        float u = bf16_round_rne_f32_finite(lds[0]);
+                        if (tid == 0) {
+                            float silu = g / (1.0f + expf(-g));
+                            gate_up[b * intermediate_size * 2 + my_row] =
+                                bf16_round_rne_f32_finite(silu * u);
                         }
-                    }
-                    for (int c = vec_dim + tid; c < hidden_dim; c += bs) {
-                        float gw = dotcache_qwen35_to_float(gr[c]);
-                        float uw = dotcache_qwen35_to_float(ur[c]);
-                        for (int b = 0; b < B; b++) {
-                            float inp = lds_input[b * hidden_dim + c];
-                            gp[b] += gw * inp;
-                            up[b] += uw * inp;
-                        }
+                        __syncthreads();
                     }
                 }
+            } else {
+                const int lane_p = tid % warpSize;
+                for (;;) {
+                    unsigned int my_row;
+                    if (lane_p == 0) my_row = atomicAdd(&counters[0], 1u);
+                    my_row = __shfl(my_row, 0);
+                    if (my_row >= static_cast<unsigned int>(L.intermediate_size)) break;
 
-                for (int b = 0; b < B; b++) {
-                    lds[tid] = gp[b];
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
+                    float gp[MAX_BATCH_SIZE];
+                    float up[MAX_BATCH_SIZE];
+                    for (int b = 0; b < B; b++) { gp[b] = 0.0f; up[b] = 0.0f; }
+
+                    if (mlp_int4) {
+                        const int gsz = int4_scales[layer].group_size;
+                        const int byte_cols = hidden_dim / 2;
+                        const uint8_t* g_i4 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * byte_cols;
+                        const uint8_t* u_i4 = static_cast<const uint8_t*>(L.up_proj_w) + static_cast<size_t>(my_row) * byte_cols;
+                        const hip_bfloat16* g_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].gate_proj_scale);
+                        const hip_bfloat16* g_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].gate_proj_zero);
+                        const hip_bfloat16* u_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_scale);
+                        const hip_bfloat16* u_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_zero);
+                        const int g_sr = my_row / gsz;
+                        const int sc_cols = (hidden_dim + gsz - 1) / gsz;
+                        const int vd8 = hidden_dim & ~7;
+                        for (int c = lane_p * 8; c < vd8; c += warpSize * 8) {
+                            uint32_t gpk = *reinterpret_cast<const uint32_t*>(&g_i4[c / 2]);
+                            uint32_t upk = *reinterpret_cast<const uint32_t*>(&u_i4[c / 2]);
+                            float gw[8], uw[8];
+                            int4_dequant_8(gpk, g_sc, g_zr, g_sr, c, sc_cols, gsz, gw);
+                            int4_dequant_8(upk, u_sc, u_zr, g_sr, c, sc_cols, gsz, uw);
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                gp[b] += gw[0]*inp[0] + gw[1]*inp[1] + gw[2]*inp[2] + gw[3]*inp[3]
+                                       + gw[4]*inp[4] + gw[5]*inp[5] + gw[6]*inp[6] + gw[7]*inp[7];
+                                up[b] += uw[0]*inp[0] + uw[1]*inp[1] + uw[2]*inp[2] + uw[3]*inp[3]
+                                       + uw[4]*inp[4] + uw[5]*inp[5] + uw[6]*inp[6] + uw[7]*inp[7];
+                            }
+                        }
+                        for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
+                            float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz);
+                            float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz);
+                            for (int b = 0; b < B; b++) {
+                                float inp = lds_input[b * hidden_dim + c];
+                                gp[b] += gw * inp;
+                                up[b] += uw * inp;
+                            }
+                        }
+                    } else if (gate_fp8 || up_fp8) {
+                        const uint8_t* g_fp8 = static_cast<const uint8_t*>(L.gate_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
+                        const uint8_t* u_fp8 = static_cast<const uint8_t*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
+                        const hip_bfloat16* g_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].gate_proj_scale);
+                        const hip_bfloat16* u_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].up_proj_scale);
+                        const int bsz = fp8_scales[layer].block_size;
+                        const int g_scale_row = my_row / bsz;
+                        const int scale_cols = (hidden_dim + bsz - 1) / bsz;
+                        const int vd4 = hidden_dim & ~3;
+                        for (int c = lane_p * 4; c < vd4; c += warpSize * 4) {
+                            uint32_t gp4 = *reinterpret_cast<const uint32_t*>(&g_fp8[c]);
+                            uint32_t up4 = *reinterpret_cast<const uint32_t*>(&u_fp8[c]);
+                            const int sb = g_scale_row * scale_cols;
+                            float gs0 = static_cast<float>(g_scales[sb + c / bsz]);
+                            float gs1 = static_cast<float>(g_scales[sb + (c+1) / bsz]);
+                            float gs2 = static_cast<float>(g_scales[sb + (c+2) / bsz]);
+                            float gs3 = static_cast<float>(g_scales[sb + (c+3) / bsz]);
+                            float us0 = static_cast<float>(u_scales[sb + c / bsz]);
+                            float us1 = static_cast<float>(u_scales[sb + (c+1) / bsz]);
+                            float us2 = static_cast<float>(u_scales[sb + (c+2) / bsz]);
+                            float us3 = static_cast<float>(u_scales[sb + (c+3) / bsz]);
+                            float gw0 = bf16_round_rne_f32_finite((fp8_lut[gp4 & 0xFF] * gs0));
+                            float gw1 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>8) & 0xFF] * gs1));
+                            float gw2 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>16) & 0xFF] * gs2));
+                            float gw3 = bf16_round_rne_f32_finite((fp8_lut[(gp4>>24)] * gs3));
+                            float uw0 = bf16_round_rne_f32_finite((fp8_lut[up4 & 0xFF] * us0));
+                            float uw1 = bf16_round_rne_f32_finite((fp8_lut[(up4>>8) & 0xFF] * us1));
+                            float uw2 = bf16_round_rne_f32_finite((fp8_lut[(up4>>16) & 0xFF] * us2));
+                            float uw3 = bf16_round_rne_f32_finite((fp8_lut[(up4>>24)] * us3));
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                gp[b] += gw0*inp[0] + gw1*inp[1] + gw2*inp[2] + gw3*inp[3];
+                                up[b] += uw0*inp[0] + uw1*inp[1] + uw2*inp[2] + uw3*inp[3];
+                            }
+                        }
+                        for (int c = vd4 + lane_p; c < hidden_dim; c += warpSize) {
+                            float gw = fp8_dequant_weight_lut(L.gate_proj_w, fp8_scales[layer].gate_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
+                            float uw = fp8_dequant_weight_lut(L.up_proj_w, fp8_scales[layer].up_proj_scale, my_row, c, hidden_dim, bsz, fp8_lut);
+                            for (int b = 0; b < B; b++) {
+                                float inp = lds_input[b * hidden_dim + c];
+                                gp[b] += gw * inp;
+                                up[b] += uw * inp;
+                            }
+                        }
+                    } else {
+                        const T* gr = static_cast<const T*>(L.gate_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
+                        const T* ur = static_cast<const T*>(L.up_proj_w) + static_cast<size_t>(my_row) * hidden_dim;
+                        const int vec_dim = hidden_dim & ~3;
+                        for (int c = lane_p * 4; c < vec_dim; c += warpSize * 4) {
+                            float gw0 = dotcache_qwen35_to_float(gr[c]);
+                            float gw1 = dotcache_qwen35_to_float(gr[c+1]);
+                            float gw2 = dotcache_qwen35_to_float(gr[c+2]);
+                            float gw3 = dotcache_qwen35_to_float(gr[c+3]);
+                            float uw0 = dotcache_qwen35_to_float(ur[c]);
+                            float uw1 = dotcache_qwen35_to_float(ur[c+1]);
+                            float uw2 = dotcache_qwen35_to_float(ur[c+2]);
+                            float uw3 = dotcache_qwen35_to_float(ur[c+3]);
+                            for (int b = 0; b < B; b++) {
+                                const float* inp = lds_input + b * hidden_dim + c;
+                                gp[b] += gw0 * inp[0] + gw1 * inp[1] + gw2 * inp[2] + gw3 * inp[3];
+                                up[b] += uw0 * inp[0] + uw1 * inp[1] + uw2 * inp[2] + uw3 * inp[3];
+                            }
+                        }
+                        for (int c = vec_dim + lane_p; c < hidden_dim; c += warpSize) {
+                            float gw = dotcache_qwen35_to_float(gr[c]);
+                            float uw = dotcache_qwen35_to_float(ur[c]);
+                            for (int b = 0; b < B; b++) {
+                                float inp = lds_input[b * hidden_dim + c];
+                                gp[b] += gw * inp;
+                                up[b] += uw * inp;
+                            }
+                        }
                     }
-                    float g = bf16_round_rne_f32_finite(lds[0]);
-                    lds[tid] = up[b];
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
-                        __syncthreads();
+
+                    for (int b = 0; b < B; b++) {
+                        float g = wave_reduce_sum_f32(gp[b]);
+                        float u = wave_reduce_sum_f32(up[b]);
+                        if (lane_p == 0) {
+                            float gr = bf16_round_rne_f32_finite(g);
+                            float ur = bf16_round_rne_f32_finite(u);
+                            float silu = gr / (1.0f + expf(-gr));
+                            gate_up[b * intermediate_size * 2 + my_row] =
+                                bf16_round_rne_f32_finite(silu * ur);
+                        }
                     }
-                    float u = bf16_round_rne_f32_finite(lds[0]);
-                    if (tid == 0) {
-                        float silu = g / (1.0f + expf(-g));
-                        gate_up[b * intermediate_size * 2 + my_row] =
-                            bf16_round_rne_f32_finite(silu * u);
-                    }
-                    __syncthreads();
                 }
             }
         }
+        // Waves finish independent rows at different times under wave-per-row;
+        // sync before thread-0 records the timing so it reflects the slowest wave.
+        __syncthreads();
         qwen35_4b_hip_record_timing(
             layer_timing_slots, QWEN35_4B_TIMING_MLP_GATE_UP, mlp_gate_up_clock);
         grid_barrier(barrier_counter, barrier_flag, nb);
@@ -5344,15 +6461,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             {
                 const bool down_fp8 = (fp8_scales != nullptr && fp8_scales[layer].down_proj_scale != nullptr);
                 const bool down_int4 = (int4_scales != nullptr && int4_scales[layer].down_proj_scale != nullptr);
-                __shared__ unsigned int shared_row_down;
-                for (;;) {
-                    if (tid == 0) shared_row_down = atomicAdd(&counters[0], 1u);
-                    __syncthreads();
-                    unsigned int my_row = shared_row_down;
-                    if (my_row >= static_cast<unsigned int>(hidden_dim)) break;
+                if (down_int4 && hidden_dim <= 1024) {
+                    __shared__ unsigned int shared_row_down;
+                    for (;;) {
+                        if (tid == 0) shared_row_down = atomicAdd(&counters[0], 1u);
+                        __syncthreads();
+                        unsigned int my_row = shared_row_down;
+                        if (my_row >= static_cast<unsigned int>(hidden_dim)) break;
 
-                    float p = 0.0f;
-                    if (down_int4) {
+                        float p = 0.0f;
                         const int gsz = int4_scales[layer].group_size;
                         const int byte_cols = L.intermediate_size / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * byte_cols;
@@ -5370,42 +6487,88 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         }
                         for (int c = is8 + tid; c < L.intermediate_size; c += bs)
                             p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) * lds_input[c];
-                    } else if (down_fp8) {
-                        const uint8_t* d_fp8 = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
-                        const hip_bfloat16* d_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].down_proj_scale);
-                        const int bsz = fp8_scales[layer].block_size;
-                        const int d_scale_row = my_row / bsz;
-                        const int d_scale_cols = (L.intermediate_size + bsz - 1) / bsz;
-                        const int is4 = L.intermediate_size & ~3;
-                        for (int c = tid * 4; c < is4; c += bs * 4) {
-                            uint32_t pk = *reinterpret_cast<const uint32_t*>(&d_fp8[c]);
-                            const int sb = d_scale_row * d_scale_cols;
-                            float w0 = bf16_round_rne_f32_finite((fp8_lut[pk & 0xFF] * static_cast<float>(d_scales[sb + c / bsz])));
-                            float w1 = bf16_round_rne_f32_finite((fp8_lut[(pk>>8) & 0xFF] * static_cast<float>(d_scales[sb + (c+1) / bsz])));
-                            float w2 = bf16_round_rne_f32_finite((fp8_lut[(pk>>16) & 0xFF] * static_cast<float>(d_scales[sb + (c+2) / bsz])));
-                            float w3 = bf16_round_rne_f32_finite((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
-                            p += w0*lds_input[c] + w1*lds_input[c+1] + w2*lds_input[c+2] + w3*lds_input[c+3];
+
+                        lds[tid] = p;
+                        __syncthreads();
+                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
+                            if (tid < stride) lds[tid] += lds[tid + stride];
+                            __syncthreads();
                         }
-                        for (int c = is4 + tid; c < L.intermediate_size; c += bs)
-                            p += fp8_dequant_weight_lut(L.down_proj_w, fp8_scales[layer].down_proj_scale, my_row, c, L.intermediate_size, bsz, fp8_lut) * lds_input[c];
-                    } else {
-                        const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
-                        for (int c = tid; c < L.intermediate_size; c += bs)
-                            p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
-                    }
-                    lds[tid] = p;
-                    __syncthreads();
-                    for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) lds[tid] += lds[tid + stride];
+                        if (tid == 0) {
+                            float add = bf16_round_rne_f32_finite(lds[0]);
+                            mlp_out[b * hidden_dim + my_row] = add;
+                            hidden_f32[b * hidden_dim + my_row] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + my_row] + add);
+                        }
                         __syncthreads();
                     }
-                    if (tid == 0) {
-                        float add = bf16_round_rne_f32_finite(lds[0]);
-                        mlp_out[b * hidden_dim + my_row] = add;
-                        hidden_f32[b * hidden_dim + my_row] =
-                            bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + my_row] + add);
+                } else {
+                    const int lane_d = tid % warpSize;
+                    for (;;) {
+                        unsigned int my_row;
+                        if (lane_d == 0) my_row = atomicAdd(&counters[0], 1u);
+                        my_row = __shfl(my_row, 0);
+                        if (my_row >= static_cast<unsigned int>(hidden_dim)) break;
+
+                        float p = 0.0f;
+                        if (down_int4) {
+                            const int gsz = int4_scales[layer].group_size;
+                            const int byte_cols = L.intermediate_size / 2;
+                            const uint8_t* i4_row = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * byte_cols;
+                            const hip_bfloat16* d_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].down_proj_scale);
+                            const hip_bfloat16* d_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].down_proj_zero);
+                            const int sr_g = my_row / gsz;
+                            const int sc_cols = (L.intermediate_size + gsz - 1) / gsz;
+                            const int is8 = L.intermediate_size & ~7;
+                            for (int c = lane_d * 8; c < is8; c += warpSize * 8) {
+                                uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                                float w[8];
+                                int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
+                                p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
+                                   + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
+                            }
+                            for (int c = is8 + lane_d; c < L.intermediate_size; c += warpSize)
+                                p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) * lds_input[c];
+                        } else if (down_fp8) {
+                            const uint8_t* d_fp8 = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
+                            const hip_bfloat16* d_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].down_proj_scale);
+                            const int bsz = fp8_scales[layer].block_size;
+                            const int d_scale_row = my_row / bsz;
+                            const int d_scale_cols = (L.intermediate_size + bsz - 1) / bsz;
+                            const int is4 = L.intermediate_size & ~3;
+                            for (int c = lane_d * 4; c < is4; c += warpSize * 4) {
+                                uint32_t pk = *reinterpret_cast<const uint32_t*>(&d_fp8[c]);
+                                const int sb = d_scale_row * d_scale_cols;
+                                float w0 = bf16_round_rne_f32_finite((fp8_lut[pk & 0xFF] * static_cast<float>(d_scales[sb + c / bsz])));
+                                float w1 = bf16_round_rne_f32_finite((fp8_lut[(pk>>8) & 0xFF] * static_cast<float>(d_scales[sb + (c+1) / bsz])));
+                                float w2 = bf16_round_rne_f32_finite((fp8_lut[(pk>>16) & 0xFF] * static_cast<float>(d_scales[sb + (c+2) / bsz])));
+                                float w3 = bf16_round_rne_f32_finite((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
+                                p += w0*lds_input[c] + w1*lds_input[c+1] + w2*lds_input[c+2] + w3*lds_input[c+3];
+                            }
+                            for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
+                                p += fp8_dequant_weight_lut(L.down_proj_w, fp8_scales[layer].down_proj_scale, my_row, c, L.intermediate_size, bsz, fp8_lut) * lds_input[c];
+                        } else {
+                            const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
+                            const int is4 = L.intermediate_size & ~3;
+                            for (int c = lane_d * 4; c < is4; c += warpSize * 4) {
+                                float w0 = dotcache_qwen35_to_float(wr[c]);
+                                float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                p += w0*lds_input[c]   + w1*lds_input[c+1]
+                                   + w2*lds_input[c+2] + w3*lds_input[c+3];
+                            }
+                            for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
+                                p += dotcache_qwen35_to_float(wr[c]) * lds_input[c];
+                        }
+                        float result = wave_reduce_sum_f32(p);
+                        if (lane_d == 0) {
+                            float add = bf16_round_rne_f32_finite(result);
+                            mlp_out[b * hidden_dim + my_row] = add;
+                            hidden_f32[b * hidden_dim + my_row] =
+                                bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + my_row] + add);
+                        }
                     }
-                    __syncthreads();
                 }
             }
             // Need syncthreads before grid barrier since waves may finish at different times

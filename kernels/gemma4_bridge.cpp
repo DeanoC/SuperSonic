@@ -3,7 +3,9 @@
 
 #include "gemma4.hip"
 
+#include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
 
 namespace {
@@ -214,6 +216,61 @@ int rms_norm_rows_device(int device_ordinal, int n_rows, int n_cols, float eps,
     return 0;
 }
 
+// Does this device support RDNA3 WMMA intrinsics? See
+// kernels/full_attention_bridge_4b.cpp for the analogous helper on the Qwen
+// side — the helper is duplicated here (not shared) to keep Gemma 4 in its
+// own compilation unit (gemma4.hip codegen has historically been sensitive
+// to cross-contamination with the Qwen bridge). `std::call_once` protects
+// against data races from concurrent `supersonic-serve` request threads;
+// `SUPERSONIC_GEMMA4_DISABLE_WMMA=1` forces the scalar path for A/B compare.
+static bool g4_device_supports_wmma_bf16(int device_ordinal) {
+    static std::once_flag env_once;
+    static bool env_disabled = false;
+    std::call_once(env_once, [] {
+        const char* env = std::getenv("SUPERSONIC_GEMMA4_DISABLE_WMMA");
+        env_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+    });
+    if (env_disabled) return false;
+
+    auto probe_arch = [](int ordinal) -> bool {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
+        const char* arch = props.gcnArchName;
+        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+               arch[3] == '1' && arch[4] == '1';
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) return probe_arch(device_ordinal);
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
+    return cached[device_ordinal];
+}
+
+static int matvec_batched_wmma_bf16_device(int device_ordinal,
+                                           int seq_len, int in_dim, int out_dim,
+                                           const void* x, const void* W, void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    // Must match G4_TILED_WMMA_B{M,N} in gemma4.hip.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (out_dim + TILE_N - 1) / TILE_N;
+    const int grid_y = (seq_len + TILE_M - 1) / TILE_M;
+    constexpr int threads = 128;  // 4 wavefronts per block, arranged 2x2
+    hipLaunchKernelGGL(
+        g4_matvec_batched_wmma_bf16_kernel,
+        dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
+        seq_len, in_dim, out_dim,
+        static_cast<const hip_bfloat16*>(x),
+        static_cast<const hip_bfloat16*>(W),
+        static_cast<hip_bfloat16*>(out));
+    if (hipGetLastError() != hipSuccess) return 474;
+    if (hipDeviceSynchronize() != hipSuccess) return 475;
+    return 0;
+}
+
 template <typename T>
 int matvec_batched_device(int device_ordinal,
                           int seq_len, int in_dim, int out_dim,
@@ -272,6 +329,62 @@ int matvec_int4_device(int device_ordinal, int in_dim, int out_dim, int gsz,
 }
 
 // ---- INT4 batched matvec ----
+
+static int matvec_batched_int4_wmma_bf16_device(int device_ordinal,
+                                                int seq_len, int in_dim, int out_dim, int gsz,
+                                                const void* x, const void* W_packed,
+                                                const void* W_scale, const void* W_zero,
+                                                void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (seq_len <= 0) return 0;
+
+    // Dispatch between the 64x64 tiled kernel and the one-wave-per-tile
+    // fallback. Same tradeoff as the Qwen INT4 pair: INT4 already reads
+    // ~4x less weight data than BF16, so tiling's bandwidth amortization
+    // is smaller, and the 4x compute waste from 64-row tile overhang at
+    // small seq_len can regress short-prompt prefill. The tiled kernel
+    // also requires gsz to be a multiple of BK (=64) so every K-slab stays
+    // in one GPTQ group; shipped Gemma 4 bakes use gsz=128.
+    constexpr int TILED_M_THRESHOLD = 32;
+    constexpr int TILED_BK = 64;
+    if (seq_len >= TILED_M_THRESHOLD && gsz % TILED_BK == 0) {
+        constexpr int TILE_M = 64;
+        constexpr int TILE_N = 64;
+        const int grid_x = (out_dim + TILE_N - 1) / TILE_N;
+        const int grid_y = (seq_len + TILE_M - 1) / TILE_M;
+        constexpr int threads = 128;  // 4 wavefronts arranged 2x2
+        hipLaunchKernelGGL(
+            g4_matvec_batched_int4_wmma_bf16_kernel,
+            dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
+            seq_len, in_dim, out_dim, gsz,
+            static_cast<const hip_bfloat16*>(x),
+            static_cast<const uint8_t*>(W_packed),
+            static_cast<const hip_bfloat16*>(W_scale),
+            static_cast<const hip_bfloat16*>(W_zero),
+            static_cast<hip_bfloat16*>(out));
+        if (hipGetLastError() != hipSuccess) return 494;
+        if (hipDeviceSynchronize() != hipSuccess) return 495;
+        return 0;
+    }
+
+    // Small-M fallback: one wavefront per 16x16 tile (previous shipping
+    // kernel, preserved under the _small_m suffix).
+    const int grid_x = (out_dim + 15) / 16;
+    const int grid_y = (seq_len + 15) / 16;
+    constexpr int threads = 32;
+    hipLaunchKernelGGL(
+        g4_matvec_batched_int4_wmma_bf16_small_m_kernel,
+        dim3(grid_x, grid_y, 1), dim3(threads), 0, 0,
+        seq_len, in_dim, out_dim, gsz,
+        static_cast<const hip_bfloat16*>(x),
+        static_cast<const uint8_t*>(W_packed),
+        static_cast<const hip_bfloat16*>(W_scale),
+        static_cast<const hip_bfloat16*>(W_zero),
+        static_cast<hip_bfloat16*>(out));
+    if (hipGetLastError() != hipSuccess) return 494;
+    if (hipDeviceSynchronize() != hipSuccess) return 495;
+    return 0;
+}
 
 template <typename T>
 int matvec_batched_int4_device(int device_ordinal,
@@ -1077,9 +1190,18 @@ extern "C" int dotcache_gemma4_hip_matvec_batched(
     case 1: return matvec_batched_device<float>(static_cast<int>(device_ordinal),
                 static_cast<int>(seq_len), static_cast<int>(in_dim),
                 static_cast<int>(out_dim), x, W, out, counter);
-    case 2: return matvec_batched_device<hip_bfloat16>(static_cast<int>(device_ordinal),
-                static_cast<int>(seq_len), static_cast<int>(in_dim),
-                static_cast<int>(out_dim), x, W, out, counter);
+    case 2: {
+        const int ordinal = static_cast<int>(device_ordinal);
+        const int s = static_cast<int>(seq_len);
+        const int id = static_cast<int>(in_dim);
+        const int od = static_cast<int>(out_dim);
+        // WMMA pays off only once we have enough rows to fill a 16-row tile —
+        // below that the work-stealing scalar kernel uses more of the wave.
+        if (s >= 16 && g4_device_supports_wmma_bf16(ordinal)) {
+            return matvec_batched_wmma_bf16_device(ordinal, s, id, od, x, W, out);
+        }
+        return matvec_batched_device<hip_bfloat16>(ordinal, s, id, od, x, W, out, counter);
+    }
     default: return 469;
     }
 }
@@ -1568,11 +1690,23 @@ extern "C" int dotcache_gemma4_hip_matvec_batched_int4(
                 static_cast<int>(seq_len), static_cast<int>(in_dim),
                 static_cast<int>(out_dim), static_cast<int>(group_size),
                 x, W_packed, W_scale, W_zero, out, counter);
-    case 2: return matvec_batched_int4_device<hip_bfloat16>(
-                static_cast<int>(device_ordinal),
-                static_cast<int>(seq_len), static_cast<int>(in_dim),
-                static_cast<int>(out_dim), static_cast<int>(group_size),
-                x, W_packed, W_scale, W_zero, out, counter);
+    case 2: {
+        const int ordinal = static_cast<int>(device_ordinal);
+        const int s = static_cast<int>(seq_len);
+        const int id = static_cast<int>(in_dim);
+        const int od = static_cast<int>(out_dim);
+        const int gs = static_cast<int>(group_size);
+        // WMMA wants a 16-row tile minimum, and dequantizes each 16-K chunk
+        // with one scale/zero fetch — only valid if gsz is a multiple of 16
+        // (128 in the shipped Gemma 4 bake; weights.rs reads from metadata
+        // so a custom bake could land something else, same guard as Qwen).
+        if (s >= 16 && gs % 16 == 0 && g4_device_supports_wmma_bf16(ordinal)) {
+            return matvec_batched_int4_wmma_bf16_device(
+                ordinal, s, id, od, gs, x, W_packed, W_scale, W_zero, out);
+        }
+        return matvec_batched_int4_device<hip_bfloat16>(
+            ordinal, s, id, od, gs, x, W_packed, W_scale, W_zero, out, counter);
+    }
     default: return 499;
     }
 }
