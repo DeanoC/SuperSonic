@@ -75,6 +75,69 @@ fn residual_add(
     Ok(())
 }
 
+fn rms_norm_rows_model(
+    config: &TextConfig,
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    output: &mut GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    let op = if config.rms_norm_add_unit_offset {
+        prefill_ffi::rms_norm_rows
+    } else {
+        prefill_ffi::rms_norm_rows_plain
+    };
+    op(
+        ordinal,
+        ScalarType::BF16,
+        rows,
+        cols,
+        config.rms_norm_eps as f32,
+        input,
+        weight,
+        output,
+    )
+    .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    Ok(())
+}
+
+fn maybe_attn_rms_norm_rows(
+    config: &TextConfig,
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    input: &GpuBuffer,
+    weight: Option<&GpuBuffer>,
+    output: &mut GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    if let Some(weight) = weight {
+        let op = if config.rms_norm_add_unit_offset {
+            prefill_ffi::rms_norm_rows
+        } else {
+            prefill_ffi::rms_norm_rows_plain
+        };
+        op(
+            ordinal,
+            ScalarType::BF16,
+            rows,
+            cols,
+            1e-6,
+            input,
+            weight,
+            output,
+        )
+        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    } else {
+        gpu_hal::copy_d2d(ordinal, output.as_mut_ptr(), input.as_ptr(), rows * cols * ScalarType::BF16.size_in_bytes())
+            .map_err(|e| anyhow::anyhow!("{label} copy-through: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Compute per-position logits for a contiguous range of the hidden-state
 /// buffer.
 ///
@@ -122,12 +185,16 @@ pub fn compute_logits_for_range(
     // Final RMSNorm → BF16 [count, hidden_dim]. Qwen3.5 uses add_unit_offset=1.
     let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
         .map_err(|e| anyhow::anyhow!("range normed alloc: {e}"))?;
-    prefill_ffi::rms_norm_rows(
-        ordinal, ScalarType::BF16, count, hidden_dim,
-        config.rms_norm_eps as f32,
-        &slice, &weights.norm_weight, &mut normed,
-    )
-    .map_err(|e| anyhow::anyhow!("range final norm: {e}"))?;
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        count,
+        hidden_dim,
+        &slice,
+        &weights.norm_weight,
+        &mut normed,
+        "range final norm",
+    )?;
 
     // lm_head projection. For count=1, prefer the standalone matvec even on
     // 4B-capable models: it avoids the tiled matmul path's extra packing and
@@ -517,12 +584,16 @@ fn prefill_inner(
         // Layer loop (all layers for this chunk)
         for idx in 0..config.num_hidden_layers {
             // Input RMSNorm
-            prefill_ffi::rms_norm_rows(
-                ordinal, ScalarType::BF16, chunk_len, hidden_dim,
-                config.rms_norm_eps as f32,
-                &scratch.hidden, &weights.layers[idx].input_norm_w, &mut scratch.normed,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} input norm: {e}"))?;
+            rms_norm_rows_model(
+                config,
+                ordinal,
+                chunk_len,
+                hidden_dim,
+                &scratch.hidden,
+                &weights.layers[idx].input_norm_w,
+                &mut scratch.normed,
+                &format!("layer {idx} input norm"),
+            )?;
 
             if config.is_full_attention(idx) {
                 prefill_full_attention_layer(
@@ -571,11 +642,16 @@ fn prefill_inner(
             }
 
             // Post-attention RMSNorm
-            prefill_ffi::rms_norm_rows(
-                ordinal, ScalarType::BF16, chunk_len, hidden_dim,
-                config.rms_norm_eps as f32,
-                &scratch.hidden, &weights.layers[idx].post_attn_norm_w, &mut scratch.normed,
-            ).map_err(|e| anyhow::anyhow!("layer {idx} post-attn norm: {e}"))?;
+            rms_norm_rows_model(
+                config,
+                ordinal,
+                chunk_len,
+                hidden_dim,
+                &scratch.hidden,
+                &weights.layers[idx].post_attn_norm_w,
+                &mut scratch.normed,
+                &format!("layer {idx} post-attn norm"),
+            )?;
 
             if is_last_chunk {
                 if let Some(trace) = layer_post_attn_norm_trace.as_mut() {
@@ -920,7 +996,17 @@ fn prefill_full_attention_layer(
     let num_kv_heads = config.num_key_value_heads;
     let head_dim = config.head_dim;
     let q_dim = num_q_heads * head_dim;
-    let q_proj_dim = num_q_heads * head_dim * 2;
+    let q_proj_dim = fw.q_proj_w.shape()[0];
+    let has_attn_gate = match q_proj_dim {
+        dim if dim == q_dim => false,
+        dim if dim == q_dim * 2 => true,
+        dim => {
+            return Err(anyhow::anyhow!(
+                "layer {idx}: unsupported full-attention q_proj rows {dim}, expected {q_dim} or {}",
+                q_dim * 2
+            ));
+        }
+    };
     let kv_dim = num_kv_heads * head_dim;
     let rotary_dim = config.rotary_dim();
     let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -935,13 +1021,24 @@ fn prefill_full_attention_layer(
         fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), weights.int4_group_size,
     )?;
 
-    // 2. Split Q into query and gate
+    // 2. Split Q into query and gate when present. Llama-style full attention
+    // uses an ungated q_proj whose row count matches q_dim exactly.
     let mut query_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
         .map_err(|e| anyhow::anyhow!("query_buf alloc: {e}"))?;
     let mut gate_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
         .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
-    prefill_ffi::split_qgate(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &q_full, &mut query_buf, &mut gate_buf)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
+    if has_attn_gate {
+        prefill_ffi::split_qgate(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &q_full, &mut query_buf, &mut gate_buf)
+            .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
+    } else {
+        gpu_hal::copy_d2d(
+            ordinal,
+            query_buf.as_ptr() as *mut c_void,
+            q_full.as_ptr(),
+            chunk_len * q_dim * elem_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q copy: {e}"))?;
+    }
 
     // 3. K projection
     matmul_proj(
@@ -954,10 +1051,16 @@ fn prefill_full_attention_layer(
     {
         let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_q_heads, head_dim])
             .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal, ScalarType::BF16, chunk_len * num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
-        ).map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            config,
+            ordinal,
+            chunk_len * num_q_heads,
+            head_dim,
+            &query_buf,
+            fw.q_norm_w.as_ref(),
+            &mut q_normed,
+            &format!("layer {idx} Q norm"),
+        )?;
         gpu_hal::copy_d2d(ordinal, query_buf.as_ptr() as *mut c_void, q_normed.as_ptr(), chunk_len * q_dim * elem_bytes)
             .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
     }
@@ -966,10 +1069,16 @@ fn prefill_full_attention_layer(
     {
         let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_kv_heads, head_dim])
             .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
-        prefill_ffi::rms_norm_rows(
-            ordinal, ScalarType::BF16, chunk_len * num_kv_heads, head_dim, 1e-6,
-            &scratch.proj_buf2, &fw.k_norm_w, &mut k_normed,
-        ).map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            config,
+            ordinal,
+            chunk_len * num_kv_heads,
+            head_dim,
+            &scratch.proj_buf2,
+            fw.k_norm_w.as_ref(),
+            &mut k_normed,
+            &format!("layer {idx} K norm"),
+        )?;
         gpu_hal::copy_d2d(ordinal, scratch.proj_buf2.as_ptr() as *mut c_void, k_normed.as_ptr(), chunk_len * kv_dim * elem_bytes)
             .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
     }
@@ -1105,8 +1214,8 @@ fn prefill_full_attention_layer(
     prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, num_q_heads, chunk_len, head_dim, &scratch.attn_q, &mut scratch.proj_buf)
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
-    // 14. Apply gate
-    {
+    // 14. Apply attention gate only for gated-Q attention models (Qwen).
+    if has_attn_gate {
         let mut gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
             .map_err(|e| anyhow::anyhow!("gated alloc: {e}"))?;
         prefill_ffi::sigmoid_mul(ordinal, ScalarType::BF16, chunk_len * q_dim, &scratch.proj_buf, &gate_buf, &mut gated)

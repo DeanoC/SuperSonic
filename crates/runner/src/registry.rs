@@ -7,6 +7,7 @@ pub enum ModelFamily {
     Qwen35,
     Gemma4,
     Phi4,
+    Llama31,
 }
 
 impl fmt::Display for ModelFamily {
@@ -15,6 +16,7 @@ impl fmt::Display for ModelFamily {
             Self::Qwen35 => write!(f, "qwen3.5"),
             Self::Gemma4 => write!(f, "gemma4"),
             Self::Phi4 => write!(f, "phi4"),
+            Self::Llama31 => write!(f, "llama3.1"),
         }
     }
 }
@@ -28,6 +30,7 @@ pub enum ModelVariant {
     Gemma4_E2B,
     Gemma4_E4B,
     Phi4_Mini,
+    Llama3_1_8B,
 }
 
 impl ModelVariant {
@@ -40,6 +43,7 @@ impl ModelVariant {
             "gemma4-e2b" | "gemma-4-e2b" | "e2b" => Some(Self::Gemma4_E2B),
             "gemma4-e4b" | "gemma-4-e4b" | "e4b" => Some(Self::Gemma4_E4B),
             "phi4-mini" | "phi-4-mini" | "phi4mini" => Some(Self::Phi4_Mini),
+            "llama3.1-8b" | "llama31-8b" | "meta-llama-3.1-8b" => Some(Self::Llama3_1_8B),
             _ => None,
         }
     }
@@ -53,6 +57,7 @@ impl ModelVariant {
             Self::Gemma4_E2B => "google/gemma-4-E2B",
             Self::Gemma4_E4B => "google/gemma-4-E4B",
             Self::Phi4_Mini => "microsoft/Phi-4-mini-instruct",
+            Self::Llama3_1_8B => "NousResearch/Meta-Llama-3.1-8B",
         }
     }
 
@@ -63,6 +68,7 @@ impl ModelVariant {
             }
             Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
             Self::Phi4_Mini => ModelFamily::Phi4,
+            Self::Llama3_1_8B => ModelFamily::Llama31,
         }
     }
 }
@@ -77,6 +83,7 @@ impl fmt::Display for ModelVariant {
             Self::Gemma4_E2B => write!(f, "gemma4-e2b"),
             Self::Gemma4_E4B => write!(f, "gemma4-e4b"),
             Self::Phi4_Mini => write!(f, "phi4-mini"),
+            Self::Llama3_1_8B => write!(f, "llama3.1-8b"),
         }
     }
 }
@@ -142,10 +149,17 @@ pub struct Phi4KernelParams {
     pub kv_chunk_size: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct Llama31KernelParams {
+    pub weight_prefix: &'static str,
+    pub kv_chunk_size: usize,
+}
+
 pub enum FamilyParams {
     Qwen35(Qwen35KernelParams),
     Gemma4(Gemma4KernelParams),
     Phi4(Phi4KernelParams),
+    Llama31(Llama31KernelParams),
 }
 
 pub struct VramBudget {
@@ -361,6 +375,19 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    RegistryEntry {
+        model: ModelVariant::Llama3_1_8B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Llama31(Llama31KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
 ];
 
 pub fn lookup(
@@ -384,6 +411,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Gemma4_E2B => "gemma4-e2b",
             ModelVariant::Gemma4_E4B => "gemma4-e4b",
             ModelVariant::Phi4_Mini => "phi4-mini",
+            ModelVariant::Llama3_1_8B => "llama3.1-8b",
         })
         .collect();
     models.sort_unstable();

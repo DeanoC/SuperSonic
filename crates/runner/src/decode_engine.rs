@@ -81,6 +81,74 @@ fn residual_add(
     Ok(())
 }
 
+fn rms_norm_rows_model(
+    config: &TextConfig,
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    output: &mut GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    let op = if config.rms_norm_add_unit_offset {
+        kernel_ffi::prefill_ffi::rms_norm_rows
+    } else {
+        kernel_ffi::prefill_ffi::rms_norm_rows_plain
+    };
+    op(
+        ordinal,
+        ScalarType::BF16,
+        rows,
+        cols,
+        config.rms_norm_eps as f32,
+        input,
+        weight,
+        output,
+    )
+    .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    Ok(())
+}
+
+fn maybe_attn_rms_norm_rows(
+    config: &TextConfig,
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    input: &GpuBuffer,
+    weight: Option<&GpuBuffer>,
+    output: &mut GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    if let Some(weight) = weight {
+        let op = if config.rms_norm_add_unit_offset {
+            kernel_ffi::prefill_ffi::rms_norm_rows
+        } else {
+            kernel_ffi::prefill_ffi::rms_norm_rows_plain
+        };
+        op(
+            ordinal,
+            ScalarType::BF16,
+            rows,
+            cols,
+            1e-6,
+            input,
+            weight,
+            output,
+        )
+        .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    } else {
+        gpu_hal::copy_d2d(
+            ordinal,
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            rows * cols * ScalarType::BF16.size_in_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("{label} copy-through: {e}"))?;
+    }
+    Ok(())
+}
+
 fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
     let sign = (byte >> 7) & 1;
     let exp = (byte >> 3) & 0xF;
@@ -1056,9 +1124,20 @@ impl DecodeEngine {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let q_dim = num_q_heads * head_dim;
-        let q_proj_dim = q_dim * 2;
+        let q_proj_dim = fw.q_proj_w.shape()[0];
+        let has_attn_gate = match q_proj_dim {
+            dim if dim == q_dim => false,
+            dim if dim == q_dim * 2 => true,
+            dim => {
+                return Err(anyhow::anyhow!(
+                    "layer {idx}: unsupported full-attention q_proj rows {dim}, expected {q_dim} or {}",
+                    q_dim * 2
+                ));
+            }
+        };
         let kv_dim = num_kv_heads * head_dim;
         let rotary_dim = config.rotary_dim();
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
 
         let hidden_buf = GpuBuffer::from_host_bytes(
             self.ordinal,
@@ -1069,17 +1148,16 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} hidden trace H2D: {e}"))?;
         let mut normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace normed alloc: {e}"))?;
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             hidden_dim,
-            config.rms_norm_eps as f32,
             &hidden_buf,
             &self.weights.layers[idx].input_norm_w,
             &mut normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace input rms_norm: {e}"))?;
+            &format!("layer {idx} trace input rms_norm"),
+        )?;
 
         let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace q_full alloc: {e}"))?;
@@ -1101,17 +1179,27 @@ impl DecodeEngine {
             &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
-        kernel_ffi::prefill_ffi::split_qgate(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_q_heads,
-            head_dim,
-            &q_full,
-            &mut query_buf,
-            &mut gate_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace split qgate: {e}"))?;
+        if has_attn_gate {
+            kernel_ffi::prefill_ffi::split_qgate(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                head_dim,
+                &q_full,
+                &mut query_buf,
+                &mut gate_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace split qgate: {e}"))?;
+        } else {
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                query_buf.as_ptr() as *mut c_void,
+                q_full.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace q copy: {e}"))?;
+        }
 
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
@@ -1124,11 +1212,16 @@ impl DecodeEngine {
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace q norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            &config,
+            self.ordinal,
+            num_q_heads,
+            head_dim,
+            &query_buf,
+            fw.q_norm_w.as_ref(),
+            &mut q_normed,
+            &format!("layer {idx} trace q norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             query_buf.as_ptr() as *mut c_void,
@@ -1137,11 +1230,16 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q norm copy: {e}"))?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace k norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            &config,
+            self.ordinal,
+            num_kv_heads,
+            head_dim,
+            &k_buf,
+            fw.k_norm_w.as_ref(),
+            &mut k_normed,
+            &format!("layer {idx} trace k norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             k_buf.as_ptr() as *mut c_void,
@@ -1208,7 +1306,17 @@ impl DecodeEngine {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let q_dim = num_q_heads * head_dim;
-        let q_proj_dim = q_dim * 2;
+        let q_proj_dim = fw.q_proj_w.shape()[0];
+        let has_attn_gate = match q_proj_dim {
+            dim if dim == q_dim => false,
+            dim if dim == q_dim * 2 => true,
+            dim => {
+                return Err(anyhow::anyhow!(
+                    "layer {idx}: unsupported full-attention q_proj rows {dim}, expected {q_dim} or {}",
+                    q_dim * 2
+                ));
+            }
+        };
         let kv_dim = num_kv_heads * head_dim;
         let rotary_dim = config.rotary_dim();
         let kv_len = seqlen_offset + 1;
@@ -1223,17 +1331,16 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer hidden H2D: {e}"))?;
         let mut normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer normed alloc: {e}"))?;
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             hidden_dim,
-            config.rms_norm_eps as f32,
             &hidden_in,
             &self.weights.layers[idx].input_norm_w,
             &mut normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer input rms_norm: {e}"))?;
+            &format!("layer {idx} trace full layer input rms_norm"),
+        )?;
 
         let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_full alloc: {e}"))?;
@@ -1278,17 +1385,27 @@ impl DecodeEngine {
             &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
-        kernel_ffi::prefill_ffi::split_qgate(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_q_heads,
-            head_dim,
-            &q_full,
-            &mut query_buf,
-            &mut gate_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer split qgate: {e}"))?;
+        if has_attn_gate {
+            kernel_ffi::prefill_ffi::split_qgate(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                head_dim,
+                &q_full,
+                &mut query_buf,
+                &mut gate_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer split qgate: {e}"))?;
+        } else {
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                query_buf.as_ptr() as *mut c_void,
+                q_full.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q copy: {e}"))?;
+        }
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
             &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
@@ -1299,11 +1416,16 @@ impl DecodeEngine {
             &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            &config,
+            self.ordinal,
+            num_q_heads,
+            head_dim,
+            &query_buf,
+            fw.q_norm_w.as_ref(),
+            &mut q_normed,
+            &format!("layer {idx} trace full layer q norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             query_buf.as_ptr() as *mut c_void,
@@ -1311,11 +1433,16 @@ impl DecodeEngine {
             q_dim * elem_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q norm copy: {e}"))?;
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            &config,
+            self.ordinal,
+            num_kv_heads,
+            head_dim,
+            &k_buf,
+            fw.k_norm_w.as_ref(),
+            &mut k_normed,
+            &format!("layer {idx} trace full layer k norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             k_buf.as_ptr() as *mut c_void,
@@ -1410,10 +1537,20 @@ impl DecodeEngine {
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn bf16 D2H: {e}"))?,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat H2D: {e}"))?;
-        kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate apply: {e}"))?;
+        if has_attn_gate {
+            kernel_ffi::prefill_ffi::sigmoid_mul(
+                self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate apply: {e}"))?;
+        } else {
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                gated.as_ptr() as *mut c_void,
+                attn_flat.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate bypass copy: {e}"))?;
+        }
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
             &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
@@ -1492,17 +1629,16 @@ impl DecodeEngine {
         &mut self,
         idx: usize,
     ) -> Result<(ComponentLinearTrace, Vec<u8>, Vec<u8>, Vec<u8>)> {
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             self.weights.config.hidden_size,
-            self.weights.config.rms_norm_eps as f32,
             &self.hidden_io,
             &self.weights.layers[idx].input_norm_w,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} component trace input rms_norm: {e}"))?;
+            &format!("layer {idx} component trace input rms_norm"),
+        )?;
         let trace = self
             .component_decode_linear_attention_layer(idx, true)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected linear trace output"))?;
@@ -1540,17 +1676,16 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<ComponentLayerTrace> {
         let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             self.weights.config.hidden_size,
-            self.weights.config.rms_norm_eps as f32,
             &self.hidden_io,
             &self.weights.layers[idx].input_norm_w,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer input rms_norm: {e}"))?;
+            &format!("layer {idx} component full-layer input rms_norm"),
+        )?;
 
         if self.weights.config.is_full_attention(idx) {
             let hidden_in = self
@@ -1579,17 +1714,16 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden D2H: {e}"))?[..row_bytes]
             .to_vec();
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             self.weights.config.hidden_size,
-            self.weights.config.rms_norm_eps as f32,
             &self.hidden_io,
             &self.weights.layers[idx].post_attn_norm_w,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer post rms_norm: {e}"))?;
+            &format!("layer {idx} component full-layer post rms_norm"),
+        )?;
         let post_attn_norm = self
             .normed_buf
             .to_host_bytes()
@@ -1702,17 +1836,16 @@ impl DecodeEngine {
                         .map_err(|e| anyhow::anyhow!("layer {i} hidden trace D2H: {e}"))?,
                 );
             }
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             hidden_dim,
-            rms_norm_eps,
             &self.hidden_io,
             &self.weights.layers[i].input_norm_w,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {i} input rms_norm: {e}"))?;
+            &format!("layer {i} input rms_norm"),
+        )?;
 
             if self.weights.config.is_full_attention(i) {
                 self.component_decode_full_attention_layer(i, seqlen_offset)?;
@@ -1735,17 +1868,16 @@ impl DecodeEngine {
                 );
             }
 
-            kernel_ffi::prefill_ffi::rms_norm_rows(
+            rms_norm_rows_model(
+                &self.weights.config,
                 self.ordinal,
-                ScalarType::BF16,
                 1,
                 hidden_dim,
-                rms_norm_eps,
                 &self.hidden_io,
                 &self.weights.layers[i].post_attn_norm_w,
                 &mut self.normed_buf,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {i} post-attn rms_norm: {e}"))?;
+                &format!("layer {i} post-attn rms_norm"),
+            )?;
 
             if trace_layer == Some(i) {
                 trace_post_attn_norm = Some(
@@ -1781,17 +1913,16 @@ impl DecodeEngine {
             }
         }
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
+        rms_norm_rows_model(
+            &self.weights.config,
             self.ordinal,
-            ScalarType::BF16,
             1,
             hidden_dim,
-            rms_norm_eps,
             &self.hidden_io,
             &self.weights.norm_weight,
             &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
+            "final rms_norm",
+        )?;
 
         kernel_ffi::standalone_matvec_4b(
             self.ordinal,
@@ -1888,7 +2019,17 @@ impl DecodeEngine {
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let q_dim = num_q_heads * head_dim;
-        let q_proj_dim = q_dim * 2;
+        let q_proj_dim = fw.q_proj_w.shape()[0];
+        let has_attn_gate = match q_proj_dim {
+            dim if dim == q_dim => false,
+            dim if dim == q_dim * 2 => true,
+            dim => {
+                return Err(anyhow::anyhow!(
+                    "layer {idx}: unsupported full-attention q_proj rows {dim}, expected {q_dim} or {}",
+                    q_dim * 2
+                ));
+            }
+        };
         let kv_dim = num_kv_heads * head_dim;
         let rotary_dim = config.rotary_dim();
         let kv_len = seqlen_offset + 1;
@@ -1928,17 +2069,27 @@ impl DecodeEngine {
             &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
             fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
-        kernel_ffi::prefill_ffi::split_qgate(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_q_heads,
-            head_dim,
-            &q_full,
-            &mut query_buf,
-            &mut gate_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
+        if has_attn_gate {
+            kernel_ffi::prefill_ffi::split_qgate(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                head_dim,
+                &q_full,
+                &mut query_buf,
+                &mut gate_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
+        } else {
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                query_buf.as_ptr() as *mut c_void,
+                q_full.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
+        }
 
         matmul_proj(
             self.ordinal, 1, 1, kv_dim, hidden_dim,
@@ -1951,11 +2102,16 @@ impl DecodeEngine {
             fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            config,
+            self.ordinal,
+            num_q_heads,
+            head_dim,
+            &query_buf,
+            fw.q_norm_w.as_ref(),
+            &mut q_normed,
+            &format!("layer {idx} q norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             query_buf.as_ptr() as *mut c_void,
@@ -1964,11 +2120,16 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm copy: {e}"))?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
+        maybe_attn_rms_norm_rows(
+            config,
+            self.ordinal,
+            num_kv_heads,
+            head_dim,
+            &k_buf,
+            fw.k_norm_w.as_ref(),
+            &mut k_normed,
+            &format!("layer {idx} k norm"),
+        )?;
         gpu_hal::copy_d2d(
             self.ordinal,
             k_buf.as_ptr() as *mut c_void,
@@ -2085,10 +2246,20 @@ impl DecodeEngine {
 
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
-        kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+        if has_attn_gate {
+            kernel_ffi::prefill_ffi::sigmoid_mul(
+                self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+        } else {
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                gated.as_ptr() as *mut c_void,
+                attn_flat.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} gate bypass copy: {e}"))?;
+        }
 
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
@@ -2686,6 +2857,35 @@ impl DecodeEngine {
         batch_size: usize,
     ) -> Result<Self> {
         let config = &weights.config;
+        let rotary =
+            RotaryTables::build(config, ordinal).map_err(|e| anyhow::anyhow!("rotary: {e}"))?;
+        Self::new_with_rotary(
+            weights,
+            rotary,
+            ordinal,
+            proj_buf_floats,
+            attn_scratch_floats,
+            kv_chunk_size,
+            use_4b_kernel,
+            prefill_chunk_size,
+            kv_fp8,
+            batch_size,
+        )
+    }
+
+    pub fn new_with_rotary(
+        weights: Qwen35Weights,
+        rotary: RotaryTables,
+        ordinal: usize,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
+        kv_chunk_size: usize,
+        use_4b_kernel: bool,
+        prefill_chunk_size: usize,
+        kv_fp8: bool,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let config = &weights.config;
         let state = ModelState::new(config, ordinal)
             .map_err(|e| anyhow::anyhow!("model state init: {e}"))?;
 
@@ -2708,8 +2908,6 @@ impl DecodeEngine {
             batch_size,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
-        let rotary =
-            RotaryTables::build(config, ordinal).map_err(|e| anyhow::anyhow!("rotary: {e}"))?;
         let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])
             .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
         let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])

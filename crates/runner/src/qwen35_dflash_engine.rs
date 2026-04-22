@@ -73,7 +73,7 @@ pub fn run_qwen35_dflash(
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
-        FamilyParams::Gemma4(_) | FamilyParams::Phi4(_) => {
+        FamilyParams::Gemma4(_) | FamilyParams::Phi4(_) | FamilyParams::Llama31(_) => {
             unreachable!("run_qwen35_dflash dispatched for non-qwen35 variant");
         }
     };

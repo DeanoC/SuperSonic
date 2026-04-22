@@ -110,8 +110,8 @@ pub struct FullWeights {
     pub k_proj_w: GpuBuffer,   // [512, hidden]
     pub v_proj_w: GpuBuffer,   // [512, hidden]
     pub o_proj_w: GpuBuffer,   // [hidden, 2048]
-    pub q_norm_w: GpuBuffer,   // [256]
-    pub k_norm_w: GpuBuffer,   // [256]
+    pub q_norm_w: Option<GpuBuffer>,   // [head_dim] when present
+    pub k_norm_w: Option<GpuBuffer>,   // [head_dim] when present
     // FP8 scale_inv (None when BF16)
     pub q_proj_scale: Option<GpuBuffer>,
     pub k_proj_scale: Option<GpuBuffer>,
@@ -172,8 +172,8 @@ impl Qwen35Weights {
                     k_proj_w: loader.load_to_gpu(&format!("{fa}.k_proj.weight"), ordinal)?,
                     v_proj_w: loader.load_to_gpu(&format!("{fa}.v_proj.weight"), ordinal)?,
                     o_proj_w: loader.load_to_gpu(&format!("{fa}.o_proj.weight"), ordinal)?,
-                    q_norm_w: loader.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?,
-                    k_norm_w: loader.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?,
+                    q_norm_w: Some(loader.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?),
+                    k_norm_w: Some(loader.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?),
                     q_proj_scale: None, k_proj_scale: None, v_proj_scale: None, o_proj_scale: None,
                     q_proj_int4_scale: None, q_proj_int4_zero: None,
                     k_proj_int4_scale: None, k_proj_int4_zero: None,
@@ -383,8 +383,8 @@ impl Qwen35Weights {
                     k_proj_w: store.load_to_gpu(&k_name, ordinal)?,
                     v_proj_w: store.load_to_gpu(&v_name, ordinal)?,
                     o_proj_w: store.load_to_gpu(&o_name, ordinal)?,
-                    q_norm_w: store.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?,
-                    k_norm_w: store.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?,
+                    q_norm_w: Some(store.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?),
+                    k_norm_w: Some(store.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?),
                     q_proj_scale: load_scale(&q_name)?,
                     k_proj_scale: load_scale(&k_name)?,
                     v_proj_scale: load_scale(&v_name)?,

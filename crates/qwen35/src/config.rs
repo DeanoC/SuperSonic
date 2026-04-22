@@ -9,6 +9,7 @@ fn default_linear_num_value_heads() -> usize { 32 }
 fn default_partial_rotary_factor() -> f64 { 0.25 }
 fn default_rope_theta() -> f64 { 10_000.0 }
 fn default_rope_type() -> String { "default".to_string() }
+fn default_rms_norm_add_unit_offset() -> bool { true }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RopeParameters {
@@ -52,6 +53,8 @@ pub struct TextConfig {
     pub hidden_act: Activation,
     pub max_position_embeddings: usize,
     pub rms_norm_eps: f64,
+    #[serde(default = "default_rms_norm_add_unit_offset")]
+    pub rms_norm_add_unit_offset: bool,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]

@@ -3412,7 +3412,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 const int nkv = L.attn_num_kv_heads;  // 2
                 const int kv_groups = nh / nkv;       // 4
                 const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-                const int rotary_dim = hd / 4;        // 64
+                const int attn_rotary_dim = (rotary_dim < hd) ? rotary_dim : hd;
                 const int kv_len = L.kv_len + 1;
                 float* saved_gate = attn_scratch;
 
@@ -3420,18 +3420,20 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const int qh = blockIdx.x;
                     float* q_head = q_f32 + qh * hd * 2;
 
-                    float sq = 0.0f;
-                    for (int d = tid; d < hd; d += bs) sq += q_head[d] * q_head[d];
-                    float inv = rsqrtf(
-                        dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + 1e-6f);
                     const T* qnw = static_cast<const T*>(L.q_norm_w);
-                    for (int d = tid; d < hd; d += bs) {
-                        q_head[d] = q_head[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
+                    if (qnw != nullptr && L.q_norm_eps > 0.0f) {
+                        float sq = 0.0f;
+                        for (int d = tid; d < hd; d += bs) sq += q_head[d] * q_head[d];
+                        float inv = rsqrtf(
+                            dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + L.q_norm_eps);
+                        for (int d = tid; d < hd; d += bs) {
+                            q_head[d] = q_head[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
+                        }
                     }
                     __syncthreads();
-                    const int half_rot = rotary_dim / 2;
+                    const int half_rot = attn_rotary_dim / 2;
                     const size_t cos_off = static_cast<size_t>(seqlen_offset) * half_rot;
-                    if (cos_table != nullptr && rotary_dim > 0 && tid < half_rot) {
+                    if (cos_table != nullptr && attn_rotary_dim > 0 && tid < half_rot) {
                             float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
                             float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
                             float x0 = q_head[tid];
@@ -3449,19 +3451,21 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 if (blockIdx.x < nkv) {
                     const int kh_idx = blockIdx.x;
                     float* k_head = k_f32 + kh_idx * hd;
-                    float sq = 0.0f;
-                    for (int d = tid; d < hd; d += bs) sq += k_head[d] * k_head[d];
-                    float inv = rsqrtf(
-                        dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + 1e-6f);
                     const T* knw = static_cast<const T*>(L.k_norm_w);
-                    for (int d = tid; d < hd; d += bs) {
-                        k_head[d] = k_head[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
+                    if (knw != nullptr && L.k_norm_eps > 0.0f) {
+                        float sq = 0.0f;
+                        for (int d = tid; d < hd; d += bs) sq += k_head[d] * k_head[d];
+                        float inv = rsqrtf(
+                            dotcache_qwen35_block_sum_256(sq, lds) / static_cast<float>(hd) + L.k_norm_eps);
+                        for (int d = tid; d < hd; d += bs) {
+                            k_head[d] = k_head[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
+                        }
                     }
                     __syncthreads();
 
-                    const int half_rot = rotary_dim / 2;
+                    const int half_rot = attn_rotary_dim / 2;
                     const size_t cos_off = static_cast<size_t>(seqlen_offset) * half_rot;
-                    if (cos_table != nullptr && rotary_dim > 0 && tid < half_rot) {
+                    if (cos_table != nullptr && attn_rotary_dim > 0 && tid < half_rot) {
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + tid]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + tid]);
                         float x0 = k_head[tid];
@@ -3558,50 +3562,54 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 const int nkv = L.attn_num_kv_heads;   // 2
                 const int kv_groups = nh / nkv;         // 4
                 const float scale = 1.0f / sqrtf(static_cast<float>(hd));
-                const int rotary_dim = hd / 4;          // 64 (partial_rotary_factor=0.25)
+                const int attn_rotary_dim = (rotary_dim < hd) ? rotary_dim : hd;
                 const int kv_len = L.kv_len + 1;       // includes this new token
                 // q_f32 layout: [nh * hd * 2] = per head: [query(hd) | gate(hd)]
 
                 // Step B: QK-norm — RMSNorm per head on head_dim
                 for (int h = 0; h < nh; ++h) {
                     float* qh = q_f32 + h * hd * 2;  // query portion
-                    float sq = 0.0f;
-                    for (int d = tid; d < hd; d += bs) sq += qh[d] * qh[d];
-                    lds[tid] = sq;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
-                        __syncthreads();
-                    }
-                    float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
                     const T* qnw = static_cast<const T*>(L.q_norm_w);
-                    for (int d = tid; d < hd; d += bs) {
-                        qh[d] = qh[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
+                    if (qnw != nullptr && L.q_norm_eps > 0.0f) {
+                        float sq = 0.0f;
+                        for (int d = tid; d < hd; d += bs) sq += qh[d] * qh[d];
+                        lds[tid] = sq;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        float inv = rsqrtf(lds[0] / static_cast<float>(hd) + L.q_norm_eps);
+                        for (int d = tid; d < hd; d += bs) {
+                            qh[d] = qh[d] * inv * (dotcache_qwen35_to_float(qnw[d]) + 1.0f);
+                        }
                     }
                     __syncthreads();
                 }
                 for (int h = 0; h < nkv; ++h) {
                     float* kh = k_f32 + h * hd;
-                    float sq = 0.0f;
-                    for (int d = tid; d < hd; d += bs) sq += kh[d] * kh[d];
-                    lds[tid] = sq;
-                    __syncthreads();
-                    for (int s = bs/2; s > 0; s >>= 1) {
-                        if (tid < s) lds[tid] += lds[tid+s];
-                        __syncthreads();
-                    }
-                    float inv = rsqrtf(lds[0] / static_cast<float>(hd) + 1e-6f);
                     const T* knw = static_cast<const T*>(L.k_norm_w);
-                    for (int d = tid; d < hd; d += bs) {
-                        kh[d] = kh[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
+                    if (knw != nullptr && L.k_norm_eps > 0.0f) {
+                        float sq = 0.0f;
+                        for (int d = tid; d < hd; d += bs) sq += kh[d] * kh[d];
+                        lds[tid] = sq;
+                        __syncthreads();
+                        for (int s = bs/2; s > 0; s >>= 1) {
+                            if (tid < s) lds[tid] += lds[tid+s];
+                            __syncthreads();
+                        }
+                        float inv = rsqrtf(lds[0] / static_cast<float>(hd) + L.k_norm_eps);
+                        for (int d = tid; d < hd; d += bs) {
+                            kh[d] = kh[d] * inv * (dotcache_qwen35_to_float(knw[d]) + 1.0f);
+                        }
                     }
                     __syncthreads();
                 }
 
-                // Step C: RoPE (partial, first rotary_dim dims of head_dim)
-                // Qwen3.5 uses rotate_half over the rotary slice.
-                if (cos_table != nullptr && rotary_dim > 0) {
-                    const int half_rot = rotary_dim / 2;
+                // Step C: RoPE over the configured rotary slice. Qwen uses
+                // partial-rotary here; Llama 3.1 passes the full head dim.
+                if (cos_table != nullptr && attn_rotary_dim > 0) {
+                    const int half_rot = attn_rotary_dim / 2;
                     const size_t cos_off =
                         static_cast<size_t>(seqlen_offset) * half_rot;
 

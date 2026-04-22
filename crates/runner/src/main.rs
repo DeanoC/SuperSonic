@@ -1,6 +1,7 @@
 mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
+mod llama31_engine;
 mod oracle;
 mod phi4_engine;
 mod prefill_engine;
@@ -727,6 +728,9 @@ fn main() -> Result<()> {
         ModelFamily::Phi4 => {
             return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
         }
+        ModelFamily::Llama31 => {
+            return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
+        }
         ModelFamily::Qwen35 => {}
     }
 
@@ -782,6 +786,7 @@ fn main() -> Result<()> {
         FamilyParams::Qwen35(p) => p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
+        FamilyParams::Llama31(_) => unreachable!("llama3.1 handled above"),
     };
     let host_lm_head_rescorer = HostLmHeadRescorer::from_model_dir(&cli.model_dir)?;
 
@@ -2040,6 +2045,7 @@ fn run_gemma4(
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {
