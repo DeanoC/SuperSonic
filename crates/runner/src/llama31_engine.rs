@@ -811,6 +811,47 @@ pub fn run_llama31(
                         "[gpu-validate-layer] layer={} attn_delta={attn_delta:.6} post_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}",
                         layer_idx
                     );
+                    if layer_idx > 0 {
+                        let prev_idx = layer_idx - 1;
+                        let replay_prev_attn = replay
+                            .layer_attn_trace
+                            .as_ref()
+                            .and_then(|layers| layers.get(prev_idx))
+                            .ok_or_else(|| anyhow!("internal: missing replay attn trace for layer {prev_idx}"))?;
+                        let replay_prev_post = replay
+                            .layer_post_attn_norm_trace
+                            .as_ref()
+                            .and_then(|layers| layers.get(prev_idx))
+                            .ok_or_else(|| anyhow!("internal: missing replay post trace for layer {prev_idx}"))?;
+                        let replay_prev_mlp = replay
+                            .layer_mlp_out_trace
+                            .as_ref()
+                            .and_then(|layers| layers.get(prev_idx))
+                            .ok_or_else(|| anyhow!("internal: missing replay mlp trace for layer {prev_idx}"))?;
+                        engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                        let (_prev_logits, prev_trace) =
+                            engine.component_decode_step_4b_trace_layer(next_token, pos, prev_idx)?;
+                        let prev_attn_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&prev_trace.attn_hidden),
+                            &decode_bf16_le(replay_prev_attn),
+                        );
+                        let prev_post_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&prev_trace.post_attn_norm),
+                            &decode_bf16_le(replay_prev_post),
+                        );
+                        let prev_mlp_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&prev_trace.mlp_out),
+                            &decode_bf16_le(replay_prev_mlp),
+                        );
+                        let prev_hidden_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&prev_trace.layer_hidden),
+                            &decode_bf16_le(&replay_hidden[prev_idx]),
+                        );
+                        eprintln!(
+                            "[gpu-validate-layer-prev] layer={} attn_delta={prev_attn_delta:.6} post_delta={prev_post_delta:.6} mlp_delta={prev_mlp_delta:.6} hidden_delta={prev_hidden_delta:.6}",
+                            prev_idx
+                        );
+                    }
                     if engine.weights().config.is_full_attention(layer_idx) && layer_idx > 0 {
                         engine.rebuild_prefill_state(prefix_token_ids, false)?;
                         let (_stage_logits, native_input_hidden) =
@@ -864,14 +905,69 @@ pub fn run_llama31(
                             &decode_bf16_le(&native_stage.gated),
                             &decode_bf16_le(&replay_stage.gated),
                         );
+                        let proj_out_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.proj_out),
+                            &decode_bf16_le(&replay_stage.proj_out),
+                        );
                         let native_attn_delta = validate::max_abs_delta(
                             &decode_bf16_le(&native_stage.attn_hidden),
                             &decode_bf16_le(&replay_stage.attn_hidden),
                         );
                         eprintln!(
-                            "[gpu-validate-full-attn] layer={} input_delta={input_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_delta:.6} gated_delta={gated_delta:.6} native_attn_delta={native_attn_delta:.6}",
+                            "[gpu-validate-full-attn] layer={} input_delta={input_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_delta:.6} gated_delta={gated_delta:.6} proj_out_delta={proj_out_delta:.6} native_attn_delta={native_attn_delta:.6}",
                             layer_idx
                         );
+                        let prev_idx = layer_idx - 1;
+                        if engine.weights().config.is_full_attention(prev_idx) && prev_idx > 0 {
+                            let replay_prev_input_hidden = &replay_hidden[prev_idx - 1];
+                            engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                            let (_prev_stage_logits, prev_input_hidden) =
+                                engine.component_decode_step_4b_traced(next_token, pos, prev_idx)?;
+                            let prev_input_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&prev_input_hidden),
+                                &decode_bf16_le(replay_prev_input_hidden),
+                            );
+                            engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                            engine.set_hidden_from_bytes(&prev_input_hidden)?;
+                            let native_prev_stage = engine
+                                .component_trace_full_attention_from_current_hidden_with_seqlen(
+                                    prev_idx, pos,
+                                )?;
+                            engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                            engine.set_hidden_from_bytes(replay_prev_input_hidden)?;
+                            let replay_prev_stage = engine
+                                .component_trace_full_attention_from_current_hidden_with_seqlen(
+                                    prev_idx, pos,
+                                )?;
+                            let prev_q_proj_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.q_proj),
+                                &decode_bf16_le(&replay_prev_stage.q_proj),
+                            );
+                            let prev_k_proj_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.k_proj),
+                                &decode_bf16_le(&replay_prev_stage.k_proj),
+                            );
+                            let prev_v_proj_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.v_proj),
+                                &decode_bf16_le(&replay_prev_stage.v_proj),
+                            );
+                            let prev_pre_gate_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.pre_gate),
+                                &decode_bf16_le(&replay_prev_stage.pre_gate),
+                            );
+                            let prev_proj_out_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.proj_out),
+                                &decode_bf16_le(&replay_prev_stage.proj_out),
+                            );
+                            let prev_native_attn_delta = validate::max_abs_delta(
+                                &decode_bf16_le(&native_prev_stage.attn_hidden),
+                                &decode_bf16_le(&replay_prev_stage.attn_hidden),
+                            );
+                            eprintln!(
+                                "[gpu-validate-full-attn-prev] layer={} input_delta={prev_input_delta:.6} q_proj_delta={prev_q_proj_delta:.6} k_proj_delta={prev_k_proj_delta:.6} v_proj_delta={prev_v_proj_delta:.6} pre_gate_delta={prev_pre_gate_delta:.6} proj_out_delta={prev_proj_out_delta:.6} native_attn_delta={prev_native_attn_delta:.6}",
+                                prev_idx
+                            );
+                        }
                     }
                     engine.rebuild_prefill_state(&full_token_ids, false)?;
                 } else {
