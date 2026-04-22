@@ -539,6 +539,18 @@ pub struct FullAttentionLayerOutputTrace {
     pub attn_hidden: Vec<u8>,
 }
 
+pub struct ComponentFullAttentionTrace {
+    pub q_proj: Vec<u8>,
+    pub gate_proj: Vec<u8>,
+    pub k_proj: Vec<u8>,
+    pub v_proj: Vec<u8>,
+    pub q_rope: Vec<u8>,
+    pub k_rope: Vec<u8>,
+    pub pre_gate: Vec<u8>,
+    pub gated: Vec<u8>,
+    pub attn_hidden: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Persistent4BLayerTiming {
     full_attn_ms: f64,
@@ -1756,6 +1768,29 @@ impl DecodeEngine {
         })
     }
 
+    pub fn component_trace_full_attention_from_current_hidden_with_seqlen(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+    ) -> Result<ComponentFullAttentionTrace> {
+        anyhow::ensure!(
+            self.weights.config.is_full_attention(idx),
+            "layer {idx} is not full attention"
+        );
+        rms_norm_rows_model(
+            &self.weights.config,
+            self.ordinal,
+            1,
+            self.weights.config.hidden_size,
+            &self.hidden_io,
+            &self.weights.layers[idx].input_norm_w,
+            &mut self.normed_buf,
+            &format!("layer {idx} component full-attn input rms_norm"),
+        )?;
+        self.component_decode_full_attention_layer(idx, seqlen_offset, true)?
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing full-attention trace"))
+    }
+
     pub fn full_attention_cache_step_bytes(
         &self,
         layer_idx: usize,
@@ -1856,7 +1891,7 @@ impl DecodeEngine {
         )?;
 
             if self.weights.config.is_full_attention(i) {
-                self.component_decode_full_attention_layer(i, seqlen_offset)?;
+                let _ = self.component_decode_full_attention_layer(i, seqlen_offset, false)?;
             } else {
                 if let Some(trace) = self.component_decode_linear_attention_layer(
                     i,
@@ -2016,7 +2051,12 @@ impl DecodeEngine {
         Ok((logits, trace))
     }
 
-    fn component_decode_full_attention_layer(&mut self, idx: usize, seqlen_offset: usize) -> Result<()> {
+    fn component_decode_full_attention_layer(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+        trace_output: bool,
+    ) -> Result<Option<ComponentFullAttentionTrace>> {
         let config = &self.weights.config;
         let fw = self.weights.layers[idx]
             .full
@@ -2043,6 +2083,14 @@ impl DecodeEngine {
         let kv_len = seqlen_offset + 1;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
         let use_late_decode_mixed = self.weights.is_int8 && idx + 2 >= config.num_hidden_layers;
+        let mut q_proj_trace = None;
+        let mut gate_proj_trace = None;
+        let mut k_proj_trace = None;
+        let mut v_proj_trace = None;
+        let mut q_rope_trace = None;
+        let mut k_rope_trace = None;
+        let mut pre_gate_trace = None;
+        let mut gated_trace = None;
 
         let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} q_full alloc: {e}"))?;
@@ -2215,6 +2263,28 @@ impl DecodeEngine {
             kv_dim * elem_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
+        if trace_output {
+            q_proj_trace = Some(
+                query_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} q proj trace D2H: {e}"))?,
+            );
+            gate_proj_trace = Some(
+                gate_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gate proj trace D2H: {e}"))?,
+            );
+            k_proj_trace = Some(
+                k_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} k proj trace D2H: {e}"))?,
+            );
+            v_proj_trace = Some(
+                v_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} v proj trace D2H: {e}"))?,
+            );
+        }
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
@@ -2226,6 +2296,18 @@ impl DecodeEngine {
             &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
+        if trace_output {
+            q_rope_trace = Some(
+                query_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} q rope trace D2H: {e}"))?,
+            );
+            k_rope_trace = Some(
+                k_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} k rope trace D2H: {e}"))?,
+            );
+        }
 
         kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q)
             .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
@@ -2321,6 +2403,13 @@ impl DecodeEngine {
             self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+        if trace_output {
+            pre_gate_trace = Some(
+                attn_flat
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+            );
+        }
 
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
@@ -2338,6 +2427,13 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate bypass copy: {e}"))?;
         }
+        if trace_output {
+            gated_trace = Some(
+                gated
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
+            );
+        }
 
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
@@ -2345,7 +2441,24 @@ impl DecodeEngine {
             fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
-        Ok(())
+        Ok(if trace_output {
+            Some(ComponentFullAttentionTrace {
+                q_proj: q_proj_trace.unwrap_or_default(),
+                gate_proj: gate_proj_trace.unwrap_or_default(),
+                k_proj: k_proj_trace.unwrap_or_default(),
+                v_proj: v_proj_trace.unwrap_or_default(),
+                q_rope: q_rope_trace.unwrap_or_default(),
+                k_rope: k_rope_trace.unwrap_or_default(),
+                pre_gate: pre_gate_trace.unwrap_or_default(),
+                gated: gated_trace.unwrap_or_default(),
+                attn_hidden: self
+                    .hidden_io
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attn hidden trace D2H: {e}"))?,
+            })
+        } else {
+            None
+        })
     }
 
     fn component_decode_linear_attention_layer(

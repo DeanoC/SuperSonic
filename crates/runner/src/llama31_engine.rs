@@ -821,20 +821,17 @@ pub fn run_llama31(
                             &decode_bf16_le(replay_input_hidden),
                         );
                         engine.rebuild_prefill_state(prefix_token_ids, false)?;
-                        let native_stage = engine.trace_full_attention_stages_from_hidden(
+                        engine.set_hidden_from_bytes(&native_input_hidden)?;
+                        let native_stage = engine.component_trace_full_attention_from_current_hidden_with_seqlen(
                             layer_idx,
-                            &native_input_hidden,
                             pos,
                         )?;
-                        let replay_stage = engine.trace_full_attention_stages_from_hidden(
+                        engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                        engine.set_hidden_from_bytes(replay_input_hidden)?;
+                        let replay_stage = engine.component_trace_full_attention_from_current_hidden_with_seqlen(
                             layer_idx,
-                            replay_input_hidden,
                             pos,
                         )?;
-                        let normed_delta = validate::max_abs_delta(
-                            &decode_bf16_le(&native_stage.normed),
-                            &decode_bf16_le(&replay_stage.normed),
-                        );
                         let q_proj_delta = validate::max_abs_delta(
                             &decode_bf16_le(&native_stage.q_proj),
                             &decode_bf16_le(&replay_stage.q_proj),
@@ -859,8 +856,20 @@ pub fn run_llama31(
                             &decode_bf16_le(&native_stage.k_rope),
                             &decode_bf16_le(&replay_stage.k_rope),
                         );
+                        let pre_gate_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.pre_gate),
+                            &decode_bf16_le(&replay_stage.pre_gate),
+                        );
+                        let gated_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.gated),
+                            &decode_bf16_le(&replay_stage.gated),
+                        );
+                        let native_attn_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.attn_hidden),
+                            &decode_bf16_le(&replay_stage.attn_hidden),
+                        );
                         eprintln!(
-                            "[gpu-validate-full-attn] layer={} input_delta={input_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6}",
+                            "[gpu-validate-full-attn] layer={} input_delta={input_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_delta:.6} gated_delta={gated_delta:.6} native_attn_delta={native_attn_delta:.6}",
                             layer_idx
                         );
                     }
