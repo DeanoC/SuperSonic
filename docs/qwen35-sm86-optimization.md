@@ -14,7 +14,7 @@ Current hero lanes:
 - backend: CUDA
 - arch: `sm86`
 - `qwen3.5-0.8b`: batch-1, BF16, normal generation
-- `qwen3.5-4b`: batch-1, BF16, baked load, `--force-kernel-decode`
+- `qwen3.5-4b`: batch-1, BF16, baked load, native single-kernel decode
 
 These lanes are intentionally specialized. Validation, tracing, replay-based
 correctness, and other models still keep their fallback paths.
@@ -208,15 +208,16 @@ Exact lane:
 
 Current best verified commit:
 
-- `d8124c8` `cuda: parallelize qwen35 4b recurrent head pairs`
+- `5a34190` `cuda: cache qwen35 4b hero inputs in bf16`
 
 Current warmed result on this box:
 
-- prefill: `119.0 tok/s`
-- decode: `19.9 tok/s`
-- decode wall time: `804.7 ms`
-- persistent decode stage: `731.951 ms`
-- `linear_core_recurrent`: `24.775 ms`
+- prefill: `101.5 tok/s`
+- decode: `22.0 tok/s`
+- decode wall time: `727.0 ms`
+- persistent decode stage: `654.628 ms`
+- `linear_proj`: `35.132 ms`
+- `linear_core_recurrent`: `24.803 ms`
 
 Validated behavior at this checkpoint:
 
@@ -234,14 +235,16 @@ Kept progression on the `4B` hero lane:
 | `553c292` | trim recurrent-state traffic in the serial linear-attention core | reduced warmed `linear_core` and persistent time |
 | `e5f244d` | add a true CUDA-only single-stream BF16 specialized 4B kernel entrypoint | improved warmed decode from about `14.5 tok/s` to `15.2 tok/s` |
 | `d8124c8` | parallelize recurrent head-pair work across hero blocks | improved warmed decode to about `19.9 tok/s` and cut `linear_core_recurrent` to about `24.8 ms` |
+| `5a34190` | cache single-stream 4B hero inputs in BF16 shared memory for `linear_proj` | improved warmed decode to about `22.0 tok/s` and cut `linear_proj` to about `35.1 ms` |
 
 What the latest kept pass changed structurally:
 
-- moved the single-stream BF16 hero recurrent update from one block onto a
-  head-pair-per-block schedule
-- kept the generic block-0-only recurrent implementation as the fallback path
-- disabled the decayless-store shortcut only in the cross-block recurrent hero
-  split, where it was not numerically safe enough
+- added a BF16 shared-activation cache for the single-stream 4B hero
+  `linear_proj` family
+- moved the single-stream BF16 hero `linear_proj` rows onto a warp-per-row dot
+  path instead of a full-block reduction
+- extended the specialized 4B CUDA bridge shared-memory sizing so the hero
+  BF16 cache fits correctly on launch
 
 Things tried on the `4B` hero lane and not kept:
 
@@ -251,13 +254,21 @@ Things tried on the `4B` hero lane and not kept:
   wall-clock decode
 - corrected single-stream BF16 MLP specializations that still regressed the
   short warmed lane
+- BF16-cache warp-per-row rewrites for `mlp_gate_up`, `mlp_down`, and
+  `linear_out`
+  - produced attractive local timing deltas
+  - did not meet the parity gate (`decode_max_delta` rose to about `5-8` on the
+    `Hello` smoke prompt, and the `mlp_down`-only cut changed generated tokens)
+  - reverted rather than carried as a “fast but wrong” path
 
 Current 4B bottleneck read:
 
 - the dominant remaining cost is still inside the persistent kernel
 - the recurrent bottleneck is no longer dominant after `d8124c8`
 - the biggest remaining timing buckets are now `mlp_down`, `mlp_gate_up`,
-  `full_attn_core`, `linear_proj`, and `linear_out`
+  `full_attn_core`, and `linear_out`
+- the easy 0.8B-style warp-reduction copy path is not numerically free on 4B;
+  future work should be trace-driven rather than blind hero-path cloning
 - the next likely win is another hero-lane scheduling change on one of those
   wide row-dot families, not more surgery on the recurrent body
 
