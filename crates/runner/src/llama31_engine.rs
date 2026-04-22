@@ -395,11 +395,14 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         return;
     }
     eprintln!(
-        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} persistent={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
+        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} layer_compute={:.1} full_attn={:.1} linear={:.1} mlp={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
         tokens,
         timings.total_ms(),
         timings.total_ms() / tokens as f64,
         timings.persistent_ms,
+        timings.persistent_full_attn_ms,
+        timings.persistent_linear_core_ms,
+        timings.persistent_mlp_down_ms,
         timings.rms_norm_ms,
         timings.lm_head_ms,
         timings.logits_d2h_ms,
@@ -689,8 +692,13 @@ pub fn run_llama31(
     let mut stage_totals = DecodeStageTimings::default();
     while generated.len() < cli.max_new_tokens && !eos_ids.contains(&next_token) {
         let pos = prompt_ids.len() + generated.len() - 1;
-        let (logits, timings) = engine.decode_step_with_timings(next_token, pos)?;
-        stage_totals.add_assign(timings);
+        let logits = if cli.emit_stage_timings {
+            let (logits, timings) = engine.decode_step_with_timings(next_token, pos)?;
+            stage_totals.add_assign(timings);
+            logits
+        } else {
+            engine.decode_step(next_token, pos)?
+        };
         let native_next = DecodeEngine::greedy_sample(&logits);
         if let Some(ref oracle) = oracle_output {
             let decode_idx = generated.len() - 1;

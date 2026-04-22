@@ -1871,11 +1871,12 @@ impl DecodeEngine {
         trace_input_layer: Option<usize>,
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
+        mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<(Vec<f32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
         let hidden_dim = self.weights.config.hidden_size;
-        let rms_norm_eps = self.weights.config.rms_norm_eps as f32;
         let vocab_size = self.weights.config.vocab_size;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let collect_timings = timings.is_some();
 
         let row_bytes = hidden_dim * elem_bytes;
         let src_offset = token_id as usize * row_bytes;
@@ -1899,25 +1900,44 @@ impl DecodeEngine {
                         .map_err(|e| anyhow::anyhow!("layer {i} hidden trace D2H: {e}"))?,
                 );
             }
-        rms_norm_rows_model(
-            &self.weights.config,
-            self.ordinal,
-            1,
-            hidden_dim,
-            &self.hidden_io,
-            &self.weights.layers[i].input_norm_w,
-            &mut self.normed_buf,
-            &format!("layer {i} input rms_norm"),
-        )?;
+            let input_norm_start = Instant::now();
+            rms_norm_rows_model(
+                &self.weights.config,
+                self.ordinal,
+                1,
+                hidden_dim,
+                &self.hidden_io,
+                &self.weights.layers[i].input_norm_w,
+                &mut self.normed_buf,
+                &format!("layer {i} input rms_norm"),
+            )?;
+            self.sync_stage_if_requested(collect_timings, &format!("layer {i} input rms_norm"))?;
+            if let Some(t) = timings.as_mut() {
+                t.rms_norm_ms += input_norm_start.elapsed().as_secs_f64() * 1000.0;
+            }
 
             if self.weights.config.is_full_attention(i) {
+                let full_attn_start = Instant::now();
                 let _ = self.component_decode_full_attention_layer(i, seqlen_offset, false)?;
+                self.sync_stage_if_requested(collect_timings, &format!("layer {i} full attention"))?;
+                let elapsed = full_attn_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(t) = timings.as_mut() {
+                    t.persistent_ms += elapsed;
+                    t.persistent_full_attn_ms += elapsed;
+                }
             } else {
+                let linear_start = Instant::now();
                 if let Some(trace) = self.component_decode_linear_attention_layer(
                     i,
                     trace_linear_layer == Some(i),
                 )? {
                     traced_linear = Some(trace);
+                }
+                self.sync_stage_if_requested(collect_timings, &format!("layer {i} linear attention"))?;
+                let elapsed = linear_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(t) = timings.as_mut() {
+                    t.persistent_ms += elapsed;
+                    t.persistent_linear_core_ms += elapsed;
                 }
             }
 
@@ -1931,6 +1951,7 @@ impl DecodeEngine {
                 );
             }
 
+            let post_attn_norm_start = Instant::now();
             rms_norm_rows_model(
                 &self.weights.config,
                 self.ordinal,
@@ -1941,6 +1962,10 @@ impl DecodeEngine {
                 &mut self.normed_buf,
                 &format!("layer {i} post-attn rms_norm"),
             )?;
+            self.sync_stage_if_requested(collect_timings, &format!("layer {i} post-attn rms_norm"))?;
+            if let Some(t) = timings.as_mut() {
+                t.rms_norm_ms += post_attn_norm_start.elapsed().as_secs_f64() * 1000.0;
+            }
 
             if trace_layer == Some(i) {
                 trace_post_attn_norm = Some(
@@ -1950,7 +1975,14 @@ impl DecodeEngine {
                 );
             }
 
+            let mlp_start = Instant::now();
             let maybe_mlp = self.component_decode_mlp_layer(i, trace_layer == Some(i))?;
+            self.sync_stage_if_requested(collect_timings, &format!("layer {i} mlp"))?;
+            let mlp_elapsed = mlp_start.elapsed().as_secs_f64() * 1000.0;
+            if let Some(t) = timings.as_mut() {
+                t.persistent_ms += mlp_elapsed;
+                t.persistent_mlp_down_ms += mlp_elapsed;
+            }
             if trace_layer == Some(i) {
                 let mlp_trace = maybe_mlp
                     .ok_or_else(|| anyhow::anyhow!("missing mlp trace for layer {i}"))?;
@@ -1976,6 +2008,7 @@ impl DecodeEngine {
             }
         }
 
+        let final_norm_start = Instant::now();
         rms_norm_rows_model(
             &self.weights.config,
             self.ordinal,
@@ -1986,7 +2019,12 @@ impl DecodeEngine {
             &mut self.normed_buf,
             "final rms_norm",
         )?;
+        self.sync_stage_if_requested(collect_timings, "final rms_norm")?;
+        if let Some(t) = timings.as_mut() {
+            t.rms_norm_ms += final_norm_start.elapsed().as_secs_f64() * 1000.0;
+        }
 
+        let lm_head_start = Instant::now();
         kernel_ffi::standalone_matvec_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -1998,11 +2036,19 @@ impl DecodeEngine {
             &mut self.matvec_counter,
         )
         .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+        self.sync_stage_if_requested(collect_timings, "lm_head matvec 4b")?;
+        if let Some(t) = timings.as_mut() {
+            t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
+        }
 
+        let logits_d2h_start = Instant::now();
         let logits_bytes = self
             .logits_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
+        if let Some(t) = timings.as_mut() {
+            t.logits_d2h_ms += logits_d2h_start.elapsed().as_secs_f64() * 1000.0;
+        }
         Ok((
             logits_bytes
                 .chunks_exact(2)
@@ -2016,8 +2062,28 @@ impl DecodeEngine {
 
     fn component_decode_step_4b(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
         let (logits, _, _, _) =
-            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None)?;
+            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, None)?;
         Ok(logits)
+    }
+
+    fn component_decode_step_4b_with_timings(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        let mut timings = DecodeStageTimings::default();
+        let (logits, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            Some(&mut timings),
+        )?;
+        let sampling_start = Instant::now();
+        let _ = Self::greedy_sample(&logits);
+        timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
+        Ok((logits, timings))
     }
 
     pub fn component_decode_step_4b_traced(
@@ -2030,6 +2096,7 @@ impl DecodeEngine {
             token_id,
             seqlen_offset,
             Some(trace_input_layer),
+            None,
             None,
             None,
         )?;
@@ -2049,6 +2116,7 @@ impl DecodeEngine {
             None,
             Some(trace_layer),
             None,
+            None,
         )?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
         Ok((logits, trace))
@@ -2066,6 +2134,7 @@ impl DecodeEngine {
             None,
             None,
             Some(trace_layer),
+            None,
         )?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
         Ok((logits, trace))
@@ -3536,11 +3605,19 @@ impl DecodeEngine {
         Ok(result)
     }
 
+    fn sync_stage_if_requested(&self, enabled: bool, stage: &str) -> Result<()> {
+        if !enabled {
+            return Ok(());
+        }
+        gpu_hal::sync(self.ordinal).map_err(|e| anyhow::anyhow!("{stage} synchronize: {e}"))
+    }
+
     fn decode_step_non_4b(
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
         sampling_mode: DecodeSamplingMode,
+        sync_for_timing: bool,
     ) -> Result<DecodeStepOutput> {
         let config = &self.weights.config;
         let mut timings = DecodeStageTimings::default();
@@ -3630,6 +3707,7 @@ impl DecodeEngine {
         };
         persist_result
             .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
+        self.sync_stage_if_requested(sync_for_timing, "persistent_decode")?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // 6. Update KV filled counts
@@ -3652,6 +3730,7 @@ impl DecodeEngine {
             config.hidden_size,
         )
         .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
+        self.sync_stage_if_requested(sync_for_timing, "final rms_norm")?;
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         match sampling_mode {
@@ -3668,6 +3747,7 @@ impl DecodeEngine {
                     config.vocab_size,
                 )
                 .map_err(|e| anyhow::anyhow!("cuda fused lm_head argmax: {e}"))?;
+                self.sync_stage_if_requested(sync_for_timing, "cuda fused lm_head argmax")?;
                 timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 let start = Instant::now();
@@ -3702,6 +3782,7 @@ impl DecodeEngine {
                     &mut self.matvec_counter,
                 )
                 .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+                self.sync_stage_if_requested(sync_for_timing, "lm_head matvec")?;
                 timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                 if sampling_mode == DecodeSamplingMode::CudaFastGreedy {
@@ -3713,6 +3794,7 @@ impl DecodeEngine {
                         config.vocab_size,
                     )
                     .map_err(|e| anyhow::anyhow!("cuda argmax: {e}"))?;
+                    self.sync_stage_if_requested(sync_for_timing, "cuda argmax")?;
                     timings.gpu_argmax_ms = start.elapsed().as_secs_f64() * 1000.0;
 
                     let start = Instant::now();
@@ -3767,10 +3849,14 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
         if self.use_4b_kernel {
-            let logits = self.component_decode_step_4b(token_id, seqlen_offset)?;
-            return Ok((logits, DecodeStageTimings::default()));
+            return self.component_decode_step_4b_with_timings(token_id, seqlen_offset);
         }
-        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::HostLogits)?;
+        let out = self.decode_step_non_4b(
+            token_id,
+            seqlen_offset,
+            DecodeSamplingMode::HostLogits,
+            true,
+        )?;
         let logits = out
             .logits
             .ok_or_else(|| anyhow::anyhow!("decode_step_with_timings missing logits"))?;
@@ -3790,7 +3876,12 @@ impl DecodeEngine {
         if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
             anyhow::bail!("decode_step_cuda_fast_greedy requires CUDA backend");
         }
-        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::CudaFastGreedy)?;
+        let out = self.decode_step_non_4b(
+            token_id,
+            seqlen_offset,
+            DecodeSamplingMode::CudaFastGreedy,
+            false,
+        )?;
         Ok((out.sampled_token, out.timings))
     }
 
@@ -3811,14 +3902,24 @@ impl DecodeEngine {
             token_id,
             seqlen_offset,
             DecodeSamplingMode::CudaHeroFusedLmHead,
+            false,
         )?;
         Ok((out.sampled_token, out.timings))
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
     pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
-        let (logits, _) = self.decode_step_with_timings(token_id, seqlen_offset)?;
-        Ok(logits)
+        if self.use_4b_kernel {
+            return self.component_decode_step_4b(token_id, seqlen_offset);
+        }
+        let out = self.decode_step_non_4b(
+            token_id,
+            seqlen_offset,
+            DecodeSamplingMode::HostLogits,
+            false,
+        )?;
+        out.logits
+            .ok_or_else(|| anyhow::anyhow!("decode_step missing logits"))
     }
 
     /// Forced single-sequence 4B kernel path with native stage timings.
