@@ -5412,25 +5412,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             void* conv_b = hero_specialized ? L.conv_state : (batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state);
             void* rec_b  = hero_specialized ? L.recurrent_state : (batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state);
             float* proj_b = proj_buf + b * proj_buf_floats;
+            float* gate_up_b = gate_up + b * intermediate_size * 2;
+            float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
+            float* mlp_out_b = mlp_out + b * hidden_dim;
+            const int conv_dim = L.qkv_out_dim;
+            const int kern = L.conv_kernel_size;
+            const int nv = L.linear_num_v_heads;
+            const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
+            const int hkd = L.linear_head_k_dim;
+            const int hvd = L.linear_head_v_dim;
+            const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
+            const int val_dim = L.linear_value_dim; // 2048
 
             if (blockIdx.x == 0) {
                 float* qkv_f32 = proj_b;
                 float* z_f32 = proj_b + L.qkv_out_dim;
                 float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
                 float* a_f32 = b_f32 + nv_heads;
-                // Batch-strided scratch aliases
-                float* gate_up_b = gate_up + b * intermediate_size * 2;
-                float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
-                float* mlp_out_b = mlp_out + b * hidden_dim;
-
-                const int conv_dim = L.qkv_out_dim;
-                const int kern = L.conv_kernel_size;
-                const int nv = L.linear_num_v_heads;
-                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
-                const int hkd = L.linear_head_k_dim;
-                const int hvd = L.linear_head_v_dim;
-                const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
-                const int val_dim = L.linear_value_dim; // 2048
                 const unsigned long long linear_conv_clock = clock64();
 
                 // Step B: Conv1d stateful update
@@ -5547,21 +5545,22 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_CONV_BASE + min(b, 1),
                     linear_conv_clock);
+            } // end if (blockIdx.x == 0) conv/qk prep
 
-                const unsigned long long linear_recurrent_clock = clock64();
+            // Grid barrier: block 0 wrote normalized Q/K/V scratch needed below.
+            __threadfence();
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                // Step C: Parallel delta recurrent state update
-                // state: [nv, hkd, hvd] F32 — the recurrent memory
-                // 256 threads process 2 heads at a time: threads 0-127 → head h,
-                // threads 128-255 → head h+1. Each thread owns one v-dimension.
-                // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
-                //           state += outer(key, delta), output = state @ query
-                {
+            const unsigned long long linear_recurrent_clock = clock64();
+            // Step C: Parallel delta recurrent state update
+            // Hero lane spreads one head-pair per block; the generic path keeps
+            // the existing block-0-only implementation.
+            if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
+                const int hero_pairs = (nv + 1) / 2;
+                if (blockIdx.x < hero_pairs) {
+                    const int hp = static_cast<int>(blockIdx.x) * 2;
                     float* conv_out = gate_up_b;  // reused
                     float* state = static_cast<float*>(rec_b);
-                    // Reuse the front of lds_input as a tiny per-head staging area
-                    // so the recurrent body does not keep reloading the same Q/K
-                    // vectors from global scratch.
                     float* q_stage = lds_input;
                     float* k_stage = q_stage + 2 * hkd;
 
@@ -5571,106 +5570,164 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const int q_key_offset = 0;
                     const int k_key_offset = key_dim;
                     const int v_val_offset = key_dim * 2;
-                    const int v = tid % hvd;          // v-dimension for this thread
-                    const bool qwen4b_single_linear_decayless_store_hero =
-                        runtime_qwen35_4b_shape &&
-                        B == 1 && bs == 256 && kern == 4 &&
-                        nv == 16 && nk == 16 && hkd == 128 && hvd == 128;
+                    const int v = tid % hvd;
+                    // Keep the cross-block recurrent split conservative: the
+                    // single-block decayless-store shortcut is numerically
+                    // safe on the original hero path, but it changes long-
+                    // context behavior once head pairs are distributed across
+                    // blocks. Re-evaluate it only after parity is restored.
+                    const bool qwen4b_single_linear_decayless_store_hero = false;
 
-                    // Process 2 heads per iteration (256 threads / 128 hvd)
-                    for (int hp = 0; hp < nv; hp += 2) {
-                        if (tid < 2 * hkd) {
-                            const int pair_head = tid / hkd;
-                            const int d = tid % hkd;
-                            const int staged_h = hp + pair_head;
-                            if (staged_h < nv) {
-                                const int staged_hk = staged_h * nk / nv;
-                                q_stage[tid] =
-                                    conv_out[q_key_offset + staged_hk * hkd + d];
-                                k_stage[tid] =
-                                    conv_out[k_key_offset + staged_hk * hkd + d];
-                            }
+                    if (tid < 2 * hkd) {
+                        const int pair_head = tid / hkd;
+                        const int d = tid % hkd;
+                        const int staged_h = hp + pair_head;
+                        if (staged_h < nv) {
+                            const int staged_hk = staged_h * nk / nv;
+                            q_stage[tid] =
+                                conv_out[q_key_offset + staged_hk * hkd + d];
+                            k_stage[tid] =
+                                conv_out[k_key_offset + staged_hk * hkd + d];
                         }
-                        __syncthreads();
-
-                        const int h = hp + (tid >= hvd ? 1 : 0);
-
-                        if (h < nv) {
-                            float* sh = state + h * hkd * hvd;
-                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
-                            float decay = 1.0f;
-                            if (dt_bw != nullptr && ale_w != nullptr) {
-                                const float sp = logf(1.0f + expf(
-                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
-                            }
-
-                            // Map value head to key head for Q/K indexing
-                            // nk key heads shared among nv value heads
-                            const int pair_head = h - hp;
-                            const float* qh = q_stage + pair_head * hkd;
-                            const float* kh = k_stage + pair_head * hkd;
-
-                            // First pass: accumulate kv_mem from the decayed state.
-                            // On the single-stream hero lane we skip the intermediate
-                            // "write decayed state" step and apply decay only when the
-                            // final updated state is written back in the second pass.
-                            float kv_mem_v = 0.0f;
-                            if (qwen4b_single_linear_decayless_store_hero) {
-                                for (int k = 0; k < 128; ++k) {
-                                    const float state_orig = sh[k * 128 + v];
-                                    const float state_decay = state_orig * decay;
-                                    kv_mem_v += state_decay * kh[k];
-                                }
-                            } else {
-                                for (int k = 0; k < hkd; ++k) {
-                                    float* state_kv = sh + k * hvd + v;
-                                    const float state_decay = (*state_kv) * decay;
-                                    *state_kv = state_decay;
-                                    kv_mem_v += state_decay * kh[k];
-                                }
-                            }
-
-                            // delta = (value - kv_mem) * beta
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            const float delta = (val - kv_mem_v) * beta;
-
-                            // Second pass: update the state and accumulate the output
-                            // from the updated value in the same walk.
-                            float out_v = 0.0f;
-                            if (qwen4b_single_linear_decayless_store_hero) {
-                                for (int k = 0; k < 128; ++k) {
-                                    float* state_kv = sh + k * 128 + v;
-                                    const float state_orig = *state_kv;
-                                    const float state_decay = state_orig * decay;
-                                    const float state_update =
-                                        state_decay + kh[k] * delta;
-                                    *state_kv = state_update;
-                                    out_v += state_update * qh[k];
-                                }
-                            } else {
-                                for (int k = 0; k < hkd; ++k) {
-                                    float* state_kv = sh + k * hvd + v;
-                                    const float state_update = (*state_kv) + kh[k] * delta;
-                                    *state_kv = state_update;
-                                    out_v += state_update * qh[k];
-                                }
-                            }
-
-                            attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
-                        }
-                        __syncthreads();
                     }
-                }
+                    __syncthreads();
 
-                __syncthreads();
+                    const int h = hp + (tid >= hvd ? 1 : 0);
+                    if (h < nv) {
+                        float* sh = state + h * hkd * hvd;
+                        const float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
+                        const float* a_f32 = b_f32 + nv_heads;
+                        const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
+                        float decay = 1.0f;
+                        if (dt_bw != nullptr && ale_w != nullptr) {
+                            const float sp = logf(1.0f + expf(
+                                a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                            decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
+                        }
+
+                        const int pair_head = h - hp;
+                        const float* qh = q_stage + pair_head * hkd;
+                        const float* kh = k_stage + pair_head * hkd;
+
+                        float kv_mem_v = 0.0f;
+                        if (qwen4b_single_linear_decayless_store_hero) {
+                            for (int k = 0; k < 128; ++k) {
+                                const float state_orig = sh[k * 128 + v];
+                                const float state_decay = state_orig * decay;
+                                kv_mem_v += state_decay * kh[k];
+                            }
+                        } else {
+                            for (int k = 0; k < hkd; ++k) {
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_decay = (*state_kv) * decay;
+                                *state_kv = state_decay;
+                                kv_mem_v += state_decay * kh[k];
+                            }
+                        }
+
+                        const float val = conv_out[v_val_offset + h * hvd + v];
+                        const float delta = (val - kv_mem_v) * beta;
+                        float out_v = 0.0f;
+                        if (qwen4b_single_linear_decayless_store_hero) {
+                            for (int k = 0; k < 128; ++k) {
+                                float* state_kv = sh + k * 128 + v;
+                                const float state_orig = *state_kv;
+                                const float state_decay = state_orig * decay;
+                                const float state_update = state_decay + kh[k] * delta;
+                                *state_kv = state_update;
+                                out_v += state_update * qh[k];
+                            }
+                        } else {
+                            for (int k = 0; k < hkd; ++k) {
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_update = (*state_kv) + kh[k] * delta;
+                                *state_kv = state_update;
+                                out_v += state_update * qh[k];
+                            }
+                        }
+                        attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    }
+                    __syncthreads();
+                }
+            } else if (blockIdx.x == 0) {
+                float* conv_out = gate_up_b;  // reused
+                float* state = static_cast<float*>(rec_b);
+                float* q_stage = lds_input;
+                float* k_stage = q_stage + 2 * hkd;
+
+                const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
+                const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
+
+                const int q_key_offset = 0;
+                const int k_key_offset = key_dim;
+                const int v_val_offset = key_dim * 2;
+                const int v = tid % hvd;
+
+                for (int hp = 0; hp < nv; hp += 2) {
+                    if (tid < 2 * hkd) {
+                        const int pair_head = tid / hkd;
+                        const int d = tid % hkd;
+                        const int staged_h = hp + pair_head;
+                        if (staged_h < nv) {
+                            const int staged_hk = staged_h * nk / nv;
+                            q_stage[tid] =
+                                conv_out[q_key_offset + staged_hk * hkd + d];
+                            k_stage[tid] =
+                                conv_out[k_key_offset + staged_hk * hkd + d];
+                        }
+                    }
+                    __syncthreads();
+
+                    const int h = hp + (tid >= hvd ? 1 : 0);
+                    if (h < nv) {
+                        float* sh = state + h * hkd * hvd;
+                        const float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
+                        const float* a_f32 = b_f32 + nv_heads;
+                        const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
+                        float decay = 1.0f;
+                        if (dt_bw != nullptr && ale_w != nullptr) {
+                            const float sp = logf(1.0f + expf(
+                                a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                            decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
+                        }
+
+                        const int pair_head = h - hp;
+                        const float* qh = q_stage + pair_head * hkd;
+                        const float* kh = k_stage + pair_head * hkd;
+                        float kv_mem_v = 0.0f;
+                        for (int k = 0; k < hkd; ++k) {
+                            float* state_kv = sh + k * hvd + v;
+                            const float state_decay = (*state_kv) * decay;
+                            *state_kv = state_decay;
+                            kv_mem_v += state_decay * kh[k];
+                        }
+
+                        const float val = conv_out[v_val_offset + h * hvd + v];
+                        const float delta = (val - kv_mem_v) * beta;
+                        float out_v = 0.0f;
+                        for (int k = 0; k < hkd; ++k) {
+                            float* state_kv = sh + k * hvd + v;
+                            const float state_update = (*state_kv) + kh[k] * delta;
+                            *state_kv = state_update;
+                            out_v += state_update * qh[k];
+                        }
+                        attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    }
+                    __syncthreads();
+                }
+            }
+
+            __threadfence();
+            grid_barrier(barrier_counter, barrier_flag, nb);
+
+            if (blockIdx.x == 0) {
                 qwen35_record_persistent_4b_timing(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + min(b, 1),
                     linear_recurrent_clock);
 
                 const unsigned long long linear_post_clock = clock64();
+                float* z_f32 = proj_b + L.qkv_out_dim;
 
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
                 {
@@ -5700,9 +5757,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_POST_BASE + min(b, 1),
                     linear_post_clock);
-
-            } // end if (blockIdx.x == 0) for linear attention core
-            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+            }
+            // Grid barrier: recurrent/post wrote attn_scratch_b, all blocks need it for out_proj
             qwen35_record_persistent_4b_timing(
                 layer_timing_slots, QWEN35_4B_TIMING_LINEAR_CORE_BASE + b, linear_core_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);
