@@ -1658,6 +1658,7 @@ fn main() -> Result<()> {
         } else {
             // Single-sequence decode (original path)
             let mut maybe_fast_token = None;
+            let mut can_rescore_with_normed = false;
             let logits = if cuda_fast_greedy_enabled {
                 let (token, timings) = engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
@@ -1869,22 +1870,26 @@ fn main() -> Result<()> {
                         engine.decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
                     native_decode_timings.add_assign(timings);
                     native_decode_timing_steps += 1;
+                    can_rescore_with_normed = true;
                     logits
                 } else {
+                    can_rescore_with_normed = true;
                     engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
                 }
             } else if cli.emit_stage_timings {
                 let (logits, timings) = engine.decode_step_with_timings(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
+                can_rescore_with_normed = true;
                 logits
             } else {
+                can_rescore_with_normed = true;
                 engine.decode_step(next_token, seqlen_offset)?
             };
             let native_token = if let Some(token) = maybe_fast_token {
                 token
             } else {
-                let normed = if host_lm_head_rescorer.is_some() {
+                let normed = if can_rescore_with_normed && host_lm_head_rescorer.is_some() {
                     Some(engine.last_normed_host_f32()?)
                 } else {
                     None

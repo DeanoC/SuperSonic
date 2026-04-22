@@ -43,6 +43,7 @@ if [ -f /root/.cargo/env ]; then
 fi
 MAX_DELTA_THRESHOLD="${MAX_DELTA_THRESHOLD:-1.5}"
 GPU_VALIDATE_DELTA_THRESHOLD="${GPU_VALIDATE_DELTA_THRESHOLD:-0.75}"
+ORACLE_DEVICE="${ORACLE_DEVICE:-cpu}"
 TIMEOUT="${TIMEOUT:-900}"
 PROMPT="Hello"
 MAX_NEW_TOKENS=4
@@ -53,6 +54,7 @@ echo "=== SuperSonic E2E Test: sm86 / qwen3.5-9b ==="
 echo "Model dir:  $MODEL_DIR"
 echo "Threshold:  $MAX_DELTA_THRESHOLD"
 echo "GPU validate threshold:  $GPU_VALIDATE_DELTA_THRESHOLD"
+echo "Oracle device:  $ORACLE_DEVICE"
 echo ""
 
 echo "--- Building (release) ---"
@@ -67,7 +69,7 @@ run_test() {
     echo "--- $label ---"
     if ! timeout "$TIMEOUT" "$SUPERSONIC" \
         --backend cuda \
-        --oracle-device cuda:0 \
+        --oracle-device "$ORACLE_DEVICE" \
         --model qwen3.5-9b \
         --model-dir "$MODEL_DIR" \
         --prompt "$PROMPT" \
