@@ -73,7 +73,18 @@ fn llama31_int8_late_full_mixed_layers() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(6)
+        .unwrap_or(32)
+}
+
+fn llama31_int8_late_full_mixed_component_enabled(component: &str) -> bool {
+    env::var("SUPERSONIC_LLAMA31_INT8_LATE_FULL_MIXED_COMPONENTS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(|piece| piece.trim().to_ascii_lowercase())
+                .any(|piece| piece == component)
+        })
+        .unwrap_or(matches!(component, "q" | "k"))
 }
 
 fn residual_add(
@@ -2094,6 +2105,12 @@ impl DecodeEngine {
         let late_mixed_layers = llama31_int8_late_full_mixed_layers();
         let use_late_decode_mixed =
             self.weights.is_int8 && idx + late_mixed_layers >= config.num_hidden_layers;
+        let use_late_q_mixed =
+            use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("q");
+        let use_late_k_mixed =
+            use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("k");
+        let use_late_v_mixed =
+            use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("v");
         let mut q_proj_trace = None;
         let mut gate_proj_trace = None;
         let mut k_proj_trace = None;
@@ -2133,7 +2150,7 @@ impl DecodeEngine {
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
-        if use_late_decode_mixed {
+        if use_late_q_mixed {
             if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
                 prefill_engine::matmul_int8_mixed_host(
                     self.ordinal,
@@ -2184,7 +2201,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
         }
 
-        if use_late_decode_mixed {
+        if use_late_k_mixed {
             if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
                 prefill_engine::matmul_int8_mixed_host(
                     self.ordinal,
@@ -2206,6 +2223,14 @@ impl DecodeEngine {
                     fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
                 )?;
             }
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, kv_dim, hidden_dim,
+                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+                fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
+        if use_late_v_mixed {
             if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
                 prefill_engine::matmul_int8_mixed_host(
                     self.ordinal,
@@ -2228,11 +2253,6 @@ impl DecodeEngine {
                 )?;
             }
         } else {
-            matmul_proj(
-                self.ordinal, 1, 1, kv_dim, hidden_dim,
-                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-                fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-            )?;
             matmul_proj(
                 self.ordinal, 1, 1, kv_dim, hidden_dim,
                 &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
