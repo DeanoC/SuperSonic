@@ -349,6 +349,10 @@ pub struct DecodeEngine {
     /// only once per fused-verify call chain. Re-allocated if the block
     /// size changes between calls.
     dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
+    /// Reusable fixed-size scratch for component full-attention decode.
+    /// Avoids per-layer-per-step allocation churn on single-sequence
+    /// component decode paths.
+    component_full_attn_scratch: Option<ComponentFullAttentionScratch>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -376,6 +380,74 @@ struct DFlashFusedVerifyCache {
     /// Device copy of `Vec<BatchSeqDesc>` (one per layer), re-uploaded
     /// each fused-verify call.
     batch_desc_device: GpuBuffer,
+}
+
+struct ComponentFullAttentionScratch {
+    q_full: GpuBuffer,
+    query_buf: GpuBuffer,
+    gate_buf: GpuBuffer,
+    k_buf: GpuBuffer,
+    v_buf: GpuBuffer,
+    q_normed: GpuBuffer,
+    k_normed: GpuBuffer,
+    attn_q: GpuBuffer,
+    attn_k_step: GpuBuffer,
+    attn_v_step: GpuBuffer,
+    attn_out_f32: GpuBuffer,
+    attn_out_bf16: GpuBuffer,
+    attn_flat: GpuBuffer,
+    gated: GpuBuffer,
+    proj_out: GpuBuffer,
+}
+
+impl ComponentFullAttentionScratch {
+    fn alloc(weights: &Qwen35Weights, ordinal: usize) -> Result<Self> {
+        let config = &weights.config;
+        let head_dim = config.head_dim;
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let q_dim = num_q_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let max_q_proj_dim = weights
+            .layers
+            .iter()
+            .filter_map(|layer| layer.full.as_ref())
+            .map(|fw| fw.q_proj_w.shape()[0])
+            .max()
+            .unwrap_or(q_dim);
+        Ok(Self {
+            q_full: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, max_q_proj_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn q_full alloc: {e}"))?,
+            query_buf: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn query alloc: {e}"))?,
+            gate_buf: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn gate alloc: {e}"))?,
+            k_buf: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn k alloc: {e}"))?,
+            v_buf: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn v alloc: {e}"))?,
+            q_normed: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn q_normed alloc: {e}"))?,
+            k_normed: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn k_normed alloc: {e}"))?,
+            attn_q: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_q alloc: {e}"))?,
+            attn_k_step: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_k alloc: {e}"))?,
+            attn_v_step: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_v alloc: {e}"))?,
+            attn_out_f32: GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_out alloc: {e}"))?,
+            attn_out_bf16: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_out bf16 alloc: {e}"))?,
+            attn_flat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn attn_flat alloc: {e}"))?,
+            gated: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow::anyhow!("component full-attn gated alloc: {e}"))?,
+            proj_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
+                .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
+        })
+    }
 }
 
 impl DFlashFusedVerifyCache {
@@ -2153,17 +2225,17 @@ impl DecodeEngine {
         trace_output: bool,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
-        let config = &self.weights.config;
-        let fw = self.weights.layers[idx]
+        let hidden_dim = self.weights.config.hidden_size;
+        let num_q_heads = self.weights.config.num_attention_heads;
+        let num_kv_heads = self.weights.config.num_key_value_heads;
+        let head_dim = self.weights.config.head_dim;
+        let q_dim = num_q_heads * head_dim;
+        let q_proj_dim = self.weights.layers[idx]
             .full
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected full attention weights"))?;
-        let hidden_dim = config.hidden_size;
-        let num_q_heads = config.num_attention_heads;
-        let num_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
-        let q_dim = num_q_heads * head_dim;
-        let q_proj_dim = fw.q_proj_w.shape()[0];
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected full attention weights"))?
+            .q_proj_w
+            .shape()[0];
         let has_attn_gate = match q_proj_dim {
             dim if dim == q_dim => false,
             dim if dim == q_dim * 2 => true,
@@ -2175,12 +2247,12 @@ impl DecodeEngine {
             }
         };
         let kv_dim = num_kv_heads * head_dim;
-        let rotary_dim = config.rotary_dim();
+        let rotary_dim = self.weights.config.rotary_dim();
         let kv_len = seqlen_offset + 1;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
         let late_mixed_layers = llama31_int8_late_full_mixed_layers();
         let use_late_decode_mixed =
-            self.weights.is_int8 && idx + late_mixed_layers >= config.num_hidden_layers;
+            self.weights.is_int8 && idx + late_mixed_layers >= self.weights.config.num_hidden_layers;
         let use_late_q_mixed =
             use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("q");
         let use_late_k_mixed =
@@ -2197,38 +2269,34 @@ impl DecodeEngine {
         let mut pre_gate_trace = None;
         let mut gated_trace = None;
         let mut proj_out_trace = None;
+        let mut scratch = self
+            .component_full_attn_scratch
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("component full-attn scratch missing"))?;
+        let result = (|| -> Result<Option<ComponentFullAttentionTrace>> {
+            let config = &self.weights.config;
+            let fw = self.weights.layers[idx]
+                .full
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected full attention weights"))?;
+            let q_full = &mut scratch.q_full;
+            let query_buf = &mut scratch.query_buf;
+            let gate_buf = &mut scratch.gate_buf;
+            let k_buf = &mut scratch.k_buf;
+            let v_buf = &mut scratch.v_buf;
+            let q_normed = &mut scratch.q_normed;
+            let k_normed = &mut scratch.k_normed;
+            let attn_q = &mut scratch.attn_q;
+            let attn_k_step = &mut scratch.attn_k_step;
+            let attn_v_step = &mut scratch.attn_v_step;
+            let attn_out_f32 = &mut scratch.attn_out_f32;
+            let attn_out_bf16 = &mut scratch.attn_out_bf16;
+            let attn_flat = &mut scratch.attn_flat;
+            let gated = &mut scratch.gated;
+            let proj_out = &mut scratch.proj_out;
 
-        let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_full alloc: {e}"))?;
-        let mut query_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} query alloc: {e}"))?;
-        let mut gate_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} gate alloc: {e}"))?;
-        let mut k_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k alloc: {e}"))?;
-        let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_normed alloc: {e}"))?;
-        let mut attn_q = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_q alloc: {e}"))?;
-        let mut attn_k_step = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_k alloc: {e}"))?;
-        let mut attn_v_step = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_v alloc: {e}"))?;
-        let mut attn_out_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_out alloc: {e}"))?;
-        let mut attn_out_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_out bf16 alloc: {e}"))?;
-        let mut attn_flat = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_flat alloc: {e}"))?;
-        let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
-
-        let proj_start = Instant::now();
-        if use_late_q_mixed {
+            let proj_start = Instant::now();
+            if use_late_q_mixed {
             if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
                 prefill_engine::matmul_int8_mixed_host(
                     self.ordinal,
@@ -2241,19 +2309,19 @@ impl DecodeEngine {
                     &format!("{}.layers.{idx}.self_attn.q_proj.weight", self.weights.weight_prefix),
                     &fw.q_proj_w,
                     sc,
-                    &mut q_full,
+                    q_full,
                 )?;
             } else {
                 matmul_proj(
                     self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-                    &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+                    &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, q_full,
                     fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
                 )?;
             }
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-                &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+                &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, q_full,
                 fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
@@ -2265,8 +2333,8 @@ impl DecodeEngine {
                 num_q_heads,
                 head_dim,
                 &q_full,
-                &mut query_buf,
-                &mut gate_buf,
+                query_buf,
+                gate_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
         } else {
@@ -2292,19 +2360,19 @@ impl DecodeEngine {
                     &format!("{}.layers.{idx}.self_attn.k_proj.weight", self.weights.weight_prefix),
                     &fw.k_proj_w,
                     sc,
-                    &mut k_buf,
+                    k_buf,
                 )?;
             } else {
                 matmul_proj(
                     self.ordinal, 1, 1, kv_dim, hidden_dim,
-                    &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+                    &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, k_buf,
                     fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
                 )?;
             }
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, kv_dim, hidden_dim,
-                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, k_buf,
                 fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
@@ -2321,19 +2389,19 @@ impl DecodeEngine {
                     &format!("{}.layers.{idx}.self_attn.v_proj.weight", self.weights.weight_prefix),
                     &fw.v_proj_w,
                     sc,
-                    &mut v_buf,
+                    v_buf,
                 )?;
             } else {
                 matmul_proj(
                     self.ordinal, 1, 1, kv_dim, hidden_dim,
-                    &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+                    &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, v_buf,
                     fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
                 )?;
             }
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, kv_dim, hidden_dim,
-                &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+                &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, v_buf,
                 fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
@@ -2345,7 +2413,7 @@ impl DecodeEngine {
             head_dim,
             &query_buf,
             fw.q_norm_w.as_ref(),
-            &mut q_normed,
+            q_normed,
             &format!("layer {idx} q norm"),
         )?;
         gpu_hal::copy_d2d(
@@ -2363,7 +2431,7 @@ impl DecodeEngine {
             head_dim,
             &k_buf,
             fw.k_norm_w.as_ref(),
-            &mut k_normed,
+            k_normed,
             &format!("layer {idx} k norm"),
         )?;
         gpu_hal::copy_d2d(
@@ -2402,12 +2470,12 @@ impl DecodeEngine {
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            &self.rotary.cos, &self.rotary.sin, seqlen_offset, query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
             self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            &self.rotary.cos, &self.rotary.sin, seqlen_offset, k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
         if trace_output {
@@ -2423,11 +2491,11 @@ impl DecodeEngine {
             );
         }
 
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q)
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, query_buf, attn_q)
             .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &k_buf, &mut attn_k_step)
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, k_buf, attn_k_step)
             .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &v_buf, &mut attn_v_step)
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, v_buf, attn_v_step)
             .map_err(|e| anyhow::anyhow!("layer {idx} v transpose: {e}"))?;
 
         let ls = &mut self.state.layers[idx];
@@ -2506,16 +2574,16 @@ impl DecodeEngine {
         kernel_ffi::prefill_ffi::full_attention_prefill(
             self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
             1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-            &attn_q, attn_k_ref, attn_v_ref, &mut attn_out_f32,
+            attn_q, attn_k_ref, attn_v_ref, attn_out_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
+            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, attn_out_f32, attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
+            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, attn_out_bf16, attn_flat,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
         if trace_output {
@@ -2526,11 +2594,9 @@ impl DecodeEngine {
             );
         }
 
-        let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
         if has_attn_gate {
             kernel_ffi::prefill_ffi::sigmoid_mul(
-                self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+                self.ordinal, ScalarType::BF16, q_dim, attn_flat, gate_buf, gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
         } else {
@@ -2557,7 +2623,7 @@ impl DecodeEngine {
         let out_start = Instant::now();
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
+            gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, proj_out,
             fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
         )?;
         if trace_output {
@@ -2591,6 +2657,9 @@ impl DecodeEngine {
         } else {
             None
         })
+        })();
+        self.component_full_attn_scratch = Some(scratch);
+        result
     }
 
     fn component_decode_linear_attention_layer(
@@ -3387,6 +3456,13 @@ impl DecodeEngine {
         } else {
             None
         };
+        let component_full_attn_scratch = if use_4b_kernel
+            && weights.layers.iter().any(|layer| layer.full.is_some())
+        {
+            Some(ComponentFullAttentionScratch::alloc(&weights, ordinal)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             weights,
@@ -3413,6 +3489,7 @@ impl DecodeEngine {
             batch_size,
             dflash_tap_cache: None,
             dflash_fused_verify_cache: None,
+            component_full_attn_scratch,
         })
     }
 
