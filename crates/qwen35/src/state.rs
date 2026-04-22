@@ -165,6 +165,11 @@ impl LayerState {
     /// Record actual filled KV length (no reallocation).
     pub fn set_kv_filled(&mut self, filled: usize) {
         self.kv_filled = filled;
+        if self.kv_shadow_k.is_some() && self.kv_shadow_v.is_some() {
+            self.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| filled.saturating_sub(window))
+                .unwrap_or(0);
+        }
     }
 
     /// Get KV cache capacity (allocated seq dim).

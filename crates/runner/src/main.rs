@@ -1086,6 +1086,8 @@ fn main() -> Result<()> {
         cli.kv_fp8,
         cli.batch_size,
     )?;
+    let allow_host_lm_head_rescore =
+        cli.no_bake && !engine.weights().is_fp8 && !engine.weights().is_int4;
 
     // When using FP8 runtime weights, tell the oracle to use the same FP8 weights
     // (dequanted to BF16) so we compare apples-to-apples.
@@ -1138,7 +1140,9 @@ fn main() -> Result<()> {
         let first = sample_qwen_logits_with_rescore(
             &prefill_result.logits,
             prefill_normed.as_deref(),
-            host_lm_head_rescorer.as_ref(),
+            host_lm_head_rescorer
+                .as_ref()
+                .filter(|_| allow_host_lm_head_rescore),
         )?;
         eprintln!("[prefill] native GPU prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
         (
@@ -1889,7 +1893,7 @@ fn main() -> Result<()> {
             let native_token = if let Some(token) = maybe_fast_token {
                 token
             } else {
-                let normed = if can_rescore_with_normed && host_lm_head_rescorer.is_some() {
+                let normed = if can_rescore_with_normed && allow_host_lm_head_rescore {
                     Some(engine.last_normed_host_f32()?)
                 } else {
                     None
@@ -1897,7 +1901,9 @@ fn main() -> Result<()> {
                 sample_qwen_logits_with_rescore(
                     &logits,
                     normed.as_deref(),
-                    host_lm_head_rescorer.as_ref(),
+                    host_lm_head_rescorer
+                        .as_ref()
+                        .filter(|_| allow_host_lm_head_rescore),
                 )?
             };
 
