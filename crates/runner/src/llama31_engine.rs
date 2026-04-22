@@ -811,6 +811,59 @@ pub fn run_llama31(
                         "[gpu-validate-layer] layer={} attn_delta={attn_delta:.6} post_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}",
                         layer_idx
                     );
+                    if engine.weights().config.is_full_attention(layer_idx) && layer_idx > 0 {
+                        engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                        let (_stage_logits, native_input_hidden) =
+                            engine.component_decode_step_4b_traced(next_token, pos, layer_idx)?;
+                        let replay_input_hidden = &replay_hidden[layer_idx - 1];
+                        let input_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_input_hidden),
+                            &decode_bf16_le(replay_input_hidden),
+                        );
+                        engine.rebuild_prefill_state(prefix_token_ids, false)?;
+                        let native_stage = engine.trace_full_attention_stages_from_hidden(
+                            layer_idx,
+                            &native_input_hidden,
+                            pos,
+                        )?;
+                        let replay_stage = engine.trace_full_attention_stages_from_hidden(
+                            layer_idx,
+                            replay_input_hidden,
+                            pos,
+                        )?;
+                        let normed_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.normed),
+                            &decode_bf16_le(&replay_stage.normed),
+                        );
+                        let q_proj_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.q_proj),
+                            &decode_bf16_le(&replay_stage.q_proj),
+                        );
+                        let gate_proj_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.gate_proj),
+                            &decode_bf16_le(&replay_stage.gate_proj),
+                        );
+                        let k_proj_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.k_proj),
+                            &decode_bf16_le(&replay_stage.k_proj),
+                        );
+                        let v_proj_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.v_proj),
+                            &decode_bf16_le(&replay_stage.v_proj),
+                        );
+                        let q_rope_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.q_rope),
+                            &decode_bf16_le(&replay_stage.q_rope),
+                        );
+                        let k_rope_delta = validate::max_abs_delta(
+                            &decode_bf16_le(&native_stage.k_rope),
+                            &decode_bf16_le(&replay_stage.k_rope),
+                        );
+                        eprintln!(
+                            "[gpu-validate-full-attn] layer={} input_delta={input_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6}",
+                            layer_idx
+                        );
+                    }
                     engine.rebuild_prefill_state(&full_token_ids, false)?;
                 } else {
                     eprintln!("[gpu-validate-layer] no layer exceeded hidden_delta threshold");

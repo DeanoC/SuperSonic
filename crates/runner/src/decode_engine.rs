@@ -2042,6 +2042,7 @@ impl DecodeEngine {
         let rotary_dim = config.rotary_dim();
         let kv_len = seqlen_offset + 1;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let use_late_decode_mixed = self.weights.is_int8 && idx + 2 >= config.num_hidden_layers;
 
         let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} q_full alloc: {e}"))?;
@@ -2072,11 +2073,35 @@ impl DecodeEngine {
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
-        matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
+        if use_late_decode_mixed {
+            if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
+                prefill_engine::matmul_int8_mixed_host(
+                    self.ordinal,
+                    1,
+                    1,
+                    q_proj_dim,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                    &format!("{}.layers.{idx}.self_attn.q_proj.weight", self.weights.weight_prefix),
+                    &fw.q_proj_w,
+                    sc,
+                    &mut q_full,
+                )?;
+            } else {
+                matmul_proj(
+                    self.ordinal, 1, 1, q_proj_dim, hidden_dim,
+                    &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+                    fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                )?;
+            }
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, q_proj_dim, hidden_dim,
+                &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
+                fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
         if has_attn_gate {
             kernel_ffi::prefill_ffi::split_qgate(
                 self.ordinal,
@@ -2099,16 +2124,61 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
         }
 
-        matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
-        matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
+        if use_late_decode_mixed {
+            if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
+                prefill_engine::matmul_int8_mixed_host(
+                    self.ordinal,
+                    1,
+                    1,
+                    kv_dim,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                    &format!("{}.layers.{idx}.self_attn.k_proj.weight", self.weights.weight_prefix),
+                    &fw.k_proj_w,
+                    sc,
+                    &mut k_buf,
+                )?;
+            } else {
+                matmul_proj(
+                    self.ordinal, 1, 1, kv_dim, hidden_dim,
+                    &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+                    fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                )?;
+            }
+            if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
+                prefill_engine::matmul_int8_mixed_host(
+                    self.ordinal,
+                    1,
+                    1,
+                    kv_dim,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                    &format!("{}.layers.{idx}.self_attn.v_proj.weight", self.weights.weight_prefix),
+                    &fw.v_proj_w,
+                    sc,
+                    &mut v_buf,
+                )?;
+            } else {
+                matmul_proj(
+                    self.ordinal, 1, 1, kv_dim, hidden_dim,
+                    &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+                    fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                )?;
+            }
+        } else {
+            matmul_proj(
+                self.ordinal, 1, 1, kv_dim, hidden_dim,
+                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
+                fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+            matmul_proj(
+                self.ordinal, 1, 1, kv_dim, hidden_dim,
+                &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
+                fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            )?;
+        }
 
         maybe_attn_rms_norm_rows(
             config,
