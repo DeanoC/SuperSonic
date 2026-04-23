@@ -3564,21 +3564,7 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
 
-            let contig_stride = kv_len * head_dim * elem_bytes;
             let cap_stride = cap * head_dim * elem_bytes;
-            let copy_bytes = kv_len * head_dim * elem_bytes;
-            let value_bf16 =
-                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode BF16 value alloc: {e}"))?;
-            for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
-                    self.ordinal,
-                    value_bf16.offset_ptr(h * contig_stride) as *mut c_void,
-                    cache_v_ref.offset_ptr(h * cap_stride),
-                    copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value copy h={h}: {e}"))?;
-            }
             let tail_key_bf16 = if tail_len > 0 {
                 let tail =
                     GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, tail_len, head_dim])
@@ -3602,13 +3588,14 @@ impl DecodeEngine {
             let mut score_scratch =
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len])
                     .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}"))?;
-            kernel_ffi::certified_kv::attend_int8_bf16_values(
+            kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                 self.ordinal,
                 attn_q,
                 &key_i8,
                 &key_scale,
-                &value_bf16,
+                cache_v_ref,
                 tail_key_bf16.as_ref(),
+                kv_len,
                 block_size,
                 num_q_heads / num_kv_heads,
                 1.0 / (head_dim as f32).sqrt(),
