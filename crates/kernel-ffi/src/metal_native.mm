@@ -153,6 +153,12 @@ struct LinearDecodeApplyParams {
     uint32_t total_threads;
 };
 
+struct ConvStateUpdateParams {
+    uint32_t channels;
+    uint32_t state_len;
+    uint32_t total_threads;
+};
+
 struct L2NormParams {
     uint32_t n_rows;
     uint32_t n_cols;
@@ -3429,6 +3435,99 @@ kernel void supersonic_linear_decode_apply_parts_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> conv_state_update_bf16_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:205
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"CSU(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ConvStateUpdateParams {
+    uint channels;
+    uint state_len;
+    uint total_threads;
+};
+
+kernel void supersonic_conv_state_update_bf16(
+    device bfloat* state [[buffer(0)]],
+    device const bfloat* qkv [[buffer(1)]],
+    constant ConvStateUpdateParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+    uint channel = gid / params.state_len;
+    uint pos = gid - channel * params.state_len;
+    uint base = channel * params.state_len;
+    if (pos + 1 < params.state_len) {
+        state[base + pos] = state[base + pos + 1];
+    } else {
+        state[base + pos] = qkv[channel];
+    }
+}
+)CSU";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:206
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile conv-state-update library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_conv_state_update_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:207
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load conv-state-update function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                code:208
+                                                                            userInfo:@{
+                                                                                NSLocalizedDescriptionKey :
+                                                                                    @"Failed to create conv-state-update pipeline"
+                                                                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> l2norm_pipeline(NSString* function_name, NSError** error_out) {
     static std::mutex mutex;
     static bool attempted_bf16 = false;
@@ -5214,6 +5313,56 @@ extern "C" int supersonic_metal_linear_decode_apply_parts_f32(
             [encoder dispatchThreads:MTLSizeMake(total_threads, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
         }, 201, 202, 203, 204);
+    }
+}
+
+extern "C" int supersonic_metal_conv_state_update_bf16(
+    size_t channels,
+    size_t state_len,
+    const void* qkv_ptr,
+    void* state_ptr
+) {
+    @autoreleasepool {
+        if (channels == 0 || state_len == 0 || qkv_ptr == nullptr || state_ptr == nullptr) {
+            return 209;
+        }
+        if (channels > UINT32_MAX || state_len > UINT32_MAX || channels > SIZE_MAX / state_len) {
+            return 210;
+        }
+        size_t total_threads = channels * state_len;
+        if (total_threads > UINT32_MAX) {
+            return 211;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = conv_state_update_bf16_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 212;
+        }
+
+        id<MTLBuffer> qkv = nil;
+        id<MTLBuffer> state = nil;
+        size_t qkv_offset = 0;
+        size_t state_offset = 0;
+        if (lookup_buffer(qkv_ptr, &qkv, &qkv_offset) != 0) return 213;
+        if (lookup_buffer(state_ptr, &state, &state_offset) != 0) return 214;
+
+        ConvStateUpdateParams params = {
+            static_cast<uint32_t>(channels),
+            static_cast<uint32_t>(state_len),
+            static_cast<uint32_t>(total_threads),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:state offset:state_offset atIndex:0];
+            [encoder setBuffer:qkv offset:qkv_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        }, 215, 216, 217, 218);
     }
 }
 

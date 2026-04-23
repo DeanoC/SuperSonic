@@ -182,6 +182,15 @@ pub fn metal_linear_decode_apply_parts_f32(
     )
 }
 
+pub fn metal_conv_state_update_bf16(
+    channels: usize,
+    state_len: usize,
+    qkv: &GpuBuffer,
+    state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_native::conv_state_update_bf16(channels, state_len, qkv, state)
+}
+
 pub struct MetalBatchGuard {
     inner: Option<metal_native::MetalBatchGuard>,
 }

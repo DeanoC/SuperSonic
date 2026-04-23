@@ -49,8 +49,7 @@ fn copy_d2d_ordered(
         kernel_ffi::prefill_ffi::metal_copy_d2d(src, dst, bytes)
             .map_err(|e| anyhow::anyhow!("{label} Metal blit copy: {e}"))?;
     } else {
-        gpu_hal::copy_d2d(ordinal, dst, src, bytes)
-            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     }
     Ok(())
 }
@@ -2048,13 +2047,14 @@ impl DecodeEngine {
             let src_stride = head_dim * elem_bytes;
             let dst_offset = seqlen_offset * head_dim * elem_bytes;
             for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
+                copy_d2d_ordered(
                     self.ordinal,
                     cache_k.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
                     attn_k_step.offset_ptr(h * src_stride),
                     src_stride,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} cache k write h={h}: {e}"))?;
+                    cache_k,
+                    &format!("layer {idx} cache k write h={h}"),
+                )?;
             }
         }
         if let Some(ref mut cache_v) = ls.kv_cache_v {
@@ -2063,13 +2063,14 @@ impl DecodeEngine {
             let src_stride = head_dim * elem_bytes;
             let dst_offset = seqlen_offset * head_dim * elem_bytes;
             for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
+                copy_d2d_ordered(
                     self.ordinal,
                     cache_v.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
                     attn_v_step.offset_ptr(h * src_stride),
                     src_stride,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} cache v write h={h}: {e}"))?;
+                    cache_v,
+                    &format!("layer {idx} cache v write h={h}"),
+                )?;
             }
         }
 
@@ -2100,20 +2101,22 @@ impl DecodeEngine {
             let contig_stride = kv_len * head_dim * elem_bytes;
             let copy_bytes = kv_len * head_dim * elem_bytes;
             for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
+                copy_d2d_ordered(
                     self.ordinal,
                     kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
                     cache_k_ref.offset_ptr(h * cap_stride),
                     copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble k h={h}: {e}"))?;
-                gpu_hal::copy_d2d(
+                    &kv_k_contig,
+                    &format!("layer {idx} kv assemble k h={h}"),
+                )?;
+                copy_d2d_ordered(
                     self.ordinal,
                     kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
                     cache_v_ref.offset_ptr(h * cap_stride),
                     copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble v h={h}: {e}"))?;
+                    &kv_v_contig,
+                    &format!("layer {idx} kv assemble v h={h}"),
+                )?;
             }
             attn_k_ref = &kv_k_contig;
             attn_v_ref = &kv_v_contig;
@@ -2403,16 +2406,14 @@ impl DecodeEngine {
                 &mut b_f32,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} b f32 proj: {e}"))?;
-            a_for_beta_f32 = Some(decode_f32_le(
-                &a_f32
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} a_f32 D2H: {e}"))?,
-            ));
-            b_for_beta_f32 = Some(decode_f32_le(
-                &b_f32
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} b_f32 D2H: {e}"))?,
-            ));
+            a_for_beta_f32 =
+                Some(decode_f32_le(&a_f32.to_host_bytes().map_err(|e| {
+                    anyhow::anyhow!("layer {idx} a_f32 D2H: {e}")
+                })?));
+            b_for_beta_f32 =
+                Some(decode_f32_le(&b_f32.to_host_bytes().map_err(|e| {
+                    anyhow::anyhow!("layer {idx} b_f32 D2H: {e}")
+                })?));
             kernel_ffi::prefill_ffi::cast(
                 self.ordinal,
                 ScalarType::F32,
@@ -2464,7 +2465,7 @@ impl DecodeEngine {
         };
 
         let ls = &mut self.state.layers[idx];
-        let conv_state = ls
+        let conv_state_ref = ls
             .conv_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
@@ -2485,7 +2486,7 @@ impl DecodeEngine {
             config.linear_conv_kernel_dim,
             nv,
             &qkv,
-            conv_state,
+            conv_state_ref,
             &lw.conv1d_w,
             &a,
             &lw.dt_bias,
@@ -2722,36 +2723,49 @@ impl DecodeEngine {
 
         let state_len = config.linear_conv_kernel_dim - 1;
         let state_bytes = ScalarType::BF16.size_in_bytes();
-        let new_conv_state =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
-                .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
-        for c in 0..qkv_dim {
-            let channel_base = c * state_len * state_bytes;
-            if state_len > 1 {
+        let conv_state = ls
+            .conv_state
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+        if conv_state.backend() == gpu_hal::Backend::Metal
+            && std::env::var_os("SUPERSONIC_METAL_ENABLE_DIRECT_CONV_STATE_UPDATE").is_some()
+        {
+            kernel_ffi::prefill_ffi::metal_conv_state_update_bf16(
+                qkv_dim, state_len, &qkv, conv_state,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} metal conv state update: {e}"))?;
+        } else {
+            let new_conv_state =
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
+            for c in 0..qkv_dim {
+                let channel_base = c * state_len * state_bytes;
+                if state_len > 1 {
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        new_conv_state.offset_ptr(channel_base) as *mut c_void,
+                        conv_state.offset_ptr(channel_base + state_bytes),
+                        (state_len - 1) * state_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} conv shift c={c}: {e}"))?;
+                }
                 gpu_hal::copy_d2d(
                     self.ordinal,
-                    new_conv_state.offset_ptr(channel_base) as *mut c_void,
-                    conv_state.offset_ptr(channel_base + state_bytes),
-                    (state_len - 1) * state_bytes,
+                    new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
+                        as *mut c_void,
+                    qkv.offset_ptr(c * state_bytes),
+                    state_bytes,
                 )
-                .map_err(|e| anyhow::anyhow!("layer {idx} conv shift c={c}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("layer {idx} conv append c={c}: {e}"))?;
             }
             gpu_hal::copy_d2d(
                 self.ordinal,
-                new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
-                    as *mut c_void,
-                qkv.offset_ptr(c * state_bytes),
-                state_bytes,
+                conv_state.as_ptr() as *mut c_void,
+                new_conv_state.as_ptr(),
+                qkv_dim * state_len * state_bytes,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} conv append c={c}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
         }
-        gpu_hal::copy_d2d(
-            self.ordinal,
-            conv_state.as_ptr() as *mut c_void,
-            new_conv_state.as_ptr(),
-            qkv_dim * state_len * state_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
             self.ordinal,
@@ -3793,7 +3807,9 @@ impl DecodeEngine {
         trace_layer: usize,
     ) -> Result<(u32, DecodeStageTimings, ComponentLinearTrace)> {
         if self.hidden_io.backend() != gpu_hal::Backend::Metal {
-            anyhow::bail!("decode_step_metal_component_greedy_trace_linear_layer requires Metal backend");
+            anyhow::bail!(
+                "decode_step_metal_component_greedy_trace_linear_layer requires Metal backend"
+            );
         }
         if self.use_4b_kernel {
             anyhow::bail!(
@@ -3802,9 +3818,11 @@ impl DecodeEngine {
         }
         let start = Instant::now();
         let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_TRACE_WITH_BATCH").is_some() {
-            Some(kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
-                anyhow::anyhow!("begin Metal component decode trace batch: {e}")
-            })?)
+            Some(
+                kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
+                    anyhow::anyhow!("begin Metal component decode trace batch: {e}")
+                })?,
+            )
         } else {
             None
         };
@@ -3838,7 +3856,9 @@ impl DecodeEngine {
         trace_layer: usize,
     ) -> Result<(u32, DecodeStageTimings, Vec<u8>)> {
         if self.hidden_io.backend() != gpu_hal::Backend::Metal {
-            anyhow::bail!("decode_step_metal_component_greedy_trace_input_layer requires Metal backend");
+            anyhow::bail!(
+                "decode_step_metal_component_greedy_trace_input_layer requires Metal backend"
+            );
         }
         if self.use_4b_kernel {
             anyhow::bail!(
@@ -3847,9 +3867,11 @@ impl DecodeEngine {
         }
         let start = Instant::now();
         let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_TRACE_WITH_BATCH").is_some() {
-            Some(kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
-                anyhow::anyhow!("begin Metal component decode input trace batch: {e}")
-            })?)
+            Some(
+                kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
+                    anyhow::anyhow!("begin Metal component decode input trace batch: {e}")
+                })?,
+            )
         } else {
             None
         };
@@ -3862,16 +3884,17 @@ impl DecodeEngine {
             None,
         )?;
         if let Some(guard) = metal_batch_guard {
-            guard
-                .finish()
-                .map_err(|e| anyhow::anyhow!("finish Metal component decode input trace batch: {e}"))?;
+            guard.finish().map_err(|e| {
+                anyhow::anyhow!("finish Metal component decode input trace batch: {e}")
+            })?;
         }
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         let token =
             sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
-        let trace =
-            trace.ok_or_else(|| anyhow::anyhow!("missing Metal component input trace for layer {trace_layer}"))?;
+        let trace = trace.ok_or_else(|| {
+            anyhow::anyhow!("missing Metal component input trace for layer {trace_layer}")
+        })?;
         Ok((token, timings, trace))
     }
 

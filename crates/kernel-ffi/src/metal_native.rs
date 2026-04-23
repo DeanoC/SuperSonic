@@ -362,6 +362,12 @@ unsafe extern "C" {
         initial_state_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_conv_state_update_bf16(
+        channels: usize,
+        state_len: usize,
+        qkv_ptr: *const c_void,
+        state_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 pub(crate) struct MetalBatchGuard {
@@ -573,7 +579,10 @@ pub(crate) fn matmul_rhs_transposed_f32(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    if lhs.dtype() != ScalarType::F32 || rhs.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+    if lhs.dtype() != ScalarType::F32
+        || rhs.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native matmul_rhs_transposed_f32 expects F32 buffers, got {:?}/{:?}/{:?}",
             lhs.dtype(),
@@ -798,7 +807,10 @@ pub(crate) fn rms_norm_gated_f32(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    if hidden.dtype() != ScalarType::F32 || gate.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+    if hidden.dtype() != ScalarType::F32
+        || gate.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native rms_norm_gated_f32 expects F32 hidden/gate/out, got {:?}/{:?}/{:?}",
             hidden.dtype(),
@@ -1258,7 +1270,10 @@ pub(crate) fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    if data.dtype() != dtype || cos_table.dtype() != ScalarType::BF16 || sin_table.dtype() != ScalarType::BF16 {
+    if data.dtype() != dtype
+        || cos_table.dtype() != ScalarType::BF16
+        || sin_table.dtype() != ScalarType::BF16
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native apply_rope_prefill expects data={dtype:?} and BF16 tables, got data={:?} cos={:?} sin={:?}",
             data.dtype(),
@@ -1367,9 +1382,13 @@ pub(crate) fn extract_conv_state(
                 src.as_ptr(),
                 dst.as_mut_ptr(),
             ),
-            ScalarType::F32 => {
-                supersonic_metal_extract_conv_state_f32(s, c, kern_minus_1, src.as_ptr(), dst.as_mut_ptr())
-            }
+            ScalarType::F32 => supersonic_metal_extract_conv_state_f32(
+                s,
+                c,
+                kern_minus_1,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            ),
             other => {
                 return Err(GpuError::InvalidArg(format!(
                     "metal native extract_conv_state does not support dtype {other:?}"
@@ -1807,6 +1826,41 @@ pub(crate) fn linear_decode_apply_parts_f32(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn conv_state_update_bf16(
+    channels: usize,
+    state_len: usize,
+    qkv: &GpuBuffer,
+    state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if qkv.dtype() != ScalarType::BF16 || state.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native conv_state_update_bf16 expects BF16 qkv/state, got qkv={:?} state={:?}",
+            qkv.dtype(),
+            state.dtype()
+        )));
+    }
+    if channels == 0 || state_len == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native conv_state_update_bf16 invalid shape: channels={channels} state_len={state_len}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_conv_state_update_bf16(
+            channels,
+            state_len,
+            qkv.as_ptr(),
+            state.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native conv_state_update_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 impl MetalBatchGuard {
     pub(crate) fn begin() -> Result<Self, GpuError> {
@@ -1852,6 +1906,18 @@ pub(crate) fn linear_decode_apply_parts_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native linear_decode_apply_parts_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn conv_state_update_bf16(
+    _channels: usize,
+    _state_len: usize,
+    _qkv: &GpuBuffer,
+    _state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native conv_state_update_bf16 is not compiled".into(),
     ))
 }
 
@@ -2350,8 +2416,7 @@ mod tests {
             &f32_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0]),
         )
         .expect("upload rhs");
-        let mut out =
-            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
 
         matmul_rhs_transposed_f32(1, 2, 2, 3, &lhs, &rhs, &mut out).expect("run native F32 matmul");
 
@@ -2602,13 +2667,9 @@ mod tests {
         let ordinal = 0usize;
         let hidden_vals = [1.0f32, 2.0, 2.0, 2.0, 0.0, 2.0];
         let gate_vals = [0.0f32, 1.0, -1.0, 3.0, -2.0, 0.5];
-        let hidden = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[2, 3],
-            &f32_bytes(&hidden_vals),
-        )
-        .expect("upload hidden");
+        let hidden =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[2, 3], &f32_bytes(&hidden_vals))
+                .expect("upload hidden");
         let gate =
             GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[2, 3], &f32_bytes(&gate_vals))
                 .expect("upload gate");
@@ -3046,20 +3107,12 @@ mod tests {
             &f32_bytes(&input_vals),
         )
         .expect("upload reference data");
-        let cos = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[3, 2],
-            &bf16_bytes(&cos_vals),
-        )
-        .expect("upload cos");
-        let sin = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[3, 2],
-            &bf16_bytes(&sin_vals),
-        )
-        .expect("upload sin");
+        let cos =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[3, 2], &bf16_bytes(&cos_vals))
+                .expect("upload cos");
+        let sin =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[3, 2], &bf16_bytes(&sin_vals))
+                .expect("upload sin");
 
         crate::metal_host::apply_rope_prefill(
             ScalarType::F32,
