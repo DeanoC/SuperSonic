@@ -611,6 +611,15 @@ pub struct DecodeStepOutput {
     pub timings: DecodeStageTimings,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CertifiedKvShadowStats {
+    pub layers: usize,
+    pub aligned_tokens: usize,
+    pub compressed_vram_bytes: usize,
+    pub max_value_error: f32,
+    pub quantize_ms: f64,
+}
+
 pub struct ComponentLayerTrace {
     pub attn_hidden: Vec<u8>,
     pub post_attn_norm: Vec<u8>,
@@ -1058,6 +1067,97 @@ mod tests {
 impl DecodeEngine {
     pub fn scratch_debug_ptr(&self) -> usize {
         self.scratch.workspace.as_ptr() as usize
+    }
+
+    pub fn certified_kv_shadow_quantize_probe(
+        &self,
+        block_size: usize,
+        value_group_size: usize,
+    ) -> Result<CertifiedKvShadowStats> {
+        let mut stats = CertifiedKvShadowStats::default();
+        for (layer_idx, layer_state) in self.state.layers.iter().enumerate() {
+            if !self.weights.config.is_full_attention(layer_idx) || layer_state.kv_filled == 0 {
+                continue;
+            }
+            let cache_k = layer_state
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
+            let cache_v = layer_state
+                .kv_cache_v
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
+            let aligned =
+                kernel_ffi::certified_kv::aligned_tokens(layer_state.kv_filled, block_size);
+            if aligned == 0 {
+                continue;
+            }
+            let num_kv_heads = cache_k.shape()[1];
+            let head_dim = cache_k.shape()[3];
+            let (
+                key_i8_shape,
+                key_scale_shape,
+                value_i4_shape,
+                value_meta_shape,
+                value_error_shape,
+            ) = kernel_ffi::certified_kv::quantized_shapes(
+                num_kv_heads,
+                layer_state.kv_filled,
+                head_dim,
+                block_size,
+                value_group_size,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV shapes: {e}"))?;
+
+            let mut key_i8 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 alloc: {e}"))?;
+            let mut key_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_scale alloc: {e}"))?;
+            let mut value_i4 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_i4 alloc: {e}"))?;
+            let mut value_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_scale alloc: {e}"))?;
+            let mut value_zero = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_zero alloc: {e}"))?;
+            let mut value_error =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_error alloc: {e}"))?;
+
+            let start = Instant::now();
+            kernel_ffi::certified_kv::quantize_bf16_cache(
+                self.ordinal,
+                cache_k,
+                cache_v,
+                layer_state.kv_filled,
+                block_size,
+                value_group_size,
+                &mut key_i8,
+                &mut key_scale,
+                &mut value_i4,
+                &mut value_scale,
+                &mut value_zero,
+                &mut value_error,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV quantize: {e}"))?;
+            stats.quantize_ms += start.elapsed().as_secs_f64() * 1000.0;
+
+            let errors = decode_f32_le(
+                &value_error
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_error D2H: {e}"))?,
+            );
+            let layer_max = errors.into_iter().fold(0.0f32, f32::max);
+            stats.max_value_error = stats.max_value_error.max(layer_max);
+            stats.layers += 1;
+            stats.aligned_tokens = stats.aligned_tokens.max(aligned);
+            stats.compressed_vram_bytes += key_i8.len_bytes()
+                + key_scale.len_bytes()
+                + value_i4.len_bytes()
+                + value_scale.len_bytes()
+                + value_zero.len_bytes()
+                + value_error.len_bytes();
+        }
+        Ok(stats)
     }
 
     // Rebuild the BF16 sidecar from the current prefix cache when a KV-FP8 state

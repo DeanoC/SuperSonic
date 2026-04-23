@@ -646,6 +646,27 @@ pub fn run_llama31(
         prompt_ids.len(),
         prefill_start.elapsed().as_millis()
     );
+    let certified_kv_shadow_stats = if let Some(cfg) = &certified_kv_cfg {
+        if cli.certified_kv_shadow_validate {
+            let stats = engine.certified_kv_shadow_quantize_probe(
+                cfg.block_size,
+                cfg.value_group_size,
+            )?;
+            eprintln!(
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6}",
+                stats.layers,
+                stats.aligned_tokens,
+                stats.compressed_vram_bytes,
+                stats.quantize_ms,
+                stats.max_value_error,
+            );
+            Some(stats)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if gpu_validate_enabled {
         eprintln!("[gpu-validate] replaying decode steps through GPU prefill reference");
     }
@@ -1084,6 +1105,11 @@ pub fn run_llama31(
                 "rung1_multiplier": cfg.rung1_multiplier,
                 "eps_guard": cfg.eps_guard,
                 "rung4_forced_dense_steps": generated.len(),
+                "shadow_layers": certified_kv_shadow_stats.map(|s| s.layers),
+                "shadow_aligned_tokens": certified_kv_shadow_stats.map(|s| s.aligned_tokens),
+                "shadow_tier1_bytes": certified_kv_shadow_stats.map(|s| s.compressed_vram_bytes),
+                "shadow_quantize_ms": certified_kv_shadow_stats.map(|s| s.quantize_ms),
+                "shadow_max_value_error": certified_kv_shadow_stats.map(|s| s.max_value_error),
             });
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {

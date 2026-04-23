@@ -388,6 +388,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     certified_kv_telemetry: Option<PathBuf>,
 
+    /// Quantize real BF16 KV caches after prefill and report shadow-cache telemetry.
+    #[arg(long, hide = true)]
+    certified_kv_shadow_validate: bool,
+
     /// Certified KV cache block size in tokens.
     #[arg(long, default_value = "16", hide = true)]
     certified_kv_block_size: usize,
@@ -741,6 +745,8 @@ fn main() -> Result<()> {
             anyhow::bail!("--certified-kv is single-sequence at launch (--batch-size must be 1)");
         }
         let _ = certified_kv::CertifiedKvConfig::from_cli(&cli)?;
+    } else if cli.certified_kv_shadow_validate {
+        anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
 
     // 2. Detect GPU
