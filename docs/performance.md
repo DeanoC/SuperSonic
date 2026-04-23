@@ -206,6 +206,26 @@ Notes:
 - ¹ The batched decode figure is aggregate tokens/second across
   `--batch-size 2`.
 
+Llama 3.1 8B arxiv_v1 retrieval smoke QA
+(`./tests/sm86/bench_llama31_arxiv_v1_smoke.sh`, commit `9d00178`):
+
+| Subtask           | Path              | Context | Score | DotCache ref | Decode ms/tok |
+|-------------------|-------------------|--------:|------:|-------------:|--------------:|
+| niah_single       | dense INT8        |    4096 | 1.000 |        1.000 |         397.6 |
+| niah_single       | certified KV INT8 |    4096 | 1.000 |        1.000 |          74.5 |
+| niah_multikey     | dense INT8        |    4096 | 1.000 |        1.000 |         402.1 |
+| niah_multikey     | certified KV INT8 |    4096 | 1.000 |        1.000 |          82.5 |
+| niah_multiquery   | dense INT8        |    4096 | 1.000 |        1.000 |         404.6 |
+| niah_multiquery   | certified KV INT8 |    4096 | 1.000 |        1.000 |          83.2 |
+
+The arxiv_v1 smoke harness replays the DotCache synthetic retrieval subtasks
+with deterministic seeds, scores only the generated suffix, compares against
+the normalized DotCache reference results from
+`/workspace/DotCache/benchmarks/results/arxiv_v1_20260420`, and fails on
+critical certified-vs-dense regressions. The 4K smoke above passed all gates.
+PG-19 parity is not covered by this harness yet because SuperSonic does not
+currently expose the teacher-forced log-probability path needed for perplexity.
+
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
 [qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
@@ -238,4 +258,10 @@ SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
   --prompt "Hello" \
   --max-new-tokens 32 \
   --int8
+
+# CUDA / sm86 Llama 3.1 8B arxiv_v1 retrieval smoke QA
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
 ```

@@ -182,6 +182,12 @@ SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
   --max-new-tokens 32 \
   --int8
 
+# Llama 3.1 8B arxiv_v1 retrieval smoke QA
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
 # Combined wrapper
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
@@ -346,6 +352,10 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh /path/to/Qwen3.5-0.8B /path/to/
 SUPERSONIC_BACKENDS=cuda ./target/release/supersonic --backend cuda \
   --model llama3.1-8b --model-dir /path/to/Meta-Llama-3.1-8B \
   --prompt "Hello" --max-new-tokens 32 --int8
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
 ```
 
 ### Adding tests for a new machine
