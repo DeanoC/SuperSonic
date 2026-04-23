@@ -42,12 +42,14 @@ struct RmsNormParams {
     uint32_t n_cols;
     float eps;
     uint32_t add_unit_offset;
+    uint32_t block_size;
 };
 
 struct RmsNormGatedParams {
     uint32_t n_rows;
     uint32_t n_cols;
     float eps;
+    uint32_t block_size;
 };
 
 struct LinearConvParams {
@@ -486,6 +488,7 @@ struct RmsNormParams {
     uint n_cols;
     float eps;
     uint add_unit_offset;
+    uint block_size;
 };
 
 kernel void supersonic_rms_norm_rows_bf16(
@@ -493,23 +496,35 @@ kernel void supersonic_rms_norm_rows_bf16(
     device const bfloat* weight [[buffer(1)]],
     device bfloat* out [[buffer(2)]],
     constant RmsNormParams& params [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    uint col = gid.x;
-    uint row = gid.y;
-    if (row >= params.n_rows || col >= params.n_cols) {
+    if (row >= params.n_rows || tid >= params.block_size) {
         return;
     }
 
+    threadgroup float scratch[256];
     uint row_base = row * params.n_cols;
     float mean_sq = 0.0f;
-    for (uint kk = 0; kk < params.n_cols; ++kk) {
-        float value = float(input[row_base + kk]);
-        mean_sq += value * value;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = float(input[row_base + col]);
+        mean_sq = fma(value, value, mean_sq);
     }
-    float inv_rms = 1.0f / sqrt((mean_sq / float(params.n_cols)) + params.eps);
-    float scale = float(weight[col]) + (params.add_unit_offset != 0 ? 1.0f : 0.0f);
-    out[row_base + col] = bfloat(float(input[row_base + col]) * inv_rms * scale);
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float scale = float(weight[col]) + (params.add_unit_offset != 0 ? 1.0f : 0.0f);
+        out[row_base + col] = bfloat(float(input[row_base + col]) * inv_rms * scale);
+    }
 }
 )RMS";
 
@@ -585,6 +600,7 @@ struct RmsNormGatedParams {
     uint n_rows;
     uint n_cols;
     float eps;
+    uint block_size;
 };
 
 kernel void supersonic_rms_norm_gated_bf16(
@@ -593,26 +609,38 @@ kernel void supersonic_rms_norm_gated_bf16(
     device const bfloat* weight [[buffer(2)]],
     device bfloat* out [[buffer(3)]],
     constant RmsNormGatedParams& params [[buffer(4)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    uint col = gid.x;
-    uint row = gid.y;
-    if (row >= params.n_rows || col >= params.n_cols) {
+    if (row >= params.n_rows || tid >= params.block_size) {
         return;
     }
 
+    threadgroup float scratch[256];
     uint row_base = row * params.n_cols;
     float mean_sq = 0.0f;
-    for (uint kk = 0; kk < params.n_cols; ++kk) {
-        float value = float(hidden[row_base + kk]);
-        mean_sq += value * value;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = float(hidden[row_base + col]);
+        mean_sq = fma(value, value, mean_sq);
     }
-    float inv_rms = 1.0f / sqrt((mean_sq / float(params.n_cols)) + params.eps);
-    float gate_value = float(gate[row_base + col]);
-    float sig = 1.0f / (1.0f + exp(-gate_value));
-    float silu_gate = gate_value * sig;
-    float value = float(hidden[row_base + col]) * inv_rms * float(weight[col]) * silu_gate;
-    out[row_base + col] = bfloat(value);
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float gate_value = float(gate[row_base + col]);
+        float sig = 1.0f / (1.0f + exp(-gate_value));
+        float silu_gate = gate_value * sig;
+        float value = float(hidden[row_base + col]) * inv_rms * float(weight[col]) * silu_gate;
+        out[row_base + col] = bfloat(value);
+    }
 }
 )RMSG";
 
@@ -3886,11 +3914,16 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
             return 48;
         }
 
+        NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
         RmsNormParams params = {
             static_cast<uint32_t>(n_rows),
             static_cast<uint32_t>(n_cols),
             eps,
             add_unit_offset ? 1u : 0u,
+            static_cast<uint32_t>(block_size),
         };
 
         [encoder setComputePipelineState:pipeline];
@@ -3899,15 +3932,9 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
         [encoder setBuffer:out offset:out_offset atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width = std::min<NSUInteger>(32, std::max<NSUInteger>(1, n_cols));
-        NSUInteger tg_height =
-            std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
-        if (tg_height == 0) {
-            tg_height = 1;
-        }
-        MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
-        MTLSize threads_per_grid = MTLSizeMake(n_cols, n_rows, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
@@ -3974,10 +4001,15 @@ extern "C" int supersonic_metal_rms_norm_gated_bf16(
             return 236;
         }
 
+        NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
         RmsNormGatedParams params = {
             static_cast<uint32_t>(n_rows),
             static_cast<uint32_t>(n_cols),
             eps,
+            static_cast<uint32_t>(block_size),
         };
 
         [encoder setComputePipelineState:pipeline];
@@ -3987,15 +4019,9 @@ extern "C" int supersonic_metal_rms_norm_gated_bf16(
         [encoder setBuffer:out offset:out_offset atIndex:3];
         [encoder setBytes:&params length:sizeof(params) atIndex:4];
 
-        NSUInteger tg_width = std::min<NSUInteger>(32, std::max<NSUInteger>(1, n_cols));
-        NSUInteger tg_height =
-            std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
-        if (tg_height == 0) {
-            tg_height = 1;
-        }
-        MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
-        MTLSize threads_per_grid = MTLSizeMake(n_cols, n_rows, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
