@@ -381,7 +381,6 @@ struct ComponentFullScratch {
     attn_k_step: GpuBuffer,
     attn_v_step: GpuBuffer,
     attn_out_f32: GpuBuffer,
-    attn_out_bf16: GpuBuffer,
     attn_flat: GpuBuffer,
     gated: GpuBuffer,
     proj_out: GpuBuffer,
@@ -500,9 +499,6 @@ impl ComponentFullScratch {
         let attn_out_f32 =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
                 .map_err(|e| anyhow::anyhow!("component full attn_out scratch alloc: {e}"))?;
-        let attn_out_bf16 =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("component full attn_out bf16 scratch alloc: {e}"))?;
         let attn_flat = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("component full attn_flat scratch alloc: {e}"))?;
         let gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
@@ -521,7 +517,6 @@ impl ComponentFullScratch {
             attn_k_step,
             attn_v_step,
             attn_out_f32,
-            attn_out_bf16,
             attn_flat,
             gated,
             proj_out,
@@ -2138,7 +2133,6 @@ impl DecodeEngine {
             attn_k_step,
             attn_v_step,
             attn_out_f32,
-            attn_out_bf16,
             attn_flat,
             gated,
             proj_out,
@@ -2451,19 +2445,9 @@ impl DecodeEngine {
             ScalarType::BF16,
             num_q_heads * head_dim,
             attn_out_f32,
-            attn_out_bf16,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal,
-            ScalarType::BF16,
-            num_q_heads,
-            1,
-            head_dim,
-            attn_out_bf16,
             attn_flat,
         )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
 
         kernel_ffi::prefill_ffi::sigmoid_mul(
             self.ordinal,
