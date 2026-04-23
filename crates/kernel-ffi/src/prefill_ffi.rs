@@ -2,10 +2,137 @@
 //! These are component kernels (not megakernels) — the prefill engine
 //! orchestrates them layer by layer.
 
+use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::{metal_host, metal_native};
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+
+static METAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static METAL_PROFILE: OnceLock<Mutex<MetalProfileAccumulator>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct MetalProfileEntry {
+    pub op: String,
+    pub path: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub max_ms: f64,
+}
+
+impl MetalProfileEntry {
+    pub fn mean_ms(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.total_ms / self.calls as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MetalProfileSnapshot {
+    pub total_calls: u64,
+    pub native_calls: u64,
+    pub host_calls: u64,
+    pub total_ms: f64,
+    pub native_ms: f64,
+    pub host_ms: f64,
+    pub entries: Vec<MetalProfileEntry>,
+}
+
+#[derive(Debug, Default)]
+struct MetalProfileAccumulator {
+    entries: BTreeMap<(String, String), MetalProfileEntry>,
+}
+
+pub fn metal_profile_set_enabled(enabled: bool) {
+    METAL_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn metal_profile_enabled() -> bool {
+    METAL_PROFILE_ENABLED.load(Ordering::Relaxed)
+        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
+}
+
+pub fn metal_profile_reset() {
+    if let Some(profile) = METAL_PROFILE.get() {
+        profile
+            .lock()
+            .expect("metal profile mutex poisoned")
+            .entries
+            .clear();
+    }
+}
+
+pub fn metal_profile_snapshot() -> MetalProfileSnapshot {
+    let mut snapshot = MetalProfileSnapshot::default();
+    let Some(profile) = METAL_PROFILE.get() else {
+        return snapshot;
+    };
+    let mut entries: Vec<_> = profile
+        .lock()
+        .expect("metal profile mutex poisoned")
+        .entries
+        .values()
+        .cloned()
+        .collect();
+    entries.sort_by(|lhs, rhs| {
+        rhs.total_ms
+            .partial_cmp(&lhs.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.op.cmp(&rhs.op))
+            .then_with(|| lhs.path.cmp(&rhs.path))
+    });
+    for entry in &entries {
+        snapshot.total_calls += entry.calls;
+        snapshot.total_ms += entry.total_ms;
+        match entry.path.as_str() {
+            "native" => {
+                snapshot.native_calls += entry.calls;
+                snapshot.native_ms += entry.total_ms;
+            }
+            "host" => {
+                snapshot.host_calls += entry.calls;
+                snapshot.host_ms += entry.total_ms;
+            }
+            _ => {}
+        }
+    }
+    snapshot.entries = entries;
+    snapshot
+}
+
+fn metal_profile_time<T, F>(op: &'static str, path: &'static str, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !metal_profile_enabled() {
+        return f();
+    }
+    let start = Instant::now();
+    let result = f();
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let profile = METAL_PROFILE.get_or_init(|| Mutex::new(MetalProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("metal profile mutex poisoned");
+    let entry = profile
+        .entries
+        .entry((op.to_string(), path.to_string()))
+        .or_insert_with(|| MetalProfileEntry {
+            op: op.to_string(),
+            path: path.to_string(),
+            calls: 0,
+            total_ms: 0.0,
+            max_ms: 0.0,
+        });
+    entry.calls += 1;
+    entry.total_ms += elapsed_ms;
+    entry.max_ms = entry.max_ms.max(elapsed_ms);
+    result
+}
 
 fn metal_force_host_rms_norm() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM").is_some()
@@ -476,9 +603,23 @@ pub fn embedding_lookup(
 ) -> Result<(), GpuError> {
     if embeddings.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
-            && metal_native::embedding_lookup_bf16(
+        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
+            let result = metal_profile_time("embedding_lookup", "native", || {
+                metal_native::embedding_lookup_bf16(
+                    token_count,
+                    vocab_size,
+                    hidden_size,
+                    embeddings,
+                    indexes,
+                    out,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        return metal_profile_time("embedding_lookup", "host", || {
+            metal_host::embedding_lookup(
                 token_count,
                 vocab_size,
                 hidden_size,
@@ -486,18 +627,7 @@ pub fn embedding_lookup(
                 indexes,
                 out,
             )
-            .is_ok()
-        {
-            return Ok(());
-        }
-        return metal_host::embedding_lookup(
-            token_count,
-            vocab_size,
-            hidden_size,
-            embeddings,
-            indexes,
-            out,
-        );
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_embedding_lookup(
@@ -533,7 +663,9 @@ pub fn batched_matmul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out);
+        return metal_profile_time("batched_matmul", "host", || {
+            metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out)
+        });
     }
     // Simple rank-1 batch (no broadcasting)
     let batch_dims = [batch_elems as c_int];
@@ -584,7 +716,29 @@ pub fn full_attention_prefill(
             && !metal_native::disabled_by_env()
             && !metal_force_host_full_attention()
         {
-            if metal_native::full_attention_prefill_bf16_f32(
+            let result = metal_profile_time("full_attention_prefill", "native", || {
+                metal_native::full_attention_prefill_bf16_f32(
+                    q_heads,
+                    kv_heads,
+                    q_len,
+                    kv_len,
+                    head_dim,
+                    scale,
+                    seqlen_offset,
+                    query,
+                    key,
+                    value,
+                    out,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        return metal_profile_time("full_attention_prefill", "host", || {
+            metal_host::full_attention_prefill(
+                dtype,
+                batch_size,
                 q_heads,
                 kv_heads,
                 q_len,
@@ -597,26 +751,7 @@ pub fn full_attention_prefill(
                 value,
                 out,
             )
-            .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        return metal_host::full_attention_prefill(
-            dtype,
-            batch_size,
-            q_heads,
-            kv_heads,
-            q_len,
-            kv_len,
-            head_dim,
-            scale,
-            seqlen_offset,
-            query,
-            key,
-            value,
-            out,
-        );
+        });
     }
     let num_kv_groups = q_heads / kv_heads;
     let status = unsafe {
@@ -666,7 +801,25 @@ pub fn linear_prefill_conv_pack(
             && !metal_native::disabled_by_env()
             && !metal_force_host_linear_conv_pack()
         {
-            if metal_native::linear_prefill_conv_pack_bf16(
+            let result = metal_profile_time("linear_prefill_conv_pack", "native", || {
+                metal_native::linear_prefill_conv_pack_bf16(
+                    conv_dim,
+                    total_len,
+                    seq_len,
+                    kernel_size,
+                    mixed_qkv,
+                    weights,
+                    out,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        return metal_profile_time("linear_prefill_conv_pack", "host", || {
+            metal_host::linear_prefill_conv_pack(
+                dtype,
+                batch_size,
                 conv_dim,
                 total_len,
                 seq_len,
@@ -675,22 +828,7 @@ pub fn linear_prefill_conv_pack(
                 weights,
                 out,
             )
-            .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        return metal_host::linear_prefill_conv_pack(
-            dtype,
-            batch_size,
-            conv_dim,
-            total_len,
-            seq_len,
-            kernel_size,
-            mixed_qkv,
-            weights,
-            out,
-        );
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_linear_prefill_conv_pack(
@@ -928,9 +1066,29 @@ pub fn delta_recurrent_prefill(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
-            && metal_native::delta_recurrent_prefill_f32(
+        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+            let result = metal_profile_time("delta_recurrent_prefill", "native", || {
+                metal_native::delta_recurrent_prefill_f32(
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state,
+                    query,
+                    key,
+                    value,
+                    beta,
+                    g,
+                    out,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        return metal_profile_time("delta_recurrent_prefill", "host", || {
+            metal_host::delta_recurrent_prefill(
+                dtype,
                 batch_heads,
                 seq_len,
                 k_head_dim,
@@ -943,24 +1101,7 @@ pub fn delta_recurrent_prefill(
                 g,
                 out,
             )
-            .is_ok()
-        {
-            return Ok(());
-        }
-        return metal_host::delta_recurrent_prefill(
-            dtype,
-            batch_heads,
-            seq_len,
-            k_head_dim,
-            v_head_dim,
-            initial_state,
-            query,
-            key,
-            value,
-            beta,
-            g,
-            out,
-        );
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_delta_recurrent_prefill(
@@ -999,13 +1140,17 @@ pub fn l2norm(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_l2norm()
-            && metal_native::l2norm(dtype, n_rows, n_cols, eps, input, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_l2norm() {
+            let result = metal_profile_time("l2norm", "native", || {
+                metal_native::l2norm(dtype, n_rows, n_cols, eps, input, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out);
+        return metal_profile_time("l2norm", "host", || {
+            metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_l2norm(
@@ -1035,12 +1180,17 @@ pub fn swiglu_mul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && metal_native::swiglu_mul(dtype, elem_count, gate, up, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("swiglu_mul", "native", || {
+                metal_native::swiglu_mul(dtype, elem_count, gate, up, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::swiglu_mul(dtype, elem_count, gate, up, out);
+        return metal_profile_time("swiglu_mul", "host", || {
+            metal_host::swiglu_mul(dtype, elem_count, gate, up, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_swiglu_mul(
@@ -1072,14 +1222,17 @@ pub fn rms_norm_gated(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16
-            && !metal_native::disabled_by_env()
-            && metal_native::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
-                .is_ok()
-        {
-            return Ok(());
+        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
+            let result = metal_profile_time("rms_norm_gated", "native", || {
+                metal_native::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out);
+        return metal_profile_time("rms_norm_gated", "host", || {
+            metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm_gated(
@@ -1111,13 +1264,17 @@ pub fn mul_scalar(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_mul_scalar()
-            && metal_native::mul_scalar(dtype, total_elems, scalar, input, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_mul_scalar() {
+            let result = metal_profile_time("mul_scalar", "native", || {
+                metal_native::mul_scalar(dtype, total_elems, scalar, input, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::mul_scalar(dtype, total_elems, scalar, input, out);
+        return metal_profile_time("mul_scalar", "host", || {
+            metal_host::mul_scalar(dtype, total_elems, scalar, input, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_mul_scalar(
@@ -1155,17 +1312,19 @@ pub fn fused_rms_norm_linear_rows(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_host::fused_rms_norm_linear_rows(
-            dtype,
-            n_rows,
-            hidden_dim,
-            out_dim,
-            eps,
-            hidden,
-            norm_weight,
-            proj_weight,
-            out,
-        );
+        return metal_profile_time("fused_rms_norm_linear_rows", "host", || {
+            metal_host::fused_rms_norm_linear_rows(
+                dtype,
+                n_rows,
+                hidden_dim,
+                out_dim,
+                eps,
+                hidden,
+                norm_weight,
+                proj_weight,
+                out,
+            )
+        });
     }
     let row_bytes = hidden_dim * dtype.size_in_bytes();
     let out_row_bytes = out_dim * dtype.size_in_bytes();
@@ -1219,12 +1378,16 @@ pub fn matmul_rhs_transposed(
             && !metal_native::disabled_by_env()
             && !metal_force_host_matmul()
         {
-            if metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out).is_ok()
-            {
-                return Ok(());
+            let result = metal_profile_time("matmul_rhs_transposed", "native", || {
+                metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out)
+            });
+            if result.is_ok() {
+                return result;
             }
         }
-        return metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out);
+        return metal_profile_time("matmul_rhs_transposed", "host", || {
+            metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
@@ -1341,13 +1504,16 @@ pub fn rms_norm_rows(
             && !metal_native::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
-            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
-                .is_ok()
-            {
-                return Ok(());
+            let result = metal_profile_time("rms_norm_rows", "native", || {
+                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
+            });
+            if result.is_ok() {
+                return result;
             }
         }
-        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out);
+        return metal_profile_time("rms_norm_rows", "host", || {
+            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
@@ -1387,13 +1553,16 @@ pub fn rms_norm_rows_plain(
             && !metal_native::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
-            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
-                .is_ok()
-            {
-                return Ok(());
+            let result = metal_profile_time("rms_norm_rows_plain", "native", || {
+                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
+            });
+            if result.is_ok() {
+                return result;
             }
         }
-        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out);
+        return metal_profile_time("rms_norm_rows_plain", "host", || {
+            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
@@ -1428,23 +1597,21 @@ pub fn rms_norm_rows_plain_inplace(
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
-        gpu_hal::copy_d2d(
-            ordinal,
-            input.as_mut_ptr(),
-            data.as_ptr(),
-            data.len_bytes(),
-        )?;
+        gpu_hal::copy_d2d(ordinal, input.as_mut_ptr(), data.as_ptr(), data.len_bytes())?;
         if dtype == ScalarType::BF16
             && !metal_native::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
-            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
-                .is_ok()
-            {
-                return Ok(());
+            let result = metal_profile_time("rms_norm_rows_plain_inplace", "native", || {
+                metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
+            });
+            if result.is_ok() {
+                return result;
             }
         }
-        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data);
+        return metal_profile_time("rms_norm_rows_plain_inplace", "host", || {
+            metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data)
+        });
     }
     let ptr = data.as_mut_ptr();
     let status = unsafe {
@@ -1485,13 +1652,17 @@ pub fn element_add_inplace(
             lhs_out.as_ptr(),
             lhs_out.len_bytes(),
         )?;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_element_add()
-            && metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_element_add() {
+            let result = metal_profile_time("element_add_inplace", "native", || {
+                metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out);
+        return metal_profile_time("element_add_inplace", "host", || {
+            metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
+        });
     }
     let ptr = lhs_out.as_mut_ptr();
     let status = unsafe {
@@ -1523,13 +1694,17 @@ pub fn cast(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_cast()
-            && metal_native::cast(input_dtype, output_dtype, total_elems, input, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_cast() {
+            let result = metal_profile_time("cast", "native", || {
+                metal_native::cast(input_dtype, output_dtype, total_elems, input, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::cast(input_dtype, output_dtype, total_elems, input, out);
+        return metal_profile_time("cast", "host", || {
+            metal_host::cast(input_dtype, output_dtype, total_elems, input, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_cast(
@@ -1560,13 +1735,17 @@ pub fn element_add(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_element_add()
-            && metal_native::element_add(dtype, total_elems, lhs, rhs, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_element_add() {
+            let result = metal_profile_time("element_add", "native", || {
+                metal_native::element_add(dtype, total_elems, lhs, rhs, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::element_add(dtype, total_elems, lhs, rhs, out);
+        return metal_profile_time("element_add", "host", || {
+            metal_host::element_add(dtype, total_elems, lhs, rhs, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_element_add(
@@ -1605,9 +1784,12 @@ pub fn apply_rope_prefill(
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_host::apply_rope_prefill(
-            dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset, data,
-        );
+        return metal_profile_time("apply_rope_prefill", "host", || {
+            metal_host::apply_rope_prefill(
+                dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
+                data,
+            )
+        });
     }
     let half_rot = rotary_dim / 2;
     // Offset cos/sin table pointers by pos_offset positions.
@@ -1648,13 +1830,17 @@ pub fn transpose_shd_hsd(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_transpose_shd_hsd()
-            && metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_transpose_shd_hsd() {
+            let result = metal_profile_time("transpose_shd_hsd", "native", || {
+                metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst);
+        return metal_profile_time("transpose_shd_hsd", "host", || {
+            metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_shd_hsd(
@@ -1688,7 +1874,9 @@ pub fn transpose_pad_conv(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst);
+        return metal_profile_time("transpose_pad_conv", "host", || {
+            metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_pad_conv(
@@ -1721,7 +1909,9 @@ pub fn extract_conv_state(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst);
+        return metal_profile_time("extract_conv_state", "host", || {
+            metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_extract_conv_state(
@@ -1753,12 +1943,17 @@ pub fn sigmoid_mul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && metal_native::sigmoid_mul(dtype, total_elems, data, gate, out).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("sigmoid_mul", "native", || {
+                metal_native::sigmoid_mul(dtype, total_elems, data, gate, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::sigmoid_mul(dtype, total_elems, data, gate, out);
+        return metal_profile_time("sigmoid_mul", "host", || {
+            metal_host::sigmoid_mul(dtype, total_elems, data, gate, out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_sigmoid_mul(
@@ -1795,14 +1990,17 @@ pub fn compute_beta_g(
 ) -> Result<(), GpuError> {
     if beta.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::F32
-            && !metal_native::disabled_by_env()
-            && metal_native::compute_beta_g_f32(seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
-                .is_ok()
-        {
-            return Ok(());
+        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+            let result = metal_profile_time("compute_beta_g", "native", || {
+                metal_native::compute_beta_g_f32(seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g);
+        return metal_profile_time("compute_beta_g", "host", || {
+            metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_compute_beta_g(
@@ -1839,14 +2037,17 @@ pub fn split_qgate(
 ) -> Result<(), GpuError> {
     if query_out.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_split_qgate()
-            && metal_native::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
-                .is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_split_qgate() {
+            let result = metal_profile_time("split_qgate", "native", || {
+                metal_native::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out);
+        return metal_profile_time("split_qgate", "host", || {
+            metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_split_qgate(
@@ -1883,13 +2084,17 @@ pub fn split_qkv(
 ) -> Result<(), GpuError> {
     if q.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && !metal_force_host_split_qkv()
-            && metal_native::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v).is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() && !metal_force_host_split_qkv() {
+            let result = metal_profile_time("split_qkv", "native", || {
+                metal_native::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v);
+        return metal_profile_time("split_qkv", "host", || {
+            metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_split_qkv(
@@ -1926,13 +2131,19 @@ pub fn repeat_interleave_heads(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        if !metal_native::disabled_by_env()
-            && metal_native::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
-                .is_ok()
-        {
-            return Ok(());
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("repeat_interleave_heads", "native", || {
+                metal_native::repeat_interleave_heads(
+                    dtype, s, n_heads, head_dim, repeats, src, dst,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
         }
-        return metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst);
+        return metal_profile_time("repeat_interleave_heads", "host", || {
+            metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
+        });
     }
     let status = unsafe {
         dotcache_qwen35_hip_repeat_interleave_heads(

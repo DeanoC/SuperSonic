@@ -48,6 +48,12 @@ struct Cli {
 
     #[arg(long, default_value_t = 1)]
     warmup: usize,
+
+    #[arg(long, default_value_t = 0)]
+    decode_tokens: usize,
+
+    #[arg(long)]
+    profile_ops: bool,
 }
 
 fn main() -> Result<()> {
@@ -66,6 +72,8 @@ fn main() -> Result<()> {
         layer_kind: cli.layer_kind,
         bench_iterations: cli.iters,
         bench_warmup: cli.warmup,
+        bench_decode_tokens: cli.decode_tokens,
+        bench_profile_ops: cli.profile_ops,
     })?;
 
     let exit_code = report.exit_code();
