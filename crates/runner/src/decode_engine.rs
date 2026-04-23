@@ -3524,9 +3524,7 @@ impl DecodeEngine {
             }
         }
 
-        let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-        let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
-        let cap = cache_k_ref.shape()[2];
+        let cap = ls.kv_cache_k.as_ref().unwrap().shape()[2];
 
         let core_start = Instant::now();
         let use_certified_bf16_values = certified_kv_decode
@@ -3548,22 +3546,52 @@ impl DecodeEngine {
                 value_group_size,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode shapes: {e}"))?;
-            let mut key_i8 =
-                GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key_i8 alloc: {e}"))?;
-            let mut key_scale =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key_scale alloc: {e}"))?;
-            kernel_ffi::certified_kv::quantize_bf16_keys(
-                self.ordinal,
-                cache_k_ref,
-                kv_len,
-                block_size,
-                &mut key_i8,
-                &mut key_scale,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
+            let needs_key_alloc = ls
+                .certified_kv_key_i8
+                .as_ref()
+                .map(|buf| buf.shape() != key_i8_shape)
+                .unwrap_or(true)
+                || ls
+                    .certified_kv_key_scale
+                    .as_ref()
+                    .map(|buf| buf.shape() != key_scale_shape)
+                    .unwrap_or(true);
+            if needs_key_alloc {
+                ls.certified_kv_key_i8 =
+                    Some(GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape).map_err(
+                        |e| anyhow::anyhow!("layer {idx} certified KV decode key_i8 alloc: {e}"),
+                    )?);
+                ls.certified_kv_key_scale = Some(
+                    GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape).map_err(
+                        |e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV decode key_scale alloc: {e}"
+                            )
+                        },
+                    )?,
+                );
+                ls.certified_kv_key_tokens = 0;
+            }
+            if ls.certified_kv_key_tokens < aligned {
+                let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+                let key_i8 = ls.certified_kv_key_i8.as_mut().unwrap();
+                let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
+                kernel_ffi::certified_kv::quantize_bf16_keys(
+                    self.ordinal,
+                    cache_k_ref,
+                    kv_len,
+                    block_size,
+                    key_i8,
+                    key_scale,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
+                ls.certified_kv_key_tokens = aligned;
+            }
 
+            let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+            let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+            let key_i8 = ls.certified_kv_key_i8.as_ref().unwrap();
+            let key_scale = ls.certified_kv_key_scale.as_ref().unwrap();
             let cap_stride = cap * head_dim * elem_bytes;
             let tail_key_bf16 = if tail_len > 0 {
                 let tail =
@@ -3591,8 +3619,8 @@ impl DecodeEngine {
             kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                 self.ordinal,
                 attn_q,
-                &key_i8,
-                &key_scale,
+                key_i8,
+                key_scale,
                 cache_v_ref,
                 tail_key_bf16.as_ref(),
                 kv_len,
@@ -3658,7 +3686,10 @@ impl DecodeEngine {
                     );
                 }
             }
-        } else if has_attn_gate {
+        } else {
+            let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+            let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+            if has_attn_gate {
             let kv_k_contig;
             let kv_v_contig;
             let attn_k_ref;
@@ -3719,7 +3750,7 @@ impl DecodeEngine {
                 self.ordinal, ScalarType::BF16, q_dim, attn_flat, gate_buf, gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
-        } else if cap == kv_len {
+            } else if cap == kv_len {
             kernel_ffi::prefill_ffi::full_attention_decode_flat(
                 self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
                 kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(),
@@ -3733,7 +3764,7 @@ impl DecodeEngine {
                         .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
                 );
             }
-        } else {
+            } else {
             kernel_ffi::prefill_ffi::full_attention_decode_flat_strided(
                 self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
                 kv_len, cap, head_dim, 1.0 / (head_dim as f32).sqrt(),
@@ -3746,6 +3777,7 @@ impl DecodeEngine {
                         .to_host_bytes()
                         .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
                 );
+            }
             }
         }
         self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention core"))?;

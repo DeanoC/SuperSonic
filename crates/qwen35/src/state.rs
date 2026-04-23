@@ -28,6 +28,11 @@ pub struct LayerState {
     pub kv_shadow_k: Option<GpuBuffer>,
     pub kv_shadow_v: Option<GpuBuffer>,
     pub kv_shadow_start: usize,
+    // Certified KV experimental decode cache: INT8 post-RoPE keys and per-block
+    // scales for the contiguous prefix covered by complete blocks.
+    pub certified_kv_key_i8: Option<GpuBuffer>,
+    pub certified_kv_key_scale: Option<GpuBuffer>,
+    pub certified_kv_key_tokens: usize,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -63,6 +68,9 @@ impl LayerState {
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: usize::MAX,
+            certified_kv_key_i8: None,
+            certified_kv_key_scale: None,
+            certified_kv_key_tokens: 0,
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -79,6 +87,9 @@ impl LayerState {
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: usize::MAX,
+            certified_kv_key_i8: None,
+            certified_kv_key_scale: None,
+            certified_kv_key_tokens: 0,
             conv_state: None,
             recurrent_state: None,
         }
@@ -165,6 +176,9 @@ impl LayerState {
     /// Record actual filled KV length (no reallocation).
     pub fn set_kv_filled(&mut self, filled: usize) {
         self.kv_filled = filled;
+        if filled < self.certified_kv_key_tokens {
+            self.certified_kv_key_tokens = 0;
+        }
         if self.kv_shadow_k.is_some() && self.kv_shadow_v.is_some() {
             self.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
                 .map(|window| filled.saturating_sub(window))
@@ -200,6 +214,9 @@ impl LayerState {
             kv_shadow_k: clone_opt(&self.kv_shadow_k)?,
             kv_shadow_v: clone_opt(&self.kv_shadow_v)?,
             kv_shadow_start: self.kv_shadow_start,
+            certified_kv_key_i8: clone_opt(&self.certified_kv_key_i8)?,
+            certified_kv_key_scale: clone_opt(&self.certified_kv_key_scale)?,
+            certified_kv_key_tokens: self.certified_kv_key_tokens,
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })
