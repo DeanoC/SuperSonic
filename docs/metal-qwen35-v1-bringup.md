@@ -31,6 +31,25 @@ The current Metal path is a pragmatic bridge, not a full native-kernel backend:
 That last point mattered on this machine because the Command Line Tools
 `python3` was `3.9.6` and was too old for the modern `qwen3_5` oracle stack.
 
+## Bughunt gate
+
+The repeatable parity gate for the current Qwen3.5 0.8B Metal bring-up is:
+
+```bash
+tests/metal/qwen35_bughunt_gate.sh
+```
+
+The script builds `qwen35_bughunt`, runs the checked-in token-ID manifest, uses
+the Python oracle on CPU as truth, and writes JSON to
+`/tmp/qwen35_bughunt_gate.json` by default.
+
+Useful overrides:
+
+- `QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B`
+- `QWEN35_BUGHUNT_PROMPT=code_prompt`
+- `QWEN35_BUGHUNT_REPORT_JSON=/tmp/report.json`
+- `QWEN35_ORACLE_DEVICE=cpu`
+
 ## Replay drift prompt family
 
 The most informative prompt family so far is:
