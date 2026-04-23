@@ -286,6 +286,10 @@ pub struct BenchPromptReport {
     pub min_native_prefill_ms: f64,
     pub max_native_prefill_ms: f64,
     pub mean_native_prefill_ms: f64,
+    pub greedy_prefill_ms: Vec<f64>,
+    pub min_greedy_prefill_ms: f64,
+    pub max_greedy_prefill_ms: f64,
+    pub mean_greedy_prefill_ms: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub replay_decode_ms: Vec<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -309,11 +313,15 @@ pub struct BenchPromptReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub greedy_prefill_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_decode_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub component_decode_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub greedy_prefill_hal_profile: Option<HalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_decode_hal_profile: Option<HalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -908,11 +916,21 @@ fn run_bench_mode(
             "[bughunt] bench prompt={} warmup={} iters={} decode_tokens={} profile_ops={} start",
             prompt.name, warmup_iterations, iterations, decode_tokens, profile_ops
         );
+        let mut greedy_prefill_state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+            .map_err(|e| anyhow::anyhow!("bench greedy prefill state init: {e}"))?;
         for warmup in 0..warmup_iterations {
             let _ = run_native_prefill(runtime, &prompt.prompt_ids)
                 .with_context(|| format!("bench warmup {warmup} prompt {}", prompt.name))?;
             gpu_hal::sync(runtime.ordinal)
                 .with_context(|| format!("bench warmup sync prompt {}", prompt.name))?;
+            let _ = run_native_prefill_greedy_token_with_state(
+                runtime,
+                &mut greedy_prefill_state,
+                &prompt.prompt_ids,
+            )
+            .with_context(|| format!("bench greedy warmup {warmup} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench greedy warmup sync prompt {}", prompt.name))?;
             if decode_tokens > 0 {
                 let _ = run_replay_decode_once(runtime, &prompt.prompt_ids, decode_tokens)
                     .with_context(|| {
@@ -933,12 +951,42 @@ fn run_bench_mode(
 
         let (min_native_prefill_ms, max_native_prefill_ms, mean_native_prefill_ms) =
             bench_stats(&native_prefill_ms);
+        let mut greedy_prefill_ms = Vec::with_capacity(iterations);
+        for iter in 0..iterations {
+            let start = Instant::now();
+            let _ = run_native_prefill_greedy_token_with_state(
+                runtime,
+                &mut greedy_prefill_state,
+                &prompt.prompt_ids,
+            )
+            .with_context(|| format!("bench greedy iter {iter} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench greedy iter sync prompt {}", prompt.name))?;
+            greedy_prefill_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let (min_greedy_prefill_ms, max_greedy_prefill_ms, mean_greedy_prefill_ms) =
+            bench_stats(&greedy_prefill_ms);
         let prefill_profiles = if profile_ops {
             collect_profiles(|| {
                 let _ = run_native_prefill(runtime, &prompt.prompt_ids)
                     .with_context(|| format!("bench profile prefill prompt {}", prompt.name))?;
                 gpu_hal::sync(runtime.ordinal)
                     .with_context(|| format!("bench profile prefill sync prompt {}", prompt.name))
+            })?
+        } else {
+            ProfileReports::default()
+        };
+        let greedy_prefill_profiles = if profile_ops {
+            collect_profiles(|| {
+                let _ = run_native_prefill_greedy_token_with_state(
+                    runtime,
+                    &mut greedy_prefill_state,
+                    &prompt.prompt_ids,
+                )
+                .with_context(|| format!("bench profile greedy prefill prompt {}", prompt.name))?;
+                gpu_hal::sync(runtime.ordinal).with_context(|| {
+                    format!("bench profile greedy prefill sync prompt {}", prompt.name)
+                })
             })?
         } else {
             ProfileReports::default()
@@ -980,14 +1028,18 @@ fn run_bench_mode(
             for warmup in 0..warmup_iterations {
                 let _ = run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
                     .with_context(|| {
-                        format!("bench component decode warmup {warmup} prompt {}", prompt.name)
+                        format!(
+                            "bench component decode warmup {warmup} prompt {}",
+                            prompt.name
+                        )
                     })?;
             }
             for iter in 0..iterations {
-                let elapsed_ms = run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
-                    .with_context(|| {
-                        format!("bench component decode iter {iter} prompt {}", prompt.name)
-                    })?;
+                let elapsed_ms =
+                    run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
+                        .with_context(|| {
+                            format!("bench component decode iter {iter} prompt {}", prompt.name)
+                        })?;
                 component_decode_ms.push(elapsed_ms);
             }
         }
@@ -1011,11 +1063,12 @@ fn run_bench_mode(
             ProfileReports::default()
         };
         eprintln!(
-            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_replay_decode_ms_per_token={} mean_component_decode_ms_per_token={}",
+            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_greedy_prefill_ms={:.1} mean_replay_decode_ms_per_token={} mean_component_decode_ms_per_token={}",
             prompt.name,
             mean_native_prefill_ms,
             min_native_prefill_ms,
             max_native_prefill_ms,
+            mean_greedy_prefill_ms,
             mean_replay_decode_ms_per_token
                 .map(|value| format!("{value:.1}"))
                 .unwrap_or_else(|| "n/a".to_string()),
@@ -1034,6 +1087,10 @@ fn run_bench_mode(
             min_native_prefill_ms,
             max_native_prefill_ms,
             mean_native_prefill_ms,
+            greedy_prefill_ms,
+            min_greedy_prefill_ms,
+            max_greedy_prefill_ms,
+            mean_greedy_prefill_ms,
             replay_decode_ms,
             min_replay_decode_ms,
             max_replay_decode_ms,
@@ -1045,9 +1102,11 @@ fn run_bench_mode(
             mean_component_decode_ms,
             mean_component_decode_ms_per_token,
             prefill_profile: prefill_profiles.metal,
+            greedy_prefill_profile: greedy_prefill_profiles.metal,
             replay_decode_profile: replay_decode_profiles.metal,
             component_decode_profile: component_decode_profiles.metal,
             prefill_hal_profile: prefill_profiles.hal,
+            greedy_prefill_hal_profile: greedy_prefill_profiles.hal,
             replay_decode_hal_profile: replay_decode_profiles.hal,
             component_decode_hal_profile: component_decode_profiles.hal,
         });
@@ -3158,7 +3217,7 @@ fn print_report_summary(report: &BughuntReport) {
                 );
                 for prompt in &bench.prompt_results {
                     println!(
-                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1} decode_tokens={} replay_decode_ms_per_token_mean={} component_decode_ms_per_token_mean={}",
+                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1} greedy_prefill_ms_mean={:.1} min={:.1} max={:.1} decode_tokens={} replay_decode_ms_per_token_mean={} component_decode_ms_per_token_mean={}",
                         prompt.name,
                         prompt.prompt_len,
                         prompt.iterations,
@@ -3166,6 +3225,9 @@ fn print_report_summary(report: &BughuntReport) {
                         prompt.mean_native_prefill_ms,
                         prompt.min_native_prefill_ms,
                         prompt.max_native_prefill_ms,
+                        prompt.mean_greedy_prefill_ms,
+                        prompt.min_greedy_prefill_ms,
+                        prompt.max_greedy_prefill_ms,
                         prompt.decode_tokens,
                         prompt
                             .mean_replay_decode_ms_per_token
@@ -3179,6 +3241,9 @@ fn print_report_summary(report: &BughuntReport) {
                     if let Some(profile) = prompt.prefill_profile.as_ref() {
                         print_profile_summary(&prompt.name, "prefill", profile);
                     }
+                    if let Some(profile) = prompt.greedy_prefill_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "greedy_prefill", profile);
+                    }
                     if let Some(profile) = prompt.replay_decode_profile.as_ref() {
                         print_profile_summary(&prompt.name, "replay_decode", profile);
                     }
@@ -3187,6 +3252,9 @@ fn print_report_summary(report: &BughuntReport) {
                     }
                     if let Some(profile) = prompt.prefill_hal_profile.as_ref() {
                         print_hal_profile_summary(&prompt.name, "prefill", profile);
+                    }
+                    if let Some(profile) = prompt.greedy_prefill_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "greedy_prefill", profile);
                     }
                     if let Some(profile) = prompt.replay_decode_hal_profile.as_ref() {
                         print_hal_profile_summary(&prompt.name, "replay_decode", profile);
@@ -3648,6 +3716,10 @@ mod tests {
                     min_native_prefill_ms: 3.0,
                     max_native_prefill_ms: 3.0,
                     mean_native_prefill_ms: 3.0,
+                    greedy_prefill_ms: vec![1.0],
+                    min_greedy_prefill_ms: 1.0,
+                    max_greedy_prefill_ms: 1.0,
+                    mean_greedy_prefill_ms: 1.0,
                     replay_decode_ms: vec![4.0],
                     min_replay_decode_ms: Some(4.0),
                     max_replay_decode_ms: Some(4.0),
@@ -3674,6 +3746,7 @@ mod tests {
                             max_ms: 1.0,
                         }],
                     }),
+                    greedy_prefill_profile: None,
                     replay_decode_profile: None,
                     component_decode_profile: None,
                     prefill_hal_profile: Some(HalProfileReport {
@@ -3696,6 +3769,7 @@ mod tests {
                             total_bytes: 1024,
                         }],
                     }),
+                    greedy_prefill_hal_profile: None,
                     replay_decode_hal_profile: None,
                     component_decode_hal_profile: None,
                 }],
@@ -3704,6 +3778,7 @@ mod tests {
         let value = serde_json::to_value(&report).unwrap();
         let prompt = &value["bench"]["prompt_results"][0];
         assert_eq!(prompt["decode_tokens"], 1);
+        assert_eq!(prompt["mean_greedy_prefill_ms"], 1.0);
         assert_eq!(prompt["mean_replay_decode_ms_per_token"], 4.0);
         assert_eq!(prompt["mean_component_decode_ms_per_token"], 2.0);
         assert_eq!(prompt["prefill_profile"]["native_calls"], 1);
