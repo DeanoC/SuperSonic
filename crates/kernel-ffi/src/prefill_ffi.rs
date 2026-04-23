@@ -537,7 +537,11 @@ pub fn full_attention_prefill(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && batch_size == 1 && !metal_force_host_full_attention() {
+        if dtype == ScalarType::BF16
+            && batch_size == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_full_attention()
+        {
             if metal_native::full_attention_prefill_bf16_f32(
                 q_heads,
                 kv_heads,
@@ -615,7 +619,11 @@ pub fn linear_prefill_conv_pack(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && batch_size == 1 && !metal_force_host_linear_conv_pack() {
+        if dtype == ScalarType::BF16
+            && batch_size == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_linear_conv_pack()
+        {
             if metal_native::linear_prefill_conv_pack_bf16(
                 conv_dim,
                 total_len,
@@ -1122,7 +1130,10 @@ pub fn matmul_rhs_transposed(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_force_host_matmul() {
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_matmul()
+        {
             if metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out).is_ok()
             {
                 return Ok(());
@@ -1241,7 +1252,10 @@ pub fn rms_norm_rows(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_force_host_rms_norm() {
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
             if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
                 .is_ok()
             {
@@ -1284,7 +1298,10 @@ pub fn rms_norm_rows_plain(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_force_host_rms_norm() {
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
             if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
                 .is_ok()
             {
@@ -1327,7 +1344,10 @@ pub fn rms_norm_rows_plain_inplace(
     if data.backend() == Backend::Metal {
         let _ = ordinal;
         let input = unsafe { &*(data as *const GpuBuffer) };
-        if dtype == ScalarType::BF16 && !metal_force_host_rms_norm() {
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
             if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, data)
                 .is_ok()
             {

@@ -50,6 +50,12 @@ Useful overrides:
 - `QWEN35_BUGHUNT_REPORT_JSON=/tmp/report.json`
 - `QWEN35_ORACLE_DEVICE=cpu`
 
+Native Metal kernels can be disabled for an A/B run with:
+
+```bash
+SUPERSONIC_METAL_FORCE_HOST_NATIVE=1 tests/metal/qwen35_bughunt_gate.sh
+```
+
 ## Replay drift prompt family
 
 The most informative prompt family so far is:

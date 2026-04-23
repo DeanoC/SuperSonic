@@ -1057,7 +1057,7 @@ pub fn rms_norm(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 {
+        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
             if metal_native::rms_norm_rows_bf16(1, hidden_dim, eps, true, input, weight, output)
                 .is_ok()
             {

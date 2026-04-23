@@ -2,6 +2,10 @@ use std::ffi::{c_int, c_void};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
+pub(crate) fn disabled_by_env() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_some()
+}
+
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 unsafe extern "C" {
     fn supersonic_metal_matmul_rhs_transposed_bf16(
