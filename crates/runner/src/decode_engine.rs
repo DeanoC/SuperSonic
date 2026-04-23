@@ -1408,34 +1408,47 @@ impl DecodeEngine {
                 }
                 stats.attend_max_abs = stats.attend_max_abs.max(value.abs());
             }
-            let query0 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
-            let mut dense_scores = Vec::with_capacity(aligned);
+            let query_f32_all = decode_bf16_le_host(&query_host);
+            let mut dense_scores = vec![0.0f32; aligned];
             let q_scale = (head_dim as f32).powf(-0.5);
-            for t in 0..aligned {
-                let mut acc = 0.0f32;
+            for qh in 0..num_q_heads {
+                let kvh = qh / gqa_group;
+                let query0 = qh * head_dim;
+                let kv_base = kvh * max_t * head_dim * elem_bytes;
+                for t in 0..aligned {
+                    let mut acc = 0.0f32;
+                    for d in 0..head_dim {
+                        let k_offset = kv_base + (t * head_dim + d) * elem_bytes;
+                        let k = half::bf16::from_le_bytes([
+                            cache_k_host[k_offset],
+                            cache_k_host[k_offset + 1],
+                        ])
+                        .to_f32();
+                        acc += query_f32_all[query0 + d] * k;
+                    }
+                    dense_scores[t] = acc * q_scale;
+                }
+                let dense_max = dense_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let dense_denom: f32 = dense_scores.iter().map(|s| (*s - dense_max).exp()).sum();
                 for d in 0..head_dim {
-                    let k_offset = (t * head_dim + d) * elem_bytes;
-                    let k = half::bf16::from_le_bytes([cache_k_host[k_offset], cache_k_host[k_offset + 1]])
+                    let mut dense_out = 0.0f32;
+                    for (t, score) in dense_scores.iter().enumerate() {
+                        let v_offset = kv_base + (t * head_dim + d) * elem_bytes;
+                        let v = half::bf16::from_le_bytes([
+                            cache_v_host[v_offset],
+                            cache_v_host[v_offset + 1],
+                        ])
                         .to_f32();
-                    acc += query0[d] * k;
+                        dense_out += ((*score - dense_max).exp() / dense_denom) * v;
+                    }
+                    let attn_idx = qh * head_dim + d;
+                    stats.attend_ref_max_delta =
+                        stats.attend_ref_max_delta.max((attn_host[attn_idx] - dense_out).abs());
                 }
-                dense_scores.push(acc * q_scale);
-            }
-            let dense_max = dense_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let dense_denom: f32 = dense_scores.iter().map(|s| (*s - dense_max).exp()).sum();
-            for d in 0..head_dim {
-                let mut dense_out = 0.0f32;
-                for (t, score) in dense_scores.iter().enumerate() {
-                    let v_offset = (t * head_dim + d) * elem_bytes;
-                    let v = half::bf16::from_le_bytes([cache_v_host[v_offset], cache_v_host[v_offset + 1]])
-                        .to_f32();
-                    dense_out += ((*score - dense_max).exp() / dense_denom) * v;
-                }
-                stats.attend_ref_max_delta = stats.attend_ref_max_delta.max((attn_host[d] - dense_out).abs());
             }
             stats.attend_layers += 1;
 
-            let query_f32 = query0;
+            let query_f32 = query_f32_all[0..head_dim].to_vec();
             let key_i8_host = key_i8
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 D2H: {e}"))?;
