@@ -1,5 +1,6 @@
 use std::ffi::{c_int, c_uint, c_void};
 
+use crate::{metal_host, metal_native};
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -84,14 +85,14 @@ unsafe extern "C" {
         proj_buf_floats: usize,
         attn_scratch_floats: usize,
         enable_attention_trace: c_int,
-        fp8_scales: *const c_void,  // nullptr for BF16, pointer to FP8ScaleDesc[] for FP8
-        kv_fp8_descs: *const c_void,  // nullptr for BF16 KV, pointer to KVCacheFp8Desc[] for FP8 KV
-        batch_size: usize,            // 1 for single-sequence (default), >1 for batched
-        batch_descs: *const c_void,   // nullptr for single-sequence, BatchSeqDesc[] for batched
-        int4_scales: *const c_void,   // nullptr for non-INT4, pointer to INT4ScaleDesc[] for INT4
-        tap_workspace: *mut c_void,   // nullptr for non-DFlash, [num_taps * hidden_dim] T for DFlash
-        tap_layers: *const c_int,     // nullptr when tap_workspace is nullptr
-        num_taps: usize,              // 0 when tap_workspace is nullptr
+        fp8_scales: *const c_void, // nullptr for BF16, pointer to FP8ScaleDesc[] for FP8
+        kv_fp8_descs: *const c_void, // nullptr for BF16 KV, pointer to KVCacheFp8Desc[] for FP8 KV
+        batch_size: usize,         // 1 for single-sequence (default), >1 for batched
+        batch_descs: *const c_void, // nullptr for single-sequence, BatchSeqDesc[] for batched
+        int4_scales: *const c_void, // nullptr for non-INT4, pointer to INT4ScaleDesc[] for INT4
+        tap_workspace: *mut c_void, // nullptr for non-DFlash, [num_taps * hidden_dim] T for DFlash
+        tap_layers: *const c_int,  // nullptr when tap_workspace is nullptr
+        num_taps: usize,           // 0 when tap_workspace is nullptr
     ) -> c_int;
 
     fn dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
@@ -207,6 +208,7 @@ fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
         Backend::Hip => GpuError::Hip(format!("{what} failed with status {status}")),
         Backend::Cuda => GpuError::Cuda(format!("{what} failed with status {status}")),
+        Backend::Metal => GpuError::Metal(format!("{what} failed with status {status}")),
     }
 }
 
@@ -214,6 +216,7 @@ fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
         Backend::Cuda => GpuError::Cuda(msg),
+        Backend::Metal => GpuError::Metal(msg),
     }
 }
 
@@ -262,7 +265,7 @@ pub fn persistent_decode(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -288,8 +291,13 @@ pub fn persistent_decode(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
@@ -342,10 +350,15 @@ pub fn persistent_decode_qwen08_sm86_specialized(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
         Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_qwen08_sm86_specialized is CUDA-only".into(),
+            ))
+        }
+        Backend::Metal => {
             return Err(GpuError::InvalidArg(
                 "persistent_decode_qwen08_sm86_specialized is CUDA-only".into(),
             ))
@@ -413,13 +426,9 @@ pub fn persistent_decode_4b(
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
 
-    let kv_fp8_ptr = kv_fp8_descs
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
+    let kv_fp8_ptr = kv_fp8_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
 
-    let batch_descs_ptr = batch_descs
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
+    let batch_descs_ptr = batch_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
 
     let int4_scales_ptr = int4_scale_descs
         .map(|b| b.as_ptr())
@@ -435,7 +444,8 @@ pub fn persistent_decode_4b(
         (None, None) => (std::ptr::null_mut(), std::ptr::null::<c_int>(), 0),
         _ => {
             return Err(GpuError::InvalidArg(
-                "persistent_decode_4b: tap_workspace and tap_layers must both be Some or both None".into(),
+                "persistent_decode_4b: tap_workspace and tap_layers must both be Some or both None"
+                    .into(),
             ));
         }
     };
@@ -476,7 +486,7 @@ pub fn persistent_decode_4b(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -514,12 +524,21 @@ pub fn persistent_decode_4b(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
-        return Err(backend_error(backend, "persistent_decode_4b kernel", status));
+        return Err(backend_error(
+            backend,
+            "persistent_decode_4b kernel",
+            status,
+        ));
     }
     Ok(())
 }
@@ -568,12 +587,8 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
     let fp8_scales_ptr = fp8_scale_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
-    let kv_fp8_descs_ptr = kv_fp8_descs
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
-    let batch_descs_ptr = batch_descs
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
+    let kv_fp8_descs_ptr = kv_fp8_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    let batch_descs_ptr = batch_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let int4_scales_ptr = int4_scale_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
@@ -611,10 +626,15 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
         Backend::Hip => {
+            return Err(GpuError::InvalidArg(
+                "persistent_decode_4b_qwen35_sm86_specialized is CUDA-only".into(),
+            ))
+        }
+        Backend::Metal => {
             return Err(GpuError::InvalidArg(
                 "persistent_decode_4b_qwen35_sm86_specialized is CUDA-only".into(),
             ))
@@ -655,12 +675,8 @@ pub fn cuda_argmax_bf16(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_qwen35_cuda_argmax_bf16(
-            ordinal,
-            n,
-            logits.as_ptr(),
-            out_index.as_mut_ptr(),
-        );
+        let status =
+            dotcache_qwen35_cuda_argmax_bf16(ordinal, n, logits.as_ptr(), out_index.as_mut_ptr());
         if status != 0 {
             return Err(GpuError::Cuda(format!(
                 "cuda_argmax_bf16 failed with status {status}"
@@ -781,7 +797,7 @@ pub fn rms_norm_4b(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -801,8 +817,13 @@ pub fn rms_norm_4b(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "rms_norm_4b is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
@@ -856,7 +877,7 @@ pub fn standalone_matvec_4b(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -875,12 +896,21 @@ pub fn standalone_matvec_4b(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "standalone_matvec_4b is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
-        return Err(backend_error(backend, "standalone_matvec_4b kernel", status));
+        return Err(backend_error(
+            backend,
+            "standalone_matvec_4b kernel",
+            status,
+        ));
     }
     Ok(())
 }
@@ -915,7 +945,7 @@ pub fn rms_norm_4b_multirow(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -935,12 +965,21 @@ pub fn rms_norm_4b_multirow(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "rms_norm_4b_multirow is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
-        return Err(backend_error(backend, "rms_norm_4b_multirow kernel", status));
+        return Err(backend_error(
+            backend,
+            "rms_norm_4b_multirow kernel",
+            status,
+        ));
     }
     Ok(())
 }
@@ -976,7 +1015,7 @@ pub fn matmul_rhs_transposed_4b(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -996,8 +1035,13 @@ pub fn matmul_rhs_transposed_4b(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "matmul_rhs_transposed_4b is not supported on Metal v1".into(),
+            ))
         }
     };
     if status != 0 {
@@ -1021,6 +1065,17 @@ pub fn rms_norm(
     hidden_dim: usize,
 ) -> Result<(), GpuError> {
     let backend = output.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
+            if metal_native::rms_norm_rows_bf16(1, hidden_dim, eps, true, input, weight, output)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::rms_norm_rows(dtype, 1, hidden_dim, eps, true, input, weight, output);
+    }
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -1039,7 +1094,7 @@ pub fn rms_norm(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -1059,14 +1114,72 @@ pub fn rms_norm(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(backend, "rms_norm kernel", status));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use gpu_hal::{set_backend, Backend};
+    use half::bf16;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn metal_rms_norm_applies_qwen_unit_offset() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2], &bf16_bytes(&[3.0, 4.0]))
+                .expect("upload input");
+        let weight =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2], &bf16_bytes(&[0.5, -0.5]))
+                .expect("upload weight");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("alloc output");
+
+        rms_norm(
+            ordinal,
+            ScalarType::BF16,
+            &mut output,
+            &input,
+            &weight,
+            0.0,
+            2,
+        )
+        .expect("run rms_norm");
+
+        let actual = read_bf16(&output);
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        let expected = vec![3.0 * inv_rms * 1.5, 4.0 * inv_rms * 0.5];
+        for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (got - want).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {want}, got {got}, delta {delta}"
+            );
+        }
+    }
 }
 
 /// Matrix-vector multiply for output projection (lm_head).
@@ -1091,6 +1204,10 @@ pub fn standalone_matvec(
         )));
     }
     let backend = output.backend();
+    if backend == Backend::Metal {
+        let _ = (ordinal, counter_buf);
+        return metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim);
+    }
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
 
@@ -1111,7 +1228,7 @@ pub fn standalone_matvec(
             }
             #[cfg(not(supersonic_backend_hip))]
             {
-                return Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
             }
         }
         Backend::Cuda => {
@@ -1130,9 +1247,10 @@ pub fn standalone_matvec(
             }
             #[cfg(not(supersonic_backend_cuda))]
             {
-                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+                return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(backend, "standalone_matvec kernel", status));
@@ -1140,28 +1258,90 @@ pub fn standalone_matvec(
     Ok(())
 }
 
+pub fn standalone_matvec_host_f32(
+    ordinal: usize,
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    let backend = input.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim);
+    }
+
+    let mut output = GpuBuffer::zeros(ordinal, dtype, &[out_dim])?;
+    let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])?;
+    standalone_matvec(
+        ordinal,
+        dtype,
+        &mut output,
+        input,
+        weight,
+        in_dim,
+        out_dim,
+        &mut counter,
+    )?;
+    let bytes = output.to_host_bytes()?;
+    match dtype {
+        ScalarType::BF16 => Ok(bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
+            .collect()),
+        ScalarType::F32 => Ok(bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()),
+        other => Err(GpuError::InvalidArg(format!(
+            "standalone_matvec_host_f32 unsupported dtype {other:?}"
+        ))),
+    }
+}
+
+pub fn qwen_rms_norm_standalone_matvec_host_f32(
+    ordinal: usize,
+    dtype: ScalarType,
+    input: &GpuBuffer,
+    norm_weight: &GpuBuffer,
+    eps: f32,
+    weight: &GpuBuffer,
+    hidden_dim: usize,
+    out_dim: usize,
+) -> Result<Vec<f32>, GpuError> {
+    let backend = input.backend();
+    if backend == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::qwen_rms_norm_standalone_matvec_host_f32(
+            dtype,
+            input,
+            norm_weight,
+            eps,
+            weight,
+            hidden_dim,
+            out_dim,
+        );
+    }
+
+    let mut normed = GpuBuffer::zeros(ordinal, dtype, &[hidden_dim])?;
+    rms_norm(
+        ordinal,
+        dtype,
+        &mut normed,
+        input,
+        norm_weight,
+        eps,
+        hidden_dim,
+    )?;
+    standalone_matvec_host_f32(ordinal, dtype, &normed, weight, hidden_dim, out_dim)
+}
+
 /// Query GPU architecture name and total VRAM for a given device ordinal.
 pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
-    let mut arch_buf = [0u8; 64];
-    let mut total_vram: u64 = 0;
-    let status = unsafe {
-        dotcache_query_gpu_info(
-            ordinal as c_int,
-            arch_buf.as_mut_ptr(),
-            arch_buf.len(),
-            &mut total_vram,
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "query_gpu_info failed with status {status}"
-        )));
-    }
-    let arch_name = std::ffi::CStr::from_bytes_until_nul(&arch_buf)
-        .map_err(|_| ffi_error("query_gpu_info: arch name not null-terminated".into()))?
-        .to_string_lossy()
-        .into_owned();
-    Ok((arch_name, total_vram))
+    let backend = gpu_hal::current_backend();
+    let info = gpu_hal::query_device_info(backend, ordinal)?;
+    Ok((info.arch_name, info.total_vram_bytes))
 }
 
 /// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.
@@ -1176,16 +1356,14 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
     }
     #[cfg(supersonic_backend_hip)]
     {
-    let mut clock_khz: u32 = 0;
-    let status = unsafe {
-        dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz)
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "hip_device_clock_khz failed with status {status}"
-        )));
-    }
-    Ok(clock_khz)
+        let mut clock_khz: u32 = 0;
+        let status = unsafe { dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz) };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "hip_device_clock_khz failed with status {status}"
+            )));
+        }
+        Ok(clock_khz)
     }
 }
 

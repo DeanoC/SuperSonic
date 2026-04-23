@@ -3,12 +3,55 @@
 //! orchestrates them layer by layer.
 
 use std::ffi::{c_int, c_void};
+
+use crate::{metal_host, metal_native};
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+
+fn metal_force_host_rms_norm() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM").is_some()
+}
+
+fn metal_force_host_matmul() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MATMUL").is_some()
+}
+
+fn metal_force_host_full_attention() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_FULL_ATTENTION").is_some()
+}
+
+fn metal_force_host_linear_conv_pack() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_LINEAR_CONV_PACK").is_some()
+}
+
+fn metal_force_host_element_add() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_ELEMENT_ADD").is_some()
+}
+
+fn metal_force_host_cast() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_CAST").is_some()
+}
+
+fn metal_force_host_mul_scalar() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MUL_SCALAR").is_some()
+}
+
+fn metal_force_host_transpose_shd_hsd() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_TRANSPOSE_SHD_HSD").is_some()
+}
+
+fn metal_force_host_split_qkv() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_SPLIT_QKV").is_some()
+}
+
+fn metal_force_host_split_qgate() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_SPLIT_QGATE").is_some()
+}
 
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
         Backend::Cuda => GpuError::Cuda(msg),
+        Backend::Metal => GpuError::Metal(msg),
     }
 }
 
@@ -490,6 +533,17 @@ pub fn embedding_lookup(
     indexes: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if embeddings.backend() == Backend::Metal {
+        let _ = (ordinal, dtype);
+        return metal_host::embedding_lookup(
+            token_count,
+            vocab_size,
+            hidden_size,
+            embeddings,
+            indexes,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_embedding_lookup(
             dtype.kernel_dtype_code(),
@@ -522,6 +576,10 @@ pub fn batched_matmul(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out);
+    }
     // Simple rank-1 batch (no broadcasting)
     let batch_dims = [batch_elems as c_int];
     let status = unsafe {
@@ -564,6 +622,47 @@ pub fn full_attention_prefill(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && batch_size == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_full_attention()
+        {
+            if metal_native::full_attention_prefill_bf16_f32(
+                q_heads,
+                kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                scale,
+                seqlen_offset,
+                query,
+                key,
+                value,
+                out,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::full_attention_prefill(
+            dtype,
+            batch_size,
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key,
+            value,
+            out,
+        );
+    }
     let num_kv_groups = q_heads / kv_heads;
     let status = unsafe {
         dotcache_qwen35_hip_full_attention_prefill(
@@ -585,7 +684,9 @@ pub fn full_attention_prefill(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("full_attention_prefill failed: {status}")));
+        return Err(ffi_error(format!(
+            "full_attention_prefill failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -703,6 +804,39 @@ pub fn linear_prefill_conv_pack(
     weights: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && batch_size == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_linear_conv_pack()
+        {
+            if metal_native::linear_prefill_conv_pack_bf16(
+                conv_dim,
+                total_len,
+                seq_len,
+                kernel_size,
+                mixed_qkv,
+                weights,
+                out,
+            )
+            .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::linear_prefill_conv_pack(
+            dtype,
+            batch_size,
+            conv_dim,
+            total_len,
+            seq_len,
+            kernel_size,
+            mixed_qkv,
+            weights,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_linear_prefill_conv_pack(
             dtype.kernel_dtype_code(),
@@ -718,7 +852,9 @@ pub fn linear_prefill_conv_pack(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("linear_prefill_conv_pack failed: {status}")));
+        return Err(ffi_error(format!(
+            "linear_prefill_conv_pack failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -837,7 +973,9 @@ pub fn linear_decode_prepare_4b(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("linear_decode_prepare_4b failed: {status}")));
+        return Err(ffi_error(format!(
+            "linear_decode_prepare_4b failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -866,7 +1004,9 @@ pub fn linear_decode_apply_4b(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("linear_decode_apply_4b failed: {status}")));
+        return Err(ffi_error(format!(
+            "linear_decode_apply_4b failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -931,6 +1071,23 @@ pub fn delta_recurrent_prefill(
     g: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::delta_recurrent_prefill(
+            dtype,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+        );
+    }
     let status = unsafe {
         dotcache_qwen35_hip_delta_recurrent_prefill(
             dtype.kernel_dtype_code(),
@@ -949,7 +1106,9 @@ pub fn delta_recurrent_prefill(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("delta_recurrent_prefill failed: {status}")));
+        return Err(ffi_error(format!(
+            "delta_recurrent_prefill failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -964,6 +1123,10 @@ pub fn l2norm(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_l2norm(
             dtype.kernel_dtype_code(),
@@ -990,6 +1153,10 @@ pub fn swiglu_mul(
     up: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::swiglu_mul(dtype, elem_count, gate, up, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_swiglu_mul(
             dtype.kernel_dtype_code(),
@@ -1018,6 +1185,10 @@ pub fn rms_norm_gated(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm_gated(
             dtype.kernel_dtype_code(),
@@ -1046,6 +1217,16 @@ pub fn mul_scalar(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_mul_scalar()
+            && metal_native::mul_scalar(dtype, total_elems, scalar, input, out).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::mul_scalar(dtype, total_elems, scalar, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_mul_scalar(
             dtype.kernel_dtype_code(),
@@ -1080,11 +1261,27 @@ pub fn fused_rms_norm_linear_rows(
     proj_weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::fused_rms_norm_linear_rows(
+            dtype,
+            n_rows,
+            hidden_dim,
+            out_dim,
+            eps,
+            hidden,
+            norm_weight,
+            proj_weight,
+            out,
+        );
+    }
     let row_bytes = hidden_dim * dtype.size_in_bytes();
     let out_row_bytes = out_dim * dtype.size_in_bytes();
     for row in 0..n_rows {
         let hidden_ptr = hidden.offset_ptr(row * row_bytes);
-        let out_ptr = unsafe { (out.as_mut_ptr() as *mut u8).add(row * out_row_bytes) as *mut std::ffi::c_void };
+        let out_ptr = unsafe {
+            (out.as_mut_ptr() as *mut u8).add(row * out_row_bytes) as *mut std::ffi::c_void
+        };
         let status = unsafe {
             dotcache_qwen35_hip_fused_rms_norm_linear(
                 dtype.kernel_dtype_code(),
@@ -1100,7 +1297,9 @@ pub fn fused_rms_norm_linear_rows(
             )
         };
         if status != 0 {
-            return Err(ffi_error(format!("fused_rms_norm_linear row {row} failed: {status}")));
+            return Err(ffi_error(format!(
+                "fused_rms_norm_linear row {row} failed: {status}"
+            )));
         }
     }
     Ok(())
@@ -1122,6 +1321,19 @@ pub fn matmul_rhs_transposed(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_matmul()
+        {
+            if metal_native::matmul_rhs_transposed_bf16(batch_elems, m, n, k, lhs, rhs, out).is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out);
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             dtype.kernel_dtype_code(),
@@ -1171,7 +1383,9 @@ pub fn matmul_rhs_transposed_fp8(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("matmul_rhs_transposed_fp8 failed: {status}")));
+        return Err(ffi_error(format!(
+            "matmul_rhs_transposed_fp8 failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -1208,7 +1422,9 @@ pub fn matmul_rhs_transposed_int4(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("matmul_rhs_transposed_int4 failed: {status}")));
+        return Err(ffi_error(format!(
+            "matmul_rhs_transposed_int4 failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -1323,6 +1539,20 @@ pub fn rms_norm_rows(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, true, input, weight, out)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -1355,6 +1585,20 @@ pub fn rms_norm_rows_plain(
     weight: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
@@ -1386,6 +1630,26 @@ pub fn rms_norm_rows_plain_inplace(
     data: &mut GpuBuffer,
     weight: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    if data.backend() == Backend::Metal {
+        let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            input.as_mut_ptr(),
+            data.as_ptr(),
+            data.len_bytes(),
+        )?;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
+                .is_ok()
+            {
+                return Ok(());
+            }
+        }
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data);
+    }
     let ptr = data.as_mut_ptr();
     let status = unsafe {
         dotcache_qwen35_hip_rms_norm(
@@ -1401,7 +1665,9 @@ pub fn rms_norm_rows_plain_inplace(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("rms_norm_rows_plain_inplace failed: {status}")));
+        return Err(ffi_error(format!(
+            "rms_norm_rows_plain_inplace failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -1415,6 +1681,22 @@ pub fn element_add_inplace(
     lhs_out: &mut GpuBuffer,
     rhs: &GpuBuffer,
 ) -> Result<(), GpuError> {
+    if lhs_out.backend() == Backend::Metal {
+        let mut lhs = GpuBuffer::zeros(ordinal, dtype, lhs_out.shape())?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            lhs.as_mut_ptr(),
+            lhs_out.as_ptr(),
+            lhs_out.len_bytes(),
+        )?;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_element_add()
+            && metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out);
+    }
     let ptr = lhs_out.as_mut_ptr();
     let status = unsafe {
         dotcache_qwen35_hip_element_add(
@@ -1443,6 +1725,16 @@ pub fn cast(
     input: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_cast()
+            && metal_native::cast(input_dtype, output_dtype, total_elems, input, out).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::cast(input_dtype, output_dtype, total_elems, input, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_cast(
             input_dtype.kernel_dtype_code(),
@@ -1470,6 +1762,16 @@ pub fn element_add(
     rhs: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_element_add()
+            && metal_native::element_add(dtype, total_elems, lhs, rhs, out).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::element_add(dtype, total_elems, lhs, rhs, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_element_add(
             dtype.kernel_dtype_code(),
@@ -1505,6 +1807,12 @@ pub fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if data.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::apply_rope_prefill(
+            dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset, data,
+        );
+    }
     let half_rot = rotary_dim / 2;
     // Offset cos/sin table pointers by pos_offset positions.
     // Table layout: [max_positions, half_rot] BF16 → stride = half_rot * 2 bytes per position
@@ -1542,11 +1850,23 @@ pub fn transpose_shd_hsd(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_transpose_shd_hsd()
+            && metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_shd_hsd(
             dtype.kernel_dtype_code(),
             ordinal,
-            s, h, d,
+            s,
+            h,
+            d,
             src.as_ptr(),
             dst.as_mut_ptr(),
         )
@@ -1570,11 +1890,17 @@ pub fn transpose_pad_conv(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_transpose_pad_conv(
             dtype.kernel_dtype_code(),
             ordinal,
-            s, c, pad,
+            s,
+            c,
+            pad,
             src.as_ptr(),
             dst.as_mut_ptr(),
         )
@@ -1597,11 +1923,17 @@ pub fn extract_conv_state(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_extract_conv_state(
             dtype.kernel_dtype_code(),
             ordinal,
-            s, c, kern_minus_1,
+            s,
+            c,
+            kern_minus_1,
             src.as_ptr(),
             dst.as_mut_ptr(),
         )
@@ -1623,10 +1955,18 @@ pub fn sigmoid_mul(
     gate: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::sigmoid_mul(dtype, total_elems, data, gate, out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_sigmoid_mul(
-            dtype.kernel_dtype_code(), ordinal, total_elems,
-            data.as_ptr(), gate.as_ptr(), out.as_mut_ptr(),
+            dtype.kernel_dtype_code(),
+            ordinal,
+            total_elems,
+            data.as_ptr(),
+            gate.as_ptr(),
+            out.as_mut_ptr(),
         )
     };
     if status != 0 {
@@ -1652,11 +1992,22 @@ pub fn compute_beta_g(
     beta: &mut GpuBuffer,
     g: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if beta.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_compute_beta_g(
-            dtype.kernel_dtype_code(), ordinal, seq_len, nv,
-            b.as_ptr(), a.as_ptr(), dt_bias.as_ptr(), a_log_exp.as_ptr(),
-            beta.as_mut_ptr(), g.as_mut_ptr(),
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            nv,
+            b.as_ptr(),
+            a.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            beta.as_mut_ptr(),
+            g.as_mut_ptr(),
         )
     };
     if status != 0 {
@@ -1678,10 +2029,27 @@ pub fn split_qgate(
     query_out: &mut GpuBuffer,
     gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if query_out.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_split_qgate()
+            && metal_native::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
+                .is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_split_qgate(
-            dtype.kernel_dtype_code(), ordinal, s, num_heads, head_dim,
-            src.as_ptr(), query_out.as_mut_ptr(), gate_out.as_mut_ptr(),
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s,
+            num_heads,
+            head_dim,
+            src.as_ptr(),
+            query_out.as_mut_ptr(),
+            gate_out.as_mut_ptr(),
         )
     };
     if status != 0 {
@@ -1705,10 +2073,27 @@ pub fn split_qkv(
     k: &mut GpuBuffer,
     v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if q.backend() == Backend::Metal {
+        let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_split_qkv()
+            && metal_native::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v).is_ok()
+        {
+            return Ok(());
+        }
+        return metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_split_qkv(
-            dtype.kernel_dtype_code(), ordinal, s, key_dim, val_dim,
-            src.as_ptr(), q.as_mut_ptr(), k.as_mut_ptr(), v.as_mut_ptr(),
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s,
+            key_dim,
+            val_dim,
+            src.as_ptr(),
+            q.as_mut_ptr(),
+            k.as_mut_ptr(),
+            v.as_mut_ptr(),
         )
     };
     if status != 0 {
@@ -1731,15 +2116,26 @@ pub fn repeat_interleave_heads(
     src: &GpuBuffer,
     dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst);
+    }
     let status = unsafe {
         dotcache_qwen35_hip_repeat_interleave_heads(
-            dtype.kernel_dtype_code(), ordinal,
-            s, n_heads, head_dim, repeats,
-            src.as_ptr(), dst.as_mut_ptr(),
+            dtype.kernel_dtype_code(),
+            ordinal,
+            s,
+            n_heads,
+            head_dim,
+            repeats,
+            src.as_ptr(),
+            dst.as_mut_ptr(),
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("repeat_interleave_heads failed: {status}")));
+        return Err(ffi_error(format!(
+            "repeat_interleave_heads failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -1778,4 +2174,67 @@ pub fn quantize_kv_to_fp8(
         return Err(ffi_error(format!("quantize_kv_to_fp8 failed: {status}")));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use gpu_hal::{set_backend, Backend};
+    use half::bf16;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    #[test]
+    fn metal_prefill_rms_norm_rows_applies_qwen_unit_offset() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2],
+            &bf16_bytes(&[3.0, 4.0]),
+        )
+        .expect("upload input");
+        let weight =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2], &bf16_bytes(&[0.5, -0.5]))
+                .expect("upload weight");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2]).expect("alloc output");
+
+        rms_norm_rows(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            2,
+            0.0,
+            &input,
+            &weight,
+            &mut output,
+        )
+        .expect("run rms_norm_rows");
+
+        let actual = read_bf16(&output);
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        let expected = vec![3.0 * inv_rms * 1.5, 4.0 * inv_rms * 0.5];
+        for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (got - want).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {want}, got {got}, delta {delta}"
+            );
+        }
+    }
 }
