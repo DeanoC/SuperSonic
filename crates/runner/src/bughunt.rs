@@ -14,7 +14,7 @@ use qwen35::weights::Qwen35Weights;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::decode_engine::decode_f32_le;
+use crate::decode_engine::{decode_f32_le, DecodeEngine};
 use crate::oracle;
 use crate::prefill_engine;
 use crate::registry::{self, FamilyParams, GpuArch, ModelVariant};
@@ -297,13 +297,27 @@ pub struct BenchPromptReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mean_replay_decode_ms_per_token: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_ms: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_component_decode_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_decode_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefill_hal_profile: Option<HalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_decode_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_hal_profile: Option<HalProfileReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -445,6 +459,9 @@ struct QwenBughuntRuntime {
     kv_chunk_size: usize,
     prefill_chunk_size: usize,
     use_4b_kernel: bool,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
+    weight_prefix: String,
     oracle_script: PathBuf,
     qwen35_trace_script: PathBuf,
     commit_ish: Option<String>,
@@ -599,6 +616,9 @@ impl QwenBughuntRuntime {
             kv_chunk_size: params.kv_chunk_size,
             prefill_chunk_size: 0,
             use_4b_kernel: params.use_4b_kernel,
+            proj_buf_floats: params.proj_buf_floats,
+            attn_scratch_floats: params.attn_scratch_floats,
+            weight_prefix: params.weight_prefix.to_string(),
             oracle_script: repo_root.join("oracle/run_oracle.py"),
             qwen35_trace_script: repo_root.join("oracle/qwen35_oracle.py"),
             commit_ish: git_commit_ish(&repo_root),
@@ -616,6 +636,33 @@ impl QwenBughuntRuntime {
             oracle_device: self.oracle_device.clone(),
             commit_ish: self.commit_ish.clone(),
         }
+    }
+
+    fn new_component_decode_engine(&self, context_tokens: usize) -> Result<DecodeEngine> {
+        let attn_scratch_floats = qwen35::scratch::required_attn_scratch_floats(
+            self.weights.config.num_attention_heads,
+            self.weights.config.head_dim,
+            context_tokens,
+            self.kv_chunk_size,
+        )
+        .max(self.attn_scratch_floats);
+        let weights = load_qwen35_weights(
+            &self.model_dir,
+            &self.weights.config,
+            self.ordinal,
+            &self.weight_prefix,
+        )?;
+        DecodeEngine::new(
+            weights,
+            self.ordinal,
+            self.proj_buf_floats,
+            attn_scratch_floats,
+            self.kv_chunk_size,
+            self.use_4b_kernel,
+            self.prefill_chunk_size,
+            false,
+            1,
+        )
     }
 }
 
@@ -897,6 +944,17 @@ fn run_bench_mode(
             ProfileReports::default()
         };
 
+        let mut component_engine = if decode_tokens > 0 && runtime.backend == Backend::Metal {
+            Some(
+                runtime
+                    .new_component_decode_engine(prompt.prompt_ids.len() + decode_tokens)
+                    .with_context(|| {
+                        format!("bench component decode engine prompt {}", prompt.name)
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut replay_decode_ms = Vec::with_capacity(iterations);
         if decode_tokens > 0 {
             for iter in 0..iterations {
@@ -917,13 +975,51 @@ fn run_bench_mode(
         } else {
             ProfileReports::default()
         };
+        let mut component_decode_ms = Vec::with_capacity(iterations);
+        if let Some(engine) = component_engine.as_mut() {
+            for warmup in 0..warmup_iterations {
+                let _ = run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
+                    .with_context(|| {
+                        format!("bench component decode warmup {warmup} prompt {}", prompt.name)
+                    })?;
+            }
+            for iter in 0..iterations {
+                let elapsed_ms = run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
+                    .with_context(|| {
+                        format!("bench component decode iter {iter} prompt {}", prompt.name)
+                    })?;
+                component_decode_ms.push(elapsed_ms);
+            }
+        }
+        let (min_component_decode_ms, max_component_decode_ms, mean_component_decode_ms) =
+            optional_bench_stats(&component_decode_ms);
+        let mean_component_decode_ms_per_token = mean_component_decode_ms
+            .filter(|_| decode_tokens > 0)
+            .map(|value| value / decode_tokens as f64);
+        let component_decode_profiles = if profile_ops && decode_tokens > 0 {
+            if let Some(engine) = component_engine.as_mut() {
+                collect_component_decode_profile(
+                    runtime.ordinal,
+                    engine,
+                    &prompt.prompt_ids,
+                    decode_tokens,
+                )?
+            } else {
+                ProfileReports::default()
+            }
+        } else {
+            ProfileReports::default()
+        };
         eprintln!(
-            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_replay_decode_ms_per_token={}",
+            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_replay_decode_ms_per_token={} mean_component_decode_ms_per_token={}",
             prompt.name,
             mean_native_prefill_ms,
             min_native_prefill_ms,
             max_native_prefill_ms,
             mean_replay_decode_ms_per_token
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            mean_component_decode_ms_per_token
                 .map(|value| format!("{value:.1}"))
                 .unwrap_or_else(|| "n/a".to_string())
         );
@@ -943,10 +1039,17 @@ fn run_bench_mode(
             max_replay_decode_ms,
             mean_replay_decode_ms,
             mean_replay_decode_ms_per_token,
+            component_decode_ms: (!component_decode_ms.is_empty()).then_some(component_decode_ms),
+            min_component_decode_ms,
+            max_component_decode_ms,
+            mean_component_decode_ms,
+            mean_component_decode_ms_per_token,
             prefill_profile: prefill_profiles.metal,
             replay_decode_profile: replay_decode_profiles.metal,
+            component_decode_profile: component_decode_profiles.metal,
             prefill_hal_profile: prefill_profiles.hal,
             replay_decode_hal_profile: replay_decode_profiles.hal,
+            component_decode_hal_profile: component_decode_profiles.hal,
         });
     }
     Ok(BenchRunSection {
@@ -1014,6 +1117,30 @@ fn collect_replay_decode_profile(
         gpu_hal::sync(runtime.ordinal)
             .with_context(|| format!("bench profile replay decode sync step {step}"))?;
     }
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
+}
+
+fn collect_component_decode_profile(
+    ordinal: usize,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<ProfileReports> {
+    let token = engine
+        .rebuild_prefill_state_greedy_token(prompt_ids)
+        .context("bench profile component decode initial prefill")?;
+    gpu_hal::sync(ordinal).context("bench profile component decode initial sync")?;
+
+    let _guard = ProfileGuard::new();
+    kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
+    run_component_decode_steps(engine, token, prompt_ids.len(), decode_tokens)
+        .context("bench profile component decode steps")?;
     Ok(ProfileReports {
         metal: Some(metal_profile_report(
             kernel_ffi::prefill_ffi::metal_profile_snapshot(),
@@ -1110,6 +1237,33 @@ fn run_replay_decode_once(
             .with_context(|| format!("bench replay decode step {step}"))?;
         gpu_hal::sync(runtime.ordinal)
             .with_context(|| format!("bench replay decode sync step {step}"))?;
+    }
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn run_component_decode_once(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<f64> {
+    let token = engine
+        .rebuild_prefill_state_greedy_token(prompt_ids)
+        .context("bench component decode initial prefill")?;
+    run_component_decode_steps(engine, token, prompt_ids.len(), decode_tokens)
+}
+
+fn run_component_decode_steps(
+    engine: &mut DecodeEngine,
+    mut token: u32,
+    initial_seqlen: usize,
+    decode_tokens: usize,
+) -> Result<f64> {
+    let start = Instant::now();
+    for step in 0..decode_tokens {
+        let (next, _) = engine
+            .decode_step_metal_component_greedy(token, initial_seqlen + step)
+            .with_context(|| format!("bench component decode step {step}"))?;
+        token = next;
     }
     Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
@@ -3004,7 +3158,7 @@ fn print_report_summary(report: &BughuntReport) {
                 );
                 for prompt in &bench.prompt_results {
                     println!(
-                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1} decode_tokens={} replay_decode_ms_per_token_mean={}",
+                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1} decode_tokens={} replay_decode_ms_per_token_mean={} component_decode_ms_per_token_mean={}",
                         prompt.name,
                         prompt.prompt_len,
                         prompt.iterations,
@@ -3017,6 +3171,10 @@ fn print_report_summary(report: &BughuntReport) {
                             .mean_replay_decode_ms_per_token
                             .map(|value| format!("{value:.1}"))
                             .unwrap_or_else(|| "n/a".to_string()),
+                        prompt
+                            .mean_component_decode_ms_per_token
+                            .map(|value| format!("{value:.1}"))
+                            .unwrap_or_else(|| "n/a".to_string()),
                     );
                     if let Some(profile) = prompt.prefill_profile.as_ref() {
                         print_profile_summary(&prompt.name, "prefill", profile);
@@ -3024,11 +3182,17 @@ fn print_report_summary(report: &BughuntReport) {
                     if let Some(profile) = prompt.replay_decode_profile.as_ref() {
                         print_profile_summary(&prompt.name, "replay_decode", profile);
                     }
+                    if let Some(profile) = prompt.component_decode_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "component_decode", profile);
+                    }
                     if let Some(profile) = prompt.prefill_hal_profile.as_ref() {
                         print_hal_profile_summary(&prompt.name, "prefill", profile);
                     }
                     if let Some(profile) = prompt.replay_decode_hal_profile.as_ref() {
                         print_hal_profile_summary(&prompt.name, "replay_decode", profile);
+                    }
+                    if let Some(profile) = prompt.component_decode_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "component_decode", profile);
                     }
                 }
             }
@@ -3489,6 +3653,11 @@ mod tests {
                     max_replay_decode_ms: Some(4.0),
                     mean_replay_decode_ms: Some(4.0),
                     mean_replay_decode_ms_per_token: Some(4.0),
+                    component_decode_ms: Some(vec![2.0]),
+                    min_component_decode_ms: Some(2.0),
+                    max_component_decode_ms: Some(2.0),
+                    mean_component_decode_ms: Some(2.0),
+                    mean_component_decode_ms_per_token: Some(2.0),
                     prefill_profile: Some(MetalProfileReport {
                         total_calls: 2,
                         native_calls: 1,
@@ -3506,6 +3675,7 @@ mod tests {
                         }],
                     }),
                     replay_decode_profile: None,
+                    component_decode_profile: None,
                     prefill_hal_profile: Some(HalProfileReport {
                         total_calls: 3,
                         total_ms: 2.0,
@@ -3527,6 +3697,7 @@ mod tests {
                         }],
                     }),
                     replay_decode_hal_profile: None,
+                    component_decode_hal_profile: None,
                 }],
             }),
         };
@@ -3534,6 +3705,7 @@ mod tests {
         let prompt = &value["bench"]["prompt_results"][0];
         assert_eq!(prompt["decode_tokens"], 1);
         assert_eq!(prompt["mean_replay_decode_ms_per_token"], 4.0);
+        assert_eq!(prompt["mean_component_decode_ms_per_token"], 2.0);
         assert_eq!(prompt["prefill_profile"]["native_calls"], 1);
         assert_eq!(
             prompt["prefill_profile"]["entries"][0]["op"],

@@ -2727,8 +2727,13 @@ impl DecodeEngine {
             .conv_state
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+        let native_linear_conv_enabled =
+            conv_state.backend() == gpu_hal::Backend::Metal
+                && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
+                    .is_none();
         if conv_state.backend() == gpu_hal::Backend::Metal
-            && std::env::var_os("SUPERSONIC_METAL_ENABLE_DIRECT_CONV_STATE_UPDATE").is_some()
+            && (native_linear_conv_enabled
+                || std::env::var_os("SUPERSONIC_METAL_ENABLE_DIRECT_CONV_STATE_UPDATE").is_some())
         {
             kernel_ffi::prefill_ffi::metal_conv_state_update_bf16(
                 qkv_dim, state_len, &qkv, conv_state,

@@ -1117,6 +1117,28 @@ pub fn linear_stateful_conv_value_decay_4b(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && batch_size == 1
+            && seq_len == 1
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
+                .is_none()
+        {
+            return metal_profile_time("linear_stateful_conv_value_decay_4b", "native", || {
+                metal_native::linear_conv_value_decay_bf16(
+                    conv_dim,
+                    state_len,
+                    kernel_size,
+                    num_heads,
+                    mixed_qkv,
+                    prev_state,
+                    weights,
+                    a,
+                    dt_bias,
+                    a_log_exp,
+                    out,
+                )
+            });
+        }
         return metal_profile_host_time("linear_stateful_conv_value_decay_4b", || {
             metal_host::linear_stateful_conv_value_decay(
                 dtype,
