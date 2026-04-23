@@ -29,6 +29,22 @@ unsafe extern "C" {
         block_size: c_int,
         value_group_size: c_int,
     ) -> c_int;
+
+    fn dotcache_llama31_certified_kv_score_blocks_int8(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        block_max: *mut c_void,
+        block_sum: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
 }
 
 pub fn aligned_tokens(seq_len: usize, block_size: usize) -> usize {
@@ -220,6 +236,139 @@ pub fn quantize_bf16_cache(
     }
 }
 
+pub fn score_blocks_int8(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    key_int8: &GpuBuffer,
+    key_scale: &GpuBuffer,
+    block_size: usize,
+    gqa_group: usize,
+    q_scale: f32,
+    block_max: &mut GpuBuffer,
+    block_sum: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV INT8 scoring is currently CUDA-only".into(),
+        ));
+    }
+    if query_bf16.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring expects BF16 query, got {:?}",
+            query_bf16.dtype()
+        )));
+    }
+    if key_int8.dtype() != ScalarType::U8 || key_scale.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring expects U8/F32 key buffers, got {:?}/{:?}",
+            key_int8.dtype(),
+            key_scale.dtype()
+        )));
+    }
+    if block_max.dtype() != ScalarType::F32 || block_sum.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring expects F32 outputs, got {:?}/{:?}",
+            block_max.dtype(),
+            block_sum.dtype()
+        )));
+    }
+    if query_bf16.shape().len() != 2 || key_int8.shape().len() != 3 || key_scale.shape().len() != 3
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring expects query [qh,hd], key_int8 [kvh,t,hd], key_scale [kvh,b,hd], got {:?}/{:?}/{:?}",
+            query_bf16.shape(),
+            key_int8.shape(),
+            key_scale.shape()
+        )));
+    }
+    if block_size == 0 || block_size > 256 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring block_size={block_size} must be in 1..=256"
+        )));
+    }
+    if gqa_group == 0 {
+        return Err(GpuError::InvalidArg(
+            "certified KV INT8 scoring gqa_group must be > 0".into(),
+        ));
+    }
+    let q_heads = query_bf16.shape()[0];
+    let head_dim = query_bf16.shape()[1];
+    let kv_heads = key_int8.shape()[0];
+    let aligned_tokens = key_int8.shape()[1];
+    if key_int8.shape()[2] != head_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring query head_dim={head_dim} does not match key_int8 shape {:?}",
+            key_int8.shape()
+        )));
+    }
+    if aligned_tokens % block_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring aligned_tokens={aligned_tokens} must divide block_size={block_size}"
+        )));
+    }
+    let num_blocks = aligned_tokens / block_size;
+    if q_heads != kv_heads * gqa_group {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring q_heads={q_heads} must equal kv_heads={kv_heads} * gqa_group={gqa_group}"
+        )));
+    }
+    if key_scale.shape() != [kv_heads, num_blocks, head_dim] {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring key_scale expects {:?}, got {:?}",
+            [kv_heads, num_blocks, head_dim],
+            key_scale.shape()
+        )));
+    }
+    if block_max.shape() != [q_heads, num_blocks] || block_sum.shape() != [q_heads, num_blocks] {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring outputs expect {:?}, got {:?}/{:?}",
+            [q_heads, num_blocks],
+            block_max.shape(),
+            block_sum.shape()
+        )));
+    }
+
+    let backend = query_bf16.backend();
+    match backend {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let status = unsafe {
+                    dotcache_llama31_certified_kv_score_blocks_int8(
+                        ordinal,
+                        query_bf16.as_ptr(),
+                        key_int8.as_ptr(),
+                        key_scale.as_ptr(),
+                        block_max.as_mut_ptr(),
+                        block_sum.as_mut_ptr(),
+                        q_heads as c_int,
+                        kv_heads as c_int,
+                        num_blocks as c_int,
+                        block_size as c_int,
+                        head_dim as c_int,
+                        gqa_group as c_int,
+                        q_scale,
+                    )
+                };
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        backend,
+                        format!("certified KV CUDA INT8 scoring failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV INT8 scoring is currently CUDA-only".into(),
+        )),
+    }
+}
+
 #[cfg(all(test, supersonic_backend_cuda))]
 mod tests {
     use super::*;
@@ -230,6 +379,13 @@ mod tests {
         values
             .iter()
             .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
             .collect()
     }
 
@@ -335,5 +491,76 @@ mod tests {
             "unexpected block 0 value error {}",
             errors[0]
         );
+    }
+
+    #[test]
+    fn cuda_score_blocks_int8_matches_hand_computed_logits() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 4],
+            &bf16_bytes(&[1.0, 0.5, -1.0, 2.0, -1.0, 1.0, 0.25, 0.5]),
+        )
+        .expect("upload query");
+        let key_i8 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 2, 4],
+            &[
+                10i8 as u8,
+                -20i8 as u8,
+                30i8 as u8,
+                -40i8 as u8,
+                -5i8 as u8,
+                15i8 as u8,
+                -25i8 as u8,
+                35i8 as u8,
+            ],
+        )
+        .expect("upload key_i8");
+        let key_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 4],
+            &f32_bytes(&[0.1, 0.2, 0.05, 0.25]),
+        )
+        .expect("upload key_scale");
+        let mut block_max = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 1]).expect("block_max");
+        let mut block_sum = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 1]).expect("block_sum");
+
+        score_blocks_int8(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            2,
+            2,
+            1.0,
+            &mut block_max,
+            &mut block_sum,
+        )
+        .expect("score blocks");
+
+        let maxes = f32s(&block_max.to_host_bytes().expect("download block_max"));
+        let sums = f32s(&block_sum.to_host_bytes().expect("download block_sum"));
+        let expected_maxes = [19.75_f32, 7.5625_f32];
+        let expected_sums = [
+            (-22.5_f32 - 19.75_f32).exp() + 1.0,
+            (-9.625_f32 - 7.5625_f32).exp() + 1.0,
+        ];
+        for (got, expected) in maxes.iter().zip(expected_maxes) {
+            assert!(
+                (got - expected).abs() < 0.02,
+                "unexpected block max got={got} expected={expected}"
+            );
+        }
+        for (got, expected) in sums.iter().zip(expected_sums) {
+            assert!(
+                (got - expected).abs() < 0.001,
+                "unexpected block sum got={got} expected={expected}"
+            );
+        }
     }
 }
