@@ -385,6 +385,9 @@ struct ComponentFullScratch {
     attn_flat: GpuBuffer,
     gated: GpuBuffer,
     proj_out: GpuBuffer,
+    kv_k_contig: Option<GpuBuffer>,
+    kv_v_contig: Option<GpuBuffer>,
+    kv_contig_capacity: usize,
 }
 
 impl ComponentLinearScratch {
@@ -522,6 +525,9 @@ impl ComponentFullScratch {
             attn_flat,
             gated,
             proj_out,
+            kv_k_contig: None,
+            kv_v_contig: None,
+            kv_contig_capacity: 0,
         })
     }
 }
@@ -2136,6 +2142,9 @@ impl DecodeEngine {
             attn_flat,
             gated,
             proj_out,
+            kv_k_contig,
+            kv_v_contig,
+            kv_contig_capacity,
         } = scratch;
 
         let use_fused_full_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
@@ -2370,26 +2379,29 @@ impl DecodeEngine {
         let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
         let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
         let cap = cache_k_ref.shape()[2];
-        let kv_k_contig;
-        let kv_v_contig;
         let attn_k_ref;
         let attn_v_ref;
         if cap == kv_len {
             attn_k_ref = cache_k_ref;
             attn_v_ref = cache_v_ref;
         } else {
-            kv_k_contig = GpuBuffer::zeros(
-                self.ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, kv_len, head_dim],
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
-            kv_v_contig = GpuBuffer::zeros(
-                self.ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, kv_len, head_dim],
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
+            if *kv_contig_capacity < cap {
+                *kv_k_contig = Some(
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, cap, head_dim])
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?,
+                );
+                *kv_v_contig = Some(
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, cap, head_dim])
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?,
+                );
+                *kv_contig_capacity = cap;
+            }
+            let kv_k_contig = kv_k_contig
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing cached K contig scratch"))?;
+            let kv_v_contig = kv_v_contig
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing cached V contig scratch"))?;
             let cap_stride = cap * head_dim * elem_bytes;
             let contig_stride = kv_len * head_dim * elem_bytes;
             let copy_bytes = kv_len * head_dim * elem_bytes;
