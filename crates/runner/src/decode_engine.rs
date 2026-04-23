@@ -1905,8 +1905,15 @@ impl DecodeEngine {
         let profile_flush_layers =
             self.hidden_io.backend() == gpu_hal::Backend::Metal && metal_profile_flush_layers_enabled();
         for i in 0..layer_count {
+            let layer_kind = if self.weights.config.is_full_attention(i) {
+                "full"
+            } else {
+                "linear"
+            };
             if profile_flush_layers {
-                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!("decode_layer_{i:02}_attn"))
+                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!(
+                    "decode_layer_{i:02}_{layer_kind}_attn"
+                ))
                     .map_err(|e| anyhow::anyhow!("set Metal decode layer {i} attn profile label: {e}"))?;
             }
             if trace_input_layer == Some(i) {
@@ -1928,7 +1935,7 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {i} input rms_norm: {e}"))?;
 
-            if self.weights.config.is_full_attention(i) {
+            if layer_kind == "full" {
                 self.component_decode_full_attention_layer(i, seqlen_offset)?;
             } else {
                 if let Some(trace) =
@@ -1950,7 +1957,9 @@ impl DecodeEngine {
             if profile_flush_layers {
                 kernel_ffi::prefill_ffi::flush_metal_batch()
                     .map_err(|e| anyhow::anyhow!("profile flush Metal decode layer {i} attn: {e}"))?;
-                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!("decode_layer_{i:02}_mlp"))
+                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!(
+                    "decode_layer_{i:02}_{layer_kind}_mlp"
+                ))
                     .map_err(|e| anyhow::anyhow!("set Metal decode layer {i} mlp profile label: {e}"))?;
             }
 
