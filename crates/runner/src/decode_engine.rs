@@ -2246,13 +2246,6 @@ impl DecodeEngine {
             q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
-        gpu_hal::copy_d2d(
-            self.ordinal,
-            query_buf.as_ptr() as *mut c_void,
-            q_normed.as_ptr(),
-            q_dim * elem_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q norm copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
@@ -2265,13 +2258,6 @@ impl DecodeEngine {
             k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
-        gpu_hal::copy_d2d(
-            self.ordinal,
-            k_buf.as_ptr() as *mut c_void,
-            k_normed.as_ptr(),
-            kv_dim * elem_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
             self.ordinal,
@@ -2283,7 +2269,7 @@ impl DecodeEngine {
             &self.rotary.cos,
             &self.rotary.sin,
             seqlen_offset,
-            query_buf,
+            q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
@@ -2296,7 +2282,7 @@ impl DecodeEngine {
             &self.rotary.cos,
             &self.rotary.sin,
             seqlen_offset,
-            k_buf,
+            k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
 
@@ -2306,7 +2292,7 @@ impl DecodeEngine {
             1,
             num_q_heads,
             head_dim,
-            query_buf,
+            q_normed,
             attn_q,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
@@ -2316,7 +2302,7 @@ impl DecodeEngine {
             1,
             num_kv_heads,
             head_dim,
-            k_buf,
+            k_normed,
             attn_k_step,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
