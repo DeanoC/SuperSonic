@@ -726,6 +726,8 @@ pub struct CertifiedKvShadowStats {
     pub attend_ms: f64,
     pub attend_max_abs: f32,
     pub attend_ref_max_delta: f32,
+    pub attend_bf16_value_ms: f64,
+    pub attend_bf16_value_ref_max_delta: f32,
 }
 
 pub struct ComponentLayerTrace {
@@ -1417,6 +1419,57 @@ impl DecodeEngine {
                 }
                 stats.attend_max_abs = stats.attend_max_abs.max(value.abs());
             }
+            let mut value_bf16_host = vec![0u8; num_kv_heads * aligned * head_dim * elem_bytes];
+            let aligned_row_bytes = aligned * head_dim * elem_bytes;
+            for kvh in 0..num_kv_heads {
+                let src = kvh * max_t * head_dim * elem_bytes;
+                let dst = kvh * aligned_row_bytes;
+                value_bf16_host[dst..dst + aligned_row_bytes]
+                    .copy_from_slice(&cache_v_host[src..src + aligned_row_bytes]);
+            }
+            let value_bf16 = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, aligned, head_dim],
+                &value_bf16_host,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value H2D: {e}"))?;
+            let mut bf16_value_score_scratch =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, aligned])
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value score alloc: {e}"))?;
+            let mut bf16_value_output =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output alloc: {e}"))?;
+            let bf16_value_start = Instant::now();
+            kernel_ffi::certified_kv::attend_int8_bf16_values(
+                self.ordinal,
+                &query,
+                &key_i8,
+                &key_scale,
+                &value_bf16,
+                None,
+                block_size,
+                gqa_group,
+                (head_dim as f32).powf(-0.5),
+                &mut bf16_value_score_scratch,
+                &mut bf16_value_output,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value attend: {e}"))?;
+            stats.attend_bf16_value_ms += bf16_value_start.elapsed().as_secs_f64() * 1000.0;
+            let bf16_value_host = decode_f32_le(
+                &bf16_value_output
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output D2H: {e}"))?,
+            );
+            for (idx, value) in bf16_value_host.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(anyhow::anyhow!(
+                        "layer {layer_idx} certified KV BF16-value output invalid at {}: {}",
+                        idx,
+                        *value
+                    ));
+                }
+            }
             let query_f32_all = decode_bf16_le_host(&query_host);
             let mut dense_scores = vec![0.0f32; aligned];
             let q_scale = (head_dim as f32).powf(-0.5);
@@ -1453,6 +1506,9 @@ impl DecodeEngine {
                     let attn_idx = qh * head_dim + d;
                     stats.attend_ref_max_delta =
                         stats.attend_ref_max_delta.max((attn_host[attn_idx] - dense_out).abs());
+                    stats.attend_bf16_value_ref_max_delta = stats
+                        .attend_bf16_value_ref_max_delta
+                        .max((bf16_value_host[attn_idx] - dense_out).abs());
                 }
             }
             stats.attend_layers += 1;
