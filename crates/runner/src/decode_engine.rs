@@ -494,6 +494,7 @@ struct ComponentFullAttentionScratch {
     attn_flat: GpuBuffer,
     gated: GpuBuffer,
     proj_out: GpuBuffer,
+    certified_score_scratch: Option<GpuBuffer>,
 }
 
 impl ComponentFullAttentionScratch {
@@ -542,6 +543,7 @@ impl ComponentFullAttentionScratch {
                 .map_err(|e| anyhow::anyhow!("component full-attn gated alloc: {e}"))?,
             proj_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
                 .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
+            certified_score_scratch: None,
         })
     }
 }
@@ -3613,9 +3615,20 @@ impl DecodeEngine {
             } else {
                 None
             };
-            let mut score_scratch =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}"))?;
+            let score_shape = [num_q_heads, cap];
+            if scratch
+                .certified_score_scratch
+                .as_ref()
+                .map(|buf| buf.shape() != score_shape)
+                .unwrap_or(true)
+            {
+                scratch.certified_score_scratch = Some(
+                    GpuBuffer::zeros(self.ordinal, ScalarType::F32, &score_shape).map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}")
+                    })?,
+                );
+            }
+            let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
             kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                 self.ordinal,
                 attn_q,
@@ -3627,7 +3640,7 @@ impl DecodeEngine {
                 block_size,
                 num_q_heads / num_kv_heads,
                 1.0 / (head_dim as f32).sqrt(),
-                &mut score_scratch,
+                score_scratch,
                 attn_out_f32,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;

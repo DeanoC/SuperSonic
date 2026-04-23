@@ -115,6 +115,7 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         tail_len: c_int,
+        score_stride_tokens: c_int,
         value_stride_tokens: c_int,
         head_dim: c_int,
         gqa_group: c_int,
@@ -991,8 +992,14 @@ pub fn attend_int8_bf16_values_strided(
     let output_shape = output_f32.shape();
     let output_is_2d = output_shape == [q_heads, head_dim];
     let output_is_3d = output_shape == [q_heads, 1, head_dim];
+    let score_shape = score_scratch.shape();
+    let score_stride_tokens = if score_shape.len() == 2 && score_shape[0] == q_heads {
+        score_shape[1]
+    } else {
+        0
+    };
     if key_scale.shape() != [kv_heads, num_blocks, head_dim]
-        || score_scratch.shape() != [q_heads, total_tokens]
+        || score_stride_tokens < total_tokens
         || (!output_is_2d && !output_is_3d)
     {
         return Err(GpuError::InvalidArg(format!(
@@ -1039,6 +1046,7 @@ pub fn attend_int8_bf16_values_strided(
                         num_blocks as c_int,
                         block_size as c_int,
                         tail_len as c_int,
+                        score_stride_tokens as c_int,
                         value_stride_tokens as c_int,
                         head_dim as c_int,
                         gqa_group as c_int,
