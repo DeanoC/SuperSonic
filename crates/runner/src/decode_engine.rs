@@ -4297,8 +4297,11 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
         if self.use_4b_kernel {
+            let start = Instant::now();
             let logits = self.component_decode_step_4b(token_id, seqlen_offset)?;
-            return Ok((logits, DecodeStageTimings::default()));
+            let mut timings = DecodeStageTimings::default();
+            timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+            return Ok((logits, timings));
         }
         let out =
             self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::HostLogits)?;
@@ -4381,19 +4384,10 @@ impl DecodeEngine {
         }
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let token = match sampled_token {
-            Some(token) => token,
-            None => {
-                let bytes = self
-                    .argmax_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("Metal component decode argmax D2H: {e}"))?;
-                if bytes.len() < 4 {
-                    anyhow::bail!("Metal component decode argmax buffer was truncated");
-                }
-                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
-            }
-        };
+        let token = self.resolve_metal_component_sampled_token(
+            sampled_token,
+            "Metal component decode argmax D2H",
+        )?;
         Ok((token, timings))
     }
 
@@ -4438,8 +4432,10 @@ impl DecodeEngine {
         }
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let token =
-            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        let token = self.resolve_metal_component_sampled_token(
+            sampled_token,
+            "Metal component decode trace argmax D2H",
+        )?;
         let trace = trace.ok_or_else(|| {
             anyhow::anyhow!("missing Metal component linear trace for layer {trace_layer}")
         })?;
@@ -4487,12 +4483,32 @@ impl DecodeEngine {
         }
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let token =
-            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        let token = self.resolve_metal_component_sampled_token(
+            sampled_token,
+            "Metal component decode input trace argmax D2H",
+        )?;
         let trace = trace.ok_or_else(|| {
             anyhow::anyhow!("missing Metal component input trace for layer {trace_layer}")
         })?;
         Ok((token, timings, trace))
+    }
+
+    fn resolve_metal_component_sampled_token(
+        &mut self,
+        sampled_token: Option<u32>,
+        d2h_context: &str,
+    ) -> Result<u32> {
+        if let Some(token) = sampled_token {
+            return Ok(token);
+        }
+        let bytes = self
+            .argmax_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("{d2h_context}: {e}"))?;
+        if bytes.len() < 4 {
+            anyhow::bail!("Metal component decode argmax buffer was truncated");
+        }
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
