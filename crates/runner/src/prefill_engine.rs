@@ -3,7 +3,7 @@
 //! Orchestrates component kernels (embedding, matmul, attention, conv, recurrence,
 //! norms, MLP) to process the entire prompt sequence through the model on GPU.
 
-use std::ffi::c_void;
+use std::{env, ffi::c_void};
 
 use anyhow::Result;
 use gpu_hal::{copy_h2d, GpuBuffer, ScalarType};
@@ -26,6 +26,22 @@ fn encode_bf16_le(values: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 2);
     for &v in values {
         out.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+    }
+    out
+}
+
+fn encode_f32_le(values: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &v in values {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
+}
+
+fn encode_u32_le(values: &[usize]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for &v in values {
+        out.extend_from_slice(&(v as u32).to_le_bytes());
     }
     out
 }
@@ -210,6 +226,42 @@ pub(crate) fn matmul_int8_mixed_prepared_host(
         out,
     )
     .map_err(|e| anyhow::anyhow!("matmul_int8_zeroed: {e}"))?;
+
+    if env::var_os("SUPERSONIC_LLAMA31_INT8_HOST_OUTLIER_CORRECTION").is_none() {
+        let mut outlier_vals = Vec::with_capacity(rows * outlier_cols.len());
+        for r in 0..rows {
+            for &col in outlier_cols {
+                outlier_vals.push(prepared_lhs.lhs_host[r * k + col]);
+            }
+        }
+        let outlier_cols_gpu = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U32,
+            &[outlier_cols.len()],
+            &encode_u32_le(outlier_cols),
+        )
+        .map_err(|e| anyhow::anyhow!("int8 mixed outlier_cols H2D: {e}"))?;
+        let outlier_vals_gpu = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[rows, outlier_cols.len()],
+            &encode_f32_le(&outlier_vals),
+        )
+        .map_err(|e| anyhow::anyhow!("int8 mixed outlier_vals H2D: {e}"))?;
+        return prefill_ffi::int8_outlier_add(
+            ordinal,
+            rows,
+            n,
+            k,
+            outlier_cols.len(),
+            weight,
+            int8_scale,
+            &outlier_cols_gpu,
+            &outlier_vals_gpu,
+            out,
+        )
+        .map_err(|e| anyhow::anyhow!("int8 mixed outlier add: {e}"));
+    }
 
     let scb_name = weight_name.replace(".weight", ".SCB");
     let rhs_i8 = store

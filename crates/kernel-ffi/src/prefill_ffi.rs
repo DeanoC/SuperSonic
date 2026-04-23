@@ -215,6 +215,20 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_4b_hip_int8_outlier_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        rows: c_int,
+        n: c_int,
+        k: c_int,
+        sub_cols: c_int,
+        rhs_int8: *const c_void,
+        scale: *const c_void,
+        outlier_cols: *const c_void,
+        outlier_vals: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     // BF16 → FP8 KV cache quantization
     fn dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
@@ -1145,6 +1159,39 @@ pub fn matmul_rhs_transposed_int8(
     };
     if status != 0 {
         return Err(ffi_error(format!("matmul_rhs_transposed_int8 failed: {status}")));
+    }
+    Ok(())
+}
+
+pub fn int8_outlier_add(
+    ordinal: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    sub_cols: usize,
+    rhs_int8: &GpuBuffer,
+    scale: &GpuBuffer,
+    outlier_cols: &GpuBuffer,
+    outlier_vals: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_int8_outlier_add(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            rows as c_int,
+            n as c_int,
+            k as c_int,
+            sub_cols as c_int,
+            rhs_int8.as_ptr(),
+            scale.as_ptr(),
+            outlier_cols.as_ptr(),
+            outlier_vals.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
     }
     Ok(())
 }

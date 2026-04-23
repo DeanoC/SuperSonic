@@ -2936,6 +2936,44 @@ __global__ void dotcache_qwen35_dequant_int32_int8mm_kernel(
 }
 
 template <typename T>
+__global__ void dotcache_qwen35_int8_outlier_add_kernel(
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const int8_t* __restrict__ rhs_int8,
+    const float* __restrict__ scale,
+    const uint32_t* __restrict__ outlier_cols,
+    const float* __restrict__ outlier_vals,
+    T* __restrict__ out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    if (idx >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(idx / static_cast<size_t>(n));
+    const int out_col = static_cast<int>(idx % static_cast<size_t>(n));
+    const int rhs_base = out_col * k;
+    constexpr float inv_127 = 1.0f / 127.0f;
+    const float row_scale = scale[out_col];
+
+    float acc = 0.0f;
+    for (int j = 0; j < sub_cols; ++j) {
+        const int col = static_cast<int>(outlier_cols[j]);
+        const float lhs = outlier_vals[row * sub_cols + j];
+        const float q = static_cast<float>(rhs_int8[rhs_base + col]);
+        const float w = dotcache_qwen35_to_float(
+            dotcache_qwen35_from_float<T>(q * row_scale * inv_127));
+        acc += lhs * w;
+    }
+
+    const float base = dotcache_qwen35_to_float(out[idx]);
+    out[idx] = dotcache_qwen35_from_float<T>(base + acc);
+}
+
+template <typename T>
 __global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
     int batch_heads,
     int num_chunks,

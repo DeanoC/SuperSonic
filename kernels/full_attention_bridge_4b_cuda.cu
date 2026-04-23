@@ -3897,6 +3897,66 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int8(
     }
 }
 
+template <typename T>
+int int8_outlier_add_device(
+    int device_ordinal,
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const void* rhs_int8,
+    const void* scale,
+    const void* outlier_cols,
+    const void* outlier_vals,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_int8_outlier_add_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        rows,
+        n,
+        k,
+        sub_cols,
+        static_cast<const int8_t*>(rhs_int8),
+        static_cast<const float*>(scale),
+        static_cast<const uint32_t*>(outlier_cols),
+        static_cast<const float*>(outlier_vals),
+        static_cast<T*>(out));
+    if (cudaGetLastError() != cudaSuccess) return 290;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 291;
+    return 0;
+}
+
+extern "C" int dotcache_qwen35_4b_hip_int8_outlier_add(
+    int dtype,
+    size_t device_ordinal,
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const void* rhs_int8,
+    const void* scale,
+    const void* outlier_cols,
+    const void* outlier_vals,
+    void* out
+) {
+    switch (dtype) {
+    case 2:
+        return int8_outlier_add_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), rows, n, k, sub_cols,
+            rhs_int8, scale, outlier_cols, outlier_vals, out);
+    default:
+        return 292;
+    }
+}
+
 extern "C" int dotcache_qwen35_4b_hip_cast(
     int input_dtype,
     int output_dtype,
