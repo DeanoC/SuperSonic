@@ -170,10 +170,7 @@ unsafe extern "C" {
 // `cudaGetDeviceProperties` on the Rust side).
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn dotcache_hip_device_clock_khz(
-        device_ordinal: c_int,
-        clock_rate_khz_out: *mut u32,
-    ) -> c_int;
+    fn dotcache_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
 
     // Per-model launch preset for the qwen4b persistent decode kernel.
     // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
@@ -1206,7 +1203,9 @@ pub fn standalone_matvec(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = (ordinal, counter_buf);
-        return metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim);
+        return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
+            metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
+        });
     }
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
@@ -1269,7 +1268,11 @@ pub fn standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        return metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim);
+        return crate::prefill_ffi::metal_profile_time(
+            "standalone_matvec_host_f32",
+            "host",
+            || metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim),
+        );
     }
 
     let mut output = GpuBuffer::zeros(ordinal, dtype, &[out_dim])?;
@@ -1313,14 +1316,20 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        return metal_host::qwen_rms_norm_standalone_matvec_host_f32(
-            dtype,
-            input,
-            norm_weight,
-            eps,
-            weight,
-            hidden_dim,
-            out_dim,
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen_rms_norm_standalone_matvec_host_f32",
+            "host",
+            || {
+                metal_host::qwen_rms_norm_standalone_matvec_host_f32(
+                    dtype,
+                    input,
+                    norm_weight,
+                    eps,
+                    weight,
+                    hidden_dim,
+                    out_dim,
+                )
+            },
         );
     }
 
@@ -1377,10 +1386,7 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
 pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
     #[cfg(supersonic_backend_hip)]
     unsafe {
-        dotcache_qwen35_4b_hip_set_launch_preset(
-            blocks as c_int,
-            if coop { 1 } else { 0 },
-        );
+        dotcache_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
     #[cfg(not(supersonic_backend_hip))]
     {

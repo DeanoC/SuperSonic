@@ -106,7 +106,7 @@ pub fn metal_profile_snapshot() -> MetalProfileSnapshot {
     snapshot
 }
 
-fn metal_profile_time<T, F>(op: &'static str, path: &'static str, f: F) -> T
+pub(crate) fn metal_profile_time<T, F>(op: &'static str, path: &'static str, f: F) -> T
 where
     F: FnOnce() -> T,
 {

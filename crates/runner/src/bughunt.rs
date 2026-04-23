@@ -300,6 +300,10 @@ pub struct BenchPromptReport {
     pub prefill_profile: Option<MetalProfileReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay_decode_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_decode_hal_profile: Option<HalProfileReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -321,6 +325,31 @@ pub struct MetalProfileOpReport {
     pub total_ms: f64,
     pub mean_ms: f64,
     pub max_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HalProfileReport {
+    pub total_calls: u64,
+    pub total_ms: f64,
+    pub alloc_calls: u64,
+    pub alloc_bytes: u64,
+    pub free_calls: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub d2d_bytes: u64,
+    pub memset_bytes: u64,
+    pub sync_calls: u64,
+    pub entries: Vec<HalProfileOpReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HalProfileOpReport {
+    pub op: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+    pub total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -857,15 +886,15 @@ fn run_bench_mode(
 
         let (min_native_prefill_ms, max_native_prefill_ms, mean_native_prefill_ms) =
             bench_stats(&native_prefill_ms);
-        let prefill_profile = if profile_ops {
-            collect_metal_profile(|| {
+        let prefill_profiles = if profile_ops {
+            collect_profiles(|| {
                 let _ = run_native_prefill(runtime, &prompt.prompt_ids)
                     .with_context(|| format!("bench profile prefill prompt {}", prompt.name))?;
                 gpu_hal::sync(runtime.ordinal)
                     .with_context(|| format!("bench profile prefill sync prompt {}", prompt.name))
             })?
         } else {
-            None
+            ProfileReports::default()
         };
 
         let mut replay_decode_ms = Vec::with_capacity(iterations);
@@ -883,10 +912,10 @@ fn run_bench_mode(
         let mean_replay_decode_ms_per_token = mean_replay_decode_ms
             .filter(|_| decode_tokens > 0)
             .map(|value| value / decode_tokens as f64);
-        let replay_decode_profile = if profile_ops && decode_tokens > 0 {
+        let replay_decode_profiles = if profile_ops && decode_tokens > 0 {
             collect_replay_decode_profile(runtime, &prompt.prompt_ids, decode_tokens)?
         } else {
-            None
+            ProfileReports::default()
         };
         eprintln!(
             "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_replay_decode_ms_per_token={}",
@@ -914,8 +943,10 @@ fn run_bench_mode(
             max_replay_decode_ms,
             mean_replay_decode_ms,
             mean_replay_decode_ms_per_token,
-            prefill_profile,
-            replay_decode_profile,
+            prefill_profile: prefill_profiles.metal,
+            replay_decode_profile: replay_decode_profiles.metal,
+            prefill_hal_profile: prefill_profiles.hal,
+            replay_decode_hal_profile: replay_decode_profiles.hal,
         });
     }
     Ok(BenchRunSection {
@@ -939,31 +970,42 @@ fn optional_bench_stats(values: &[f64]) -> (Option<f64>, Option<f64>, Option<f64
     (Some(min), Some(max), Some(mean))
 }
 
-fn collect_metal_profile<F>(f: F) -> Result<Option<MetalProfileReport>>
+#[derive(Debug, Default)]
+struct ProfileReports {
+    metal: Option<MetalProfileReport>,
+    hal: Option<HalProfileReport>,
+}
+
+fn collect_profiles<F>(f: F) -> Result<ProfileReports>
 where
     F: FnOnce() -> Result<()>,
 {
-    let _guard = MetalProfileGuard::new();
+    let _guard = ProfileGuard::new();
     kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
     f()?;
-    Ok(Some(metal_profile_report(
-        kernel_ffi::prefill_ffi::metal_profile_snapshot(),
-    )))
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
 }
 
 fn collect_replay_decode_profile(
     runtime: &QwenBughuntRuntime,
     prompt_ids: &[u32],
     decode_tokens: usize,
-) -> Result<Option<MetalProfileReport>> {
+) -> Result<ProfileReports> {
     let mut history = prompt_ids.to_vec();
     let mut logits = run_native_prefill(runtime, &history)
         .context("bench profile replay decode initial prefill")?
         .logits;
     gpu_hal::sync(runtime.ordinal).context("bench profile replay decode initial sync")?;
 
-    let _guard = MetalProfileGuard::new();
+    let _guard = ProfileGuard::new();
     kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
     for step in 0..decode_tokens {
         let token = greedy_sample(&logits)
             .with_context(|| format!("bench profile replay decode sample step {step}"))?;
@@ -974,9 +1016,12 @@ fn collect_replay_decode_profile(
         gpu_hal::sync(runtime.ordinal)
             .with_context(|| format!("bench profile replay decode sync step {step}"))?;
     }
-    Ok(Some(metal_profile_report(
-        kernel_ffi::prefill_ffi::metal_profile_snapshot(),
-    )))
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
 }
 
 fn metal_profile_report(
@@ -1004,18 +1049,47 @@ fn metal_profile_report(
     }
 }
 
-struct MetalProfileGuard;
+fn hal_profile_report(snapshot: gpu_hal::HalProfileSnapshot) -> HalProfileReport {
+    HalProfileReport {
+        total_calls: snapshot.total_calls,
+        total_ms: snapshot.total_ms,
+        alloc_calls: snapshot.alloc_calls,
+        alloc_bytes: snapshot.alloc_bytes,
+        free_calls: snapshot.free_calls,
+        h2d_bytes: snapshot.h2d_bytes,
+        d2h_bytes: snapshot.d2h_bytes,
+        d2d_bytes: snapshot.d2d_bytes,
+        memset_bytes: snapshot.memset_bytes,
+        sync_calls: snapshot.sync_calls,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|entry| HalProfileOpReport {
+                mean_ms: entry.mean_ms(),
+                op: entry.op,
+                calls: entry.calls,
+                total_ms: entry.total_ms,
+                max_ms: entry.max_ms,
+                total_bytes: entry.total_bytes,
+            })
+            .collect(),
+    }
+}
 
-impl MetalProfileGuard {
+struct ProfileGuard;
+
+impl ProfileGuard {
     fn new() -> Self {
         kernel_ffi::prefill_ffi::metal_profile_set_enabled(true);
+        gpu_hal::hal_profile_set_enabled(true);
         Self
     }
 }
 
-impl Drop for MetalProfileGuard {
+impl Drop for ProfileGuard {
     fn drop(&mut self) {
         kernel_ffi::prefill_ffi::metal_profile_set_enabled(false);
+        gpu_hal::hal_profile_set_enabled(false);
     }
 }
 
@@ -2945,6 +3019,12 @@ fn print_report_summary(report: &BughuntReport) {
                     if let Some(profile) = prompt.replay_decode_profile.as_ref() {
                         print_profile_summary(&prompt.name, "replay_decode", profile);
                     }
+                    if let Some(profile) = prompt.prefill_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "prefill", profile);
+                    }
+                    if let Some(profile) = prompt.replay_decode_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "replay_decode", profile);
+                    }
                 }
             }
         }
@@ -2977,6 +3057,41 @@ fn print_profile_summary(prompt_name: &str, phase: &str, profile: &MetalProfileR
             entry.max_ms,
         );
     }
+}
+
+fn print_hal_profile_summary(prompt_name: &str, phase: &str, profile: &HalProfileReport) {
+    println!(
+        "HAL_PROFILE prompt={} phase={} total_calls={} total_ms={:.1} alloc_calls={} alloc_mb={:.1} free_calls={} h2d_mb={:.1} d2h_mb={:.1} d2d_mb={:.1} memset_mb={:.1} sync_calls={}",
+        prompt_name,
+        phase,
+        profile.total_calls,
+        profile.total_ms,
+        profile.alloc_calls,
+        bytes_to_mb(profile.alloc_bytes),
+        profile.free_calls,
+        bytes_to_mb(profile.h2d_bytes),
+        bytes_to_mb(profile.d2h_bytes),
+        bytes_to_mb(profile.d2d_bytes),
+        bytes_to_mb(profile.memset_bytes),
+        profile.sync_calls,
+    );
+    for entry in profile.entries.iter().take(8) {
+        println!(
+            "HAL_OP prompt={} phase={} op={} calls={} total_ms={:.1} mean_ms={:.3} max_ms={:.3} total_mb={:.1}",
+            prompt_name,
+            phase,
+            entry.op,
+            entry.calls,
+            entry.total_ms,
+            entry.mean_ms,
+            entry.max_ms,
+            bytes_to_mb(entry.total_bytes),
+        );
+    }
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 fn write_report_json(path: &Path, report: &BughuntReport) -> Result<()> {
@@ -3386,6 +3501,27 @@ mod tests {
                         }],
                     }),
                     replay_decode_profile: None,
+                    prefill_hal_profile: Some(HalProfileReport {
+                        total_calls: 3,
+                        total_ms: 2.0,
+                        alloc_calls: 1,
+                        alloc_bytes: 1024,
+                        free_calls: 1,
+                        h2d_bytes: 0,
+                        d2h_bytes: 2048,
+                        d2d_bytes: 0,
+                        memset_bytes: 1024,
+                        sync_calls: 1,
+                        entries: vec![HalProfileOpReport {
+                            op: "alloc".to_string(),
+                            calls: 1,
+                            total_ms: 1.0,
+                            mean_ms: 1.0,
+                            max_ms: 1.0,
+                            total_bytes: 1024,
+                        }],
+                    }),
+                    replay_decode_hal_profile: None,
                 }],
             }),
         };
@@ -3398,6 +3534,8 @@ mod tests {
             prompt["prefill_profile"]["entries"][0]["op"],
             "matmul_rhs_transposed"
         );
+        assert_eq!(prompt["prefill_hal_profile"]["alloc_calls"], 1);
+        assert_eq!(prompt["prefill_hal_profile"]["d2h_bytes"], 2048);
     }
 
     #[test]
@@ -3421,6 +3559,32 @@ mod tests {
         assert_eq!(report.native_calls, 2);
         assert_eq!(report.host_calls, 1);
         assert_eq!(report.entries[0].mean_ms, 1.5);
+    }
+
+    #[test]
+    fn hal_profile_report_preserves_memory_summary() {
+        let report = hal_profile_report(gpu_hal::HalProfileSnapshot {
+            total_calls: 2,
+            total_ms: 5.0,
+            alloc_calls: 1,
+            alloc_bytes: 4096,
+            free_calls: 1,
+            h2d_bytes: 128,
+            d2h_bytes: 256,
+            d2d_bytes: 512,
+            memset_bytes: 1024,
+            sync_calls: 1,
+            entries: vec![gpu_hal::HalProfileEntry {
+                op: "alloc".to_string(),
+                calls: 1,
+                total_ms: 4.0,
+                max_ms: 4.0,
+                total_bytes: 4096,
+            }],
+        });
+        assert_eq!(report.alloc_calls, 1);
+        assert_eq!(report.alloc_bytes, 4096);
+        assert_eq!(report.entries[0].mean_ms, 4.0);
     }
 
     #[test]
