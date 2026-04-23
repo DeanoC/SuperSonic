@@ -157,6 +157,10 @@ fn metal_fused_residual_projection_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_RESIDUAL_PROJ").is_some()
 }
 
+fn metal_fused_mlp_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_MLP").is_some()
+}
+
 fn metal_matmul_residual_add_bf16(
     input_dim: usize,
     output_dim: usize,
@@ -3196,45 +3200,75 @@ impl DecodeEngine {
         let mlp = &mut scratch.mlp;
         let down = &mut scratch.down;
 
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            intermediate,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.gate_proj_w,
-            lw.gate_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            gate,
-            lw.gate_proj_int4_scale.as_ref(),
-            lw.gate_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            intermediate,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.up_proj_w,
-            lw.up_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            up,
-            lw.up_proj_int4_scale.as_ref(),
-            lw.up_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
-        kernel_ffi::prefill_ffi::swiglu_mul(
-            self.ordinal,
-            ScalarType::BF16,
-            intermediate,
-            gate,
-            up,
-            mlp,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
+        let use_fused_mlp = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && metal_fused_mlp_enabled()
+            && lw.gate_proj_scale.is_none()
+            && lw.gate_proj_int4_scale.is_none()
+            && lw.gate_proj_int4_zero.is_none()
+            && lw.up_proj_scale.is_none()
+            && lw.up_proj_int4_scale.is_none()
+            && lw.up_proj_int4_zero.is_none()
+            && lw.down_proj_scale.is_none()
+            && lw.down_proj_int4_scale.is_none()
+            && lw.down_proj_int4_zero.is_none()
+            && self.normed_buf.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16
+            && lw.gate_proj_w.dtype() == ScalarType::BF16
+            && lw.up_proj_w.dtype() == ScalarType::BF16
+            && lw.down_proj_w.dtype() == ScalarType::BF16;
+        if use_fused_mlp {
+            kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_bf16(
+                hidden_dim,
+                intermediate,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                &lw.up_proj_w,
+                gate,
+                up,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused mlp gate/up: {e}"))?;
+        } else {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                lw.gate_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                gate,
+                lw.gate_proj_int4_scale.as_ref(),
+                lw.gate_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.up_proj_w,
+                lw.up_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                up,
+                lw.up_proj_int4_scale.as_ref(),
+                lw.up_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            kernel_ffi::prefill_ffi::swiglu_mul(
+                self.ordinal,
+                ScalarType::BF16,
+                intermediate,
+                gate,
+                up,
+                mlp,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
+        }
         let use_fused_residual_down_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && !metal_fused_residual_projection_disabled()
@@ -3244,7 +3278,20 @@ impl DecodeEngine {
             && lw.down_proj_w.dtype() == ScalarType::BF16
             && mlp.dtype() == ScalarType::BF16
             && self.hidden_io.dtype() == ScalarType::BF16;
-        let trace = if use_fused_residual_down_proj {
+        let trace = if use_fused_mlp {
+            let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
+            kernel_ffi::prefill_ffi::metal_qwen_mlp_down_residual_bf16(
+                hidden_dim,
+                intermediate,
+                gate,
+                up,
+                &lw.down_proj_w,
+                residual,
+                &mut self.hidden_io,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused mlp down/residual: {e}"))?;
+            None
+        } else if use_fused_residual_down_proj {
             metal_matmul_residual_add_bf16(intermediate, hidden_dim, mlp, &lw.down_proj_w, &mut self.hidden_io)
                 .map_err(|e| anyhow::anyhow!("layer {idx} fused residual down proj: {e}"))?;
             None

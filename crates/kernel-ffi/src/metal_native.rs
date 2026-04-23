@@ -67,6 +67,24 @@ unsafe extern "C" {
         a_out_ptr: *mut c_void,
         b_out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_mlp_gate_up_bf16(
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        input_ptr: *const c_void,
+        gate_weight_ptr: *const c_void,
+        up_weight_ptr: *const c_void,
+        gate_out_ptr: *mut c_void,
+        up_out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_qwen_mlp_down_residual_bf16(
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        gate_ptr: *const c_void,
+        up_ptr: *const c_void,
+        down_weight_ptr: *const c_void,
+        residual_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_lm_head_argmax_bf16(
         in_dim: usize,
         vocab_size: usize,
@@ -765,6 +783,100 @@ pub(crate) fn qwen_linear_projections_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native qwen_linear_projections_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_gate_up_bf16(
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    input: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    up_weight: &GpuBuffer,
+    gate_out: &mut GpuBuffer,
+    up_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        input.dtype(),
+        gate_weight.dtype(),
+        up_weight.dtype(),
+        gate_out.dtype(),
+        up_out.dtype(),
+    ];
+    if dtypes.iter().any(|dtype| *dtype != ScalarType::BF16) {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_gate_up_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || intermediate_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_gate_up_bf16 invalid shape: hidden_dim={hidden_dim} intermediate_dim={intermediate_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_mlp_gate_up_bf16(
+            hidden_dim,
+            intermediate_dim,
+            input.as_ptr(),
+            gate_weight.as_ptr(),
+            up_weight.as_ptr(),
+            gate_out.as_mut_ptr(),
+            up_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_mlp_gate_up_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_down_residual_bf16(
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    down_weight: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        gate.dtype(),
+        up.dtype(),
+        down_weight.dtype(),
+        residual.dtype(),
+        out.dtype(),
+    ];
+    if dtypes.iter().any(|dtype| *dtype != ScalarType::BF16) {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_down_residual_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || intermediate_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_down_residual_bf16 invalid shape: hidden_dim={hidden_dim} intermediate_dim={intermediate_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_mlp_down_residual_bf16(
+            hidden_dim,
+            intermediate_dim,
+            gate.as_ptr(),
+            up.as_ptr(),
+            down_weight.as_ptr(),
+            residual.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_mlp_down_residual_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -2343,6 +2455,38 @@ pub(crate) fn qwen_linear_projections_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_gate_up_bf16(
+    _hidden_dim: usize,
+    _intermediate_dim: usize,
+    _input: &GpuBuffer,
+    _gate_weight: &GpuBuffer,
+    _up_weight: &GpuBuffer,
+    _gate_out: &mut GpuBuffer,
+    _up_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_mlp_gate_up_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_down_residual_bf16(
+    _hidden_dim: usize,
+    _intermediate_dim: usize,
+    _gate: &GpuBuffer,
+    _up: &GpuBuffer,
+    _down_weight: &GpuBuffer,
+    _residual: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_mlp_down_residual_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
     _weight: &GpuBuffer,
@@ -2878,6 +3022,138 @@ mod tests {
                 assert!(
                     delta <= 0.02,
                     "{name}[{idx}]: expected {e}, got {a}, delta {delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_native_qwen_mlp_fusions_match_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden_dim = 3usize;
+        let intermediate = 4usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_dim],
+            &bf16_bytes(&[1.0, 2.0, -1.0]),
+        )
+        .expect("upload input");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[intermediate, hidden_dim],
+            &bf16_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0, -2.0, 0.5, 1.0, 0.25, 0.75, -0.5]),
+        )
+        .expect("upload gate weight");
+        let up_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[intermediate, hidden_dim],
+            &bf16_bytes(&[0.0, 1.0, 0.5, 1.0, 1.0, -1.0, 0.25, -0.5, 2.0, -1.0, 0.0, 0.5]),
+        )
+        .expect("upload up weight");
+        let down_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_dim, intermediate],
+            &bf16_bytes(&[0.5, 1.0, -0.25, 0.75, -1.0, 0.25, 0.5, 1.5, 0.0, -0.5, 1.0, 0.25]),
+        )
+        .expect("upload down weight");
+        let residual = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_dim],
+            &bf16_bytes(&[0.25, -0.5, 1.0]),
+        )
+        .expect("upload residual");
+        let mut gate_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("gate ref");
+        let mut up_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("up ref");
+        let mut mlp_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("mlp ref");
+        let mut down_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("down ref");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out ref");
+        let mut gate =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("gate");
+        let mut up =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("up");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out");
+
+        crate::metal_host::matmul_rhs_transposed(
+            ScalarType::BF16,
+            1,
+            1,
+            intermediate,
+            hidden_dim,
+            &input,
+            &gate_w,
+            &mut gate_ref,
+        )
+        .expect("host gate");
+        crate::metal_host::matmul_rhs_transposed(
+            ScalarType::BF16,
+            1,
+            1,
+            intermediate,
+            hidden_dim,
+            &input,
+            &up_w,
+            &mut up_ref,
+        )
+        .expect("host up");
+        crate::metal_host::swiglu_mul(ScalarType::BF16, intermediate, &gate_ref, &up_ref, &mut mlp_ref)
+            .expect("host swiglu");
+        crate::metal_host::matmul_rhs_transposed(
+            ScalarType::BF16,
+            1,
+            1,
+            hidden_dim,
+            intermediate,
+            &mlp_ref,
+            &down_w,
+            &mut down_ref,
+        )
+        .expect("host down");
+        crate::metal_host::element_add(ScalarType::BF16, hidden_dim, &residual, &down_ref, &mut out_ref)
+            .expect("host residual");
+
+        qwen_mlp_gate_up_bf16(
+            hidden_dim,
+            intermediate,
+            &input,
+            &gate_w,
+            &up_w,
+            &mut gate,
+            &mut up,
+        )
+        .expect("native gate/up");
+        qwen_mlp_down_residual_bf16(
+            hidden_dim,
+            intermediate,
+            &gate,
+            &up,
+            &down_w,
+            &residual,
+            &mut out,
+        )
+        .expect("native down/residual");
+
+        for (label, actual, expected) in [
+            ("gate", read_bf16(&gate), read_bf16(&gate_ref)),
+            ("up", read_bf16(&up), read_bf16(&up_ref)),
+            ("out", read_bf16(&out), read_bf16(&out_ref)),
+        ] {
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let delta = (a - e).abs();
+                assert!(
+                    delta <= 0.02,
+                    "{label} idx {idx}: expected {e}, got {a}, delta {delta}"
                 );
             }
         }
