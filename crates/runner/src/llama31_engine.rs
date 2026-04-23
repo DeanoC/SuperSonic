@@ -1116,7 +1116,13 @@ pub fn run_llama31(
     let text = tokenizer
         .decode(&all_ids, true)
         .map_err(|e| anyhow!("detokenize: {e}"))?;
+    let generated_text = tokenizer
+        .decode(&generated, true)
+        .map_err(|e| anyhow!("detokenize generated suffix: {e}"))?;
     println!("{text}");
+    if cli.emit_generated_json {
+        println!("[generated_json] {}", serde_json::to_string(&generated_text)?);
+    }
     println!(
         "[tokens] {}",
         generated

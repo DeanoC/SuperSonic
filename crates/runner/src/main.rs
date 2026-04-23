@@ -331,6 +331,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     emit_stage_timings: bool,
 
+    /// Emit the generated suffix as a JSON string for benchmark harnesses.
+    #[arg(long)]
+    emit_generated_json: bool,
+
     /// Run PyTorch oracle and compare logits
     #[arg(long)]
     validate: bool,
@@ -2100,8 +2104,14 @@ fn main() -> Result<()> {
     let text = tokenizer
         .decode(&all_ids, true)
         .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+    let generated_text = tokenizer
+        .decode(&generated_ids, true)
+        .map_err(|e| anyhow::anyhow!("detokenize generated suffix: {e}"))?;
 
     println!("{text}");
+    if cli.emit_generated_json {
+        println!("[generated_json] {}", serde_json::to_string(&generated_text)?);
+    }
     println!(
         "[tokens] {}",
         generated_ids
@@ -2471,8 +2481,14 @@ fn run_gemma4(
         let text = tokenizer
             .decode(&all_ids, true)
             .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+        let generated_text = tokenizer
+            .decode(&generated_per_seq[b], true)
+            .map_err(|e| anyhow::anyhow!("detokenize generated suffix: {e}"))?;
         if batch_size == 1 {
             println!("{text}");
+            if cli.emit_generated_json {
+                println!("[generated_json] {}", serde_json::to_string(&generated_text)?);
+            }
             println!(
                 "[tokens] {}",
                 generated_per_seq[b]
@@ -2483,6 +2499,9 @@ fn run_gemma4(
             );
         } else {
             println!("[seq={b}] {text}");
+            if cli.emit_generated_json {
+                println!("[seq={b}][generated_json] {}", serde_json::to_string(&generated_text)?);
+            }
             println!(
                 "[seq={b}][tokens] {}",
                 generated_per_seq[b]
