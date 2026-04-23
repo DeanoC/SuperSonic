@@ -651,9 +651,19 @@ pub fn run_llama31(
             let stats = engine.certified_kv_shadow_quantize_probe(
                 cfg.block_size,
                 cfg.value_group_size,
+                cfg.tau_cov,
+                cfg.k_min,
+                cfg.k_max,
+                cfg.rung1_threshold,
+                cfg.rung1_multiplier,
             )?;
+            let selector_mean_k = if stats.selector_heads == 0 {
+                0.0
+            } else {
+                stats.selector_selected_blocks as f32 / stats.selector_heads as f32
+            };
             eprintln!(
-                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6}",
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={}",
                 stats.layers,
                 stats.aligned_tokens,
                 stats.compressed_vram_bytes,
@@ -662,6 +672,10 @@ pub fn run_llama31(
                 stats.score_layers,
                 stats.score_ms,
                 stats.max_score_ref_delta,
+                stats.selector_heads,
+                selector_mean_k,
+                stats.selector_max_tail_mass,
+                stats.selector_rung1_heads,
             );
             Some(stats)
         } else {
@@ -1116,6 +1130,16 @@ pub fn run_llama31(
                 "shadow_score_layers": certified_kv_shadow_stats.map(|s| s.score_layers),
                 "shadow_score_ms": certified_kv_shadow_stats.map(|s| s.score_ms),
                 "shadow_max_score_ref_delta": certified_kv_shadow_stats.map(|s| s.max_score_ref_delta),
+                "shadow_selector_heads": certified_kv_shadow_stats.map(|s| s.selector_heads),
+                "shadow_selector_mean_k": certified_kv_shadow_stats.map(|s| {
+                    if s.selector_heads == 0 {
+                        0.0
+                    } else {
+                        s.selector_selected_blocks as f32 / s.selector_heads as f32
+                    }
+                }),
+                "shadow_selector_max_tail_mass": certified_kv_shadow_stats.map(|s| s.selector_max_tail_mass),
+                "shadow_selector_rung1_heads": certified_kv_shadow_stats.map(|s| s.selector_rung1_heads),
             });
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {

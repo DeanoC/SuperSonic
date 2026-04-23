@@ -190,11 +190,17 @@ if shadow_runs:
     shadow_score_layers = statistics.mean(r.get("shadow_score_layers", 0) for r in shadow_runs)
     shadow_score_ms = statistics.mean(r.get("shadow_score_ms", 0.0) for r in shadow_runs)
     shadow_score_delta = max(r.get("shadow_max_score_ref_delta", 0.0) for r in shadow_runs)
+    shadow_selector_heads = statistics.mean(r.get("shadow_selector_heads", 0) for r in shadow_runs)
+    shadow_selector_mean_k = statistics.mean(r.get("shadow_selector_mean_k", 0.0) for r in shadow_runs)
+    shadow_selector_tail = max(r.get("shadow_selector_max_tail_mass", 0.0) for r in shadow_runs)
+    shadow_selector_rung1 = statistics.mean(r.get("shadow_selector_rung1_heads", 0) for r in shadow_runs)
     print(
         "shadow_mean "
         f"layers={shadow_layers:.1f} aligned_tokens={shadow_tokens:.1f} "
         f"tier1_bytes={shadow_bytes:.0f} quantize_ms={shadow_ms:.3f} "
         f"max_value_error={shadow_err:.6f} score_layers={shadow_score_layers:.1f} "
-        f"score_ms={shadow_score_ms:.3f} max_score_ref_delta={shadow_score_delta:.6f}"
+        f"score_ms={shadow_score_ms:.3f} max_score_ref_delta={shadow_score_delta:.6f} "
+        f"selector_heads={shadow_selector_heads:.1f} selector_mean_k={shadow_selector_mean_k:.2f} "
+        f"selector_max_tail_mass={shadow_selector_tail:.6f} selector_rung1_heads={shadow_selector_rung1:.1f}"
     )
 PY

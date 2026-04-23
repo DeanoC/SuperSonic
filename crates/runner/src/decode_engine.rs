@@ -35,6 +35,86 @@ fn decode_bf16_le_host(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn logsumexp(values: &[f32]) -> f32 {
+    let max_v = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max_v.is_finite() {
+        return max_v;
+    }
+    let sum: f32 = values.iter().map(|v| (*v - max_v).exp()).sum();
+    max_v + sum.ln()
+}
+
+fn certified_kv_select_blocks_from_scores(
+    block_max: &[f32],
+    block_sum: &[f32],
+    tau_cov: f32,
+    k_min: usize,
+    k_max: usize,
+    rung1_threshold: f32,
+    rung1_multiplier: f32,
+) -> Result<(usize, f32, bool)> {
+    let num_blocks = block_max.len();
+    if num_blocks == 0 || block_sum.len() != num_blocks {
+        return Ok((0, 0.0, false));
+    }
+    let mut log_mass = Vec::with_capacity(num_blocks);
+    for (&m, &s) in block_max.iter().zip(block_sum.iter()) {
+        if !m.is_finite() || !s.is_finite() || s <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "certified KV selector received invalid block score max={} sum={}",
+                m,
+                s
+            ));
+        }
+        log_mass.push(m + s.ln());
+    }
+    let global = logsumexp(&log_mass);
+    if !global.is_finite() {
+        return Err(anyhow::anyhow!(
+            "certified KV selector global logsumexp is not finite"
+        ));
+    }
+    let mut probs: Vec<f32> = log_mass.iter().map(|m| (*m - global).exp()).collect();
+    for p in &mut probs {
+        if !p.is_finite() || *p < 0.0 {
+            return Err(anyhow::anyhow!(
+                "certified KV selector produced invalid probability {}",
+                *p
+            ));
+        }
+    }
+    let mut order: Vec<usize> = (0..num_blocks).collect();
+    order.sort_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut selected = 0usize;
+    let mut covered = 0.0f32;
+    for &idx in &order {
+        covered += probs[idx];
+        selected += 1;
+        if covered >= tau_cov {
+            break;
+        }
+    }
+    let min_k = k_min.min(num_blocks);
+    let max_k = k_max.min(num_blocks).max(min_k);
+    selected = selected.max(min_k).min(max_k);
+    covered = order.iter().take(selected).map(|&idx| probs[idx]).sum();
+    let mut tail = (1.0 - covered).max(0.0);
+    let mut rung1 = false;
+    if tail > rung1_threshold && selected < num_blocks {
+        let expanded = ((selected as f32) * rung1_multiplier).ceil() as usize;
+        selected = expanded.max(selected + 1).min(num_blocks);
+        covered = order.iter().take(selected).map(|&idx| probs[idx]).sum();
+        tail = (1.0 - covered).max(0.0);
+        rung1 = true;
+    }
+    Ok((selected, tail, rung1))
+}
+
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -628,6 +708,10 @@ pub struct CertifiedKvShadowStats {
     pub score_layers: usize,
     pub score_ms: f64,
     pub max_score_ref_delta: f32,
+    pub selector_heads: usize,
+    pub selector_selected_blocks: usize,
+    pub selector_max_tail_mass: f32,
+    pub selector_rung1_heads: usize,
 }
 
 pub struct ComponentLayerTrace {
@@ -1083,6 +1167,11 @@ impl DecodeEngine {
         &self,
         block_size: usize,
         value_group_size: usize,
+        tau_cov: f32,
+        k_min: usize,
+        k_max: usize,
+        rung1_threshold: f32,
+        rung1_multiplier: f32,
     ) -> Result<CertifiedKvShadowStats> {
         let mut stats = CertifiedKvShadowStats::default();
         for (layer_idx, layer_state) in self.state.layers.iter().enumerate() {
@@ -1234,6 +1323,26 @@ impl DecodeEngine {
                         m,
                         s
                     ));
+                }
+            }
+            for qh in 0..num_q_heads {
+                let start = qh * num_blocks;
+                let end = start + num_blocks;
+                let (selected, tail, rung1) = certified_kv_select_blocks_from_scores(
+                    &block_max_host[start..end],
+                    &block_sum_host[start..end],
+                    tau_cov,
+                    k_min,
+                    k_max,
+                    rung1_threshold,
+                    rung1_multiplier,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} q_head {qh} certified KV selector: {e}"))?;
+                stats.selector_heads += 1;
+                stats.selector_selected_blocks += selected;
+                stats.selector_max_tail_mass = stats.selector_max_tail_mass.max(tail);
+                if rung1 {
+                    stats.selector_rung1_heads += 1;
                 }
             }
 
