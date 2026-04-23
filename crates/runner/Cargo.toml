@@ -3,6 +3,10 @@ name = "runner"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+bughunt = []
+
 [[bin]]
 name = "supersonic"
 path = "src/main.rs"
@@ -62,6 +66,7 @@ path = "src/bin/gemma4_int4_layer_diag.rs"
 [[bin]]
 name = "qwen35_bughunt"
 path = "src/bin/qwen35_bughunt.rs"
+required-features = ["bughunt"]
 
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }

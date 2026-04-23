@@ -142,9 +142,26 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
         "auto" => match backend {
             Backend::Cuda => format!("cuda:{ordinal}"),
             Backend::Hip => "cpu".to_string(),
+            Backend::Metal => "cpu".to_string(),
         },
         other => other.to_string(),
     }
+}
+
+fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
+    tokenizers::Tokenizer::from_file(tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("loading tokenizer {}: {e}", tokenizer_path.display()))
+}
+
+fn resolve_prompt_token_ids(cli: &Cli, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if prompt_ids.is_empty() {
+        anyhow::bail!("prompt tokenization produced 0 tokens");
+    }
+    Ok(prompt_ids)
 }
 
 fn model_dir_has_raw_safetensors(model_dir: &Path) -> bool {
@@ -670,6 +687,11 @@ fn main() -> Result<()> {
             (arch_name, total_vram, 32)
         }
         Backend::Cuda => {
+            let info = gpu_hal::query_device_info(backend, ordinal)
+                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
+            (info.arch_name, info.total_vram_bytes, info.warp_size)
+        }
+        Backend::Metal => {
             let info = gpu_hal::query_device_info(backend, ordinal)
                 .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)

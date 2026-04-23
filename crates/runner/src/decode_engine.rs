@@ -4878,6 +4878,7 @@ impl DecodeEngine {
                     PersistentTimingCalibration::ClockRateKhz(khz)
                 }
                 gpu_hal::Backend::Hip => PersistentTimingCalibration::WallClockMs(0.0),
+                gpu_hal::Backend::Metal => PersistentTimingCalibration::WallClockMs(0.0),
             })
         } else {
             None
