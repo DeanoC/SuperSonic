@@ -40,6 +40,7 @@ pub enum BughuntMode {
     Gate,
     Localize,
     Dump,
+    Bench,
 }
 
 impl BughuntMode {
@@ -48,6 +49,7 @@ impl BughuntMode {
             Self::Gate => "gate",
             Self::Localize => "localize",
             Self::Dump => "dump",
+            Self::Bench => "bench",
         }
     }
 }
@@ -91,6 +93,8 @@ pub struct BughuntArgs {
     pub position: Option<usize>,
     pub layer: Option<usize>,
     pub layer_kind: Option<BughuntLayerKind>,
+    pub bench_iterations: usize,
+    pub bench_warmup: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -269,6 +273,25 @@ pub struct DumpRunSection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BenchPromptReport {
+    pub name: String,
+    pub notes: Option<String>,
+    pub prompt_len: usize,
+    pub warmup_iterations: usize,
+    pub iterations: usize,
+    pub native_prefill_ms: Vec<f64>,
+    pub min_native_prefill_ms: f64,
+    pub max_native_prefill_ms: f64,
+    pub mean_native_prefill_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchRunSection {
+    pub pass: bool,
+    pub prompt_results: Vec<BenchPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BughuntReport {
     pub mode: String,
     pub metadata: RunMetadata,
@@ -278,6 +301,8 @@ pub struct BughuntReport {
     pub localize: Option<LocalizeRunSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dump: Option<DumpRunSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench: Option<BenchRunSection>,
 }
 
 impl BughuntReport {
@@ -310,6 +335,18 @@ impl BughuntReport {
             "dump" => {
                 if self
                     .dump
+                    .as_ref()
+                    .map(|section| section.pass)
+                    .unwrap_or(false)
+                {
+                    0
+                } else {
+                    1
+                }
+            }
+            "bench" => {
+                if self
+                    .bench
                     .as_ref()
                     .map(|section| section.pass)
                     .unwrap_or(false)
@@ -365,6 +402,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: Some(reports),
                 localize: None,
                 dump: None,
+                bench: None,
             }
         }
         BughuntMode::Localize => {
@@ -375,6 +413,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: None,
                 localize: Some(section),
                 dump: None,
+                bench: None,
             }
         }
         BughuntMode::Dump => {
@@ -392,6 +431,24 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: None,
                 localize: None,
                 dump: Some(section),
+                bench: None,
+            }
+        }
+        BughuntMode::Bench => {
+            let section = run_bench_mode(
+                &runtime,
+                &manifest,
+                args.prompt.as_deref(),
+                args.bench_iterations,
+                args.bench_warmup,
+            )?;
+            BughuntReport {
+                mode: args.mode.as_str().to_string(),
+                metadata,
+                gate: None,
+                localize: None,
+                dump: None,
+                bench: Some(section),
             }
         }
     };
@@ -413,6 +470,9 @@ fn validate_args(args: &BughuntArgs) -> Result<()> {
     }
     if matches!(args.mode, BughuntMode::Dump) && args.prompt.is_none() {
         bail!("--prompt is required in dump mode");
+    }
+    if matches!(args.mode, BughuntMode::Bench) && args.bench_iterations == 0 {
+        bail!("--iters must be greater than zero in bench mode");
     }
     Ok(())
 }
@@ -712,6 +772,69 @@ fn run_gate_mode(
     let pass = prompt_results.iter().all(|prompt| prompt.pass);
     Ok(GateRunSection {
         pass,
+        prompt_results,
+    })
+}
+
+fn run_bench_mode(
+    runtime: &QwenBughuntRuntime,
+    manifest: &PromptManifest,
+    selected_prompt: Option<&str>,
+    iterations: usize,
+    warmup_iterations: usize,
+) -> Result<BenchRunSection> {
+    let prompts = select_prompts(manifest, selected_prompt)?;
+    let mut prompt_results = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        eprintln!(
+            "[bughunt] bench prompt={} warmup={} iters={} start",
+            prompt.name, warmup_iterations, iterations
+        );
+        for warmup in 0..warmup_iterations {
+            let _ = run_native_prefill(runtime, &prompt.prompt_ids)
+                .with_context(|| format!("bench warmup {warmup} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench warmup sync prompt {}", prompt.name))?;
+        }
+
+        let mut native_prefill_ms = Vec::with_capacity(iterations);
+        for iter in 0..iterations {
+            let start = Instant::now();
+            let _ = run_native_prefill(runtime, &prompt.prompt_ids)
+                .with_context(|| format!("bench iter {iter} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench iter sync prompt {}", prompt.name))?;
+            native_prefill_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let min_native_prefill_ms = native_prefill_ms
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
+        let max_native_prefill_ms = native_prefill_ms
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        let mean_native_prefill_ms =
+            native_prefill_ms.iter().sum::<f64>() / native_prefill_ms.len() as f64;
+        eprintln!(
+            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1}",
+            prompt.name, mean_native_prefill_ms, min_native_prefill_ms, max_native_prefill_ms
+        );
+        prompt_results.push(BenchPromptReport {
+            name: prompt.name.clone(),
+            notes: prompt.notes.clone(),
+            prompt_len: prompt.prompt_ids.len(),
+            warmup_iterations,
+            iterations,
+            native_prefill_ms,
+            min_native_prefill_ms,
+            max_native_prefill_ms,
+            mean_native_prefill_ms,
+        });
+    }
+    Ok(BenchRunSection {
+        pass: true,
         prompt_results,
     })
 }
@@ -2577,6 +2700,28 @@ fn print_report_summary(report: &BughuntReport) {
                 }
             }
         }
+        "bench" => {
+            if let Some(bench) = report.bench.as_ref() {
+                println!(
+                    "mode=bench backend={} prompts={} pass={}",
+                    report.metadata.backend,
+                    bench.prompt_results.len(),
+                    bench.pass
+                );
+                for prompt in &bench.prompt_results {
+                    println!(
+                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1}",
+                        prompt.name,
+                        prompt.prompt_len,
+                        prompt.iterations,
+                        prompt.warmup_iterations,
+                        prompt.mean_native_prefill_ms,
+                        prompt.min_native_prefill_ms,
+                        prompt.max_native_prefill_ms,
+                    );
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -2926,6 +3071,7 @@ mod tests {
                 },
             }),
             dump: None,
+            bench: None,
         };
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["mode"], "localize");
