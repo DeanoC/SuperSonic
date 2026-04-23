@@ -2808,33 +2808,61 @@ impl DecodeEngine {
         };
 
         let ls = &mut self.state.layers[idx];
-        let conv_state_ref = ls
-            .conv_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+        let use_fused_conv_update = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_CONV_UPDATE").is_some()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_CONV_UPDATE").is_none()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
+                .is_none();
+
+        if use_fused_conv_update {
+            let conv_state = ls
+                .conv_state
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+            kernel_ffi::prefill_ffi::metal_linear_conv_value_decay_update_bf16(
+                qkv_dim,
+                config.linear_conv_kernel_dim - 1,
+                config.linear_conv_kernel_dim,
+                nv,
+                &qkv,
+                conv_state,
+                &lw.conv1d_w,
+                &a,
+                &lw.dt_bias,
+                &lw.a_log_exp,
+                &mut conv_pack,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear conv/value_decay update: {e}"))?;
+        } else {
+            let conv_state_ref = ls
+                .conv_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+            kernel_ffi::prefill_ffi::linear_stateful_conv_value_decay_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                qkv_dim,
+                1,
+                config.linear_conv_kernel_dim - 1,
+                config.linear_conv_kernel_dim,
+                nv,
+                &qkv,
+                conv_state_ref,
+                &lw.conv1d_w,
+                &a,
+                &lw.dt_bias,
+                &lw.a_log_exp,
+                &mut conv_pack,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
+        }
+
         let recurrent_state = ls
             .recurrent_state
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
-
-        kernel_ffi::prefill_ffi::linear_stateful_conv_value_decay_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            qkv_dim,
-            1,
-            config.linear_conv_kernel_dim - 1,
-            config.linear_conv_kernel_dim,
-            nv,
-            &qkv,
-            conv_state_ref,
-            &lw.conv1d_w,
-            &a,
-            &lw.dt_bias,
-            &lw.a_log_exp,
-            &mut conv_pack,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
 
         let use_fused_linear_prep_apply = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
@@ -3090,55 +3118,58 @@ impl DecodeEngine {
             };
         }
 
-        let state_len = config.linear_conv_kernel_dim - 1;
-        let state_bytes = ScalarType::BF16.size_in_bytes();
-        let conv_state = ls
-            .conv_state
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
-        let native_linear_conv_enabled =
-            conv_state.backend() == gpu_hal::Backend::Metal
-                && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
-                    .is_none();
-        if conv_state.backend() == gpu_hal::Backend::Metal
-            && (native_linear_conv_enabled
-                || std::env::var_os("SUPERSONIC_METAL_ENABLE_DIRECT_CONV_STATE_UPDATE").is_some())
-        {
-            kernel_ffi::prefill_ffi::metal_conv_state_update_bf16(
-                qkv_dim, state_len, &qkv, conv_state,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} metal conv state update: {e}"))?;
-        } else {
-            let new_conv_state =
-                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
-            for c in 0..qkv_dim {
-                let channel_base = c * state_len * state_bytes;
-                if state_len > 1 {
+        if !use_fused_conv_update {
+            let state_len = config.linear_conv_kernel_dim - 1;
+            let state_bytes = ScalarType::BF16.size_in_bytes();
+            let conv_state = ls
+                .conv_state
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+            let native_linear_conv_enabled =
+                conv_state.backend() == gpu_hal::Backend::Metal
+                    && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
+                        .is_none();
+            if conv_state.backend() == gpu_hal::Backend::Metal
+                && (native_linear_conv_enabled
+                    || std::env::var_os("SUPERSONIC_METAL_ENABLE_DIRECT_CONV_STATE_UPDATE")
+                        .is_some())
+            {
+                kernel_ffi::prefill_ffi::metal_conv_state_update_bf16(
+                    qkv_dim, state_len, &qkv, conv_state,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} metal conv state update: {e}"))?;
+            } else {
+                let new_conv_state =
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
+                        .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
+                for c in 0..qkv_dim {
+                    let channel_base = c * state_len * state_bytes;
+                    if state_len > 1 {
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            new_conv_state.offset_ptr(channel_base) as *mut c_void,
+                            conv_state.offset_ptr(channel_base + state_bytes),
+                            (state_len - 1) * state_bytes,
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} conv shift c={c}: {e}"))?;
+                    }
                     gpu_hal::copy_d2d(
                         self.ordinal,
-                        new_conv_state.offset_ptr(channel_base) as *mut c_void,
-                        conv_state.offset_ptr(channel_base + state_bytes),
-                        (state_len - 1) * state_bytes,
+                        new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
+                            as *mut c_void,
+                        qkv.offset_ptr(c * state_bytes),
+                        state_bytes,
                     )
-                    .map_err(|e| anyhow::anyhow!("layer {idx} conv shift c={c}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("layer {idx} conv append c={c}: {e}"))?;
                 }
                 gpu_hal::copy_d2d(
                     self.ordinal,
-                    new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
-                        as *mut c_void,
-                    qkv.offset_ptr(c * state_bytes),
-                    state_bytes,
+                    conv_state.as_ptr() as *mut c_void,
+                    new_conv_state.as_ptr(),
+                    qkv_dim * state_len * state_bytes,
                 )
-                .map_err(|e| anyhow::anyhow!("layer {idx} conv append c={c}: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
             }
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                conv_state.as_ptr() as *mut c_void,
-                new_conv_state.as_ptr(),
-                qkv_dim * state_len * state_bytes,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
         }
 
         kernel_ffi::prefill_ffi::cast(

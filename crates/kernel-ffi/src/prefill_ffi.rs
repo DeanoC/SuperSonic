@@ -260,6 +260,37 @@ pub fn metal_conv_state_update_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn metal_linear_conv_value_decay_update_bf16(
+    conv_dim: usize,
+    state_len: usize,
+    kernel_size: usize,
+    num_heads: usize,
+    mixed_qkv: &GpuBuffer,
+    state: &mut GpuBuffer,
+    weights: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("linear_conv_value_decay_update", "native", || {
+        metal_native::linear_conv_value_decay_update_bf16(
+            conv_dim,
+            state_len,
+            kernel_size,
+            num_heads,
+            mixed_qkv,
+            state,
+            weights,
+            a,
+            dt_bias,
+            a_log_exp,
+            out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn metal_qwen_linear_projections_bf16(
     hidden_dim: usize,
     qkv_dim: usize,

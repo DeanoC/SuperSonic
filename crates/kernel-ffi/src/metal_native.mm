@@ -4389,11 +4389,23 @@ kernel void supersonic_conv_state_update_bf16(
     return pipeline;
 }
 
-id<MTLComputePipelineState> linear_conv_value_decay_bf16_pipeline(NSError** error_out) {
+id<MTLComputePipelineState> linear_conv_value_decay_bf16_pipeline(
+    NSString* function_name,
+    NSError** error_out
+) {
     static std::mutex mutex;
-    static bool attempted = false;
-    static __strong id<MTLComputePipelineState> pipeline = nil;
-    static __strong NSError* build_error = nil;
+    static bool attempted_plain = false;
+    static bool attempted_update = false;
+    static __strong id<MTLComputePipelineState> pipeline_plain = nil;
+    static __strong id<MTLComputePipelineState> pipeline_update = nil;
+    static __strong NSError* build_error_plain = nil;
+    static __strong NSError* build_error_update = nil;
+
+    const bool want_update =
+        [function_name isEqualToString:@"supersonic_linear_conv_value_decay_update_bf16"];
+    bool& attempted = want_update ? attempted_update : attempted_plain;
+    __strong id<MTLComputePipelineState>& pipeline = want_update ? pipeline_update : pipeline_plain;
+    __strong NSError*& build_error = want_update ? build_error_update : build_error_plain;
 
     std::lock_guard<std::mutex> lock(mutex);
     if (!attempted) {
@@ -4469,6 +4481,58 @@ kernel void supersonic_linear_conv_value_decay_bf16(
         out[params.conv_dim + head] = bfloat(value);
     }
 }
+
+kernel void supersonic_linear_conv_value_decay_update_bf16(
+    device const bfloat* mixed_qkv [[buffer(0)]],
+    device bfloat* state [[buffer(1)]],
+    device const bfloat* weights [[buffer(2)]],
+    device const bfloat* a [[buffer(3)]],
+    device const bfloat* dt_bias [[buffer(4)]],
+    device const bfloat* a_log_exp [[buffer(5)]],
+    device bfloat* out [[buffer(6)]],
+    constant LinearConvValueDecayParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+    if (gid < params.conv_dim) {
+        uint c = gid;
+        uint state_base = c * params.state_len;
+        uint weight_base = c * params.kernel_size;
+        float acc = 0.0f;
+        uint history = params.kernel_size - 1;
+        for (uint tap = 0; tap < params.kernel_size; ++tap) {
+            int src = int(tap) - int(history);
+            float x = 0.0f;
+            if (src >= 0) {
+                x = float(mixed_qkv[c]);
+            } else {
+                int state_idx = int(params.state_len) + src;
+                if (state_idx >= 0) {
+                    x = float(state[state_base + uint(state_idx)]);
+                }
+            }
+            acc = fma(x, float(weights[weight_base + tap]), acc);
+        }
+        out[c] = bfloat(silu(acc));
+
+        for (uint pos = 0; pos < params.state_len; ++pos) {
+            if (pos + 1 < params.state_len) {
+                state[state_base + pos] = state[state_base + pos + 1];
+            } else {
+                state[state_base + pos] = mixed_qkv[c];
+            }
+        }
+        return;
+    }
+
+    uint head = gid - params.conv_dim;
+    if (head < params.num_heads) {
+        float value = -softplus_stable(float(a[head]) + float(dt_bias[head])) * float(a_log_exp[head]);
+        out[params.conv_dim + head] = bfloat(value);
+    }
+}
 )LCVD";
                 NSString* source = [NSString stringWithUTF8String:kSource];
                 MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
@@ -4485,8 +4549,7 @@ kernel void supersonic_linear_conv_value_decay_bf16(
                                                                            @"Failed to compile linear-conv-value-decay library"
                                                                    }];
                 } else {
-                    id<MTLFunction> function =
-                        [library newFunctionWithName:@"supersonic_linear_conv_value_decay_bf16"];
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
                     if (function == nil) {
                         build_error = [NSError errorWithDomain:@"SuperSonicMetal"
                                                            code:221
@@ -6615,7 +6678,10 @@ extern "C" int supersonic_metal_linear_conv_value_decay_bf16(
         }
 
         NSError* pipeline_error = nil;
-        id<MTLComputePipelineState> pipeline = linear_conv_value_decay_bf16_pipeline(&pipeline_error);
+        id<MTLComputePipelineState> pipeline =
+            linear_conv_value_decay_bf16_pipeline(
+                @"supersonic_linear_conv_value_decay_bf16",
+                &pipeline_error);
         if (pipeline == nil) {
             return 227;
         }
@@ -6666,6 +6732,96 @@ extern "C" int supersonic_metal_linear_conv_value_decay_bf16(
             [encoder dispatchThreads:MTLSizeMake(out_width, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
         }, 235, 236, 237, 238);
+    }
+}
+
+extern "C" int supersonic_metal_linear_conv_value_decay_update_bf16(
+    size_t conv_dim,
+    size_t state_len,
+    size_t kernel_size,
+    size_t num_heads,
+    const void* mixed_qkv_ptr,
+    void* state_ptr,
+    const void* weights_ptr,
+    const void* a_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_exp_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (conv_dim == 0 || state_len == 0 || kernel_size == 0 || num_heads == 0 ||
+            mixed_qkv_ptr == nullptr || state_ptr == nullptr || weights_ptr == nullptr ||
+            a_ptr == nullptr || dt_bias_ptr == nullptr || a_log_exp_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 602;
+        }
+        if (kernel_size != state_len + 1) {
+            return 603;
+        }
+        if (conv_dim > UINT32_MAX || state_len > UINT32_MAX || kernel_size > UINT32_MAX ||
+            num_heads > UINT32_MAX || conv_dim > SIZE_MAX - num_heads) {
+            return 604;
+        }
+        size_t out_width = conv_dim + num_heads;
+        if (out_width > UINT32_MAX) {
+            return 605;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            linear_conv_value_decay_bf16_pipeline(
+                @"supersonic_linear_conv_value_decay_update_bf16",
+                &pipeline_error);
+        if (pipeline == nil) {
+            return 606;
+        }
+
+        id<MTLBuffer> mixed_qkv = nil;
+        id<MTLBuffer> state = nil;
+        id<MTLBuffer> weights = nil;
+        id<MTLBuffer> a = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log_exp = nil;
+        id<MTLBuffer> out = nil;
+        size_t mixed_qkv_offset = 0;
+        size_t state_offset = 0;
+        size_t weights_offset = 0;
+        size_t a_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_exp_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(mixed_qkv_ptr, &mixed_qkv, &mixed_qkv_offset) != 0) return 607;
+        if (lookup_buffer(state_ptr, &state, &state_offset) != 0) return 608;
+        if (lookup_buffer(weights_ptr, &weights, &weights_offset) != 0) return 609;
+        if (lookup_buffer(a_ptr, &a, &a_offset) != 0) return 610;
+        if (lookup_buffer(dt_bias_ptr, &dt_bias, &dt_bias_offset) != 0) return 611;
+        if (lookup_buffer(a_log_exp_ptr, &a_log_exp, &a_log_exp_offset) != 0) return 612;
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) return 613;
+
+        LinearConvValueDecayParams params = {
+            static_cast<uint32_t>(conv_dim),
+            static_cast<uint32_t>(state_len),
+            static_cast<uint32_t>(kernel_size),
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(out_width),
+            static_cast<uint32_t>(out_width),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:mixed_qkv offset:mixed_qkv_offset atIndex:0];
+            [encoder setBuffer:state offset:state_offset atIndex:1];
+            [encoder setBuffer:weights offset:weights_offset atIndex:2];
+            [encoder setBuffer:a offset:a_offset atIndex:3];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:4];
+            [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:5];
+            [encoder setBuffer:out offset:out_offset atIndex:6];
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(out_width, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        }, 614, 615, 616, 617);
     }
 }
 

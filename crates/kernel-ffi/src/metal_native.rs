@@ -465,6 +465,19 @@ unsafe extern "C" {
         a_log_exp_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_linear_conv_value_decay_update_bf16(
+        conv_dim: usize,
+        state_len: usize,
+        kernel_size: usize,
+        num_heads: usize,
+        mixed_qkv_ptr: *const c_void,
+        state_ptr: *mut c_void,
+        weights_ptr: *const c_void,
+        a_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_exp_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 pub(crate) struct MetalBatchGuard {
@@ -2417,6 +2430,68 @@ pub(crate) fn linear_conv_value_decay_bf16(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn linear_conv_value_decay_update_bf16(
+    conv_dim: usize,
+    state_len: usize,
+    kernel_size: usize,
+    num_heads: usize,
+    mixed_qkv: &GpuBuffer,
+    state: &mut GpuBuffer,
+    weights: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if mixed_qkv.dtype() != ScalarType::BF16
+        || state.dtype() != ScalarType::BF16
+        || weights.dtype() != ScalarType::BF16
+        || a.dtype() != ScalarType::BF16
+        || dt_bias.dtype() != ScalarType::BF16
+        || a_log_exp.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native linear_conv_value_decay_update_bf16 expects BF16 buffers, got mixed={:?} state={:?} weights={:?} a={:?} dt={:?} a_log={:?} out={:?}",
+            mixed_qkv.dtype(),
+            state.dtype(),
+            weights.dtype(),
+            a.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            out.dtype()
+        )));
+    }
+    if conv_dim == 0 || state_len == 0 || kernel_size != state_len + 1 || num_heads == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native linear_conv_value_decay_update_bf16 invalid shape: conv_dim={conv_dim} state_len={state_len} kernel_size={kernel_size} num_heads={num_heads}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_linear_conv_value_decay_update_bf16(
+            conv_dim,
+            state_len,
+            kernel_size,
+            num_heads,
+            mixed_qkv.as_ptr(),
+            state.as_mut_ptr(),
+            weights.as_ptr(),
+            a.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native linear_conv_value_decay_update_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 impl MetalBatchGuard {
     pub(crate) fn begin() -> Result<Self, GpuError> {
@@ -2536,6 +2611,26 @@ pub(crate) fn linear_conv_value_decay_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native linear_conv_value_decay_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn linear_conv_value_decay_update_bf16(
+    _conv_dim: usize,
+    _state_len: usize,
+    _kernel_size: usize,
+    _num_heads: usize,
+    _mixed_qkv: &GpuBuffer,
+    _state: &mut GpuBuffer,
+    _weights: &GpuBuffer,
+    _a: &GpuBuffer,
+    _dt_bias: &GpuBuffer,
+    _a_log_exp: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native linear_conv_value_decay_update_bf16 is not compiled".into(),
     ))
 }
 
