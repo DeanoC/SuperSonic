@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CString};
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 
@@ -10,6 +10,7 @@ pub(crate) fn disabled_by_env() -> bool {
 unsafe extern "C" {
     fn supersonic_metal_batch_begin() -> c_int;
     fn supersonic_metal_batch_flush() -> c_int;
+    fn supersonic_metal_batch_set_label(label: *const c_char) -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
     fn supersonic_metal_copy_d2d(
         src_ptr: *const c_void,
@@ -80,6 +81,19 @@ unsafe extern "C" {
         initial_state_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_linear_decode_apply_inplace_bf16(
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_pack_ptr: *const c_void,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_exp_ptr: *const c_void,
+        state_ptr: *mut c_void,
+        attn_out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen_mlp_gate_up_bf16(
         hidden_dim: usize,
         intermediate_dim: usize,
@@ -95,6 +109,18 @@ unsafe extern "C" {
         gate_ptr: *const c_void,
         up_ptr: *const c_void,
         down_weight_ptr: *const c_void,
+        residual_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_qwen_linear_out_residual_f32_bf16(
+        hidden_dim: usize,
+        num_rows: usize,
+        row_dim: usize,
+        eps: f32,
+        attn_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_proj_ptr: *const c_void,
         residual_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
@@ -115,6 +141,13 @@ unsafe extern "C" {
         vocab_size: usize,
         hidden_ptr: *const c_void,
         weight_ptr: *const c_void,
+        out_index_ptr: *mut c_void,
+        partial_values_ptr: *mut c_void,
+        partial_indices_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_argmax_bf16(
+        n: usize,
+        logits_ptr: *const c_void,
         out_index_ptr: *mut c_void,
     ) -> c_int;
     fn supersonic_metal_full_attention_prefill_bf16_f32(
@@ -137,6 +170,18 @@ unsafe extern "C" {
         add_unit_offset: bool,
         input_ptr: *const c_void,
         weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_rms_norm_rope_rows_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        rotary_dim: usize,
+        eps: f32,
+        pos_offset: usize,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        cos_ptr: *const c_void,
+        sin_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
     fn supersonic_metal_rms_norm_rows_f32_weight_bf16(
@@ -536,6 +581,19 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
+    let label = CString::new(label)
+        .map_err(|_| GpuError::Metal("metal native batch label contains NUL byte".to_string()))?;
+    let status = unsafe { supersonic_metal_batch_set_label(label.as_ptr()) };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native batch set label failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
     if src.is_null() || dst.is_null() || bytes == 0 {
         return Err(GpuError::InvalidArg(
@@ -559,6 +617,19 @@ pub(crate) fn lm_head_argmax_bf16(
     in_dim: usize,
     vocab_size: usize,
 ) -> Result<(), GpuError> {
+    lm_head_argmax_bf16_with_partials(hidden, weight, out_index, None, None, in_dim, vocab_size)
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn lm_head_argmax_bf16_with_partials(
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+    partial_values: Option<&mut GpuBuffer>,
+    partial_indices: Option<&mut GpuBuffer>,
+    in_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
     if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
             "metal native lm_head_argmax_bf16 expects BF16 hidden/weight, got {:?}/{:?}",
@@ -576,6 +647,31 @@ pub(crate) fn lm_head_argmax_bf16(
             "metal native lm_head_argmax_bf16 dimensions exceed u32: in_dim={in_dim}, vocab_size={vocab_size}"
         )));
     }
+    let partial_count = vocab_size.div_ceil(256);
+    if let Some(buf) = partial_values.as_ref() {
+        if buf.dtype() != ScalarType::F32 || buf.elem_count() < partial_count {
+            return Err(GpuError::InvalidArg(format!(
+                "metal native lm_head_argmax_bf16 partial_values must be F32[{partial_count}], got {:?}[{}]",
+                buf.dtype(),
+                buf.elem_count()
+            )));
+        }
+    }
+    if let Some(buf) = partial_indices.as_ref() {
+        if buf.dtype() != ScalarType::U32 || buf.elem_count() < partial_count {
+            return Err(GpuError::InvalidArg(format!(
+                "metal native lm_head_argmax_bf16 partial_indices must be U32[{partial_count}], got {:?}[{}]",
+                buf.dtype(),
+                buf.elem_count()
+            )));
+        }
+    }
+    let partial_values_ptr = partial_values
+        .map(|buf| buf.as_mut_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    let partial_indices_ptr = partial_indices
+        .map(|buf| buf.as_mut_ptr())
+        .unwrap_or(std::ptr::null_mut());
     let status = unsafe {
         supersonic_metal_lm_head_argmax_bf16(
             in_dim,
@@ -583,11 +679,44 @@ pub(crate) fn lm_head_argmax_bf16(
             hidden.as_ptr(),
             weight.as_ptr(),
             out_index.as_mut_ptr(),
+            partial_values_ptr,
+            partial_indices_ptr,
         )
     };
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native lm_head_argmax_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn argmax_bf16(
+    logits: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+    n: usize,
+) -> Result<(), GpuError> {
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native argmax_bf16 expects BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "metal native argmax_bf16 requires a U32[1] output buffer".into(),
+        ));
+    }
+    if n > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native argmax_bf16 n exceeds u32: n={n}"
+        )));
+    }
+    let status = unsafe { supersonic_metal_argmax_bf16(n, logits.as_ptr(), out_index.as_mut_ptr()) };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native argmax_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -922,6 +1051,67 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_out_residual_f32_bf16(
+    hidden_dim: usize,
+    num_rows: usize,
+    row_dim: usize,
+    eps: f32,
+    attn: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_proj: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        attn.dtype(),
+        gate.dtype(),
+        weight.dtype(),
+        out_proj.dtype(),
+        residual.dtype(),
+        out.dtype(),
+    ];
+    if dtypes != [
+        ScalarType::F32,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+    ] {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_out_residual_f32_bf16 expects F32/BF16/BF16/BF16/BF16/BF16, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || num_rows == 0 || row_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_out_residual_f32_bf16 invalid shape: hidden_dim={hidden_dim} num_rows={num_rows} row_dim={row_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_out_residual_f32_bf16(
+            hidden_dim,
+            num_rows,
+            row_dim,
+            eps,
+            attn.as_ptr(),
+            gate.as_ptr(),
+            weight.as_ptr(),
+            out_proj.as_ptr(),
+            residual.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_out_residual_f32_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_full_projections_bf16(
     hidden_dim: usize,
     q_proj_dim: usize,
@@ -1064,6 +1254,57 @@ pub(crate) fn rms_norm_rows_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native rms_norm_rows_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rms_norm_rope_rows_bf16(
+    n_rows: usize,
+    n_cols: usize,
+    rotary_dim: usize,
+    eps: f32,
+    pos_offset: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    cos: &GpuBuffer,
+    sin: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if input.dtype() != ScalarType::BF16
+        || weight.dtype() != ScalarType::BF16
+        || cos.dtype() != ScalarType::BF16
+        || sin.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native rms_norm_rope_rows_bf16 expects BF16 buffers, got {:?}/{:?}/{:?}/{:?}/{:?}",
+            input.dtype(),
+            weight.dtype(),
+            cos.dtype(),
+            sin.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_rms_norm_rope_rows_bf16(
+            n_rows,
+            n_cols,
+            rotary_dim,
+            eps,
+            pos_offset,
+            input.as_ptr(),
+            weight.as_ptr(),
+            cos.as_ptr(),
+            sin.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native rms_norm_rope_rows_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -2335,6 +2576,73 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_pack: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    state: &mut GpuBuffer,
+    attn_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_pack.dtype() != ScalarType::BF16
+        || a.dtype() != ScalarType::BF16
+        || b.dtype() != ScalarType::BF16
+        || dt_bias.dtype() != ScalarType::BF16
+        || a_log_exp.dtype() != ScalarType::BF16
+        || state.dtype() != ScalarType::F32
+        || attn_out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_decode_apply_inplace_bf16 expects BF16 conv/a/b/dt/a_log/attn and F32 state, got conv={:?} a={:?} b={:?} dt={:?} a_log={:?} state={:?} attn={:?}",
+            conv_pack.dtype(),
+            a.dtype(),
+            b.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            state.dtype(),
+            attn_out.dtype()
+        )));
+    }
+    if num_v_heads == 0
+        || num_k_heads == 0
+        || head_k_dim == 0
+        || head_v_dim == 0
+        || num_v_heads % num_k_heads != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_decode_apply_inplace_bf16 invalid shape: num_v_heads={num_v_heads} num_k_heads={num_k_heads} head_k_dim={head_k_dim} head_v_dim={head_v_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_decode_apply_inplace_bf16(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_pack.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            state.as_mut_ptr(),
+            attn_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_decode_apply_inplace_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn conv_state_update_bf16(
     channels: usize,
     state_len: usize,
@@ -2509,6 +2817,11 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn set_batch_label(_label: &str) -> Result<(), GpuError> {
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn copy_d2d(
     _src: *const c_void,
     _dst: *mut c_void,
@@ -2580,6 +2893,26 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native qwen_linear_prep_decode_apply_bf16_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
+    _num_v_heads: usize,
+    _num_k_heads: usize,
+    _head_k_dim: usize,
+    _head_v_dim: usize,
+    _conv_pack: &GpuBuffer,
+    _a: &GpuBuffer,
+    _b: &GpuBuffer,
+    _dt_bias: &GpuBuffer,
+    _a_log_exp: &GpuBuffer,
+    _state: &mut GpuBuffer,
+    _attn_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_decode_apply_inplace_bf16 is not compiled".into(),
     ))
 }
 
@@ -2750,6 +3083,25 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_out_residual_f32_bf16(
+    _hidden_dim: usize,
+    _num_rows: usize,
+    _row_dim: usize,
+    _eps: f32,
+    _attn: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out_proj: &GpuBuffer,
+    _residual: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_out_residual_f32_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_full_projections_bf16(
     _hidden_dim: usize,
     _q_proj_dim: usize,
@@ -2777,6 +3129,17 @@ pub(crate) fn lm_head_argmax_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native lm_head_argmax_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn argmax_bf16(
+    _logits: &GpuBuffer,
+    _out_index: &mut GpuBuffer,
+    _n: usize,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native argmax_bf16 is not compiled".into(),
     ))
 }
 
@@ -2811,6 +3174,25 @@ pub(crate) fn rms_norm_rows_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native rms_norm_rows_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rms_norm_rope_rows_bf16(
+    _n_rows: usize,
+    _n_cols: usize,
+    _rotary_dim: usize,
+    _eps: f32,
+    _pos_offset: usize,
+    _input: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _cos: &GpuBuffer,
+    _sin: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native rms_norm_rope_rows_bf16 is not compiled".into(),
     ))
 }
 

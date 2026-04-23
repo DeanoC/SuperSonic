@@ -177,6 +177,10 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
+    metal_native::set_batch_label(label)
+}
+
 pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
     metal_native::copy_d2d(src, dst, bytes)
 }
@@ -277,6 +281,37 @@ pub fn metal_qwen_linear_prep_decode_apply_bf16_f32(
             a_log_exp,
             initial_state,
             out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_decode_apply_inplace_bf16(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_pack: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    state: &mut GpuBuffer,
+    attn_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_decode_apply_inplace", "native", || {
+        metal_native::qwen_linear_decode_apply_inplace_bf16(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_pack,
+            a,
+            b,
+            dt_bias,
+            a_log_exp,
+            state,
+            attn_out,
         )
     })
 }
@@ -398,6 +433,46 @@ pub fn metal_qwen_mlp_down_residual_bf16(
             down_weight,
             residual,
             out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_out_residual_f32_bf16(
+    hidden_dim: usize,
+    num_rows: usize,
+    row_dim: usize,
+    eps: f32,
+    attn: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_proj: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_out_residual", "native", || {
+        metal_native::qwen_linear_out_residual_f32_bf16(
+            hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_rms_norm_rope_rows_bf16(
+    n_rows: usize,
+    n_cols: usize,
+    rotary_dim: usize,
+    eps: f32,
+    pos_offset: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    cos: &GpuBuffer,
+    sin: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("rms_norm_rope_rows", "native", || {
+        metal_native::rms_norm_rope_rows_bf16(
+            n_rows, n_cols, rotary_dim, eps, pos_offset, input, weight, cos, sin, out,
         )
     })
 }

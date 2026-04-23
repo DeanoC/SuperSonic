@@ -37,6 +37,14 @@ fn flush_metal_batch_for_host_boundary(buffer: &GpuBuffer, label: &str) -> Resul
     Ok(())
 }
 
+fn metal_profile_flush_layers_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_PROFILE_FLUSH_LAYERS").is_some()
+}
+
+fn metal_matmul_lm_head_argmax_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_MATMUL_LM_HEAD_ARGMAX").is_some()
+}
+
 fn copy_d2d_ordered(
     ordinal: usize,
     dst: *mut c_void,
@@ -163,6 +171,18 @@ fn metal_fused_mlp_enabled() -> bool {
 
 fn metal_fused_full_projection_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
+}
+
+fn metal_fused_full_qk_prep_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_QK_PREP").is_some()
+}
+
+fn metal_fused_linear_out_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
+}
+
+fn metal_fused_linear_decode_apply_inplace_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_DECODE_APPLY_INPLACE").is_some()
 }
 
 fn metal_matmul_residual_add_bf16(
@@ -1882,7 +1902,13 @@ impl DecodeEngine {
         let mut traced_hidden = None;
         let mut traced_layer = None;
         let mut traced_linear = None;
+        let profile_flush_layers =
+            self.hidden_io.backend() == gpu_hal::Backend::Metal && metal_profile_flush_layers_enabled();
         for i in 0..layer_count {
+            if profile_flush_layers {
+                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!("decode_layer_{i:02}_attn"))
+                    .map_err(|e| anyhow::anyhow!("set Metal decode layer {i} attn profile label: {e}"))?;
+            }
             if trace_input_layer == Some(i) {
                 traced_hidden = Some(
                     self.hidden_io
@@ -1920,6 +1946,12 @@ impl DecodeEngine {
                         .to_host_bytes()
                         .map_err(|e| anyhow::anyhow!("layer {i} attn hidden trace D2H: {e}"))?,
                 );
+            }
+            if profile_flush_layers {
+                kernel_ffi::prefill_ffi::flush_metal_batch()
+                    .map_err(|e| anyhow::anyhow!("profile flush Metal decode layer {i} attn: {e}"))?;
+                kernel_ffi::prefill_ffi::set_metal_batch_label(&format!("decode_layer_{i:02}_mlp"))
+                    .map_err(|e| anyhow::anyhow!("set Metal decode layer {i} mlp profile label: {e}"))?;
             }
 
             kernel_ffi::prefill_ffi::rms_norm_rows(
@@ -1960,6 +1992,10 @@ impl DecodeEngine {
                         .map_err(|e| anyhow::anyhow!("layer {i} final hidden trace D2H: {e}"))?,
                 });
             }
+            if profile_flush_layers {
+                kernel_ffi::prefill_ffi::flush_metal_batch()
+                    .map_err(|e| anyhow::anyhow!("profile flush Metal decode layer {i} mlp: {e}"))?;
+            }
         }
 
         let filled = seqlen_offset + 1;
@@ -1969,6 +2005,10 @@ impl DecodeEngine {
             }
         }
 
+        if profile_flush_layers {
+            kernel_ffi::prefill_ffi::set_metal_batch_label("decode_tail_final_norm")
+                .map_err(|e| anyhow::anyhow!("set Metal decode final norm profile label: {e}"))?;
+        }
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
             ScalarType::BF16,
@@ -1980,19 +2020,42 @@ impl DecodeEngine {
             &mut self.normed_buf,
         )
         .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
+        if profile_flush_layers {
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("profile flush Metal decode final norm: {e}"))?;
+            kernel_ffi::prefill_ffi::set_metal_batch_label("decode_tail_lm_head")
+                .map_err(|e| anyhow::anyhow!("set Metal decode lm-head profile label: {e}"))?;
+        }
 
         let (logits, sampled_token) = if metal_greedy {
             if self.normed_buf.backend() != gpu_hal::Backend::Metal {
                 anyhow::bail!("component Metal greedy decode requires Metal buffers");
             }
-            kernel_ffi::metal_lm_head_argmax_bf16_into(
-                &self.normed_buf,
-                &*self.weights.lm_head,
-                &mut self.argmax_buf,
-                hidden_dim,
-                vocab_size,
-            )
-            .map_err(|e| anyhow::anyhow!("lm_head argmax: {e}"))?;
+            if metal_matmul_lm_head_argmax_enabled() {
+                kernel_ffi::prefill_ffi::matmul_rhs_transposed(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    1,
+                    1,
+                    vocab_size,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    &mut self.logits_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("lm_head matmul argmax projection: {e}"))?;
+                kernel_ffi::metal_argmax_bf16_into(&self.logits_buf, &mut self.argmax_buf, vocab_size)
+                    .map_err(|e| anyhow::anyhow!("lm_head matmul argmax reduce: {e}"))?;
+            } else {
+                kernel_ffi::metal_lm_head_argmax_bf16_into(
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    &mut self.argmax_buf,
+                    hidden_dim,
+                    vocab_size,
+                )
+                .map_err(|e| anyhow::anyhow!("lm_head argmax: {e}"))?;
+            }
             (Vec::new(), None)
         } else {
             kernel_ffi::standalone_matvec_4b(
@@ -2017,6 +2080,10 @@ impl DecodeEngine {
                 .collect();
             (logits, None)
         };
+        if profile_flush_layers {
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("profile flush Metal decode lm-head: {e}"))?;
+        }
         Ok((
             logits,
             sampled_token,
@@ -2258,58 +2325,93 @@ impl DecodeEngine {
             .k_norm_w
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
+        let use_fused_qk_prep = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && metal_fused_full_qk_prep_enabled()
+            && q_norm_w.dtype() == ScalarType::BF16
+            && k_norm_w.dtype() == ScalarType::BF16
+            && query_buf.dtype() == ScalarType::BF16
+            && k_buf.dtype() == ScalarType::BF16
+            && q_normed.dtype() == ScalarType::BF16
+            && k_normed.dtype() == ScalarType::BF16;
+        if use_fused_qk_prep {
+            kernel_ffi::prefill_ffi::metal_rms_norm_rope_rows_bf16(
+                num_q_heads,
+                head_dim,
+                rotary_dim,
+                1e-6,
+                seqlen_offset,
+                query_buf,
+                q_norm_w,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                q_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused q prep: {e}"))?;
+            kernel_ffi::prefill_ffi::metal_rms_norm_rope_rows_bf16(
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                1e-6,
+                seqlen_offset,
+                k_buf,
+                k_norm_w,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                k_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused k prep: {e}"))?;
+        } else {
+            kernel_ffi::prefill_ffi::rms_norm_rows(
+                self.ordinal,
+                ScalarType::BF16,
+                num_q_heads,
+                head_dim,
+                1e-6,
+                query_buf,
+                q_norm_w,
+                q_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal,
-            ScalarType::BF16,
-            num_q_heads,
-            head_dim,
-            1e-6,
-            query_buf,
-            q_norm_w,
-            q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
+            kernel_ffi::prefill_ffi::rms_norm_rows(
+                self.ordinal,
+                ScalarType::BF16,
+                num_kv_heads,
+                head_dim,
+                1e-6,
+                k_buf,
+                k_norm_w,
+                k_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
 
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal,
-            ScalarType::BF16,
-            num_kv_heads,
-            head_dim,
-            1e-6,
-            k_buf,
-            k_norm_w,
-            k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
-
-        kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_q_heads,
-            head_dim,
-            rotary_dim,
-            &self.rotary.cos,
-            &self.rotary.sin,
-            seqlen_offset,
-            q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
-        kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_kv_heads,
-            head_dim,
-            rotary_dim,
-            &self.rotary.cos,
-            &self.rotary.sin,
-            seqlen_offset,
-            k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
-
+            kernel_ffi::prefill_ffi::apply_rope_prefill(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                head_dim,
+                rotary_dim,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                seqlen_offset,
+                q_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
+            kernel_ffi::prefill_ffi::apply_rope_prefill(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                seqlen_offset,
+                k_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
+        }
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
             self.ordinal,
             ScalarType::BF16,
@@ -2883,17 +2985,42 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
         }
 
-        let recurrent_state = ls
-            .recurrent_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
-
         let use_fused_linear_prep_apply = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_PREP_APPLY").is_none()
             && a_for_beta_f32.is_none()
             && b_for_beta_f32.is_none();
-        if use_fused_linear_prep_apply {
+        let use_fused_linear_decode_apply_inplace = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && metal_fused_linear_decode_apply_inplace_enabled()
+            && a_for_beta_f32.is_none()
+            && b_for_beta_f32.is_none();
+        let mut used_fused_linear_decode_apply_inplace = false;
+        if use_fused_linear_decode_apply_inplace {
+            let recurrent_state = ls
+                .recurrent_state
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
+            kernel_ffi::prefill_ffi::metal_qwen_linear_decode_apply_inplace_bf16(
+                nv,
+                nk,
+                khd,
+                vhd,
+                &conv_pack,
+                &a,
+                &b,
+                &lw.dt_bias,
+                &lw.a_log_exp,
+                recurrent_state,
+                &mut attn_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear decode apply inplace: {e}"))?;
+            used_fused_linear_decode_apply_inplace = true;
+        } else if use_fused_linear_prep_apply {
+            let recurrent_state = ls
+                .recurrent_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
             kernel_ffi::prefill_ffi::metal_qwen_linear_prep_decode_apply_bf16_f32(
                 nv,
                 nk,
@@ -3024,7 +3151,9 @@ impl DecodeEngine {
                 &b,
                 &lw.dt_bias,
                 &lw.a_log_exp,
-                recurrent_state,
+                ls.recurrent_state
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?,
                 &mut rec_apply,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} metal direct linear decode apply: {e}"))?;
@@ -3127,7 +3256,9 @@ impl DecodeEngine {
                 khd,
                 vhd,
                 &packed,
-                recurrent_state,
+                ls.recurrent_state
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?,
                 &mut rec_apply,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} linear decode apply: {e}"))?;
@@ -3196,25 +3327,7 @@ impl DecodeEngine {
             }
         }
 
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::F32,
-            ScalarType::BF16,
-            val_dim,
-            &rec_apply,
-            &mut attn_bf16,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
-        let attn_trace = if trace_output {
-            Some(
-                attn_bf16
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?,
-            )
-        } else {
-            None
-        };
-        let rec_apply_trace = if trace_output {
+        let rec_apply_trace = if trace_output && !used_fused_linear_decode_apply_inplace {
             Some(
                 rec_apply
                     .to_host_bytes()
@@ -3223,14 +3336,20 @@ impl DecodeEngine {
         } else {
             None
         };
-        copy_d2d_ordered(
-            self.ordinal,
-            recurrent_state.as_ptr() as *mut c_void,
-            rec_apply.offset_ptr(val_dim * ScalarType::F32.size_in_bytes()),
-            nv * khd * vhd * ScalarType::F32.size_in_bytes(),
-            recurrent_state,
-            &format!("layer {idx} recurrent update copy"),
-        )?;
+        if !used_fused_linear_decode_apply_inplace {
+            let recurrent_state = ls
+                .recurrent_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
+            copy_d2d_ordered(
+                self.ordinal,
+                recurrent_state.as_ptr() as *mut c_void,
+                rec_apply.offset_ptr(val_dim * ScalarType::F32.size_in_bytes()),
+                nv * khd * vhd * ScalarType::F32.size_in_bytes(),
+                recurrent_state,
+                &format!("layer {idx} recurrent update copy"),
+            )?;
+        }
 
         let cached_norm_w_bf16 = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
@@ -3269,29 +3388,77 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
             &norm_w_bf16
         };
-        kernel_ffi::prefill_ffi::rms_norm_gated(
-            self.ordinal,
-            ScalarType::BF16,
-            nv,
-            vhd,
-            config.rms_norm_eps as f32,
-            &attn_bf16,
-            &z,
-            norm_w_bf16_ref,
-            &mut gated,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} gated norm: {e}"))?;
-        let gated_trace = if trace_output {
-            Some(
-                gated
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
+        let use_fused_linear_out = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && metal_fused_linear_out_enabled()
+            && norm_w_bf16_ref.dtype() == ScalarType::BF16
+            && z.dtype() == ScalarType::BF16
+            && rec_apply.dtype() == ScalarType::F32
+            && lw.out_proj_w.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16
+            && lw.out_proj_scale.is_none()
+            && lw.out_proj_int4_scale.is_none()
+            && lw.out_proj_int4_zero.is_none();
+        let (attn_trace, gated_trace, proj_trace) = if use_fused_linear_out {
+            let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
+            kernel_ffi::prefill_ffi::metal_qwen_linear_out_residual_f32_bf16(
+                hidden_dim,
+                nv,
+                vhd,
+                config.rms_norm_eps as f32,
+                &rec_apply,
+                &z,
+                norm_w_bf16_ref,
+                &lw.out_proj_w,
+                residual,
+                &mut self.hidden_io,
             )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear out/residual: {e}"))?;
+            (None, None, None)
         } else {
-            None
-        };
+            if !used_fused_linear_decode_apply_inplace {
+                kernel_ffi::prefill_ffi::cast(
+                    self.ordinal,
+                    ScalarType::F32,
+                    ScalarType::BF16,
+                    val_dim,
+                    &rec_apply,
+                    &mut attn_bf16,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+            }
+            let attn_trace = if trace_output {
+                Some(
+                    attn_bf16
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?,
+                )
+            } else {
+                None
+            };
+            kernel_ffi::prefill_ffi::rms_norm_gated(
+                self.ordinal,
+                ScalarType::BF16,
+                nv,
+                vhd,
+                config.rms_norm_eps as f32,
+                &attn_bf16,
+                &z,
+                norm_w_bf16_ref,
+                &mut gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} gated norm: {e}"))?;
+            let gated_trace = if trace_output {
+                Some(
+                    gated
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
+                )
+            } else {
+                None
+            };
 
-        let use_fused_residual_out_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            let use_fused_residual_out_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && !metal_fused_residual_projection_disabled()
             && lw.out_proj_scale.is_none()
@@ -3300,37 +3467,39 @@ impl DecodeEngine {
             && lw.out_proj_w.dtype() == ScalarType::BF16
             && gated.dtype() == ScalarType::BF16
             && self.hidden_io.dtype() == ScalarType::BF16;
-        let proj_trace = if use_fused_residual_out_proj {
-            metal_matmul_residual_add_bf16(val_dim, hidden_dim, &gated, &lw.out_proj_w, &mut self.hidden_io)
-                .map_err(|e| anyhow::anyhow!("layer {idx} fused residual out proj: {e}"))?;
-            None
-        } else {
-            matmul_proj(
-                self.ordinal,
-                1,
-                1,
-                hidden_dim,
-                val_dim,
-                &gated,
-                &lw.out_proj_w,
-                lw.out_proj_scale.as_ref(),
-                self.weights.fp8_block_size,
-                &mut proj_out,
-                lw.out_proj_int4_scale.as_ref(),
-                lw.out_proj_int4_zero.as_ref(),
-                self.weights.int4_group_size,
-            )?;
-            let trace = if trace_output {
-                Some(
-                    proj_out
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
-                )
-            } else {
+            let proj_trace = if use_fused_residual_out_proj {
+                metal_matmul_residual_add_bf16(val_dim, hidden_dim, &gated, &lw.out_proj_w, &mut self.hidden_io)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} fused residual out proj: {e}"))?;
                 None
+            } else {
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    hidden_dim,
+                    val_dim,
+                    &gated,
+                    &lw.out_proj_w,
+                    lw.out_proj_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    &mut proj_out,
+                    lw.out_proj_int4_scale.as_ref(),
+                    lw.out_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+                let trace = if trace_output {
+                    Some(
+                        proj_out
+                            .to_host_bytes()
+                            .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
+                    )
+                } else {
+                    None
+                };
+                residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
+                trace
             };
-            residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
-            trace
+            (attn_trace, gated_trace, proj_trace)
         };
         Ok(if trace_output {
             Some(ComponentLinearTrace {
@@ -3696,9 +3865,10 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
         let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
-        let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
+        let lm_head_partial_count = config.vocab_size.div_ceil(256);
+        let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[lm_head_partial_count])
             .map_err(|e| anyhow::anyhow!("lm_head_block_best_vals: {e}"))?;
-        let lm_head_block_best_idxs = GpuBuffer::zeros(ordinal, ScalarType::U32, &[512])
+        let lm_head_block_best_idxs = GpuBuffer::zeros(ordinal, ScalarType::U32, &[lm_head_partial_count])
             .map_err(|e| anyhow::anyhow!("lm_head_block_best_idxs: {e}"))?;
         let matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("matvec_counter: {e}"))?;
