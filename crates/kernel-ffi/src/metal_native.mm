@@ -76,6 +76,21 @@ struct SplitQgateParams {
     uint32_t total_elems;
 };
 
+struct RepeatInterleaveHeadsParams {
+    uint32_t s;
+    uint32_t n_heads;
+    uint32_t head_dim;
+    uint32_t repeats;
+    uint32_t dst_heads;
+    uint32_t total_elems;
+};
+
+struct ComputeBetaGParams {
+    uint32_t seq_len;
+    uint32_t nv;
+    uint32_t total_elems;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -1249,6 +1264,224 @@ kernel void supersonic_split_qgate_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> repeat_interleave_heads_pipeline(
+    NSString* function_name,
+    NSError** error_out
+) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_repeat_interleave_heads_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:134
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"RPTI(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RepeatInterleaveHeadsParams {
+    uint s;
+    uint n_heads;
+    uint head_dim;
+    uint repeats;
+    uint dst_heads;
+    uint total_elems;
+};
+
+kernel void supersonic_repeat_interleave_heads_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant RepeatInterleaveHeadsParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.head_dim;
+    uint dst_head = (gid / params.head_dim) % params.dst_heads;
+    uint row = gid / (params.dst_heads * params.head_dim);
+    uint src_head = dst_head / params.repeats;
+    uint src_idx = ((row * params.n_heads) + src_head) * params.head_dim + elem;
+    dst[gid] = src[src_idx];
+}
+
+kernel void supersonic_repeat_interleave_heads_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant RepeatInterleaveHeadsParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.head_dim;
+    uint dst_head = (gid / params.head_dim) % params.dst_heads;
+    uint row = gid / (params.dst_heads * params.head_dim);
+    uint src_head = dst_head / params.repeats;
+    uint src_idx = ((row * params.n_heads) + src_head) * params.head_dim + elem;
+    dst[gid] = src[src_idx];
+}
+)RPTI";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:135
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile repeat-interleave-heads library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:136
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load repeat-interleave-heads function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:137
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create repeat-interleave-heads pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> compute_beta_g_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:144
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"CBG(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ComputeBetaGParams {
+    uint seq_len;
+    uint nv;
+    uint total_elems;
+};
+
+kernel void supersonic_compute_beta_g_f32(
+    device const float* b [[buffer(0)]],
+    device const float* a [[buffer(1)]],
+    device const float* dt_bias [[buffer(2)]],
+    device const float* a_log_exp [[buffer(3)]],
+    device float* beta [[buffer(4)]],
+    device float* g [[buffer(5)]],
+    constant ComputeBetaGParams& params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint t = gid / params.nv;
+    uint h = gid - t * params.nv;
+    uint dst_idx = h * params.seq_len + t;
+    float bv = b[gid];
+    float av = a[gid] + dt_bias[h];
+    beta[dst_idx] = 1.0f / (1.0f + exp(-bv));
+    float sp = (av > 20.0f) ? av : log(1.0f + exp(av));
+    g[dst_idx] = -sp * a_log_exp[h];
+}
+)CBG";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:145
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile compute-beta-g library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:@"supersonic_compute_beta_g_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:146
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load compute-beta-g function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:147
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create compute-beta-g pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -1967,6 +2200,239 @@ extern "C" int supersonic_metal_split_qgate_f32(
         gate_ptr,
         @"supersonic_split_qgate_f32"
     );
+}
+
+static int supersonic_metal_repeat_interleave_heads_impl(
+    size_t s,
+    size_t n_heads,
+    size_t head_dim,
+    size_t repeats,
+    const void* src_ptr,
+    void* dst_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (s == 0 || n_heads == 0 || head_dim == 0 || repeats == 0) {
+            return 0;
+        }
+        if (s > UINT32_MAX || n_heads > UINT32_MAX || head_dim > UINT32_MAX || repeats > UINT32_MAX ||
+            src_ptr == nullptr || dst_ptr == nullptr) {
+            return 134;
+        }
+        if (n_heads != 0 && repeats > SIZE_MAX / n_heads) {
+            return 135;
+        }
+        size_t dst_heads = n_heads * repeats;
+        if (dst_heads > UINT32_MAX || (s != 0 && dst_heads > SIZE_MAX / s)) {
+            return 135;
+        }
+        if (head_dim != 0 && dst_heads > SIZE_MAX / head_dim) {
+            return 136;
+        }
+        size_t total_elems = s * dst_heads * head_dim;
+        if (total_elems > UINT32_MAX) {
+            return 136;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            repeat_interleave_heads_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 137;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 138;
+        }
+        if (lookup_buffer(dst_ptr, &dst, &dst_offset) != 0) {
+            return 139;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 140;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 141;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 142;
+        }
+
+        RepeatInterleaveHeadsParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(n_heads),
+            static_cast<uint32_t>(head_dim),
+            static_cast<uint32_t>(repeats),
+            static_cast<uint32_t>(dst_heads),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:src offset:src_offset atIndex:0];
+        [encoder setBuffer:dst offset:dst_offset atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 143;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_repeat_interleave_heads_bf16(
+    size_t s,
+    size_t n_heads,
+    size_t head_dim,
+    size_t repeats,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_repeat_interleave_heads_impl(
+        s,
+        n_heads,
+        head_dim,
+        repeats,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_repeat_interleave_heads_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_repeat_interleave_heads_f32(
+    size_t s,
+    size_t n_heads,
+    size_t head_dim,
+    size_t repeats,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_repeat_interleave_heads_impl(
+        s,
+        n_heads,
+        head_dim,
+        repeats,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_repeat_interleave_heads_f32"
+    );
+}
+
+extern "C" int supersonic_metal_compute_beta_g_f32(
+    size_t seq_len,
+    size_t nv,
+    const void* b_ptr,
+    const void* a_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_exp_ptr,
+    void* beta_ptr,
+    void* g_ptr
+) {
+    @autoreleasepool {
+        if (seq_len == 0 || nv == 0) {
+            return 0;
+        }
+        if (seq_len > UINT32_MAX || nv > UINT32_MAX || b_ptr == nullptr || a_ptr == nullptr ||
+            dt_bias_ptr == nullptr || a_log_exp_ptr == nullptr || beta_ptr == nullptr || g_ptr == nullptr) {
+            return 144;
+        }
+        size_t total_elems = seq_len * nv;
+        if (total_elems > UINT32_MAX || (nv != 0 && total_elems / nv != seq_len)) {
+            return 145;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = compute_beta_g_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 146;
+        }
+
+        id<MTLBuffer> b = nil;
+        id<MTLBuffer> a = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log_exp = nil;
+        id<MTLBuffer> beta = nil;
+        id<MTLBuffer> g = nil;
+        size_t b_offset = 0;
+        size_t a_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_exp_offset = 0;
+        size_t beta_offset = 0;
+        size_t g_offset = 0;
+        if (lookup_buffer(b_ptr, &b, &b_offset) != 0) {
+            return 147;
+        }
+        if (lookup_buffer(a_ptr, &a, &a_offset) != 0) {
+            return 148;
+        }
+        if (lookup_buffer(dt_bias_ptr, &dt_bias, &dt_bias_offset) != 0) {
+            return 149;
+        }
+        if (lookup_buffer(a_log_exp_ptr, &a_log_exp, &a_log_exp_offset) != 0) {
+            return 150;
+        }
+        if (lookup_buffer(beta_ptr, &beta, &beta_offset) != 0) {
+            return 151;
+        }
+        if (lookup_buffer(g_ptr, &g, &g_offset) != 0) {
+            return 152;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 153;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 154;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 155;
+        }
+
+        ComputeBetaGParams params = {
+            static_cast<uint32_t>(seq_len),
+            static_cast<uint32_t>(nv),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:b offset:b_offset atIndex:0];
+        [encoder setBuffer:a offset:a_offset atIndex:1];
+        [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:2];
+        [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:3];
+        [encoder setBuffer:beta offset:beta_offset atIndex:4];
+        [encoder setBuffer:g offset:g_offset atIndex:5];
+        [encoder setBytes:&params length:sizeof(params) atIndex:6];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 156;
+        }
+        return 0;
+    }
 }
 
 extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(

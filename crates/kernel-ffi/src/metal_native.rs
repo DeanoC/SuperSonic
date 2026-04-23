@@ -145,6 +145,32 @@ unsafe extern "C" {
         query_ptr: *mut c_void,
         gate_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_repeat_interleave_heads_bf16(
+        s: usize,
+        n_heads: usize,
+        head_dim: usize,
+        repeats: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_repeat_interleave_heads_f32(
+        s: usize,
+        n_heads: usize,
+        head_dim: usize,
+        repeats: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_compute_beta_g_f32(
+        seq_len: usize,
+        nv: usize,
+        b_ptr: *const c_void,
+        a_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_exp_ptr: *const c_void,
+        beta_ptr: *mut c_void,
+        g_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -682,6 +708,139 @@ pub(crate) fn split_qgate(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn repeat_interleave_heads(
+    dtype: ScalarType,
+    s: usize,
+    n_heads: usize,
+    head_dim: usize,
+    repeats: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dst_heads = n_heads.checked_mul(repeats).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native repeat_interleave_heads overflows: n_heads={n_heads} repeats={repeats}"
+        ))
+    })?;
+    let total = s
+        .checked_mul(dst_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "metal native repeat_interleave_heads shape overflows: s={s} dst_heads={dst_heads} head_dim={head_dim}"
+            ))
+        })?;
+    if total > u32::MAX as usize
+        || s > u32::MAX as usize
+        || n_heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+        || repeats > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native repeat_interleave_heads supports u32-sized shapes, got s={s} n_heads={n_heads} head_dim={head_dim} repeats={repeats}"
+        )));
+    }
+    if src.dtype() != dtype || dst.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native repeat_interleave_heads expects dtype {dtype:?}, got src={:?} dst={:?}",
+            src.dtype(),
+            dst.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_repeat_interleave_heads_bf16(
+                s,
+                n_heads,
+                head_dim,
+                repeats,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_repeat_interleave_heads_f32(
+                s,
+                n_heads,
+                head_dim,
+                repeats,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native repeat_interleave_heads does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native repeat_interleave_heads failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn compute_beta_g_f32(
+    seq_len: usize,
+    nv: usize,
+    b: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    beta: &mut GpuBuffer,
+    g: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total = seq_len.checked_mul(nv).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native compute_beta_g_f32 shape overflows: seq_len={seq_len} nv={nv}"
+        ))
+    })?;
+    if total > u32::MAX as usize || seq_len > u32::MAX as usize || nv > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native compute_beta_g_f32 supports u32-sized shapes, got seq_len={seq_len} nv={nv}"
+        )));
+    }
+    if b.dtype() != ScalarType::F32
+        || a.dtype() != ScalarType::F32
+        || dt_bias.dtype() != ScalarType::F32
+        || a_log_exp.dtype() != ScalarType::F32
+        || beta.dtype() != ScalarType::F32
+        || g.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native compute_beta_g_f32 expects F32 buffers, got b={:?} a={:?} dt_bias={:?} a_log_exp={:?} beta={:?} g={:?}",
+            b.dtype(),
+            a.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            beta.dtype(),
+            g.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        supersonic_metal_compute_beta_g_f32(
+            seq_len,
+            nv,
+            b.as_ptr(),
+            a.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            beta.as_mut_ptr(),
+            g.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native compute_beta_g_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -825,6 +984,37 @@ pub(crate) fn split_qgate(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native split_qgate is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn repeat_interleave_heads(
+    _dtype: ScalarType,
+    _s: usize,
+    _n_heads: usize,
+    _head_dim: usize,
+    _repeats: usize,
+    _src: &GpuBuffer,
+    _dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native repeat_interleave_heads is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn compute_beta_g_f32(
+    _seq_len: usize,
+    _nv: usize,
+    _b: &GpuBuffer,
+    _a: &GpuBuffer,
+    _dt_bias: &GpuBuffer,
+    _a_log_exp: &GpuBuffer,
+    _beta: &mut GpuBuffer,
+    _g: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native compute_beta_g_f32 is not compiled".into(),
     ))
 }
 
@@ -1340,5 +1530,119 @@ mod tests {
             .expect("run f32 split_qgate");
         assert_eq!(read_f32(&query), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(read_f32(&gate), vec![11.0, 12.0, 13.0, 14.0]);
+    }
+
+    #[test]
+    fn metal_native_repeat_interleave_heads_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 2, 2],
+            &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]),
+        )
+        .expect("upload f32 input");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 6, 2]).expect("allocate f32 out");
+        repeat_interleave_heads(ScalarType::F32, 2, 2, 2, 3, &input, &mut out)
+            .expect("run f32 repeat_interleave_heads");
+        assert_eq!(
+            read_f32(&out),
+            vec![
+                1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 10.0, 20.0, 10.0,
+                20.0, 10.0, 20.0, 30.0, 40.0, 30.0, 40.0, 30.0, 40.0
+            ]
+        );
+    }
+
+    #[test]
+    fn metal_native_compute_beta_g_f32_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let seq_len = 3usize;
+        let nv = 2usize;
+        let b_vals = vec![0.0f32, 1.0, -1.0, 2.0, 3.0, -2.0];
+        let a_vals = vec![0.5f32, -0.5, 1.0, -1.0, 2.0, -2.0];
+        let dt_bias_vals = vec![0.1f32, -0.2];
+        let a_log_exp_vals = vec![1.5f32, 0.75];
+
+        let b = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[seq_len, nv],
+            &f32_bytes(&b_vals),
+        )
+        .expect("upload b");
+        let a = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[seq_len, nv],
+            &f32_bytes(&a_vals),
+        )
+        .expect("upload a");
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[nv],
+            &f32_bytes(&dt_bias_vals),
+        )
+        .expect("upload dt_bias");
+        let a_log_exp = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[nv],
+            &f32_bytes(&a_log_exp_vals),
+        )
+        .expect("upload a_log_exp");
+        let mut beta_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc beta native");
+        let mut g_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g native");
+        let mut beta_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc beta ref");
+        let mut g_ref = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g ref");
+
+        crate::metal_host::compute_beta_g(
+            ScalarType::F32,
+            seq_len,
+            nv,
+            &b,
+            &a,
+            &dt_bias,
+            &a_log_exp,
+            &mut beta_ref,
+            &mut g_ref,
+        )
+        .expect("host compute_beta_g");
+        compute_beta_g_f32(
+            seq_len,
+            nv,
+            &b,
+            &a,
+            &dt_bias,
+            &a_log_exp,
+            &mut beta_native,
+            &mut g_native,
+        )
+        .expect("native compute_beta_g");
+
+        let beta_ref_vals = read_f32(&beta_ref);
+        let beta_native_vals = read_f32(&beta_native);
+        let g_ref_vals = read_f32(&g_ref);
+        let g_native_vals = read_f32(&g_native);
+        for (idx, (a, e)) in beta_native_vals.iter().zip(beta_ref_vals.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-6,
+                "beta idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+        for (idx, (a, e)) in g_native_vals.iter().zip(g_ref_vals.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(delta <= 1e-6, "g idx {idx}: expected {e}, got {a}, delta {delta}");
+        }
     }
 }

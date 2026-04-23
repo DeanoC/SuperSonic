@@ -1735,6 +1735,13 @@ pub fn compute_beta_g(
 ) -> Result<(), GpuError> {
     if beta.backend() == Backend::Metal {
         let _ = ordinal;
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && metal_native::compute_beta_g_f32(seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
+                .is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g);
     }
     let status = unsafe {
@@ -1859,6 +1866,12 @@ pub fn repeat_interleave_heads(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && metal_native::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
+                .is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst);
     }
     let status = unsafe {
