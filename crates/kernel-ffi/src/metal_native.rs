@@ -111,6 +111,24 @@ unsafe extern "C" {
         src_ptr: *const c_void,
         dst_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_split_qkv_bf16(
+        s: usize,
+        key_dim: usize,
+        val_dim: usize,
+        src_ptr: *const c_void,
+        q_ptr: *mut c_void,
+        k_ptr: *mut c_void,
+        v_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_split_qkv_f32(
+        s: usize,
+        key_dim: usize,
+        val_dim: usize,
+        src_ptr: *const c_void,
+        q_ptr: *mut c_void,
+        k_ptr: *mut c_void,
+        v_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -500,6 +518,85 @@ pub(crate) fn transpose_shd_hsd(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn split_qkv(
+    dtype: ScalarType,
+    s: usize,
+    key_dim: usize,
+    val_dim: usize,
+    src: &GpuBuffer,
+    q: &mut GpuBuffer,
+    k: &mut GpuBuffer,
+    v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let src_stride = key_dim
+        .checked_mul(2)
+        .and_then(|v| v.checked_add(val_dim))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "metal native split_qkv shape overflows: s={s} key_dim={key_dim} val_dim={val_dim}"
+            ))
+        })?;
+    let total = s.checked_mul(src_stride).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native split_qkv total overflows: s={s} stride={src_stride}"
+        ))
+    })?;
+    if total > u32::MAX as usize
+        || s > u32::MAX as usize
+        || key_dim > u32::MAX as usize
+        || val_dim > u32::MAX as usize
+        || src_stride > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native split_qkv supports u32-sized shapes, got s={s} key_dim={key_dim} val_dim={val_dim}"
+        )));
+    }
+    if src.dtype() != dtype || q.dtype() != dtype || k.dtype() != dtype || v.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native split_qkv expects dtype {dtype:?}, got src={:?} q={:?} k={:?} v={:?}",
+            src.dtype(),
+            q.dtype(),
+            k.dtype(),
+            v.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_split_qkv_bf16(
+                s,
+                key_dim,
+                val_dim,
+                src.as_ptr(),
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_split_qkv_f32(
+                s,
+                key_dim,
+                val_dim,
+                src.as_ptr(),
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native split_qkv does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native split_qkv failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -612,6 +709,22 @@ pub(crate) fn transpose_shd_hsd(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native transpose_shd_hsd is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn split_qkv(
+    _dtype: ScalarType,
+    _s: usize,
+    _key_dim: usize,
+    _val_dim: usize,
+    _src: &GpuBuffer,
+    _q: &mut GpuBuffer,
+    _k: &mut GpuBuffer,
+    _v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native split_qkv is not compiled".into(),
     ))
 }
 
@@ -1040,5 +1153,45 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2, 2]).expect("allocate f32 out");
         transpose_shd_hsd(ScalarType::F32, 2, 2, 2, &input, &mut out).expect("run f32 transpose");
         assert_eq!(read_f32(&out), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn metal_native_split_qkv_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 5],
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]),
+        )
+        .expect("upload bf16 input");
+        let mut q = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 2]).expect("allocate bf16 q");
+        let mut k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 2]).expect("allocate bf16 k");
+        let mut v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 1]).expect("allocate bf16 v");
+        split_qkv(ScalarType::BF16, 2, 2, 1, &input, &mut q, &mut k, &mut v)
+            .expect("run bf16 split_qkv");
+        assert_eq!(read_bf16(&q), vec![1.0, 2.0, 10.0, 20.0]);
+        assert_eq!(read_bf16(&k), vec![3.0, 4.0, 30.0, 40.0]);
+        assert_eq!(read_bf16(&v), vec![5.0, 50.0]);
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 7],
+            &f32_bytes(&[
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0,
+            ]),
+        )
+        .expect("upload f32 input");
+        let mut q = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("allocate f32 q");
+        let mut k = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("allocate f32 k");
+        let mut v = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate f32 v");
+        split_qkv(ScalarType::F32, 2, 2, 3, &input, &mut q, &mut k, &mut v)
+            .expect("run f32 split_qkv");
+        assert_eq!(read_f32(&q), vec![1.0, 2.0, 11.0, 12.0]);
+        assert_eq!(read_f32(&k), vec![3.0, 4.0, 13.0, 14.0]);
+        assert_eq!(read_f32(&v), vec![5.0, 6.0, 7.0, 15.0, 16.0, 17.0]);
     }
 }

@@ -60,6 +60,14 @@ struct TransposeShdHsdParams {
     uint32_t total_elems;
 };
 
+struct SplitQkvParams {
+    uint32_t s;
+    uint32_t key_dim;
+    uint32_t val_dim;
+    uint32_t src_stride;
+    uint32_t total_elems;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -985,6 +993,134 @@ kernel void supersonic_transpose_shd_hsd_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> split_qkv_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_split_qkv_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:111
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"SQKV(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SplitQkvParams {
+    uint s;
+    uint key_dim;
+    uint val_dim;
+    uint src_stride;
+    uint total_elems;
+};
+
+kernel void supersonic_split_qkv_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* q [[buffer(1)]],
+    device bfloat* k [[buffer(2)]],
+    device bfloat* v [[buffer(3)]],
+    constant SplitQkvParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint row = gid / params.src_stride;
+    uint col = gid - row * params.src_stride;
+    if (col < params.key_dim) {
+        q[row * params.key_dim + col] = src[gid];
+    } else if (col < params.key_dim * 2) {
+        k[row * params.key_dim + col - params.key_dim] = src[gid];
+    } else {
+        v[row * params.val_dim + col - params.key_dim * 2] = src[gid];
+    }
+}
+
+kernel void supersonic_split_qkv_f32(
+    device const float* src [[buffer(0)]],
+    device float* q [[buffer(1)]],
+    device float* k [[buffer(2)]],
+    device float* v [[buffer(3)]],
+    constant SplitQkvParams& params [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint row = gid / params.src_stride;
+    uint col = gid - row * params.src_stride;
+    if (col < params.key_dim) {
+        q[row * params.key_dim + col] = src[gid];
+    } else if (col < params.key_dim * 2) {
+        k[row * params.key_dim + col - params.key_dim] = src[gid];
+    } else {
+        v[row * params.val_dim + col - params.key_dim * 2] = src[gid];
+    }
+}
+)SQKV";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:112
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile split-qkv library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:113
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load split-qkv function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:114
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create split-qkv pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -1421,6 +1557,148 @@ extern "C" int supersonic_metal_transpose_shd_hsd_f32(
         src_ptr,
         dst_ptr,
         @"supersonic_transpose_shd_hsd_f32"
+    );
+}
+
+static int supersonic_metal_split_qkv_impl(
+    size_t s,
+    size_t key_dim,
+    size_t val_dim,
+    const void* src_ptr,
+    void* q_ptr,
+    void* k_ptr,
+    void* v_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (s == 0 || (key_dim == 0 && val_dim == 0)) {
+            return 0;
+        }
+        if (s > UINT32_MAX || key_dim > UINT32_MAX || val_dim > UINT32_MAX || src_ptr == nullptr ||
+            q_ptr == nullptr || k_ptr == nullptr || v_ptr == nullptr) {
+            return 111;
+        }
+        if (key_dim > (SIZE_MAX - val_dim) / 2) {
+            return 112;
+        }
+        size_t src_stride = key_dim * 2 + val_dim;
+        if (src_stride > UINT32_MAX || src_stride < key_dim || src_stride < val_dim) {
+            return 112;
+        }
+        size_t total_elems = s * src_stride;
+        if (total_elems > UINT32_MAX || (src_stride != 0 && total_elems / src_stride != s)) {
+            return 113;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = split_qkv_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 114;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> q = nil;
+        id<MTLBuffer> k = nil;
+        id<MTLBuffer> v = nil;
+        size_t src_offset = 0;
+        size_t q_offset = 0;
+        size_t k_offset = 0;
+        size_t v_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 115;
+        }
+        if (lookup_buffer(q_ptr, &q, &q_offset) != 0) {
+            return 116;
+        }
+        if (lookup_buffer(k_ptr, &k, &k_offset) != 0) {
+            return 117;
+        }
+        if (lookup_buffer(v_ptr, &v, &v_offset) != 0) {
+            return 118;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 119;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 120;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 121;
+        }
+
+        SplitQkvParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(key_dim),
+            static_cast<uint32_t>(val_dim),
+            static_cast<uint32_t>(src_stride),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:src offset:src_offset atIndex:0];
+        [encoder setBuffer:q offset:q_offset atIndex:1];
+        [encoder setBuffer:k offset:k_offset atIndex:2];
+        [encoder setBuffer:v offset:v_offset atIndex:3];
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 122;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_split_qkv_bf16(
+    size_t s,
+    size_t key_dim,
+    size_t val_dim,
+    const void* src_ptr,
+    void* q_ptr,
+    void* k_ptr,
+    void* v_ptr
+) {
+    return supersonic_metal_split_qkv_impl(
+        s,
+        key_dim,
+        val_dim,
+        src_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        @"supersonic_split_qkv_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_split_qkv_f32(
+    size_t s,
+    size_t key_dim,
+    size_t val_dim,
+    const void* src_ptr,
+    void* q_ptr,
+    void* k_ptr,
+    void* v_ptr
+) {
+    return supersonic_metal_split_qkv_impl(
+        s,
+        key_dim,
+        val_dim,
+        src_ptr,
+        q_ptr,
+        k_ptr,
+        v_ptr,
+        @"supersonic_split_qkv_f32"
     );
 }
 

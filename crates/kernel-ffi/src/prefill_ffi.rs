@@ -39,6 +39,10 @@ fn metal_force_host_transpose_shd_hsd() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_TRANSPOSE_SHD_HSD").is_some()
 }
 
+fn metal_force_host_split_qkv() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_SPLIT_QKV").is_some()
+}
+
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
@@ -1791,6 +1795,12 @@ pub fn split_qkv(
 ) -> Result<(), GpuError> {
     if q.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_split_qkv()
+            && metal_native::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v);
     }
     let status = unsafe {
