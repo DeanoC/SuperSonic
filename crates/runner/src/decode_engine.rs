@@ -3636,7 +3636,7 @@ impl DecodeEngine {
                     num_q_heads / num_kv_heads,
                     1.0 / (head_dim as f32).sqrt(),
                     score_scratch,
-                    attn_out_f32,
+                    attn_out_bf16,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
                 if let Some(t) = timings.as_mut() {
@@ -3746,7 +3746,7 @@ impl DecodeEngine {
                     num_q_heads / num_kv_heads,
                     1.0 / (head_dim as f32).sqrt(),
                     score_scratch,
-                    attn_out_f32,
+                    attn_out_bf16,
                 )
                 .map_err(|e| {
                     anyhow::anyhow!("layer {idx} certified KV decode INT4 attention: {e}")
@@ -3754,19 +3754,6 @@ impl DecodeEngine {
                 if let Some(t) = timings.as_mut() {
                     t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
                 }
-            }
-            let cast_start = Instant::now();
-            kernel_ffi::prefill_ffi::cast(
-                self.ordinal,
-                ScalarType::F32,
-                ScalarType::BF16,
-                num_q_heads * head_dim,
-                attn_out_f32,
-                attn_out_bf16,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attn cast: {e}"))?;
-            if let Some(t) = timings.as_mut() {
-                t.certified_kv_cast_ms += cast_start.elapsed().as_secs_f64() * 1000.0;
             }
             if has_attn_gate {
                 kernel_ffi::prefill_ffi::transpose_shd_hsd(

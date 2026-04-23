@@ -161,6 +161,36 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        value_int4: *const c_void,
+        value_scale: *const c_void,
+        value_zero: *const c_void,
+        tail_key_bf16: *const c_void,
+        tail_value_bf16: *const c_void,
+        score_scratch: *mut c_void,
+        output_bf16: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        tail_len: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
+        value_stride_tokens: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
+        tail_value_start_tokens: c_int,
+        tail_value_stride_tokens: c_int,
+        score_stride_tokens: c_int,
+        head_dim: c_int,
+        value_group_size: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
 
     fn dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
         device_ordinal: usize,
@@ -171,6 +201,30 @@ unsafe extern "C" {
         tail_key_bf16: *const c_void,
         score_scratch: *mut c_void,
         output_f32: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        tail_len: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
+        score_stride_tokens: c_int,
+        value_stride_tokens: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        value_bf16: *const c_void,
+        tail_key_bf16: *const c_void,
+        score_scratch: *mut c_void,
+        output_bf16: *mut c_void,
         q_heads: c_int,
         kv_heads: c_int,
         num_blocks: c_int,
@@ -1203,10 +1257,10 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
         || value_scale.dtype() != ScalarType::F16
         || value_zero.dtype() != ScalarType::F16
         || score_scratch.dtype() != ScalarType::F32
-        || output_f32.dtype() != ScalarType::F32
+        || (output_f32.dtype() != ScalarType::F32 && output_f32.dtype() != ScalarType::BF16)
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV strided hybrid dtypes must be BF16/U8/F32/U8/F16/F16/F32/F32, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            "certified KV strided hybrid dtypes must be BF16/U8/F32/U8/F16/F16/F32/F32-or-BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
             query_bf16.dtype(),
             key_int8.dtype(),
             key_scale.dtype(),
@@ -1343,36 +1397,69 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                let status = dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
-                    ordinal,
-                    query_bf16.as_ptr(),
-                    key_int8.as_ptr(),
-                    key_scale.as_ptr(),
-                    value_int4.as_ptr(),
-                    value_scale.as_ptr(),
-                    value_zero.as_ptr(),
-                    tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
-                    tail_value_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
-                    score_scratch.as_mut_ptr(),
-                    output_f32.as_mut_ptr(),
-                    q_heads as c_int,
-                    kv_heads as c_int,
-                    num_blocks as c_int,
-                    block_size as c_int,
-                    tail_len as c_int,
-                    key_stride_tokens as c_int,
-                    key_scale_stride_blocks as c_int,
-                    value_stride_tokens as c_int,
-                    tail_key_start as c_int,
-                    tail_key_stride as c_int,
-                    tail_value_start as c_int,
-                    tail_value_stride as c_int,
-                    score_scratch.shape()[1] as c_int,
-                    head_dim as c_int,
-                    value_group_size as c_int,
-                    gqa_group as c_int,
-                    q_scale,
-                );
+                let status = if output_f32.dtype() == ScalarType::BF16 {
+                    dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
+                        ordinal,
+                        query_bf16.as_ptr(),
+                        key_int8.as_ptr(),
+                        key_scale.as_ptr(),
+                        value_int4.as_ptr(),
+                        value_scale.as_ptr(),
+                        value_zero.as_ptr(),
+                        tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                        tail_value_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                        score_scratch.as_mut_ptr(),
+                        output_f32.as_mut_ptr(),
+                        q_heads as c_int,
+                        kv_heads as c_int,
+                        num_blocks as c_int,
+                        block_size as c_int,
+                        tail_len as c_int,
+                        key_stride_tokens as c_int,
+                        key_scale_stride_blocks as c_int,
+                        value_stride_tokens as c_int,
+                        tail_key_start as c_int,
+                        tail_key_stride as c_int,
+                        tail_value_start as c_int,
+                        tail_value_stride as c_int,
+                        score_scratch.shape()[1] as c_int,
+                        head_dim as c_int,
+                        value_group_size as c_int,
+                        gqa_group as c_int,
+                        q_scale,
+                    )
+                } else {
+                    dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+                        ordinal,
+                        query_bf16.as_ptr(),
+                        key_int8.as_ptr(),
+                        key_scale.as_ptr(),
+                        value_int4.as_ptr(),
+                        value_scale.as_ptr(),
+                        value_zero.as_ptr(),
+                        tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                        tail_value_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                        score_scratch.as_mut_ptr(),
+                        output_f32.as_mut_ptr(),
+                        q_heads as c_int,
+                        kv_heads as c_int,
+                        num_blocks as c_int,
+                        block_size as c_int,
+                        tail_len as c_int,
+                        key_stride_tokens as c_int,
+                        key_scale_stride_blocks as c_int,
+                        value_stride_tokens as c_int,
+                        tail_key_start as c_int,
+                        tail_key_stride as c_int,
+                        tail_value_start as c_int,
+                        tail_value_stride as c_int,
+                        score_scratch.shape()[1] as c_int,
+                        head_dim as c_int,
+                        value_group_size as c_int,
+                        gqa_group as c_int,
+                        q_scale,
+                    )
+                };
                 if status != 0 {
                     return Err(certified_kv_error(
                         Backend::Cuda,
@@ -1451,10 +1538,10 @@ pub fn attend_int8_bf16_values_strided(
         || key_scale.dtype() != ScalarType::F32
         || value_bf16.dtype() != ScalarType::BF16
         || score_scratch.dtype() != ScalarType::F32
-        || output_f32.dtype() != ScalarType::F32
+        || (output_f32.dtype() != ScalarType::F32 && output_f32.dtype() != ScalarType::BF16)
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV strided INT8/BF16-value dtypes must be BF16/U8/F32/BF16/F32/F32, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            "certified KV strided INT8/BF16-value dtypes must be BF16/U8/F32/BF16/F32/F32-or-BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
             query_bf16.dtype(),
             key_int8.dtype(),
             key_scale.dtype(),
@@ -1604,30 +1691,57 @@ pub fn attend_int8_bf16_values_strided(
             {
                 let tail_key_ptr = tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr);
                 let status = unsafe {
-                    dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
-                        ordinal,
-                        query_bf16.as_ptr(),
-                        key_int8.as_ptr(),
-                        key_scale.as_ptr(),
-                        value_bf16.as_ptr(),
-                        tail_key_ptr,
-                        score_scratch.as_mut_ptr(),
-                        output_f32.as_mut_ptr(),
-                        q_heads as c_int,
-                        kv_heads as c_int,
-                        num_blocks as c_int,
-                        block_size as c_int,
-                        tail_len as c_int,
-                        key_stride_tokens as c_int,
-                        key_scale_stride_blocks as c_int,
-                        tail_key_start_tokens as c_int,
-                        tail_key_stride_tokens as c_int,
-                        score_stride_tokens as c_int,
-                        value_stride_tokens as c_int,
-                        head_dim as c_int,
-                        gqa_group as c_int,
-                        q_scale,
-                    )
+                    if output_f32.dtype() == ScalarType::BF16 {
+                        dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
+                            ordinal,
+                            query_bf16.as_ptr(),
+                            key_int8.as_ptr(),
+                            key_scale.as_ptr(),
+                            value_bf16.as_ptr(),
+                            tail_key_ptr,
+                            score_scratch.as_mut_ptr(),
+                            output_f32.as_mut_ptr(),
+                            q_heads as c_int,
+                            kv_heads as c_int,
+                            num_blocks as c_int,
+                            block_size as c_int,
+                            tail_len as c_int,
+                            key_stride_tokens as c_int,
+                            key_scale_stride_blocks as c_int,
+                            tail_key_start_tokens as c_int,
+                            tail_key_stride_tokens as c_int,
+                            score_stride_tokens as c_int,
+                            value_stride_tokens as c_int,
+                            head_dim as c_int,
+                            gqa_group as c_int,
+                            q_scale,
+                        )
+                    } else {
+                        dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
+                            ordinal,
+                            query_bf16.as_ptr(),
+                            key_int8.as_ptr(),
+                            key_scale.as_ptr(),
+                            value_bf16.as_ptr(),
+                            tail_key_ptr,
+                            score_scratch.as_mut_ptr(),
+                            output_f32.as_mut_ptr(),
+                            q_heads as c_int,
+                            kv_heads as c_int,
+                            num_blocks as c_int,
+                            block_size as c_int,
+                            tail_len as c_int,
+                            key_stride_tokens as c_int,
+                            key_scale_stride_blocks as c_int,
+                            tail_key_start_tokens as c_int,
+                            tail_key_stride_tokens as c_int,
+                            score_stride_tokens as c_int,
+                            value_stride_tokens as c_int,
+                            head_dim as c_int,
+                            gqa_group as c_int,
+                            q_scale,
+                        )
+                    }
                 };
                 if status != 0 {
                     return Err(certified_kv_error(
@@ -1688,6 +1802,13 @@ mod tests {
         bytes
             .chunks_exact(2)
             .map(|chunk| f16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    fn bf16s(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect()
     }
 
@@ -2219,6 +2340,37 @@ mod tests {
                 "tail should dominate strided INT4 hybrid softmax: got={value} expected={expected}"
             );
         }
+
+        let mut score_scratch =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 4]).expect("score_scratch bf16");
+        let mut output_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, 4]).expect("output bf16");
+        attend_int8_int4_with_bf16_tail_strided(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &value_i4,
+            &value_scale,
+            &value_zero,
+            Some(&tail_key),
+            Some(&tail_value),
+            3,
+            2,
+            2,
+            1,
+            1.0,
+            &mut score_scratch,
+            &mut output_bf16,
+        )
+        .expect("strided hybrid attend bf16 output");
+        let out = bf16s(&output_bf16.to_host_bytes().expect("download bf16 output"));
+        for (value, expected) in out.iter().zip([7.0_f32, 8.0, 9.0, 10.0]) {
+            assert!(
+                (value - expected).abs() < 0.02,
+                "tail should dominate strided INT4 hybrid BF16 output: got={value} expected={expected}"
+            );
+        }
     }
 
     #[test]
@@ -2360,6 +2512,33 @@ mod tests {
             assert!(
                 (value - expected).abs() < 0.01,
                 "tail should dominate strided INT8-key/BF16-value softmax: got={value} expected={expected}"
+            );
+        }
+
+        let mut score_scratch =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 3]).expect("score_scratch bf16");
+        let mut output_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 4]).expect("output bf16");
+        attend_int8_bf16_values_strided(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &values,
+            Some(&tail_key),
+            3,
+            2,
+            1,
+            1.0,
+            &mut score_scratch,
+            &mut output_bf16,
+        )
+        .expect("attend int8 keys with strided bf16 values and bf16 output");
+        let out = bf16s(&output_bf16.to_host_bytes().expect("download bf16 output"));
+        for (value, expected) in out.iter().zip([9.0_f32, 10.0, 11.0, 12.0]) {
+            assert!(
+                (value - expected).abs() < 0.02,
+                "tail should dominate strided INT8-key/BF16-value BF16 output: got={value} expected={expected}"
             );
         }
     }
