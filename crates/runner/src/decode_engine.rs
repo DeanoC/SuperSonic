@@ -2294,11 +2294,23 @@ impl DecodeEngine {
             let attn_flat = &mut scratch.attn_flat;
             let gated = &mut scratch.gated;
             let proj_out = &mut scratch.proj_out;
+            let mixed_lhs = if use_late_q_mixed || use_late_k_mixed || use_late_v_mixed {
+                prefill_engine::prepare_int8_mixed_lhs(
+                    self.ordinal,
+                    1,
+                    1,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                )?
+            } else {
+                None
+            };
 
             let proj_start = Instant::now();
             if use_late_q_mixed {
             if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_host(
+                prefill_engine::matmul_int8_mixed_prepared_host(
                     self.ordinal,
                     1,
                     1,
@@ -2310,6 +2322,7 @@ impl DecodeEngine {
                     &fw.q_proj_w,
                     sc,
                     q_full,
+                    mixed_lhs.as_ref(),
                 )?;
             } else {
                 matmul_proj(
@@ -2349,7 +2362,7 @@ impl DecodeEngine {
 
         if use_late_k_mixed {
             if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_host(
+                prefill_engine::matmul_int8_mixed_prepared_host(
                     self.ordinal,
                     1,
                     1,
@@ -2361,6 +2374,7 @@ impl DecodeEngine {
                     &fw.k_proj_w,
                     sc,
                     k_buf,
+                    mixed_lhs.as_ref(),
                 )?;
             } else {
                 matmul_proj(
@@ -2378,7 +2392,7 @@ impl DecodeEngine {
         }
         if use_late_v_mixed {
             if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_host(
+                prefill_engine::matmul_int8_mixed_prepared_host(
                     self.ordinal,
                     1,
                     1,
@@ -2390,6 +2404,7 @@ impl DecodeEngine {
                     &fw.v_proj_w,
                     sc,
                     v_buf,
+                    mixed_lhs.as_ref(),
                 )?;
             } else {
                 matmul_proj(

@@ -71,26 +71,24 @@ fn host_bf16_addmm_inplace(
     }
 }
 
-pub(crate) fn matmul_int8_mixed_host(
+pub(crate) struct Int8MixedLhs {
+    rows: usize,
+    k: usize,
+    lhs_host: Vec<f32>,
+    outlier_cols: Vec<usize>,
+    lhs_zeroed_gpu: Option<GpuBuffer>,
+}
+
+pub(crate) fn prepare_int8_mixed_lhs(
     ordinal: usize,
     batch: usize,
     m: usize,
-    n: usize,
     k: usize,
     lhs: &GpuBuffer,
     weights: &Qwen35Weights,
-    weight_name: &str,
-    weight: &GpuBuffer,
-    int8_scale: &GpuBuffer,
-    out: &mut GpuBuffer,
-) -> Result<()> {
-    let Some(store) = weights.int8_baked_store.as_ref() else {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
-    };
-    if weights.int8_outlier_threshold <= 0.0 {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+) -> Result<Option<Int8MixedLhs>> {
+    if weights.int8_baked_store.is_none() || weights.int8_outlier_threshold <= 0.0 {
+        return Ok(None);
     }
 
     let rows = batch * m;
@@ -100,8 +98,13 @@ pub(crate) fn matmul_int8_mixed_host(
     );
     let outlier_cols = detect_outlier_cols(&lhs_host, rows, k, weights.int8_outlier_threshold);
     if outlier_cols.is_empty() {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+        return Ok(Some(Int8MixedLhs {
+            rows,
+            k,
+            lhs_host,
+            outlier_cols,
+            lhs_zeroed_gpu: None,
+        }));
     }
 
     let mut lhs_zeroed = lhs_host.clone();
@@ -117,13 +120,91 @@ pub(crate) fn matmul_int8_mixed_host(
         &encode_bf16_le(&lhs_zeroed),
     )
     .map_err(|e| anyhow::anyhow!("int8 mixed lhs_zeroed H2D: {e}"))?;
+
+    Ok(Some(Int8MixedLhs {
+        rows,
+        k,
+        lhs_host,
+        outlier_cols,
+        lhs_zeroed_gpu: Some(lhs_zeroed_gpu),
+    }))
+}
+
+pub(crate) fn matmul_int8_mixed_host(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weights: &Qwen35Weights,
+    weight_name: &str,
+    weight: &GpuBuffer,
+    int8_scale: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<()> {
+    matmul_int8_mixed_prepared_host(
+        ordinal, batch, m, n, k, lhs, weights, weight_name, weight, int8_scale, out, None,
+    )
+}
+
+pub(crate) fn matmul_int8_mixed_prepared_host(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weights: &Qwen35Weights,
+    weight_name: &str,
+    weight: &GpuBuffer,
+    int8_scale: &GpuBuffer,
+    out: &mut GpuBuffer,
+    prepared_lhs: Option<&Int8MixedLhs>,
+) -> Result<()> {
+    let Some(store) = weights.int8_baked_store.as_ref() else {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    };
+    if weights.int8_outlier_threshold <= 0.0 {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    }
+
+    let owned_prepared;
+    let prepared_lhs = if let Some(prepared_lhs) = prepared_lhs {
+        prepared_lhs
+    } else {
+        owned_prepared = prepare_int8_mixed_lhs(ordinal, batch, m, k, lhs, weights)?;
+        let Some(prepared_lhs) = owned_prepared.as_ref() else {
+            return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+                .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+        };
+        prepared_lhs
+    };
+
+    let rows = batch * m;
+    if prepared_lhs.rows != rows || prepared_lhs.k != k {
+        return Err(anyhow::anyhow!(
+            "int8 mixed prepared lhs shape mismatch: got rows={} k={}, want rows={} k={}",
+            prepared_lhs.rows,
+            prepared_lhs.k,
+            rows,
+            k
+        ));
+    }
+    let Some(lhs_zeroed_gpu) = prepared_lhs.lhs_zeroed_gpu.as_ref() else {
+        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+    };
+    let outlier_cols = &prepared_lhs.outlier_cols;
     prefill_ffi::matmul_rhs_transposed_int8(
         ordinal,
         batch,
         m,
         n,
         k,
-        &lhs_zeroed_gpu,
+        lhs_zeroed_gpu,
         weight,
         int8_scale,
         out,
@@ -148,7 +229,7 @@ pub(crate) fn matmul_int8_mixed_host(
     let mut suba = vec![0.0f32; rows * sub_cols];
     for r in 0..rows {
         for (j, &col) in outlier_cols.iter().enumerate() {
-            suba[r * sub_cols + j] = lhs_host[r * k + col];
+            suba[r * sub_cols + j] = prepared_lhs.lhs_host[r * k + col];
         }
     }
     let mut subb_t = vec![0.0f32; n * sub_cols];
