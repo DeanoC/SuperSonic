@@ -25,6 +25,7 @@ TARGET_PROMPT_TOKENS="${TARGET_PROMPT_TOKENS:-520}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 WARMUP_RUNS="${WARMUP_RUNS:-3}"
 TIMED_RUNS="${TIMED_RUNS:-5}"
+CERTIFIED_KV_SHADOW_VALIDATE="${CERTIFIED_KV_SHADOW_VALIDATE:-0}"
 export SUPERSONIC_BACKENDS="${SUPERSONIC_BACKENDS:-cuda}"
 
 echo "=== SuperSonic sm86 Llama 3.1 8B Certified KV Benchmark ==="
@@ -32,6 +33,7 @@ echo "Target prompt tokens: $TARGET_PROMPT_TOKENS"
 echo "Max new tokens:       $MAX_NEW_TOKENS"
 echo "Warmup runs:          $WARMUP_RUNS"
 echo "Timed runs:           $TIMED_RUNS"
+echo "Shadow validate:      $CERTIFIED_KV_SHADOW_VALIDATE"
 echo ""
 
 echo "--- Building (release) ---"
@@ -42,6 +44,7 @@ SUPERSONIC="$REPO_ROOT/target/release/supersonic"
 
 python3 - "$SUPERSONIC" "$MODEL_DIR" "$TARGET_PROMPT_TOKENS" "$MAX_NEW_TOKENS" "$WARMUP_RUNS" "$TIMED_RUNS" <<'PY'
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -85,6 +88,8 @@ def run_once(prompt: str, run_max_new_tokens: int):
             "--certified-kv-telemetry", telemetry.name,
             "--emit-stage-timings",
         ]
+        if os.environ.get("CERTIFIED_KV_SHADOW_VALIDATE") == "1":
+            cmd.append("--certified-kv-shadow-validate")
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
         if proc.returncode != 0:
             print(proc.stderr, file=sys.stderr)
@@ -159,6 +164,7 @@ lm_head_mean = statistics.mean(r["lm_head_ms"] for r in runs)
 logits_d2h_mean = statistics.mean(r["logits_d2h_ms"] for r in runs)
 host_sampling_mean = statistics.mean(r["host_sampling_ms"] for r in runs)
 rung4_steps = statistics.mean(r["telemetry"].get("rung4_forced_dense_steps", 0) for r in runs)
+shadow_runs = [r["telemetry"] for r in runs if r["telemetry"].get("shadow_layers") is not None]
 
 prefill_toks_s = (prompt_tokens / prefill_mean) * 1000.0 if prefill_mean else 0.0
 decode_toks_s = (generated_tokens / decode_mean) * 1000.0 if decode_mean else 0.0
@@ -175,4 +181,16 @@ print(
     f"rms_norm={rms_mean:.3f} lm_head={lm_head_mean:.3f} logits_d2h={logits_d2h_mean:.3f} "
     f"host_sampling={host_sampling_mean:.3f} forced_rung4_steps={rung4_steps:.1f}"
 )
+if shadow_runs:
+    shadow_layers = statistics.mean(r.get("shadow_layers", 0) for r in shadow_runs)
+    shadow_tokens = statistics.mean(r.get("shadow_aligned_tokens", 0) for r in shadow_runs)
+    shadow_bytes = statistics.mean(r.get("shadow_tier1_bytes", 0) for r in shadow_runs)
+    shadow_ms = statistics.mean(r.get("shadow_quantize_ms", 0.0) for r in shadow_runs)
+    shadow_err = max(r.get("shadow_max_value_error", 0.0) for r in shadow_runs)
+    print(
+        "shadow_mean "
+        f"layers={shadow_layers:.1f} aligned_tokens={shadow_tokens:.1f} "
+        f"tier1_bytes={shadow_bytes:.0f} quantize_ms={shadow_ms:.3f} "
+        f"max_value_error={shadow_err:.6f}"
+    )
 PY

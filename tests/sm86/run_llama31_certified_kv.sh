@@ -32,9 +32,22 @@ ORACLE_DEVICE="${ORACLE_DEVICE:-cuda:0}"
 TIMEOUT="${TIMEOUT:-1200}"
 PROMPT="${PROMPT:-Hello}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-8}"
-TELEMETRY="${CERTIFIED_KV_TELEMETRY:-$(mktemp)}"
+CERTIFIED_KV_SHADOW_VALIDATE="${CERTIFIED_KV_SHADOW_VALIDATE:-0}"
+if [ -n "${CERTIFIED_KV_TELEMETRY:-}" ]; then
+    TELEMETRY="$CERTIFIED_KV_TELEMETRY"
+    TELEMETRY_CREATED=0
+else
+    TELEMETRY="$(mktemp)"
+    TELEMETRY_CREATED=1
+fi
 TMPOUT=$(mktemp)
-trap "rm -f $TMPOUT $TELEMETRY" EXIT
+cleanup() {
+    rm -f "$TMPOUT"
+    if [ "$TELEMETRY_CREATED" = "1" ]; then
+        rm -f "$TELEMETRY"
+    fi
+}
+trap cleanup EXIT
 
 echo "=== SuperSonic E2E Test: sm86 / llama3.1-8b / certified-kv ==="
 echo "Model dir:      $MODEL_DIR"
@@ -43,6 +56,7 @@ echo "Max new tokens: $MAX_NEW_TOKENS"
 echo "Threshold:      $MAX_DELTA_THRESHOLD"
 echo "Oracle device:  $ORACLE_DEVICE"
 echo "Telemetry:      $TELEMETRY"
+echo "Shadow validate:$CERTIFIED_KV_SHADOW_VALIDATE"
 echo ""
 
 echo "--- Building (release) ---"
@@ -52,18 +66,23 @@ echo ""
 SUPERSONIC="$REPO_ROOT/target/release/supersonic"
 
 echo "--- Certified KV dense-fallback Rust/CUDA validation ---"
-if ! timeout "$TIMEOUT" "$SUPERSONIC" \
-    --backend cuda \
-    --oracle-device "$ORACLE_DEVICE" \
-    --model llama3.1-8b \
-    --model-dir "$MODEL_DIR" \
-    --prompt "$PROMPT" \
-    --max-new-tokens "$MAX_NEW_TOKENS" \
-    --int8 \
-    --certified-kv \
-    --certified-kv-telemetry "$TELEMETRY" \
-    --validate \
-    > "$TMPOUT" 2>&1 </dev/null; then
+cmd=(
+    "$SUPERSONIC"
+    --backend cuda
+    --oracle-device "$ORACLE_DEVICE"
+    --model llama3.1-8b
+    --model-dir "$MODEL_DIR"
+    --prompt "$PROMPT"
+    --max-new-tokens "$MAX_NEW_TOKENS"
+    --int8
+    --certified-kv
+    --certified-kv-telemetry "$TELEMETRY"
+    --validate
+)
+if [ "$CERTIFIED_KV_SHADOW_VALIDATE" = "1" ]; then
+    cmd+=(--certified-kv-shadow-validate)
+fi
+if ! timeout "$TIMEOUT" "${cmd[@]}" > "$TMPOUT" 2>&1 </dev/null; then
     cat "$TMPOUT"
     echo ""
     echo "FAIL: process exited non-zero or timed out (${TIMEOUT}s limit)"
