@@ -408,6 +408,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "16", hide = true)]
     certified_kv_value_group_size: usize,
 
+    /// Debug-only: use BF16 values with INT8 keys in the certified KV trace path.
+    #[arg(long, hide = true)]
+    certified_kv_bf16_values: bool,
+
     /// Certified KV adaptive coverage target.
     #[arg(long, default_value = "0.995", hide = true)]
     certified_kv_tau_cov: f32,

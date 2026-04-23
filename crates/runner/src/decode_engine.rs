@@ -1914,7 +1914,7 @@ impl DecodeEngine {
         idx: usize,
         hidden_bytes: &[u8],
         seqlen_offset: usize,
-        certified_kv: Option<(usize, usize)>,
+        certified_kv: Option<(usize, usize, bool)>,
     ) -> Result<FullAttentionLayerOutputTrace> {
         let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
@@ -2110,7 +2110,7 @@ impl DecodeEngine {
             full_v_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
                 .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
         }
-        if let Some((block_size, value_group_size)) = certified_kv {
+        if let Some((block_size, value_group_size, bf16_values)) = certified_kv {
             let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
             anyhow::ensure!(
@@ -2329,7 +2329,9 @@ impl DecodeEngine {
             key_only_pre_gate = Some(key_only_attn_out_bf16.to_host_bytes().map_err(|e| {
                 anyhow::anyhow!("layer {idx} trace certified KV BF16-value D2H: {e}")
             })?);
-            if tail_len > 0 {
+            if bf16_values {
+                cert_attn_out = key_only_attn_out;
+            } else if tail_len > 0 {
                 let mut tail_k_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
                 let mut tail_v_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
                 let tail_row_bytes = tail_len * head_dim * elem_bytes;
@@ -2534,13 +2536,14 @@ impl DecodeEngine {
         seqlen_offset: usize,
         block_size: usize,
         value_group_size: usize,
+        bf16_values: bool,
     ) -> Result<FullAttentionLayerOutputTrace> {
         self.trace_full_attention_layer_output_from_hidden_with_state(
             state,
             idx,
             hidden_bytes,
             seqlen_offset,
-            Some((block_size, value_group_size)),
+            Some((block_size, value_group_size, bf16_values)),
         )
     }
 
@@ -2552,6 +2555,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
         block_size: usize,
         value_group_size: usize,
+        bf16_values: bool,
     ) -> Result<FullAttentionLayerOutputTrace> {
         self.trace_certified_kv_full_attention_layer_output_from_hidden_state(
             self.state_for_batch(batch_index),
@@ -2560,6 +2564,7 @@ impl DecodeEngine {
             seqlen_offset,
             block_size,
             value_group_size,
+            bf16_values,
         )
     }
 

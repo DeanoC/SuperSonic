@@ -1129,6 +1129,7 @@ pub fn run_llama31(
                 "ms_per_step": ms_per_step,
                 "block_size": cfg.block_size,
                 "value_group_size": cfg.value_group_size,
+                "value_mode": if cfg.bf16_values { "bf16" } else { "int4" },
                 "tau_cov": cfg.tau_cov,
                 "k_min": cfg.k_min,
                 "k_max": cfg.k_max,
@@ -1298,6 +1299,7 @@ fn trace_llama31_certified_kv_layer(
         seqlen_offset,
         cfg.block_size,
         cfg.value_group_size,
+        cfg.bf16_values,
     )?;
     let pre_gate_delta = validate::max_abs_delta(
         &decode_bf16_le(&dense.pre_gate),

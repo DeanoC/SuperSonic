@@ -8,6 +8,7 @@ use crate::Cli;
 pub(crate) struct CertifiedKvConfig {
     pub block_size: usize,
     pub value_group_size: usize,
+    pub bf16_values: bool,
     pub tau_cov: f32,
     pub k_min: usize,
     pub k_max: usize,
@@ -24,6 +25,7 @@ impl CertifiedKvConfig {
         let cfg = Self {
             block_size: cli.certified_kv_block_size,
             value_group_size: cli.certified_kv_value_group_size,
+            bf16_values: cli.certified_kv_bf16_values,
             tau_cov: cli.certified_kv_tau_cov,
             k_min: cli.certified_kv_k_min,
             k_max: cli.certified_kv_k_max,
@@ -77,9 +79,10 @@ impl CertifiedKvConfig {
 
     pub(crate) fn summary(&self) -> String {
         format!(
-            "block={} value_group={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} eps_guard={:.6} telemetry={}",
+            "block={} value_group={} value_mode={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} eps_guard={:.6} telemetry={}",
             self.block_size,
             self.value_group_size,
+            if self.bf16_values { "bf16" } else { "int4" },
             self.tau_cov,
             self.k_min,
             self.k_max,
