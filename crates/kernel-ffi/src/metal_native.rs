@@ -97,6 +97,20 @@ unsafe extern "C" {
         input_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_transpose_shd_hsd_bf16(
+        s: usize,
+        h: usize,
+        d: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_transpose_shd_hsd_f32(
+        s: usize,
+        h: usize,
+        d: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -429,6 +443,63 @@ pub(crate) fn mul_scalar(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn transpose_shd_hsd(
+    dtype: ScalarType,
+    s: usize,
+    h: usize,
+    d: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total = s
+        .checked_mul(h)
+        .and_then(|v| v.checked_mul(d))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "metal native transpose_shd_hsd shape overflows: {s}x{h}x{d}"
+            ))
+        })?;
+    if total > u32::MAX as usize
+        || s > u32::MAX as usize
+        || h > u32::MAX as usize
+        || d > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native transpose_shd_hsd supports u32-sized shapes, got {s}x{h}x{d}"
+        )));
+    }
+    if src.dtype() != dtype || dst.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native transpose_shd_hsd expects dtype {dtype:?}, got {:?}->{:?}",
+            src.dtype(),
+            dst.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => {
+                supersonic_metal_transpose_shd_hsd_bf16(s, h, d, src.as_ptr(), dst.as_mut_ptr())
+            }
+            ScalarType::F32 => {
+                supersonic_metal_transpose_shd_hsd_f32(s, h, d, src.as_ptr(), dst.as_mut_ptr())
+            }
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native transpose_shd_hsd does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native transpose_shd_hsd failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -527,6 +598,20 @@ pub(crate) fn mul_scalar(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native mul_scalar is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn transpose_shd_hsd(
+    _dtype: ScalarType,
+    _s: usize,
+    _h: usize,
+    _d: usize,
+    _src: &GpuBuffer,
+    _dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native transpose_shd_hsd is not compiled".into(),
     ))
 }
 
@@ -921,5 +1006,39 @@ mod tests {
         let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
         mul_scalar(ScalarType::F32, 3, 2.0, &input, &mut out).expect("run f32 mul_scalar");
         assert_eq!(read_f32(&out), vec![2.5, -8.0, 16.0]);
+    }
+
+    #[test]
+    fn metal_native_transpose_shd_hsd_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input_vals = (0..12).map(|v| v as f32).collect::<Vec<_>>();
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3, 2],
+            &bf16_bytes(&input_vals),
+        )
+        .expect("upload bf16 input");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[3, 2, 2]).expect("allocate bf16 out");
+        transpose_shd_hsd(ScalarType::BF16, 2, 3, 2, &input, &mut out).expect("run bf16 transpose");
+        assert_eq!(
+            read_bf16(&out),
+            vec![0.0, 1.0, 6.0, 7.0, 2.0, 3.0, 8.0, 9.0, 4.0, 5.0, 10.0, 11.0]
+        );
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 2, 2],
+            &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+        )
+        .expect("upload f32 input");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2, 2]).expect("allocate f32 out");
+        transpose_shd_hsd(ScalarType::F32, 2, 2, 2, &input, &mut out).expect("run f32 transpose");
+        assert_eq!(read_f32(&out), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 }

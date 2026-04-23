@@ -53,6 +53,13 @@ struct MulScalarParams {
     float scalar;
 };
 
+struct TransposeShdHsdParams {
+    uint32_t s;
+    uint32_t h;
+    uint32_t d;
+    uint32_t total_elems;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -863,6 +870,121 @@ kernel void supersonic_mul_scalar_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> transpose_shd_hsd_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_transpose_shd_hsd_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:101
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"TSHD(
+#include <metal_stdlib>
+using namespace metal;
+
+struct TransposeShdHsdParams {
+    uint s;
+    uint h;
+    uint d;
+    uint total_elems;
+};
+
+kernel void supersonic_transpose_shd_hsd_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant TransposeShdHsdParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.d;
+    uint head = (gid / params.d) % params.h;
+    uint seq = gid / (params.d * params.h);
+    uint dst_idx = (head * params.s + seq) * params.d + elem;
+    dst[dst_idx] = src[gid];
+}
+
+kernel void supersonic_transpose_shd_hsd_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant TransposeShdHsdParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.d;
+    uint head = (gid / params.d) % params.h;
+    uint seq = gid / (params.d * params.h);
+    uint dst_idx = (head * params.s + seq) * params.d + elem;
+    dst[dst_idx] = src[gid];
+}
+)TSHD";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:102
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile transpose-shd-hsd library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:103
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load transpose-shd-hsd function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:104
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create transpose-shd-hsd pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -1188,6 +1310,117 @@ extern "C" int supersonic_metal_mul_scalar_f32(
         input_ptr,
         out_ptr,
         @"supersonic_mul_scalar_f32"
+    );
+}
+
+static int supersonic_metal_transpose_shd_hsd_impl(
+    size_t s,
+    size_t h,
+    size_t d,
+    const void* src_ptr,
+    void* dst_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (s == 0 || h == 0 || d == 0) {
+            return 0;
+        }
+        if (s > UINT32_MAX || h > UINT32_MAX || d > UINT32_MAX || src_ptr == nullptr || dst_ptr == nullptr) {
+            return 101;
+        }
+        size_t total_elems = s * h * d;
+        if (total_elems > UINT32_MAX || total_elems / d / h != s) {
+            return 102;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = transpose_shd_hsd_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 103;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 104;
+        }
+        if (lookup_buffer(dst_ptr, &dst, &dst_offset) != 0) {
+            return 105;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 106;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 107;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 108;
+        }
+
+        TransposeShdHsdParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(h),
+            static_cast<uint32_t>(d),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:src offset:src_offset atIndex:0];
+        [encoder setBuffer:dst offset:dst_offset atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 109;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_transpose_shd_hsd_bf16(
+    size_t s,
+    size_t h,
+    size_t d,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_transpose_shd_hsd_impl(
+        s,
+        h,
+        d,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_transpose_shd_hsd_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_transpose_shd_hsd_f32(
+    size_t s,
+    size_t h,
+    size_t d,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_transpose_shd_hsd_impl(
+        s,
+        h,
+        d,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_transpose_shd_hsd_f32"
     );
 }
 

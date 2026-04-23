@@ -35,6 +35,10 @@ fn metal_force_host_mul_scalar() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MUL_SCALAR").is_some()
 }
 
+fn metal_force_host_transpose_shd_hsd() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_TRANSPOSE_SHD_HSD").is_some()
+}
+
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
@@ -1571,6 +1575,12 @@ pub fn transpose_shd_hsd(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_transpose_shd_hsd()
+            && metal_native::transpose_shd_hsd(dtype, s, h, d, src, dst).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst);
     }
     let status = unsafe {
