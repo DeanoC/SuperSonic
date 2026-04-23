@@ -94,6 +94,60 @@ __global__ void certified_kv_quantize_keys_kernel(
     }
 }
 
+__global__ void certified_kv_quantize_keys_range_kernel(
+    const __nv_bfloat16* key,
+    uint8_t* key_int8,
+    float* key_scale,
+    int num_kv_heads,
+    int max_t,
+    int key_stride_tokens,
+    int scale_stride_blocks,
+    int start_block,
+    int block_count,
+    int head_dim,
+    int block_size
+) {
+    const int linear = blockIdx.x;
+    const int dim = linear % head_dim;
+    const int local_block = (linear / head_dim) % block_count;
+    const int kvh = linear / (head_dim * block_count);
+    if (kvh >= num_kv_heads) return;
+    const int block_id = start_block + local_block;
+
+    extern __shared__ float scratch[];
+    float local_absmax = 0.0f;
+    for (int t = threadIdx.x; t < block_size; t += blockDim.x) {
+        const int tok = block_id * block_size + t;
+        const size_t src_idx = (static_cast<size_t>(kvh) * max_t + tok) * head_dim + dim;
+        local_absmax = fmaxf(local_absmax, fabsf(bf16_to_float(key[src_idx])));
+    }
+    scratch[threadIdx.x] = local_absmax;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float scale = fmaxf(scratch[0], 1.0e-8f) / 127.0f;
+    if (threadIdx.x == 0) {
+        const size_t scale_idx =
+            (static_cast<size_t>(kvh) * scale_stride_blocks + block_id) * head_dim + dim;
+        key_scale[scale_idx] = scale;
+    }
+    __syncthreads();
+
+    for (int t = threadIdx.x; t < block_size; t += blockDim.x) {
+        const int tok = block_id * block_size + t;
+        const size_t src_idx = (static_cast<size_t>(kvh) * max_t + tok) * head_dim + dim;
+        const float x = bf16_to_float(key[src_idx]);
+        const int q = clamp_i32(static_cast<int>(nearbyintf(x / scale)), -127, 127);
+        const size_t dst_idx = (static_cast<size_t>(kvh) * key_stride_tokens + tok) * head_dim + dim;
+        key_int8[dst_idx] = static_cast<uint8_t>(static_cast<int8_t>(q));
+    }
+}
+
 __global__ void certified_kv_quantize_values_kernel(
     const __nv_bfloat16* value,
     uint8_t* value_int4,
@@ -440,6 +494,8 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
     int num_blocks,
     int block_size,
     int tail_len,
+    int key_stride_tokens,
+    int key_scale_stride_blocks,
     int tail_key_start_tokens,
     int tail_key_stride_tokens,
     int score_stride_tokens,
@@ -461,10 +517,12 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
         for (int d = 0; d < head_dim; ++d) {
             const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
             const int8_t kq = static_cast<int8_t>(
-                key_int8[(static_cast<size_t>(kvh) * aligned_tokens + tok) * head_dim + d]
+                key_int8[(static_cast<size_t>(kvh) * key_stride_tokens + tok) * head_dim + d]
             );
             const float ks =
-                key_scale[(static_cast<size_t>(kvh) * num_blocks + block_id) * head_dim + d];
+                key_scale[
+                    (static_cast<size_t>(kvh) * key_scale_stride_blocks + block_id) * head_dim + d
+                ];
             acc += q * (static_cast<float>(kq) * ks);
         }
         score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] = acc * q_scale;
@@ -631,6 +689,58 @@ extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16(
     );
     if (cudaGetLastError() != cudaSuccess) return 3;
     if (cudaDeviceSynchronize() != cudaSuccess) return 4;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+    size_t device_ordinal,
+    const void* key_bf16,
+    void* key_int8,
+    void* key_scale,
+    int num_kv_heads,
+    int max_t,
+    int key_stride_tokens,
+    int scale_stride_blocks,
+    int start_block,
+    int block_count,
+    int head_dim,
+    int block_size
+) {
+    if (key_bf16 == nullptr || key_int8 == nullptr || key_scale == nullptr) {
+        return 1;
+    }
+    if (num_kv_heads <= 0 || max_t <= 0 || key_stride_tokens <= 0 ||
+        scale_stride_blocks <= 0 || start_block < 0 || block_count < 0 ||
+        head_dim <= 0 || block_size <= 0 || head_dim > 256) {
+        return 2;
+    }
+    if (block_count == 0) {
+        return 0;
+    }
+    const int end_block = start_block + block_count;
+    if (end_block > scale_stride_blocks || end_block * block_size > key_stride_tokens ||
+        end_block * block_size > max_t) {
+        return 3;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+
+    const int key_threads = 32;
+    const int key_grid = num_kv_heads * block_count * head_dim;
+    certified_kv_quantize_keys_range_kernel<<<key_grid, key_threads, key_threads * sizeof(float)>>>(
+        static_cast<const __nv_bfloat16*>(key_bf16),
+        static_cast<uint8_t*>(key_int8),
+        static_cast<float*>(key_scale),
+        num_kv_heads,
+        max_t,
+        key_stride_tokens,
+        scale_stride_blocks,
+        start_block,
+        block_count,
+        head_dim,
+        block_size
+    );
+    if (cudaGetLastError() != cudaSuccess) return 4;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 5;
     return 0;
 }
 
@@ -848,6 +958,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values(
         num_blocks,
         block_size,
         tail_len,
+        num_blocks * block_size,
+        num_blocks,
         0,
         tail_len,
         num_blocks * block_size + tail_len,
@@ -875,6 +987,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
     int num_blocks,
     int block_size,
     int tail_len,
+    int key_stride_tokens,
+    int key_scale_stride_blocks,
     int tail_key_start_tokens,
     int tail_key_stride_tokens,
     int score_stride_tokens,
@@ -891,12 +1005,14 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
         return 52;
     }
     if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
-        tail_len < 0 || tail_key_start_tokens < 0 || score_stride_tokens <= 0 ||
-        value_stride_tokens <= 0 || head_dim <= 0 || gqa_group <= 0) {
+        tail_len < 0 || key_stride_tokens <= 0 || key_scale_stride_blocks <= 0 ||
+        tail_key_start_tokens < 0 || score_stride_tokens <= 0 || value_stride_tokens <= 0 ||
+        head_dim <= 0 || gqa_group <= 0) {
         return 53;
     }
     const int total_tokens = num_blocks * block_size + tail_len;
     if (block_size > 256 || q_heads != kv_heads * gqa_group ||
+        key_stride_tokens < num_blocks * block_size || key_scale_stride_blocks < num_blocks ||
         score_stride_tokens < total_tokens || value_stride_tokens < total_tokens ||
         (tail_len > 0 && tail_key_stride_tokens < tail_key_start_tokens + tail_len)) {
         return 54;
@@ -915,6 +1031,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
         num_blocks,
         block_size,
         tail_len,
+        key_stride_tokens,
+        key_scale_stride_blocks,
         tail_key_start_tokens,
         tail_key_stride_tokens,
         score_stride_tokens,

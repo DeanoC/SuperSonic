@@ -3536,18 +3536,13 @@ impl DecodeEngine {
             })
             .unwrap_or(false);
         if use_certified_bf16_values {
-            let (block_size, value_group_size, _) = certified_kv_decode
+            let (block_size, _value_group_size, _) = certified_kv_decode
                 .expect("certified KV decode config is present when enabled");
             let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
-            let (key_i8_shape, key_scale_shape, _, _, _) = kernel_ffi::certified_kv::quantized_shapes(
-                num_kv_heads,
-                kv_len,
-                head_dim,
-                block_size,
-                value_group_size,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode shapes: {e}"))?;
+            let cap_aligned = kernel_ffi::certified_kv::aligned_tokens(cap, block_size);
+            let key_i8_shape = [num_kv_heads, cap_aligned, head_dim];
+            let key_scale_shape = [num_kv_heads, cap_aligned / block_size, head_dim];
             let needs_key_alloc = ls
                 .certified_kv_key_i8
                 .as_ref()
@@ -3578,10 +3573,13 @@ impl DecodeEngine {
                 let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
                 let key_i8 = ls.certified_kv_key_i8.as_mut().unwrap();
                 let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
-                kernel_ffi::certified_kv::quantize_bf16_keys(
+                let start_block = ls.certified_kv_key_tokens / block_size;
+                let block_count = (aligned - ls.certified_kv_key_tokens) / block_size;
+                kernel_ffi::certified_kv::quantize_bf16_keys_range(
                     self.ordinal,
                     cache_k_ref,
-                    kv_len,
+                    start_block,
+                    block_count,
                     block_size,
                     key_i8,
                     key_scale,

@@ -41,6 +41,20 @@ unsafe extern "C" {
         head_dim: c_int,
         block_size: c_int,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+        device_ordinal: usize,
+        key_bf16: *const c_void,
+        key_int8: *mut c_void,
+        key_scale: *mut c_void,
+        num_kv_heads: c_int,
+        max_t: c_int,
+        key_stride_tokens: c_int,
+        scale_stride_blocks: c_int,
+        start_block: c_int,
+        block_count: c_int,
+        head_dim: c_int,
+        block_size: c_int,
+    ) -> c_int;
 
     fn dotcache_llama31_certified_kv_score_blocks_int8(
         device_ordinal: usize,
@@ -115,6 +129,8 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         tail_len: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
         tail_key_start_tokens: c_int,
         tail_key_stride_tokens: c_int,
         score_stride_tokens: c_int,
@@ -402,6 +418,116 @@ pub fn quantize_bf16_keys(
         }
         Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
             "certified KV key quantization is currently CUDA-only".into(),
+        )),
+    }
+}
+
+pub fn quantize_bf16_keys_range(
+    ordinal: usize,
+    key_bf16: &GpuBuffer,
+    start_block: usize,
+    block_count: usize,
+    block_size: usize,
+    key_int8: &mut GpuBuffer,
+    key_scale: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if key_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV key range quantization is currently CUDA-only".into(),
+        ));
+    }
+    if key_bf16.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization expects BF16 key cache, got {:?}",
+            key_bf16.dtype()
+        )));
+    }
+    if key_bf16.shape().len() != 4 || key_bf16.shape()[0] != 1 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization expects [1,nkv,max_t,hd] cache, got {:?}",
+            key_bf16.shape()
+        )));
+    }
+    if block_size == 0 {
+        return Err(GpuError::InvalidArg(
+            "certified KV key range quantization block_size must be > 0".into(),
+        ));
+    }
+    let num_kv_heads = key_bf16.shape()[1];
+    let max_t = key_bf16.shape()[2];
+    let head_dim = key_bf16.shape()[3];
+    let key_shape = key_int8.shape();
+    let scale_shape = key_scale.shape();
+    if key_int8.dtype() != ScalarType::U8
+        || key_shape.len() != 3
+        || key_shape[0] != num_kv_heads
+        || key_shape[2] != head_dim
+        || key_shape[1] % block_size != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization key_int8 expects U8 [{num_kv_heads}, stride, {head_dim}], got {:?} {:?}",
+            key_int8.dtype(),
+            key_int8.shape()
+        )));
+    }
+    if key_scale.dtype() != ScalarType::F32
+        || scale_shape.len() != 3
+        || scale_shape[0] != num_kv_heads
+        || scale_shape[2] != head_dim
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization key_scale expects F32 [{num_kv_heads}, blocks, {head_dim}], got {:?} {:?}",
+            key_scale.dtype(),
+            key_scale.shape()
+        )));
+    }
+    let end_block = start_block.checked_add(block_count).ok_or_else(|| {
+        GpuError::InvalidArg("certified KV key range quantization block range overflow".into())
+    })?;
+    let key_stride_tokens = key_shape[1];
+    let scale_stride_blocks = scale_shape[1];
+    if end_block > scale_stride_blocks
+        || end_block * block_size > key_stride_tokens
+        || end_block * block_size > max_t
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization range start_block={start_block} block_count={block_count} exceeds key_stride={key_stride_tokens} scale_blocks={scale_stride_blocks} max_t={max_t}"
+        )));
+    }
+
+    match key_bf16.backend() {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                let status = dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+                    ordinal,
+                    key_bf16.as_ptr(),
+                    key_int8.as_mut_ptr(),
+                    key_scale.as_mut_ptr(),
+                    num_kv_heads as c_int,
+                    max_t as c_int,
+                    key_stride_tokens as c_int,
+                    scale_stride_blocks as c_int,
+                    start_block as c_int,
+                    block_count as c_int,
+                    head_dim as c_int,
+                    block_size as c_int,
+                );
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        Backend::Cuda,
+                        format!("certified KV CUDA key range quantization failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV key range quantization is currently CUDA-only".into(),
         )),
     }
 }
@@ -959,15 +1085,19 @@ pub fn attend_int8_bf16_values_strided(
         query_shape[2]
     };
     let kv_heads = key_int8.shape()[0];
-    let aligned_tokens = key_int8.shape()[1];
-    if key_int8.shape()[2] != head_dim || aligned_tokens == 0 || aligned_tokens % block_size != 0
+    let key_stride_tokens = key_int8.shape()[1];
+    let active_aligned_tokens = aligned_tokens(total_tokens, block_size);
+    if key_int8.shape()[2] != head_dim
+        || active_aligned_tokens == 0
+        || key_stride_tokens < active_aligned_tokens
+        || key_stride_tokens % block_size != 0
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV strided INT8/BF16-value key shape {:?} incompatible with head_dim={head_dim} block_size={block_size}",
+            "certified KV strided INT8/BF16-value key shape {:?} incompatible with active_aligned={active_aligned_tokens} head_dim={head_dim} block_size={block_size}",
             key_int8.shape()
         )));
     }
-    let num_blocks = aligned_tokens / block_size;
+    let num_blocks = active_aligned_tokens / block_size;
     let value_shape = value_bf16.shape();
     let (value_kv_heads, value_stride_tokens, value_head_dim) = if value_shape.len() == 3 {
         (value_shape[0], value_shape[1], value_shape[2])
@@ -980,12 +1110,12 @@ pub fn attend_int8_bf16_values_strided(
             value_bf16.shape()
         )));
     }
-    if total_tokens < aligned_tokens || value_stride_tokens < total_tokens {
+    if value_stride_tokens < total_tokens {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV strided INT8/BF16-value needs aligned_tokens={aligned_tokens} <= total_tokens={total_tokens} <= value_stride_tokens={value_stride_tokens}"
+            "certified KV strided INT8/BF16-value needs total_tokens={total_tokens} <= value_stride_tokens={value_stride_tokens}"
         )));
     }
-    let tail_len = total_tokens - aligned_tokens;
+    let tail_len = total_tokens - active_aligned_tokens;
     if q_heads != kv_heads * gqa_group {
         return Err(GpuError::InvalidArg(format!(
             "certified KV strided INT8/BF16-value q_heads={q_heads} must equal kv_heads={kv_heads} * gqa_group={gqa_group}"
@@ -1000,7 +1130,16 @@ pub fn attend_int8_bf16_values_strided(
     } else {
         0
     };
-    if key_scale.shape() != [kv_heads, num_blocks, head_dim]
+    let key_scale_shape = key_scale.shape();
+    let key_scale_stride_blocks = if key_scale_shape.len() == 3
+        && key_scale_shape[0] == kv_heads
+        && key_scale_shape[2] == head_dim
+    {
+        key_scale_shape[1]
+    } else {
+        0
+    };
+    if key_scale_stride_blocks < num_blocks
         || score_stride_tokens < total_tokens
         || (!output_is_2d && !output_is_3d)
     {
@@ -1040,7 +1179,7 @@ pub fn attend_int8_bf16_values_strided(
                     "certified KV strided INT8/BF16-value full tail key stride={stride} must cover total_tokens={total_tokens}"
                 )));
             }
-            (aligned_tokens, stride)
+            (active_aligned_tokens, stride)
         }
     } else if tail_len != 0 {
         return Err(GpuError::InvalidArg(format!(
@@ -1071,6 +1210,8 @@ pub fn attend_int8_bf16_values_strided(
                         num_blocks as c_int,
                         block_size as c_int,
                         tail_len as c_int,
+                        key_stride_tokens as c_int,
+                        key_scale_stride_blocks as c_int,
                         tail_key_start_tokens as c_int,
                         tail_key_stride_tokens as c_int,
                         score_stride_tokens as c_int,
@@ -1253,6 +1394,49 @@ mod tests {
                 .to_host_bytes()
                 .expect("download key_only_scale"),
             key_scale.to_host_bytes().expect("download key_scale again")
+        );
+
+        let mut key_range_i8 =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[num_kv_heads, 6, head_dim])
+                .expect("key_range_i8");
+        let mut key_range_scale =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, 3, head_dim])
+                .expect("key_range_scale");
+        quantize_bf16_keys_range(
+            ordinal,
+            &key,
+            0,
+            1,
+            block_size,
+            &mut key_range_i8,
+            &mut key_range_scale,
+        )
+        .expect("quantize key range 0");
+        quantize_bf16_keys_range(
+            ordinal,
+            &key,
+            1,
+            1,
+            block_size,
+            &mut key_range_i8,
+            &mut key_range_scale,
+        )
+        .expect("quantize key range 1");
+        let key_range_q = key_range_i8
+            .to_host_bytes()
+            .expect("download key_range_i8");
+        assert_eq!(
+            &key_range_q[..num_kv_heads * seq_len * head_dim],
+            &key_i8.to_host_bytes().expect("download key_i8 range cmp")[..]
+        );
+        let key_range_scales = key_range_scale
+            .to_host_bytes()
+            .expect("download key_range_scale");
+        assert_eq!(
+            &key_range_scales[..num_kv_heads * (seq_len / block_size) * head_dim * 4],
+            &key_scale
+                .to_host_bytes()
+                .expect("download key_scale range cmp")[..]
         );
     }
 
