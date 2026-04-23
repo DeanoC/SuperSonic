@@ -1969,15 +1969,15 @@ impl DecodeEngine {
             if self.normed_buf.backend() != gpu_hal::Backend::Metal {
                 anyhow::bail!("component Metal greedy decode requires Metal buffers");
             }
-            let token = kernel_ffi::metal_lm_head_argmax_bf16(
-                self.ordinal,
+            kernel_ffi::metal_lm_head_argmax_bf16_into(
                 &self.normed_buf,
                 &*self.weights.lm_head,
+                &mut self.argmax_buf,
                 hidden_dim,
                 vocab_size,
             )
             .map_err(|e| anyhow::anyhow!("lm_head argmax: {e}"))?;
-            (Vec::new(), Some(token))
+            (Vec::new(), None)
         } else {
             kernel_ffi::standalone_matvec_4b(
                 self.ordinal,
@@ -4357,8 +4357,19 @@ impl DecodeEngine {
         }
         let mut timings = DecodeStageTimings::default();
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
-        let token =
-            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        let token = match sampled_token {
+            Some(token) => token,
+            None => {
+                let bytes = self
+                    .argmax_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("Metal component decode argmax D2H: {e}"))?;
+                if bytes.len() < 4 {
+                    anyhow::bail!("Metal component decode argmax buffer was truncated");
+                }
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+            }
+        };
         Ok((token, timings))
     }
 
