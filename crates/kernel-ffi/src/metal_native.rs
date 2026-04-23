@@ -85,6 +85,18 @@ unsafe extern "C" {
         residual_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_full_projections_bf16(
+        hidden_dim: usize,
+        q_proj_dim: usize,
+        kv_dim: usize,
+        input_ptr: *const c_void,
+        q_weight_ptr: *const c_void,
+        k_weight_ptr: *const c_void,
+        v_weight_ptr: *const c_void,
+        q_out_ptr: *mut c_void,
+        k_out_ptr: *mut c_void,
+        v_out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_lm_head_argmax_bf16(
         in_dim: usize,
         vocab_size: usize,
@@ -877,6 +889,61 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native qwen_mlp_down_residual_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_full_projections_bf16(
+    hidden_dim: usize,
+    q_proj_dim: usize,
+    kv_dim: usize,
+    input: &GpuBuffer,
+    q_weight: &GpuBuffer,
+    k_weight: &GpuBuffer,
+    v_weight: &GpuBuffer,
+    q_out: &mut GpuBuffer,
+    k_out: &mut GpuBuffer,
+    v_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        input.dtype(),
+        q_weight.dtype(),
+        k_weight.dtype(),
+        v_weight.dtype(),
+        q_out.dtype(),
+        k_out.dtype(),
+        v_out.dtype(),
+    ];
+    if dtypes.iter().any(|dtype| *dtype != ScalarType::BF16) {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_full_projections_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || q_proj_dim == 0 || kv_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_full_projections_bf16 invalid shape: hidden_dim={hidden_dim} q_proj_dim={q_proj_dim} kv_dim={kv_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_full_projections_bf16(
+            hidden_dim,
+            q_proj_dim,
+            kv_dim,
+            input.as_ptr(),
+            q_weight.as_ptr(),
+            k_weight.as_ptr(),
+            v_weight.as_ptr(),
+            q_out.as_mut_ptr(),
+            k_out.as_mut_ptr(),
+            v_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_full_projections_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -2487,6 +2554,25 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_full_projections_bf16(
+    _hidden_dim: usize,
+    _q_proj_dim: usize,
+    _kv_dim: usize,
+    _input: &GpuBuffer,
+    _q_weight: &GpuBuffer,
+    _k_weight: &GpuBuffer,
+    _v_weight: &GpuBuffer,
+    _q_out: &mut GpuBuffer,
+    _k_out: &mut GpuBuffer,
+    _v_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_full_projections_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
     _weight: &GpuBuffer,
@@ -3015,6 +3101,78 @@ mod tests {
             ("z", read_bf16(&z), vec![1.0, 0.0]),
             ("a", read_bf16(&a), vec![5.0]),
             ("b", read_bf16(&b), vec![-1.5]),
+        ];
+        for (name, actual, expected) in cases {
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let delta = (a - e).abs();
+                assert!(
+                    delta <= 0.02,
+                    "{name}[{idx}]: expected {e}, got {a}, delta {delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_native_qwen_full_projections_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden_dim = 3usize;
+        let q_proj_dim = 4usize;
+        let kv_dim = 2usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_dim],
+            &bf16_bytes(&[1.0, 2.0, -1.0]),
+        )
+        .expect("upload input");
+        let q_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[q_proj_dim, hidden_dim],
+            &bf16_bytes(&[
+                1.0, 0.0, 1.0, 0.5, -1.0, 2.0, -2.0, 0.5, 1.0, 0.25, 0.75, -0.5,
+            ]),
+        )
+        .expect("upload q weight");
+        let k_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[kv_dim, hidden_dim],
+            &bf16_bytes(&[0.0, 1.0, 1.0, -1.0, 0.5, 0.0]),
+        )
+        .expect("upload k weight");
+        let v_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[kv_dim, hidden_dim],
+            &bf16_bytes(&[2.0, 1.0, -1.0, -1.0, 0.0, 0.5]),
+        )
+        .expect("upload v weight");
+        let mut q_out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_proj_dim]).expect("q out");
+        let mut k_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim]).expect("k out");
+        let mut v_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim]).expect("v out");
+
+        qwen_full_projections_bf16(
+            hidden_dim,
+            q_proj_dim,
+            kv_dim,
+            &input,
+            &q_w,
+            &k_w,
+            &v_w,
+            &mut q_out,
+            &mut k_out,
+            &mut v_out,
+        )
+        .expect("run fused qwen full projections");
+
+        let cases = [
+            ("q", read_bf16(&q_out), vec![0.0, -3.5, -2.0, 2.25]),
+            ("k", read_bf16(&k_out), vec![1.0, 0.0]),
+            ("v", read_bf16(&v_out), vec![5.0, -1.5]),
         ];
         for (name, actual, expected) in cases {
             for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {

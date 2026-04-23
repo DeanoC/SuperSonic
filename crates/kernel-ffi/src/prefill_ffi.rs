@@ -309,6 +309,35 @@ pub fn metal_qwen_mlp_down_residual_bf16(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_full_projections_bf16(
+    hidden_dim: usize,
+    q_proj_dim: usize,
+    kv_dim: usize,
+    input: &GpuBuffer,
+    q_weight: &GpuBuffer,
+    k_weight: &GpuBuffer,
+    v_weight: &GpuBuffer,
+    q_out: &mut GpuBuffer,
+    k_out: &mut GpuBuffer,
+    v_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_full_projections", "native", || {
+        metal_native::qwen_full_projections_bf16(
+            hidden_dim,
+            q_proj_dim,
+            kv_dim,
+            input,
+            q_weight,
+            k_weight,
+            v_weight,
+            q_out,
+            k_out,
+            v_out,
+        )
+    })
+}
+
 pub struct MetalBatchGuard {
     inner: Option<metal_native::MetalBatchGuard>,
 }

@@ -33,6 +33,13 @@ struct QwenMlpParams {
     uint32_t intermediate_dim;
 };
 
+struct QwenFullProjectionParams {
+    uint32_t hidden_dim;
+    uint32_t q_proj_dim;
+    uint32_t kv_dim;
+    uint32_t total_cols;
+};
+
 struct FullAttentionParams {
     uint32_t q_heads;
     uint32_t kv_heads;
@@ -895,6 +902,121 @@ kernel void supersonic_qwen_mlp_down_residual_bf16(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create Qwen MLP down pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> qwen_full_projection_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:401
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"QWENFULLPROJ(
+#include <metal_stdlib>
+using namespace metal;
+
+struct QwenFullProjectionParams {
+    uint hidden_dim;
+    uint q_proj_dim;
+    uint kv_dim;
+    uint total_cols;
+};
+
+kernel void supersonic_qwen_full_projections_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* q_weight [[buffer(1)]],
+    device const bfloat* k_weight [[buffer(2)]],
+    device const bfloat* v_weight [[buffer(3)]],
+    device bfloat* q_out [[buffer(4)]],
+    device bfloat* k_out [[buffer(5)]],
+    device bfloat* v_out [[buffer(6)]],
+    constant QwenFullProjectionParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_cols) {
+        return;
+    }
+
+    device const bfloat* weight = q_weight;
+    device bfloat* out = q_out;
+    uint local_col = gid;
+    if (gid >= params.q_proj_dim) {
+        uint kv_col = gid - params.q_proj_dim;
+        if (kv_col < params.kv_dim) {
+            weight = k_weight;
+            out = k_out;
+            local_col = kv_col;
+        } else {
+            weight = v_weight;
+            out = v_out;
+            local_col = kv_col - params.kv_dim;
+        }
+    }
+
+    float acc = 0.0f;
+    uint weight_base = local_col * params.hidden_dim;
+    for (uint kk = 0; kk < params.hidden_dim; ++kk) {
+        acc += float(input[kk]) * float(weight[weight_base + kk]);
+    }
+    out[local_col] = bfloat(acc);
+}
+)QWENFULLPROJ";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:402
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen full projection library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen_full_projections_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:403
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen full projection function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:404
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create Qwen full projection pipeline"
                                                                              }];
                         }
                     }
@@ -6650,6 +6772,99 @@ extern "C" int supersonic_metal_qwen_mlp_down_residual_bf16(
             MTLSize threads_per_grid = MTLSizeMake(hidden_dim, 1, 1);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 395, 396, 397, 398);
+    }
+}
+
+extern "C" int supersonic_metal_qwen_full_projections_bf16(
+    size_t hidden_dim,
+    size_t q_proj_dim,
+    size_t kv_dim,
+    const void* input_ptr,
+    const void* q_weight_ptr,
+    const void* k_weight_ptr,
+    const void* v_weight_ptr,
+    void* q_out_ptr,
+    void* k_out_ptr,
+    void* v_out_ptr
+) {
+    @autoreleasepool {
+        if (hidden_dim == 0 || q_proj_dim == 0 || kv_dim == 0 || input_ptr == nullptr ||
+            q_weight_ptr == nullptr || k_weight_ptr == nullptr || v_weight_ptr == nullptr ||
+            q_out_ptr == nullptr || k_out_ptr == nullptr || v_out_ptr == nullptr) {
+            return 405;
+        }
+        const size_t total_cols = q_proj_dim + kv_dim * 2;
+        if (hidden_dim > UINT32_MAX || q_proj_dim > UINT32_MAX || kv_dim > UINT32_MAX ||
+            total_cols > UINT32_MAX) {
+            return 406;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = qwen_full_projection_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 407;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> q_weight = nil;
+        id<MTLBuffer> k_weight = nil;
+        id<MTLBuffer> v_weight = nil;
+        id<MTLBuffer> q_out = nil;
+        id<MTLBuffer> k_out = nil;
+        id<MTLBuffer> v_out = nil;
+        size_t input_offset = 0;
+        size_t q_weight_offset = 0;
+        size_t k_weight_offset = 0;
+        size_t v_weight_offset = 0;
+        size_t q_out_offset = 0;
+        size_t k_out_offset = 0;
+        size_t v_out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 408;
+        }
+        if (lookup_buffer(q_weight_ptr, &q_weight, &q_weight_offset) != 0) {
+            return 409;
+        }
+        if (lookup_buffer(k_weight_ptr, &k_weight, &k_weight_offset) != 0) {
+            return 410;
+        }
+        if (lookup_buffer(v_weight_ptr, &v_weight, &v_weight_offset) != 0) {
+            return 411;
+        }
+        if (lookup_buffer(q_out_ptr, &q_out, &q_out_offset) != 0) {
+            return 412;
+        }
+        if (lookup_buffer(k_out_ptr, &k_out, &k_out_offset) != 0) {
+            return 413;
+        }
+        if (lookup_buffer(v_out_ptr, &v_out, &v_out_offset) != 0) {
+            return 414;
+        }
+
+        QwenFullProjectionParams params = {
+            static_cast<uint32_t>(hidden_dim),
+            static_cast<uint32_t>(q_proj_dim),
+            static_cast<uint32_t>(kv_dim),
+            static_cast<uint32_t>(total_cols),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:q_weight offset:q_weight_offset atIndex:1];
+            [encoder setBuffer:k_weight offset:k_weight_offset atIndex:2];
+            [encoder setBuffer:v_weight offset:v_weight_offset atIndex:3];
+            [encoder setBuffer:q_out offset:q_out_offset atIndex:4];
+            [encoder setBuffer:k_out offset:k_out_offset atIndex:5];
+            [encoder setBuffer:v_out offset:v_out_offset atIndex:6];
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_cols, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 415, 416, 417, 418);
     }
 }
 

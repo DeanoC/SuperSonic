@@ -161,6 +161,10 @@ fn metal_fused_mlp_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_MLP").is_some()
 }
 
+fn metal_fused_full_projection_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
+}
+
 fn metal_matmul_residual_add_bf16(
     input_dim: usize,
     output_dim: usize,
@@ -2043,21 +2047,52 @@ impl DecodeEngine {
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            q_proj_dim,
-            hidden_dim,
-            &self.normed_buf,
-            &fw.q_proj_w,
-            fw.q_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut q_full,
-            fw.q_proj_int4_scale.as_ref(),
-            fw.q_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
+        let use_fused_full_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !metal_fused_full_projection_disabled()
+            && fw.q_proj_scale.is_none()
+            && fw.q_proj_int4_scale.is_none()
+            && fw.q_proj_int4_zero.is_none()
+            && fw.k_proj_scale.is_none()
+            && fw.k_proj_int4_scale.is_none()
+            && fw.k_proj_int4_zero.is_none()
+            && fw.v_proj_scale.is_none()
+            && fw.v_proj_int4_scale.is_none()
+            && fw.v_proj_int4_zero.is_none()
+            && self.normed_buf.dtype() == ScalarType::BF16
+            && fw.q_proj_w.dtype() == ScalarType::BF16
+            && fw.k_proj_w.dtype() == ScalarType::BF16
+            && fw.v_proj_w.dtype() == ScalarType::BF16;
+        if use_fused_full_proj {
+            kernel_ffi::prefill_ffi::metal_qwen_full_projections_bf16(
+                hidden_dim,
+                q_proj_dim,
+                kv_dim,
+                &self.normed_buf,
+                &fw.q_proj_w,
+                &fw.k_proj_w,
+                &fw.v_proj_w,
+                &mut q_full,
+                &mut k_buf,
+                &mut v_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused full projections: {e}"))?;
+        } else {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                q_proj_dim,
+                hidden_dim,
+                &self.normed_buf,
+                &fw.q_proj_w,
+                fw.q_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut q_full,
+                fw.q_proj_int4_scale.as_ref(),
+                fw.q_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+        }
         kernel_ffi::prefill_ffi::split_qgate(
             self.ordinal,
             ScalarType::BF16,
@@ -2070,36 +2105,38 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
 
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            kv_dim,
-            hidden_dim,
-            &self.normed_buf,
-            &fw.k_proj_w,
-            fw.k_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(),
-            fw.k_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            kv_dim,
-            hidden_dim,
-            &self.normed_buf,
-            &fw.v_proj_w,
-            fw.v_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(),
-            fw.v_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
+        if !use_fused_full_proj {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                kv_dim,
+                hidden_dim,
+                &self.normed_buf,
+                &fw.k_proj_w,
+                fw.k_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut k_buf,
+                fw.k_proj_int4_scale.as_ref(),
+                fw.k_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                kv_dim,
+                hidden_dim,
+                &self.normed_buf,
+                &fw.v_proj_w,
+                fw.v_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut v_buf,
+                fw.v_proj_int4_scale.as_ref(),
+                fw.v_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+        }
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
