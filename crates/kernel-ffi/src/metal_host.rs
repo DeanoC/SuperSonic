@@ -1496,6 +1496,143 @@ pub(crate) fn delta_recurrent_prefill(
     Ok(())
 }
 
+pub(crate) fn linear_stateful_conv_value_decay(
+    dtype: ScalarType,
+    batch_size: usize,
+    conv_dim: usize,
+    seq_len: usize,
+    state_len: usize,
+    kernel_size: usize,
+    num_heads: usize,
+    mixed_qkv: &GpuBuffer,
+    prev_state: &GpuBuffer,
+    weights: &GpuBuffer,
+    a: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(unsupported(
+            "linear_stateful_conv_value_decay",
+            format!("expected BF16 dtype, got {dtype:?}"),
+        ));
+    }
+    let out_width = conv_dim + num_heads;
+    let mixed = unsafe { bf16_slice(mixed_qkv.as_ptr(), batch_size * conv_dim * seq_len) };
+    let state = unsafe { bf16_slice(prev_state.as_ptr(), batch_size * conv_dim * state_len) };
+    let weights = unsafe { bf16_slice(weights.as_ptr(), conv_dim * kernel_size) };
+    let a = unsafe { bf16_slice(a.as_ptr(), batch_size * seq_len * num_heads) };
+    let dt_bias = unsafe { bf16_slice(dt_bias.as_ptr(), num_heads) };
+    let a_log_exp = unsafe { bf16_slice(a_log_exp.as_ptr(), num_heads) };
+    let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), batch_size * seq_len * out_width) };
+
+    for b in 0..batch_size {
+        for t in 0..seq_len {
+            for c in 0..conv_dim {
+                let mixed_base = b * conv_dim * seq_len + c * seq_len;
+                let state_base = b * conv_dim * state_len + c * state_len;
+                let weight_base = c * kernel_size;
+                let mut acc = 0.0f32;
+                let history = kernel_size.saturating_sub(1);
+                for tap in 0..kernel_size {
+                    let src = t as isize + tap as isize - history as isize;
+                    let x = if src >= 0 {
+                        bf16_to_f32(mixed[mixed_base + src as usize])
+                    } else {
+                        let state_idx = state_len as isize + src;
+                        if state_idx >= 0 {
+                            bf16_to_f32(state[state_base + state_idx as usize])
+                        } else {
+                            0.0
+                        }
+                    };
+                    acc += x * bf16_to_f32(weights[weight_base + tap]);
+                }
+                let out_idx = b * seq_len * out_width + t * out_width + c;
+                out[out_idx] = f32_to_bf16_bits(qwen_silu(acc));
+            }
+
+            let a_base = b * seq_len * num_heads + t * num_heads;
+            for head in 0..num_heads {
+                let a_val = bf16_to_f32(a[a_base + head]);
+                let bias = bf16_to_f32(dt_bias[head]);
+                let decay = bf16_to_f32(a_log_exp[head]);
+                let value = -softplus(a_val + bias) * decay;
+                let out_idx = b * seq_len * out_width + t * out_width + conv_dim + head;
+                out[out_idx] = f32_to_bf16_bits(value);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn linear_decode_apply(
+    batch_size: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    packed: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if packed.dtype() != ScalarType::F32
+        || initial_state.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+    {
+        return Err(unsupported(
+            "linear_decode_apply",
+            format!(
+                "expected F32 buffers, got packed={:?} state={:?} out={:?}",
+                packed.dtype(),
+                initial_state.dtype(),
+                out.dtype()
+            ),
+        ));
+    }
+    let value_dim = num_v_heads * head_v_dim;
+    let state_dim = num_v_heads * head_k_dim * head_v_dim;
+    let packed_width = 2 * head_k_dim + head_v_dim + 2;
+    let packed = unsafe { f32_slice(packed.as_ptr(), batch_size * num_v_heads * packed_width) };
+    let initial_state = unsafe { f32_slice(initial_state.as_ptr(), batch_size * state_dim) };
+    let out = unsafe { f32_slice_mut(out.as_mut_ptr(), batch_size * (value_dim + state_dim)) };
+
+    for b in 0..batch_size {
+        for v_head in 0..num_v_heads {
+            let pair = b * num_v_heads + v_head;
+            let pair_base = pair * packed_width;
+            let q = &packed[pair_base..pair_base + head_k_dim];
+            let k = &packed[pair_base + head_k_dim..pair_base + 2 * head_k_dim];
+            let value = &packed
+                [pair_base + 2 * head_k_dim..pair_base + 2 * head_k_dim + head_v_dim];
+            let beta = packed[pair_base + 2 * head_k_dim + head_v_dim];
+            let g_exp = packed[pair_base + 2 * head_k_dim + head_v_dim + 1];
+            for v_idx in 0..head_v_dim {
+                let state_head_base = b * state_dim + (v_head * head_k_dim) * head_v_dim + v_idx;
+                let mut state = vec![0.0f32; head_k_dim];
+                for k_idx in 0..head_k_dim {
+                    state[k_idx] = initial_state[state_head_base + k_idx * head_v_dim] * g_exp;
+                }
+                let mut kv_mem = 0.0f32;
+                for k_idx in 0..head_k_dim {
+                    kv_mem += state[k_idx] * k[k_idx];
+                }
+                let delta = (value[v_idx] - kv_mem) * beta;
+                let mut out_value = 0.0f32;
+                let state_out_base =
+                    b * (value_dim + state_dim) + value_dim + (v_head * head_k_dim) * head_v_dim + v_idx;
+                for k_idx in 0..head_k_dim {
+                    state[k_idx] += k[k_idx] * delta;
+                    out_value += state[k_idx] * q[k_idx];
+                    out[state_out_base + k_idx * head_v_dim] = state[k_idx];
+                }
+                out[b * (value_dim + state_dim) + v_head * head_v_dim + v_idx] = out_value;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
 mod tests {
     use super::*;

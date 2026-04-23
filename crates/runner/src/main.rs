@@ -1591,8 +1591,15 @@ fn main() -> Result<()> {
         && !gpu_validate_enabled
         && !cli.emit_stage_timings
         && cli.trace_replay_decode_step.is_none();
+    let metal_component_decode_enabled = metal_replay_fast_greedy_enabled
+        && env::var_os("SUPERSONIC_METAL_ENABLE_COMPONENT_DECODE").is_some();
     if replay_decode_enabled {
-        if metal_replay_fast_greedy_enabled {
+        if metal_component_decode_enabled {
+            eprintln!(
+                "[decode] experimental Metal component decode path enabled \
+                 (prototype; parity not guaranteed)"
+            );
+        } else if metal_replay_fast_greedy_enabled {
             eprintln!("[decode] Metal fast greedy replay-prefill path enabled");
         } else if backend == Backend::Metal {
             eprintln!("[decode] Metal v1 replays native prefill for each decode step");
@@ -1831,7 +1838,14 @@ fn main() -> Result<()> {
                 let token_ids = replay_token_ids
                     .as_ref()
                     .expect("replay token ids are present when replay decode is enabled");
-                if metal_replay_fast_greedy_enabled {
+                if metal_component_decode_enabled {
+                    let (token, timings) =
+                        engine.decode_step_metal_component_greedy(next_token, seqlen_offset)?;
+                    native_decode_timings.add_assign(timings);
+                    native_decode_timing_steps += 1;
+                    maybe_fast_token = Some(token);
+                    Vec::new()
+                } else if metal_replay_fast_greedy_enabled {
                     maybe_fast_token = Some(engine.rebuild_prefill_state_greedy_token(token_ids)?);
                     Vec::new()
                 } else {

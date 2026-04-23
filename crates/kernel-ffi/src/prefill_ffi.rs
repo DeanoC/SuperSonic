@@ -1015,6 +1015,20 @@ pub fn linear_decode_apply_4b(
     initial_state: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_profile_host_time("linear_decode_apply_4b", || {
+            metal_host::linear_decode_apply(
+                batch_size,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                packed,
+                initial_state,
+                out,
+            )
+        });
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_linear_decode_apply(
             ordinal,
@@ -1052,6 +1066,27 @@ pub fn linear_stateful_conv_value_decay_4b(
     a_log_exp: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_profile_host_time("linear_stateful_conv_value_decay_4b", || {
+            metal_host::linear_stateful_conv_value_decay(
+                dtype,
+                batch_size,
+                conv_dim,
+                seq_len,
+                state_len,
+                kernel_size,
+                num_heads,
+                mixed_qkv,
+                prev_state,
+                weights,
+                a,
+                dt_bias,
+                a_log_exp,
+                out,
+            )
+        });
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_linear_stateful_conv_value_decay(
             dtype.kernel_dtype_code(),

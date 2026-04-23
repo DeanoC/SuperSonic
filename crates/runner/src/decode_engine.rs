@@ -1518,11 +1518,13 @@ impl DecodeEngine {
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
+        metal_greedy: bool,
         trace_input_layer: Option<usize>,
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
     ) -> Result<(
         Vec<f32>,
+        Option<u32>,
         Option<Vec<u8>>,
         Option<ComponentLayerTrace>,
         Option<ComponentLinearTrace>,
@@ -1645,27 +1647,45 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("final rms_norm: {e}"))?;
 
-        kernel_ffi::standalone_matvec_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            &mut self.logits_buf,
-            &self.normed_buf,
-            &*self.weights.lm_head,
-            hidden_dim,
-            vocab_size,
-            &mut self.matvec_counter,
-        )
-        .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+        let (logits, sampled_token) = if metal_greedy {
+            if self.normed_buf.backend() != gpu_hal::Backend::Metal {
+                anyhow::bail!("component Metal greedy decode requires Metal buffers");
+            }
+            let token = kernel_ffi::metal_lm_head_argmax_bf16(
+                self.ordinal,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                hidden_dim,
+                vocab_size,
+            )
+            .map_err(|e| anyhow::anyhow!("lm_head argmax: {e}"))?;
+            (Vec::new(), Some(token))
+        } else {
+            kernel_ffi::standalone_matvec_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                &mut self.logits_buf,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                hidden_dim,
+                vocab_size,
+                &mut self.matvec_counter,
+            )
+            .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
 
-        let logits_bytes = self
-            .logits_buf
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
-        Ok((
-            logits_bytes
+            let logits_bytes = self
+                .logits_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("logits D2H: {e}"))?;
+            let logits = logits_bytes
                 .chunks_exact(2)
                 .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-                .collect(),
+                .collect();
+            (logits, None)
+        };
+        Ok((
+            logits,
+            sampled_token,
             traced_hidden,
             traced_layer,
             traced_linear,
@@ -1677,8 +1697,8 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
     ) -> Result<Vec<f32>> {
-        let (logits, _, _, _) =
-            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None)?;
+        let (logits, _, _, _, _) =
+            self.component_decode_step_4b_impl(token_id, seqlen_offset, false, None, None, None)?;
         Ok(logits)
     }
 
@@ -1688,9 +1708,10 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_input_layer: usize,
     ) -> Result<(Vec<f32>, Vec<u8>)> {
-        let (logits, trace, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, trace, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
+            false,
             Some(trace_input_layer),
             None,
             None,
@@ -1706,9 +1727,10 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLayerTrace)> {
-        let (logits, _, trace, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, trace, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
+            false,
             None,
             Some(trace_layer),
             None,
@@ -1724,9 +1746,10 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLinearTrace)> {
-        let (logits, _, _, trace) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, trace) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
+            false,
             None,
             None,
             Some(trace_layer),
@@ -3501,6 +3524,45 @@ impl DecodeEngine {
             DecodeSamplingMode::CudaHeroFusedLmHead,
         )?;
         Ok((out.sampled_token, out.timings))
+    }
+
+    /// Prototype Metal component decode path for Qwen3.5 0.8B.
+    ///
+    /// This consumes the ModelState produced by native Metal prefill and
+    /// advances it by one token instead of replaying the whole prompt. It is
+    /// intentionally opt-in from the CLI while correctness/perf are measured.
+    pub fn decode_step_metal_component_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Metal {
+            anyhow::bail!("decode_step_metal_component_greedy requires Metal backend");
+        }
+        if self.use_4b_kernel {
+            anyhow::bail!("decode_step_metal_component_greedy is scoped to the non-4B path");
+        }
+        let start = Instant::now();
+        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none() {
+            Some(
+                kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
+                    .map_err(|e| anyhow::anyhow!("begin Metal component decode batch: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let (_, sampled_token, _, _, _) =
+            self.component_decode_step_4b_impl(token_id, seqlen_offset, true, None, None, None)?;
+        if let Some(guard) = metal_batch_guard {
+            guard
+                .finish()
+                .map_err(|e| anyhow::anyhow!("finish Metal component decode batch: {e}"))?;
+        }
+        let mut timings = DecodeStageTimings::default();
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let token =
+            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        Ok((token, timings))
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
