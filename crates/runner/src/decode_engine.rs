@@ -181,8 +181,8 @@ fn metal_fused_linear_out_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
 }
 
-fn metal_fused_linear_decode_apply_inplace_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_DECODE_APPLY_INPLACE").is_some()
+fn metal_fused_linear_decode_apply_inplace_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_DECODE_APPLY_INPLACE").is_some()
 }
 
 fn metal_matmul_residual_add_bf16(
@@ -2945,7 +2945,6 @@ impl DecodeEngine {
         let ls = &mut self.state.layers[idx];
         let use_fused_conv_update = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
-            && std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_CONV_UPDATE").is_some()
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_CONV_UPDATE").is_none()
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
                 .is_none();
@@ -3001,7 +3000,7 @@ impl DecodeEngine {
             && b_for_beta_f32.is_none();
         let use_fused_linear_decode_apply_inplace = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
-            && metal_fused_linear_decode_apply_inplace_enabled()
+            && !metal_fused_linear_decode_apply_inplace_disabled()
             && a_for_beta_f32.is_none()
             && b_for_beta_f32.is_none();
         let mut used_fused_linear_decode_apply_inplace = false;
