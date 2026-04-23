@@ -715,6 +715,9 @@ pub struct CertifiedKvShadowStats {
     pub value_bound_heads: usize,
     pub value_bound_max: f32,
     pub value_escalation_blocks: usize,
+    pub attend_layers: usize,
+    pub attend_ms: f64,
+    pub attend_max_abs: f32,
 }
 
 pub struct ComponentLayerTrace {
@@ -1361,6 +1364,47 @@ impl DecodeEngine {
                 stats.value_bound_heads += 1;
                 stats.value_bound_max = stats.value_bound_max.max(value_bound);
             }
+
+            let mut attn_score_scratch =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, aligned])
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend score alloc: {e}"))?;
+            let mut attn_output =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend output alloc: {e}"))?;
+            let attend_start = Instant::now();
+            kernel_ffi::certified_kv::attend_int8_int4(
+                self.ordinal,
+                &query,
+                &key_i8,
+                &key_scale,
+                &value_i4,
+                &value_scale,
+                &value_zero,
+                block_size,
+                value_group_size,
+                gqa_group,
+                (head_dim as f32).powf(-0.5),
+                &mut attn_score_scratch,
+                &mut attn_output,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend: {e}"))?;
+            stats.attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
+            let attn_host = decode_f32_le(
+                &attn_output
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend output D2H: {e}"))?,
+            );
+            for (idx, value) in attn_host.iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(anyhow::anyhow!(
+                        "layer {layer_idx} certified KV attend output invalid at {}: {}",
+                        idx,
+                        *value
+                    ));
+                }
+                stats.attend_max_abs = stats.attend_max_abs.max(value.abs());
+            }
+            stats.attend_layers += 1;
 
             let query_f32 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
             let key_i8_host = key_i8

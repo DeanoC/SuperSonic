@@ -664,7 +664,7 @@ pub fn run_llama31(
                 stats.selector_selected_blocks as f32 / stats.selector_heads as f32
             };
             eprintln!(
-                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={} value_bound_max={:.6} value_escalation_blocks={}",
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={} value_bound_max={:.6} value_escalation_blocks={} attend_layers={} attend_ms={:.3} attend_max_abs={:.6}",
                 stats.layers,
                 stats.aligned_tokens,
                 stats.compressed_vram_bytes,
@@ -679,6 +679,9 @@ pub fn run_llama31(
                 stats.selector_rung1_heads,
                 stats.value_bound_max,
                 stats.value_escalation_blocks,
+                stats.attend_layers,
+                stats.attend_ms,
+                stats.attend_max_abs,
             );
             Some(stats)
         } else {
@@ -1146,6 +1149,9 @@ pub fn run_llama31(
                 "shadow_value_bound_heads": certified_kv_shadow_stats.map(|s| s.value_bound_heads),
                 "shadow_value_bound_max": certified_kv_shadow_stats.map(|s| s.value_bound_max),
                 "shadow_value_escalation_blocks": certified_kv_shadow_stats.map(|s| s.value_escalation_blocks),
+                "shadow_attend_layers": certified_kv_shadow_stats.map(|s| s.attend_layers),
+                "shadow_attend_ms": certified_kv_shadow_stats.map(|s| s.attend_ms),
+                "shadow_attend_max_abs": certified_kv_shadow_stats.map(|s| s.attend_max_abs),
             });
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {

@@ -196,6 +196,9 @@ if shadow_runs:
     shadow_selector_rung1 = statistics.mean(r.get("shadow_selector_rung1_heads", 0) for r in shadow_runs)
     shadow_value_bound = max(r.get("shadow_value_bound_max", 0.0) for r in shadow_runs)
     shadow_value_escalations = statistics.mean(r.get("shadow_value_escalation_blocks", 0) for r in shadow_runs)
+    shadow_attend_layers = statistics.mean(r.get("shadow_attend_layers", 0) for r in shadow_runs)
+    shadow_attend_ms = statistics.mean(r.get("shadow_attend_ms", 0.0) for r in shadow_runs)
+    shadow_attend_abs = max(r.get("shadow_attend_max_abs", 0.0) for r in shadow_runs)
     print(
         "shadow_mean "
         f"layers={shadow_layers:.1f} aligned_tokens={shadow_tokens:.1f} "
@@ -204,6 +207,8 @@ if shadow_runs:
         f"score_ms={shadow_score_ms:.3f} max_score_ref_delta={shadow_score_delta:.6f} "
         f"selector_heads={shadow_selector_heads:.1f} selector_mean_k={shadow_selector_mean_k:.2f} "
         f"selector_max_tail_mass={shadow_selector_tail:.6f} selector_rung1_heads={shadow_selector_rung1:.1f} "
-        f"value_bound_max={shadow_value_bound:.6f} value_escalation_blocks={shadow_value_escalations:.1f}"
+        f"value_bound_max={shadow_value_bound:.6f} value_escalation_blocks={shadow_value_escalations:.1f} "
+        f"attend_layers={shadow_attend_layers:.1f} attend_ms={shadow_attend_ms:.3f} "
+        f"attend_max_abs={shadow_attend_abs:.6f}"
     )
 PY
