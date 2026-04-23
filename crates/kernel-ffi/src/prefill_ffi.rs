@@ -169,6 +169,10 @@ fn metal_force_host_rms_norm() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM").is_some()
 }
 
+fn metal_force_host_rms_norm_gated() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM_GATED").is_some()
+}
+
 fn metal_force_host_matmul() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MATMUL").is_some()
 }
@@ -1288,7 +1292,10 @@ pub fn rms_norm_gated(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        if dtype == ScalarType::BF16 && !metal_native::disabled_by_env() {
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm_gated()
+        {
             let result = metal_profile_time("rms_norm_gated", "native", || {
                 metal_native::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
             });
@@ -1296,7 +1303,10 @@ pub fn rms_norm_gated(
                 return result;
             }
         }
-        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm_gated()
+        {
             let result = metal_profile_time("rms_norm_gated", "native", || {
                 metal_native::rms_norm_gated_f32(n_rows, n_cols, eps, hidden, gate, weight, out)
             });

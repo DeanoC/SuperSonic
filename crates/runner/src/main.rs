@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Parser;
 use gpu_hal::{GpuBuffer, ScalarType};
@@ -1839,8 +1839,86 @@ fn main() -> Result<()> {
                     .as_ref()
                     .expect("replay token ids are present when replay decode is enabled");
                 if metal_component_decode_enabled {
-                    let (token, timings) =
-                        engine.decode_step_metal_component_greedy(next_token, seqlen_offset)?;
+                    let metal_linear_trace_layer =
+                        if let Some(raw) = env::var_os("SUPERSONIC_METAL_TRACE_COMPONENT_LINEAR_LAYER")
+                        {
+                            Some(
+                                raw.to_string_lossy().parse::<usize>().with_context(|| {
+                                    format!(
+                                        "invalid SUPERSONIC_METAL_TRACE_COMPONENT_LINEAR_LAYER '{}'",
+                                        raw.to_string_lossy()
+                                    )
+                                })?,
+                            )
+                        } else {
+                            None
+                        };
+                    let metal_input_trace_layer =
+                        if let Some(raw) = env::var_os("SUPERSONIC_METAL_TRACE_COMPONENT_INPUT_LAYER")
+                        {
+                            Some(
+                                raw.to_string_lossy().parse::<usize>().with_context(|| {
+                                    format!(
+                                        "invalid SUPERSONIC_METAL_TRACE_COMPONENT_INPUT_LAYER '{}'",
+                                        raw.to_string_lossy()
+                                    )
+                                })?,
+                            )
+                        } else {
+                            None
+                        };
+                    let (token, timings) = if let Some(trace_layer) = metal_input_trace_layer {
+                        let (token, timings, hidden_trace) = engine
+                            .decode_step_metal_component_greedy_trace_input_layer(
+                                next_token,
+                                seqlen_offset,
+                                trace_layer,
+                            )?;
+                        trace_component_input_layer(
+                            &engine,
+                            &hidden_trace,
+                            trace_layer,
+                            token_ids,
+                            ordinal,
+                            params.kv_chunk_size,
+                            cli.prefill_chunk_size,
+                            params.use_4b_kernel,
+                        )?;
+                        (token, timings)
+                    } else if let Some(trace_layer) = metal_linear_trace_layer {
+                        let (token, timings, linear_trace) = engine
+                            .decode_step_metal_component_greedy_trace_linear_layer(
+                                next_token,
+                                seqlen_offset,
+                                trace_layer,
+                            )?;
+                        trace_component_linear_layer(
+                            &engine,
+                            trace_layer,
+                            &linear_trace,
+                            token_ids,
+                            ordinal,
+                            params.kv_chunk_size,
+                            cli.prefill_chunk_size,
+                            params.use_4b_kernel,
+                        )?;
+                        (token, timings)
+                    } else {
+                        engine.decode_step_metal_component_greedy(next_token, seqlen_offset)?
+                    };
+                    if let Some(trace_spec) =
+                        env::var_os("SUPERSONIC_METAL_TRACE_COMPONENT_LINEAR_STATE_LAYER")
+                    {
+                        trace_metal_component_linear_state_layers(
+                            &engine,
+                            trace_spec.to_string_lossy().as_ref(),
+                            token_ids,
+                            ordinal,
+                            params.kv_chunk_size,
+                            cli.prefill_chunk_size,
+                            params.use_4b_kernel,
+                        )?;
+                    }
                     native_decode_timings.add_assign(timings);
                     native_decode_timing_steps += 1;
                     maybe_fast_token = Some(token);
@@ -6991,6 +7069,8 @@ fn trace_component_linear_layer(
         .linear_debug_trace
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing replay linear trace for layer {trace_layer}"))?;
+    let normed_delta =
+        validate::max_abs_delta(&decode_bf16_le(&native.normed), &decode_bf16_le(&replay.normed));
     let qkv_delta =
         validate::max_abs_delta(&decode_bf16_le(&native.qkv), &decode_bf16_le(&replay.qkv));
     let z_delta = validate::max_abs_delta(&decode_bf16_le(&native.z), &decode_bf16_le(&replay.z));
@@ -7082,7 +7162,7 @@ fn trace_component_linear_layer(
         &decode_bf16_le(&replay.proj_out),
     );
     eprintln!(
-        "[trace-component-linear] layer={trace_layer} qkv_delta={qkv_delta:.6} z_delta={z_delta:.6} packed_delta={packed_delta:.6} q_delta={q_delta:.6} k_delta={k_delta:.6} v_delta={v_delta:.6} state_vs_tail_delta={state_vs_tail_delta:.6} v_ref_native_delta={v_ref_native_delta:.6} v_ref_replay_delta={v_ref_replay_delta:.6} beta_delta={beta_delta:.6} gexp_delta={gexp_delta:.6} rec_apply_delta={rec_apply_delta:.6} attn_delta={attn_delta:.6} gated_delta={gated_delta:.6} proj_out_delta={proj_out_delta:.6}"
+        "[trace-component-linear] layer={trace_layer} normed_delta={normed_delta:.6} qkv_delta={qkv_delta:.6} z_delta={z_delta:.6} packed_delta={packed_delta:.6} q_delta={q_delta:.6} k_delta={k_delta:.6} v_delta={v_delta:.6} state_vs_tail_delta={state_vs_tail_delta:.6} v_ref_native_delta={v_ref_native_delta:.6} v_ref_replay_delta={v_ref_replay_delta:.6} beta_delta={beta_delta:.6} gexp_delta={gexp_delta:.6} rec_apply_delta={rec_apply_delta:.6} attn_delta={attn_delta:.6} gated_delta={gated_delta:.6} proj_out_delta={proj_out_delta:.6}"
     );
     Ok(())
 }
@@ -7238,6 +7318,58 @@ fn trace_component_linear_state_layer(
     eprintln!(
         "[trace-component-linear-state] layer={trace_layer} conv_delta={conv_delta:.6} recurrent_delta={rec_delta:.6}"
     );
+    Ok(())
+}
+
+fn trace_metal_component_linear_state_layers(
+    engine: &DecodeEngine,
+    trace_spec: &str,
+    history_token_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    use_4b_kernel: bool,
+) -> Result<()> {
+    let mut layers = Vec::new();
+    if trace_spec.eq_ignore_ascii_case("all") {
+        layers.extend(
+            (0..engine.weights().config.num_hidden_layers)
+                .filter(|&layer| !engine.weights().config.is_full_attention(layer)),
+        );
+    } else {
+        for raw in trace_spec.split(',') {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            layers.push(
+                raw.parse::<usize>()
+                    .with_context(|| format!("invalid Metal component linear state layer '{raw}'"))?,
+            );
+        }
+    }
+
+    if layers.is_empty() {
+        anyhow::bail!("SUPERSONIC_METAL_TRACE_COMPONENT_LINEAR_STATE_LAYER selected no layers");
+    }
+
+    for layer in layers {
+        if engine.weights().config.is_full_attention(layer) {
+            eprintln!(
+                "[trace-component-linear-state] layer={layer} skipped kind=full-attention"
+            );
+            continue;
+        }
+        trace_component_linear_state_layer(
+            engine,
+            layer,
+            history_token_ids,
+            ordinal,
+            kv_chunk_size,
+            prefill_chunk_size,
+            use_4b_kernel,
+        )?;
+    }
     Ok(())
 }
 

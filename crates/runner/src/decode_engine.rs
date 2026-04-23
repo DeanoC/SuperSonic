@@ -81,6 +81,41 @@ fn matmul_proj(
     }
 }
 
+fn metal_f32_projection_from_f32_input_to_f32(
+    ordinal: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    input_f32: &GpuBuffer,
+    weight: &GpuBuffer,
+    output_f32: &mut GpuBuffer,
+) -> Result<()> {
+    let mut weight_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[out_dim, in_dim])
+        .map_err(|e| anyhow::anyhow!("metal f32 projection weight alloc: {e}"))?;
+    kernel_ffi::prefill_ffi::cast(
+        ordinal,
+        weight.dtype(),
+        ScalarType::F32,
+        out_dim * in_dim,
+        weight,
+        &mut weight_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("metal f32 projection weight cast: {e}"))?;
+    kernel_ffi::prefill_ffi::matmul_rhs_transposed(
+        ordinal,
+        ScalarType::F32,
+        1,
+        rows,
+        out_dim,
+        in_dim,
+        input_f32,
+        &weight_f32,
+        output_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("metal f32 projection matmul: {e}"))?;
+    Ok(())
+}
+
 fn residual_add(
     ordinal: usize,
     total_elems: usize,
@@ -321,6 +356,7 @@ pub struct ComponentMlpTrace {
 }
 
 pub struct ComponentLinearTrace {
+    pub normed: Vec<u8>,
     pub qkv: Vec<u8>,
     pub z: Vec<u8>,
     pub b: Vec<u8>,
@@ -2170,6 +2206,61 @@ impl DecodeEngine {
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
+        let use_metal_f32_linear_input = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && std::env::var_os("SUPERSONIC_METAL_ENABLE_COMPONENT_F32_LINEAR_INPUT").is_some()
+            && lw.qkv_proj_scale.is_none()
+            && lw.qkv_proj_int4_scale.is_none()
+            && lw.qkv_proj_int4_zero.is_none()
+            && lw.z_proj_scale.is_none()
+            && lw.z_proj_int4_scale.is_none()
+            && lw.z_proj_int4_zero.is_none()
+            && lw.b_proj_scale.is_none()
+            && lw.a_proj_scale.is_none()
+            && matches!(lw.qkv_proj_w.dtype(), ScalarType::BF16 | ScalarType::F32)
+            && matches!(lw.z_proj_w.dtype(), ScalarType::BF16 | ScalarType::F32)
+            && matches!(lw.b_proj_w.dtype(), ScalarType::BF16 | ScalarType::F32)
+            && matches!(lw.a_proj_w.dtype(), ScalarType::BF16 | ScalarType::F32);
+        let linear_normed_f32_storage;
+        let linear_normed_f32 = if use_metal_f32_linear_input {
+            let mut hidden_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, hidden_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} component hidden_f32 alloc: {e}"))?;
+            let mut normed_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, hidden_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} component normed_f32 alloc: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                hidden_dim,
+                &self.hidden_io,
+                &mut hidden_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} component hidden cast: {e}"))?;
+            kernel_ffi::prefill_ffi::rms_norm_rows(
+                self.ordinal,
+                ScalarType::F32,
+                1,
+                hidden_dim,
+                config.rms_norm_eps as f32,
+                &hidden_f32,
+                &self.weights.layers[idx].input_norm_w,
+                &mut normed_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} component input norm f32: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                hidden_dim,
+                &normed_f32,
+                &mut self.normed_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} component normed cast: {e}"))?;
+            linear_normed_f32_storage = normed_f32;
+            Some(&linear_normed_f32_storage)
+        } else {
+            None
+        };
+
         matmul_proj(
             self.ordinal,
             1,
@@ -2185,6 +2276,15 @@ impl DecodeEngine {
             lw.qkv_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
         )?;
+        let normed_trace = if trace_output {
+            Some(
+                self.normed_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} normed trace D2H: {e}"))?,
+            )
+        } else {
+            None
+        };
         let qkv_trace = if trace_output {
             Some(
                 qkv.to_host_bytes()
@@ -2247,7 +2347,64 @@ impl DecodeEngine {
             self.weights.int4_group_size,
         )?;
 
+        let mut a_for_beta_f32: Option<Vec<f32>> = None;
+        let mut b_for_beta_f32: Option<Vec<f32>> = None;
+
         let ab_bytes = nv * ScalarType::BF16.size_in_bytes();
+        if let Some(normed_f32) = linear_normed_f32 {
+            let mut a_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, nv])
+                .map_err(|e| anyhow::anyhow!("layer {idx} a_f32 alloc: {e}"))?;
+            let mut b_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, nv])
+                .map_err(|e| anyhow::anyhow!("layer {idx} b_f32 alloc: {e}"))?;
+            metal_f32_projection_from_f32_input_to_f32(
+                self.ordinal,
+                1,
+                hidden_dim,
+                nv,
+                normed_f32,
+                &lw.a_proj_w,
+                &mut a_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} a f32 proj: {e}"))?;
+            metal_f32_projection_from_f32_input_to_f32(
+                self.ordinal,
+                1,
+                hidden_dim,
+                nv,
+                normed_f32,
+                &lw.b_proj_w,
+                &mut b_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} b f32 proj: {e}"))?;
+            a_for_beta_f32 = Some(decode_f32_le(
+                &a_f32
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} a_f32 D2H: {e}"))?,
+            ));
+            b_for_beta_f32 = Some(decode_f32_le(
+                &b_f32
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} b_f32 D2H: {e}"))?,
+            ));
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                nv,
+                &a_f32,
+                &mut a,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} a f32 cast: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                nv,
+                &b_f32,
+                &mut b,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} b f32 cast: {e}"))?;
+        }
         gpu_hal::copy_d2d(
             self.ordinal,
             a_beta_raw.as_ptr() as *mut c_void,
@@ -2408,12 +2565,6 @@ impl DecodeEngine {
         let v_linear_host = v_linear_f32
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} v_linear D2H: {e}"))?;
-        let a_host = a
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} a D2H: {e}"))?;
-        let b_host = b
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} b D2H: {e}"))?;
         let dt_bias_host = lw
             .dt_bias
             .to_host_bytes()
@@ -2434,14 +2585,24 @@ impl DecodeEngine {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        let a_bf16: Vec<f32> = a_host
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect();
-        let b_bf16: Vec<f32> = b_host
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect();
+        let a_for_beta = if let Some(values) = a_for_beta_f32 {
+            values
+        } else {
+            a.to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} a D2H: {e}"))?
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect()
+        };
+        let b_for_beta = if let Some(values) = b_for_beta_f32 {
+            values
+        } else {
+            b.to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} b D2H: {e}"))?
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                .collect()
+        };
         let dt_bias_bf16: Vec<f32> = dt_bias_host
             .chunks_exact(2)
             .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
@@ -2465,8 +2626,9 @@ impl DecodeEngine {
             for i in 0..vhd {
                 packed_host[out_base + 2 * khd + i] = v_linear_f32_host[v_base + i];
             }
-            packed_host[out_base + 2 * khd + vhd] = 1.0f32 / (1.0f32 + (-b_bf16[v_head]).exp());
-            let softplus = (1.0f32 + (a_bf16[v_head] + dt_bias_bf16[v_head]).exp()).ln();
+            packed_host[out_base + 2 * khd + vhd] =
+                1.0f32 / (1.0f32 + (-b_for_beta[v_head]).exp());
+            let softplus = (1.0f32 + (a_for_beta[v_head] + dt_bias_bf16[v_head]).exp()).ln();
             packed_host[out_base + 2 * khd + vhd + 1] = (-softplus * a_log_exp_bf16[v_head]).exp();
         }
         let packed = GpuBuffer::from_host_bytes(
@@ -2627,6 +2789,7 @@ impl DecodeEngine {
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
         Ok(if trace_output {
             Some(ComponentLinearTrace {
+                normed: normed_trace.unwrap_or_default(),
                 qkv: qkv_trace.unwrap_or_default(),
                 z: z_trace.unwrap_or_default(),
                 b: b_trace.unwrap_or_default(),
@@ -3563,6 +3726,97 @@ impl DecodeEngine {
         let token =
             sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
         Ok((token, timings))
+    }
+
+    pub fn decode_step_metal_component_greedy_trace_linear_layer(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        trace_layer: usize,
+    ) -> Result<(u32, DecodeStageTimings, ComponentLinearTrace)> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Metal {
+            anyhow::bail!("decode_step_metal_component_greedy_trace_linear_layer requires Metal backend");
+        }
+        if self.use_4b_kernel {
+            anyhow::bail!(
+                "decode_step_metal_component_greedy_trace_linear_layer is scoped to the non-4B path"
+            );
+        }
+        let start = Instant::now();
+        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none() {
+            Some(
+                kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
+                    .map_err(|e| anyhow::anyhow!("begin Metal component decode trace batch: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let (_, sampled_token, _, _, trace) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            true,
+            None,
+            None,
+            Some(trace_layer),
+        )?;
+        if let Some(guard) = metal_batch_guard {
+            guard
+                .finish()
+                .map_err(|e| anyhow::anyhow!("finish Metal component decode trace batch: {e}"))?;
+        }
+        let mut timings = DecodeStageTimings::default();
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let token =
+            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        let trace = trace.ok_or_else(|| {
+            anyhow::anyhow!("missing Metal component linear trace for layer {trace_layer}")
+        })?;
+        Ok((token, timings, trace))
+    }
+
+    pub fn decode_step_metal_component_greedy_trace_input_layer(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        trace_layer: usize,
+    ) -> Result<(u32, DecodeStageTimings, Vec<u8>)> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Metal {
+            anyhow::bail!("decode_step_metal_component_greedy_trace_input_layer requires Metal backend");
+        }
+        if self.use_4b_kernel {
+            anyhow::bail!(
+                "decode_step_metal_component_greedy_trace_input_layer is scoped to the non-4B path"
+            );
+        }
+        let start = Instant::now();
+        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none() {
+            Some(
+                kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
+                    .map_err(|e| anyhow::anyhow!("begin Metal component decode input trace batch: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let (_, sampled_token, trace, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            true,
+            Some(trace_layer),
+            None,
+            None,
+        )?;
+        if let Some(guard) = metal_batch_guard {
+            guard
+                .finish()
+                .map_err(|e| anyhow::anyhow!("finish Metal component decode input trace batch: {e}"))?;
+        }
+        let mut timings = DecodeStageTimings::default();
+        timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let token =
+            sampled_token.ok_or_else(|| anyhow::anyhow!("Metal component decode missing token"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing Metal component input trace for layer {trace_layer}"))?;
+        Ok((token, timings, trace))
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
