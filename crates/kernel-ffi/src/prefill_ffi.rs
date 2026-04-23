@@ -219,6 +219,37 @@ pub fn metal_qwen_linear_prep_bf16_f32(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_prep_decode_apply_bf16_f32(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_pack: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_prep_decode_apply", "native", || {
+        metal_native::qwen_linear_prep_decode_apply_bf16_f32(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_pack,
+            a,
+            b,
+            dt_bias,
+            a_log_exp,
+            initial_state,
+            out,
+        )
+    })
+}
+
 pub fn metal_conv_state_update_bf16(
     channels: usize,
     state_len: usize,

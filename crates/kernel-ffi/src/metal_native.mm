@@ -183,6 +183,20 @@ struct QwenLinearPrepParams {
     float q_scale;
 };
 
+struct QwenLinearPrepDecodeApplyParams {
+    uint32_t num_v_heads;
+    uint32_t num_k_heads;
+    uint32_t head_repeat;
+    uint32_t k_head_dim;
+    uint32_t v_head_dim;
+    uint32_t key_dim;
+    uint32_t value_dim;
+    uint32_t state_dim;
+    uint32_t total_threads;
+    float eps;
+    float q_scale;
+};
+
 struct ConvStateUpdateParams {
     uint32_t channels;
     uint32_t state_len;
@@ -4136,6 +4150,152 @@ kernel void supersonic_qwen_linear_prep_bf16_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> qwen_linear_prep_decode_apply_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:580
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"LDPREPAPPLY(
+#include <metal_stdlib>
+using namespace metal;
+
+struct QwenLinearPrepDecodeApplyParams {
+    uint num_v_heads;
+    uint num_k_heads;
+    uint head_repeat;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint key_dim;
+    uint value_dim;
+    uint state_dim;
+    uint total_threads;
+    float eps;
+    float q_scale;
+};
+
+static inline float softplus_stable(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+kernel void supersonic_qwen_linear_prep_decode_apply_bf16_f32(
+    device const bfloat* conv_pack [[buffer(0)]],
+    device const bfloat* a [[buffer(1)]],
+    device const bfloat* b [[buffer(2)]],
+    device const bfloat* dt_bias [[buffer(3)]],
+    device const bfloat* a_log_exp [[buffer(4)]],
+    device const float* initial_state [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant QwenLinearPrepDecodeApplyParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+
+    uint v_head = gid / params.v_head_dim;
+    uint vv = gid - v_head * params.v_head_dim;
+    uint k_head = v_head / params.head_repeat;
+    uint qk_base = k_head * params.k_head_dim;
+    uint v_base = v_head * params.v_head_dim;
+
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float qh = float(conv_pack[qk_base + kk]);
+        float kh = float(conv_pack[params.key_dim + qk_base + kk]);
+        q_sum = fma(qh, qh, q_sum);
+        k_sum = fma(kh, kh, k_sum);
+    }
+    float q_inv_norm = rsqrt(q_sum + params.eps) * params.q_scale;
+    float k_inv_norm = rsqrt(k_sum + params.eps);
+
+    float beta = 1.0f / (1.0f + exp(-float(b[v_head])));
+    float g_exp =
+        exp(-softplus_stable(float(a[v_head]) + float(dt_bias[v_head])) * float(a_log_exp[v_head]));
+
+    uint state_head_base = (v_head * params.k_head_dim) * params.v_head_dim + vv;
+    uint state_out_base = params.value_dim + (v_head * params.k_head_dim) * params.v_head_dim + vv;
+    float kv_mem = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float k_norm = float(conv_pack[params.key_dim + qk_base + kk]) * k_inv_norm;
+        float state = initial_state[state_head_base + kk * params.v_head_dim] * g_exp;
+        kv_mem = fma(state, k_norm, kv_mem);
+        out[state_out_base + kk * params.v_head_dim] = state;
+    }
+
+    float v_linear = float(conv_pack[params.key_dim * 2 + v_base + vv]);
+    float delta = (v_linear - kv_mem) * beta;
+    float out_value = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float q_scaled = float(conv_pack[qk_base + kk]) * q_inv_norm;
+        float k_norm = float(conv_pack[params.key_dim + qk_base + kk]) * k_inv_norm;
+        uint state_idx = state_out_base + kk * params.v_head_dim;
+        float state = fma(k_norm, delta, out[state_idx]);
+        out[state_idx] = state;
+        out_value = fma(state, q_scaled, out_value);
+    }
+    out[v_base + vv] = out_value;
+}
+)LDPREPAPPLY";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:581
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen linear prep/apply library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen_linear_prep_decode_apply_bf16_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:582
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen linear prep/apply function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                code:583
+                                                                            userInfo:@{
+                                                                                NSLocalizedDescriptionKey :
+                                                                                    @"Failed to create Qwen linear prep/apply pipeline"
+                                                                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> conv_state_update_bf16_pipeline(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -6266,6 +6426,109 @@ extern "C" int supersonic_metal_qwen_linear_prep_bf16_f32(
             MTLSize group = MTLSizeMake(threads_per_group, 1, 1);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:group];
         }, 204, 205, 206, 207);
+    }
+}
+
+extern "C" int supersonic_metal_qwen_linear_prep_decode_apply_bf16_f32(
+    size_t num_v_heads,
+    size_t num_k_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* conv_pack_ptr,
+    const void* a_ptr,
+    const void* b_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_exp_ptr,
+    const void* initial_state_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (num_v_heads == 0 || num_k_heads == 0 || head_k_dim == 0 || head_v_dim == 0 ||
+            num_v_heads % num_k_heads != 0 || conv_pack_ptr == nullptr || a_ptr == nullptr ||
+            b_ptr == nullptr || dt_bias_ptr == nullptr || a_log_exp_ptr == nullptr ||
+            initial_state_ptr == nullptr || out_ptr == nullptr) {
+            return 584;
+        }
+        if (num_v_heads > UINT32_MAX || num_k_heads > UINT32_MAX ||
+            head_k_dim > UINT32_MAX || head_v_dim > UINT32_MAX) {
+            return 585;
+        }
+        if (num_v_heads > SIZE_MAX / head_v_dim) {
+            return 586;
+        }
+        size_t total_threads = num_v_heads * head_v_dim;
+        if (total_threads > UINT32_MAX) {
+            return 587;
+        }
+        if (num_k_heads > SIZE_MAX / head_k_dim ||
+            num_v_heads > SIZE_MAX / head_k_dim / head_v_dim) {
+            return 588;
+        }
+        size_t key_dim = num_k_heads * head_k_dim;
+        size_t value_dim = total_threads;
+        size_t state_dim = num_v_heads * head_k_dim * head_v_dim;
+        if (key_dim > UINT32_MAX || value_dim > UINT32_MAX || state_dim > UINT32_MAX) {
+            return 589;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            qwen_linear_prep_decode_apply_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 590;
+        }
+
+        id<MTLBuffer> conv_pack = nil;
+        id<MTLBuffer> a = nil;
+        id<MTLBuffer> b = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log_exp = nil;
+        id<MTLBuffer> initial_state = nil;
+        id<MTLBuffer> out = nil;
+        size_t conv_pack_offset = 0;
+        size_t a_offset = 0;
+        size_t b_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_exp_offset = 0;
+        size_t initial_state_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(conv_pack_ptr, &conv_pack, &conv_pack_offset) != 0) return 591;
+        if (lookup_buffer(a_ptr, &a, &a_offset) != 0) return 592;
+        if (lookup_buffer(b_ptr, &b, &b_offset) != 0) return 593;
+        if (lookup_buffer(dt_bias_ptr, &dt_bias, &dt_bias_offset) != 0) return 594;
+        if (lookup_buffer(a_log_exp_ptr, &a_log_exp, &a_log_exp_offset) != 0) return 595;
+        if (lookup_buffer(initial_state_ptr, &initial_state, &initial_state_offset) != 0) return 596;
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) return 597;
+
+        QwenLinearPrepDecodeApplyParams params = {
+            static_cast<uint32_t>(num_v_heads),
+            static_cast<uint32_t>(num_k_heads),
+            static_cast<uint32_t>(num_v_heads / num_k_heads),
+            static_cast<uint32_t>(head_k_dim),
+            static_cast<uint32_t>(head_v_dim),
+            static_cast<uint32_t>(key_dim),
+            static_cast<uint32_t>(value_dim),
+            static_cast<uint32_t>(state_dim),
+            static_cast<uint32_t>(total_threads),
+            1.0e-6f,
+            1.0f / sqrtf(static_cast<float>(head_k_dim)),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:conv_pack offset:conv_pack_offset atIndex:0];
+            [encoder setBuffer:a offset:a_offset atIndex:1];
+            [encoder setBuffer:b offset:b_offset atIndex:2];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:3];
+            [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:4];
+            [encoder setBuffer:initial_state offset:initial_state_offset atIndex:5];
+            [encoder setBuffer:out offset:out_offset atIndex:6];
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        }, 598, 599, 600, 601);
     }
 }
 

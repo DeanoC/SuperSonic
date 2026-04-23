@@ -67,6 +67,19 @@ unsafe extern "C" {
         a_out_ptr: *mut c_void,
         b_out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_linear_prep_decode_apply_bf16_f32(
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_pack_ptr: *const c_void,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_exp_ptr: *const c_void,
+        initial_state_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen_mlp_gate_up_bf16(
         hidden_dim: usize,
         intermediate_dim: usize,
@@ -2242,6 +2255,73 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_pack: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_pack.dtype() != ScalarType::BF16
+        || a.dtype() != ScalarType::BF16
+        || b.dtype() != ScalarType::BF16
+        || dt_bias.dtype() != ScalarType::BF16
+        || a_log_exp.dtype() != ScalarType::BF16
+        || initial_state.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_prep_decode_apply_bf16_f32 expects BF16 conv/a/b/dt/a_log and F32 state/out, got conv={:?} a={:?} b={:?} dt={:?} a_log={:?} state={:?} out={:?}",
+            conv_pack.dtype(),
+            a.dtype(),
+            b.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            initial_state.dtype(),
+            out.dtype(),
+        )));
+    }
+    if num_v_heads == 0
+        || num_k_heads == 0
+        || head_k_dim == 0
+        || head_v_dim == 0
+        || num_v_heads % num_k_heads != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_prep_decode_apply_bf16_f32 invalid shape: num_v_heads={num_v_heads} num_k_heads={num_k_heads} head_k_dim={head_k_dim} head_v_dim={head_v_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_prep_decode_apply_bf16_f32(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_pack.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            initial_state.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_prep_decode_apply_bf16_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn conv_state_update_bf16(
     channels: usize,
     state_len: usize,
@@ -2405,6 +2485,26 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native qwen_linear_prep_bf16_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
+    _num_v_heads: usize,
+    _num_k_heads: usize,
+    _head_k_dim: usize,
+    _head_v_dim: usize,
+    _conv_pack: &GpuBuffer,
+    _a: &GpuBuffer,
+    _b: &GpuBuffer,
+    _dt_bias: &GpuBuffer,
+    _a_log_exp: &GpuBuffer,
+    _initial_state: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_prep_decode_apply_bf16_f32 is not compiled".into(),
     ))
 }
 

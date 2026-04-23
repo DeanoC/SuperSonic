@@ -2836,7 +2836,27 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
 
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+        let use_fused_linear_prep_apply = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_PREP_APPLY").is_none()
+            && a_for_beta_f32.is_none()
+            && b_for_beta_f32.is_none();
+        if use_fused_linear_prep_apply {
+            kernel_ffi::prefill_ffi::metal_qwen_linear_prep_decode_apply_bf16_f32(
+                nv,
+                nk,
+                khd,
+                vhd,
+                &conv_pack,
+                &a,
+                &b,
+                &lw.dt_bias,
+                &lw.a_log_exp,
+                recurrent_state,
+                &mut rec_apply,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear prep/apply: {e}"))?;
+        } else if self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_PREP").is_none()
         {
@@ -2931,7 +2951,10 @@ impl DecodeEngine {
         }
 
         let mut packed_trace = None;
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+        if use_fused_linear_prep_apply {
+            // `rec_apply` already contains both the attention output and the
+            // updated recurrent state in the same layout as the split path.
+        } else if self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_DIRECT_LINEAR_DECODE").is_none()
             && a_for_beta_f32.is_none()
