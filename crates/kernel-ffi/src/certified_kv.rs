@@ -30,6 +30,18 @@ unsafe extern "C" {
         value_group_size: c_int,
     ) -> c_int;
 
+    fn dotcache_llama31_certified_kv_quantize_keys_bf16(
+        device_ordinal: usize,
+        key_bf16: *const c_void,
+        key_int8: *mut c_void,
+        key_scale: *mut c_void,
+        num_kv_heads: c_int,
+        seq_len: c_int,
+        max_t: c_int,
+        head_dim: c_int,
+        block_size: c_int,
+    ) -> c_int;
+
     fn dotcache_llama31_certified_kv_score_blocks_int8(
         device_ordinal: usize,
         query_bf16: *const c_void,
@@ -294,6 +306,98 @@ pub fn quantize_bf16_cache(
         }
         Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
             "certified KV quantization is currently CUDA-only".into(),
+        )),
+    }
+}
+
+pub fn quantize_bf16_keys(
+    ordinal: usize,
+    key_bf16: &GpuBuffer,
+    seq_len: usize,
+    block_size: usize,
+    key_int8: &mut GpuBuffer,
+    key_scale: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if key_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV key quantization is currently CUDA-only".into(),
+        ));
+    }
+    if key_bf16.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key quantization expects BF16 key cache, got {:?}",
+            key_bf16.dtype()
+        )));
+    }
+    if key_bf16.shape().len() != 4 || key_bf16.shape()[0] != 1 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key quantization expects [1,nkv,max_t,hd] cache, got {:?}",
+            key_bf16.shape()
+        )));
+    }
+    if block_size == 0 {
+        return Err(GpuError::InvalidArg(
+            "certified KV key quantization block_size must be > 0".into(),
+        ));
+    }
+    let num_kv_heads = key_bf16.shape()[1];
+    let max_t = key_bf16.shape()[2];
+    let head_dim = key_bf16.shape()[3];
+    if seq_len > max_t {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key quantization seq_len={seq_len} exceeds cache capacity max_t={max_t}"
+        )));
+    }
+    let aligned = aligned_tokens(seq_len, block_size);
+    let key_i8_shape = [num_kv_heads, aligned, head_dim];
+    let key_scale_shape = [num_kv_heads, aligned / block_size, head_dim];
+    if key_int8.dtype() != ScalarType::U8 || key_int8.shape() != key_i8_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key_int8 expects U8 {:?}, got {:?} {:?}",
+            key_i8_shape,
+            key_int8.dtype(),
+            key_int8.shape()
+        )));
+    }
+    if key_scale.dtype() != ScalarType::F32 || key_scale.shape() != key_scale_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key_scale expects F32 {:?}, got {:?} {:?}",
+            key_scale_shape,
+            key_scale.dtype(),
+            key_scale.shape()
+        )));
+    }
+
+    match key_bf16.backend() {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                let status = dotcache_llama31_certified_kv_quantize_keys_bf16(
+                    ordinal,
+                    key_bf16.as_ptr(),
+                    key_int8.as_mut_ptr(),
+                    key_scale.as_mut_ptr(),
+                    num_kv_heads as c_int,
+                    seq_len as c_int,
+                    max_t as c_int,
+                    head_dim as c_int,
+                    block_size as c_int,
+                );
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        Backend::Cuda,
+                        format!("certified KV CUDA key quantization failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV key quantization is currently CUDA-only".into(),
         )),
     }
 }
@@ -1044,6 +1148,30 @@ mod tests {
             errors[0] <= 0.02,
             "unexpected block 0 value error {}",
             errors[0]
+        );
+
+        let mut key_only_i8 =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &key_i8_shape).expect("key_only_i8");
+        let mut key_only_scale =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &key_scale_shape).expect("key_only_scale");
+        quantize_bf16_keys(
+            ordinal,
+            &key,
+            seq_len,
+            block_size,
+            &mut key_only_i8,
+            &mut key_only_scale,
+        )
+        .expect("quantize keys");
+        assert_eq!(
+            key_only_i8.to_host_bytes().expect("download key_only_i8"),
+            key_i8.to_host_bytes().expect("download key_i8 again")
+        );
+        assert_eq!(
+            key_only_scale
+                .to_host_bytes()
+                .expect("download key_only_scale"),
+            key_scale.to_host_bytes().expect("download key_scale again")
         );
     }
 

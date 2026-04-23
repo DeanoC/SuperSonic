@@ -2131,20 +2131,15 @@ impl DecodeEngine {
                 &full_v_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV V H2D: {e}"))?;
-            let (
-                key_i8_shape,
-                key_scale_shape,
-                value_i4_shape,
-                value_meta_shape,
-                value_error_shape,
-            ) = kernel_ffi::certified_kv::quantized_shapes(
-                num_kv_heads,
-                kv_len,
-                head_dim,
-                block_size,
-                value_group_size,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV shapes: {e}"))?;
+            let (key_i8_shape, key_scale_shape, value_i4_shape, value_meta_shape, value_error_shape) =
+                kernel_ffi::certified_kv::quantized_shapes(
+                    num_kv_heads,
+                    kv_len,
+                    head_dim,
+                    block_size,
+                    value_group_size,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV shapes: {e}"))?;
             let mut key_i8 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_i8 alloc: {e}"))?;
             let mut key_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
@@ -3545,13 +3540,7 @@ impl DecodeEngine {
                 .expect("certified KV decode config is present when enabled");
             let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
-            let (
-                key_i8_shape,
-                key_scale_shape,
-                value_i4_shape,
-                value_meta_shape,
-                value_error_shape,
-            ) = kernel_ffi::certified_kv::quantized_shapes(
+            let (key_i8_shape, key_scale_shape, _, _, _) = kernel_ffi::certified_kv::quantized_shapes(
                 num_kv_heads,
                 kv_len,
                 head_dim,
@@ -3565,33 +3554,15 @@ impl DecodeEngine {
             let mut key_scale =
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
                     .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key_scale alloc: {e}"))?;
-            let mut value_i4 =
-                GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_i4 alloc: {e}"))?;
-            let mut value_scale =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_scale alloc: {e}"))?;
-            let mut value_zero =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_zero alloc: {e}"))?;
-            let mut value_error =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_error alloc: {e}"))?;
-            kernel_ffi::certified_kv::quantize_bf16_cache(
+            kernel_ffi::certified_kv::quantize_bf16_keys(
                 self.ordinal,
                 cache_k_ref,
-                cache_v_ref,
                 kv_len,
                 block_size,
-                value_group_size,
                 &mut key_i8,
                 &mut key_scale,
-                &mut value_i4,
-                &mut value_scale,
-                &mut value_zero,
-                &mut value_error,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode quantize: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
 
             let contig_stride = kv_len * head_dim * elem_bytes;
             let cap_stride = cap * head_dim * elem_bytes;

@@ -585,6 +585,48 @@ extern "C" int dotcache_llama31_certified_kv_quantize_bf16(
     return 0;
 }
 
+extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16(
+    size_t device_ordinal,
+    const void* key_bf16,
+    void* key_int8,
+    void* key_scale,
+    int num_kv_heads,
+    int seq_len,
+    int max_t,
+    int head_dim,
+    int block_size
+) {
+    if (key_bf16 == nullptr || key_int8 == nullptr || key_scale == nullptr) {
+        return 1;
+    }
+    if (num_kv_heads <= 0 || seq_len < 0 || max_t <= 0 || head_dim <= 0 ||
+        block_size <= 0 || head_dim > 256) {
+        return 2;
+    }
+    const int aligned_tokens = (seq_len / block_size) * block_size;
+    if (aligned_tokens == 0) {
+        return 0;
+    }
+    const int num_blocks = aligned_tokens / block_size;
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+
+    const int key_threads = 32;
+    const int key_grid = num_kv_heads * num_blocks * head_dim;
+    certified_kv_quantize_keys_kernel<<<key_grid, key_threads, key_threads * sizeof(float)>>>(
+        static_cast<const __nv_bfloat16*>(key_bf16),
+        static_cast<uint8_t*>(key_int8),
+        static_cast<float*>(key_scale),
+        num_kv_heads,
+        max_t,
+        aligned_tokens,
+        head_dim,
+        block_size
+    );
+    if (cudaGetLastError() != cudaSuccess) return 3;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 4;
+    return 0;
+}
+
 extern "C" int dotcache_llama31_certified_kv_score_blocks_int8(
     size_t device_ordinal,
     const void* query_bf16,
