@@ -471,7 +471,21 @@ pub fn embedding_lookup(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if embeddings.backend() == Backend::Metal {
-        let _ = (ordinal, dtype);
+        let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && metal_native::embedding_lookup_bf16(
+                token_count,
+                vocab_size,
+                hidden_size,
+                embeddings,
+                indexes,
+                out,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::embedding_lookup(
             token_count,
             vocab_size,

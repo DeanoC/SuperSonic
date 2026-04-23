@@ -30,6 +30,13 @@ struct FullAttentionParams {
     float scale;
 };
 
+struct EmbeddingLookupParams {
+    uint32_t token_count;
+    uint32_t vocab_size;
+    uint32_t hidden_size;
+    uint32_t total_elems;
+};
+
 struct RmsNormParams {
     uint32_t n_rows;
     uint32_t n_cols;
@@ -344,6 +351,102 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create full-attention pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> embedding_lookup_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:238
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"EMB(
+#include <metal_stdlib>
+using namespace metal;
+
+struct EmbeddingLookupParams {
+    uint token_count;
+    uint vocab_size;
+    uint hidden_size;
+    uint total_elems;
+};
+
+kernel void supersonic_embedding_lookup_bf16(
+    device const bfloat* embeddings [[buffer(0)]],
+    device const uint* indexes [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant EmbeddingLookupParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint token_idx = gid / params.hidden_size;
+    uint col = gid - token_idx * params.hidden_size;
+    uint vocab_idx = indexes[token_idx];
+    if (vocab_idx >= params.vocab_size) {
+        out[gid] = bfloat(0.0f);
+        return;
+    }
+    out[gid] = embeddings[vocab_idx * params.hidden_size + col];
+}
+)EMB";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:239
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile embedding lookup library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_embedding_lookup_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:240
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load embedding lookup function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:241
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create embedding lookup pipeline"
                                                                              }];
                         }
                     }
@@ -3472,6 +3575,92 @@ extern "C" int supersonic_metal_l2norm_bf16(
     void* out_ptr
 ) {
     return supersonic_metal_l2norm_impl(n_rows, n_cols, eps, input_ptr, out_ptr, @"supersonic_l2norm_bf16");
+}
+
+extern "C" int supersonic_metal_embedding_lookup_bf16(
+    size_t token_count,
+    size_t vocab_size,
+    size_t hidden_size,
+    const void* embeddings_ptr,
+    const void* indexes_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (token_count == 0 || vocab_size == 0 || hidden_size == 0 || token_count > UINT32_MAX ||
+            vocab_size > UINT32_MAX || hidden_size > UINT32_MAX || embeddings_ptr == nullptr ||
+            indexes_ptr == nullptr || out_ptr == nullptr) {
+            return 242;
+        }
+        const size_t total_elems = token_count * hidden_size;
+        if (hidden_size != 0 && total_elems / hidden_size != token_count) {
+            return 243;
+        }
+        if (total_elems > UINT32_MAX) {
+            return 244;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = embedding_lookup_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 245;
+        }
+
+        id<MTLBuffer> embeddings = nil;
+        id<MTLBuffer> indexes = nil;
+        id<MTLBuffer> out = nil;
+        size_t embeddings_offset = 0;
+        size_t indexes_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(embeddings_ptr, &embeddings, &embeddings_offset) != 0) {
+            return 246;
+        }
+        if (lookup_buffer(indexes_ptr, &indexes, &indexes_offset) != 0) {
+            return 247;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 248;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 249;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 250;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 251;
+        }
+
+        EmbeddingLookupParams params = {
+            static_cast<uint32_t>(token_count),
+            static_cast<uint32_t>(vocab_size),
+            static_cast<uint32_t>(hidden_size),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:embeddings offset:embeddings_offset atIndex:0];
+        [encoder setBuffer:indexes offset:indexes_offset atIndex:1];
+        [encoder setBuffer:out offset:out_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+        NSUInteger tg_width =
+            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 252;
+        }
+        return 0;
+    }
 }
 
 extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(

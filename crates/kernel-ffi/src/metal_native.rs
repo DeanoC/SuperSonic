@@ -8,6 +8,14 @@ pub(crate) fn disabled_by_env() -> bool {
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 unsafe extern "C" {
+    fn supersonic_metal_embedding_lookup_bf16(
+        token_count: usize,
+        vocab_size: usize,
+        hidden_size: usize,
+        embeddings_ptr: *const c_void,
+        indexes_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_bf16(
         batch_elems: usize,
         m: usize,
@@ -231,6 +239,52 @@ unsafe extern "C" {
         g_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn embedding_lookup_bf16(
+    token_count: usize,
+    vocab_size: usize,
+    hidden_size: usize,
+    embeddings: &GpuBuffer,
+    indexes: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if token_count > u32::MAX as usize
+        || vocab_size > u32::MAX as usize
+        || hidden_size > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native embedding_lookup_bf16 dimensions exceed u32: token_count={token_count}, vocab_size={vocab_size}, hidden_size={hidden_size}"
+        )));
+    }
+    if embeddings.dtype() != ScalarType::BF16
+        || indexes.dtype() != ScalarType::U32
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native embedding_lookup_bf16 expects BF16/U32/BF16 buffers, got {:?}/{:?}/{:?}",
+            embeddings.dtype(),
+            indexes.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_embedding_lookup_bf16(
+            token_count,
+            vocab_size,
+            hidden_size,
+            embeddings.as_ptr(),
+            indexes.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native embedding_lookup_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -1168,6 +1222,20 @@ pub(crate) fn delta_recurrent_prefill_f32(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn embedding_lookup_bf16(
+    _token_count: usize,
+    _vocab_size: usize,
+    _hidden_size: usize,
+    _embeddings: &GpuBuffer,
+    _indexes: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native embedding_lookup_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -1459,6 +1527,36 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn metal_native_embedding_lookup_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let embeddings_vals = [
+            1.0f32, 1.5, 2.0, 10.0, 10.5, 11.0, -2.0, -2.5, -3.0, 4.0, 4.5, 5.0,
+        ];
+        let embeddings = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4, 3],
+            &bf16_bytes(&embeddings_vals),
+        )
+        .expect("upload embeddings");
+        let indexes =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[3], &u32_bytes(&[2, 0, 3]))
+                .expect("upload indexes");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[3, 3]).expect("allocate native out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[3, 3]).expect("allocate ref out");
+
+        crate::metal_host::embedding_lookup(3, 4, 3, &embeddings, &indexes, &mut out_ref)
+            .expect("host embedding lookup");
+        embedding_lookup_bf16(3, 4, 3, &embeddings, &indexes, &mut out_native)
+            .expect("native embedding lookup");
+
+        assert_eq!(read_bf16(&out_native), read_bf16(&out_ref));
     }
 
     #[test]
