@@ -210,6 +210,55 @@ CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
 [qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
 
+## Metal — `apple-m4` (Apple M4)
+
+The current Metal numbers are still prototype-grade and are scoped narrowly to
+`qwen3.5-0.8b`, but they are now fast enough to serve as a stable Apple-silicon
+performance checkpoint instead of a pure bring-up lane.
+
+Measurements below were recorded on the Apple M4 development machine using the
+checked-in Metal bughunt harness and the local cached Qwen3.5 0.8B snapshot.
+The benchmark command was:
+
+```bash
+target/debug/qwen35_bughunt \
+  --mode bench \
+  --backend metal \
+  --model-dir /path/to/Qwen3.5-0.8B \
+  --prompt-manifest crates/runner/bughunt/qwen35_metal_manifest.json \
+  --prompt hello_world \
+  --iters 3 \
+  --warmup 1 \
+  --decode-tokens 4 \
+  --profile-ops
+```
+
+Current checkpoint:
+
+| Model         | Path                     | Metric                  | Value      |
+|---------------|--------------------------|-------------------------|-----------:|
+| qwen3.5-0.8b  | native prefill           | prefill wall time       |   107 ms   |
+| qwen3.5-0.8b  | greedy prefill           | first-token wall time   |    99.7 ms |
+| qwen3.5-0.8b  | replay decode            | decode wall time        |    84.0 ms/tok |
+| qwen3.5-0.8b  | component decode proto   | decode wall time        |    35.2 ms/tok |
+
+What moved this checkpoint materially:
+
+- runtime profiling exposed command-buffer creation / wait overhead instead of
+  treating Metal as a black box
+- lazy batch encoder creation removed the worst encoder churn in prefill
+- standalone matvec now uses native Metal by default instead of the host path
+- component decode now reuses the persistent argmax buffer instead of allocating
+  and flushing an argmax buffer every token
+
+What still dominates:
+
+- prefill is no longer host-fallback dominated on the benchmarked path
+- replay decode is still mostly a correctness/reference lane
+- component decode is now mostly bounded by the single per-token command-buffer
+  wait, which implies the next real win should come from deeper decode fusion
+  or fewer queued decode sub-operations rather than more host-side cleanup
+
 ## How to reproduce
 
 ```bash

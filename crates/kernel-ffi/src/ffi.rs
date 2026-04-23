@@ -170,10 +170,7 @@ unsafe extern "C" {
 // `cudaGetDeviceProperties` on the Rust side).
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn dotcache_hip_device_clock_khz(
-        device_ordinal: c_int,
-        clock_rate_khz_out: *mut u32,
-    ) -> c_int;
+    fn dotcache_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
 
     // Per-model launch preset for the qwen4b persistent decode kernel.
     // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
@@ -768,6 +765,67 @@ pub fn cuda_lm_head_argmax_bf16(
     }
 }
 
+pub fn metal_lm_head_argmax_bf16(
+    ordinal: usize,
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<u32, GpuError> {
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])?;
+    metal_lm_head_argmax_bf16_into(hidden, weight, &mut out_index, hidden_dim, vocab_size)?;
+    crate::metal_native::flush_batch()?;
+    let bytes = out_index.to_host_bytes()?;
+    let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(token)
+}
+
+pub fn metal_lm_head_argmax_bf16_into(
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    mut out_index: &mut GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if hidden.backend() != Backend::Metal
+        || weight.backend() != Backend::Metal
+        || out_index.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "metal_lm_head_argmax_bf16_into requires Metal buffers".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_lm_head_argmax_bf16_into requires BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "metal_lm_head_argmax_bf16_into requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    {
+        crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
+            crate::metal_native::lm_head_argmax_bf16(
+                hidden,
+                weight,
+                &mut out_index,
+                hidden_dim,
+                vocab_size,
+            )
+        })
+    }
+    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    {
+        let _ = (hidden, weight, out_index, hidden_dim, vocab_size);
+        Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+    }
+}
+
 /// 4B variant of RMSNorm (same logic, separate compilation).
 pub fn rms_norm_4b(
     ordinal: usize,
@@ -1206,7 +1264,27 @@ pub fn standalone_matvec(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = (ordinal, counter_buf);
-        return metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim);
+        if crate::metal_native::disabled_by_env()
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_STANDALONE_MATVEC").is_some()
+        {
+            crate::metal_native::flush_batch()?;
+            return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
+                metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
+            });
+        }
+        return crate::prefill_ffi::metal_profile_time("standalone_matvec", "native", || {
+            match dtype {
+                ScalarType::BF16 => crate::metal_native::matmul_rhs_transposed_bf16(
+                    1, 1, out_dim, in_dim, input, weight, output,
+                ),
+                ScalarType::F32 => crate::metal_native::matmul_rhs_transposed_f32(
+                    1, 1, out_dim, in_dim, input, weight, output,
+                ),
+                other => Err(GpuError::InvalidArg(format!(
+                    "standalone_matvec unsupported Metal dtype {other:?}"
+                ))),
+            }
+        });
     }
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
@@ -1269,7 +1347,12 @@ pub fn standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        return metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim);
+        crate::metal_native::flush_batch()?;
+        return crate::prefill_ffi::metal_profile_time(
+            "standalone_matvec_host_f32",
+            "host",
+            || metal_host::standalone_matvec_host_f32(dtype, input, weight, in_dim, out_dim),
+        );
     }
 
     let mut output = GpuBuffer::zeros(ordinal, dtype, &[out_dim])?;
@@ -1313,14 +1396,21 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
-        return metal_host::qwen_rms_norm_standalone_matvec_host_f32(
-            dtype,
-            input,
-            norm_weight,
-            eps,
-            weight,
-            hidden_dim,
-            out_dim,
+        crate::metal_native::flush_batch()?;
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen_rms_norm_standalone_matvec_host_f32",
+            "host",
+            || {
+                metal_host::qwen_rms_norm_standalone_matvec_host_f32(
+                    dtype,
+                    input,
+                    norm_weight,
+                    eps,
+                    weight,
+                    hidden_dim,
+                    out_dim,
+                )
+            },
         );
     }
 
@@ -1377,10 +1467,7 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
 pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
     #[cfg(supersonic_backend_hip)]
     unsafe {
-        dotcache_qwen35_4b_hip_set_launch_preset(
-            blocks as c_int,
-            if coop { 1 } else { 0 },
-        );
+        dotcache_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
     #[cfg(not(supersonic_backend_hip))]
     {

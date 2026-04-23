@@ -1,8 +1,10 @@
+use std::env;
 use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 #[derive(Debug, Deserialize)]
 pub struct OracleOutput {
@@ -116,6 +118,100 @@ pub struct OracleOutput {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct Qwen35TraceOutput {
+    #[serde(default)]
+    pub trace_linear_layer: Option<usize>,
+    #[serde(default)]
+    pub trace_full_layer: Option<usize>,
+    #[serde(default)]
+    pub trace_mlp_layer: Option<usize>,
+    #[serde(default)]
+    pub trace_position: Option<usize>,
+    #[serde(default)]
+    pub trace_position_prefill_final_norm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_position_prefill_logits: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_input_layernorm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_qkv_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_z_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_post_conv_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_query_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_key_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_value_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_beta_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_prepared_g_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_direct_recurrent_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_norm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_linear_token_mixer_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_q_and_gate_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_gate_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_k_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_v_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_query_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_key_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_prepared_value_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_rotated_query_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_rotated_key_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_raw_attention_output: Option<Value>,
+    #[serde(default)]
+    pub trace_full_attention_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_post_attention_layernorm_input: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_post_attention_layernorm_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_gate_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_up_proj_output: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_activated_hidden: Option<Value>,
+    #[serde(default)]
+    pub trace_mlp_down_proj_output: Option<Value>,
+    #[serde(default)]
+    pub decoder_layer_outputs: Vec<Value>,
+    pub first_layer_linear_qkv_output: Value,
+    pub first_layer_linear_z_output: Value,
+    pub first_layer_linear_prepared_query_output: Value,
+    pub first_layer_linear_prepared_key_output: Value,
+    pub first_layer_linear_prepared_value_output: Value,
+    pub first_layer_linear_prepared_beta_output: Value,
+    pub first_layer_linear_prepared_g_output: Value,
+    pub first_layer_linear_direct_recurrent_output: Value,
+    pub first_layer_linear_norm_output: Value,
+    pub first_layer_token_mixer_output: Value,
+    pub layer3_q_and_gate_output: Value,
+    pub layer3_gate_output: Value,
+    pub layer3_k_proj_output: Value,
+    pub layer3_v_proj_output: Value,
+    pub layer3_prepared_query_output: Value,
+    pub layer3_prepared_key_output: Value,
+    pub layer3_prepared_value_output: Value,
+    pub layer3_attention_output: Value,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct KvCacheDump {
     pub layer: usize,
     pub k: String,       // base64
@@ -131,6 +227,22 @@ pub struct StateDump {
     pub shape: Vec<usize>,
 }
 
+fn resolve_oracle_python() -> String {
+    if let Some(value) = env::var_os("SUPERSONIC_ORACLE_PYTHON") {
+        return value.to_string_lossy().into_owned();
+    }
+
+    for candidate in ["/opt/homebrew/bin/python3.11", "python3.11", "python3"] {
+        if let Ok(status) = Command::new(candidate).arg("--version").status() {
+            if status.success() {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    "python3".to_string()
+}
+
 /// Run the PyTorch oracle for prefill + decode.
 pub fn run_oracle(
     oracle_script: &Path,
@@ -144,13 +256,14 @@ pub fn run_oracle(
     fp8_model_dir: Option<&Path>,
     trace_full_attn_layer: Option<usize>,
 ) -> Result<OracleOutput> {
+    let python = resolve_oracle_python();
     let ids_str = prompt_ids
         .iter()
         .map(|id| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
 
-    let mut cmd = Command::new("python3");
+    let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
         .arg("--model-id").arg(model_id)
         .arg("--prompt-ids").arg(&ids_str)
@@ -175,7 +288,7 @@ pub fn run_oracle(
     let trace_flag = trace_full_attn_layer
         .map(|layer| format!(" --trace-full-attn-layer {layer}"))
         .unwrap_or_default();
-    eprintln!("[oracle] running: python3 {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{int8_flag}{fp8_flag}{trace_flag}",
+    eprintln!("[oracle] running: {python} {} --model-id {model_id} --prompt-ids {ids_str} --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}{}{int8_flag}{fp8_flag}{trace_flag}",
         oracle_script.display(),
         if emit_state { " --emit-state" } else { "" }
     );
@@ -196,6 +309,66 @@ pub fn run_oracle(
     Ok(oracle)
 }
 
+pub fn run_qwen35_trace_oracle(
+    oracle_script: &Path,
+    model_id: &str,
+    prompt_ids: &[u32],
+    max_new_tokens: usize,
+    dtype: &str,
+    device: &str,
+    trace_linear_layer: Option<usize>,
+    trace_full_layer: Option<usize>,
+    trace_mlp_layer: Option<usize>,
+    trace_position: Option<usize>,
+) -> Result<Qwen35TraceOutput> {
+    let python = resolve_oracle_python();
+    let ids_str = prompt_ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut cmd = Command::new(&python);
+    cmd.arg(oracle_script)
+        .arg("--model-id")
+        .arg(model_id)
+        .arg("--prompt-ids")
+        .arg(&ids_str)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--dtype")
+        .arg(dtype)
+        .arg("--device")
+        .arg(device);
+    if let Some(layer) = trace_linear_layer {
+        cmd.arg("--trace-linear-layer").arg(layer.to_string());
+    }
+    if let Some(layer) = trace_full_layer {
+        cmd.arg("--trace-full-layer").arg(layer.to_string());
+    }
+    if let Some(layer) = trace_mlp_layer {
+        cmd.arg("--trace-mlp-layer").arg(layer.to_string());
+    }
+    if let Some(position) = trace_position {
+        cmd.arg("--trace-position").arg(position.to_string());
+    }
+
+    let output = cmd
+        .output()
+        .context("failed to start qwen35 trace oracle process")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "qwen35 trace oracle failed (exit {}): {stderr}",
+            output.status
+        );
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("qwen35 trace oracle stdout not UTF-8")?;
+    serde_json::from_str(&stdout).context("failed to parse qwen35 trace oracle JSON output")
+}
+
 /// Run the Phi-4 oracle (`oracle/phi4_oracle.py`) for a single prompt.
 /// Mirrors `run_gemma4_oracle`: loads weights from `model_dir`, tokenizes
 /// the prompt Python-side. Phi-4 oracle additionally accepts `--device`
@@ -208,7 +381,8 @@ pub fn run_phi4_oracle(
     dtype: &str,
     device: &str,
 ) -> Result<OracleOutput> {
-    let mut cmd = Command::new("python3");
+    let python = resolve_oracle_python();
+    let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
         .arg("--model-dir").arg(model_dir)
         .arg("--prompt").arg(prompt)
@@ -217,7 +391,7 @@ pub fn run_phi4_oracle(
         .arg("--device").arg(device);
 
     eprintln!(
-        "[oracle] running: python3 {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}",
+        "[oracle] running: {python} {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}",
         oracle_script.display(),
         model_dir.display(),
     );
