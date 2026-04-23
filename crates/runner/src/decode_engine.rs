@@ -264,6 +264,9 @@ pub struct DecodeEngine {
     component_linear_scratch: Option<ComponentLinearScratch>,
     /// Reused single-token component decode full-attention temporaries.
     component_full_scratch: Option<ComponentFullScratch>,
+    /// Per-linear-layer BF16 copies of static norm weights used by Metal
+    /// component decode. Avoids recasting the same F32 weight every token.
+    component_linear_norm_w_bf16: Vec<Option<GpuBuffer>>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -3165,15 +3168,43 @@ impl DecodeEngine {
             &format!("layer {idx} recurrent update copy"),
         )?;
 
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::F32,
-            ScalarType::BF16,
-            vhd,
-            &lw.norm_w,
-            &mut norm_w_bf16,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
+        let cached_norm_w_bf16 = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && lw.norm_w.dtype() == ScalarType::F32
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_LINEAR_NORM_W_CACHE").is_none();
+        let norm_w_bf16_ref = if cached_norm_w_bf16 {
+            let slot = self
+                .component_linear_norm_w_bf16
+                .get_mut(idx)
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing norm_w cache slot"))?;
+            if slot.is_none() {
+                let mut cached = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[vhd])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} cached norm_w alloc: {e}"))?;
+                kernel_ffi::prefill_ffi::cast(
+                    self.ordinal,
+                    ScalarType::F32,
+                    ScalarType::BF16,
+                    vhd,
+                    &lw.norm_w,
+                    &mut cached,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} cached norm_w cast: {e}"))?;
+                *slot = Some(cached);
+            }
+            slot.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing cached norm_w"))?
+        } else {
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                vhd,
+                &lw.norm_w,
+                &mut norm_w_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
+            &norm_w_bf16
+        };
         kernel_ffi::prefill_ffi::rms_norm_gated(
             self.ordinal,
             ScalarType::BF16,
@@ -3182,7 +3213,7 @@ impl DecodeEngine {
             config.rms_norm_eps as f32,
             &attn_bf16,
             &z,
-            &norm_w_bf16,
+            norm_w_bf16_ref,
             &mut gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gated norm: {e}"))?;
@@ -3607,6 +3638,7 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("lm_head_block_best_idxs: {e}"))?;
         let matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("matvec_counter: {e}"))?;
+        let num_hidden_layers = config.num_hidden_layers;
 
         let fp8_scale_device = if let Some(fp8_descs) = build_fp8_scale_descs(&weights) {
             let desc_bytes: &[u8] = unsafe {
@@ -3674,6 +3706,7 @@ impl DecodeEngine {
             component_mlp_scratch: None,
             component_linear_scratch: None,
             component_full_scratch: None,
+            component_linear_norm_w_bf16: (0..num_hidden_layers).map(|_| None).collect(),
         })
     }
 
