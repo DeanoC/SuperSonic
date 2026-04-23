@@ -290,16 +290,19 @@ Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 
 ## Metal
 
-Metal support is currently a Qwen3.5 0.8B correctness checkpoint on Apple M4.
-It is meant to make Apple silicon development reproducible before the next
-performance pass, not to compete with the HIP/CUDA persistent decode kernels yet.
+Metal support is currently a Qwen3.5 0.8B Apple-silicon bring-up and early
+performance checkpoint on Apple M4. It is still narrower than the HIP/CUDA
+persistent decode paths, but the core Qwen 0.8B path is now practical for
+local development and repeatable performance work on this machine.
 
 Validated Metal scope:
 
 - `qwen3.5-0.8b`
 - Apple M4 / `apple-m4`
 - BF16 prefill parity against the Python CPU oracle
-- CLI/debug harness path only
+- CLI/debug harness path
+- native Metal greedy prefill
+- Metal component decode prototype for single-sequence greedy generation
 - checked token-ID prompt corpus via `qwen35_bughunt`
 
 Metal currently rejects or defers:
@@ -309,15 +312,17 @@ Metal currently rejects or defers:
 - `--fp8-runtime`
 - `--kv-fp8`
 - batched decode
-- persistent/component decode optimization paths
+- persistent megakernel decode
 - server runtime support
 
 The current Metal implementation intentionally mixes native Metal kernels with
-shared-memory host fallbacks. Native kernels are already used for the key
-Qwen bring-up primitives that have been promoted so far:
+shared-memory host fallbacks where needed, but the main hot-path bring-up work
+has moved onto native Metal kernels. Native kernels are already used for the
+key Qwen bring-up and first-pass performance primitives promoted so far:
 
 - matmul RHS-transposed
 - full-attention prefill core
+- lm-head argmax
 - RMSNorm rows
 - linear prefill conv pack
 - element add
@@ -327,10 +332,29 @@ Qwen bring-up primitives that have been promoted so far:
 - QKV split
 - Q-gate split
 
-Remaining prefill primitives still fall back through the Metal shared-memory host
-path, and decode is still correctness-first. Treat Metal throughput numbers as
-pre-optimization until those fallbacks are replaced and a dedicated benchmark is
-added.
+Current Apple M4 checkpoint on this machine:
+
+- `qwen35_bughunt --mode gate`: PASS for `hello_world`, `forest_prompt`, and `code_prompt`
+- `qwen35_bughunt --mode bench --prompt hello_world --decode-tokens 4`:
+  - native prefill about `107 ms`
+  - greedy prefill about `100 ms`
+  - replay decode about `84 ms/token`
+  - component decode about `35 ms/token`
+- `supersonic --backend metal --model qwen3.5-0.8b --prompt "Hello, world" --max-new-tokens 8`:
+  - native prefill about `112 ms`
+  - component decode about `34 ms/token`
+
+The biggest Metal performance wins in this checkpoint were:
+
+- command-buffer / encoder churn removal through lazy batch encoder creation
+- switching standalone matvec to native Metal by default
+- keeping component decode greedy argmax on a reused device buffer
+
+Metal is now in a good “working checkpoint” state, but it is still not a
+throughput-complete backend. The next optimization target is decode-side GPU
+work: component decode still spends most of its time in the single per-token
+command-buffer wait, which means deeper decode fusion is the next meaningful
+step rather than more host-side plumbing cleanup.
 
 ### Metal validation
 
