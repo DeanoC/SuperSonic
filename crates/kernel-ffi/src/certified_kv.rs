@@ -45,6 +45,26 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
+
+    fn dotcache_llama31_certified_kv_attend_int8_int4(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        value_int4: *const c_void,
+        value_scale: *const c_void,
+        value_zero: *const c_void,
+        score_scratch: *mut c_void,
+        output_f32: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        head_dim: c_int,
+        value_group_size: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
 }
 
 pub fn aligned_tokens(seq_len: usize, block_size: usize) -> usize {
@@ -369,6 +389,146 @@ pub fn score_blocks_int8(
     }
 }
 
+pub fn attend_int8_int4(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    key_int8: &GpuBuffer,
+    key_scale: &GpuBuffer,
+    value_int4: &GpuBuffer,
+    value_scale: &GpuBuffer,
+    value_zero: &GpuBuffer,
+    block_size: usize,
+    value_group_size: usize,
+    gqa_group: usize,
+    q_scale: f32,
+    score_scratch: &mut GpuBuffer,
+    output_f32: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV INT8/INT4 attention is currently CUDA-only".into(),
+        ));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || key_int8.dtype() != ScalarType::U8
+        || key_scale.dtype() != ScalarType::F32
+        || value_int4.dtype() != ScalarType::U8
+        || value_scale.dtype() != ScalarType::F16
+        || value_zero.dtype() != ScalarType::F16
+        || score_scratch.dtype() != ScalarType::F32
+        || output_f32.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention dtypes must be BF16/U8/F32/U8/F16/F16/F32/F32, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            query_bf16.dtype(),
+            key_int8.dtype(),
+            key_scale.dtype(),
+            value_int4.dtype(),
+            value_scale.dtype(),
+            value_zero.dtype(),
+            score_scratch.dtype(),
+            output_f32.dtype()
+        )));
+    }
+    if query_bf16.shape().len() != 2 || key_int8.shape().len() != 3 || key_scale.shape().len() != 3
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention expects query [qh,hd], key_int8 [kvh,t,hd], key_scale [kvh,b,hd], got {:?}/{:?}/{:?}",
+            query_bf16.shape(),
+            key_int8.shape(),
+            key_scale.shape()
+        )));
+    }
+    if block_size == 0 || block_size > 256 || value_group_size == 0 || gqa_group == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention invalid block_size={block_size} value_group_size={value_group_size} gqa_group={gqa_group}"
+        )));
+    }
+    let q_heads = query_bf16.shape()[0];
+    let head_dim = query_bf16.shape()[1];
+    let kv_heads = key_int8.shape()[0];
+    let aligned_tokens = key_int8.shape()[1];
+    if head_dim % 2 != 0 || head_dim % value_group_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention head_dim={head_dim} must be even and divisible by value_group_size={value_group_size}"
+        )));
+    }
+    if key_int8.shape()[2] != head_dim || aligned_tokens % block_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention key shape {:?} incompatible with head_dim={head_dim} block_size={block_size}",
+            key_int8.shape()
+        )));
+    }
+    let num_blocks = aligned_tokens / block_size;
+    if q_heads != kv_heads * gqa_group {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention q_heads={q_heads} must equal kv_heads={kv_heads} * gqa_group={gqa_group}"
+        )));
+    }
+    let value_groups = head_dim / value_group_size;
+    if key_scale.shape() != [kv_heads, num_blocks, head_dim]
+        || value_int4.shape() != [kv_heads, aligned_tokens, head_dim / 2]
+        || value_scale.shape() != [kv_heads, aligned_tokens, value_groups]
+        || value_zero.shape() != [kv_heads, aligned_tokens, value_groups]
+        || score_scratch.shape() != [q_heads, aligned_tokens]
+        || output_f32.shape() != [q_heads, head_dim]
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV attention shape mismatch key_scale={:?} value_int4={:?} value_scale={:?} value_zero={:?} score_scratch={:?} output={:?}",
+            key_scale.shape(),
+            value_int4.shape(),
+            value_scale.shape(),
+            value_zero.shape(),
+            score_scratch.shape(),
+            output_f32.shape()
+        )));
+    }
+
+    let backend = query_bf16.backend();
+    match backend {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let status = unsafe {
+                    dotcache_llama31_certified_kv_attend_int8_int4(
+                        ordinal,
+                        query_bf16.as_ptr(),
+                        key_int8.as_ptr(),
+                        key_scale.as_ptr(),
+                        value_int4.as_ptr(),
+                        value_scale.as_ptr(),
+                        value_zero.as_ptr(),
+                        score_scratch.as_mut_ptr(),
+                        output_f32.as_mut_ptr(),
+                        q_heads as c_int,
+                        kv_heads as c_int,
+                        num_blocks as c_int,
+                        block_size as c_int,
+                        head_dim as c_int,
+                        value_group_size as c_int,
+                        gqa_group as c_int,
+                        q_scale,
+                    )
+                };
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        backend,
+                        format!("certified KV CUDA INT8/INT4 attention failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV INT8/INT4 attention is currently CUDA-only".into(),
+        )),
+    }
+}
+
 #[cfg(all(test, supersonic_backend_cuda))]
 mod tests {
     use super::*;
@@ -386,6 +546,13 @@ mod tests {
         values
             .iter()
             .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn f16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| f16::from_f32(*value).to_bits().to_le_bytes())
             .collect()
     }
 
@@ -561,6 +728,94 @@ mod tests {
                 (got - expected).abs() < 0.001,
                 "unexpected block sum got={got} expected={expected}"
             );
+        }
+    }
+
+    #[test]
+    fn cuda_attend_int8_int4_matches_dominant_token_reference() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 4],
+            &bf16_bytes(&[1.0, 0.5, -1.0, 2.0, -1.0, 1.0, 0.25, 0.5]),
+        )
+        .expect("upload query");
+        let key_i8 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 2, 4],
+            &[
+                10i8 as u8,
+                -20i8 as u8,
+                30i8 as u8,
+                -40i8 as u8,
+                -5i8 as u8,
+                15i8 as u8,
+                -25i8 as u8,
+                35i8 as u8,
+            ],
+        )
+        .expect("upload key_i8");
+        let key_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 4],
+            &f32_bytes(&[0.1, 0.2, 0.05, 0.25]),
+        )
+        .expect("upload key_scale");
+        let value_i4 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 2, 2],
+            &[0xf0, 0xf0, 0xf0, 0xf0],
+        )
+        .expect("upload value_i4");
+        let value_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F16,
+            &[1, 2, 2],
+            &f16_bytes(&[1.0 / 15.0, 1.0 / 15.0, 1.0 / 15.0, 1.0 / 15.0]),
+        )
+        .expect("upload value_scale");
+        let value_zero = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F16,
+            &[1, 2, 2],
+            &f16_bytes(&[0.0, 2.0, 4.0, 6.0]),
+        )
+        .expect("upload value_zero");
+        let mut score_scratch =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("score_scratch");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 4]).expect("output");
+
+        attend_int8_int4(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &value_i4,
+            &value_scale,
+            &value_zero,
+            2,
+            2,
+            2,
+            1.0,
+            &mut score_scratch,
+            &mut output,
+        )
+        .expect("attend");
+
+        let out = f32s(&output.to_host_bytes().expect("download output"));
+        for row in 0..2 {
+            let got = &out[row * 4..row * 4 + 4];
+            for (value, expected) in got.iter().zip([4.0_f32, 5.0, 6.0, 7.0]) {
+                assert!(
+                    (value - expected).abs() < 0.01,
+                    "row {row} unexpected value got={value} expected={expected}"
+                );
+            }
         }
     }
 }
