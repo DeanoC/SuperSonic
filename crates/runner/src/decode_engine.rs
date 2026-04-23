@@ -35,6 +35,13 @@ fn decode_bf16_le_host(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_f16_le_host(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
 fn logsumexp(values: &[f32]) -> f32 {
     let max_v = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     if !max_v.is_finite() {
@@ -762,6 +769,8 @@ pub struct FullAttentionLayerOutputTrace {
     pub pre_gate: Vec<u8>,
     pub gated: Vec<u8>,
     pub attn_hidden: Vec<u8>,
+    pub key_only_pre_gate: Option<Vec<u8>>,
+    pub value_only_pre_gate: Option<Vec<u8>>,
 }
 
 pub struct ComponentFullAttentionTrace {
@@ -1926,6 +1935,8 @@ impl DecodeEngine {
             hidden_bytes,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer hidden copy H2D: {e}"))?;
+        let mut key_only_pre_gate = None;
+        let mut value_only_pre_gate = None;
 
         matmul_proj(
             self.ordinal, 1, 1, q_proj_dim, hidden_dim,
@@ -2105,6 +2116,83 @@ impl DecodeEngine {
                 &mut value_error,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV quantize: {e}"))?;
+            let q_f32 = decode_bf16_le_host(&q_rope_bytes);
+            let full_k_f32 = decode_bf16_le_host(&full_k_bytes);
+            let full_v_f32 = decode_bf16_le_host(&full_v_bytes);
+            let key_i8_host = key_i8
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_i8 D2H: {e}"))?;
+            let key_scale_host = decode_f32_le(
+                &key_scale
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_scale D2H: {e}"))?,
+            );
+            let value_i4_host = value_i4
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_i4 D2H: {e}"))?;
+            let value_scale_host = decode_f16_le_host(
+                &value_scale
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_scale D2H: {e}"))?,
+            );
+            let value_zero_host = decode_f16_le_host(
+                &value_zero
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_zero D2H: {e}"))?,
+            );
+            let host_attention = |quant_keys: bool, quant_values: bool| -> Vec<f32> {
+                let mut out = vec![0.0f32; num_q_heads * head_dim];
+                let q_scale = 1.0 / (head_dim as f32).sqrt();
+                let num_blocks = aligned / block_size;
+                let groups = head_dim / value_group_size;
+                for qh in 0..num_q_heads {
+                    let kvh = qh / (num_q_heads / num_kv_heads);
+                    let mut scores = vec![0.0f32; kv_len];
+                    for t in 0..kv_len {
+                        let mut score = 0.0f32;
+                        for d in 0..head_dim {
+                            let q = q_f32[qh * head_dim + d];
+                            let k = if quant_keys && t < aligned {
+                                let block_id = t / block_size;
+                                let qk = key_i8_host[(kvh * aligned + t) * head_dim + d] as i8 as f32;
+                                let scale = key_scale_host[(kvh * num_blocks + block_id) * head_dim + d];
+                                qk * scale
+                            } else {
+                                full_k_f32[(kvh * kv_len + t) * head_dim + d]
+                            };
+                            score += q * k;
+                        }
+                        scores[t] = score * q_scale;
+                    }
+                    let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let denom: f32 = scores.iter().map(|score| (*score - max_score).exp()).sum();
+                    for d in 0..head_dim {
+                        let mut acc = 0.0f32;
+                        for t in 0..kv_len {
+                            let value = if quant_values && t < aligned {
+                                let packed = value_i4_host[(kvh * aligned + t) * (head_dim / 2) + d / 2];
+                                let qv_u8 = if (d & 1) == 0 {
+                                    packed & 0x0f
+                                } else {
+                                    (packed >> 4) & 0x0f
+                                };
+                                let qv = qv_u8 as f32;
+                                let group = d / value_group_size;
+                                let meta = (kvh * aligned + t) * groups + group;
+                                qv * value_scale_host[meta] + value_zero_host[meta]
+                            } else {
+                                full_v_f32[(kvh * kv_len + t) * head_dim + d]
+                            };
+                            let weight = (scores[t] - max_score).exp() / denom;
+                            acc += weight * value;
+                        }
+                        out[qh * head_dim + d] = acc;
+                    }
+                }
+                out
+            };
+            key_only_pre_gate = Some(f32_to_bf16_bytes_host(host_attention(true, false)));
+            value_only_pre_gate = Some(f32_to_bf16_bytes_host(host_attention(false, true)));
             let query_cert = GpuBuffer::from_host_bytes(
                 self.ordinal,
                 ScalarType::BF16,
@@ -2278,6 +2366,8 @@ impl DecodeEngine {
             attn_hidden: hidden_out
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_hidden D2H: {e}"))?,
+            key_only_pre_gate,
+            value_only_pre_gate,
         })
     }
 

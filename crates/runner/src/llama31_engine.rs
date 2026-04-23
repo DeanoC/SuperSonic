@@ -1190,6 +1190,8 @@ struct CertifiedKvLayerTrace {
     pre_gate_delta: f32,
     gated_delta: f32,
     attn_hidden_delta: f32,
+    key_only_pre_gate_delta: Option<f32>,
+    value_only_pre_gate_delta: Option<f32>,
 }
 
 fn trace_llama31_certified_kv_all_layers(
@@ -1218,8 +1220,16 @@ fn trace_llama31_certified_kv_all_layers(
         .iter()
         .max_by(|a, b| a.gated_delta.total_cmp(&b.gated_delta))
         .expect("trace list is non-empty");
+    let worst_key_only = traces
+        .iter()
+        .filter_map(|trace| trace.key_only_pre_gate_delta.map(|delta| (trace.layer, delta)))
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    let worst_value_only = traces
+        .iter()
+        .filter_map(|trace| trace.value_only_pre_gate_delta.map(|delta| (trace.layer, delta)))
+        .max_by(|a, b| a.1.total_cmp(&b.1));
     eprintln!(
-        "[certified-kv-trace-summary] layers={} trace_tokens={} prefix_tokens={} worst_pre_gate_layer={} worst_pre_gate_delta={:.6} worst_gated_layer={} worst_gated_delta={:.6} worst_attn_hidden_layer={} worst_attn_hidden_delta={:.6}",
+        "[certified-kv-trace-summary] layers={} trace_tokens={} prefix_tokens={} worst_pre_gate_layer={} worst_pre_gate_delta={:.6} worst_gated_layer={} worst_gated_delta={:.6} worst_attn_hidden_layer={} worst_attn_hidden_delta={:.6} worst_key_only_layer={} worst_key_only_delta={:.6} worst_value_only_layer={} worst_value_only_delta={:.6}",
         traces.len(),
         worst_pre.trace_tokens,
         worst_pre.prefix_tokens,
@@ -1229,6 +1239,10 @@ fn trace_llama31_certified_kv_all_layers(
         worst_gated.gated_delta,
         worst_hidden.layer,
         worst_hidden.attn_hidden_delta,
+        worst_key_only.map(|v| v.0).unwrap_or(usize::MAX),
+        worst_key_only.map(|v| v.1).unwrap_or(f32::NAN),
+        worst_value_only.map(|v| v.0).unwrap_or(usize::MAX),
+        worst_value_only.map(|v| v.1).unwrap_or(f32::NAN),
     );
     Ok(())
 }
@@ -1293,14 +1307,22 @@ fn trace_llama31_certified_kv_layer(
         &decode_bf16_le(&dense.attn_hidden),
         &decode_bf16_le(&certified.attn_hidden),
     );
+    let key_only_pre_gate_delta = certified.key_only_pre_gate.as_ref().map(|bytes| {
+        validate::max_abs_delta(&decode_bf16_le(&dense.pre_gate), &decode_bf16_le(bytes))
+    });
+    let value_only_pre_gate_delta = certified.value_only_pre_gate.as_ref().map(|bytes| {
+        validate::max_abs_delta(&decode_bf16_le(&dense.pre_gate), &decode_bf16_le(bytes))
+    });
     eprintln!(
-        "[certified-kv-trace] layer={} trace_tokens={} prefix_tokens={} pre_gate_delta={:.6} gated_delta={:.6} attn_hidden_delta={:.6}",
+        "[certified-kv-trace] layer={} trace_tokens={} prefix_tokens={} pre_gate_delta={:.6} gated_delta={:.6} attn_hidden_delta={:.6} key_only_pre_gate_delta={:.6} value_only_pre_gate_delta={:.6}",
         trace_layer,
         trace_len,
         seqlen_offset,
         pre_gate_delta,
         gated_delta,
         attn_hidden_delta,
+        key_only_pre_gate_delta.unwrap_or(f32::NAN),
+        value_only_pre_gate_delta.unwrap_or(f32::NAN),
     );
     Ok(CertifiedKvLayerTrace {
         layer: trace_layer,
@@ -1309,6 +1331,8 @@ fn trace_llama31_certified_kv_layer(
         pre_gate_delta,
         gated_delta,
         attn_hidden_delta,
+        key_only_pre_gate_delta,
+        value_only_pre_gate_delta,
     })
 }
 
