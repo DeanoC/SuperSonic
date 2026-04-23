@@ -997,8 +997,10 @@ fn collect_replay_decode_profile(
     prompt_ids: &[u32],
     decode_tokens: usize,
 ) -> Result<ProfileReports> {
+    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+        .map_err(|e| anyhow::anyhow!("bench profile replay state init: {e}"))?;
     let mut history = prompt_ids.to_vec();
-    let mut token = run_native_prefill_greedy_token(runtime, &history)
+    let mut token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
         .context("bench profile replay decode initial prefill")?;
     gpu_hal::sync(runtime.ordinal).context("bench profile replay decode initial sync")?;
 
@@ -1007,7 +1009,7 @@ fn collect_replay_decode_profile(
     gpu_hal::hal_profile_reset();
     for step in 0..decode_tokens {
         history.push(token);
-        token = run_native_prefill_greedy_token(runtime, &history)
+        token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
             .with_context(|| format!("bench profile replay decode step {step}"))?;
         gpu_hal::sync(runtime.ordinal)
             .with_context(|| format!("bench profile replay decode sync step {step}"))?;
@@ -1094,15 +1096,17 @@ fn run_replay_decode_once(
     prompt_ids: &[u32],
     decode_tokens: usize,
 ) -> Result<f64> {
+    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+        .map_err(|e| anyhow::anyhow!("bench replay state init: {e}"))?;
     let mut history = prompt_ids.to_vec();
-    let mut token = run_native_prefill_greedy_token(runtime, &history)
+    let mut token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
         .context("bench replay decode initial prefill")?;
     gpu_hal::sync(runtime.ordinal).context("bench replay decode initial sync")?;
 
     let start = Instant::now();
     for step in 0..decode_tokens {
         history.push(token);
-        token = run_native_prefill_greedy_token(runtime, &history)
+        token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
             .with_context(|| format!("bench replay decode step {step}"))?;
         gpu_hal::sync(runtime.ordinal)
             .with_context(|| format!("bench replay decode sync step {step}"))?;
@@ -2777,15 +2781,15 @@ fn run_native_prefill(
     )
 }
 
-fn run_native_prefill_greedy_token(
+fn run_native_prefill_greedy_token_with_state(
     runtime: &QwenBughuntRuntime,
+    state: &mut ModelState,
     prompt_ids: &[u32],
 ) -> Result<u32> {
-    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
-        .map_err(|e| anyhow::anyhow!("native greedy prefill model state init: {e}"))?;
+    state.reset_for_prefill_reuse();
     prefill_engine::prefill_greedy_token(
         &runtime.weights,
-        &mut state,
+        state,
         &runtime.rotary,
         prompt_ids,
         runtime.ordinal,

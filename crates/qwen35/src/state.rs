@@ -224,6 +224,29 @@ impl ModelState {
         Ok(Self { layers })
     }
 
+    /// Prepare existing buffers for a from-scratch prefill replay without
+    /// reallocating caches that can safely be overwritten in place.
+    pub fn reset_for_prefill_reuse(&mut self) {
+        for ls in &mut self.layers {
+            ls.kv_filled = 0;
+            ls.kv_shadow_start = usize::MAX;
+            ls.kv_scale_k = None;
+            ls.kv_scale_v = None;
+            ls.kv_shadow_k = None;
+            ls.kv_shadow_v = None;
+
+            let reusable_bf16_cache = ls
+                .kv_cache_k
+                .as_ref()
+                .zip(ls.kv_cache_v.as_ref())
+                .is_some_and(|(k, v)| k.dtype() == ScalarType::BF16 && v.dtype() == ScalarType::BF16);
+            if !reusable_bf16_cache {
+                ls.kv_cache_k = None;
+                ls.kv_cache_v = None;
+            }
+        }
+    }
+
     /// Deep-copy all layer states to create an independent clone.
     pub fn clone_gpu(&self) -> Result<Self, GpuError> {
         let mut layers = Vec::with_capacity(self.layers.len());

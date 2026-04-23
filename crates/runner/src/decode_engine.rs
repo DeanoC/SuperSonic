@@ -3083,8 +3083,7 @@ impl DecodeEngine {
         token_ids: &[u32],
         replicate_batch: bool,
     ) -> Result<Vec<f32>> {
-        self.state = ModelState::new(&self.weights.config, self.ordinal)
-            .map_err(|e| anyhow::anyhow!("rebuild model state init: {e}"))?;
+        self.state.reset_for_prefill_reuse();
         let logits = self.prefill_native(token_ids)?;
         if replicate_batch && self.batch_size > 1 {
             self.replicate_state_to_batch()?;
@@ -3094,8 +3093,7 @@ impl DecodeEngine {
 
     /// Rebuild sequence-0 state from scratch and return only the greedy token.
     pub fn rebuild_prefill_state_greedy_token(&mut self, token_ids: &[u32]) -> Result<u32> {
-        self.state = ModelState::new(&self.weights.config, self.ordinal)
-            .map_err(|e| anyhow::anyhow!("rebuild greedy model state init: {e}"))?;
+        self.state.reset_for_prefill_reuse();
         self.prefill_native_greedy_token(token_ids)
     }
 
