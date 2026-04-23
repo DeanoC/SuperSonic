@@ -188,6 +188,11 @@ CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
   ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 
+# Llama 3.1 8B PG-19 teacher-forced smoke QA
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
 # Combined wrapper
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
@@ -208,6 +213,9 @@ Each `sm86` script currently validates:
 matches the legacy host-logits sampling path on short, medium, and long prompts.
 `llama3.1-8b --int8` is checked with the PyTorch oracle, `--gpu-validate`, and
 fast-greedy/full-logits token regression runs.
+`tests/sm86/bench_llama31_arxiv_v1_smoke.sh` covers generated RULER/NIAH-style
+retrieval smoke QA, and `tests/sm86/bench_llama31_pg19_smoke.sh` covers
+teacher-forced PG-19/perplexity smoke QA for dense INT8 vs certified KV.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference
@@ -355,6 +363,9 @@ SUPERSONIC_BACKENDS=cuda ./target/release/supersonic --backend cuda \
 CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
   SAMPLES=1 CONFIG=both TIMEOUT=900 \
   ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 ```
 

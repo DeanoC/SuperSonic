@@ -417,6 +417,126 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
     );
 }
 
+fn target_nll_from_logits(logits: &[f32], target_token: u32) -> Result<f64> {
+    let target_idx = target_token as usize;
+    let target_logit = logits
+        .get(target_idx)
+        .ok_or_else(|| {
+            anyhow!(
+                "target token {target_token} outside logits len {}",
+                logits.len()
+            )
+        })?;
+    let max_logit = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp = logits
+        .iter()
+        .map(|&x| ((x as f64) - max_logit).exp())
+        .sum::<f64>();
+    Ok(max_logit + sum_exp.ln() - *target_logit as f64)
+}
+
+fn run_llama31_teacher_forced(
+    cli: &crate::Cli,
+    model_variant: &ModelVariant,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    certified_kv_cfg: Option<&crate::certified_kv::CertifiedKvConfig>,
+) -> Result<()> {
+    if prompt_ids.len() < 2 {
+        bail!("--teacher-forced requires at least 2 prompt tokens");
+    }
+    if cli.validate || cli.gpu_validate {
+        bail!("--teacher-forced does not currently support --validate or --gpu-validate");
+    }
+    if cli.trace_prefill_layers
+        || cli.trace_oracle_prefill_layer.is_some()
+        || cli.certified_kv_trace_layer.is_some()
+        || cli.certified_kv_trace_all
+        || cli.certified_kv_shadow_validate
+    {
+        bail!("--teacher-forced does not support trace/debug validation flags yet");
+    }
+
+    let score_start = Instant::now();
+    let prefill_start = Instant::now();
+    let mut logits = engine.prefill_native(&prompt_ids[..1])?;
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut total_nll = 0.0f64;
+    let mut scored_tokens = 0usize;
+    let mut decode_steps = 0usize;
+    let mut stage_totals = DecodeStageTimings::default();
+
+    for target_idx in 1..prompt_ids.len() {
+        total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
+        scored_tokens += 1;
+        if target_idx + 1 < prompt_ids.len() {
+            let input_token = prompt_ids[target_idx];
+            let pos = target_idx;
+            logits = if let Some(cfg) = certified_kv_cfg {
+                engine.component_decode_step_4b_certified_kv(
+                    input_token,
+                    pos,
+                    cfg.block_size,
+                    cfg.value_group_size,
+                    cfg.bf16_values,
+                )?
+            } else if cli.emit_stage_timings {
+                let (next_logits, timings) = engine.decode_step_with_timings(input_token, pos)?;
+                stage_totals.add_assign(timings);
+                next_logits
+            } else {
+                engine.decode_step(input_token, pos)?
+            };
+            decode_steps += 1;
+        }
+    }
+
+    let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_nll = total_nll / scored_tokens as f64;
+    let perplexity = avg_nll.exp();
+    let bits_per_token = avg_nll / std::f64::consts::LN_2;
+    let ms_per_token = total_ms / scored_tokens as f64;
+    eprintln!(
+        "[teacher_forced] tokens={} scored_tokens={} decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        prompt_ids.len(),
+        scored_tokens,
+        decode_steps,
+        total_nll,
+        avg_nll,
+        perplexity,
+        bits_per_token,
+        prefill_ms,
+        total_ms,
+        ms_per_token,
+    );
+    println!(
+        "[teacher_forced_json] {}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": "cuda",
+            "model": model_variant.to_string(),
+            "mode": if certified_kv_cfg.is_some() { "certified_kv" } else { "dense" },
+            "prompt_tokens": prompt_ids.len(),
+            "scored_tokens": scored_tokens,
+            "decode_steps": decode_steps,
+            "total_nll": total_nll,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+            "bits_per_token": bits_per_token,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "ms_per_token": ms_per_token,
+        }))?
+    );
+    if cli.emit_stage_timings {
+        print_stage_timings(stage_totals, decode_steps);
+    }
+    Ok(())
+}
+
 pub fn run_llama31(
     cli: &crate::Cli,
     model_variant: &ModelVariant,
@@ -467,21 +587,22 @@ pub fn run_llama31(
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
+        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     if prompt_ids.is_empty() {
         bail!("empty prompt after tokenization");
     }
 
+    let reserve_tokens = if cli.teacher_forced { 0 } else { cli.max_new_tokens };
     let context_tokens = cli
         .context_size
-        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
-    if context_tokens < prompt_ids.len() + cli.max_new_tokens {
+        .unwrap_or(prompt_ids.len() + reserve_tokens);
+    if context_tokens < prompt_ids.len() + reserve_tokens {
         bail!(
             "--context-size {context_tokens} < prompt_tokens {} + max_new_tokens {}",
             prompt_ids.len(),
-            cli.max_new_tokens,
+            reserve_tokens,
         );
     }
 
@@ -635,6 +756,16 @@ pub fn run_llama31(
                 "[certified-kv] decode uses experimental INT8-key/INT4-value CUDA attention for full-attention layers"
             );
         }
+    }
+
+    if cli.teacher_forced {
+        return run_llama31_teacher_forced(
+            cli,
+            model_variant,
+            &mut engine,
+            &prompt_ids,
+            certified_kv_cfg.as_ref(),
+        );
     }
 
     let prefill_start = Instant::now();

@@ -156,7 +156,7 @@ fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
 
 fn resolve_prompt_token_ids(cli: &Cli, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
+        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     if prompt_ids.is_empty() {
@@ -310,6 +310,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     prompt: String,
 
+    /// Do not add tokenizer special tokens when encoding --prompt.
+    #[arg(long)]
+    prompt_no_special_tokens: bool,
+
     /// Maximum tokens to generate
     #[arg(long, default_value = "8")]
     max_new_tokens: usize,
@@ -334,6 +338,12 @@ pub(crate) struct Cli {
     /// Emit the generated suffix as a JSON string for benchmark harnesses.
     #[arg(long)]
     emit_generated_json: bool,
+
+    /// Score the prompt with teacher forcing instead of generating new tokens.
+    /// Currently wired for the Llama 3.1 CUDA path as the PG-19/perplexity QA
+    /// surface.
+    #[arg(long)]
+    teacher_forced: bool,
 
     /// Run PyTorch oracle and compare logits
     #[arg(long)]
@@ -1022,7 +1032,7 @@ fn main() -> Result<()> {
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
+        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
@@ -2229,7 +2239,7 @@ fn run_gemma4(
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
+        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());

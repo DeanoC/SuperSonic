@@ -7,8 +7,8 @@ scores against the normalized arxiv_v1 JSON files produced by DotCache.
 
 The harness intentionally shells out to the SuperSonic binary for generation so
 the same prompts can gate both the native CUDA dense INT8 path and the certified
-KV path.  It does not attempt to run PG-19 perplexity yet because SuperSonic's
-CLI does not expose token-level logprobs.
+KV path.  PG-19 teacher-forced perplexity lives in `oracle/pg19_smoke.py`;
+this harness stays focused on generated retrieval-style tasks.
 """
 
 from __future__ import annotations

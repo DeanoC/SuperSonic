@@ -223,8 +223,23 @@ with deterministic seeds, scores only the generated suffix, compares against
 the normalized DotCache reference results from
 `/workspace/DotCache/benchmarks/results/arxiv_v1_20260420`, and fails on
 critical certified-vs-dense regressions. The 4K smoke above passed all gates.
-PG-19 parity is not covered by this harness yet because SuperSonic does not
-currently expose the teacher-forced log-probability path needed for perplexity.
+
+Llama 3.1 8B PG-19 teacher-forced smoke QA is covered separately by
+`./tests/sm86/bench_llama31_pg19_smoke.sh`. It uses the Rust
+`--teacher-forced` scorer, which prefills the first token, feeds the true next
+token through dense or certified-KV CUDA decode, and accumulates NLL from the
+returned logits. A tiny local-text probe (`CONTEXTS=32`, one chunk, commit
+work-in-progress after `9d00178`) passed the dense-vs-certified gate:
+
+| Source        | Path              | Context | Chunks | PPL     | Decode ms/tok |
+|---------------|-------------------|--------:|-------:|--------:|--------------:|
+| local fixture | dense INT8        |      32 |      1 | 239.558 |          37.0 |
+| local fixture | certified KV INT8 |      32 |      1 | 235.822 |          36.6 |
+
+This is a harness sanity check, not a PG-19 quality number. For PG-19 arxiv_v1
+comparison, run the same script with `CONTEXTS=4096` and
+`REFERENCE_SMOKE=1`; that path compares against the DotCache PG-19 smoke JSON
+when a matching reference cell is present.
 
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
@@ -263,5 +278,10 @@ SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
 CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
   SAMPLES=1 CONFIG=both TIMEOUT=900 \
   ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
+# CUDA / sm86 Llama 3.1 8B PG-19 teacher-forced smoke QA
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 ```
