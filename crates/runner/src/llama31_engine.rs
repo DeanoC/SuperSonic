@@ -622,9 +622,15 @@ pub fn run_llama31(
     )?;
     if let Some(cfg) = &certified_kv_cfg {
         eprintln!("[certified-kv] {}", cfg.summary());
-        eprintln!(
-            "[certified-kv] Rust/CUDA baseline uses unconditional dense fallback (Rung 4) on the existing CUDA BF16 KV attention path"
-        );
+        if cfg.bf16_values {
+            eprintln!(
+                "[certified-kv] decode uses experimental INT8-key/BF16-value CUDA attention for full-attention layers"
+            );
+        } else {
+            eprintln!(
+                "[certified-kv] Rust/CUDA baseline uses unconditional dense fallback (Rung 4) on the existing CUDA BF16 KV attention path"
+            );
+        }
     }
 
     let prefill_start = Instant::now();
@@ -759,7 +765,32 @@ pub fn run_llama31(
     }
     while generated.len() < cli.max_new_tokens && !eos_ids.contains(&next_token) {
         let pos = prompt_ids.len() + generated.len() - 1;
-        let (native_next, logits_for_validation) = if cuda_fast_greedy_enabled {
+        let certified_decode_cfg = certified_kv_cfg.as_ref().filter(|cfg| cfg.bf16_values);
+        let (native_next, logits_for_validation) = if let Some(cfg) = certified_decode_cfg {
+            if cuda_fast_greedy_enabled {
+                let (token, timings) = engine
+                    .component_decode_step_4b_certified_kv_bf16_values_cuda_fast_greedy(
+                        next_token,
+                        pos,
+                        cfg.block_size,
+                        cfg.value_group_size,
+                        cli.emit_stage_timings,
+                    )?;
+                if cli.emit_stage_timings {
+                    stage_totals.add_assign(timings);
+                }
+                (token, None)
+            } else {
+                let logits = engine.component_decode_step_4b_certified_kv_bf16_values(
+                    next_token,
+                    pos,
+                    cfg.block_size,
+                    cfg.value_group_size,
+                )?;
+                let native_next = DecodeEngine::greedy_sample(&logits);
+                (native_next, Some(logits))
+            }
+        } else if cuda_fast_greedy_enabled {
             let (token, timings) =
                 engine.component_decode_step_4b_cuda_fast_greedy(next_token, pos, cli.emit_stage_timings)?;
             if cli.emit_stage_timings {
@@ -1122,7 +1153,11 @@ pub fn run_llama31(
             let payload = serde_json::json!({
                 "backend": "cuda",
                 "model": model_variant.to_string(),
-                "mode": "certified_kv_dense_fallback",
+                "mode": if cfg.bf16_values {
+                    "certified_kv_int8_key_bf16_value_decode"
+                } else {
+                    "certified_kv_dense_fallback"
+                },
                 "prompt_tokens": prompt_ids.len(),
                 "generated_tokens": generated.len(),
                 "decode_ms": decode_ms,
@@ -1138,7 +1173,7 @@ pub fn run_llama31(
                 "rung1_threshold": cfg.rung1_threshold,
                 "rung1_multiplier": cfg.rung1_multiplier,
                 "eps_guard": cfg.eps_guard,
-                "rung4_forced_dense_steps": generated.len(),
+                "rung4_forced_dense_steps": if cfg.bf16_values { 0 } else { generated.len() },
                 "shadow_layers": certified_kv_shadow_stats.map(|s| s.layers),
                 "shadow_aligned_tokens": certified_kv_shadow_stats.map(|s| s.aligned_tokens),
                 "shadow_tier1_bytes": certified_kv_shadow_stats.map(|s| s.compressed_vram_bytes),

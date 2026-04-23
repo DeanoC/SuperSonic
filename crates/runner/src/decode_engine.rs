@@ -2735,7 +2735,7 @@ impl DecodeEngine {
             &mut self.normed_buf,
             &format!("layer {idx} component full-attn input rms_norm"),
         )?;
-        self.component_decode_full_attention_layer(idx, seqlen_offset, true, None)?
+        self.component_decode_full_attention_layer(idx, seqlen_offset, true, None, None)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx} missing full-attention trace"))
     }
 
@@ -2800,6 +2800,7 @@ impl DecodeEngine {
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
         cuda_greedy: bool,
+        certified_kv_decode: Option<(usize, usize, bool)>,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<(Option<Vec<f32>>, Option<u32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
         let hidden_dim = self.weights.config.hidden_size;
@@ -2851,6 +2852,7 @@ impl DecodeEngine {
                     i,
                     seqlen_offset,
                     false,
+                    certified_kv_decode,
                     timings.as_deref_mut(),
                 )?;
                 self.sync_stage_if_requested(collect_timings, &format!("layer {i} full attention"))?;
@@ -3033,7 +3035,7 @@ impl DecodeEngine {
 
     fn component_decode_step_4b(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
         let (logits, _, _, _, _) =
-            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, false, None)?;
+            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, false, None, None)?;
         logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
     }
 
@@ -3050,6 +3052,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             Some(&mut timings),
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component decode timings missing logits"))?;
@@ -3077,10 +3080,59 @@ impl DecodeEngine {
             None,
             None,
             true,
+            None,
             timing_slot,
         )?;
         let sampled_token = sampled_token
             .ok_or_else(|| anyhow::anyhow!("component CUDA fast greedy missing sampled token"))?;
+        Ok((sampled_token, timings))
+    }
+
+    pub fn component_decode_step_4b_certified_kv_bf16_values(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        block_size: usize,
+        value_group_size: usize,
+    ) -> Result<Vec<f32>> {
+        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            Some((block_size, value_group_size, true)),
+            None,
+        )?;
+        logits.ok_or_else(|| anyhow::anyhow!("certified KV BF16-value decode missing logits"))
+    }
+
+    pub fn component_decode_step_4b_certified_kv_bf16_values_cuda_fast_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        block_size: usize,
+        value_group_size: usize,
+        collect_timings: bool,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
+            anyhow::bail!("certified KV BF16-value fast greedy requires CUDA backend");
+        }
+        let mut timings = DecodeStageTimings::default();
+        let timing_slot = if collect_timings { Some(&mut timings) } else { None };
+        let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            true,
+            Some((block_size, value_group_size, true)),
+            timing_slot,
+        )?;
+        let sampled_token = sampled_token
+            .ok_or_else(|| anyhow::anyhow!("certified KV BF16-value fast greedy missing sampled token"))?;
         Ok((sampled_token, timings))
     }
 
@@ -3097,6 +3149,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component trace missing logits"))?;
@@ -3118,6 +3171,7 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component layer trace missing logits"))?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
@@ -3138,6 +3192,7 @@ impl DecodeEngine {
             Some(trace_layer),
             false,
             None,
+            None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component linear trace missing logits"))?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
@@ -3149,6 +3204,7 @@ impl DecodeEngine {
         idx: usize,
         seqlen_offset: usize,
         trace_output: bool,
+        certified_kv_decode: Option<(usize, usize, bool)>,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
         let hidden_dim = self.weights.config.hidden_size;
@@ -3478,7 +3534,173 @@ impl DecodeEngine {
         let cap = cache_k_ref.shape()[2];
 
         let core_start = Instant::now();
-        if has_attn_gate {
+        let use_certified_bf16_values = certified_kv_decode
+            .map(|(block_size, _, bf16_values)| {
+                bf16_values
+                    && kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size) > 0
+            })
+            .unwrap_or(false);
+        if use_certified_bf16_values {
+            let (block_size, value_group_size, _) = certified_kv_decode
+                .expect("certified KV decode config is present when enabled");
+            let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
+            let tail_len = kv_len - aligned;
+            let (
+                key_i8_shape,
+                key_scale_shape,
+                value_i4_shape,
+                value_meta_shape,
+                value_error_shape,
+            ) = kernel_ffi::certified_kv::quantized_shapes(
+                num_kv_heads,
+                kv_len,
+                head_dim,
+                block_size,
+                value_group_size,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode shapes: {e}"))?;
+            let mut key_i8 =
+                GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key_i8 alloc: {e}"))?;
+            let mut key_scale =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key_scale alloc: {e}"))?;
+            let mut value_i4 =
+                GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_i4 alloc: {e}"))?;
+            let mut value_scale =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_scale alloc: {e}"))?;
+            let mut value_zero =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_zero alloc: {e}"))?;
+            let mut value_error =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value_error alloc: {e}"))?;
+            kernel_ffi::certified_kv::quantize_bf16_cache(
+                self.ordinal,
+                cache_k_ref,
+                cache_v_ref,
+                kv_len,
+                block_size,
+                value_group_size,
+                &mut key_i8,
+                &mut key_scale,
+                &mut value_i4,
+                &mut value_scale,
+                &mut value_zero,
+                &mut value_error,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode quantize: {e}"))?;
+
+            let contig_stride = kv_len * head_dim * elem_bytes;
+            let cap_stride = cap * head_dim * elem_bytes;
+            let copy_bytes = kv_len * head_dim * elem_bytes;
+            let value_bf16 =
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode BF16 value alloc: {e}"))?;
+            for h in 0..num_kv_heads {
+                gpu_hal::copy_d2d(
+                    self.ordinal,
+                    value_bf16.offset_ptr(h * contig_stride) as *mut c_void,
+                    cache_v_ref.offset_ptr(h * cap_stride),
+                    copy_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode value copy h={h}: {e}"))?;
+            }
+            let tail_key_bf16 = if tail_len > 0 {
+                let tail =
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, tail_len, head_dim])
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode tail key alloc: {e}"))?;
+                let tail_stride = tail_len * head_dim * elem_bytes;
+                let tail_src_offset = aligned * head_dim * elem_bytes;
+                let tail_bytes = tail_len * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        tail.offset_ptr(h * tail_stride) as *mut c_void,
+                        cache_k_ref.offset_ptr(h * cap_stride + tail_src_offset),
+                        tail_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode tail key copy h={h}: {e}"))?;
+                }
+                Some(tail)
+            } else {
+                None
+            };
+            let mut score_scratch =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}"))?;
+            kernel_ffi::certified_kv::attend_int8_bf16_values(
+                self.ordinal,
+                attn_q,
+                &key_i8,
+                &key_scale,
+                &value_bf16,
+                tail_key_bf16.as_ref(),
+                block_size,
+                num_q_heads / num_kv_heads,
+                1.0 / (head_dim as f32).sqrt(),
+                &mut score_scratch,
+                attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                attn_out_f32,
+                attn_out_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attn cast: {e}"))?;
+            if has_attn_gate {
+                kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    num_q_heads,
+                    1,
+                    head_dim,
+                    attn_out_bf16,
+                    attn_flat,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}"))?;
+                if trace_output {
+                    pre_gate_trace = Some(
+                        attn_flat
+                            .to_host_bytes()
+                            .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                    );
+                }
+                kernel_ffi::prefill_ffi::sigmoid_mul(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    q_dim,
+                    attn_flat,
+                    gate_buf,
+                    gated,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+            } else {
+                kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    num_q_heads,
+                    1,
+                    head_dim,
+                    attn_out_bf16,
+                    gated,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}"))?;
+                if trace_output {
+                    pre_gate_trace = Some(
+                        gated
+                            .to_host_bytes()
+                            .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                    );
+                }
+            }
+        } else if has_attn_gate {
             let kv_k_contig;
             let kv_v_contig;
             let attn_k_ref;

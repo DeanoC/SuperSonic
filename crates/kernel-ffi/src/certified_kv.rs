@@ -785,13 +785,17 @@ pub fn attend_int8_bf16_values(
             output_f32.dtype()
         )));
     }
-    if query_bf16.shape().len() != 2
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d
+        && !query_is_3d
         || key_int8.shape().len() != 3
         || key_scale.shape().len() != 3
         || value_bf16.shape().len() != 3
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV INT8/BF16-value expects query [qh,hd], key_int8 [kvh,aligned,hd], key_scale [kvh,b,hd], value [kvh,total,hd], got {:?}/{:?}/{:?}/{:?}",
+            "certified KV INT8/BF16-value expects query [qh,hd] or [qh,1,hd], key_int8 [kvh,aligned,hd], key_scale [kvh,b,hd], value [kvh,total,hd], got {:?}/{:?}/{:?}/{:?}",
             query_bf16.shape(),
             key_int8.shape(),
             key_scale.shape(),
@@ -803,8 +807,12 @@ pub fn attend_int8_bf16_values(
             "certified KV INT8/BF16-value invalid block_size={block_size} gqa_group={gqa_group}"
         )));
     }
-    let q_heads = query_bf16.shape()[0];
-    let head_dim = query_bf16.shape()[1];
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
     let kv_heads = key_int8.shape()[0];
     let aligned_tokens = key_int8.shape()[1];
     if key_int8.shape()[2] != head_dim || aligned_tokens == 0 || aligned_tokens % block_size != 0
@@ -833,9 +841,12 @@ pub fn attend_int8_bf16_values(
             "certified KV INT8/BF16-value q_heads={q_heads} must equal kv_heads={kv_heads} * gqa_group={gqa_group}"
         )));
     }
+    let output_shape = output_f32.shape();
+    let output_is_2d = output_shape == [q_heads, head_dim];
+    let output_is_3d = output_shape == [q_heads, 1, head_dim];
     if key_scale.shape() != [kv_heads, num_blocks, head_dim]
         || score_scratch.shape() != [q_heads, total_tokens]
-        || output_f32.shape() != [q_heads, head_dim]
+        || (!output_is_2d && !output_is_3d)
     {
         return Err(GpuError::InvalidArg(format!(
             "certified KV INT8/BF16-value shape mismatch key_scale={:?} score_scratch={:?} output={:?}",
