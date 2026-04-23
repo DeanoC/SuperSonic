@@ -2583,107 +2583,142 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k l2norm: {e}"))?;
 
-        flush_metal_batch_for_host_boundary(
-            &self.hidden_io,
-            &format!("layer {idx} linear packed host-read boundary"),
-        )?;
-        let q_scaled_host = q_scaled
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_scaled D2H: {e}"))?;
-        let k_normed_host = k_normed
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_normed D2H: {e}"))?;
-        let v_linear_host = v_linear_f32
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} v_linear D2H: {e}"))?;
-        let dt_bias_host = lw
-            .dt_bias
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} dt_bias D2H: {e}"))?;
-        let a_log_exp_host = lw
-            .a_log_exp
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} a_log_exp D2H: {e}"))?;
-        let q_scaled_f32: Vec<f32> = q_scaled_host
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let k_normed_f32: Vec<f32> = k_normed_host
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let v_linear_f32_host: Vec<f32> = v_linear_host
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
-        let a_for_beta = if let Some(values) = a_for_beta_f32 {
-            values
+        let mut packed_trace = None;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_DIRECT_LINEAR_DECODE").is_none()
+            && a_for_beta_f32.is_none()
+            && b_for_beta_f32.is_none()
+        {
+            kernel_ffi::prefill_ffi::metal_linear_decode_apply_parts_f32(
+                nv,
+                nk,
+                khd,
+                vhd,
+                &q_scaled,
+                &k_normed,
+                &v_linear_f32,
+                &a,
+                &b,
+                &lw.dt_bias,
+                &lw.a_log_exp,
+                recurrent_state,
+                &mut rec_apply,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} metal direct linear decode apply: {e}"))?;
         } else {
-            a.to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {idx} a D2H: {e}"))?
+            flush_metal_batch_for_host_boundary(
+                &self.hidden_io,
+                &format!("layer {idx} linear packed host-read boundary"),
+            )?;
+            let q_scaled_host = q_scaled
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} q_scaled D2H: {e}"))?;
+            let k_normed_host = k_normed
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} k_normed D2H: {e}"))?;
+            let v_linear_host = v_linear_f32
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} v_linear D2H: {e}"))?;
+            let dt_bias_host = lw
+                .dt_bias
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} dt_bias D2H: {e}"))?;
+            let a_log_exp_host = lw
+                .a_log_exp
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {idx} a_log_exp D2H: {e}"))?;
+            let q_scaled_f32: Vec<f32> = q_scaled_host
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let k_normed_f32: Vec<f32> = k_normed_host
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let v_linear_f32_host: Vec<f32> = v_linear_host
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let a_for_beta = if let Some(values) = a_for_beta_f32 {
+                values
+            } else {
+                a.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} a D2H: {e}"))?
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                    .collect()
+            };
+            let b_for_beta = if let Some(values) = b_for_beta_f32 {
+                values
+            } else {
+                b.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} b D2H: {e}"))?
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+                    .collect()
+            };
+            let dt_bias_bf16: Vec<f32> = dt_bias_host
                 .chunks_exact(2)
                 .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                .collect()
-        };
-        let b_for_beta = if let Some(values) = b_for_beta_f32 {
-            values
-        } else {
-            b.to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {idx} b D2H: {e}"))?
+                .collect();
+            let a_log_exp_bf16: Vec<f32> = a_log_exp_host
                 .chunks_exact(2)
                 .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-                .collect()
-        };
-        let dt_bias_bf16: Vec<f32> = dt_bias_host
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect();
-        let a_log_exp_bf16: Vec<f32> = a_log_exp_host
-            .chunks_exact(2)
-            .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-            .collect();
-        let packed_width = 2 * khd + vhd + 2;
-        let mut packed_host = vec![0f32; nv * packed_width];
-        for v_head in 0..nv {
-            let k_head = v_head / head_repeat;
-            let out_base = v_head * packed_width;
-            let q_base = k_head * khd;
-            let k_base = k_head * khd;
-            let v_base = v_head * vhd;
-            for i in 0..khd {
-                packed_host[out_base + i] = q_scaled_f32[q_base + i];
-                packed_host[out_base + khd + i] = k_normed_f32[k_base + i];
+                .collect();
+            let packed_width = 2 * khd + vhd + 2;
+            let mut packed_host = vec![0f32; nv * packed_width];
+            for v_head in 0..nv {
+                let k_head = v_head / head_repeat;
+                let out_base = v_head * packed_width;
+                let q_base = k_head * khd;
+                let k_base = k_head * khd;
+                let v_base = v_head * vhd;
+                for i in 0..khd {
+                    packed_host[out_base + i] = q_scaled_f32[q_base + i];
+                    packed_host[out_base + khd + i] = k_normed_f32[k_base + i];
+                }
+                for i in 0..vhd {
+                    packed_host[out_base + 2 * khd + i] = v_linear_f32_host[v_base + i];
+                }
+                packed_host[out_base + 2 * khd + vhd] =
+                    1.0f32 / (1.0f32 + (-b_for_beta[v_head]).exp());
+                let softplus = (1.0f32 + (a_for_beta[v_head] + dt_bias_bf16[v_head]).exp()).ln();
+                packed_host[out_base + 2 * khd + vhd + 1] =
+                    (-softplus * a_log_exp_bf16[v_head]).exp();
             }
-            for i in 0..vhd {
-                packed_host[out_base + 2 * khd + i] = v_linear_f32_host[v_base + i];
-            }
-            packed_host[out_base + 2 * khd + vhd] =
-                1.0f32 / (1.0f32 + (-b_for_beta[v_head]).exp());
-            let softplus = (1.0f32 + (a_for_beta[v_head] + dt_bias_bf16[v_head]).exp()).ln();
-            packed_host[out_base + 2 * khd + vhd + 1] = (-softplus * a_log_exp_bf16[v_head]).exp();
-        }
-        let packed = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::F32,
-            &[nv, packed_width],
-            &packed_host
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>(),
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} packed H2D: {e}"))?;
+            let packed = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::F32,
+                &[nv, packed_width],
+                &packed_host
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} packed H2D: {e}"))?;
 
-        kernel_ffi::prefill_ffi::linear_decode_apply_4b(
-            self.ordinal,
-            1,
-            nv,
-            khd,
-            vhd,
-            &packed,
-            recurrent_state,
-            &mut rec_apply,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} linear decode apply: {e}"))?;
+            kernel_ffi::prefill_ffi::linear_decode_apply_4b(
+                self.ordinal,
+                1,
+                nv,
+                khd,
+                vhd,
+                &packed,
+                recurrent_state,
+                &mut rec_apply,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} linear decode apply: {e}"))?;
+            packed_trace = if trace_output {
+                Some(
+                    packed
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} packed trace D2H: {e}"))?,
+                )
+            } else {
+                None
+            };
+        }
 
         let state_len = config.linear_conv_kernel_dim - 1;
         let state_bytes = ScalarType::BF16.size_in_bytes();
@@ -2805,15 +2840,6 @@ impl DecodeEngine {
                 proj_out
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
-            )
-        } else {
-            None
-        };
-        let packed_trace = if trace_output {
-            Some(
-                packed
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} packed trace D2H: {e}"))?,
             )
         } else {
             None

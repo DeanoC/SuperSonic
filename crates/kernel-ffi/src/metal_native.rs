@@ -347,6 +347,21 @@ unsafe extern "C" {
         g_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_linear_decode_apply_parts_f32(
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        q_scaled_ptr: *const c_void,
+        k_normed_ptr: *const c_void,
+        v_linear_ptr: *const c_void,
+        a_ptr: *const c_void,
+        b_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_exp_ptr: *const c_void,
+        initial_state_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 pub(crate) struct MetalBatchGuard {
@@ -1723,6 +1738,75 @@ pub(crate) fn delta_recurrent_prefill_f32(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn linear_decode_apply_parts_f32(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    q_scaled: &GpuBuffer,
+    k_normed: &GpuBuffer,
+    v_linear: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if q_scaled.dtype() != ScalarType::F32
+        || k_normed.dtype() != ScalarType::F32
+        || v_linear.dtype() != ScalarType::F32
+        || initial_state.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+        || a.dtype() != ScalarType::BF16
+        || b.dtype() != ScalarType::BF16
+        || dt_bias.dtype() != ScalarType::BF16
+        || a_log_exp.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native linear_decode_apply_parts_f32 expects F32 q/k/v/state/out and BF16 a/b/dt/a_log, got q={:?} k={:?} v={:?} a={:?} b={:?} dt={:?} a_log={:?} state={:?} out={:?}",
+            q_scaled.dtype(),
+            k_normed.dtype(),
+            v_linear.dtype(),
+            a.dtype(),
+            b.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            initial_state.dtype(),
+            out.dtype()
+        )));
+    }
+    if num_v_heads == 0 || num_k_heads == 0 || num_v_heads % num_k_heads != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native linear_decode_apply_parts_f32 invalid heads: num_v_heads={num_v_heads} num_k_heads={num_k_heads}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_linear_decode_apply_parts_f32(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            q_scaled.as_ptr(),
+            k_normed.as_ptr(),
+            v_linear.as_ptr(),
+            a.as_ptr(),
+            b.as_ptr(),
+            dt_bias.as_ptr(),
+            a_log_exp.as_ptr(),
+            initial_state.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native linear_decode_apply_parts_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 impl MetalBatchGuard {
     pub(crate) fn begin() -> Result<Self, GpuError> {
@@ -1747,6 +1831,27 @@ pub(crate) fn copy_d2d(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native copy_d2d is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn linear_decode_apply_parts_f32(
+    _num_v_heads: usize,
+    _num_k_heads: usize,
+    _head_k_dim: usize,
+    _head_v_dim: usize,
+    _q_scaled: &GpuBuffer,
+    _k_normed: &GpuBuffer,
+    _v_linear: &GpuBuffer,
+    _a: &GpuBuffer,
+    _b: &GpuBuffer,
+    _dt_bias: &GpuBuffer,
+    _a_log_exp: &GpuBuffer,
+    _initial_state: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native linear_decode_apply_parts_f32 is not compiled".into(),
     ))
 }
 

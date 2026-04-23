@@ -142,6 +142,17 @@ struct DeltaRecurrentPrefillParams {
     uint32_t total_threads;
 };
 
+struct LinearDecodeApplyParams {
+    uint32_t num_v_heads;
+    uint32_t num_k_heads;
+    uint32_t head_repeat;
+    uint32_t k_head_dim;
+    uint32_t v_head_dim;
+    uint32_t value_dim;
+    uint32_t state_dim;
+    uint32_t total_threads;
+};
+
 struct L2NormParams {
     uint32_t n_rows;
     uint32_t n_cols;
@@ -3288,6 +3299,136 @@ kernel void supersonic_delta_recurrent_prefill_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> linear_decode_apply_parts_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:181
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"LDA(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LinearDecodeApplyParams {
+    uint num_v_heads;
+    uint num_k_heads;
+    uint head_repeat;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint value_dim;
+    uint state_dim;
+    uint total_threads;
+};
+
+static inline float softplus_stable(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+kernel void supersonic_linear_decode_apply_parts_f32(
+    device const float* q_scaled [[buffer(0)]],
+    device const float* k_normed [[buffer(1)]],
+    device const float* v_linear [[buffer(2)]],
+    device const bfloat* a [[buffer(3)]],
+    device const bfloat* b [[buffer(4)]],
+    device const bfloat* dt_bias [[buffer(5)]],
+    device const bfloat* a_log_exp [[buffer(6)]],
+    device const float* initial_state [[buffer(7)]],
+    device float* out [[buffer(8)]],
+    constant LinearDecodeApplyParams& params [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+    uint v_head = gid / params.v_head_dim;
+    uint vv = gid - v_head * params.v_head_dim;
+    uint k_head = v_head / params.head_repeat;
+
+    uint q_base = k_head * params.k_head_dim;
+    uint k_base = k_head * params.k_head_dim;
+    uint v_base = v_head * params.v_head_dim;
+    float beta = 1.0f / (1.0f + exp(-float(b[v_head])));
+    float g_exp =
+        exp(-softplus_stable(float(a[v_head]) + float(dt_bias[v_head])) * float(a_log_exp[v_head]));
+
+    uint state_head_base = (v_head * params.k_head_dim) * params.v_head_dim + vv;
+    uint state_out_base = params.value_dim + (v_head * params.k_head_dim) * params.v_head_dim + vv;
+    float kv_mem = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float state = initial_state[state_head_base + kk * params.v_head_dim] * g_exp;
+        kv_mem = fma(state, k_normed[k_base + kk], kv_mem);
+        out[state_out_base + kk * params.v_head_dim] = state;
+    }
+
+    float delta = (v_linear[v_base + vv] - kv_mem) * beta;
+    float out_value = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        uint state_idx = state_out_base + kk * params.v_head_dim;
+        float state = fma(k_normed[k_base + kk], delta, out[state_idx]);
+        out[state_idx] = state;
+        out_value = fma(state, q_scaled[q_base + kk], out_value);
+    }
+    out[v_base + vv] = out_value;
+}
+)LDA";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:182
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile linear-decode-apply-parts library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_linear_decode_apply_parts_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:183
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load linear-decode-apply-parts function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                code:184
+                                                                            userInfo:@{
+                                                                                NSLocalizedDescriptionKey :
+                                                                                    @"Failed to create linear-decode-apply-parts pipeline"
+                                                                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> l2norm_pipeline(NSString* function_name, NSError** error_out) {
     static std::mutex mutex;
     static bool attempted_bf16 = false;
@@ -4965,6 +5106,114 @@ static int supersonic_metal_l2norm_impl(
             MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
             [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         }, 187, 188, 189, 190);
+    }
+}
+
+extern "C" int supersonic_metal_linear_decode_apply_parts_f32(
+    size_t num_v_heads,
+    size_t num_k_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* q_scaled_ptr,
+    const void* k_normed_ptr,
+    const void* v_linear_ptr,
+    const void* a_ptr,
+    const void* b_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_exp_ptr,
+    const void* initial_state_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (num_v_heads == 0 || num_k_heads == 0 || head_k_dim == 0 || head_v_dim == 0 ||
+            num_v_heads % num_k_heads != 0 || q_scaled_ptr == nullptr || k_normed_ptr == nullptr ||
+            v_linear_ptr == nullptr || a_ptr == nullptr || b_ptr == nullptr ||
+            dt_bias_ptr == nullptr || a_log_exp_ptr == nullptr || initial_state_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 185;
+        }
+        if (num_v_heads > UINT32_MAX || num_k_heads > UINT32_MAX ||
+            head_k_dim > UINT32_MAX || head_v_dim > UINT32_MAX) {
+            return 186;
+        }
+        if (num_v_heads > SIZE_MAX / head_v_dim) {
+            return 187;
+        }
+        size_t total_threads = num_v_heads * head_v_dim;
+        if (total_threads > UINT32_MAX) {
+            return 188;
+        }
+        if (head_k_dim != 0 && num_v_heads > SIZE_MAX / head_k_dim / head_v_dim) {
+            return 189;
+        }
+        size_t value_dim = total_threads;
+        size_t state_dim = num_v_heads * head_k_dim * head_v_dim;
+        if (value_dim > UINT32_MAX || state_dim > UINT32_MAX) {
+            return 190;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = linear_decode_apply_parts_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 191;
+        }
+
+        id<MTLBuffer> q_scaled = nil;
+        id<MTLBuffer> k_normed = nil;
+        id<MTLBuffer> v_linear = nil;
+        id<MTLBuffer> a = nil;
+        id<MTLBuffer> b = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log_exp = nil;
+        id<MTLBuffer> initial_state = nil;
+        id<MTLBuffer> out = nil;
+        size_t q_scaled_offset = 0;
+        size_t k_normed_offset = 0;
+        size_t v_linear_offset = 0;
+        size_t a_offset = 0;
+        size_t b_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_exp_offset = 0;
+        size_t initial_state_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(q_scaled_ptr, &q_scaled, &q_scaled_offset) != 0) return 192;
+        if (lookup_buffer(k_normed_ptr, &k_normed, &k_normed_offset) != 0) return 193;
+        if (lookup_buffer(v_linear_ptr, &v_linear, &v_linear_offset) != 0) return 194;
+        if (lookup_buffer(a_ptr, &a, &a_offset) != 0) return 195;
+        if (lookup_buffer(b_ptr, &b, &b_offset) != 0) return 196;
+        if (lookup_buffer(dt_bias_ptr, &dt_bias, &dt_bias_offset) != 0) return 197;
+        if (lookup_buffer(a_log_exp_ptr, &a_log_exp, &a_log_exp_offset) != 0) return 198;
+        if (lookup_buffer(initial_state_ptr, &initial_state, &initial_state_offset) != 0) return 199;
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) return 200;
+
+        LinearDecodeApplyParams params = {
+            static_cast<uint32_t>(num_v_heads),
+            static_cast<uint32_t>(num_k_heads),
+            static_cast<uint32_t>(num_v_heads / num_k_heads),
+            static_cast<uint32_t>(head_k_dim),
+            static_cast<uint32_t>(head_v_dim),
+            static_cast<uint32_t>(value_dim),
+            static_cast<uint32_t>(state_dim),
+            static_cast<uint32_t>(total_threads),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:q_scaled offset:q_scaled_offset atIndex:0];
+            [encoder setBuffer:k_normed offset:k_normed_offset atIndex:1];
+            [encoder setBuffer:v_linear offset:v_linear_offset atIndex:2];
+            [encoder setBuffer:a offset:a_offset atIndex:3];
+            [encoder setBuffer:b offset:b_offset atIndex:4];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:5];
+            [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:6];
+            [encoder setBuffer:initial_state offset:initial_state_offset atIndex:7];
+            [encoder setBuffer:out offset:out_offset atIndex:8];
+            [encoder setBytes:&params length:sizeof(params) atIndex:9];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        }, 201, 202, 203, 204);
     }
 }
 

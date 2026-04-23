@@ -150,6 +150,38 @@ pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Res
     metal_native::copy_d2d(src, dst, bytes)
 }
 
+pub fn metal_linear_decode_apply_parts_f32(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    q_scaled: &GpuBuffer,
+    k_normed: &GpuBuffer,
+    v_linear: &GpuBuffer,
+    a: &GpuBuffer,
+    b: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    initial_state: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_native::linear_decode_apply_parts_f32(
+        num_v_heads,
+        num_k_heads,
+        head_k_dim,
+        head_v_dim,
+        q_scaled,
+        k_normed,
+        v_linear,
+        a,
+        b,
+        dt_bias,
+        a_log_exp,
+        initial_state,
+        out,
+    )
+}
+
 pub struct MetalBatchGuard {
     inner: Option<metal_native::MetalBatchGuard>,
 }
