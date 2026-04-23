@@ -23,6 +23,10 @@ fn metal_force_host_linear_conv_pack() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_LINEAR_CONV_PACK").is_some()
 }
 
+fn metal_force_host_element_add() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_ELEMENT_ADD").is_some()
+}
+
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
@@ -1390,6 +1394,12 @@ pub fn element_add_inplace(
     if lhs_out.backend() == Backend::Metal {
         let _ = ordinal;
         let lhs = unsafe { &*(lhs_out as *const GpuBuffer) };
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_element_add()
+            && metal_native::element_add(dtype, total_elems, lhs, rhs, lhs_out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::element_add(dtype, total_elems, lhs, rhs, lhs_out);
     }
     let ptr = lhs_out.as_mut_ptr();
@@ -1453,6 +1463,12 @@ pub fn element_add(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_element_add()
+            && metal_native::element_add(dtype, total_elems, lhs, rhs, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::element_add(dtype, total_elems, lhs, rhs, out);
     }
     let status = unsafe {

@@ -48,6 +48,18 @@ unsafe extern "C" {
         weights_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_element_add_bf16(
+        total_elems: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_element_add_f32(
+        total_elems: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -224,6 +236,57 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn element_add(
+    dtype: ScalarType,
+    total_elems: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native element_add supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if lhs.dtype() != dtype || rhs.dtype() != dtype || out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native element_add expects matching dtype {dtype:?}, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_element_add_bf16(
+                total_elems,
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_element_add_f32(
+                total_elems,
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native element_add does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native element_add failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -288,6 +351,19 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     ))
 }
 
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn element_add(
+    _dtype: ScalarType,
+    _total_elems: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native element_add is not compiled".into(),
+    ))
+}
+
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
 mod tests {
     use super::*;
@@ -315,6 +391,10 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
     }
 
     #[test]
@@ -531,5 +611,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn metal_native_element_add_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&[1.0, -2.0, 0.5, 10.0]),
+        )
+        .expect("upload lhs bf16");
+        let rhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&[0.25, 3.0, -0.25, -1.5]),
+        )
+        .expect("upload rhs bf16");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate bf16 out");
+        element_add(ScalarType::BF16, 4, &lhs, &rhs, &mut out).expect("run bf16 add");
+        let actual = read_bf16(&out);
+        let expected = [1.25f32, 1.0, 0.25, 8.5];
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3],
+            &f32_bytes(&[1.25, -4.0, 8.0]),
+        )
+        .expect("upload lhs f32");
+        let rhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3],
+            &f32_bytes(&[-0.25, 2.0, 0.5]),
+        )
+        .expect("upload rhs f32");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
+        element_add(ScalarType::F32, 3, &lhs, &rhs, &mut out).expect("run f32 add");
+        assert_eq!(read_f32(&out), vec![1.0, -2.0, 8.5]);
     }
 }
