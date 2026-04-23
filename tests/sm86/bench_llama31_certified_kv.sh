@@ -199,6 +199,7 @@ if shadow_runs:
     shadow_attend_layers = statistics.mean(r.get("shadow_attend_layers", 0) for r in shadow_runs)
     shadow_attend_ms = statistics.mean(r.get("shadow_attend_ms", 0.0) for r in shadow_runs)
     shadow_attend_abs = max(r.get("shadow_attend_max_abs", 0.0) for r in shadow_runs)
+    shadow_attend_ref_delta = max(r.get("shadow_attend_ref_max_delta", 0.0) for r in shadow_runs)
     print(
         "shadow_mean "
         f"layers={shadow_layers:.1f} aligned_tokens={shadow_tokens:.1f} "
@@ -209,6 +210,6 @@ if shadow_runs:
         f"selector_max_tail_mass={shadow_selector_tail:.6f} selector_rung1_heads={shadow_selector_rung1:.1f} "
         f"value_bound_max={shadow_value_bound:.6f} value_escalation_blocks={shadow_value_escalations:.1f} "
         f"attend_layers={shadow_attend_layers:.1f} attend_ms={shadow_attend_ms:.3f} "
-        f"attend_max_abs={shadow_attend_abs:.6f}"
+        f"attend_max_abs={shadow_attend_abs:.6f} attend_ref_max_delta={shadow_attend_ref_delta:.6f}"
     )
 PY

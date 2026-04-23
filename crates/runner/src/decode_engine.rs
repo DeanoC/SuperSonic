@@ -718,6 +718,7 @@ pub struct CertifiedKvShadowStats {
     pub attend_layers: usize,
     pub attend_ms: f64,
     pub attend_max_abs: f32,
+    pub attend_ref_max_delta: f32,
 }
 
 pub struct ComponentLayerTrace {
@@ -1276,6 +1277,9 @@ impl DecodeEngine {
             let cache_k_host = cache_k
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV K cache D2H: {e}"))?;
+            let cache_v_host = cache_v
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV V cache D2H: {e}"))?;
             let mut query_host = vec![0u8; num_q_heads * head_dim * ScalarType::BF16.size_in_bytes()];
             let max_t = cache_k.shape()[2];
             let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -1404,9 +1408,34 @@ impl DecodeEngine {
                 }
                 stats.attend_max_abs = stats.attend_max_abs.max(value.abs());
             }
+            let query0 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
+            let mut dense_scores = Vec::with_capacity(aligned);
+            let q_scale = (head_dim as f32).powf(-0.5);
+            for t in 0..aligned {
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    let k_offset = (t * head_dim + d) * elem_bytes;
+                    let k = half::bf16::from_le_bytes([cache_k_host[k_offset], cache_k_host[k_offset + 1]])
+                        .to_f32();
+                    acc += query0[d] * k;
+                }
+                dense_scores.push(acc * q_scale);
+            }
+            let dense_max = dense_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let dense_denom: f32 = dense_scores.iter().map(|s| (*s - dense_max).exp()).sum();
+            for d in 0..head_dim {
+                let mut dense_out = 0.0f32;
+                for (t, score) in dense_scores.iter().enumerate() {
+                    let v_offset = (t * head_dim + d) * elem_bytes;
+                    let v = half::bf16::from_le_bytes([cache_v_host[v_offset], cache_v_host[v_offset + 1]])
+                        .to_f32();
+                    dense_out += ((*score - dense_max).exp() / dense_denom) * v;
+                }
+                stats.attend_ref_max_delta = stats.attend_ref_max_delta.max((attn_host[d] - dense_out).abs());
+            }
             stats.attend_layers += 1;
 
-            let query_f32 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
+            let query_f32 = query0;
             let key_i8_host = key_i8
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 D2H: {e}"))?;
@@ -1415,7 +1444,6 @@ impl DecodeEngine {
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_scale D2H: {e}"))?,
             );
-            let q_scale = (head_dim as f32).powf(-0.5);
             let mut ref_scores = Vec::with_capacity(block_size);
             for t in 0..block_size {
                 let mut acc = 0.0f32;
