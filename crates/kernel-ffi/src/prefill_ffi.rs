@@ -1016,6 +1016,11 @@ pub fn swiglu_mul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && metal_native::swiglu_mul(dtype, elem_count, gate, up, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::swiglu_mul(dtype, elem_count, gate, up, out);
     }
     let status = unsafe {

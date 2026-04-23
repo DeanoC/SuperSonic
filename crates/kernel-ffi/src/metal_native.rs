@@ -86,6 +86,18 @@ unsafe extern "C" {
         gate_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_swiglu_mul_bf16(
+        total_elems: usize,
+        gate_ptr: *const c_void,
+        up_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_swiglu_mul_f32(
+        total_elems: usize,
+        gate_ptr: *const c_void,
+        up_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_cast_bf16_to_bf16(
         total_elems: usize,
         input_ptr: *const c_void,
@@ -533,6 +545,57 @@ pub(crate) fn sigmoid_mul(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native sigmoid_mul failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn swiglu_mul(
+    dtype: ScalarType,
+    total_elems: usize,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native swiglu_mul supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if gate.dtype() != dtype || up.dtype() != dtype || out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native swiglu_mul expects matching dtype {dtype:?}, got {:?}/{:?}/{:?}",
+            gate.dtype(),
+            up.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_swiglu_mul_bf16(
+                total_elems,
+                gate.as_ptr(),
+                up.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_swiglu_mul_f32(
+                total_elems,
+                gate.as_ptr(),
+                up.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native swiglu_mul does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native swiglu_mul failed with status {status}"
         )));
     }
     Ok(())
@@ -1156,6 +1219,19 @@ pub(crate) fn sigmoid_mul(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn swiglu_mul(
+    _dtype: ScalarType,
+    _total_elems: usize,
+    _gate: &GpuBuffer,
+    _up: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native swiglu_mul is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn cast(
     _input_dtype: ScalarType,
     _output_dtype: ScalarType,
@@ -1656,6 +1732,74 @@ mod tests {
             let delta = (a - e).abs();
             assert!(
                 delta <= 1e-6,
+                "f32 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_swiglu_mul_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let gate_vals = [0.0f32, 1.0, -1.0, 3.0];
+        let up_vals = [1.0f32, -2.0, 0.5, 10.0];
+        let gate = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&gate_vals),
+        )
+        .expect("upload bf16 gate");
+        let up =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&up_vals))
+                .expect("upload bf16 up");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate ref bf16 out");
+        crate::metal_host::swiglu_mul(ScalarType::BF16, 4, &gate, &up, &mut out_ref)
+            .expect("host bf16 swiglu_mul");
+        swiglu_mul(ScalarType::BF16, 4, &gate, &up, &mut out_native)
+            .expect("native bf16 swiglu_mul");
+        for (idx, (a, e)) in read_bf16(&out_native)
+            .iter()
+            .zip(read_bf16(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let gate = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[4],
+            &f32_bytes(&gate_vals),
+        )
+        .expect("upload f32 gate");
+        let up =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&up_vals))
+                .expect("upload f32 up");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate ref f32 out");
+        crate::metal_host::swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_ref)
+            .expect("host f32 swiglu_mul");
+        swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_native)
+            .expect("native f32 swiglu_mul");
+        for (idx, (a, e)) in read_f32(&out_native)
+            .iter()
+            .zip(read_f32(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 5e-6,
                 "f32 idx {idx}: expected {e}, got {a}, delta {delta}"
             );
         }
