@@ -1047,16 +1047,19 @@ fn prefill_inner(
         seq_len
     };
     let mut scratch = PrefillScratch::new(config, max_chunk, ordinal)?;
-    let metal_batch_guard =
-        if output_mode == PrefillOutputMode::GreedyToken && scratch.hidden.backend() == Backend::Metal
-        {
-            Some(
-                prefill_ffi::MetalBatchGuard::begin()
-                    .map_err(|e| anyhow::anyhow!("begin Metal prefill batch: {e}"))?,
-            )
-        } else {
-            None
-        };
+    let metal_batch_guard = if scratch.hidden.backend() == Backend::Metal
+        && !trace_layers
+        && debug_linear_layer.is_none()
+        && debug_full_layer.is_none()
+        && debug_mlp_layer.is_none()
+    {
+        Some(
+            prefill_ffi::MetalBatchGuard::begin()
+                .map_err(|e| anyhow::anyhow!("begin Metal prefill batch: {e}"))?,
+        )
+    } else {
+        None
+    };
     let mut layer_attn_trace = if trace_layers {
         Some(Vec::with_capacity(config.num_hidden_layers))
     } else {

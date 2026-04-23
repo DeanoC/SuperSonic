@@ -1249,6 +1249,7 @@ pub fn standalone_matvec(
         if crate::metal_native::disabled_by_env()
             || std::env::var_os("SUPERSONIC_METAL_ENABLE_NATIVE_STANDALONE_MATVEC").is_none()
         {
+            crate::metal_native::flush_batch()?;
             return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
                 metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
             });
@@ -1328,6 +1329,7 @@ pub fn standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
+        crate::metal_native::flush_batch()?;
         return crate::prefill_ffi::metal_profile_time(
             "standalone_matvec_host_f32",
             "host",
@@ -1376,6 +1378,7 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
     let backend = input.backend();
     if backend == Backend::Metal {
         let _ = ordinal;
+        crate::metal_native::flush_batch()?;
         return crate::prefill_ffi::metal_profile_time(
             "qwen_rms_norm_standalone_matvec_host_f32",
             "host",
