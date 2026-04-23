@@ -1722,6 +1722,11 @@ pub fn sigmoid_mul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && metal_native::sigmoid_mul(dtype, total_elems, data, gate, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::sigmoid_mul(dtype, total_elems, data, gate, out);
     }
     let status = unsafe {

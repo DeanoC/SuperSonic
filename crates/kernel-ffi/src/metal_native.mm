@@ -660,6 +660,115 @@ kernel void supersonic_element_add_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> sigmoid_mul_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_sigmoid_mul_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:191
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"SIGM(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ElementwiseParams {
+    uint total_elems;
+};
+
+kernel void supersonic_sigmoid_mul_bf16(
+    device const bfloat* data [[buffer(0)]],
+    device const bfloat* gate [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant ElementwiseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    float gv = float(gate[gid]);
+    float sig = 1.0f / (1.0f + exp(-gv));
+    out[gid] = bfloat(float(data[gid]) * sig);
+}
+
+kernel void supersonic_sigmoid_mul_f32(
+    device const float* data [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant ElementwiseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    float sig = 1.0f / (1.0f + exp(-gate[gid]));
+    out[gid] = data[gid] * sig;
+}
+)SIGM";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:192
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile sigmoid-mul library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:193
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load sigmoid-mul function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:194
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create sigmoid-mul pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> cast_pipeline(NSString* function_name, NSError** error_out) {
     static std::mutex mutex;
     static __strong NSMutableSet* attempted = nil;
@@ -1878,6 +1987,110 @@ extern "C" int supersonic_metal_element_add_f32(
         rhs_ptr,
         out_ptr,
         @"supersonic_element_add_f32"
+    );
+}
+
+static int supersonic_metal_sigmoid_mul_impl(
+    size_t total_elems,
+    const void* data_ptr,
+    const void* gate_ptr,
+    void* out_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (total_elems == 0) {
+            return 0;
+        }
+        if (total_elems > UINT32_MAX || data_ptr == nullptr || gate_ptr == nullptr || out_ptr == nullptr) {
+            return 195;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = sigmoid_mul_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 196;
+        }
+
+        id<MTLBuffer> data = nil;
+        id<MTLBuffer> gate = nil;
+        id<MTLBuffer> out = nil;
+        size_t data_offset = 0;
+        size_t gate_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(data_ptr, &data, &data_offset) != 0) {
+            return 197;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 198;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 199;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 200;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 201;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 202;
+        }
+
+        ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:data offset:data_offset atIndex:0];
+        [encoder setBuffer:gate offset:gate_offset atIndex:1];
+        [encoder setBuffer:out offset:out_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+        NSUInteger tg_width =
+            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 203;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_sigmoid_mul_bf16(
+    size_t total_elems,
+    const void* data_ptr,
+    const void* gate_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_sigmoid_mul_impl(
+        total_elems,
+        data_ptr,
+        gate_ptr,
+        out_ptr,
+        @"supersonic_sigmoid_mul_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_sigmoid_mul_f32(
+    size_t total_elems,
+    const void* data_ptr,
+    const void* gate_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_sigmoid_mul_impl(
+        total_elems,
+        data_ptr,
+        gate_ptr,
+        out_ptr,
+        @"supersonic_sigmoid_mul_f32"
     );
 }
 

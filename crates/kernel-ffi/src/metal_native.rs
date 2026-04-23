@@ -74,6 +74,18 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_sigmoid_mul_bf16(
+        total_elems: usize,
+        data_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_sigmoid_mul_f32(
+        total_elems: usize,
+        data_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_cast_bf16_to_bf16(
         total_elems: usize,
         input_ptr: *const c_void,
@@ -470,6 +482,57 @@ pub(crate) fn element_add(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native element_add failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn sigmoid_mul(
+    dtype: ScalarType,
+    total_elems: usize,
+    data: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native sigmoid_mul supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if data.dtype() != dtype || gate.dtype() != dtype || out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native sigmoid_mul expects matching dtype {dtype:?}, got {:?}/{:?}/{:?}",
+            data.dtype(),
+            gate.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_sigmoid_mul_bf16(
+                total_elems,
+                data.as_ptr(),
+                gate.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_sigmoid_mul_f32(
+                total_elems,
+                data.as_ptr(),
+                gate.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native sigmoid_mul does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native sigmoid_mul failed with status {status}"
         )));
     }
     Ok(())
@@ -1080,6 +1143,19 @@ pub(crate) fn element_add(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn sigmoid_mul(
+    _dtype: ScalarType,
+    _total_elems: usize,
+    _data: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native sigmoid_mul is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn cast(
     _input_dtype: ScalarType,
     _output_dtype: ScalarType,
@@ -1507,6 +1583,82 @@ mod tests {
         let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
         element_add(ScalarType::F32, 3, &lhs, &rhs, &mut out).expect("run f32 add");
         assert_eq!(read_f32(&out), vec![1.0, -2.0, 8.5]);
+    }
+
+    #[test]
+    fn metal_native_sigmoid_mul_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let data_vals = [1.0f32, -2.0, 0.5, 10.0];
+        let gate_vals = [0.0f32, 1.0, -1.0, 3.0];
+        let data = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&data_vals),
+        )
+        .expect("upload bf16 data");
+        let gate = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&gate_vals),
+        )
+        .expect("upload bf16 gate");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate ref bf16 out");
+        crate::metal_host::sigmoid_mul(ScalarType::BF16, 4, &data, &gate, &mut out_ref)
+            .expect("host bf16 sigmoid_mul");
+        sigmoid_mul(ScalarType::BF16, 4, &data, &gate, &mut out_native)
+            .expect("native bf16 sigmoid_mul");
+        for (idx, (a, e)) in read_bf16(&out_native)
+            .iter()
+            .zip(read_bf16(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let data = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[4],
+            &f32_bytes(&data_vals),
+        )
+        .expect("upload f32 data");
+        let gate = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[4],
+            &f32_bytes(&gate_vals),
+        )
+        .expect("upload f32 gate");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate ref f32 out");
+        crate::metal_host::sigmoid_mul(ScalarType::F32, 4, &data, &gate, &mut out_ref)
+            .expect("host f32 sigmoid_mul");
+        sigmoid_mul(ScalarType::F32, 4, &data, &gate, &mut out_native)
+            .expect("native f32 sigmoid_mul");
+        for (idx, (a, e)) in read_f32(&out_native)
+            .iter()
+            .zip(read_f32(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-6,
+                "f32 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
     }
 
     #[test]
