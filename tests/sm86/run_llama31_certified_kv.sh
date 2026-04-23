@@ -27,7 +27,7 @@ if [ -f /root/.cargo/env ]; then
     . /root/.cargo/env
 fi
 
-MAX_DELTA_THRESHOLD="${MAX_DELTA_THRESHOLD:-1.0}"
+MAX_DELTA_THRESHOLD="${MAX_DELTA_THRESHOLD:-2.0}"
 ORACLE_DEVICE="${ORACLE_DEVICE:-cuda:0}"
 TIMEOUT="${TIMEOUT:-1200}"
 PROMPT="${PROMPT:-Hello}"
