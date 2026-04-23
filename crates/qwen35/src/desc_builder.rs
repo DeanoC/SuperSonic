@@ -69,10 +69,18 @@ pub fn build_layer_descs(
                 d.attn_head_dim = config.head_dim as i32;
                 d.attn_num_heads = config.num_attention_heads as i32;
                 d.attn_num_kv_heads = config.num_key_value_heads as i32;
-                d.q_norm_w = fa.q_norm_w.as_ptr();
-                d.k_norm_w = fa.k_norm_w.as_ptr();
-                d.q_norm_eps = config.rms_norm_eps as f32;
-                d.k_norm_eps = config.rms_norm_eps as f32;
+                d.q_norm_w = fa.q_norm_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null());
+                d.k_norm_w = fa.k_norm_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null());
+                d.q_norm_eps = if fa.q_norm_w.is_some() {
+                    config.rms_norm_eps as f32
+                } else {
+                    0.0
+                };
+                d.k_norm_eps = if fa.k_norm_w.is_some() {
+                    config.rms_norm_eps as f32
+                } else {
+                    0.0
+                };
                 d.kv_len = seqlen_offset as i32;
                 if let Some(ref k) = ls.kv_cache_k {
                     d.kv_cache_k = k.as_ptr() as *mut _;

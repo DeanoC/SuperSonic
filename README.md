@@ -8,11 +8,10 @@ Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-Three backend surfaces are validated today:
+Two backends are validated today:
 
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
-- **Metal / `apple-m4`** — Apple M4 bring-up path for Qwen3.5 0.8B
 
 ### HIP on `gfx1150`
 
@@ -35,12 +34,13 @@ see [docs/dflash.md](docs/dflash.md).
 
 ### CUDA on `sm86`
 
-| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
-|------------------|:----:|:----:|:-----------:|:------:|
-| qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
-| qwen3.5-2b       |  ✅  |  —   |      —      |    —   |
-| qwen3.5-4b       |  ✅  |  —   |      —      |   ✅³  |
-| qwen3.5-9b       |  ✅  |  —   |      —      |    —   |
+| Model            | BF16 | INT4 | INT8 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  —   |  —   |      —      |    —   |
+| qwen3.5-2b       |  ✅  |  —   |  —   |      —      |    —   |
+| qwen3.5-4b       |  ✅  |  —   |  —   |      —      |   ✅³  |
+| qwen3.5-9b       |  ✅  |  —   |  —   |      —      |    —   |
+| llama3.1-8b      |  ✅  |  —   |  ✅  |      —      |    —   |
 
 ³ CUDA `--kv-fp8` is currently validated only for `qwen3.5-4b` on `sm86`.
   Single-sequence BF16 decode now defaults to the persistent kernel path.
@@ -49,12 +49,14 @@ see [docs/dflash.md](docs/dflash.md).
   `qwen3.5-2b` and `qwen3.5-9b` are checked BF16 CUDA lanes on `sm86`, but do
   not currently have CUDA KV-FP8, INT4, or FP8-runtime support.
 
-CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` are rejected at runtime.
+CUDA v1 is BF16-first for Qwen. `llama3.1-8b` also has a checked baked INT8
+path matching `BitsAndBytesConfig(load_in_8bit=True)` weight semantics.
+`--int4` and `--fp8-runtime` are rejected at runtime.
 
 CUDA support is currently a narrow v1 surface:
 
 - hand-maintained CUDA sources only; no generic fallback backend
-- BF16 decode path only
+- BF16 decode for Qwen and baked INT8 component decode for `llama3.1-8b`
 - validated on NVIDIA `sm86` hardware (RTX 3090-class)
 - validated for both baked weights and direct `--no-bake` safetensors loads
 - CUDA `--kv-fp8` support is currently limited to `qwen3.5-4b` on `sm86`
@@ -149,6 +151,7 @@ the resulting bake from the release. Leave `QWEN_9B_DIR` unset to skip.
 - Rust toolchain able to build this repo
 - Python 3 with `torch` and `transformers` for oracle validation
 - local model weights for `Qwen3.5-0.8B` and/or `Qwen3.5-4B`
+- local model weights for `Meta-Llama-3.1-8B` when validating the Llama INT8 lane
 
 ### Validated commands
 
@@ -170,6 +173,15 @@ SUPERSONIC_BACKENDS=cuda TIMEOUT=1200 CORPUS_TIMEOUT=1200 ./tests/sm86/run_4b_lo
 # Qwen3.5-4B batched decode
 SUPERSONIC_BACKENDS=cuda TIMEOUT=900 CORPUS_TIMEOUT=600 ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 
+# Llama 3.1 8B INT8 component decode
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
+  --backend cuda \
+  --model llama3.1-8b \
+  --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --int8
+
 # Combined wrapper
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
@@ -188,6 +200,8 @@ Each `sm86` script currently validates:
 `tests/sm86/run_batch.sh` adds `qwen3.5-4b --batch-size 2` coverage on the same `sm86` target.
 `tests/sm86/run_fast_greedy.sh` checks that the CUDA fast-greedy 0.8B path
 matches the legacy host-logits sampling path on short, medium, and long prompts.
+`llama3.1-8b --int8` is checked with the PyTorch oracle, `--gpu-validate`, and
+fast-greedy/full-logits token regression runs.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference
@@ -241,6 +255,22 @@ That harness forces `--force-kernel-decode` so the run measures the native
 single-sequence `4B` kernel instead of the default replayed-prefill
 correctness path.
 
+For the current `llama3.1-8b` CUDA INT8 short decode lane on `sm86`, use:
+
+```bash
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
+  --backend cuda \
+  --model llama3.1-8b \
+  --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --int8
+```
+
+On this RTX 3090-class box, commit `7837902` measured `822 ms` decode for 32
+generated tokens (`38.9 tok/s`, `25.7 ms/token`) after the CUDA fast-greedy,
+MLP scratch reuse, and strided-KV decode-attention passes.
+
 The current `qwen3.5-0.8b` CUDA `sm86` optimization record, benchmark progression,
 remaining gap to Lucebox, and carry-forward process for the other supported Qwen3.5
 CUDA models are tracked in [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
@@ -265,6 +295,7 @@ With a quick harness pass (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 - `qwen3.5-0.8b`: prefill `206 ms` for 112 prompt tokens (`544 tok/s`), decode `75 ms` for 8 generated tokens (`106.7 tok/s`)
 - `qwen3.5-4b --batch-size 1`: prefill `898 ms` for 112 prompt tokens (`124.7 tok/s`), decode `308 ms` for 8 generated tokens (`26.0 tok/s`)
 - `qwen3.5-4b --batch-size 2`: prefill `911 ms` for 112 prompt tokens (`122.9 tok/s`), decode `1042 ms` for 16 aggregate generated tokens (`15.4 tok/s`)
+- `llama3.1-8b --int8 --batch-size 1`: decode `822 ms` for 32 generated tokens (`38.9 tok/s`)
 
 There is also an explicit native single-sequence `4B` CUDA hero lane behind
 `--force-kernel-decode`. The exact lane is:
@@ -287,81 +318,6 @@ That single-stream lane is for Lucebox-style native-kernel optimization work.
 `qwen3.5-4b --batch-size 2` remains the validated batched throughput lane.
 Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
-
-## Metal
-
-Metal support is currently a Qwen3.5 0.8B correctness checkpoint on Apple M4.
-It is meant to make Apple silicon development reproducible before the next
-performance pass, not to compete with the HIP/CUDA persistent decode kernels yet.
-
-Validated Metal scope:
-
-- `qwen3.5-0.8b`
-- Apple M4 / `apple-m4`
-- BF16 prefill parity against the Python CPU oracle
-- CLI/debug harness path only
-- checked token-ID prompt corpus via `qwen35_bughunt`
-
-Metal currently rejects or defers:
-
-- models other than `qwen3.5-0.8b`
-- `--int4`
-- `--fp8-runtime`
-- `--kv-fp8`
-- batched decode
-- persistent/component decode optimization paths
-- server runtime support
-
-The current Metal implementation intentionally mixes native Metal kernels with
-shared-memory host fallbacks. Native kernels are already used for the key
-Qwen bring-up primitives that have been promoted so far:
-
-- matmul RHS-transposed
-- full-attention prefill core
-- RMSNorm rows
-- linear prefill conv pack
-- element add
-- cast
-- scalar multiply
-- SHD-to-HSD transpose
-- QKV split
-- Q-gate split
-
-Remaining prefill primitives still fall back through the Metal shared-memory host
-path, and decode is still correctness-first. Treat Metal throughput numbers as
-pre-optimization until those fallbacks are replaced and a dedicated benchmark is
-added.
-
-### Metal validation
-
-The canonical Apple silicon gate is:
-
-```bash
-SUPERSONIC_BACKENDS=metal \
-QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B \
-QWEN35_BUGHUNT_REPORT_JSON=/tmp/qwen35_bughunt_gate.json \
-./tests/metal/qwen35_bughunt_gate.sh
-```
-
-The script builds `qwen35_bughunt`, runs the checked-in manifest at
-`crates/runner/bughunt/qwen35_metal_manifest.json`, and compares native Metal
-prefill, GPU replay, selected hidden rows, and final prefill logits against the
-Python oracle on CPU.
-
-To run one prompt from the manifest:
-
-```bash
-SUPERSONIC_BACKENDS=metal \
-QWEN35_BUGHUNT_PROMPT=code_prompt \
-QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B \
-./tests/metal/qwen35_bughunt_gate.sh
-```
-
-Current checkpoint quality on Apple M4:
-
-- `hello_world`: PASS against Python CPU oracle
-- `forest_prompt`: PASS against Python CPU oracle
-- `code_prompt`: PASS against Python CPU oracle
 
 ## E2E Tests
 
@@ -387,9 +343,9 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run.sh /path/to/Qwen3.5-0.8B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_4b.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh /path/to/Qwen3.5-0.8B /path/to/Qwen3.5-4B
-
-# apple-m4 (Apple silicon) — Qwen3.5-0.8B Metal bughunt gate
-SUPERSONIC_BACKENDS=metal QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B ./tests/metal/qwen35_bughunt_gate.sh
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic --backend cuda \
+  --model llama3.1-8b --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" --max-new-tokens 32 --int8
 ```
 
 ### Adding tests for a new machine
@@ -400,7 +356,7 @@ SUPERSONIC_BACKENDS=metal QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B ./tests/metal/q
 
 ### Test prerequisites
 
-- ROCm/HIP runtime for HIP builds, CUDA toolkit/runtime for CUDA builds, or Apple silicon with Metal for Metal builds
+- ROCm/HIP runtime for HIP builds, or CUDA toolkit/runtime for CUDA builds
 - Python 3 with `torch` and `transformers` (for oracle)
 - Model weights downloaded locally
 
@@ -419,6 +375,3 @@ TIMEOUT=180 ./tests/gfx1150/run.sh /path/to/model
 The persistent decode megakernel can occasionally hang the GPU at 100% utilization. The test script has a timeout (default 120s) and will report failure rather than blocking forever. If this happens you may need to reset the GPU (`rocm-smi --resetgpu`) or reboot before re-running.
 
 For CUDA specifically, treat `sm86` as the validated target for now. Other NVIDIA architectures may work, but they are not yet part of the checked support matrix.
-
-For Metal specifically, treat Apple M4 as the validated target for now. Other
-Apple GPUs may work, but they are not yet part of the checked support matrix.

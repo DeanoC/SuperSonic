@@ -34,6 +34,7 @@ fn ensure_f32_on_gpu(
 /// All immutable model weights on GPU.
 pub struct Qwen35Weights {
     pub config: TextConfig,
+    pub weight_prefix: String,
     pub embed_tokens: Arc<GpuBuffer>,
     pub lm_head: Arc<GpuBuffer>,
     pub lm_head_scale: Option<GpuBuffer>,
@@ -47,6 +48,12 @@ pub struct Qwen35Weights {
     pub is_int4: bool,
     /// INT4 quantization group size (typically 128). Only valid when is_int4.
     pub int4_group_size: usize,
+    /// True if weights use BitsAndBytes-style INT8 runtime matmul.
+    pub is_int8: bool,
+    /// Optional baked INT8 store kept alive for host-side mixed-path access.
+    pub int8_baked_store: Option<Arc<model_store::BakedStore>>,
+    /// Outlier threshold used by the mixed INT8 path.
+    pub int8_outlier_threshold: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -67,6 +74,10 @@ pub struct LayerWeights {
     pub gate_proj_scale: Option<GpuBuffer>,
     pub up_proj_scale: Option<GpuBuffer>,
     pub down_proj_scale: Option<GpuBuffer>,
+    // INT8 per-row scales (BitsAndBytes `.SCB`)
+    pub gate_proj_int8_scale: Option<GpuBuffer>,
+    pub up_proj_int8_scale: Option<GpuBuffer>,
+    pub down_proj_int8_scale: Option<GpuBuffer>,
     // INT4 scale/zero for common weights (None when not INT4)
     pub gate_proj_int4_scale: Option<GpuBuffer>,
     pub gate_proj_int4_zero: Option<GpuBuffer>,
@@ -96,6 +107,12 @@ pub struct LinearWeights {
     pub b_proj_scale: Option<GpuBuffer>,
     pub a_proj_scale: Option<GpuBuffer>,
     pub out_proj_scale: Option<GpuBuffer>,
+    // INT8 per-row scales (None when not INT8)
+    pub qkv_proj_int8_scale: Option<GpuBuffer>,
+    pub z_proj_int8_scale: Option<GpuBuffer>,
+    pub b_proj_int8_scale: Option<GpuBuffer>,
+    pub a_proj_int8_scale: Option<GpuBuffer>,
+    pub out_proj_int8_scale: Option<GpuBuffer>,
     // INT4 scale/zero (None when not INT4)
     pub qkv_proj_int4_scale: Option<GpuBuffer>,
     pub qkv_proj_int4_zero: Option<GpuBuffer>,
@@ -110,13 +127,18 @@ pub struct FullWeights {
     pub k_proj_w: GpuBuffer,   // [512, hidden]
     pub v_proj_w: GpuBuffer,   // [512, hidden]
     pub o_proj_w: GpuBuffer,   // [hidden, 2048]
-    pub q_norm_w: GpuBuffer,   // [256]
-    pub k_norm_w: GpuBuffer,   // [256]
+    pub q_norm_w: Option<GpuBuffer>,   // [head_dim] when present
+    pub k_norm_w: Option<GpuBuffer>,   // [head_dim] when present
     // FP8 scale_inv (None when BF16)
     pub q_proj_scale: Option<GpuBuffer>,
     pub k_proj_scale: Option<GpuBuffer>,
     pub v_proj_scale: Option<GpuBuffer>,
     pub o_proj_scale: Option<GpuBuffer>,
+    // INT8 per-row scales (None when not INT8)
+    pub q_proj_int8_scale: Option<GpuBuffer>,
+    pub k_proj_int8_scale: Option<GpuBuffer>,
+    pub v_proj_int8_scale: Option<GpuBuffer>,
+    pub o_proj_int8_scale: Option<GpuBuffer>,
     // INT4 scale/zero (None when not INT4)
     pub q_proj_int4_scale: Option<GpuBuffer>,
     pub q_proj_int4_zero: Option<GpuBuffer>,
@@ -172,9 +194,11 @@ impl Qwen35Weights {
                     k_proj_w: loader.load_to_gpu(&format!("{fa}.k_proj.weight"), ordinal)?,
                     v_proj_w: loader.load_to_gpu(&format!("{fa}.v_proj.weight"), ordinal)?,
                     o_proj_w: loader.load_to_gpu(&format!("{fa}.o_proj.weight"), ordinal)?,
-                    q_norm_w: loader.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?,
-                    k_norm_w: loader.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?,
+                    q_norm_w: Some(loader.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?),
+                    k_norm_w: Some(loader.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?),
                     q_proj_scale: None, k_proj_scale: None, v_proj_scale: None, o_proj_scale: None,
+                    q_proj_int8_scale: None, k_proj_int8_scale: None,
+                    v_proj_int8_scale: None, o_proj_int8_scale: None,
                     q_proj_int4_scale: None, q_proj_int4_zero: None,
                     k_proj_int4_scale: None, k_proj_int4_zero: None,
                     v_proj_int4_scale: None, v_proj_int4_zero: None,
@@ -221,6 +245,9 @@ impl Qwen35Weights {
                     ).map_err(|e| LoadError::UnsupportedDtype(e.to_string()))?,
                     qkv_proj_scale: None, z_proj_scale: None, b_proj_scale: None,
                     a_proj_scale: None, out_proj_scale: None,
+                    qkv_proj_int8_scale: None, z_proj_int8_scale: None,
+                    b_proj_int8_scale: None, a_proj_int8_scale: None,
+                    out_proj_int8_scale: None,
                     qkv_proj_int4_scale: None, qkv_proj_int4_zero: None,
                     z_proj_int4_scale: None, z_proj_int4_zero: None,
                     out_proj_int4_scale: None, out_proj_int4_zero: None,
@@ -236,6 +263,7 @@ impl Qwen35Weights {
                 up_proj_w,
                 down_proj_w,
                 gate_proj_scale: None, up_proj_scale: None, down_proj_scale: None,
+                gate_proj_int8_scale: None, up_proj_int8_scale: None, down_proj_int8_scale: None,
                 gate_proj_int4_scale: None, gate_proj_int4_zero: None,
                 up_proj_int4_scale: None, up_proj_int4_zero: None,
                 down_proj_int4_scale: None, down_proj_int4_zero: None,
@@ -246,6 +274,7 @@ impl Qwen35Weights {
 
         Ok(Self {
             config: config.clone(),
+            weight_prefix: prefix.to_string(),
             embed_tokens,
             lm_head,
             lm_head_scale: None,
@@ -255,6 +284,9 @@ impl Qwen35Weights {
             fp8_block_size: 0,
             is_int4: false,
             int4_group_size: 0,
+            is_int8: false,
+            int8_baked_store: None,
+            int8_outlier_threshold: 0.0,
         })
     }
 
@@ -383,12 +415,16 @@ impl Qwen35Weights {
                     k_proj_w: store.load_to_gpu(&k_name, ordinal)?,
                     v_proj_w: store.load_to_gpu(&v_name, ordinal)?,
                     o_proj_w: store.load_to_gpu(&o_name, ordinal)?,
-                    q_norm_w: store.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?,
-                    k_norm_w: store.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?,
+                    q_norm_w: Some(store.load_to_gpu(&format!("{fa}.q_norm.weight"), ordinal)?),
+                    k_norm_w: Some(store.load_to_gpu(&format!("{fa}.k_norm.weight"), ordinal)?),
                     q_proj_scale: load_scale(&q_name)?,
                     k_proj_scale: load_scale(&k_name)?,
                     v_proj_scale: load_scale(&v_name)?,
                     o_proj_scale: load_scale(&o_name)?,
+                    q_proj_int8_scale: None,
+                    k_proj_int8_scale: None,
+                    v_proj_int8_scale: None,
+                    o_proj_int8_scale: None,
                     q_proj_int4_scale: q_i4s, q_proj_int4_zero: q_i4z,
                     k_proj_int4_scale: k_i4s, k_proj_int4_zero: k_i4z,
                     v_proj_int4_scale: v_i4s, v_proj_int4_zero: v_i4z,
@@ -423,6 +459,11 @@ impl Qwen35Weights {
                     b_proj_scale: load_scale(&b_name)?,
                     a_proj_scale: load_scale(&a_name)?,
                     out_proj_scale: load_scale(&out_name)?,
+                    qkv_proj_int8_scale: None,
+                    z_proj_int8_scale: None,
+                    b_proj_int8_scale: None,
+                    a_proj_int8_scale: None,
+                    out_proj_int8_scale: None,
                     qkv_proj_int4_scale: qkv_i4s, qkv_proj_int4_zero: qkv_i4z,
                     z_proj_int4_scale: z_i4s, z_proj_int4_zero: z_i4z,
                     out_proj_int4_scale: out_i4s, out_proj_int4_zero: out_i4z,
@@ -438,6 +479,9 @@ impl Qwen35Weights {
                 up_proj_w,
                 down_proj_w,
                 gate_proj_scale, up_proj_scale, down_proj_scale,
+                gate_proj_int8_scale: None,
+                up_proj_int8_scale: None,
+                down_proj_int8_scale: None,
                 gate_proj_int4_scale, gate_proj_int4_zero,
                 up_proj_int4_scale, up_proj_int4_zero,
                 down_proj_int4_scale, down_proj_int4_zero,
@@ -448,6 +492,7 @@ impl Qwen35Weights {
 
         Ok(Self {
             config: config.clone(),
+            weight_prefix: prefix.to_string(),
             embed_tokens,
             lm_head,
             lm_head_scale,
@@ -457,6 +502,9 @@ impl Qwen35Weights {
             fp8_block_size,
             is_int4,
             int4_group_size,
+            is_int8: false,
+            int8_baked_store: None,
+            int8_outlier_threshold: 0.0,
         })
     }
 }

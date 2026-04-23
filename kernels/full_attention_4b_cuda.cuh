@@ -2853,6 +2853,127 @@ __global__ void dotcache_qwen35_matmul_int4_dequant_kernel(
 }
 
 template <typename T>
+__global__ void dotcache_qwen35_quantize_int8_rowwise_kernel(
+    int rows,
+    int cols,
+    const T* __restrict__ input,
+    int8_t* __restrict__ out,
+    float* __restrict__ row_stats
+) {
+    const int row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    __shared__ float s_max[256];
+    const int tid = threadIdx.x;
+    const size_t row_base = static_cast<size_t>(row) * static_cast<size_t>(cols);
+    float local_max = 0.0f;
+
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float value = dotcache_qwen35_to_float(input[row_base + static_cast<size_t>(col)]);
+        value = __half2float(__float2half_rn(value));
+        local_max = fmaxf(local_max, fabsf(value));
+    }
+
+    s_max[tid] = local_max;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + stride]);
+        }
+        __syncthreads();
+    }
+
+    const float scale = s_max[0];
+    if (tid == 0) {
+        row_stats[row] = scale;
+    }
+    __syncthreads();
+
+    if (scale == 0.0f) {
+        for (int col = tid; col < cols; col += blockDim.x) {
+            out[row_base + static_cast<size_t>(col)] = 0;
+        }
+        return;
+    }
+
+    const float inv_scale = 127.0f / scale;
+    for (int col = tid; col < cols; col += blockDim.x) {
+        float value = dotcache_qwen35_to_float(input[row_base + static_cast<size_t>(col)]);
+        value = __half2float(__float2half_rn(value));
+        // Match BitsAndBytes' CUDA quantizer. Empirically its half-step
+        // behavior is equivalent to trunc(x + sign(x) * 0.49999), not
+        // round-to-nearest-even.
+        float q = truncf(value * inv_scale + copysignf(0.49999f, value));
+        q = fminf(127.0f, fmaxf(-127.0f, q));
+        out[row_base + static_cast<size_t>(col)] = static_cast<int8_t>(q);
+    }
+}
+
+template <typename T>
+__global__ void dotcache_qwen35_dequant_int32_int8mm_kernel(
+    int rows,
+    int cols,
+    const int32_t* __restrict__ input,
+    const float* __restrict__ row_stats,
+    const float* __restrict__ col_stats,
+    T* __restrict__ out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+    if (idx >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(idx / static_cast<size_t>(cols));
+    const int col = static_cast<int>(idx % static_cast<size_t>(cols));
+    constexpr float inv_127_sq = 1.0f / (127.0f * 127.0f);
+    float value = static_cast<float>(input[idx]) * row_stats[row] * col_stats[col] * inv_127_sq;
+    value = __half2float(__float2half_rn(value));
+    out[idx] = dotcache_qwen35_from_float<T>(value);
+}
+
+template <typename T>
+__global__ void dotcache_qwen35_int8_outlier_add_kernel(
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const int8_t* __restrict__ rhs_int8,
+    const float* __restrict__ scale,
+    const uint32_t* __restrict__ outlier_cols,
+    const float* __restrict__ outlier_vals,
+    T* __restrict__ out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    if (idx >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(idx / static_cast<size_t>(n));
+    const int out_col = static_cast<int>(idx % static_cast<size_t>(n));
+    const int rhs_base = out_col * k;
+    constexpr float inv_127 = 1.0f / 127.0f;
+    const float row_scale = scale[out_col];
+
+    float acc = 0.0f;
+    for (int j = 0; j < sub_cols; ++j) {
+        const int col = static_cast<int>(outlier_cols[j]);
+        const float lhs = outlier_vals[row * sub_cols + j];
+        const float q = static_cast<float>(rhs_int8[rhs_base + col]);
+        const float w = dotcache_qwen35_to_float(
+            dotcache_qwen35_from_float<T>(q * row_scale * inv_127));
+        acc += lhs * w;
+    }
+
+    const float base = dotcache_qwen35_to_float(out[idx]);
+    out[idx] = dotcache_qwen35_from_float<T>(base + acc);
+}
+
+template <typename T>
 __global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
     int batch_heads,
     int num_chunks,

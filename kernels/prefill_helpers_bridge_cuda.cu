@@ -304,7 +304,7 @@ __global__ void pfx_lm_head_argmax_blocks_bf16_kernel(
     float* __restrict__ block_best_vals,
     uint32_t* __restrict__ block_best_idxs
 ) {
-    __shared__ float shared_hidden[1024];
+    extern __shared__ float shared_hidden[];
     __shared__ float warp_best_vals[8];
     __shared__ uint32_t warp_best_idxs[8];
 
@@ -334,8 +334,9 @@ __global__ void pfx_lm_head_argmax_blocks_bf16_kernel(
             partial += __shfl_down_sync(0xffffffffu, partial, offset);
         }
 
-        if (lane == 0 && (partial > best_val || (partial == best_val && static_cast<uint32_t>(row) < best_idx))) {
-            best_val = partial;
+        const float logit = __bfloat162float(__float2bfloat16(partial));
+        if (lane == 0 && (logit > best_val || (logit == best_val && static_cast<uint32_t>(row) < best_idx))) {
+            best_val = logit;
             best_idx = static_cast<uint32_t>(row);
         }
     }
@@ -433,7 +434,8 @@ int lm_head_argmax_bf16_device(
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
     constexpr int lm_blocks = 512;
-    pfx_lm_head_argmax_blocks_bf16_kernel<<<lm_blocks, block>>>(
+    const size_t shared_bytes = static_cast<size_t>(hidden_dim) * sizeof(float);
+    pfx_lm_head_argmax_blocks_bf16_kernel<<<lm_blocks, block, shared_bytes>>>(
         static_cast<const hip_bfloat16*>(hidden),
         static_cast<const hip_bfloat16*>(weight),
         hidden_dim,

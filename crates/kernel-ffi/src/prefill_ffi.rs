@@ -245,6 +245,35 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg(supersonic_backend_cuda)]
+    fn dotcache_qwen35_4b_hip_matmul_int8(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_int8: *const c_void,
+        scale: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    #[cfg(supersonic_backend_cuda)]
+    fn dotcache_qwen35_4b_hip_int8_outlier_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        rows: c_int,
+        n: c_int,
+        k: c_int,
+        sub_cols: c_int,
+        rhs_int8: *const c_void,
+        scale: *const c_void,
+        outlier_cols: *const c_void,
+        outlier_vals: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     // BF16 → FP8 KV cache quantization
     fn dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
@@ -301,6 +330,40 @@ unsafe extern "C" {
         num_kv_groups: usize,
         scale: f32,
         seqlen_offset: usize,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_hip_full_attention_decode_flat(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        kv_len: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    #[cfg(supersonic_backend_cuda)]
+    fn dotcache_qwen35_hip_full_attention_decode_flat_strided(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        kv_len: usize,
+        kv_stride: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
         query: *const c_void,
         key: *const c_void,
         value: *const c_void,
@@ -626,6 +689,106 @@ pub fn full_attention_prefill(
         )));
     }
     Ok(())
+}
+
+/// Decode-only full attention for q_len=1. Writes BF16/FP16 flat [batch, q_heads * head_dim].
+pub fn full_attention_decode_flat(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let num_kv_groups = q_heads / kv_heads;
+    let status = unsafe {
+        dotcache_qwen35_hip_full_attention_decode_flat(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            q_heads,
+            kv_heads,
+            kv_len,
+            head_dim,
+            num_kv_groups,
+            scale,
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("full_attention_decode_flat failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Decode-only full attention for q_len=1 over a KV cache whose physical
+/// capacity stride can exceed the live `kv_len`. Writes BF16/FP16 flat
+/// `[batch, q_heads * head_dim]`.
+pub fn full_attention_decode_flat_strided(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        return Err(ffi_error(
+            "full_attention_decode_flat_strided requires the CUDA backend".to_string(),
+        ));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    {
+        if gpu_hal::current_backend() != Backend::Cuda {
+            return Err(ffi_error(
+                "full_attention_decode_flat_strided requires the CUDA backend".to_string(),
+            ));
+        }
+
+    let num_kv_groups = q_heads / kv_heads;
+    let status = unsafe {
+        dotcache_qwen35_hip_full_attention_decode_flat_strided(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            q_heads,
+            kv_heads,
+            kv_len,
+            kv_stride,
+            head_dim,
+            num_kv_groups,
+            scale,
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "full_attention_decode_flat_strided failed: {status}"
+        )));
+    }
+    Ok(())
+    }
 }
 
 /// Linear attention conv1d + SiLU for prefill.
@@ -1264,6 +1427,102 @@ pub fn matmul_rhs_transposed_int4(
         )));
     }
     Ok(())
+}
+
+pub fn matmul_rhs_transposed_int8(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int8: &GpuBuffer,
+    scale: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        return Err(ffi_error(
+            "matmul_rhs_transposed_int8 requires the CUDA backend".to_string(),
+        ));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    {
+        if gpu_hal::current_backend() != Backend::Cuda {
+            return Err(ffi_error(
+                "matmul_rhs_transposed_int8 requires the CUDA backend".to_string(),
+            ));
+        }
+
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_matmul_int8(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            batch_elems,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            lhs.as_ptr(),
+            rhs_int8.as_ptr(),
+            scale.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("matmul_rhs_transposed_int8 failed: {status}")));
+    }
+    Ok(())
+    }
+}
+
+pub fn int8_outlier_add(
+    ordinal: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    sub_cols: usize,
+    rhs_int8: &GpuBuffer,
+    scale: &GpuBuffer,
+    outlier_cols: &GpuBuffer,
+    outlier_vals: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        return Err(ffi_error(
+            "int8_outlier_add requires the CUDA backend".to_string(),
+        ));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    {
+        if gpu_hal::current_backend() != Backend::Cuda {
+            return Err(ffi_error(
+                "int8_outlier_add requires the CUDA backend".to_string(),
+            ));
+        }
+
+    let status = unsafe {
+        dotcache_qwen35_4b_hip_int8_outlier_add(
+            ScalarType::BF16.kernel_dtype_code(),
+            ordinal,
+            rows as c_int,
+            n as c_int,
+            k as c_int,
+            sub_cols as c_int,
+            rhs_int8.as_ptr(),
+            scale.as_ptr(),
+            outlier_cols.as_ptr(),
+            outlier_vals.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
+    }
+    Ok(())
+    }
 }
 
 // ---- Multi-row RMSNorm (for prefill — n_rows > 1) ----

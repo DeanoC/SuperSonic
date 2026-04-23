@@ -1,6 +1,7 @@
 mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
+mod llama31_engine;
 mod oracle;
 mod phi4_engine;
 mod prefill_engine;
@@ -9,16 +10,17 @@ mod registry;
 mod validate;
 
 use std::env;
-use std::ffi::c_void;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::Result;
 use base64::Engine as _;
 use clap::Parser;
-use gpu_hal::{GpuBuffer, ScalarType};
 
 use decode_engine::{DecodeEngine, DecodeStageTimings};
+use qwen35::loader::WeightLoader;
 use qwen35::state::{LayerState, ModelState};
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 
@@ -86,75 +88,15 @@ enum BackendChoice {
     Explicit(Backend),
 }
 
-type NativePrefillTraceBundle = (
-    Option<Vec<u8>>,
-    Option<Vec<Vec<u8>>>,
-    Option<Vec<Vec<u8>>>,
-    Option<Vec<Vec<u8>>>,
-    Option<Vec<Vec<u8>>>,
-);
-
 impl BackendChoice {
     fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
             "hip" => Some(Self::Explicit(Backend::Hip)),
             "cuda" => Some(Self::Explicit(Backend::Cuda)),
-            "metal" => Some(Self::Explicit(Backend::Metal)),
             _ => None,
         }
     }
-}
-
-pub(crate) fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
-    tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer {}: {e}", tokenizer_path.display()))
-}
-
-pub(crate) fn parse_prompt_ids_csv(spec: &str) -> Result<Vec<u32>> {
-    let mut ids = Vec::new();
-    for raw in spec.split(',') {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            anyhow::bail!("--prompt-ids contains an empty entry");
-        }
-        let id = trimmed
-            .parse::<u32>()
-            .map_err(|e| anyhow::anyhow!("invalid token id '{trimmed}' in --prompt-ids: {e}"))?;
-        ids.push(id);
-    }
-    if ids.is_empty() {
-        anyhow::bail!("--prompt-ids must contain at least one token id");
-    }
-    Ok(ids)
-}
-
-pub(crate) fn resolve_prompt_token_ids(
-    cli: &Cli,
-    tokenizer: &tokenizers::Tokenizer,
-) -> Result<Vec<u32>> {
-    let prompt_ids = if let Some(spec) = cli.prompt_ids.as_deref() {
-        let ids = parse_prompt_ids_csv(spec)?;
-        eprintln!(
-            "[tokenizer] prompt_tokens={} (from --prompt-ids)",
-            ids.len()
-        );
-        ids
-    } else if let Some(prompt) = cli.prompt.as_deref() {
-        let encoding = tokenizer
-            .encode(prompt, true)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        let ids: Vec<u32> = encoding.get_ids().to_vec();
-        eprintln!("[tokenizer] prompt_tokens={} (from --prompt)", ids.len());
-        ids
-    } else {
-        anyhow::bail!("pass either --prompt or --prompt-ids");
-    };
-
-    if prompt_ids.is_empty() {
-        anyhow::bail!("empty prompt after tokenization");
-    }
-    Ok(prompt_ids)
 }
 
 fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
@@ -183,11 +125,6 @@ fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
             {
                 return Ok(Backend::Hip);
             }
-            if gpu_hal::is_backend_compiled(Backend::Metal)
-                && gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok()
-            {
-                return Ok(Backend::Metal);
-            }
             anyhow::bail!(
                 "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
                 gpu_hal::compiled_backends()
@@ -205,10 +142,139 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
         "auto" => match backend {
             Backend::Cuda => format!("cuda:{ordinal}"),
             Backend::Hip => "cpu".to_string(),
-            Backend::Metal => "cpu".to_string(),
         },
         other => other.to_string(),
     }
+}
+
+fn model_dir_has_raw_safetensors(model_dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(model_dir) else {
+        return false;
+    };
+    entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.ends_with(".safetensors") || name.ends_with(".safetensors.index.json")
+    })
+}
+
+fn resolve_qwen_oracle_model_id(
+    explicit_model_id: Option<&str>,
+    model_dir: &Path,
+    model_variant: &ModelVariant,
+) -> String {
+    if let Some(model_id) = explicit_model_id {
+        return model_id.to_string();
+    }
+    if model_dir_has_raw_safetensors(model_dir) {
+        return model_dir.to_string_lossy().into_owned();
+    }
+    model_variant.hf_model_id().to_string()
+}
+
+struct HostLmHeadRescorer {
+    loader: WeightLoader,
+    tensor_name: String,
+}
+
+impl HostLmHeadRescorer {
+    fn from_model_dir(model_dir: &Path) -> Result<Option<Self>> {
+        if !model_dir_has_raw_safetensors(model_dir) {
+            return Ok(None);
+        }
+        let loader = WeightLoader::from_dir(model_dir)
+            .map_err(|e| anyhow::anyhow!("open raw lm_head weights: {e}"))?;
+        let tensor_name = if loader.contains("lm_head.weight") {
+            "lm_head.weight".to_string()
+        } else if loader.contains("model.embed_tokens.weight") {
+            "model.embed_tokens.weight".to_string()
+        } else {
+            return Ok(None);
+        };
+        Ok(Some(Self { loader, tensor_name }))
+    }
+
+    fn rescore(&self, normed: &[f32], candidate_ids: &[usize]) -> Result<u32> {
+        let mut best_idx = 0usize;
+        let mut best_val = f32::NEG_INFINITY;
+        for &candidate in candidate_ids {
+            let row = self
+                .loader
+                .load_bf16_row_f32(&self.tensor_name, candidate)
+                .map_err(|e| anyhow::anyhow!("load lm_head row {candidate}: {e}"))?;
+            anyhow::ensure!(
+                row.len() == normed.len(),
+                "lm_head row len {} != normed len {}",
+                row.len(),
+                normed.len()
+            );
+            let score = row
+                .iter()
+                .zip(normed.iter())
+                .map(|(w, x)| w * x)
+                .sum::<f32>();
+            if score > best_val {
+                best_val = score;
+                best_idx = candidate;
+            }
+        }
+        Ok(best_idx as u32)
+    }
+}
+
+fn top_k_candidate_ids(logits: &[f32], k: usize) -> Vec<usize> {
+    let mut best: Vec<(usize, f32)> = Vec::new();
+    for (idx, &val) in logits.iter().enumerate() {
+        let pos = best
+            .iter()
+            .position(|&(_, best_val)| val > best_val)
+            .unwrap_or(best.len());
+        if pos < k {
+            best.insert(pos, (idx, val));
+            if best.len() > k {
+                best.pop();
+            }
+        }
+    }
+    best.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn sample_qwen_logits_with_rescore(
+    logits: &[f32],
+    normed: Option<&[f32]>,
+    rescorer: Option<&HostLmHeadRescorer>,
+) -> Result<u32> {
+    let greedy = DecodeEngine::greedy_sample(logits);
+    let Some(normed) = normed else {
+        return Ok(greedy);
+    };
+    let Some(rescorer) = rescorer else {
+        return Ok(greedy);
+    };
+
+    const RESCORE_MARGIN: f32 = 0.25;
+    const RESCORE_TOP_K: usize = 4;
+
+    let candidates = top_k_candidate_ids(logits, RESCORE_TOP_K);
+    if candidates.len() < 2 {
+        return Ok(greedy);
+    }
+    let top0 = logits[candidates[0]];
+    let top1 = logits[candidates[1]];
+    if top0 - top1 > RESCORE_MARGIN {
+        return Ok(greedy);
+    }
+
+    let rescored = rescorer.rescore(normed, &candidates)?;
+    if rescored != greedy {
+        eprintln!(
+            "[sample-rescore] token {} -> {} (top_margin={:.4})",
+            greedy,
+            rescored,
+            top0 - top1
+        );
+    }
+    Ok(rescored)
 }
 
 #[derive(Parser)]
@@ -223,12 +289,8 @@ pub(crate) struct Cli {
     model_dir: PathBuf,
 
     /// Text prompt (will be tokenized)
-    #[arg(long, conflicts_with = "prompt_ids")]
-    prompt: Option<String>,
-
-    /// Exact prompt token IDs as a comma-separated list.
-    #[arg(long, conflicts_with = "prompt")]
-    prompt_ids: Option<String>,
+    #[arg(long)]
+    prompt: String,
 
     /// Maximum tokens to generate
     #[arg(long, default_value = "8")]
@@ -239,7 +301,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     context_size: Option<usize>,
 
-    /// Compute backend (`auto`, `hip`, `cuda`, or `metal`)
+    /// Compute backend (`auto`, `hip`, or `cuda`)
     #[arg(long, default_value = "auto")]
     backend: String,
 
@@ -285,6 +347,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     int4: bool,
 
+    /// Load an INT8 bake produced from BitsAndBytes `load_in_8bit=True`.
+    /// Currently only supported for `llama3.1-8b` on CUDA.
+    #[arg(long)]
+    int8: bool,
+
     /// Process prompt in chunks of this size (0 = no chunking, process entire prompt at once).
     /// Reduces activation VRAM for long prompts. Typical values: 128, 256, 512.
     #[arg(long, default_value = "0")]
@@ -307,48 +374,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     trace_prefill_layers: bool,
 
-    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
-    /// linear-attention layer's internal tensors against the Python oracle.
-    /// Defaults to a later linear layer to localize the current drift.
+    /// Debug-only: run one prompt-prefill layer from the oracle's exact prefix
+    /// state and compare our component layer outputs against the oracle.
     #[arg(long, hide = true)]
-    trace_prefill_linear_layer: Option<usize>,
-
-    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
-    /// full-attention layer's internal tensors against the Python oracle.
-    /// Defaults to a later full-attention layer where parity drift is larger.
-    #[arg(long, hide = true)]
-    trace_prefill_full_layer: Option<usize>,
-
-    /// Debug-only: when tracing Qwen prefill on Metal, also dump one selected
-    /// MLP block's internal tensors against the Python oracle.
-    /// Defaults to the selected full-attention trace layer when present.
-    #[arg(long, hide = true)]
-    trace_prefill_mlp_layer: Option<usize>,
-
-    /// Debug-only: seed prefill from the oracle decoder-block output of this
-    /// layer, then replay the remaining tail natively. Used to distinguish
-    /// upstream hidden-state drift from bugs in the later layers.
-    #[arg(long, hide = true)]
-    trace_prefill_restart_layer: Option<usize>,
-
-    /// Debug-only: when tracing Qwen prefill, compare one selected prompt
-    /// position instead of the last prompt token for the layer-hidden sweep
-    /// and traced layer internals. Defaults to the last prompt token.
-    #[arg(long, hide = true)]
-    trace_prefill_position: Option<usize>,
-
-    /// Debug-only: when replaying a traced Qwen prefill tail from an oracle
-    /// layer output, sweep multiple prompt positions instead of one and emit
-    /// a compact summary of the worst position per layer. Accepts `all` or a
-    /// comma-separated list like `0,4,9,14`.
-    #[arg(long, hide = true)]
-    trace_prefill_restart_position_scan: Option<String>,
-
-    /// Debug-only: on replay-prefill decode paths, re-run one selected decode
-    /// step through the traced prefill engine and compare the last-token layer
-    /// state against the Python oracle for the full token history at that step.
-    #[arg(long, hide = true)]
-    trace_replay_decode_step: Option<usize>,
+    trace_oracle_prefill_layer: Option<usize>,
 
     /// Batch size for decode (number of sequences decoded in parallel).
     /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
@@ -377,8 +406,8 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     force_replay_decode: bool,
 
-    /// Debug-only: allow unstable CUDA KV-FP8 experiments on the 4B kernel path.
-    /// This is intentionally hidden until the path is validated.
+    /// Legacy compatibility switch for older CUDA KV-FP8 bring-up commands.
+    /// No longer required now that the validated 4B sm86 lane is public.
     #[arg(long, hide = true)]
     allow_unstable_cuda_kv_fp8: bool,
 
@@ -481,6 +510,7 @@ pub(crate) struct Cli {
     /// checkpoint's `dflash_config.target_layer_ids`.
     #[arg(long)]
     dflash_tap_layers: Option<String>,
+
 }
 
 fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
@@ -609,15 +639,9 @@ fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if cli.prompt.is_none() && cli.prompt_ids.is_none() {
-        anyhow::bail!("pass either --prompt or --prompt-ids");
-    }
     let ordinal = cli.device;
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown backend '{}'. Expected one of: auto, hip, cuda, metal",
-            cli.backend
-        )
+        anyhow::anyhow!("Unknown backend '{}'. Expected one of: auto, hip, cuda", cli.backend)
     })?;
     let backend = resolve_backend(backend_choice, ordinal)?;
     gpu_hal::set_backend(backend);
@@ -631,6 +655,13 @@ fn main() -> Result<()> {
         )
     })?;
 
+    if cli.int8 && (cli.int4 || cli.fp8_runtime) {
+        anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
+    }
+    if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
+        anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");
+    }
+
     // 2. Detect GPU
     let (arch_name, total_vram, warp_size) = match backend {
         Backend::Hip => {
@@ -639,11 +670,6 @@ fn main() -> Result<()> {
             (arch_name, total_vram, 32)
         }
         Backend::Cuda => {
-            let info = gpu_hal::query_device_info(backend, ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            (info.arch_name, info.total_vram_bytes, info.warp_size)
-        }
-        Backend::Metal => {
             let info = gpu_hal::query_device_info(backend, ordinal)
                 .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)
@@ -662,17 +688,15 @@ fn main() -> Result<()> {
         None => {
             if let Some(override_arch) = cli.allow_untested_gpu.as_deref() {
                 let reuse_arch = GpuArch::from_backend_name(&backend, override_arch);
-                let e =
-                    registry::lookup(&model_variant, &backend, &reuse_arch).ok_or_else(|| {
-                        let supported_archs =
-                            registry::supported_archs_for(&model_variant, &backend);
-                        anyhow::anyhow!(
-                            "--allow-untested-gpu={override_arch}: no registry entry for \
+                let e = registry::lookup(&model_variant, &backend, &reuse_arch).ok_or_else(|| {
+                    let supported_archs = registry::supported_archs_for(&model_variant, &backend);
+                    anyhow::anyhow!(
+                        "--allow-untested-gpu={override_arch}: no registry entry for \
                          model={model_variant} backend={backend} arch={reuse_arch}. \
                          Pass one of: [{}]",
-                            supported_archs.join(", ")
-                        )
-                    })?;
+                        supported_archs.join(", ")
+                    )
+                })?;
                 eprintln!(
                     "[gpu] WARNING: detected arch={gpu_arch} has no registry entry; \
                      reusing {reuse_arch} kernel as requested by --allow-untested-gpu. \
@@ -715,6 +739,9 @@ fn main() -> Result<()> {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
         ModelFamily::Phi4 => {
             return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
+        }
+        ModelFamily::Llama31 => {
+            return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
         }
         ModelFamily::Qwen35 => {}
     }
@@ -771,7 +798,19 @@ fn main() -> Result<()> {
         FamilyParams::Qwen35(p) => p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
+        FamilyParams::Llama31(_) => unreachable!("llama3.1 handled above"),
     };
+    let host_lm_head_rescorer = HostLmHeadRescorer::from_model_dir(&cli.model_dir)?;
+
+    // Install the per-model HIP launch preset (grid size + cooperative
+    // flag) if the registry specifies one. User env vars still override
+    // inside the bridge. Always called — `None` clears any stale preset
+    // from a prior run, so switching models doesn't inherit the previous
+    // one's grid. No-op on CUDA builds.
+    {
+        let (blocks, coop) = params.hip_launch_preset.unwrap_or((0, false));
+        kernel_ffi::set_qwen35_4b_launch_preset(blocks, coop);
+    }
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
         anyhow::bail!("--trace-kv-fp8-cache requires --kv-fp8");
@@ -797,7 +836,9 @@ fn main() -> Result<()> {
             && !cli.force_component_decode
             && (cli.batch_size > 1 || cli.force_kernel_decode || cli.kv_fp8))
     {
-        anyhow::bail!("--trace-persistent-input-layer requires the real 4B persistent kernel path");
+        anyhow::bail!(
+            "--trace-persistent-input-layer requires the real 4B persistent kernel path"
+        );
     }
     if cli.trace_persistent_linear_state_layer.is_some()
         && !(params.use_4b_kernel
@@ -836,35 +877,17 @@ fn main() -> Result<()> {
             anyhow::bail!("CUDA v1 does not support --fp8-runtime yet");
         }
         if cli.kv_fp8 {
-            if !cli.allow_unstable_cuda_kv_fp8 {
-                anyhow::bail!("CUDA v1 does not support --kv-fp8 yet");
+            if model_variant != ModelVariant::Qwen3_5_4B || gpu_arch != GpuArch::Sm86 {
+                anyhow::bail!("CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86");
             }
-            if !params.use_4b_kernel {
-                anyhow::bail!("--allow-unstable-cuda-kv-fp8 only supports the CUDA 4B kernel path");
+            if env::var_os("SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR").is_none() {
+                env::set_var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW", "128");
+                eprintln!(
+                    "[cuda] KV-FP8 BF16 sidecar window capped to the most recent 128 tokens on CUDA; \
+                     set SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR=1 \
+                     to restore full-prefix debug sidecar coverage"
+                );
             }
-            eprintln!(
-                "[cuda] WARNING: enabling unstable CUDA KV-FP8 debug path; correctness is not guaranteed"
-            );
-        }
-    }
-    if backend == Backend::Metal {
-        if model_variant != ModelVariant::Qwen3_5_0_8B {
-            anyhow::bail!("Metal v1 only supports --model qwen3.5-0.8b");
-        }
-        if cli.int4 {
-            anyhow::bail!("Metal v1 does not support --int4");
-        }
-        if cli.fp8_runtime {
-            anyhow::bail!("Metal v1 does not support --fp8-runtime");
-        }
-        if cli.kv_fp8 {
-            anyhow::bail!("Metal v1 does not support --kv-fp8");
-        }
-        if cli.batch_size != 1 {
-            anyhow::bail!("Metal v1 only supports --batch-size 1");
-        }
-        if cli.force_kernel_decode || cli.force_component_decode {
-            anyhow::bail!("Metal v1 only supports replay-prefill decode");
         }
     }
 
@@ -888,18 +911,19 @@ fn main() -> Result<()> {
 
     // Tokenize
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = load_tokenizer(&tokenizer_path)?;
-    let prompt_ids = resolve_prompt_token_ids(&cli, &tokenizer)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
 
     // 4. VRAM check (needs config + prompt length for KV cache estimation)
     let context_tokens = cli
         .context_size
         .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
-    let kv_dtype_bytes = if cli.kv_fp8 {
-        1usize
-    } else {
-        gpu_hal::ScalarType::BF16.size_in_bytes()
-    };
+    let kv_dtype_bytes = if cli.kv_fp8 { 1usize } else { gpu_hal::ScalarType::BF16.size_in_bytes() };
     let kv_per_token = text_config.kv_bytes_per_token(kv_dtype_bytes);
     // FP8 runtime dequant halves weight VRAM; INT4 quarters it.
     let effective_fixed = if cli.int4 {
@@ -1079,6 +1103,8 @@ fn main() -> Result<()> {
         cli.kv_fp8,
         cli.batch_size,
     )?;
+    let allow_host_lm_head_rescore =
+        cli.no_bake && !engine.weights().is_fp8 && !engine.weights().is_int4;
 
     // When using FP8 runtime weights, tell the oracle to use the same FP8 weights
     // (dequanted to BF16) so we compare apples-to-apples.
@@ -1088,210 +1114,54 @@ fn main() -> Result<()> {
         None
     };
     let oracle_device = resolve_oracle_device(&cli.oracle_device, backend, ordinal);
-    if (cli.trace_prefill_layers
-        || cli.trace_replay_decode_step.is_some()
-        || cli.trace_prefill_restart_layer.is_some())
-        && !cli.validate
-    {
-        anyhow::bail!(
-            "--trace-prefill-layers, --trace-prefill-restart-layer, and --trace-replay-decode-step require --validate"
-        );
+    if cli.trace_prefill_layers && !cli.validate {
+        anyhow::bail!("--trace-prefill-layers requires --validate");
     }
-    if cli.trace_prefill_restart_layer.is_some() && !cli.trace_prefill_layers {
-        anyhow::bail!("--trace-prefill-restart-layer requires --trace-prefill-layers");
+    if cli.trace_oracle_prefill_layer.is_some() && !cli.validate {
+        anyhow::bail!("--trace-oracle-prefill-layer requires --validate");
     }
-    if cli.trace_prefill_restart_position_scan.is_some()
-        && cli.trace_prefill_restart_layer.is_none()
-    {
-        anyhow::bail!(
-            "--trace-prefill-restart-position-scan requires --trace-prefill-restart-layer"
-        );
-    }
-    if let Some(step) = cli.trace_replay_decode_step {
-        if model_variant.family() != ModelFamily::Qwen35 {
-            anyhow::bail!("--trace-replay-decode-step is only supported on Qwen3.5");
-        }
-        if cli.batch_size != 1 {
-            anyhow::bail!("--trace-replay-decode-step only supports --batch-size 1");
-        }
-        if step >= cli.max_new_tokens {
-            anyhow::bail!(
-                "--trace-replay-decode-step {} must be less than --max-new-tokens {}",
-                step,
-                cli.max_new_tokens
-            );
-        }
-    }
-    let qwen_trace_enabled = (cli.trace_prefill_layers || cli.trace_replay_decode_step.is_some())
-        && model_variant.family() == ModelFamily::Qwen35;
-    let trace_prefill_linear_layer = if qwen_trace_enabled {
-        let layer = cli.trace_prefill_linear_layer.unwrap_or(20);
-        let config = &engine.weights().config;
-        if layer >= config.num_hidden_layers {
-            anyhow::bail!(
-                "--trace-prefill-linear-layer {} out of range for {} layers",
-                layer,
-                config.num_hidden_layers
-            );
-        }
-        if config.is_full_attention(layer) {
-            anyhow::bail!(
-                "--trace-prefill-linear-layer {} selects a full-attention layer; choose a linear-attention layer",
-                layer
-            );
-        }
-        Some(layer)
-    } else {
-        None
-    };
-    let trace_prefill_full_layer = if qwen_trace_enabled {
-        let layer = cli.trace_prefill_full_layer.unwrap_or(19);
-        let config = &engine.weights().config;
-        if layer >= config.num_hidden_layers {
-            anyhow::bail!(
-                "--trace-prefill-full-layer {} out of range for {} layers",
-                layer,
-                config.num_hidden_layers
-            );
-        }
-        if !config.is_full_attention(layer) {
-            anyhow::bail!(
-                "--trace-prefill-full-layer {} selects a linear-attention layer; choose a full-attention layer",
-                layer
-            );
-        }
-        Some(layer)
-    } else {
-        None
-    };
-    let trace_prefill_mlp_layer = if qwen_trace_enabled {
-        let layer = cli
-            .trace_prefill_mlp_layer
-            .or(trace_prefill_full_layer)
-            .unwrap_or(19);
-        let config = &engine.weights().config;
-        if layer >= config.num_hidden_layers {
-            anyhow::bail!(
-                "--trace-prefill-mlp-layer {} out of range for {} layers",
-                layer,
-                config.num_hidden_layers
-            );
-        }
-        Some(layer)
-    } else {
-        None
-    };
-    let trace_prefill_restart_layer = if cli.trace_prefill_restart_layer.is_some() {
-        if model_variant.family() != ModelFamily::Qwen35 {
-            anyhow::bail!("--trace-prefill-restart-layer is only supported on Qwen3.5");
-        }
-        let layer = cli.trace_prefill_restart_layer.unwrap();
-        let config = &engine.weights().config;
-        if layer >= config.num_hidden_layers {
-            anyhow::bail!(
-                "--trace-prefill-restart-layer {} out of range for {} layers",
-                layer,
-                config.num_hidden_layers
-            );
-        }
-        Some(layer)
-    } else {
-        None
-    };
-    let trace_prefill_position = if cli.trace_prefill_layers {
-        let position = cli
-            .trace_prefill_position
-            .unwrap_or_else(|| prompt_ids.len().saturating_sub(1));
-        if position >= prompt_ids.len() {
-            anyhow::bail!(
-                "--trace-prefill-position {} out of range for prompt length {}",
-                position,
-                prompt_ids.len()
-            );
-        }
-        Some(position)
-    } else {
-        None
-    };
-    let trace_prefill_restart_position_scan =
-        if let Some(spec) = cli.trace_prefill_restart_position_scan.as_deref() {
-            Some(parse_trace_position_scan(spec, prompt_ids.len())?)
-        } else {
-            None
-        };
-    let oracle_model_id = cli
-        .model_id
-        .clone()
-        .unwrap_or_else(|| model_variant.hf_model_id().to_string());
-    let oracle_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap()
-        .to_path_buf();
-    let oracle_script = oracle_root.join("oracle/run_oracle.py");
-    let qwen35_trace_script = oracle_root.join("oracle/qwen35_oracle.py");
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
-    let (
-        prefill_logits,
-        native_prefill_trace,
-        native_linear_debug_trace,
-        native_layer3_full_attn_trace,
-        native_mlp_debug_trace,
-        mut next_token,
-    ) = if cli.oracle_prefill {
+    let (prefill_logits, native_prefill_trace, mut next_token) = if cli.oracle_prefill {
+        let model_id = resolve_qwen_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            &model_variant,
+        );
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/run_oracle.py");
         let output = oracle::run_oracle(
-            &oracle_script,
-            &oracle_model_id,
-            &prompt_ids,
-            cli.max_new_tokens,
-            &cli.oracle_dtype,
-            &oracle_device,
-            true,
+            &oracle_script, &model_id, &prompt_ids, cli.max_new_tokens,
+            &cli.oracle_dtype, &oracle_device, true, false,
             fp8_oracle_dir.as_deref(),
             None,
         )?;
         engine.load_prefill_state(&output)?;
-        let first = output
-            .generated_token_ids
-            .first()
-            .copied()
-            .unwrap_or_else(|| DecodeEngine::greedy_sample(&output.prefill_logits));
-        eprintln!(
-            "[prefill] oracle prefill done in {:.0}ms",
-            prefill_start.elapsed().as_millis()
-        );
-        (output.prefill_logits, None, None, None, None, first)
+        let first = output.generated_token_ids[0];
+        eprintln!("[prefill] oracle prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
+        (output.prefill_logits, None, first)
     } else {
         let prefill_result = if cli.trace_prefill_layers {
-            engine.prefill_native_with_trace(
-                &prompt_ids,
-                trace_prefill_linear_layer,
-                trace_prefill_full_layer,
-                trace_prefill_mlp_layer,
-                trace_prefill_position,
-            )?
+            engine.prefill_native_with_trace(&prompt_ids)?
         } else {
-            prefill_engine::PrefillResult {
-                logits: engine.prefill_native(&prompt_ids)?,
-                final_norm_trace: None,
-                layer_attn_trace: None,
-                layer_post_attn_norm_trace: None,
-                layer_mlp_swiglu_trace: None,
-                layer_mlp_out_trace: None,
-                layer_hidden_trace: None,
-                tap_hiddens: None,
-                linear_debug_trace: None,
-                layer3_full_attn_trace: None,
-                mlp_debug_trace: None,
-            }
+            engine.prefill_native_with_final_norm(&prompt_ids)?
         };
-        let first = DecodeEngine::greedy_sample(&prefill_result.logits);
-        eprintln!(
-            "[prefill] native GPU prefill done in {:.0}ms",
-            prefill_start.elapsed().as_millis()
-        );
+        let prefill_normed = prefill_result
+            .final_norm_trace
+            .as_deref()
+            .map(decode_bf16_le);
+        let first = sample_qwen_logits_with_rescore(
+            &prefill_result.logits,
+            prefill_normed.as_deref(),
+            host_lm_head_rescorer
+                .as_ref()
+                .filter(|_| allow_host_lm_head_rescore),
+        )?;
+        eprintln!("[prefill] native GPU prefill done in {:.0}ms", prefill_start.elapsed().as_millis());
         (
             prefill_result.logits,
             Some((
@@ -1301,173 +1171,221 @@ fn main() -> Result<()> {
                 prefill_result.layer_mlp_out_trace,
                 prefill_result.layer_hidden_trace,
             )),
-            prefill_result.linear_debug_trace,
-            prefill_result.layer3_full_attn_trace,
-            prefill_result.mlp_debug_trace,
             first,
         )
     };
 
     // Optionally run oracle for validation
     let oracle_output = if cli.validate {
+        let model_id = resolve_qwen_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            &model_variant,
+        );
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/run_oracle.py");
+
+        let emit_state = cli.trace_prefill_layers || cli.trace_oracle_prefill_layer.is_some();
         let output = oracle::run_oracle(
             &oracle_script,
-            &oracle_model_id,
+            &model_id,
             &prompt_ids,
             cli.max_new_tokens,
             &cli.oracle_dtype,
             &oracle_device,
-            cli.trace_prefill_layers,
+            emit_state,
+            false,
             fp8_oracle_dir.as_deref(),
-            None,
+            cli.trace_oracle_prefill_layer
+                .filter(|layer| text_config.is_full_attention(*layer)),
         )?;
 
         // Compare prefill logits
         let prefill_delta = validate::max_abs_delta(&prefill_logits, &output.prefill_logits);
         eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
 
-        let qwen35_trace_output =
-            if cli.trace_prefill_layers && model_variant.family() == ModelFamily::Qwen35 {
-                match oracle::run_qwen35_trace_oracle(
-                    &qwen35_trace_script,
-                    &oracle_model_id,
-                    &prompt_ids,
-                    cli.max_new_tokens,
-                    &cli.oracle_dtype,
-                    &oracle_device,
-                    trace_prefill_linear_layer,
-                    trace_prefill_full_layer,
-                    trace_prefill_mlp_layer,
-                    trace_prefill_position,
-                ) {
-                    Ok(trace) => Some(trace),
-                    Err(err) => {
-                        eprintln!("[trace-prefill] qwen35_trace_unavailable: {err}");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
+        if let (Some((native_final_norm_trace, ..)), Some(oracle_final_norm_b64)) = (
+            native_prefill_trace.as_ref(),
+            output.prefill_hidden.as_ref(),
+        ) {
+            if let Some(native_final_norm_trace) = native_final_norm_trace.as_ref() {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                let oracle_final_norm_bytes = b64
+                    .decode(oracle_final_norm_b64)
+                    .map_err(|e| anyhow::anyhow!("decode oracle prefill_hidden: {e}"))?;
+                let decode_bf16 = |bytes: &[u8]| -> Vec<f32> {
+                    bytes.chunks_exact(2)
+                        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                        .collect()
+                };
+                let native_final_norm = decode_bf16(native_final_norm_trace);
+                let oracle_final_norm = decode_bf16(&oracle_final_norm_bytes);
+                let final_norm_delta =
+                    validate::max_abs_delta(&native_final_norm, &oracle_final_norm);
+                eprintln!("[trace-prefill] final_norm_delta={final_norm_delta:.4}");
+            }
+        }
 
         // Check if oracle and native agree on first token
-        if let Some(&oracle_first) = output.generated_token_ids.first() {
-            if oracle_first != next_token {
-                eprintln!(
-                    "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
-                );
-            }
+        let oracle_first = output.generated_token_ids[0];
+        if oracle_first != next_token {
+            eprintln!(
+                "[validate] WARNING: prefill token mismatch! native={next_token} oracle={oracle_first}"
+            );
         }
 
         if cli.trace_prefill_layers {
-            emit_qwen35_trace_report(
-                &engine,
-                "trace-prefill",
-                trace_prefill_linear_layer,
-                trace_prefill_full_layer,
-                trace_prefill_mlp_layer,
-                &prefill_logits,
-                native_prefill_trace.as_ref(),
-                native_linear_debug_trace.as_ref(),
-                native_layer3_full_attn_trace.as_ref(),
-                native_mlp_debug_trace.as_ref(),
-                &output,
-                qwen35_trace_output.as_ref(),
-                trace_prefill_position,
-            )?;
+            if let (
+                Some((_, native_attn_trace, native_post_norm_trace, native_mlp_out_trace, native_layer_trace)),
+                Some(oracle_attn_trace),
+                Some(oracle_post_norm_trace),
+                Some(oracle_mlp_out_trace),
+                Some(oracle_layer_trace),
+            ) =
+                (
+                    native_prefill_trace.as_ref(),
+                    output.layer_attn_residual_states.as_ref(),
+                    output.layer_post_attn_norm_states.as_ref(),
+                    output.layer_mlp_outputs.as_ref(),
+                    output.layer_hidden_states.as_ref(),
+                )
+            {
+                if let (
+                    Some(native_attn_trace),
+                    Some(native_post_norm_trace),
+                    Some(native_mlp_out_trace),
+                    Some(native_layer_trace),
+                ) = (
+                    native_attn_trace.as_ref(),
+                    native_post_norm_trace.as_ref(),
+                    native_mlp_out_trace.as_ref(),
+                    native_layer_trace.as_ref(),
+                )
+                {
+	                let b64 = base64::engine::general_purpose::STANDARD;
+	                let oracle_kv = output.kv_caches.as_ref();
+	                let oracle_conv = output.conv_states.as_ref();
+	                let oracle_recurrent = output.recurrent_states.as_ref();
+	                let mut first_bad = None;
+	                for layer in 0..native_layer_trace.len().min(oracle_layer_trace.len()) {
+                    let decode_bf16 = |bytes: &[u8]| -> Vec<f32> {
+                        bytes.chunks_exact(2)
+                            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                            .collect()
+                    };
+                    let oracle_attn_bytes = b64
+                        .decode(&oracle_attn_trace[layer])
+                        .map_err(|e| anyhow::anyhow!("decode oracle layer_attn_residual_states[{layer}]: {e}"))?;
+                    let oracle_post_norm_bytes = b64
+                        .decode(&oracle_post_norm_trace[layer])
+                        .map_err(|e| anyhow::anyhow!("decode oracle layer_post_attn_norm_states[{layer}]: {e}"))?;
+                    let oracle_mlp_out_bytes = b64
+                        .decode(&oracle_mlp_out_trace[layer])
+                        .map_err(|e| anyhow::anyhow!("decode oracle layer_mlp_outputs[{layer}]: {e}"))?;
+                    let oracle_layer_bytes = b64
+                        .decode(&oracle_layer_trace[layer])
+                        .map_err(|e| anyhow::anyhow!("decode oracle layer_hidden_states[{layer}]: {e}"))?;
+                    let native_attn_f32 = decode_bf16(&native_attn_trace[layer]);
+                    let native_post_norm_f32 = decode_bf16(&native_post_norm_trace[layer]);
+                    let native_mlp_out_f32 = decode_bf16(&native_mlp_out_trace[layer]);
+                    let native_layer_f32 = decode_bf16(&native_layer_trace[layer]);
+                    let oracle_attn_f32 = decode_bf16(&oracle_attn_bytes);
+                    let oracle_post_norm_f32 = decode_bf16(&oracle_post_norm_bytes);
+                    let oracle_mlp_out_f32 = decode_bf16(&oracle_mlp_out_bytes);
+                    let oracle_layer_f32 = decode_bf16(&oracle_layer_bytes);
+	                    let attn_delta = validate::max_abs_delta(&native_attn_f32, &oracle_attn_f32);
+	                    let post_norm_delta = validate::max_abs_delta(&native_post_norm_f32, &oracle_post_norm_f32);
+	                    let mlp_out_delta = validate::max_abs_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
+	                    let layer_delta = validate::max_abs_delta(&native_layer_f32, &oracle_layer_f32);
+	                    let state_delta = if text_config.is_full_attention(layer) {
+	                        let native = engine.full_attention_prefix_cache_bf16_host(layer, 0);
+	                        match (native, oracle_kv.and_then(|caches| caches.iter().find(|kv| kv.layer == layer))) {
+	                            (Ok((native_k, native_v, _)), Some(oracle_kv)) => {
+	                                let oracle_k = b64
+	                                    .decode(&oracle_kv.k)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle kv k[{layer}]: {e}"))?;
+	                                let oracle_v = b64
+	                                    .decode(&oracle_kv.v)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle kv v[{layer}]: {e}"))?;
+	                                format!(
+	                                    " kv_k_delta={:.4} kv_v_delta={:.4}",
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_k), &decode_bf16_le(&oracle_k)),
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_v), &decode_bf16_le(&oracle_v)),
+	                                )
+	                            }
+	                            _ => String::new(),
+	                        }
+	                    } else {
+	                        let native_layer = engine.state_for_batch(0).layers.get(layer);
+	                        match (
+	                            native_layer,
+	                            oracle_conv.and_then(|states| states.iter().find(|state| state.layer == layer)),
+	                            oracle_recurrent.and_then(|states| states.iter().find(|state| state.layer == layer)),
+	                        ) {
+	                            (Some(native_layer), Some(oracle_conv), Some(oracle_recurrent)) => {
+	                                let native_conv = native_layer
+	                                    .conv_state
+	                                    .as_ref()
+	                                    .ok_or_else(|| anyhow::anyhow!("native linear layer {layer} missing conv_state"))?
+	                                    .to_host_bytes()
+	                                    .map_err(|e| anyhow::anyhow!("native conv D2H layer {layer}: {e}"))?;
+	                                let native_recurrent = native_layer
+	                                    .recurrent_state
+	                                    .as_ref()
+	                                    .ok_or_else(|| anyhow::anyhow!("native linear layer {layer} missing recurrent_state"))?
+	                                    .to_host_bytes()
+	                                    .map_err(|e| anyhow::anyhow!("native recurrent D2H layer {layer}: {e}"))?;
+	                                let oracle_conv = b64
+	                                    .decode(&oracle_conv.data)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle conv[{layer}]: {e}"))?;
+	                                let oracle_recurrent = b64
+	                                    .decode(&oracle_recurrent.data)
+	                                    .map_err(|e| anyhow::anyhow!("decode oracle recurrent[{layer}]: {e}"))?;
+	                                format!(
+	                                    " conv_delta={:.4} recurrent_delta={:.4}",
+	                                    validate::max_abs_delta(&decode_bf16_le(&native_conv), &decode_bf16_le(&oracle_conv)),
+	                                    validate::max_abs_delta(&decode_f32_le(&native_recurrent), &decode_f32_le(&oracle_recurrent)),
+	                                )
+	                            }
+	                            _ => String::new(),
+	                        }
+	                    };
+	                    if first_bad.is_none() && layer_delta > 0.5 {
+	                        first_bad = Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta));
+	                    }
+	                    eprintln!(
+	                        "[trace-prefill] layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}{state_delta}"
+	                    );
+	                }
+                if let Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta)) = first_bad {
+                    eprintln!(
+                        "[trace-prefill] first_bad_layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
+                    );
+                } else {
+                    eprintln!("[trace-prefill] no layer exceeded delta threshold");
+                }
+                } else {
+                    eprintln!("[trace-prefill] missing native attention, post-norm, mlp-out, or layer trace");
+                }
+            } else {
+                eprintln!("[trace-prefill] missing native or oracle layer trace data");
+            }
         }
 
-        if let (Some(restart_layer), Some(trace)) =
-            (trace_prefill_restart_layer, qwen35_trace_output.as_ref())
-        {
-            let hidden_value = trace
-                .decoder_layer_outputs
-                .get(restart_layer)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "qwen35 trace oracle missing decoder_layer_outputs[{restart_layer}]"
-                    )
-                })?;
-            let hidden_f32 = flatten_bsh(hidden_value).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "qwen35 trace oracle decoder_layer_outputs[{restart_layer}] was not flattenable"
-                )
-            })?;
-            let expected_hidden = prompt_ids.len() * engine.weights().config.hidden_size;
-            if hidden_f32.len() != expected_hidden {
-                anyhow::bail!(
-                    "qwen35 trace oracle decoder_layer_outputs[{restart_layer}] had {} floats, expected {} for prompt_len={} hidden_size={}",
-                    hidden_f32.len(),
-                    expected_hidden,
-                    prompt_ids.len(),
-                    engine.weights().config.hidden_size
-                );
-            }
-            if let Some(position) = trace_prefill_position {
-                emit_qwen35_restart_source_tail_report(
-                    &engine,
-                    "trace-prefill-restart-source",
-                    restart_layer,
-                    &hidden_f32,
-                    trace,
-                    position,
-                )?;
-            }
-            let hidden_bf16 = encode_bf16_le(&hidden_f32);
-            let start_layer = restart_layer + 1;
-            let restart_prefill = engine.prefill_tail_from_hidden_with_trace(
-                &hidden_bf16,
-                start_layer,
-                trace_prefill_linear_layer.filter(|layer| *layer >= start_layer),
-                trace_prefill_full_layer.filter(|layer| *layer >= start_layer),
-                trace_prefill_mlp_layer.filter(|layer| *layer >= start_layer),
-                trace_prefill_position,
-            )?;
-            emit_qwen35_restart_report(
-                &engine.weights().config,
-                "trace-prefill-restart",
-                restart_layer,
-                start_layer,
-                &restart_prefill,
+        if let Some(trace_layer) = cli.trace_oracle_prefill_layer {
+            trace_oracle_prefill_layer(
+                &mut engine,
+                trace_layer,
+                &prompt_ids,
+                &oracle_script,
+                &model_id,
+                &cli.oracle_dtype,
+                &oracle_device,
+                fp8_oracle_dir.as_deref(),
                 &output,
-                qwen35_trace_output.as_ref(),
-                trace_prefill_position,
-            )?;
-            if let Some(positions) = trace_prefill_restart_position_scan.as_ref() {
-                emit_qwen35_restart_position_scan_report(
-                    &engine,
-                    "trace-prefill-restart-scan",
-                    start_layer,
-                    &hidden_bf16,
-                    positions,
-                    trace_prefill_linear_layer,
-                    trace_prefill_full_layer,
-                    trace_prefill_mlp_layer,
-                    trace,
-                )?;
-            }
-            let restart_trace_bundle: NativePrefillTraceBundle = (
-                restart_prefill.final_norm_trace.clone(),
-                restart_prefill.layer_attn_trace.clone(),
-                restart_prefill.layer_post_attn_norm_trace.clone(),
-                restart_prefill.layer_mlp_out_trace.clone(),
-                restart_prefill.layer_hidden_trace.clone(),
-            );
-            emit_qwen35_trace_report_with_offset(
-                &engine,
-                "trace-prefill-restart",
-                start_layer,
-                trace_prefill_linear_layer.filter(|layer| *layer >= start_layer),
-                trace_prefill_full_layer.filter(|layer| *layer >= start_layer),
-                trace_prefill_mlp_layer.filter(|layer| *layer >= start_layer),
-                &restart_prefill.logits,
-                Some(&restart_trace_bundle),
-                restart_prefill.linear_debug_trace.as_ref(),
-                restart_prefill.layer3_full_attn_trace.as_ref(),
-                restart_prefill.mlp_debug_trace.as_ref(),
-                &output,
-                qwen35_trace_output.as_ref(),
-                trace_prefill_position,
             )?;
         }
 
@@ -1478,17 +1396,12 @@ fn main() -> Result<()> {
 
     // Replicate prefill state to batch items if batch_size > 1
     if cli.batch_size > 1 {
-        eprintln!(
-            "[batch] replicating prefill state to {} sequences",
-            cli.batch_size
-        );
+        eprintln!("[batch] replicating prefill state to {} sequences", cli.batch_size);
         engine.replicate_state_to_batch()?;
     }
 
     let gpu_validate_enabled = if cli.gpu_validate && cli.batch_size == 1 {
-        eprintln!(
-            "[gpu-validate] replaying full token history through GPU prefill for reference..."
-        );
+        eprintln!("[gpu-validate] replaying full token history through GPU prefill for reference...");
         true
     } else {
         if cli.gpu_validate && cli.batch_size > 1 {
@@ -1503,20 +1416,22 @@ fn main() -> Result<()> {
     // the megakernel; --force-replay-decode re-enables the replay path for
     // the rare case where someone genuinely wants to reproduce the older
     // numeric semantics.
+    let cuda_qwen2b_replay_default = backend == Backend::Cuda
+        && model_variant == ModelVariant::Qwen3_5_2B
+        && cli.batch_size == 1
+        && params.use_4b_kernel
+        && !cli.kv_fp8
+        && !cli.force_kernel_decode
+        && !cli.force_component_decode;
     let replay_decode_enabled = cli.batch_size == 1
+        && params.use_4b_kernel
+        && (cli.force_replay_decode || cuda_qwen2b_replay_default)
         && !cli.force_kernel_decode
         && !cli.force_component_decode
-        && !cli.kv_fp8
-        && (backend == Backend::Metal || (params.use_4b_kernel && cli.force_replay_decode));
-    if cli.trace_replay_decode_step.is_some() && !replay_decode_enabled {
-        anyhow::bail!(
-            "--trace-replay-decode-step requires the replay-prefill decode path \
-             (Metal v1 or --force-replay-decode)"
-        );
-    }
+        && !cli.kv_fp8;
     let replay_kv_fp8_enabled = params.use_4b_kernel
         && cli.kv_fp8
-        && cli.allow_unstable_cuda_kv_fp8
+        && cli.batch_size == 1
         && !cli.force_kernel_decode;
     let component_single_decode_enabled =
         cli.batch_size == 1 && params.use_4b_kernel && cli.force_component_decode;
@@ -1557,23 +1472,25 @@ fn main() -> Result<()> {
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
     if replay_decode_enabled {
-        if backend == Backend::Metal {
-            eprintln!("[decode] Metal v1 replays native prefill for each decode step");
+        if cuda_qwen2b_replay_default {
+            eprintln!(
+                "[decode] single-sequence CUDA qwen3.5-2b uses replayed GPU prefill for correctness"
+            );
         } else {
             eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
         }
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
-        eprintln!("[decode] experimental single-sequence KV-FP8 uses replayed GPU prefill for correctness");
-    } else if replay_kv_fp8_enabled && cli.batch_size > 1 {
-        eprintln!("[decode] experimental batched KV-FP8 rebuilds state from replayed GPU prefill each step");
+        eprintln!("[decode] single-sequence CUDA KV-FP8 uses replayed GPU prefill for correctness");
+    } else if cli.batch_size > 1 && params.use_4b_kernel && cli.kv_fp8 {
+        eprintln!("[decode] batched CUDA KV-FP8 uses the persistent kernel path");
     } else if component_single_decode_enabled {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the component decode path");
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.force_kernel_decode {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
     } else if cli.batch_size == 1 && params.use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] WARNING: experimental single-sequence KV-FP8 uses the b=1 kernel path");
+        eprintln!("[decode] WARNING: single-sequence CUDA KV-FP8 uses the b=1 kernel path");
     } else if cuda_08b_hero_enabled {
-        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled (fused lm_head argmax)");
+        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
     } else if cuda_fast_greedy_enabled {
         eprintln!("[decode] CUDA fast greedy sampling enabled for the non-4B native decode path");
     }
@@ -1708,10 +1625,7 @@ fn main() -> Result<()> {
                 (logits, Some(timings))
             } else {
                 // Batched decode
-                (
-                    engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?,
-                    None,
-                )
+                (engine.decode_step_batch(&batch_next_tokens, seqlen_offset)?, None)
             };
             if let Some(timings) = batch_timings {
                 native_decode_timings.add_assign(timings);
@@ -1725,9 +1639,7 @@ fn main() -> Result<()> {
                 if step < oracle.decode_logits.len() {
                     let oracle_logits = &oracle.decode_logits[step];
                     let delta = validate::max_abs_delta(logits, oracle_logits);
-                    if delta > max_delta {
-                        max_delta = delta;
-                    }
+                    if delta > max_delta { max_delta = delta; }
                     eprintln!(
                         "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} batch_size={}",
                         cli.batch_size
@@ -1768,35 +1680,30 @@ fn main() -> Result<()> {
         } else {
             // Single-sequence decode (original path)
             let mut maybe_fast_token = None;
-            let replay_token_ids = replay_decode_enabled.then(|| {
-                prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect::<Vec<_>>()
-            });
+            let mut can_rescore_with_normed = false;
             let logits = if cuda_fast_greedy_enabled {
-                let (token, timings) =
-                    engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
+                let (token, timings) = engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if cuda_08b_hero_enabled {
-                let (token, timings) =
-                    engine.decode_step_cuda_08b_hero(next_token, seqlen_offset)?;
+                let (token, timings) = engine.decode_step_cuda_08b_hero(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if replay_decode_enabled {
+                let token_ids: Vec<u32> = prompt_ids
+                    .iter()
+                    .copied()
+                    .chain(generated_ids.iter().copied())
+                    .chain(std::iter::once(next_token))
+                    .collect();
                 prefill_engine::gpu_reference_replay_step(
                     &engine.weights(),
                     &engine.rotary(),
-                    replay_token_ids
-                        .as_ref()
-                        .expect("replay token ids are present when replay decode is enabled"),
+                    &token_ids,
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
@@ -1828,11 +1735,8 @@ fn main() -> Result<()> {
                     )?;
                 }
                 if let Some(trace_layer) = cli.trace_component_input_layer {
-                    let (logits, hidden_trace) = engine.component_decode_step_4b_traced(
-                        next_token,
-                        seqlen_offset,
-                        trace_layer,
-                    )?;
+                    let (logits, hidden_trace) =
+                        engine.component_decode_step_4b_traced(next_token, seqlen_offset, trace_layer)?;
                     trace_component_input_layer(
                         &engine,
                         &hidden_trace,
@@ -1851,11 +1755,8 @@ fn main() -> Result<()> {
                     )?;
                     logits
                 } else if let Some(trace_layer) = cli.trace_component_layer {
-                    let (logits, layer_trace) = engine.component_decode_step_4b_trace_layer(
-                        next_token,
-                        seqlen_offset,
-                        trace_layer,
-                    )?;
+                    let (logits, layer_trace) =
+                        engine.component_decode_step_4b_trace_layer(next_token, seqlen_offset, trace_layer)?;
                     trace_component_layer(
                         &engine,
                         trace_layer,
@@ -1875,11 +1776,7 @@ fn main() -> Result<()> {
                     logits
                 } else if let Some(trace_layer) = cli.trace_component_linear_layer {
                     let (logits, linear_trace) = engine
-                        .component_decode_step_4b_trace_linear_layer(
-                            next_token,
-                            seqlen_offset,
-                            trace_layer,
-                        )?;
+                        .component_decode_step_4b_trace_linear_layer(next_token, seqlen_offset, trace_layer)?;
                     trace_component_linear_layer(
                         &engine,
                         trace_layer,
@@ -1950,120 +1847,93 @@ fn main() -> Result<()> {
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
+                if let Some(trace_layer) = cli.trace_persistent_full_attn_layer {
+                    let trace_token_ids: Vec<u32> = prompt_ids
+                        .iter()
+                        .copied()
+                        .chain(generated_ids.iter().copied())
+                        .chain(std::iter::once(next_token))
+                        .collect();
+                    trace_persistent_full_attn_layer(
+                        &mut engine,
+                        trace_layer,
+                        trace_token_ids.as_slice(),
+                        &[next_token],
+                        seqlen_offset,
+                        ordinal,
+                        params.kv_chunk_size,
+                        cli.prefill_chunk_size,
+                        params.use_4b_kernel,
+                    )?;
+                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
+                }
+                if let Some(trace_layer) = cli.trace_persistent_linear_layer {
+                    let trace_token_ids: Vec<u32> = prompt_ids
+                        .iter()
+                        .copied()
+                        .chain(generated_ids.iter().copied())
+                        .chain(std::iter::once(next_token))
+                        .collect();
+                    trace_persistent_linear_layer(
+                        &mut engine,
+                        trace_layer,
+                        trace_token_ids.as_slice(),
+                        &[next_token],
+                        seqlen_offset,
+                        ordinal,
+                        params.kv_chunk_size,
+                        cli.prefill_chunk_size,
+                        params.use_4b_kernel,
+                    )?;
+                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
+                }
                 if cli.emit_stage_timings {
-                    let (logits, timings) = engine
-                        .decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
+                    let (logits, timings) =
+                        engine.decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
                     native_decode_timings.add_assign(timings);
                     native_decode_timing_steps += 1;
+                    can_rescore_with_normed = true;
                     logits
                 } else {
-                    engine
-                        .decode_step_batch(&[next_token], seqlen_offset)?
-                        .remove(0)
+                    can_rescore_with_normed = true;
+                    engine.decode_step_batch(&[next_token], seqlen_offset)?.remove(0)
                 }
             } else if cli.emit_stage_timings {
-                let (logits, timings) =
-                    engine.decode_step_with_timings(next_token, seqlen_offset)?;
+                let (logits, timings) = engine.decode_step_with_timings(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
+                can_rescore_with_normed = true;
                 logits
             } else {
+                can_rescore_with_normed = true;
                 engine.decode_step(next_token, seqlen_offset)?
             };
-            let native_token =
-                maybe_fast_token.unwrap_or_else(|| DecodeEngine::greedy_sample(&logits));
+            let native_token = if let Some(token) = maybe_fast_token {
+                token
+            } else {
+                let normed = if can_rescore_with_normed && allow_host_lm_head_rescore {
+                    Some(engine.last_normed_host_f32()?)
+                } else {
+                    None
+                };
+                sample_qwen_logits_with_rescore(
+                    &logits,
+                    normed.as_deref(),
+                    host_lm_head_rescorer
+                        .as_ref()
+                        .filter(|_| allow_host_lm_head_rescore),
+                )?
+            };
 
             if let Some(ref oracle) = oracle_output {
                 if step < oracle.decode_logits.len() {
                     let oracle_logits = &oracle.decode_logits[step];
                     let delta = validate::max_abs_delta(&logits, oracle_logits);
-                    if delta > max_delta {
-                        max_delta = delta;
-                    }
+                    if delta > max_delta { max_delta = delta; }
                     eprintln!(
                         "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
                     );
                 }
-            }
-
-            if cli.trace_replay_decode_step == Some(step) {
-                let trace_token_ids = replay_token_ids.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "--trace-replay-decode-step requires replay-prefill decode for this run"
-                    )
-                })?;
-                let mut replay_state = ModelState::new(&engine.weights().config, ordinal)
-                    .map_err(|e| anyhow::anyhow!("replay trace model state init: {e}"))?;
-                let replay_trace = prefill_engine::prefill(
-                    engine.weights(),
-                    &mut replay_state,
-                    engine.rotary(),
-                    trace_token_ids,
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    false,
-                    params.use_4b_kernel,
-                    true,
-                    trace_prefill_linear_layer,
-                    trace_prefill_full_layer,
-                    trace_prefill_mlp_layer,
-                )?;
-                let replay_oracle = oracle::run_oracle(
-                    &oracle_script,
-                    &oracle_model_id,
-                    trace_token_ids,
-                    0,
-                    &cli.oracle_dtype,
-                    &oracle_device,
-                    true,
-                    fp8_oracle_dir.as_deref(),
-                    None,
-                )?;
-                let replay_qwen_trace = match oracle::run_qwen35_trace_oracle(
-                    &qwen35_trace_script,
-                    &oracle_model_id,
-                    trace_token_ids,
-                    0,
-                    &cli.oracle_dtype,
-                    &oracle_device,
-                    trace_prefill_linear_layer,
-                    trace_prefill_full_layer,
-                    trace_prefill_mlp_layer,
-                    None,
-                ) {
-                    Ok(trace) => Some(trace),
-                    Err(err) => {
-                        eprintln!("[trace-replay] qwen35_trace_unavailable: {err}");
-                        None
-                    }
-                };
-                let replay_trace_bundle: NativePrefillTraceBundle = (
-                    replay_trace.final_norm_trace,
-                    replay_trace.layer_attn_trace,
-                    replay_trace.layer_post_attn_norm_trace,
-                    replay_trace.layer_mlp_out_trace,
-                    replay_trace.layer_hidden_trace,
-                );
-                let replay_delta = validate::max_abs_delta(&logits, &replay_oracle.prefill_logits);
-                eprintln!(
-                    "[trace-replay] step={step} seq_off={seqlen_offset} prefill_logit_delta={replay_delta:.4}"
-                );
-                emit_qwen35_trace_report(
-                    &engine,
-                    "trace-replay",
-                    trace_prefill_linear_layer,
-                    trace_prefill_full_layer,
-                    trace_prefill_mlp_layer,
-                    &logits,
-                    Some(&replay_trace_bundle),
-                    replay_trace.linear_debug_trace.as_ref(),
-                    replay_trace.layer3_full_attn_trace.as_ref(),
-                    replay_trace.mlp_debug_trace.as_ref(),
-                    &replay_oracle,
-                    replay_qwen_trace.as_ref(),
-                    None,
-                )?;
             }
 
             if gpu_validate_enabled {
@@ -2084,14 +1954,8 @@ fn main() -> Result<()> {
                 )?;
                 let delta = validate::max_abs_delta(&logits, &gpu_logits);
                 let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
-                let token_match = if gpu_token == native_token {
-                    ""
-                } else {
-                    " MISMATCH"
-                };
-                if delta > gpu_max_delta {
-                    gpu_max_delta = delta;
-                }
+                let token_match = if gpu_token == native_token { "" } else { " MISMATCH" };
+                if delta > gpu_max_delta { gpu_max_delta = delta; }
                 eprintln!(
                     "[gpu-validate] step={step} seq_off={seqlen_offset} delta={delta:.4} native_token={native_token} gpu_token={gpu_token}{token_match}"
                 );
@@ -2119,6 +1983,7 @@ fn main() -> Result<()> {
                 )?;
             }
         }
+
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -2193,13 +2058,17 @@ fn run_gemma4(
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {
         anyhow::bail!("Gemma 4 does not yet support --fp8-runtime / --kv-fp8");
     }
     if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
-        anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
+        anyhow::bail!(
+            "--batch-size must be 1..{}",
+            kernel_ffi::MAX_BATCH_SIZE
+        );
     }
     if cli.oracle_prefill || cli.gpu_validate {
         anyhow::bail!("Gemma 4 does not yet support --oracle-prefill / --gpu-validate");
@@ -2243,8 +2112,16 @@ fn run_gemma4(
     );
 
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = load_tokenizer(&tokenizer_path)?;
-    let prompt_ids = resolve_prompt_token_ids(cli, &tokenizer)?;
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
+    if prompt_ids.is_empty() {
+        anyhow::bail!("empty prompt after tokenization");
+    }
 
     let context_tokens = cli
         .context_size
@@ -2313,10 +2190,7 @@ fn run_gemma4(
                 &canonical_model,
                 &target,
             ) {
-                Ok(true) => eprintln!(
-                    "[fetch] installed Gemma 4 INT4 bake at {}",
-                    target.display()
-                ),
+                Ok(true) => eprintln!("[fetch] installed Gemma 4 INT4 bake at {}", target.display()),
                 Ok(false) => {
                     anyhow::bail!(
                         "No INT4 bake at {} and --no-download set.\nRun on a bigger machine:\n  python oracle/bake_int4_gemma4.py --model-dir {}",
@@ -2354,11 +2228,6 @@ fn run_gemma4(
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     let oracle_output = if cli.validate {
-        if cli.prompt_ids.is_some() {
-            anyhow::bail!(
-                "Gemma 4 validation does not support --prompt-ids yet; use --prompt or disable --validate"
-            );
-        }
         let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(|p| p.parent())
@@ -2367,7 +2236,7 @@ fn run_gemma4(
         let oracle = oracle::run_gemma4_oracle(
             &oracle_script,
             &cli.model_dir,
-            cli.prompt.as_deref().unwrap_or_default(),
+            &cli.prompt,
             cli.max_new_tokens,
             &cli.oracle_dtype,
         )?;
@@ -2579,8 +2448,6 @@ fn trace_kv_cache(
         use_4b_kernel,
         false,
         None,
-        None,
-        None,
     )?;
 
     for batch_index in 0..batch_size {
@@ -2650,3045 +2517,10 @@ struct KvFp8LayerDiff {
     first_v_mismatch: Option<(usize, usize, usize, u8, u8)>,
 }
 
-fn emit_qwen35_trace_report(
-    engine: &DecodeEngine,
-    tag: &str,
-    trace_linear_layer: Option<usize>,
-    trace_full_layer: Option<usize>,
-    trace_mlp_layer: Option<usize>,
-    native_logits: &[f32],
-    native_prefill_trace: Option<&NativePrefillTraceBundle>,
-    native_linear_debug_trace: Option<&prefill_engine::LinearLayerDebugTrace>,
-    native_layer3_full_attn_trace: Option<&prefill_engine::Layer3FullAttentionTrace>,
-    native_mlp_debug_trace: Option<&prefill_engine::MlpLayerDebugTrace>,
-    oracle_output: &oracle::OracleOutput,
-    qwen35_trace_output: Option<&oracle::Qwen35TraceOutput>,
-    trace_prefill_position: Option<usize>,
-) -> Result<()> {
-    emit_qwen35_trace_report_with_offset(
-        engine,
-        tag,
-        0,
-        trace_linear_layer,
-        trace_full_layer,
-        trace_mlp_layer,
-        native_logits,
-        native_prefill_trace,
-        native_linear_debug_trace,
-        native_layer3_full_attn_trace,
-        native_mlp_debug_trace,
-        oracle_output,
-        qwen35_trace_output,
-        trace_prefill_position,
-    )
-}
-
-fn emit_qwen35_trace_report_with_offset(
-    engine: &DecodeEngine,
-    tag: &str,
-    layer_offset: usize,
-    trace_linear_layer: Option<usize>,
-    trace_full_layer: Option<usize>,
-    trace_mlp_layer: Option<usize>,
-    native_logits: &[f32],
-    native_prefill_trace: Option<&NativePrefillTraceBundle>,
-    native_linear_debug_trace: Option<&prefill_engine::LinearLayerDebugTrace>,
-    native_layer3_full_attn_trace: Option<&prefill_engine::Layer3FullAttentionTrace>,
-    native_mlp_debug_trace: Option<&prefill_engine::MlpLayerDebugTrace>,
-    oracle_output: &oracle::OracleOutput,
-    qwen35_trace_output: Option<&oracle::Qwen35TraceOutput>,
-    trace_prefill_position: Option<usize>,
-) -> Result<()> {
-    let linear_tag = format!("{tag}-linear");
-    let full_tag = format!("{tag}-full");
-    let mlp_tag = format!("{tag}-mlp");
-
-    if let Some(position) = trace_prefill_position {
-        eprintln!(
-            "[{tag}] trace_position={position} layer_hidden/debug traces target this prompt position; unlabeled final-norm/logit lines still describe the last prompt token"
-        );
-    }
-
-    if let Some(position) = trace_prefill_position {
-        if let (Some((_, _, _, _, native_layer_trace)), Some(trace)) =
-            (native_prefill_trace, qwen35_trace_output)
-        {
-            if let (Some(native_final_hidden), Some(oracle_final_hidden)) = (
-                native_layer_trace.as_ref().and_then(|trace| trace.last()),
-                trace
-                    .decoder_layer_outputs
-                    .last()
-                    .and_then(|value| flatten_token_bsd(value, Some(position))),
-            ) {
-                let native_final_hidden = decode_bf16_le(native_final_hidden);
-                let (
-                    final_hidden_idx,
-                    final_hidden_native,
-                    final_hidden_oracle,
-                    final_hidden_delta,
-                ) = max_abs_delta_details(&native_final_hidden, &oracle_final_hidden);
-                eprintln!(
-                    "[{tag}] position={} final_hidden_delta={final_hidden_delta:.4}",
-                    position
-                );
-                eprintln!(
-                    "[{tag}] position={} final_hidden_max idx={final_hidden_idx} native={final_hidden_native:.4} oracle={final_hidden_oracle:.4}",
-                    position
-                );
-
-                let native_final_norm =
-                    compute_qwen_final_norm_from_hidden_row(engine, &native_final_hidden)?;
-                let oracle_final_norm = if let Some(actual) = qwen35_trace_output
-                    .and_then(|trace| trace.trace_position_prefill_final_norm_output.as_ref())
-                    .and_then(flatten_json_vector)
-                {
-                    actual
-                } else {
-                    compute_qwen_final_norm_from_hidden_row(engine, &oracle_final_hidden)?
-                };
-                let (final_norm_idx, final_norm_native, final_norm_oracle, final_norm_delta) =
-                    max_abs_delta_details(&native_final_norm, &oracle_final_norm);
-                eprintln!(
-                    "[{tag}] position={} final_norm_from_hidden_delta={final_norm_delta:.4}",
-                    position
-                );
-                eprintln!(
-                    "[{tag}] position={} final_norm_from_hidden_max idx={final_norm_idx} native={final_norm_native:.4} oracle={final_norm_oracle:.4}",
-                    position
-                );
-
-                let native_hidden_logits =
-                    compute_qwen_logits_from_hidden_row(engine, &native_final_hidden)?;
-                let oracle_hidden_logits = if let Some(actual) = qwen35_trace_output
-                    .and_then(|trace| trace.trace_position_prefill_logits.as_ref())
-                    .and_then(flatten_json_vector)
-                {
-                    actual
-                } else {
-                    compute_qwen_logits_from_hidden_row(engine, &oracle_final_hidden)?
-                };
-                let (
-                    hidden_logit_idx,
-                    hidden_logit_native,
-                    hidden_logit_oracle,
-                    hidden_logit_delta,
-                ) = max_abs_delta_details(&native_hidden_logits, &oracle_hidden_logits);
-                eprintln!(
-                    "[{tag}] position={} final_hidden_logit_delta={hidden_logit_delta:.4}",
-                    position
-                );
-                eprintln!(
-                    "[{tag}] position={} final_hidden_logit_max idx={hidden_logit_idx} native={hidden_logit_native:.4} oracle={hidden_logit_oracle:.4}",
-                    position
-                );
-                eprintln!(
-                    "[{tag}] position={} final_hidden_native_top_logits={}",
-                    position,
-                    format_top_logits(&top_logits(&native_hidden_logits, 5))
-                );
-                eprintln!(
-                    "[{tag}] position={} final_hidden_oracle_top_logits={}",
-                    position,
-                    format_top_logits(&top_logits(&oracle_hidden_logits, 5))
-                );
-                let top_dims = logit_row_top_delta_dims(
-                    &native_final_norm,
-                    &oracle_final_norm,
-                    &engine.weights().lm_head,
-                    engine.ordinal(),
-                    hidden_logit_idx,
-                    6,
-                )?;
-                eprintln!(
-                    "[{tag}] position={} final_hidden_logit_row_detail idx={hidden_logit_idx} top_dims={}",
-                    position,
-                    format_logit_row_dims(&top_dims)
-                );
-            }
-        }
-    } else if let (Some((_, _, _, _, native_layer_trace)), Some(oracle_layer_trace)) = (
-        native_prefill_trace,
-        oracle_output.layer_hidden_states.as_ref(),
-    ) {
-        if let Some(native_layer_trace) = native_layer_trace.as_ref() {
-            if let (Some(native_final_hidden), Some(oracle_final_hidden_b64)) =
-                (native_layer_trace.last(), oracle_layer_trace.last())
-            {
-                let b64 = base64::engine::general_purpose::STANDARD;
-                let oracle_final_hidden_bytes = b64
-                    .decode(oracle_final_hidden_b64)
-                    .map_err(|e| anyhow::anyhow!("decode oracle final layer_hidden_states: {e}"))?;
-                let native_final_hidden = decode_bf16_le(native_final_hidden);
-                let oracle_final_hidden = decode_bf16_le(&oracle_final_hidden_bytes);
-                let (
-                    final_hidden_idx,
-                    final_hidden_native,
-                    final_hidden_oracle,
-                    final_hidden_delta,
-                ) = max_abs_delta_details(&native_final_hidden, &oracle_final_hidden);
-                eprintln!("[{tag}] final_hidden_delta={final_hidden_delta:.4}");
-                eprintln!(
-                    "[{tag}] final_hidden_mae={:.9e}",
-                    mean_abs_delta(&native_final_hidden, &oracle_final_hidden)
-                );
-                eprintln!(
-                    "[{tag}] final_hidden_mse={:.9e}",
-                    mean_square_delta(&native_final_hidden, &oracle_final_hidden)
-                );
-                eprintln!(
-                    "[{tag}] final_hidden_max idx={final_hidden_idx} native={final_hidden_native:.4} oracle={final_hidden_oracle:.4}"
-                );
-            }
-        }
-    }
-
-    if let (Some((native_final_norm_trace, ..)), Some(oracle_final_norm_b64)) =
-        (native_prefill_trace, oracle_output.prefill_hidden.as_ref())
-    {
-        if let Some(native_final_norm_trace) = native_final_norm_trace.as_ref() {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let oracle_final_norm_bytes = b64
-                .decode(oracle_final_norm_b64)
-                .map_err(|e| anyhow::anyhow!("decode oracle prefill_hidden: {e}"))?;
-            let native_final_norm = decode_bf16_le(native_final_norm_trace);
-            let oracle_final_norm = decode_bf16_le(&oracle_final_norm_bytes);
-            let (final_norm_idx, final_norm_native, final_norm_oracle, final_norm_delta) =
-                max_abs_delta_details(&native_final_norm, &oracle_final_norm);
-            eprintln!("[{tag}] final_norm_delta={final_norm_delta:.4}");
-            eprintln!(
-                "[{tag}] final_norm_mae={:.9e}",
-                mean_abs_delta(&native_final_norm, &oracle_final_norm)
-            );
-            eprintln!(
-                "[{tag}] final_norm_mse={:.9e}",
-                mean_square_delta(&native_final_norm, &oracle_final_norm)
-            );
-            eprintln!(
-                "[{tag}] final_norm_max idx={final_norm_idx} native={final_norm_native:.4} oracle={final_norm_oracle:.4}"
-            );
-            if let (Some((_, _, _, _, native_layer_trace)), Some(oracle_layer_trace)) = (
-                native_prefill_trace,
-                oracle_output.layer_hidden_states.as_ref(),
-            ) {
-                if let Some(native_layer_trace) = native_layer_trace.as_ref() {
-                    if let (Some(native_final_hidden_bytes), Some(oracle_final_hidden_b64)) =
-                        (native_layer_trace.last(), oracle_layer_trace.last())
-                    {
-                        let oracle_final_hidden_bytes =
-                            b64.decode(oracle_final_hidden_b64).map_err(|e| {
-                                anyhow::anyhow!(
-                                    "decode oracle final layer hidden for rms detail: {e}"
-                                )
-                            })?;
-                        let native_final_hidden = decode_bf16_le(native_final_hidden_bytes);
-                        let oracle_final_hidden = decode_bf16_le(&oracle_final_hidden_bytes);
-                        let native_mean_sq = mean_square(&native_final_hidden);
-                        let oracle_mean_sq = mean_square(&oracle_final_hidden);
-                        let native_inv_rms = 1.0f32
-                            / (native_mean_sq + engine.weights().config.rms_norm_eps as f32).sqrt();
-                        let oracle_inv_rms = 1.0f32
-                            / (oracle_mean_sq + engine.weights().config.rms_norm_eps as f32).sqrt();
-                        let scale =
-                            read_weight_element_f32(&engine.weights().norm_weight, final_norm_idx)?
-                                + 1.0;
-                        eprintln!(
-                            "[{tag}] final_norm_detail idx={final_norm_idx} hidden_native={:.4} hidden_oracle={:.4} inv_rms_native={native_inv_rms:.6} inv_rms_oracle={oracle_inv_rms:.6} scale={scale:.4}",
-                            native_final_hidden[final_norm_idx],
-                            oracle_final_hidden[final_norm_idx],
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    let (logit_idx, native_logit, oracle_logit, logit_delta) =
-        max_abs_delta_details(native_logits, &oracle_output.prefill_logits);
-    eprintln!("[{tag}] logit_max_delta={logit_delta:.4}");
-    eprintln!(
-        "[{tag}] logit_mae={:.9e}",
-        mean_abs_delta(native_logits, &oracle_output.prefill_logits)
-    );
-    eprintln!(
-        "[{tag}] logit_mse={:.9e}",
-        mean_square_delta(native_logits, &oracle_output.prefill_logits)
-    );
-    eprintln!(
-        "[{tag}] logit_max idx={logit_idx} native={native_logit:.4} oracle={oracle_logit:.4}"
-    );
-    let native_top = top_logits(native_logits, 5);
-    let oracle_top = top_logits(&oracle_output.prefill_logits, 5);
-    eprintln!(
-        "[{tag}] native_top_logits={}",
-        format_top_logits(&native_top)
-    );
-    eprintln!(
-        "[{tag}] oracle_top_logits={}",
-        format_top_logits(&oracle_top)
-    );
-    let mut tracked_logit_dims: Option<Vec<usize>> = None;
-    let top_logit_deltas = top_abs_delta_dims(native_logits, &oracle_output.prefill_logits, 3);
-    eprintln!(
-        "[{tag}] top_logit_deltas={}",
-        format_top_delta_dims(&top_logit_deltas)
-    );
-    if let (Some((native_final_norm_trace, ..)), Some(oracle_final_norm_b64)) =
-        (native_prefill_trace, oracle_output.prefill_hidden.as_ref())
-    {
-        if let Some(native_final_norm_trace) = native_final_norm_trace.as_ref() {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let oracle_final_norm_bytes = b64.decode(oracle_final_norm_b64).map_err(|e| {
-                anyhow::anyhow!("decode oracle prefill_hidden for logit detail: {e}")
-            })?;
-            let native_final_norm = decode_bf16_le(native_final_norm_trace);
-            let oracle_final_norm = decode_bf16_le(&oracle_final_norm_bytes);
-            for (rank, (row_idx, _, _, _)) in top_logit_deltas.iter().enumerate() {
-                let top_dims = logit_row_top_delta_dims(
-                    &native_final_norm,
-                    &oracle_final_norm,
-                    &engine.weights().lm_head,
-                    engine.ordinal(),
-                    *row_idx,
-                    6,
-                )?;
-                eprintln!(
-                    "[{tag}] logit_row_detail rank={rank} idx={row_idx} top_dims={}",
-                    format_logit_row_dims(&top_dims)
-                );
-            }
-            let aggregate_dims = aggregate_logit_row_delta_dims(
-                &native_final_norm,
-                &oracle_final_norm,
-                &engine.weights().lm_head,
-                engine.ordinal(),
-                &top_logit_deltas
-                    .iter()
-                    .map(|(row_idx, _, _, _)| *row_idx)
-                    .collect::<Vec<_>>(),
-                6,
-            )?;
-            eprintln!(
-                "[{tag}] logit_dim_aggregate rows={} top_dims={}",
-                top_logit_deltas
-                    .iter()
-                    .map(|(row_idx, _, _, delta)| format!("{row_idx}:{delta:.4}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
-                format_aggregate_logit_dims(&aggregate_dims)
-            );
-            tracked_logit_dims = Some(aggregate_dims.iter().map(|(dim, ..)| *dim).collect());
-            eprintln!(
-                "[{tag}] tracked_logit_dims={}",
-                tracked_logit_dims
-                    .as_ref()
-                    .map(|dims| {
-                        dims.iter()
-                            .map(|dim| dim.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_default()
-            );
-        }
-    }
-
-    if let Some(position) = trace_prefill_position {
-        if let (Some((_, _, _, _, native_layer_trace)), Some(trace)) =
-            (native_prefill_trace, qwen35_trace_output)
-        {
-            if let Some(native_layer_trace) = native_layer_trace.as_ref() {
-                let mut first_bad = None;
-                for rel_layer in 0..native_layer_trace.len() {
-                    let layer = layer_offset + rel_layer;
-                    let Some(oracle_layer_f32) = trace
-                        .decoder_layer_outputs
-                        .get(layer)
-                        .and_then(|value| flatten_token_bsd(value, Some(position)))
-                    else {
-                        break;
-                    };
-                    let native_layer_f32 = decode_bf16_le(&native_layer_trace[rel_layer]);
-                    let layer_delta = validate::max_abs_delta(&native_layer_f32, &oracle_layer_f32);
-                    let layer_kind = qwen35_layer_kind_label(&engine.weights().config, layer);
-                    if first_bad.is_none() && layer_delta > 0.5 {
-                        first_bad = Some((layer, layer_delta));
-                    }
-                    eprintln!(
-                        "[{tag}] position={} layer={} kind={} layer_delta={layer_delta:.4}",
-                        position, layer, layer_kind
-                    );
-                }
-                if let Some((layer, layer_delta)) = first_bad {
-                    eprintln!(
-                        "[{tag}] first_bad_layer position={} layer={} layer_delta={layer_delta:.4}",
-                        position, layer
-                    );
-                } else {
-                    eprintln!("[{tag}] no layer exceeded delta threshold at position={position}");
-                }
-            } else {
-                eprintln!("[{tag}] missing native layer trace for position={position}");
-            }
-        } else {
-            eprintln!("[{tag}] missing native or qwen35 trace data for position={position}");
-        }
-    } else if let (
-        Some((
-            _,
-            native_attn_trace,
-            native_post_norm_trace,
-            native_mlp_out_trace,
-            native_layer_trace,
-        )),
-        Some(oracle_attn_trace),
-        Some(oracle_post_norm_trace),
-        Some(oracle_mlp_out_trace),
-        Some(oracle_layer_trace),
-    ) = (
-        native_prefill_trace,
-        oracle_output.layer_attn_residual_states.as_ref(),
-        oracle_output.layer_post_attn_norm_states.as_ref(),
-        oracle_output.layer_mlp_outputs.as_ref(),
-        oracle_output.layer_hidden_states.as_ref(),
-    ) {
-        if let (
-            Some(native_attn_trace),
-            Some(native_post_norm_trace),
-            Some(native_mlp_out_trace),
-            Some(native_layer_trace),
-        ) = (
-            native_attn_trace.as_ref(),
-            native_post_norm_trace.as_ref(),
-            native_mlp_out_trace.as_ref(),
-            native_layer_trace.as_ref(),
-        ) {
-            let b64 = base64::engine::general_purpose::STANDARD;
-            let mut first_bad = None;
-            let mut max_layer_detail: Option<(usize, f32, f32, f32, f32)> = None;
-            let mut max_post_norm_detail: Option<(usize, f32, usize, f32, f32, f32, f32, f32)> =
-                None;
-            let tracked_dim_layer_start =
-                layer_offset.max(engine.weights().config.num_hidden_layers.saturating_sub(6));
-            for rel_layer in 0..native_layer_trace.len() {
-                let layer = layer_offset + rel_layer;
-                if layer >= oracle_layer_trace.len()
-                    || layer >= oracle_attn_trace.len()
-                    || layer >= oracle_post_norm_trace.len()
-                    || layer >= oracle_mlp_out_trace.len()
-                {
-                    break;
-                }
-                let oracle_attn_bytes = b64.decode(&oracle_attn_trace[layer]).map_err(|e| {
-                    anyhow::anyhow!("decode oracle layer_attn_residual_states[{layer}]: {e}")
-                })?;
-                let oracle_post_norm_bytes =
-                    b64.decode(&oracle_post_norm_trace[layer]).map_err(|e| {
-                        anyhow::anyhow!("decode oracle layer_post_attn_norm_states[{layer}]: {e}")
-                    })?;
-                let oracle_mlp_out_bytes =
-                    b64.decode(&oracle_mlp_out_trace[layer]).map_err(|e| {
-                        anyhow::anyhow!("decode oracle layer_mlp_outputs[{layer}]: {e}")
-                    })?;
-                let oracle_layer_bytes = b64.decode(&oracle_layer_trace[layer]).map_err(|e| {
-                    anyhow::anyhow!("decode oracle layer_hidden_states[{layer}]: {e}")
-                })?;
-                let native_attn_f32 = decode_bf16_le(&native_attn_trace[rel_layer]);
-                let native_post_norm_f32 = decode_bf16_le(&native_post_norm_trace[rel_layer]);
-                let native_mlp_out_f32 = decode_bf16_le(&native_mlp_out_trace[rel_layer]);
-                let native_layer_f32 = decode_bf16_le(&native_layer_trace[rel_layer]);
-                let oracle_attn_f32 = decode_bf16_le(&oracle_attn_bytes);
-                let oracle_post_norm_f32 = decode_bf16_le(&oracle_post_norm_bytes);
-                let oracle_mlp_out_f32 = decode_bf16_le(&oracle_mlp_out_bytes);
-                let oracle_layer_f32 = decode_bf16_le(&oracle_layer_bytes);
-                let attn_delta = validate::max_abs_delta(&native_attn_f32, &oracle_attn_f32);
-                let post_norm_delta =
-                    validate::max_abs_delta(&native_post_norm_f32, &oracle_post_norm_f32);
-                let mlp_out_delta =
-                    validate::max_abs_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
-                let layer_delta = validate::max_abs_delta(&native_layer_f32, &oracle_layer_f32);
-                let attn_mae = mean_abs_delta(&native_attn_f32, &oracle_attn_f32);
-                let post_norm_mae = mean_abs_delta(&native_post_norm_f32, &oracle_post_norm_f32);
-                let mlp_out_mae = mean_abs_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
-                let layer_mae = mean_abs_delta(&native_layer_f32, &oracle_layer_f32);
-                let attn_mse = mean_square_delta(&native_attn_f32, &oracle_attn_f32);
-                let post_norm_mse = mean_square_delta(&native_post_norm_f32, &oracle_post_norm_f32);
-                let mlp_out_mse = mean_square_delta(&native_mlp_out_f32, &oracle_mlp_out_f32);
-                let layer_mse = mean_square_delta(&native_layer_f32, &oracle_layer_f32);
-                let (post_norm_idx, _, _, post_norm_max_delta) =
-                    max_abs_delta_details(&native_post_norm_f32, &oracle_post_norm_f32);
-                let native_mean_sq = mean_square(&native_attn_f32);
-                let oracle_mean_sq = mean_square(&oracle_attn_f32);
-                let native_inv_rms =
-                    1.0f32 / (native_mean_sq + engine.weights().config.rms_norm_eps as f32).sqrt();
-                let oracle_inv_rms =
-                    1.0f32 / (oracle_mean_sq + engine.weights().config.rms_norm_eps as f32).sqrt();
-                let scale = read_weight_element_f32(
-                    &engine.weights().layers[layer].post_attn_norm_w,
-                    post_norm_idx,
-                )? + 1.0;
-                if max_post_norm_detail
-                    .as_ref()
-                    .map(|(_, delta, _, _, _, _, _, _)| post_norm_max_delta > *delta)
-                    .unwrap_or(true)
-                {
-                    max_post_norm_detail = Some((
-                        layer,
-                        post_norm_max_delta,
-                        post_norm_idx,
-                        native_attn_f32[post_norm_idx],
-                        oracle_attn_f32[post_norm_idx],
-                        native_inv_rms,
-                        oracle_inv_rms,
-                        scale,
-                    ));
-                }
-                if max_layer_detail
-                    .as_ref()
-                    .map(|(_, _, _, _, max_layer_delta)| layer_delta > *max_layer_delta)
-                    .unwrap_or(true)
-                {
-                    max_layer_detail = Some((
-                        layer,
-                        attn_delta,
-                        post_norm_delta,
-                        mlp_out_delta,
-                        layer_delta,
-                    ));
-                }
-                if first_bad.is_none() && layer_delta > 0.5 {
-                    first_bad = Some((
-                        layer,
-                        attn_delta,
-                        post_norm_delta,
-                        mlp_out_delta,
-                        layer_delta,
-                    ));
-                }
-                eprintln!(
-                    "[{tag}] layer={layer} attn_delta={attn_delta:.4} attn_mae={attn_mae:.9e} attn_mse={attn_mse:.9e} post_norm_delta={post_norm_delta:.4} post_norm_mae={post_norm_mae:.9e} post_norm_mse={post_norm_mse:.9e} mlp_out_delta={mlp_out_delta:.4} mlp_out_mae={mlp_out_mae:.9e} mlp_out_mse={mlp_out_mse:.9e} layer_delta={layer_delta:.4} layer_mae={layer_mae:.9e} layer_mse={layer_mse:.9e}"
-                );
-                if let Some(dims) = tracked_logit_dims.as_ref() {
-                    if layer >= tracked_dim_layer_start {
-                        eprintln!(
-                            "[{tag}] tracked_dims layer={layer} dims={}",
-                            format_tracked_stage_dim_deltas(
-                                dims,
-                                &native_attn_f32,
-                                &oracle_attn_f32,
-                                &native_post_norm_f32,
-                                &oracle_post_norm_f32,
-                                &native_mlp_out_f32,
-                                &oracle_mlp_out_f32,
-                                &native_layer_f32,
-                                &oracle_layer_f32,
-                            )
-                        );
-                    }
-                }
-            }
-            if let Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta)) =
-                first_bad
-            {
-                eprintln!(
-                    "[{tag}] first_bad_layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
-                );
-            } else {
-                eprintln!("[{tag}] no layer exceeded delta threshold");
-            }
-            if let Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta)) =
-                max_layer_detail
-            {
-                eprintln!(
-                    "[{tag}] max_layer_detail layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}"
-                );
-            }
-            if let Some((
-                layer,
-                post_norm_delta,
-                idx,
-                hidden_native,
-                hidden_oracle,
-                native_inv_rms,
-                oracle_inv_rms,
-                scale,
-            )) = max_post_norm_detail
-            {
-                eprintln!(
-                    "[{tag}] max_post_norm_detail layer={layer} idx={idx} post_norm_delta={post_norm_delta:.4} hidden_native={hidden_native:.4} hidden_oracle={hidden_oracle:.4} inv_rms_native={native_inv_rms:.6} inv_rms_oracle={oracle_inv_rms:.6} scale={scale:.4}"
-                );
-            }
-        } else {
-            eprintln!("[{tag}] missing native attention, post-norm, mlp-out, or layer trace");
-        }
-    } else {
-        eprintln!("[{tag}] missing native or oracle layer trace data");
-    }
-
-    if let (Some(native), Some(trace)) = (native_linear_debug_trace, qwen35_trace_output) {
-        let trace_linear_layer = trace.trace_linear_layer.or(trace_linear_layer).unwrap_or(0);
-        if let (
-            Some(oracle_normed),
-            Some(oracle_qkv),
-            Some(oracle_z),
-            Some(oracle_post_conv),
-            Some(oracle_q),
-            Some(oracle_k),
-            Some(oracle_v),
-            Some(oracle_beta),
-            Some(oracle_g),
-            Some(oracle_attn),
-            Some(oracle_gated),
-            Some(oracle_proj_out),
-        ) = (
-            trace
-                .trace_linear_input_layernorm_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_qkv_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_z_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_post_conv_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_prepared_query_output
-                .as_ref()
-                .and_then(|value| flatten_token_bshd(value, trace_prefill_position)),
-            trace
-                .trace_linear_prepared_key_output
-                .as_ref()
-                .and_then(|value| flatten_token_bshd(value, trace_prefill_position)),
-            trace
-                .trace_linear_prepared_value_output
-                .as_ref()
-                .and_then(|value| flatten_token_bshd(value, trace_prefill_position)),
-            trace
-                .trace_linear_prepared_beta_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_prepared_g_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_direct_recurrent_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_norm_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_linear_token_mixer_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-        ) {
-            let native_normed = decode_bf16_le(&native.normed);
-            let native_qkv = decode_bf16_le(&native.qkv);
-            let native_z = decode_bf16_le(&native.z);
-            let native_conv_window = decode_bf16_le(&native.conv_window);
-            let native_post_conv = decode_bf16_le(&native.post_conv);
-            let native_packed = decode_f32_le(&native.packed);
-            let native_rec_apply = decode_f32_le(&native.rec_apply);
-            let native_attn = decode_bf16_le(&native.attn);
-            let native_gated = decode_bf16_le(&native.gated);
-            let native_proj_out = decode_bf16_le(&native.proj_out);
-
-            let cfg = &engine.weights().config;
-            let hidden_dim = cfg.hidden_size;
-            let nv = cfg.linear_num_value_heads;
-            let khd = cfg.linear_key_head_dim;
-            let vhd = cfg.linear_value_head_dim;
-            let key_dim = cfg.linear_num_key_heads * khd;
-            let val_dim = nv * vhd;
-            let qkv_dim = key_dim * 2 + val_dim;
-            let packed_width = 2 * khd + vhd + 2;
-            let q_scale = 1.0f32 / (khd as f32).sqrt();
-            let mut oracle_packed = vec![0.0f32; nv * packed_width];
-            if trace_linear_layer > 0 {
-                if let (Some((_, _, _, _, native_layer_trace)), Some(oracle_input_hidden)) = (
-                    native_prefill_trace,
-                    qwen35_trace_output
-                        .and_then(|trace| trace.decoder_layer_outputs.get(trace_linear_layer - 1))
-                        .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-                ) {
-                    if let Some(native_input_hidden_bytes) = native_layer_trace
-                        .as_ref()
-                        .and_then(|layers| layers.get(trace_linear_layer - 1))
-                    {
-                        let native_input_hidden = decode_bf16_le(native_input_hidden_bytes);
-                        let native_input_norm_ref = compute_qwen_rms_norm_from_hidden_row(
-                            &native_input_hidden,
-                            &engine.weights().layers[trace_linear_layer].input_norm_w,
-                            cfg.rms_norm_eps as f32,
-                        )?;
-                        let oracle_input_norm_ref = compute_qwen_rms_norm_from_hidden_row(
-                            &oracle_input_hidden,
-                            &engine.weights().layers[trace_linear_layer].input_norm_w,
-                            cfg.rms_norm_eps as f32,
-                        )?;
-                        let (
-                            native_norm_idx,
-                            native_norm_v,
-                            native_norm_ref_v,
-                            native_norm_selfcheck_delta,
-                        ) = max_abs_delta_details(&native_normed, &native_input_norm_ref);
-                        let (
-                            oracle_norm_idx,
-                            oracle_norm_v,
-                            oracle_norm_ref_v,
-                            oracle_norm_selfcheck_delta,
-                        ) = max_abs_delta_details(&oracle_normed, &oracle_input_norm_ref);
-                        let (normed_idx, normed_native, normed_oracle, normed_delta_detail) =
-                            max_abs_delta_details(&native_normed, &oracle_normed);
-                        let (hidden_idx, hidden_native, hidden_oracle, hidden_delta_detail) =
-                            max_abs_delta_details(&native_input_hidden, &oracle_input_hidden);
-                        eprintln!(
-                            "[{linear_tag}] layer={} input_norm_selfcheck native_idx={} native={:.4} ref={:.4} delta={:.4} oracle_idx={} oracle={:.4} ref_oracle={:.4} oracle_delta={:.4} native_vs_oracle={:.4}",
-                            trace_linear_layer,
-                            native_norm_idx,
-                            native_norm_v,
-                            native_norm_ref_v,
-                            native_norm_selfcheck_delta,
-                            oracle_norm_idx,
-                            oracle_norm_v,
-                            oracle_norm_ref_v,
-                            oracle_norm_selfcheck_delta,
-                            normed_delta_detail,
-                        );
-                        eprintln!(
-                            "[{linear_tag}] layer={} input_hidden_detail idx={} hidden_native={:.4} hidden_oracle={:.4} hidden_delta={:.4}",
-                            trace_linear_layer,
-                            hidden_idx,
-                            hidden_native,
-                            hidden_oracle,
-                            hidden_delta_detail,
-                        );
-                        let native_inv_rms = 1.0f32
-                            / (mean_square(&native_input_hidden) + cfg.rms_norm_eps as f32).sqrt();
-                        let oracle_inv_rms = 1.0f32
-                            / (mean_square(&oracle_input_hidden) + cfg.rms_norm_eps as f32).sqrt();
-                        let scale = read_weight_element_f32(
-                            &engine.weights().layers[trace_linear_layer].input_norm_w,
-                            normed_idx,
-                        )? + 1.0;
-                        eprintln!(
-                            "[{linear_tag}] layer={} input_norm_detail idx={} hidden_native={:.4} hidden_oracle={:.4} inv_rms_native={:.6} inv_rms_oracle={:.6} scale={:.4} normed_native={:.4} normed_oracle={:.4}",
-                            trace_linear_layer,
-                            normed_idx,
-                            native_input_hidden[normed_idx],
-                            oracle_input_hidden[normed_idx],
-                            native_inv_rms,
-                            oracle_inv_rms,
-                            scale,
-                            normed_native,
-                            normed_oracle,
-                        );
-                    }
-                }
-            }
-            for head in 0..nv {
-                let out_base = head * packed_width;
-                let q_base = head * khd;
-                let k_base = head * khd;
-                let v_base = head * vhd;
-                for i in 0..khd {
-                    oracle_packed[out_base + i] = oracle_q[q_base + i] * q_scale;
-                    oracle_packed[out_base + khd + i] = oracle_k[k_base + i];
-                }
-                for i in 0..vhd {
-                    oracle_packed[out_base + 2 * khd + i] = oracle_v[v_base + i];
-                }
-                oracle_packed[out_base + 2 * khd + vhd] = oracle_beta[head];
-                oracle_packed[out_base + 2 * khd + vhd + 1] = oracle_g[head].exp();
-            }
-            let mut q_delta = 0.0f32;
-            let mut k_delta = 0.0f32;
-            let mut v_delta = 0.0f32;
-            let direct_recurrent_delta = validate::max_abs_delta(
-                &native_rec_apply[..val_dim.min(native_rec_apply.len())],
-                &oracle_attn,
-            );
-            let conv_q_delta =
-                validate::max_abs_delta(&native_post_conv[..key_dim], &oracle_post_conv[..key_dim]);
-            let conv_k_delta = validate::max_abs_delta(
-                &native_post_conv[key_dim..key_dim * 2],
-                &oracle_post_conv[key_dim..key_dim * 2],
-            );
-            let conv_v_delta = validate::max_abs_delta(
-                &native_post_conv[key_dim * 2..key_dim * 2 + val_dim],
-                &oracle_post_conv[key_dim * 2..key_dim * 2 + val_dim],
-            );
-            if let Some(linear) = engine.weights().layers[trace_linear_layer].linear.as_ref() {
-                let qkv_w = decode_gpu_buffer_f32(&linear.qkv_proj_w)?;
-                let qkv_ref = apply_matmul_rhs_transposed_reference(
-                    &native_normed,
-                    &qkv_w,
-                    native_qkv.len(),
-                    hidden_dim,
-                )?;
-                let oracle_qkv_ref = apply_matmul_rhs_transposed_reference(
-                    &oracle_normed,
-                    &qkv_w,
-                    oracle_qkv.len(),
-                    hidden_dim,
-                )?;
-                let qkv_matmul_selfcheck_delta = validate::max_abs_delta(&native_qkv, &qkv_ref);
-                let oracle_qkv_matmul_selfcheck_delta =
-                    validate::max_abs_delta(&oracle_qkv, &oracle_qkv_ref);
-                let (idx, native_v, ref_v, delta) = max_abs_delta_details(&native_qkv, &qkv_ref);
-                eprintln!(
-                    "[{linear_tag}] layer={} qkv_matmul_selfcheck_delta={:.4} oracle_qkv_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_linear_layer,
-                    qkv_matmul_selfcheck_delta,
-                    oracle_qkv_matmul_selfcheck_delta,
-                    idx,
-                    native_v,
-                    ref_v,
-                    delta
-                );
-                let (qkv_idx, qkv_native, qkv_oracle, qkv_delta_detail) =
-                    max_abs_delta_details(&native_qkv, &oracle_qkv);
-                eprintln!(
-                    "[{linear_tag}] layer={} qkv_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_linear_layer, qkv_idx, qkv_native, qkv_oracle, qkv_delta_detail
-                );
-                let qkv_top_dims = weight_row_top_delta_dims(
-                    &native_normed,
-                    &oracle_normed,
-                    &linear.qkv_proj_w,
-                    engine.ordinal(),
-                    qkv_idx,
-                    hidden_dim,
-                    6,
-                )?;
-                eprintln!(
-                    "[{linear_tag}] layer={} qkv_row_detail idx={} top_dims={}",
-                    trace_linear_layer,
-                    qkv_idx,
-                    format_logit_row_dims(&qkv_top_dims)
-                );
-
-                let z_w = decode_gpu_buffer_f32(&linear.z_proj_w)?;
-                let z_ref = apply_matmul_rhs_transposed_reference(
-                    &native_normed,
-                    &z_w,
-                    native_z.len(),
-                    hidden_dim,
-                )?;
-                let oracle_z_ref = apply_matmul_rhs_transposed_reference(
-                    &oracle_normed,
-                    &z_w,
-                    oracle_z.len(),
-                    hidden_dim,
-                )?;
-                let z_matmul_selfcheck_delta = validate::max_abs_delta(&native_z, &z_ref);
-                let oracle_z_matmul_selfcheck_delta =
-                    validate::max_abs_delta(&oracle_z, &oracle_z_ref);
-                let (idx, native_v, ref_v, delta) = max_abs_delta_details(&native_z, &z_ref);
-                eprintln!(
-                    "[{linear_tag}] layer={} z_matmul_selfcheck_delta={:.4} oracle_z_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_linear_layer,
-                    z_matmul_selfcheck_delta,
-                    oracle_z_matmul_selfcheck_delta,
-                    idx,
-                    native_v,
-                    ref_v,
-                    delta
-                );
-                let (z_idx, z_native, z_oracle, z_delta_detail) =
-                    max_abs_delta_details(&native_z, &oracle_z);
-                eprintln!(
-                    "[{linear_tag}] layer={} z_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_linear_layer, z_idx, z_native, z_oracle, z_delta_detail
-                );
-                let z_top_dims = weight_row_top_delta_dims(
-                    &native_normed,
-                    &oracle_normed,
-                    &linear.z_proj_w,
-                    engine.ordinal(),
-                    z_idx,
-                    hidden_dim,
-                    6,
-                )?;
-                eprintln!(
-                    "[{linear_tag}] layer={} z_row_detail idx={} top_dims={}",
-                    trace_linear_layer,
-                    z_idx,
-                    format_logit_row_dims(&z_top_dims)
-                );
-
-                let conv_w = decode_gpu_buffer_f32(&linear.conv1d_w)?;
-                let conv_ref = apply_linear_conv_pack_row_reference(
-                    &native_conv_window,
-                    &conv_w,
-                    qkv_dim,
-                    cfg.linear_conv_kernel_dim,
-                )?;
-                let conv_selfcheck_delta = validate::max_abs_delta(&native_post_conv, &conv_ref);
-                let (idx, native_v, ref_v, delta) =
-                    max_abs_delta_details(&native_post_conv, &conv_ref);
-                eprintln!(
-                    "[{linear_tag}] layer={} conv_matmul_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_linear_layer,
-                    conv_selfcheck_delta,
-                    idx,
-                    native_v,
-                    ref_v,
-                    delta
-                );
-                if let (Some(_), Some(oracle_conv_window)) = (
-                    trace_prefill_position,
-                    trace.trace_linear_qkv_output.as_ref().and_then(|value| {
-                        extract_causal_conv_window_bsd(
-                            value,
-                            trace_prefill_position?,
-                            qkv_dim,
-                            cfg.linear_conv_kernel_dim,
-                        )
-                    }),
-                ) {
-                    let oracle_conv_window_delta =
-                        validate::max_abs_delta(&native_conv_window, &oracle_conv_window);
-                    let oracle_conv_ref = apply_linear_conv_pack_row_reference(
-                        &oracle_conv_window,
-                        &conv_w,
-                        qkv_dim,
-                        cfg.linear_conv_kernel_dim,
-                    )?;
-                    let oracle_conv_selfcheck_delta =
-                        validate::max_abs_delta(&oracle_post_conv, &oracle_conv_ref);
-                    let (idx, native_v, oracle_v, delta) =
-                        max_abs_delta_details(&native_conv_window, &oracle_conv_window);
-                    eprintln!(
-                        "[{linear_tag}] layer={} conv_window_delta={:.4} oracle_conv_selfcheck_delta={:.4} idx={} native={:.4} oracle={:.4} delta={:.4}",
-                        trace_linear_layer,
-                        oracle_conv_window_delta,
-                        oracle_conv_selfcheck_delta,
-                        idx,
-                        native_v,
-                        oracle_v,
-                        delta
-                    );
-                }
-
-                let norm_w = decode_gpu_buffer_f32(&linear.norm_w)?;
-                let native_gated_ref = apply_rms_norm_gated_reference(
-                    &native_attn,
-                    &native_z,
-                    &norm_w,
-                    cfg.rms_norm_eps as f32,
-                )?;
-                let oracle_gated_ref = apply_rms_norm_gated_reference(
-                    &oracle_attn,
-                    &oracle_z,
-                    &norm_w,
-                    cfg.rms_norm_eps as f32,
-                )?;
-                let (
-                    native_gated_idx,
-                    native_gated_v,
-                    native_gated_ref_v,
-                    native_gated_selfcheck_delta,
-                ) = max_abs_delta_details(&native_gated, &native_gated_ref);
-                let (
-                    oracle_gated_idx,
-                    oracle_gated_v,
-                    oracle_gated_ref_v,
-                    oracle_gated_selfcheck_delta,
-                ) = max_abs_delta_details(&oracle_gated, &oracle_gated_ref);
-                eprintln!(
-                    "[{linear_tag}] layer={} gated_selfcheck native_idx={} native={:.4} ref={:.4} delta={:.4} oracle_idx={} oracle={:.4} ref_oracle={:.4} oracle_delta={:.4} native_vs_oracle={:.4}",
-                    trace_linear_layer,
-                    native_gated_idx,
-                    native_gated_v,
-                    native_gated_ref_v,
-                    native_gated_selfcheck_delta,
-                    oracle_gated_idx,
-                    oracle_gated_v,
-                    oracle_gated_ref_v,
-                    oracle_gated_selfcheck_delta,
-                    validate::max_abs_delta(&native_gated, &oracle_gated),
-                );
-            }
-            let mut beta_delta = 0.0f32;
-            let mut gexp_delta = 0.0f32;
-            for head in 0..nv {
-                let base = head * packed_width;
-                q_delta = q_delta.max(validate::max_abs_delta(
-                    &native_packed[base..base + khd],
-                    &oracle_packed[base..base + khd],
-                ));
-                k_delta = k_delta.max(validate::max_abs_delta(
-                    &native_packed[base + khd..base + 2 * khd],
-                    &oracle_packed[base + khd..base + 2 * khd],
-                ));
-                v_delta = v_delta.max(validate::max_abs_delta(
-                    &native_packed[base + 2 * khd..base + 2 * khd + vhd],
-                    &oracle_packed[base + 2 * khd..base + 2 * khd + vhd],
-                ));
-                beta_delta = beta_delta.max(
-                    (native_packed[base + 2 * khd + vhd] - oracle_packed[base + 2 * khd + vhd])
-                        .abs(),
-                );
-                gexp_delta = gexp_delta.max(
-                    (native_packed[base + 2 * khd + vhd + 1]
-                        - oracle_packed[base + 2 * khd + vhd + 1])
-                        .abs(),
-                );
-            }
-
-            eprintln!(
-                "[{linear_tag}] layer={} normed_delta={:.4} qkv_delta={:.4} z_delta={:.4} post_conv_delta={:.4} conv_q_delta={:.4} conv_k_delta={:.4} conv_v_delta={:.4} packed_delta={:.4} q_delta={:.4} k_delta={:.4} v_delta={:.4} beta_delta={:.4} gexp_delta={:.4} direct_recurrent_delta={:.4} attn_delta={:.4} gated_delta={:.4} proj_out_delta={:.4}",
-                trace_linear_layer,
-                validate::max_abs_delta(&native_normed, &oracle_normed),
-                validate::max_abs_delta(&native_qkv, &oracle_qkv),
-                validate::max_abs_delta(&native_z, &oracle_z),
-                validate::max_abs_delta(&native_post_conv, &oracle_post_conv),
-                conv_q_delta,
-                conv_k_delta,
-                conv_v_delta,
-                validate::max_abs_delta(&native_packed, &oracle_packed),
-                q_delta,
-                k_delta,
-                v_delta,
-                beta_delta,
-                gexp_delta,
-                direct_recurrent_delta,
-                validate::max_abs_delta(&native_attn, &oracle_attn),
-                validate::max_abs_delta(&native_gated, &oracle_gated),
-                validate::max_abs_delta(&native_proj_out, &oracle_proj_out),
-            );
-        } else {
-            eprintln!(
-                "[{linear_tag}] layer={} missing flattenable qwen35 trace tensors",
-                trace_linear_layer
-            );
-        }
-    } else {
-        let layer = trace_linear_layer.unwrap_or(0);
-        eprintln!(
-            "[{linear_tag}] layer={} missing native or qwen35 trace data",
-            layer
-        );
-    }
-
-    if let (Some(native), Some(trace)) = (native_layer3_full_attn_trace, qwen35_trace_output) {
-        let trace_full_layer = trace.trace_full_layer.or(trace_full_layer).unwrap_or(3);
-        if let (
-            Some(oracle_q_and_gate),
-            Some(oracle_gate_proj),
-            Some(oracle_k_proj),
-            Some(oracle_v_proj),
-            Some(oracle_q_prepared),
-            Some(oracle_k_prepared),
-            Some(oracle_v_prepared),
-            Some(oracle_attn),
-        ) = (
-            trace
-                .trace_full_q_and_gate_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_full_gate_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_full_k_proj_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_full_v_proj_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_full_prepared_query_output
-                .as_ref()
-                .and_then(|value| flatten_token_bhsd(value, trace_prefill_position)),
-            trace
-                .trace_full_prepared_key_output
-                .as_ref()
-                .and_then(|value| flatten_token_bhsd(value, trace_prefill_position)),
-            trace
-                .trace_full_prepared_value_output
-                .as_ref()
-                .and_then(|value| flatten_token_bhsd(value, trace_prefill_position)),
-            trace
-                .trace_full_attention_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-        ) {
-            let native_input_norm = decode_bf16_le(&native.input_norm);
-            let native_q_and_gate = decode_bf16_le(&native.q_and_gate);
-            let native_q_proj = decode_bf16_le(&native.q_proj);
-            let native_gate_proj = decode_bf16_le(&native.gate_proj);
-            let native_k_proj = decode_bf16_le(&native.k_proj);
-            let native_v_proj = decode_bf16_le(&native.v_proj);
-            let native_q_prepared = decode_bf16_le(&native.q_prepared);
-            let native_k_prepared = decode_bf16_le(&native.k_prepared);
-            let native_q_rotated = decode_bf16_le(&native.q_rotated);
-            let native_k_rotated = decode_bf16_le(&native.k_rotated);
-            let native_v_prepared = decode_bf16_le(&native.v_prepared);
-            let native_attn_pregate = decode_bf16_le(&native.attn_raw);
-            let native_attn = decode_bf16_le(&native.attn_output);
-            let oracle_q_rotated = trace
-                .trace_full_rotated_query_output
-                .as_ref()
-                .and_then(|value| flatten_token_bhsd(value, trace_prefill_position));
-            let oracle_k_rotated = trace
-                .trace_full_rotated_key_output
-                .as_ref()
-                .and_then(|value| flatten_token_bhsd(value, trace_prefill_position));
-            let oracle_attn_pregate = trace
-                .trace_full_raw_attention_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position));
-            let cfg = &engine.weights().config;
-            let hidden_dim = cfg.hidden_size;
-            let num_heads = cfg.num_attention_heads;
-            let head_dim = cfg.head_dim;
-            let q_dim = num_heads * head_dim;
-            let q_proj_dim = q_dim * 2;
-            let q_and_gate_delta = validate::max_abs_delta(&native_q_and_gate, &oracle_q_and_gate);
-            let mut oracle_q_proj = vec![0.0f32; q_dim];
-            for head in 0..num_heads {
-                let src_base = head * head_dim * 2;
-                let dst_base = head * head_dim;
-                oracle_q_proj[dst_base..dst_base + head_dim]
-                    .copy_from_slice(&oracle_q_and_gate[src_base..src_base + head_dim]);
-            }
-            let q_rotated_delta = oracle_q_rotated
-                .as_ref()
-                .map(|oracle| format!("{:.4}", validate::max_abs_delta(&native_q_rotated, oracle)))
-                .unwrap_or_else(|| "n/a".to_string());
-            let k_rotated_delta = oracle_k_rotated
-                .as_ref()
-                .map(|oracle| format!("{:.4}", validate::max_abs_delta(&native_k_rotated, oracle)))
-                .unwrap_or_else(|| "n/a".to_string());
-            let attn_pregate_delta = oracle_attn_pregate
-                .as_ref()
-                .map(|oracle| {
-                    format!(
-                        "{:.4}",
-                        validate::max_abs_delta(&native_attn_pregate, oracle)
-                    )
-                })
-                .unwrap_or_else(|| "n/a".to_string());
-            eprintln!(
-                "[{full_tag}] layer={} q_and_gate_delta={:.4} q_proj_delta={:.4} gate_proj_delta={:.4} k_proj_delta={:.4} v_proj_delta={:.4} q_prepared_delta={:.4} k_prepared_delta={:.4} q_rotated_delta={} k_rotated_delta={} v_prepared_delta={:.4} attn_pregate_delta={} attn_output_delta={:.4}",
-                trace_full_layer,
-                q_and_gate_delta,
-                validate::max_abs_delta(&native_q_proj, &oracle_q_proj),
-                validate::max_abs_delta(&native_gate_proj, &oracle_gate_proj),
-                validate::max_abs_delta(&native_k_proj, &oracle_k_proj),
-                validate::max_abs_delta(&native_v_proj, &oracle_v_proj),
-                validate::max_abs_delta(&native_q_prepared, &oracle_q_prepared),
-                validate::max_abs_delta(&native_k_prepared, &oracle_k_prepared),
-                q_rotated_delta,
-                k_rotated_delta,
-                validate::max_abs_delta(&native_v_prepared, &oracle_v_prepared),
-                attn_pregate_delta,
-                validate::max_abs_delta(&native_attn, &oracle_attn),
-            );
-            if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                let q_proj_w = decode_gpu_buffer_f32(&full.q_proj_w)?;
-                let q_matmul_ref = apply_matmul_rhs_transposed_reference(
-                    &native_input_norm,
-                    &q_proj_w,
-                    q_proj_dim,
-                    hidden_dim,
-                )?;
-                let q_matmul_selfcheck_delta =
-                    validate::max_abs_delta(&native_q_and_gate, &q_matmul_ref);
-                let (idx, native_v, ref_v, delta) =
-                    max_abs_delta_details(&native_q_and_gate, &q_matmul_ref);
-                eprintln!(
-                    "[{full_tag}] layer={} q_proj_matmul_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_full_layer, q_matmul_selfcheck_delta, idx, native_v, ref_v, delta
-                );
-            }
-            {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_q_and_gate, &oracle_q_and_gate);
-                eprintln!(
-                    "[{full_tag}] layer={} q_and_gate_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-            }
-            if let Some(oracle) = oracle_q_rotated.as_ref() {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_q_rotated, oracle);
-                eprintln!(
-                    "[{full_tag}] layer={} q_rotated_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-            }
-            {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_q_prepared, &oracle_q_prepared);
-                eprintln!(
-                    "[{full_tag}] layer={} q_prepared_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-                if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                    let q_norm_w = decode_gpu_buffer_f32(&full.q_norm_w)?;
-                    let detail = rms_norm_head_detail(
-                        &native_q_proj,
-                        &oracle_q_proj,
-                        &q_norm_w,
-                        head_dim,
-                        idx,
-                    )?;
-                    eprintln!(
-                        "[{full_tag}] layer={} q_prepared_detail idx={} head={} dim={} hidden_native={:.4} hidden_oracle={:.4} inv_rms_native={:.6} inv_rms_oracle={:.6} scale={:.4}",
-                        trace_full_layer,
-                        idx,
-                        detail.head,
-                        detail.dim,
-                        detail.hidden_native,
-                        detail.hidden_oracle,
-                        detail.inv_rms_native,
-                        detail.inv_rms_oracle,
-                        detail.scale,
-                    );
-                    let q_proj_row_idx = detail.head * head_dim * 2 + detail.dim;
-                    if trace_full_layer > 0 {
-                        if let Some(oracle_input_hidden) = qwen35_trace_output
-                            .and_then(|trace| trace.decoder_layer_outputs.get(trace_full_layer - 1))
-                            .and_then(|value| flatten_token_bsd(value, trace_prefill_position))
-                        {
-                            let oracle_input_norm = compute_qwen_rms_norm_from_hidden_row(
-                                &oracle_input_hidden,
-                                &engine.weights().layers[trace_full_layer].input_norm_w,
-                                cfg.rms_norm_eps as f32,
-                            )?;
-                            let top_dims = weight_row_top_delta_dims(
-                                &native_input_norm,
-                                &oracle_input_norm,
-                                &full.q_proj_w,
-                                engine.ordinal(),
-                                q_proj_row_idx,
-                                hidden_dim,
-                                6,
-                            )?;
-                            eprintln!(
-                                "[{full_tag}] layer={} q_proj_row_detail idx={} row={} top_dims={}",
-                                trace_full_layer,
-                                idx,
-                                q_proj_row_idx,
-                                format_logit_row_dims(&top_dims)
-                            );
-                        } else {
-                            eprintln!(
-                                "[{full_tag}] layer={} q_proj_row_detail idx={} missing_oracle_input_hidden",
-                                trace_full_layer,
-                                idx,
-                            );
-                        }
-                    }
-                }
-            }
-            {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_k_prepared, &oracle_k_prepared);
-                eprintln!(
-                    "[{full_tag}] layer={} k_prepared_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-                if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                    let k_norm_w = decode_gpu_buffer_f32(&full.k_norm_w)?;
-                    let detail = rms_norm_head_detail(
-                        &native_k_proj,
-                        &oracle_k_proj,
-                        &k_norm_w,
-                        head_dim,
-                        idx,
-                    )?;
-                    eprintln!(
-                        "[{full_tag}] layer={} k_prepared_detail idx={} head={} dim={} hidden_native={:.4} hidden_oracle={:.4} inv_rms_native={:.6} inv_rms_oracle={:.6} scale={:.4}",
-                        trace_full_layer,
-                        idx,
-                        detail.head,
-                        detail.dim,
-                        detail.hidden_native,
-                        detail.hidden_oracle,
-                        detail.inv_rms_native,
-                        detail.inv_rms_oracle,
-                        detail.scale,
-                    );
-                }
-            }
-            if let Some(position) = trace_prefill_position {
-                if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                    let eps = cfg.rms_norm_eps as f32;
-                    let q_norm_w = decode_gpu_buffer_f32(&full.q_norm_w)?;
-                    let q_norm_ref = apply_rms_norm_reference(
-                        &native_q_proj,
-                        &q_norm_w,
-                        num_heads,
-                        head_dim,
-                        eps,
-                    )?;
-                    let q_norm_selfcheck_delta =
-                        validate::max_abs_delta(&native_q_prepared, &q_norm_ref);
-                    let (idx, native_v, ref_v, delta) =
-                        max_abs_delta_details(&native_q_prepared, &q_norm_ref);
-                    eprintln!(
-                        "[{full_tag}] layer={} q_norm_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                        trace_full_layer, q_norm_selfcheck_delta, idx, native_v, ref_v, delta
-                    );
-                    let num_kv_heads = cfg.num_key_value_heads;
-                    let k_norm_w = decode_gpu_buffer_f32(&full.k_norm_w)?;
-                    let k_norm_ref = apply_rms_norm_reference(
-                        &native_k_proj,
-                        &k_norm_w,
-                        num_kv_heads,
-                        head_dim,
-                        eps,
-                    )?;
-                    let k_norm_selfcheck_delta =
-                        validate::max_abs_delta(&native_k_prepared, &k_norm_ref);
-                    let (idx, native_v, ref_v, delta) =
-                        max_abs_delta_details(&native_k_prepared, &k_norm_ref);
-                    eprintln!(
-                        "[{full_tag}] layer={} k_norm_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                        trace_full_layer, k_norm_selfcheck_delta, idx, native_v, ref_v, delta
-                    );
-                }
-                let q_rope_ref = apply_rope_reference_for_position(
-                    &native_q_prepared,
-                    engine.rotary(),
-                    position,
-                    num_heads,
-                    head_dim,
-                )?;
-                let q_rope_ref_delta = validate::max_abs_delta(&native_q_rotated, &q_rope_ref);
-                let (idx, native_v, ref_v, delta) =
-                    max_abs_delta_details(&native_q_rotated, &q_rope_ref);
-                eprintln!(
-                    "[{full_tag}] layer={} q_rope_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_full_layer, q_rope_ref_delta, idx, native_v, ref_v, delta
-                );
-                let num_kv_heads = cfg.num_key_value_heads;
-                let k_rope_ref = apply_rope_reference_for_position(
-                    &native_k_prepared,
-                    engine.rotary(),
-                    position,
-                    num_kv_heads,
-                    head_dim,
-                )?;
-                let k_rope_ref_delta = validate::max_abs_delta(&native_k_rotated, &k_rope_ref);
-                let (idx, native_v, ref_v, delta) =
-                    max_abs_delta_details(&native_k_rotated, &k_rope_ref);
-                eprintln!(
-                    "[{full_tag}] layer={} k_rope_selfcheck_delta={:.4} idx={} native={:.4} ref={:.4} delta={:.4}",
-                    trace_full_layer, k_rope_ref_delta, idx, native_v, ref_v, delta
-                );
-            }
-            if let Some(oracle) = oracle_k_rotated.as_ref() {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_k_rotated, oracle);
-                eprintln!(
-                    "[{full_tag}] layer={} k_rotated_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-            }
-            if let Some(oracle) = oracle_attn_pregate.as_ref() {
-                let (idx, native_v, oracle_v, delta) =
-                    max_abs_delta_details(&native_attn_pregate, oracle);
-                eprintln!(
-                    "[{full_tag}] layer={} attn_pregate_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                    trace_full_layer, idx, native_v, oracle_v, delta
-                );
-            }
-            let (idx, native_v, oracle_v, delta) =
-                max_abs_delta_details(&native_attn, &oracle_attn);
-            eprintln!(
-                "[{full_tag}] layer={} attn_output_max idx={} native={:.4} oracle={:.4} delta={:.4}",
-                trace_full_layer, idx, native_v, oracle_v, delta
-            );
-        } else {
-            eprintln!(
-                "[{full_tag}] layer={} missing flattenable qwen35 trace tensors",
-                trace_full_layer
-            );
-        }
-    } else {
-        let layer = trace_full_layer.unwrap_or(3);
-        eprintln!(
-            "[{full_tag}] layer={} missing native or qwen35 trace data",
-            layer
-        );
-    }
-
-    if let (Some(native), Some(trace)) = (native_mlp_debug_trace, qwen35_trace_output) {
-        let trace_mlp_layer = trace.trace_mlp_layer.or(trace_mlp_layer).unwrap_or(19);
-        if let (
-            Some(oracle_post_norm),
-            Some(oracle_gate_proj),
-            Some(oracle_up_proj),
-            Some(oracle_swiglu),
-            Some(oracle_down_proj),
-        ) = (
-            trace
-                .trace_mlp_post_attention_layernorm_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_mlp_gate_proj_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_mlp_up_proj_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_mlp_activated_hidden
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-            trace
-                .trace_mlp_down_proj_output
-                .as_ref()
-                .and_then(|value| flatten_token_bsd(value, trace_prefill_position)),
-        ) {
-            let native_post_norm = decode_bf16_le(&native.post_norm);
-            let native_gate_proj = decode_bf16_le(&native.gate_proj);
-            let native_up_proj = decode_bf16_le(&native.up_proj);
-            let native_swiglu = decode_bf16_le(&native.swiglu);
-            let native_down_proj = decode_bf16_le(&native.down_proj);
-            let (post_norm_idx, post_norm_native, post_norm_oracle, post_norm_delta) =
-                max_abs_delta_details(&native_post_norm, &oracle_post_norm);
-            let (gate_proj_idx, _gate_proj_native, _gate_proj_oracle, gate_proj_delta) =
-                max_abs_delta_details(&native_gate_proj, &oracle_gate_proj);
-            let (up_proj_idx, _up_proj_native, _up_proj_oracle, up_proj_delta) =
-                max_abs_delta_details(&native_up_proj, &oracle_up_proj);
-            let (down_proj_idx, _down_proj_native, _down_proj_oracle, down_proj_delta) =
-                max_abs_delta_details(&native_down_proj, &oracle_down_proj);
-            eprintln!(
-                "[{mlp_tag}] layer={} post_norm_delta={:.4} gate_proj_delta={:.4} up_proj_delta={:.4} swiglu_delta={:.4} down_proj_delta={:.4}",
-                trace_mlp_layer,
-                post_norm_delta,
-                gate_proj_delta,
-                up_proj_delta,
-                validate::max_abs_delta(&native_swiglu, &oracle_swiglu),
-                down_proj_delta,
-            );
-            let hidden = engine.weights().config.hidden_size;
-            let (native_gate_proj_v, native_gate_proj_ref, native_gate_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &native_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].gate_proj_w,
-                    engine.ordinal(),
-                    gate_proj_idx,
-                    hidden,
-                    &native_gate_proj,
-                )?;
-            let (oracle_gate_proj_v, oracle_gate_proj_ref, oracle_gate_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &oracle_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].gate_proj_w,
-                    engine.ordinal(),
-                    gate_proj_idx,
-                    hidden,
-                    &oracle_gate_proj,
-                )?;
-            eprintln!(
-                "[{mlp_tag}] layer={} gate_proj_matmul_selfcheck idx={} native={:.4} ref={:.4} delta={:.4} oracle={:.4} ref_oracle={:.4} oracle_delta={:.4} native_vs_oracle={:.4}",
-                trace_mlp_layer,
-                gate_proj_idx,
-                native_gate_proj_v,
-                native_gate_proj_ref,
-                native_gate_proj_selfcheck,
-                oracle_gate_proj_v,
-                oracle_gate_proj_ref,
-                oracle_gate_proj_selfcheck,
-                gate_proj_delta,
-            );
-            eprintln!(
-                "[{mlp_tag}] layer={} gate_proj_row_detail idx={} top_dims={}",
-                trace_mlp_layer,
-                gate_proj_idx,
-                format_weight_row_top_delta_dims(&weight_row_top_delta_dims(
-                    &native_post_norm,
-                    &oracle_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].gate_proj_w,
-                    engine.ordinal(),
-                    gate_proj_idx,
-                    hidden,
-                    6,
-                )?)
-            );
-            let (native_up_proj_v, native_up_proj_ref, native_up_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &native_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].up_proj_w,
-                    engine.ordinal(),
-                    up_proj_idx,
-                    hidden,
-                    &native_up_proj,
-                )?;
-            let (oracle_up_proj_v, oracle_up_proj_ref, oracle_up_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &oracle_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].up_proj_w,
-                    engine.ordinal(),
-                    up_proj_idx,
-                    hidden,
-                    &oracle_up_proj,
-                )?;
-            eprintln!(
-                "[{mlp_tag}] layer={} up_proj_matmul_selfcheck idx={} native={:.4} ref={:.4} delta={:.4} oracle={:.4} ref_oracle={:.4} oracle_delta={:.4} native_vs_oracle={:.4}",
-                trace_mlp_layer,
-                up_proj_idx,
-                native_up_proj_v,
-                native_up_proj_ref,
-                native_up_proj_selfcheck,
-                oracle_up_proj_v,
-                oracle_up_proj_ref,
-                oracle_up_proj_selfcheck,
-                up_proj_delta,
-            );
-            eprintln!(
-                "[{mlp_tag}] layer={} up_proj_row_detail idx={} top_dims={}",
-                trace_mlp_layer,
-                up_proj_idx,
-                format_weight_row_top_delta_dims(&weight_row_top_delta_dims(
-                    &native_post_norm,
-                    &oracle_post_norm,
-                    &engine.weights().layers[trace_mlp_layer].up_proj_w,
-                    engine.ordinal(),
-                    up_proj_idx,
-                    hidden,
-                    6,
-                )?)
-            );
-            eprintln!(
-                "[{mlp_tag}] layer={} swiglu_selfcheck native={:.4} oracle={:.4}",
-                trace_mlp_layer,
-                swiglu_selfcheck_delta(&native_gate_proj, &native_up_proj, &native_swiglu),
-                swiglu_selfcheck_delta(&oracle_gate_proj, &oracle_up_proj, &oracle_swiglu),
-            );
-            let intermediate = engine.weights().config.intermediate_size;
-            let (native_down_proj_v, native_down_proj_ref, native_down_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &native_swiglu,
-                    &engine.weights().layers[trace_mlp_layer].down_proj_w,
-                    engine.ordinal(),
-                    down_proj_idx,
-                    intermediate,
-                    &native_down_proj,
-                )?;
-            let (oracle_down_proj_v, oracle_down_proj_ref, oracle_down_proj_selfcheck) =
-                matmul_row_selfcheck_details(
-                    &oracle_swiglu,
-                    &engine.weights().layers[trace_mlp_layer].down_proj_w,
-                    engine.ordinal(),
-                    down_proj_idx,
-                    intermediate,
-                    &oracle_down_proj,
-                )?;
-            eprintln!(
-                "[{mlp_tag}] layer={} down_proj_matmul_selfcheck idx={} native={:.4} ref={:.4} delta={:.4} oracle={:.4} ref_oracle={:.4} oracle_delta={:.4} native_vs_oracle={:.4}",
-                trace_mlp_layer,
-                down_proj_idx,
-                native_down_proj_v,
-                native_down_proj_ref,
-                native_down_proj_selfcheck,
-                oracle_down_proj_v,
-                oracle_down_proj_ref,
-                oracle_down_proj_selfcheck,
-                down_proj_delta,
-            );
-            eprintln!(
-                "[{mlp_tag}] layer={} down_proj_row_detail idx={} top_dims={}",
-                trace_mlp_layer,
-                down_proj_idx,
-                format_mlp_down_proj_contributors(
-                    &weight_row_top_delta_dims(
-                        &native_swiglu,
-                        &oracle_swiglu,
-                        &engine.weights().layers[trace_mlp_layer].down_proj_w,
-                        engine.ordinal(),
-                        down_proj_idx,
-                        intermediate,
-                        6,
-                    )?,
-                    &native_gate_proj,
-                    &oracle_gate_proj,
-                    &native_up_proj,
-                    &oracle_up_proj,
-                    &native_swiglu,
-                    &oracle_swiglu,
-                )
-            );
-            if let Some(dims) = tracked_logit_dims.as_ref() {
-                let tracked_hidden_dims = dims.iter().copied().take(4).collect::<Vec<_>>();
-                eprintln!(
-                    "[{mlp_tag}] layer={} tracked_hidden_dims={}",
-                    trace_mlp_layer,
-                    tracked_hidden_dims
-                        .iter()
-                        .map(|dim| dim.to_string())
-                        .collect::<Vec<_>>()
-                        .join(",")
-                );
-                eprintln!(
-                    "[{mlp_tag}] layer={} tracked_hidden_stage dims={}",
-                    trace_mlp_layer,
-                    tracked_hidden_dims
-                        .iter()
-                        .filter(|dim| {
-                            **dim < native_post_norm.len()
-                                && **dim < oracle_post_norm.len()
-                                && **dim < native_down_proj.len()
-                                && **dim < oracle_down_proj.len()
-                        })
-                        .map(|dim| {
-                            format!(
-                                "{dim}:pn=({:.4},{:.4}) dp=({:.4},{:.4})",
-                                native_post_norm[*dim],
-                                oracle_post_norm[*dim],
-                                native_down_proj[*dim],
-                                oracle_down_proj[*dim],
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                for &hidden_dim in &tracked_hidden_dims {
-                    if hidden_dim >= native_down_proj.len() || hidden_dim >= oracle_down_proj.len()
-                    {
-                        continue;
-                    }
-                    let top_intermediate = weight_row_top_delta_dims(
-                        &native_swiglu,
-                        &oracle_swiglu,
-                        &engine.weights().layers[trace_mlp_layer].down_proj_w,
-                        engine.ordinal(),
-                        hidden_dim,
-                        intermediate,
-                        4,
-                    )?;
-                    eprintln!(
-                        "[{mlp_tag}] layer={} hidden_dim={} down_proj_contributors={}",
-                        trace_mlp_layer,
-                        hidden_dim,
-                        format_mlp_down_proj_contributors(
-                            &top_intermediate,
-                            &native_gate_proj,
-                            &oracle_gate_proj,
-                            &native_up_proj,
-                            &oracle_up_proj,
-                            &native_swiglu,
-                            &oracle_swiglu,
-                        )
-                    );
-                }
-                let aggregate_intermediate = aggregate_down_proj_contributors(
-                    &native_swiglu,
-                    &oracle_swiglu,
-                    &engine.weights().layers[trace_mlp_layer].down_proj_w,
-                    engine.ordinal(),
-                    &tracked_hidden_dims,
-                    intermediate,
-                    6,
-                )?;
-                eprintln!(
-                    "[{mlp_tag}] layer={} tracked_hidden_intermediate_aggregate={}",
-                    trace_mlp_layer,
-                    format_mlp_intermediate_aggregate(
-                        &aggregate_intermediate,
-                        &native_gate_proj,
-                        &oracle_gate_proj,
-                        &native_up_proj,
-                        &oracle_up_proj,
-                    )
-                );
-            }
-            if trace_prefill_position.is_none() {
-                if let (Some((_, native_attn_trace, _, _, _)), Some(oracle_attn_trace)) = (
-                    native_prefill_trace,
-                    oracle_output.layer_attn_residual_states.as_ref(),
-                ) {
-                    if let Some(native_attn_trace) = native_attn_trace.as_ref() {
-                        if trace_mlp_layer >= layer_offset {
-                            let rel_layer = trace_mlp_layer - layer_offset;
-                            if rel_layer < native_attn_trace.len()
-                                && trace_mlp_layer < oracle_attn_trace.len()
-                            {
-                                let b64 = base64::engine::general_purpose::STANDARD;
-                                let oracle_attn_bytes = b64
-                                .decode(&oracle_attn_trace[trace_mlp_layer])
-                                .map_err(|e| anyhow::anyhow!(
-                                    "decode oracle layer_attn_residual_states[{trace_mlp_layer}] for mlp detail: {e}"
-                                ))?;
-                                let native_attn_hidden =
-                                    decode_bf16_le(&native_attn_trace[rel_layer]);
-                                let oracle_attn_hidden = decode_bf16_le(&oracle_attn_bytes);
-                                let native_mean_sq = mean_square(&native_attn_hidden);
-                                let oracle_mean_sq = mean_square(&oracle_attn_hidden);
-                                let native_inv_rms = 1.0f32
-                                    / (native_mean_sq
-                                        + engine.weights().config.rms_norm_eps as f32)
-                                        .sqrt();
-                                let oracle_inv_rms = 1.0f32
-                                    / (oracle_mean_sq
-                                        + engine.weights().config.rms_norm_eps as f32)
-                                        .sqrt();
-                                let scale = read_weight_element_f32(
-                                    &engine.weights().layers[trace_mlp_layer].post_attn_norm_w,
-                                    post_norm_idx,
-                                )? + 1.0;
-                                eprintln!(
-                                "[{mlp_tag}] layer={} post_norm_detail idx={} hidden_native={:.4} hidden_oracle={:.4} inv_rms_native={native_inv_rms:.6} inv_rms_oracle={oracle_inv_rms:.6} scale={scale:.4} normed_native={:.4} normed_oracle={:.4}",
-                                trace_mlp_layer,
-                                post_norm_idx,
-                                native_attn_hidden[post_norm_idx],
-                                oracle_attn_hidden[post_norm_idx],
-                                post_norm_native,
-                                post_norm_oracle,
-                            );
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            eprintln!(
-                "[{mlp_tag}] layer={} missing flattenable qwen35 trace tensors",
-                trace_mlp_layer
-            );
-        }
-    } else {
-        let layer = trace_mlp_layer.unwrap_or(19);
-        eprintln!(
-            "[{mlp_tag}] layer={} missing native or qwen35 trace data",
-            layer
-        );
-    }
-
-    Ok(())
-}
-
-fn qwen35_layer_kind_label(config: &qwen35::config::TextConfig, layer: usize) -> &'static str {
-    if config.is_full_attention(layer) {
-        "full"
-    } else {
-        "linear"
-    }
-}
-
-fn emit_qwen35_restart_report(
-    config: &qwen35::config::TextConfig,
-    tag: &str,
-    source_layer: usize,
-    start_layer: usize,
-    native_prefill: &prefill_engine::PrefillResult,
-    oracle_output: &oracle::OracleOutput,
-    qwen35_trace_output: Option<&oracle::Qwen35TraceOutput>,
-    trace_prefill_position: Option<usize>,
-) -> Result<()> {
-    let logit_delta =
-        validate::max_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
-    if trace_prefill_position.is_some() {
-        eprintln!(
-            "[{tag}] source_layer={source_layer} start_layer={start_layer} last_token_logit_delta={logit_delta:.4}"
-        );
-    } else {
-        eprintln!(
-            "[{tag}] source_layer={source_layer} start_layer={start_layer} logit_delta={logit_delta:.4}"
-        );
-    }
-    let (logit_idx, native_logit, oracle_logit, logit_max_delta) =
-        max_abs_delta_details(&native_prefill.logits, &oracle_output.prefill_logits);
-    if trace_prefill_position.is_some() {
-        eprintln!(
-            "[{tag}] last_token_logit_max idx={logit_idx} native={native_logit:.4} oracle={oracle_logit:.4} delta={logit_max_delta:.4}"
-        );
-    } else {
-        eprintln!(
-            "[{tag}] logit_max idx={logit_idx} native={native_logit:.4} oracle={oracle_logit:.4} delta={logit_max_delta:.4}"
-        );
-    }
-
-    if let Some(position) = trace_prefill_position {
-        if let (Some(native_hidden_trace), Some(trace)) = (
-            native_prefill.layer_hidden_trace.as_ref(),
-            qwen35_trace_output,
-        ) {
-            for (offset, native_hidden_bytes) in native_hidden_trace.iter().enumerate() {
-                let layer = start_layer + offset;
-                let Some(oracle_hidden) = trace
-                    .decoder_layer_outputs
-                    .get(layer)
-                    .and_then(|value| flatten_token_bsd(value, Some(position)))
-                else {
-                    break;
-                };
-                let native_hidden = decode_bf16_le(native_hidden_bytes);
-                let layer_delta = validate::max_abs_delta(&native_hidden, &oracle_hidden);
-                let layer_kind = qwen35_layer_kind_label(config, layer);
-                eprintln!(
-                    "[{tag}] position={} layer={} kind={} layer_delta={layer_delta:.4}",
-                    position, layer, layer_kind
-                );
-            }
-        }
-    } else if let (Some(native_hidden_trace), Some(oracle_hidden_trace)) = (
-        native_prefill.layer_hidden_trace.as_ref(),
-        oracle_output.layer_hidden_states.as_ref(),
-    ) {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        for (offset, native_hidden_bytes) in native_hidden_trace.iter().enumerate() {
-            let layer = start_layer + offset;
-            if layer >= oracle_hidden_trace.len() {
-                break;
-            }
-            let oracle_hidden_bytes = b64.decode(&oracle_hidden_trace[layer]).map_err(|e| {
-                anyhow::anyhow!("decode restart oracle layer_hidden_states[{layer}]: {e}")
-            })?;
-            let oracle_hidden = decode_bf16_le(&oracle_hidden_bytes);
-            let native_hidden = decode_bf16_le(native_hidden_bytes);
-            let layer_delta = validate::max_abs_delta(&native_hidden, &oracle_hidden);
-            let layer_kind = qwen35_layer_kind_label(config, layer);
-            eprintln!("[{tag}] layer={layer} kind={layer_kind} layer_delta={layer_delta:.4}");
-        }
-    }
-
-    if let (Some(native_final_norm_trace), Some(oracle_final_norm_b64)) = (
-        native_prefill.final_norm_trace.as_ref(),
-        oracle_output.prefill_hidden.as_ref(),
-    ) {
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let oracle_final_norm_bytes = b64
-            .decode(oracle_final_norm_b64)
-            .map_err(|e| anyhow::anyhow!("decode restart oracle prefill_hidden: {e}"))?;
-        let native_final_norm = decode_bf16_le(native_final_norm_trace);
-        let oracle_final_norm = decode_bf16_le(&oracle_final_norm_bytes);
-        let (idx, native_v, oracle_v, delta) =
-            max_abs_delta_details(&native_final_norm, &oracle_final_norm);
-        if trace_prefill_position.is_some() {
-            eprintln!(
-                "[{tag}] last_token_final_norm_max idx={idx} native={native_v:.4} oracle={oracle_v:.4} delta={delta:.4}"
-            );
-        } else {
-            eprintln!(
-                "[{tag}] final_norm_max idx={idx} native={native_v:.4} oracle={oracle_v:.4} delta={delta:.4}"
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn emit_qwen35_restart_position_scan_report(
-    engine: &DecodeEngine,
-    tag: &str,
-    start_layer: usize,
-    hidden_bf16: &[u8],
-    positions: &[usize],
-    trace_linear_layer: Option<usize>,
-    trace_full_layer: Option<usize>,
-    trace_mlp_layer: Option<usize>,
-    qwen35_trace_output: &oracle::Qwen35TraceOutput,
-) -> Result<()> {
-    let num_tail_layers = engine
-        .weights()
-        .config
-        .num_hidden_layers
-        .saturating_sub(start_layer);
-    let mut worst_by_layer: Vec<Option<(usize, f32)>> = vec![None; num_tail_layers];
-    let mut worst_final_hidden_logit: Option<(usize, f32)> = None;
-
-    for &position in positions {
-        let replay = engine.prefill_tail_from_hidden_with_trace(
-            hidden_bf16,
-            start_layer,
-            trace_linear_layer.filter(|layer| *layer >= start_layer),
-            trace_full_layer.filter(|layer| *layer >= start_layer),
-            trace_mlp_layer.filter(|layer| *layer >= start_layer),
-            Some(position),
-        )?;
-
-        let native_layer_trace = replay
-            .layer_hidden_trace
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("restart position scan missing native layer trace"))?;
-
-        let mut max_layer_delta = -1.0f32;
-        let mut max_layer = start_layer;
-        for (rel_layer, native_layer_bytes) in native_layer_trace.iter().enumerate() {
-            let layer = start_layer + rel_layer;
-            let oracle_layer = qwen35_trace_output
-                .decoder_layer_outputs
-                .get(layer)
-                .and_then(|value| flatten_token_bsd(value, Some(position)))
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "restart position scan missing oracle decoder_layer_outputs[{layer}] for position {position}"
-                    )
-                })?;
-            let native_layer = decode_bf16_le(native_layer_bytes);
-            let layer_delta = validate::max_abs_delta(&native_layer, &oracle_layer);
-            if layer_delta > max_layer_delta {
-                max_layer_delta = layer_delta;
-                max_layer = layer;
-            }
-            let slot = &mut worst_by_layer[rel_layer];
-            if slot.map(|(_, delta)| layer_delta > delta).unwrap_or(true) {
-                *slot = Some((position, layer_delta));
-            }
-        }
-
-        let native_final_hidden = native_layer_trace
-            .last()
-            .map(|bytes| decode_bf16_le(bytes))
-            .ok_or_else(|| anyhow::anyhow!("restart position scan missing final hidden trace"))?;
-        let oracle_final_hidden = qwen35_trace_output
-            .decoder_layer_outputs
-            .last()
-            .and_then(|value| flatten_token_bsd(value, Some(position)))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "restart position scan missing oracle final hidden for position {position}"
-                )
-            })?;
-        let native_hidden_logits =
-            compute_qwen_logits_from_hidden_row(engine, &native_final_hidden)?;
-        let oracle_hidden_logits =
-            compute_qwen_logits_from_hidden_row(engine, &oracle_final_hidden)?;
-        let final_hidden_logit_delta =
-            validate::max_abs_delta(&native_hidden_logits, &oracle_hidden_logits);
-        if worst_final_hidden_logit
-            .map(|(_, delta)| final_hidden_logit_delta > delta)
-            .unwrap_or(true)
-        {
-            worst_final_hidden_logit = Some((position, final_hidden_logit_delta));
-        }
-
-        eprintln!(
-            "[{tag}] position={} final_hidden_logit_delta={:.4} max_layer={} max_layer_delta={:.4}",
-            position, final_hidden_logit_delta, max_layer, max_layer_delta
-        );
-    }
-
-    if let Some((position, delta)) = worst_final_hidden_logit {
-        eprintln!(
-            "[{tag}] worst_final_hidden_logit_position={} delta={:.4}",
-            position, delta
-        );
-    }
-    for (rel_layer, worst) in worst_by_layer.into_iter().enumerate() {
-        if let Some((position, delta)) = worst {
-            eprintln!(
-                "[{tag}] layer={} worst_position={} layer_delta={:.4}",
-                start_layer + rel_layer,
-                position,
-                delta
-            );
-        }
-    }
-
-    Ok(())
-}
-
-fn emit_qwen35_restart_source_tail_report(
-    engine: &DecodeEngine,
-    tag: &str,
-    source_layer: usize,
-    source_hidden_f32: &[f32],
-    qwen35_trace_output: &oracle::Qwen35TraceOutput,
-    trace_position: usize,
-) -> Result<()> {
-    let hidden_dim = engine.weights().config.hidden_size;
-    let start = trace_position
-        .checked_mul(hidden_dim)
-        .ok_or_else(|| anyhow::anyhow!("trace position hidden offset overflow"))?;
-    let end = start + hidden_dim;
-    if end > source_hidden_f32.len() {
-        anyhow::bail!(
-            "trace position {} out of range for source hidden rows (len={} hidden_dim={})",
-            trace_position,
-            source_hidden_f32.len(),
-            hidden_dim
-        );
-    }
-    let source_hidden_row = &source_hidden_f32[start..end];
-    if let Some(oracle_source_hidden) = qwen35_trace_output
-        .decoder_layer_outputs
-        .get(source_layer)
-        .and_then(|value| flatten_token_bsd(value, Some(trace_position)))
-    {
-        let (idx, native_v, oracle_v, delta) =
-            max_abs_delta_details(source_hidden_row, &oracle_source_hidden);
-        let top_dims = top_abs_delta_dims(source_hidden_row, &oracle_source_hidden, 6);
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_delta={delta:.4}"
-        );
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_max idx={idx} native={native_v:.4} oracle={oracle_v:.4}"
-        );
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_detail top_dims={}",
-            format_top_delta_dims(&top_dims)
-        );
-    }
-
-    if let Some(oracle_final_norm) = qwen35_trace_output
-        .trace_position_prefill_final_norm_output
-        .as_ref()
-        .and_then(flatten_json_vector)
-    {
-        let source_final_norm = compute_qwen_final_norm_from_hidden_row(engine, source_hidden_row)?;
-        let (idx, native_v, oracle_v, delta) =
-            max_abs_delta_details(&source_final_norm, &oracle_final_norm);
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_final_norm_delta={delta:.4}"
-        );
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_final_norm_max idx={idx} native={native_v:.4} oracle={oracle_v:.4}"
-        );
-    }
-
-    if let Some(oracle_logits) = qwen35_trace_output
-        .trace_position_prefill_logits
-        .as_ref()
-        .and_then(flatten_json_vector)
-    {
-        let source_logits = compute_qwen_logits_from_hidden_row(engine, source_hidden_row)?;
-        let (idx, native_v, oracle_v, delta) =
-            max_abs_delta_details(&source_logits, &oracle_logits);
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_logit_delta={delta:.4}"
-        );
-        eprintln!(
-            "[{tag}] source_layer={source_layer} position={trace_position} source_hidden_logit_max idx={idx} native={native_v:.4} oracle={oracle_v:.4}"
-        );
-    }
-
-    Ok(())
-}
-
-fn top_logits(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
-    indexed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    indexed.truncate(k.min(indexed.len()));
-    indexed
-}
-
-fn max_abs_delta_details(lhs: &[f32], rhs: &[f32]) -> (usize, f32, f32, f32) {
-    let mut best = (0usize, 0.0f32, 0.0f32, 0.0f32);
-    for (idx, (l, r)) in lhs.iter().copied().zip(rhs.iter().copied()).enumerate() {
-        let delta = (l - r).abs();
-        if delta > best.3 {
-            best = (idx, l, r, delta);
-        }
-    }
-    best
-}
-
-fn mean_square_delta(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len().min(rhs.len());
-    if len == 0 {
-        return 0.0;
-    }
-    lhs.iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .take(len)
-        .map(|(l, r)| {
-            let delta = l - r;
-            delta * delta
-        })
-        .sum::<f32>()
-        / len as f32
-}
-
-fn mean_abs_delta(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len().min(rhs.len());
-    if len == 0 {
-        return 0.0;
-    }
-    lhs.iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .take(len)
-        .map(|(l, r)| (l - r).abs())
-        .sum::<f32>()
-        / len as f32
-}
-
-fn top_abs_delta_dims(lhs: &[f32], rhs: &[f32], top_k: usize) -> Vec<(usize, f32, f32, f32)> {
-    let mut dims = lhs
-        .iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .enumerate()
-        .map(|(idx, (native_v, oracle_v))| (idx, native_v, oracle_v, (native_v - oracle_v).abs()))
-        .collect::<Vec<_>>();
-    dims.sort_by(|a, b| b.3.total_cmp(&a.3).then_with(|| a.0.cmp(&b.0)));
-    dims.truncate(top_k.min(dims.len()));
-    dims
-}
-
-fn format_top_delta_dims(entries: &[(usize, f32, f32, f32)]) -> String {
-    entries
-        .iter()
-        .map(|(idx, native_v, oracle_v, delta)| {
-            format!("{idx}:n={native_v:.4} o={oracle_v:.4} d={delta:.4}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn mean_square(values: &[f32]) -> f32 {
-    let sum_sq: f32 = values.iter().map(|v| v * v).sum();
-    sum_sq / values.len() as f32
-}
-
-fn read_buffer_f32_range(
-    buf: &GpuBuffer,
-    ordinal: usize,
-    start_elem: usize,
-    elem_count: usize,
-) -> Result<Vec<f32>> {
-    match buf.dtype() {
-        ScalarType::BF16 => {
-            let mut bytes = vec![0u8; elem_count * 2];
-            gpu_hal::copy_d2h(
-                ordinal,
-                bytes.as_mut_ptr() as *mut c_void,
-                buf.offset_ptr(start_elem * 2),
-                bytes.len(),
-            )
-            .map_err(|e| anyhow::anyhow!("buffer range D2H BF16: {e}"))?;
-            Ok(bytes
-                .chunks_exact(2)
-                .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                .collect())
-        }
-        ScalarType::F32 => {
-            let mut bytes = vec![0u8; elem_count * 4];
-            gpu_hal::copy_d2h(
-                ordinal,
-                bytes.as_mut_ptr() as *mut c_void,
-                buf.offset_ptr(start_elem * 4),
-                bytes.len(),
-            )
-            .map_err(|e| anyhow::anyhow!("buffer range D2H F32: {e}"))?;
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect())
-        }
-        other => Err(anyhow::anyhow!(
-            "unsupported buffer dtype for trace range read: {other:?}"
-        )),
-    }
-}
-
-fn read_weight_element_f32(buf: &GpuBuffer, idx: usize) -> Result<f32> {
-    let bytes = buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("norm weight D2H: {e}"))?;
-    match buf.dtype() {
-        ScalarType::BF16 => {
-            let start = idx * 2;
-            let bits = [bytes[start], bytes[start + 1]];
-            Ok(half::bf16::from_le_bytes(bits).to_f32())
-        }
-        ScalarType::F32 => {
-            let start = idx * 4;
-            let bits = [
-                bytes[start],
-                bytes[start + 1],
-                bytes[start + 2],
-                bytes[start + 3],
-            ];
-            Ok(f32::from_le_bytes(bits))
-        }
-        other => Err(anyhow::anyhow!(
-            "unsupported norm weight dtype for trace: {other:?}"
-        )),
-    }
-}
-
-fn read_buffer_all_f32(buf: &GpuBuffer) -> Result<Vec<f32>> {
-    let bytes = buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("buffer D2H: {e}"))?;
-    match buf.dtype() {
-        ScalarType::BF16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-            .collect()),
-        ScalarType::F32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()),
-        other => Err(anyhow::anyhow!(
-            "unsupported buffer dtype for full read: {other:?}"
-        )),
-    }
-}
-
-fn compute_qwen_rms_norm_from_hidden_row(
-    hidden_row: &[f32],
-    weight_buf: &GpuBuffer,
-    eps: f32,
-) -> Result<Vec<f32>> {
-    let hidden_dim = hidden_row.len();
-    let weights = read_buffer_all_f32(weight_buf)?;
-    if weights.len() != hidden_dim {
-        anyhow::bail!(
-            "norm weight length {} did not match hidden size {}",
-            weights.len(),
-            hidden_dim
-        );
-    }
-    let inv_rms = 1.0f32 / (mean_square(hidden_row) + eps).sqrt();
-    Ok(hidden_row
-        .iter()
-        .zip(weights.iter())
-        .map(|(hidden, weight)| hidden * inv_rms * (weight + 1.0))
-        .collect())
-}
-
-fn compute_qwen_final_norm_from_hidden_row(
-    engine: &DecodeEngine,
-    hidden_row: &[f32],
-) -> Result<Vec<f32>> {
-    let hidden_dim = engine.weights().config.hidden_size;
-    if hidden_row.len() != hidden_dim {
-        anyhow::bail!(
-            "hidden row length {} did not match hidden size {}",
-            hidden_row.len(),
-            hidden_dim
-        );
-    }
-    compute_qwen_rms_norm_from_hidden_row(
-        hidden_row,
-        &engine.weights().norm_weight,
-        engine.weights().config.rms_norm_eps as f32,
-    )
-}
-
-fn compute_qwen_logits_from_hidden_row(
-    engine: &DecodeEngine,
-    hidden_row: &[f32],
-) -> Result<Vec<f32>> {
-    let hidden_dim = engine.weights().config.hidden_size;
-    if hidden_row.len() != hidden_dim {
-        anyhow::bail!(
-            "hidden row length {} did not match hidden size {}",
-            hidden_row.len(),
-            hidden_dim
-        );
-    }
-    let hidden_bf16 = encode_bf16_le(hidden_row);
-    let hidden_gpu = GpuBuffer::from_host_bytes(
-        engine.ordinal(),
-        ScalarType::BF16,
-        &[1, hidden_dim],
-        &hidden_bf16,
-    )
-    .map_err(|e| anyhow::anyhow!("trace hidden row upload: {e}"))?;
-    kernel_ffi::qwen_rms_norm_standalone_matvec_host_f32(
-        engine.ordinal(),
-        ScalarType::BF16,
-        &hidden_gpu,
-        &engine.weights().norm_weight,
-        engine.weights().config.rms_norm_eps as f32,
-        &*engine.weights().lm_head,
-        hidden_dim,
-        engine.weights().config.vocab_size,
-    )
-    .map_err(|e| anyhow::anyhow!("trace hidden row logits: {e}"))
-}
-
-fn format_top_logits(entries: &[(usize, f32)]) -> String {
-    entries
-        .iter()
-        .map(|(token, logit)| format!("{token}:{logit:.4}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn logit_row_top_delta_dims(
-    native_normed: &[f32],
-    oracle_normed: &[f32],
-    lm_head: &GpuBuffer,
-    ordinal: usize,
-    row_idx: usize,
-    top_k: usize,
-) -> Result<Vec<(usize, f32, f32, f32, f32, f32)>> {
-    let hidden_dim = native_normed.len();
-    let row = read_buffer_f32_range(lm_head, ordinal, row_idx * hidden_dim, hidden_dim)?;
-    let mut dims = Vec::with_capacity(hidden_dim);
-    for dim in 0..hidden_dim {
-        let weight = row[dim];
-        let native_contrib = native_normed[dim] * weight;
-        let oracle_contrib = oracle_normed[dim] * weight;
-        dims.push((
-            dim,
-            weight,
-            native_normed[dim],
-            oracle_normed[dim],
-            native_contrib,
-            oracle_contrib,
-        ));
-    }
-    dims.sort_by(|a, b| {
-        let ad = (a.4 - a.5).abs();
-        let bd = (b.4 - b.5).abs();
-        bd.total_cmp(&ad).then_with(|| a.0.cmp(&b.0))
-    });
-    dims.truncate(top_k.min(dims.len()));
-    Ok(dims)
-}
-
-fn aggregate_logit_row_delta_dims(
-    native_normed: &[f32],
-    oracle_normed: &[f32],
-    lm_head: &GpuBuffer,
-    ordinal: usize,
-    row_indices: &[usize],
-    top_k: usize,
-) -> Result<Vec<(usize, f32, f32, f32, f32, f32)>> {
-    if native_normed.len() != oracle_normed.len() {
-        anyhow::bail!(
-            "aggregate_logit_row_delta_dims len mismatch: native={} oracle={}",
-            native_normed.len(),
-            oracle_normed.len()
-        );
-    }
-    let hidden_dim = native_normed.len();
-    let hidden_delta = native_normed
-        .iter()
-        .copied()
-        .zip(oracle_normed.iter().copied())
-        .map(|(native_v, oracle_v)| native_v - oracle_v)
-        .collect::<Vec<_>>();
-    let mut sum_abs_contrib = vec![0.0f32; hidden_dim];
-    let mut max_abs_contrib = vec![0.0f32; hidden_dim];
-    for &row_idx in row_indices {
-        let row = read_buffer_f32_range(lm_head, ordinal, row_idx * hidden_dim, hidden_dim)?;
-        for dim in 0..hidden_dim {
-            let abs_delta = (hidden_delta[dim] * row[dim]).abs();
-            sum_abs_contrib[dim] += abs_delta;
-            if abs_delta > max_abs_contrib[dim] {
-                max_abs_contrib[dim] = abs_delta;
-            }
-        }
-    }
-    let mut dims = (0..hidden_dim)
-        .map(|dim| {
-            (
-                dim,
-                native_normed[dim],
-                oracle_normed[dim],
-                hidden_delta[dim],
-                sum_abs_contrib[dim],
-                max_abs_contrib[dim],
-            )
-        })
-        .collect::<Vec<_>>();
-    dims.sort_by(|a, b| {
-        b.4.total_cmp(&a.4)
-            .then_with(|| b.5.total_cmp(&a.5))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    dims.truncate(top_k.min(dims.len()));
-    Ok(dims)
-}
-
-fn format_logit_row_dims(entries: &[(usize, f32, f32, f32, f32, f32)]) -> String {
-    entries
-        .iter()
-        .map(|(dim, weight, native_hidden, oracle_hidden, native_contrib, oracle_contrib)| {
-            format!(
-                "{dim}:w={weight:.4} n={native_hidden:.4} o={oracle_hidden:.4} dc={:.4} nc={native_contrib:.4} oc={oracle_contrib:.4}",
-                native_contrib - oracle_contrib,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_aggregate_logit_dims(entries: &[(usize, f32, f32, f32, f32, f32)]) -> String {
-    entries
-        .iter()
-        .map(
-            |(dim, native_hidden, oracle_hidden, hidden_delta, sum_abs_contrib, max_abs_contrib)| {
-                format!(
-                    "{dim}:n={native_hidden:.4} o={oracle_hidden:.4} hd={hidden_delta:.4} sum={sum_abs_contrib:.4} max={max_abs_contrib:.4}"
-                )
-            },
-        )
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_tracked_stage_dim_deltas(
-    dims: &[usize],
-    native_attn: &[f32],
-    oracle_attn: &[f32],
-    native_post_norm: &[f32],
-    oracle_post_norm: &[f32],
-    native_mlp_out: &[f32],
-    oracle_mlp_out: &[f32],
-    native_layer: &[f32],
-    oracle_layer: &[f32],
-) -> String {
-    dims.iter()
-        .copied()
-        .filter(|dim| {
-            *dim < native_attn.len()
-                && *dim < oracle_attn.len()
-                && *dim < native_post_norm.len()
-                && *dim < oracle_post_norm.len()
-                && *dim < native_mlp_out.len()
-                && *dim < oracle_mlp_out.len()
-                && *dim < native_layer.len()
-                && *dim < oracle_layer.len()
-        })
-        .map(|dim| {
-            let attn_delta = native_attn[dim] - oracle_attn[dim];
-            let post_norm_delta = native_post_norm[dim] - oracle_post_norm[dim];
-            let mlp_out_delta = native_mlp_out[dim] - oracle_mlp_out[dim];
-            let layer_delta = native_layer[dim] - oracle_layer[dim];
-            format!(
-                "{dim}:a={attn_delta:+.4} pn={post_norm_delta:+.4} m={mlp_out_delta:+.4} l={layer_delta:+.4}"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn format_mlp_down_proj_contributors(
-    entries: &[(usize, f32, f32, f32, f32, f32)],
-    native_gate: &[f32],
-    oracle_gate: &[f32],
-    native_up: &[f32],
-    oracle_up: &[f32],
-    native_swiglu: &[f32],
-    oracle_swiglu: &[f32],
-) -> String {
-    entries
-        .iter()
-        .map(
-            |(idx, coeff, _native_swiglu_row, _oracle_swiglu_row, native_contrib, oracle_contrib)| {
-                let gate_native = native_gate.get(*idx).copied().unwrap_or(0.0);
-                let gate_oracle = oracle_gate.get(*idx).copied().unwrap_or(0.0);
-                let up_native = native_up.get(*idx).copied().unwrap_or(0.0);
-                let up_oracle = oracle_up.get(*idx).copied().unwrap_or(0.0);
-                let swiglu_native = native_swiglu.get(*idx).copied().unwrap_or(0.0);
-                let swiglu_oracle = oracle_swiglu.get(*idx).copied().unwrap_or(0.0);
-                format!(
-                    "{idx}:w={coeff:.4} g=({gate_native:.4},{gate_oracle:.4}) u=({up_native:.4},{up_oracle:.4}) s=({swiglu_native:.4},{swiglu_oracle:.4}) dc={:.4} nc={native_contrib:.4} oc={oracle_contrib:.4}",
-                    native_contrib - oracle_contrib,
-                )
-            },
-        )
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn aggregate_down_proj_contributors(
-    native_swiglu: &[f32],
-    oracle_swiglu: &[f32],
-    down_proj_w: &GpuBuffer,
-    ordinal: usize,
-    hidden_dims: &[usize],
-    row_width: usize,
-    top_k: usize,
-) -> Result<Vec<(usize, f32, f32, f32, f32, f32)>> {
-    let len = native_swiglu.len().min(oracle_swiglu.len()).min(row_width);
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let mut sum_abs_contrib = vec![0.0f32; len];
-    let mut max_abs_contrib = vec![0.0f32; len];
-    for &hidden_dim in hidden_dims {
-        let row = read_buffer_f32_range(down_proj_w, ordinal, hidden_dim * row_width, row_width)?;
-        for idx in 0..len {
-            let native_contrib = native_swiglu[idx] * row[idx];
-            let oracle_contrib = oracle_swiglu[idx] * row[idx];
-            let abs_delta = (native_contrib - oracle_contrib).abs();
-            sum_abs_contrib[idx] += abs_delta;
-            if abs_delta > max_abs_contrib[idx] {
-                max_abs_contrib[idx] = abs_delta;
-            }
-        }
-    }
-    let mut entries = (0..len)
-        .map(|idx| {
-            (
-                idx,
-                native_swiglu[idx],
-                oracle_swiglu[idx],
-                native_swiglu[idx] - oracle_swiglu[idx],
-                sum_abs_contrib[idx],
-                max_abs_contrib[idx],
-            )
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|a, b| {
-        b.4.total_cmp(&a.4)
-            .then_with(|| b.5.total_cmp(&a.5))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    entries.truncate(top_k.min(entries.len()));
-    Ok(entries)
-}
-
-fn silu(value: f32) -> f32 {
-    value / (1.0 + (-value).exp())
-}
-
-fn format_mlp_intermediate_aggregate(
-    entries: &[(usize, f32, f32, f32, f32, f32)],
-    native_gate: &[f32],
-    oracle_gate: &[f32],
-    native_up: &[f32],
-    oracle_up: &[f32],
-) -> String {
-    entries
-        .iter()
-        .map(|(idx, native_swiglu, oracle_swiglu, swiglu_delta, sum_abs, max_abs)| {
-            let gate_native = native_gate.get(*idx).copied().unwrap_or(0.0);
-            let gate_oracle = oracle_gate.get(*idx).copied().unwrap_or(0.0);
-            let up_native = native_up.get(*idx).copied().unwrap_or(0.0);
-            let up_oracle = oracle_up.get(*idx).copied().unwrap_or(0.0);
-            let silu_native = silu(gate_native);
-            let silu_oracle = silu(gate_oracle);
-            let gate_only = silu(gate_native) * up_oracle;
-            let up_only = silu(gate_oracle) * up_native;
-            format!(
-                "{idx}:g=({gate_native:.4},{gate_oracle:.4}) gd={:+.4} sg=({silu_native:.4},{silu_oracle:.4}) sgd={:+.4} u=({up_native:.4},{up_oracle:.4}) s=({native_swiglu:.4},{oracle_swiglu:.4}) sd={swiglu_delta:+.4} gate_only={:+.4} up_only={:+.4} sum={sum_abs:.4} max={max_abs:.4}",
-                gate_native - gate_oracle,
-                silu_native - silu_oracle,
-                gate_only - oracle_swiglu,
-                up_only - oracle_swiglu,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn swiglu_selfcheck_delta(gate: &[f32], up: &[f32], swiglu: &[f32]) -> f32 {
-    gate.iter()
-        .zip(up.iter())
-        .zip(swiglu.iter())
-        .map(|((gate, up), swiglu)| (silu(*gate) * *up - *swiglu).abs())
-        .fold(0.0f32, f32::max)
-}
-
-fn matmul_row_selfcheck_details(
-    input: &[f32],
-    weight: &GpuBuffer,
-    ordinal: usize,
-    row_idx: usize,
-    row_width: usize,
-    output: &[f32],
-) -> Result<(f32, f32, f32)> {
-    let row = read_buffer_f32_range(weight, ordinal, row_idx * row_width, row_width)?;
-    let len = input.len().min(row.len());
-    anyhow::ensure!(
-        row_idx < output.len(),
-        "matmul selfcheck row {row_idx} out of range for output len {}",
-        output.len()
-    );
-    let reference = input
-        .iter()
-        .zip(row.iter())
-        .take(len)
-        .map(|(input, coeff)| input * coeff)
-        .sum::<f32>();
-    let native = output[row_idx];
-    Ok((native, reference, (native - reference).abs()))
-}
-
-fn weight_row_top_delta_dims(
-    native_input: &[f32],
-    oracle_input: &[f32],
-    weight: &GpuBuffer,
-    ordinal: usize,
-    row_idx: usize,
-    row_width: usize,
-    top_k: usize,
-) -> Result<Vec<(usize, f32, f32, f32, f32, f32)>> {
-    if native_input.len() != row_width || oracle_input.len() != row_width {
-        anyhow::bail!(
-            "weight_row_top_delta_dims input len mismatch: native={} oracle={} row_width={}",
-            native_input.len(),
-            oracle_input.len(),
-            row_width
-        );
-    }
-    let row = read_buffer_f32_range(weight, ordinal, row_idx * row_width, row_width)?;
-    let mut dims = Vec::with_capacity(row_width);
-    for dim in 0..row_width {
-        let coeff = row[dim];
-        let native_contrib = native_input[dim] * coeff;
-        let oracle_contrib = oracle_input[dim] * coeff;
-        dims.push((
-            dim,
-            coeff,
-            native_input[dim],
-            oracle_input[dim],
-            native_contrib,
-            oracle_contrib,
-        ));
-    }
-    dims.sort_by(|a, b| {
-        let ad = (a.4 - a.5).abs();
-        let bd = (b.4 - b.5).abs();
-        bd.total_cmp(&ad).then_with(|| a.0.cmp(&b.0))
-    });
-    dims.truncate(top_k.min(dims.len()));
-    Ok(dims)
-}
-
-fn format_weight_row_top_delta_dims(entries: &[(usize, f32, f32, f32, f32, f32)]) -> String {
-    entries
-        .iter()
-        .map(|(idx, coeff, native_input, oracle_input, native_contrib, oracle_contrib)| {
-            format!(
-                "{idx}:w={coeff:.4} n={native_input:.4} o={oracle_input:.4} dc={:.4} nc={native_contrib:.4} oc={oracle_contrib:.4}",
-                native_contrib - oracle_contrib,
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
+    bytes.chunks_exact(2)
         .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
         .collect()
-}
-
-fn decode_f32_bytes_le(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
-}
-
-fn decode_gpu_buffer_f32(buf: &GpuBuffer) -> Result<Vec<f32>> {
-    let bytes = buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("buffer D2H: {e}"))?;
-    match buf.dtype() {
-        ScalarType::BF16 => Ok(decode_bf16_le(&bytes)),
-        ScalarType::F32 => Ok(decode_f32_bytes_le(&bytes)),
-        other => anyhow::bail!("unsupported buffer dtype for debug decode: {other:?}"),
-    }
-}
-
-fn parse_trace_position_scan(spec: &str, seq_len: usize) -> Result<Vec<usize>> {
-    let trimmed = spec.trim();
-    if trimmed.eq_ignore_ascii_case("all") {
-        return Ok((0..seq_len).collect());
-    }
-    let mut positions = Vec::new();
-    for part in trimmed.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let position = part
-            .parse::<usize>()
-            .map_err(|e| anyhow::anyhow!("invalid trace position '{part}': {e}"))?;
-        if position >= seq_len {
-            anyhow::bail!("trace position {position} out of range for seq_len {seq_len}");
-        }
-        if !positions.contains(&position) {
-            positions.push(position);
-        }
-    }
-    if positions.is_empty() {
-        anyhow::bail!("trace position scan produced no positions");
-    }
-    Ok(positions)
-}
-
-fn apply_rope_reference_for_position(
-    prepared: &[f32],
-    rotary: &qwen35::rotary::RotaryTables,
-    position: usize,
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<Vec<f32>> {
-    let rotary_dim = rotary.rotary_dim;
-    let half_rot = rotary_dim / 2;
-    let cos = decode_rotary_row(&rotary.cos, position, half_rot)?;
-    let sin = decode_rotary_row(&rotary.sin, position, half_rot)?;
-    let mut out = prepared.to_vec();
-    for head in 0..num_heads {
-        let base = head * head_dim;
-        for i in 0..half_rot {
-            let x0 = prepared[base + i];
-            let x1 = prepared[base + i + half_rot];
-            out[base + i] = x0 * cos[i] - x1 * sin[i];
-            out[base + i + half_rot] = x1 * cos[i] + x0 * sin[i];
-        }
-    }
-    Ok(out)
-}
-
-fn decode_rotary_row(table: &GpuBuffer, row: usize, row_elems: usize) -> Result<Vec<f32>> {
-    let all = table
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("rotary table D2H: {e}"))?;
-    let values = decode_bf16_le(&all);
-    let start = row
-        .checked_mul(row_elems)
-        .ok_or_else(|| anyhow::anyhow!("rotary row overflow"))?;
-    let end = start
-        .checked_add(row_elems)
-        .ok_or_else(|| anyhow::anyhow!("rotary row overflow"))?;
-    if end > values.len() {
-        anyhow::bail!(
-            "rotary row {} out of range for {} values with row_elems {}",
-            row,
-            values.len(),
-            row_elems
-        );
-    }
-    Ok(values[start..end].to_vec())
-}
-
-struct RmsNormHeadDetail {
-    head: usize,
-    dim: usize,
-    hidden_native: f32,
-    hidden_oracle: f32,
-    inv_rms_native: f32,
-    inv_rms_oracle: f32,
-    scale: f32,
-}
-
-fn rms_norm_head_detail(
-    native_input: &[f32],
-    oracle_input: &[f32],
-    weight: &[f32],
-    head_dim: usize,
-    flat_idx: usize,
-) -> Result<RmsNormHeadDetail> {
-    if native_input.len() != oracle_input.len() {
-        anyhow::bail!(
-            "rms_norm_head_detail length mismatch: {} vs {}",
-            native_input.len(),
-            oracle_input.len()
-        );
-    }
-    if weight.len() != head_dim {
-        anyhow::bail!(
-            "rms_norm_head_detail weight len mismatch: {} vs head_dim {}",
-            weight.len(),
-            head_dim
-        );
-    }
-    if flat_idx >= native_input.len() {
-        anyhow::bail!(
-            "rms_norm_head_detail idx {} out of range for {} values",
-            flat_idx,
-            native_input.len()
-        );
-    }
-    let head = flat_idx / head_dim;
-    let dim = flat_idx % head_dim;
-    let row_start = head * head_dim;
-    let row_end = row_start + head_dim;
-    let native_row = &native_input[row_start..row_end];
-    let oracle_row = &oracle_input[row_start..row_end];
-    let native_ms = native_row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
-    let oracle_ms = oracle_row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
-    Ok(RmsNormHeadDetail {
-        head,
-        dim,
-        hidden_native: native_input[flat_idx],
-        hidden_oracle: oracle_input[flat_idx],
-        inv_rms_native: 1.0 / (native_ms + 1e-6).sqrt(),
-        inv_rms_oracle: 1.0 / (oracle_ms + 1e-6).sqrt(),
-        scale: weight[dim] + 1.0,
-    })
-}
-
-fn apply_rms_norm_reference(
-    input: &[f32],
-    weight: &[f32],
-    num_heads: usize,
-    head_dim: usize,
-    eps: f32,
-) -> Result<Vec<f32>> {
-    if weight.len() != head_dim {
-        anyhow::bail!(
-            "apply_rms_norm_reference weight len mismatch: {} vs head_dim {}",
-            weight.len(),
-            head_dim
-        );
-    }
-    if input.len() != num_heads * head_dim {
-        anyhow::bail!(
-            "apply_rms_norm_reference input len mismatch: {} vs {}",
-            input.len(),
-            num_heads * head_dim
-        );
-    }
-    let mut out = vec![0.0f32; input.len()];
-    for head in 0..num_heads {
-        let row_start = head * head_dim;
-        let row_end = row_start + head_dim;
-        let row = &input[row_start..row_end];
-        let ms = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
-        let inv_rms = 1.0 / (ms + eps).sqrt();
-        for dim in 0..head_dim {
-            out[row_start + dim] = row[dim] * inv_rms * (weight[dim] + 1.0);
-        }
-    }
-    Ok(out)
-}
-
-fn apply_rms_norm_gated_reference(
-    hidden: &[f32],
-    gate: &[f32],
-    weight: &[f32],
-    eps: f32,
-) -> Result<Vec<f32>> {
-    if hidden.len() != gate.len() {
-        anyhow::bail!(
-            "apply_rms_norm_gated_reference len mismatch: hidden={} gate={}",
-            hidden.len(),
-            gate.len()
-        );
-    }
-    if weight.is_empty() {
-        anyhow::bail!("apply_rms_norm_gated_reference weight must not be empty");
-    }
-    if hidden.len() % weight.len() != 0 {
-        anyhow::bail!(
-            "apply_rms_norm_gated_reference weight len mismatch: hidden={} weight={}",
-            hidden.len(),
-            weight.len()
-        );
-    }
-    let row_cols = weight.len();
-    let n_rows = hidden.len() / row_cols;
-    let mut out = Vec::with_capacity(hidden.len());
-    for row in 0..n_rows {
-        let base = row * row_cols;
-        let row_hidden = &hidden[base..base + row_cols];
-        let row_gate = &gate[base..base + row_cols];
-        let mean_sq = row_hidden.iter().map(|v| v * v).sum::<f32>() / row_cols as f32;
-        let inv_rms = 1.0 / (mean_sq + eps).sqrt();
-        out.extend(
-            row_hidden
-                .iter()
-                .zip(row_gate.iter())
-                .zip(weight.iter())
-                .map(|((hidden, gate), weight)| hidden * inv_rms * weight * silu(*gate)),
-        );
-    }
-    Ok(out)
-}
-
-fn apply_matmul_rhs_transposed_reference(
-    lhs_row: &[f32],
-    rhs: &[f32],
-    out_dim: usize,
-    in_dim: usize,
-) -> Result<Vec<f32>> {
-    if lhs_row.len() != in_dim {
-        anyhow::bail!(
-            "apply_matmul_rhs_transposed_reference lhs len mismatch: {} vs {}",
-            lhs_row.len(),
-            in_dim
-        );
-    }
-    if rhs.len() != out_dim * in_dim {
-        anyhow::bail!(
-            "apply_matmul_rhs_transposed_reference rhs len mismatch: {} vs {}",
-            rhs.len(),
-            out_dim * in_dim
-        );
-    }
-    let mut out = vec![0.0f32; out_dim];
-    for out_idx in 0..out_dim {
-        let row = &rhs[out_idx * in_dim..(out_idx + 1) * in_dim];
-        out[out_idx] = lhs_row
-            .iter()
-            .zip(row.iter())
-            .map(|(a, b)| a * b)
-            .sum::<f32>();
-    }
-    Ok(out)
-}
-
-fn silu_reference(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-fn apply_linear_conv_pack_row_reference(
-    conv_window: &[f32],
-    weights: &[f32],
-    conv_dim: usize,
-    kernel_size: usize,
-) -> Result<Vec<f32>> {
-    if conv_window.len() != conv_dim * kernel_size {
-        anyhow::bail!(
-            "apply_linear_conv_pack_row_reference window len mismatch: {} vs {}",
-            conv_window.len(),
-            conv_dim * kernel_size
-        );
-    }
-    if weights.len() != conv_dim * kernel_size {
-        anyhow::bail!(
-            "apply_linear_conv_pack_row_reference weight len mismatch: {} vs {}",
-            weights.len(),
-            conv_dim * kernel_size
-        );
-    }
-    let mut out = vec![0.0f32; conv_dim];
-    for ch in 0..conv_dim {
-        let window_row = &conv_window[ch * kernel_size..(ch + 1) * kernel_size];
-        let weight_row = &weights[ch * kernel_size..(ch + 1) * kernel_size];
-        let acc = window_row
-            .iter()
-            .zip(weight_row.iter())
-            .map(|(a, b)| a * b)
-            .sum::<f32>();
-        out[ch] = silu_reference(acc);
-    }
-    Ok(out)
-}
-
-fn flatten_json_numbers(value: &serde_json::Value, out: &mut Vec<f32>) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                flatten_json_numbers(value, out);
-            }
-        }
-        serde_json::Value::Number(number) => {
-            if let Some(value) = number.as_f64() {
-                out.push(value as f32);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn flatten_bsh(value: &serde_json::Value) -> Option<Vec<f32>> {
-    value.as_array()?;
-    let mut out = Vec::new();
-    flatten_json_numbers(value, &mut out);
-    Some(out)
-}
-
-fn encode_bf16_le(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| half::bf16::from_f32(*value).to_le_bytes())
-        .collect()
-}
-
-fn flatten_last_token_bsd(value: &serde_json::Value) -> Option<Vec<f32>> {
-    flatten_token_bsd(value, None)
-}
-
-fn flatten_json_vector(value: &serde_json::Value) -> Option<Vec<f32>> {
-    let array = value.as_array()?;
-    let mut out = Vec::with_capacity(array.len());
-    for elem in array {
-        out.push(elem.as_f64()? as f32);
-    }
-    Some(out)
-}
-
-fn flatten_token_bsd(value: &serde_json::Value, position: Option<usize>) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    let token = match position {
-        Some(position) => batch.get(position)?,
-        None => batch.last()?,
-    };
-    let mut out = Vec::new();
-    flatten_json_numbers(token, &mut out);
-    Some(out)
-}
-
-fn extract_causal_conv_window_bsd(
-    value: &serde_json::Value,
-    position: usize,
-    dim: usize,
-    kernel_size: usize,
-) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    if position >= batch.len() {
-        return None;
-    }
-    let pad = kernel_size.saturating_sub(1);
-    let mut out = vec![0.0f32; dim * kernel_size];
-    for tap in 0..kernel_size {
-        let src_pos = position as isize - pad as isize + tap as isize;
-        if src_pos < 0 {
-            continue;
-        }
-        let row = flatten_json_vector(batch.get(src_pos as usize)?)?;
-        if row.len() != dim {
-            return None;
-        }
-        let dst_base = tap;
-        for ch in 0..dim {
-            out[ch * kernel_size + dst_base] = row[ch];
-        }
-    }
-    Some(out)
-}
-
-fn flatten_last_token_bhsd(value: &serde_json::Value) -> Option<Vec<f32>> {
-    flatten_token_bhsd(value, None)
-}
-
-fn flatten_token_bhsd(value: &serde_json::Value, position: Option<usize>) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    let mut out = Vec::new();
-    for head in batch {
-        let tokens = head.as_array()?;
-        let token = match position {
-            Some(position) => tokens.get(position)?,
-            None => tokens.last()?,
-        };
-        flatten_json_numbers(token, &mut out);
-    }
-    Some(out)
-}
-
-fn flatten_last_token_bshd(value: &serde_json::Value) -> Option<Vec<f32>> {
-    flatten_token_bshd(value, None)
-}
-
-fn flatten_token_bshd(value: &serde_json::Value, position: Option<usize>) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    let token = match position {
-        Some(position) => batch.get(position)?,
-        None => batch.last()?,
-    }
-    .as_array()?;
-    let mut out = Vec::new();
-    for head in token {
-        flatten_json_numbers(head, &mut out);
-    }
-    Some(out)
 }
 
 fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
@@ -5703,11 +2535,7 @@ fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
     } else {
         (1.0 + f32::from(mantissa) / 8.0) * (2.0f32).powi(exp as i32 - 7)
     };
-    if sign != 0 {
-        -val
-    } else {
-        val
-    }
+    if sign != 0 { -val } else { val }
 }
 
 fn f32_to_bf16_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
@@ -5740,8 +2568,6 @@ fn trace_component_input_layer(
         use_4b_kernel,
         true,
         None,
-        None,
-        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -5755,7 +2581,9 @@ fn trace_component_input_layer(
         let native_f32 = decode_bf16_le(native_hidden);
         let replay_f32 = decode_bf16_le(replay_hidden);
         let delta = validate::max_abs_delta(&native_f32, &replay_f32);
-        eprintln!("[trace-component-input] layer={trace_layer} hidden_delta={delta:.6}");
+        eprintln!(
+            "[trace-component-input] layer={trace_layer} hidden_delta={delta:.6}"
+        );
     } else {
         eprintln!(
             "[trace-component-input] layer={trace_layer} has no replay previous-layer hidden reference"
@@ -5787,8 +2615,6 @@ fn trace_persistent_input_layer(
         use_4b_kernel,
         true,
         None,
-        None,
-        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -5802,7 +2628,9 @@ fn trace_persistent_input_layer(
         let native_f32 = decode_bf16_le(native_hidden);
         let replay_f32 = decode_bf16_le(replay_hidden);
         let delta = validate::max_abs_delta(&native_f32, &replay_f32);
-        eprintln!("[trace-persistent-input] layer={trace_layer} hidden_delta={delta:.6}");
+        eprintln!(
+            "[trace-persistent-input] layer={trace_layer} hidden_delta={delta:.6}"
+        );
     } else {
         eprintln!(
             "[trace-persistent-input] layer={trace_layer} has no replay previous-layer hidden reference"
@@ -5834,8 +2662,6 @@ fn trace_persistent_linear_state_layer(
         use_4b_kernel,
         false,
         None,
-        None,
-        None,
     )?;
 
     let native_state = engine.state_for_batch(0);
@@ -5848,63 +2674,63 @@ fn trace_persistent_linear_state_layer(
         .get(trace_layer)
         .ok_or_else(|| anyhow::anyhow!("replay layer {trace_layer} out of range"))?;
 
-    let (conv_delta, first_conv_mismatch) =
-        match (&native_layer.conv_state, &replay_layer.conv_state) {
-            (Some(native), Some(replay)) => {
-                let native_vals = decode_bf16_le(
-                    &native
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("native persistent conv trace D2H: {e}"))?,
-                );
-                let replay_vals = decode_bf16_le(
-                    &replay
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("replay persistent conv trace D2H: {e}"))?,
-                );
-                let delta = validate::max_abs_delta(&native_vals, &replay_vals);
-                let first = native_vals
-                    .iter()
-                    .zip(replay_vals.iter())
-                    .enumerate()
-                    .find(|(_, (n, r))| (*n - *r).abs() > 0.0)
-                    .map(|(idx, (n, r))| (idx, *n, *r));
-                (delta, first)
-            }
-            _ => (0.0, None),
-        };
-    let (rec_delta, first_rec_mismatch, max_rec_mismatch) =
-        match (&native_layer.recurrent_state, &replay_layer.recurrent_state) {
-            (Some(native), Some(replay)) => {
-                let native_vals =
-                    decode_f32_le(&native.to_host_bytes().map_err(|e| {
-                        anyhow::anyhow!("native persistent recurrent trace D2H: {e}")
-                    })?);
-                let replay_vals =
-                    decode_f32_le(&replay.to_host_bytes().map_err(|e| {
-                        anyhow::anyhow!("replay persistent recurrent trace D2H: {e}")
-                    })?);
-                let delta = validate::max_abs_delta(&native_vals, &replay_vals);
-                let first = native_vals
-                    .iter()
-                    .zip(replay_vals.iter())
-                    .enumerate()
-                    .find(|(_, (n, r))| (*n - *r).abs() > 0.0)
-                    .map(|(idx, (n, r))| (idx, *n, *r));
-                let max_entry = native_vals
-                    .iter()
-                    .zip(replay_vals.iter())
-                    .enumerate()
-                    .max_by(|(_, (na, ra)), (_, (nb, rb))| {
-                        (*na - *ra)
-                            .abs()
-                            .partial_cmp(&(*nb - *rb).abs())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(idx, (n, r))| (idx, *n, *r, (*n - *r).abs()));
-                (delta, first, max_entry)
-            }
-            _ => (0.0, None, None),
-        };
+    let (conv_delta, first_conv_mismatch) = match (&native_layer.conv_state, &replay_layer.conv_state) {
+        (Some(native), Some(replay)) => {
+            let native_vals = decode_bf16_le(
+                &native
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("native persistent conv trace D2H: {e}"))?,
+            );
+            let replay_vals = decode_bf16_le(
+                &replay
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("replay persistent conv trace D2H: {e}"))?,
+            );
+            let delta = validate::max_abs_delta(&native_vals, &replay_vals);
+            let first = native_vals
+                .iter()
+                .zip(replay_vals.iter())
+                .enumerate()
+                .find(|(_, (n, r))| (*n - *r).abs() > 0.0)
+                .map(|(idx, (n, r))| (idx, *n, *r));
+            (delta, first)
+        }
+        _ => (0.0, None),
+    };
+    let (rec_delta, first_rec_mismatch, max_rec_mismatch) = match (&native_layer.recurrent_state, &replay_layer.recurrent_state) {
+        (Some(native), Some(replay)) => {
+            let native_vals = decode_f32_le(
+                &native
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("native persistent recurrent trace D2H: {e}"))?,
+            );
+            let replay_vals = decode_f32_le(
+                &replay
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("replay persistent recurrent trace D2H: {e}"))?,
+            );
+            let delta = validate::max_abs_delta(&native_vals, &replay_vals);
+            let first = native_vals
+                .iter()
+                .zip(replay_vals.iter())
+                .enumerate()
+                .find(|(_, (n, r))| (*n - *r).abs() > 0.0)
+                .map(|(idx, (n, r))| (idx, *n, *r));
+            let max_entry = native_vals
+                .iter()
+                .zip(replay_vals.iter())
+                .enumerate()
+                .max_by(|(_, (na, ra)), (_, (nb, rb))| {
+                    (*na - *ra)
+                        .abs()
+                        .partial_cmp(&(*nb - *rb).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(idx, (n, r))| (idx, *n, *r, (*n - *r).abs()));
+            (delta, first, max_entry)
+        }
+        _ => (0.0, None, None),
+    };
     eprintln!(
         "[trace-persistent-linear-state] layer={trace_layer} conv_delta={conv_delta:.6} recurrent_delta={rec_delta:.6}{}{}{}",
         first_conv_mismatch
@@ -5942,16 +2768,11 @@ fn trace_persistent_full_attn_layer(
         text_config.is_full_attention(trace_layer),
         "layer {trace_layer} is not a full-attention layer"
     );
-    anyhow::ensure!(
-        trace_layer > 0,
-        "trace layer must be > 0 for full-attention input tracing"
-    );
+    anyhow::ensure!(trace_layer > 0, "trace layer must be > 0 for full-attention input tracing");
 
     let prefix_ids = token_ids
         .get(..token_ids.len().saturating_sub(1))
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing prefix token ids for persistent full-attn trace")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("missing prefix token ids for persistent full-attn trace"))?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
 
     let native_hidden = engine.decode_step_batch_trace_hidden_after_layers(
@@ -5971,23 +2792,18 @@ fn trace_persistent_full_attn_layer(
     let native_q = engine.trace_persistent_full_attention_q_after_layers(0)?;
     let native_saved_gate = engine.trace_persistent_full_attention_saved_gate_after_layers(0)?;
     let native_pre_gate = engine.trace_persistent_full_attention_pre_gate_after_layers(0)?;
-    let native_scores =
-        engine.trace_persistent_full_attention_scores_after_layers(0, seqlen_offset + 1)?;
+    let native_scores = engine.trace_persistent_full_attention_scores_after_layers(0, seqlen_offset + 1)?;
     let (_, _, _, native_token_mixer) =
         engine.trace_persistent_mlp_stage_after_layers(0, text_config.intermediate_size)?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
-    let native_component = engine.trace_full_attention_stages_from_hidden(
+    let native_component =
+        engine.trace_full_attention_stages_from_hidden(trace_layer, &native_hidden, seqlen_offset)?;
+    let native_component_layer = engine.trace_full_attention_layer_output_from_hidden_current_state(
         trace_layer,
+        0,
         &native_hidden,
         seqlen_offset,
     )?;
-    let native_component_layer = engine
-        .trace_full_attention_layer_output_from_hidden_current_state(
-            trace_layer,
-            0,
-            &native_hidden,
-            seqlen_offset,
-        )?;
 
     let mut replay_prefix_state = ModelState::new(&text_config, ordinal)
         .map_err(|e| anyhow::anyhow!("persistent full-attn replay prefix state init: {e}"))?;
@@ -6002,8 +2818,6 @@ fn trace_persistent_full_attn_layer(
         false,
         use_4b_kernel,
         true,
-        None,
-        None,
         None,
     )?;
     let mut replay_state = ModelState::new(&text_config, ordinal)
@@ -6020,19 +2834,14 @@ fn trace_persistent_full_attn_layer(
         use_4b_kernel,
         true,
         None,
-        None,
-        None,
     )?;
     let replay_hidden = replay
         .layer_hidden_trace
         .as_ref()
         .and_then(|layers| layers.get(trace_layer - 1))
         .ok_or_else(|| anyhow::anyhow!("missing replay hidden trace for layer {trace_layer}"))?;
-    let replay_component = engine.trace_full_attention_stages_from_hidden(
-        trace_layer,
-        replay_hidden,
-        seqlen_offset,
-    )?;
+    let replay_component =
+        engine.trace_full_attention_stages_from_hidden(trace_layer, replay_hidden, seqlen_offset)?;
     let replay_cache_component_layer = engine.trace_full_attention_layer_output_from_hidden_state(
         &replay_prefix_state,
         trace_layer,
@@ -6153,32 +2962,23 @@ fn trace_persistent_full_attn_layer(
         let bf16_q = decode_f32_le(&engine.trace_persistent_full_attention_q_after_layers(0)?);
         let bf16_saved_gate =
             decode_f32_le(&engine.trace_persistent_full_attention_saved_gate_after_layers(0)?);
-        let bf16_gated =
-            decode_f32_le(&engine.trace_persistent_full_attention_gated_after_layers(0)?);
+        let bf16_gated = decode_f32_le(&engine.trace_persistent_full_attention_gated_after_layers(0)?);
         let bf16_pre_gate =
             decode_f32_le(&engine.trace_persistent_full_attention_pre_gate_after_layers(0)?);
-        let bf16_scores = decode_f32_le(
-            &engine.trace_persistent_full_attention_scores_after_layers(0, seqlen_offset + 1)?,
-        );
+        let bf16_scores =
+            decode_f32_le(&engine.trace_persistent_full_attention_scores_after_layers(0, seqlen_offset + 1)?);
         let (_, _, _, bf16_token_mixer) =
             engine.trace_persistent_mlp_stage_after_layers(0, text_config.intermediate_size)?;
         let bf16_token_mixer_f32 = decode_f32_le(&bf16_token_mixer);
-        kv_vs_bf16_pre_gate = Some(validate::max_abs_delta(
-            &native_pre_gate_f32,
-            &bf16_pre_gate,
-        ));
+        kv_vs_bf16_pre_gate = Some(validate::max_abs_delta(&native_pre_gate_f32, &bf16_pre_gate));
         kv_vs_bf16_gated = Some(validate::max_abs_delta(&native_gated_f32, &bf16_gated));
-        kv_vs_bf16_attn_hidden = Some(validate::max_abs_delta(
-            &native_token_mixer_f32,
-            &bf16_token_mixer_f32,
-        ));
+        kv_vs_bf16_attn_hidden =
+            Some(validate::max_abs_delta(&native_token_mixer_f32, &bf16_token_mixer_f32));
         kv_vs_bf16_scores = Some(validate::max_abs_delta(&native_scores_f32, &bf16_scores));
         kv_vs_bf16_hidden = Some(validate::max_abs_delta(&native_hidden_f32, &bf16_hidden));
         kv_vs_bf16_q = Some(validate::max_abs_delta(&native_q_f32, &bf16_q));
-        kv_vs_bf16_saved_gate = Some(validate::max_abs_delta(
-            &native_saved_gate_f32,
-            &bf16_saved_gate,
-        ));
+        kv_vs_bf16_saved_gate =
+            Some(validate::max_abs_delta(&native_saved_gate_f32, &bf16_saved_gate));
         kv_vs_bf16_cache_k = Some(validate::max_abs_delta(
             &decode_bf16_le(&native_cache_k_bf16),
             &decode_bf16_le(&bf16_cache_k_bf16),
@@ -6193,12 +2993,9 @@ fn trace_persistent_full_attn_layer(
                 .map(|h| {
                     let start = h * score_cols;
                     let end = start + score_cols;
-                    validate::max_abs_delta(
-                        &native_scores_f32[start..end],
-                        &bf16_scores[start..end],
-                    )
+                    validate::max_abs_delta(&native_scores_f32[start..end], &bf16_scores[start..end])
                 })
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
         );
         engine.set_kv_fp8_for_trace(true);
         engine.rebuild_prefill_state(prefix_ids, true)?;
@@ -6224,15 +3021,35 @@ fn trace_persistent_full_attn_layer(
         .map(|h| {
             let start = h * head_dim;
             let end = start + head_dim;
-            validate::max_abs_delta(
-                &native_pre_gate_f32[start..end],
-                &native_comp_pre_gate_f32[start..end],
-            )
+            validate::max_abs_delta(&native_pre_gate_f32[start..end], &native_comp_pre_gate_f32[start..end])
         })
         .collect::<Vec<_>>();
     let per_head_pre_gate_str = per_head_pre_gate
         .iter()
         .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pre_gate_best_match = (0..num_q_heads)
+        .map(|h| {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            let native_head = &native_pre_gate_f32[start..end];
+            let (best_idx, best_delta) = (0..num_q_heads)
+                .map(|cand| {
+                    let cand_start = cand * head_dim;
+                    let cand_end = cand_start + head_dim;
+                    (
+                        cand,
+                        validate::max_abs_delta(
+                            native_head,
+                            &native_comp_pre_gate_f32[cand_start..cand_end],
+                        ),
+                    )
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((h, f32::INFINITY));
+            format!("{h}->{best_idx}:{best_delta:.6}")
+        })
         .collect::<Vec<_>>()
         .join(",");
     let per_head_q = (0..num_q_heads)
@@ -6245,6 +3062,29 @@ fn trace_persistent_full_attn_layer(
     let per_head_q_str = per_head_q
         .iter()
         .map(|v| format!("{v:.6}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let q_best_match = (0..num_q_heads)
+        .map(|h| {
+            let start = h * head_dim;
+            let end = start + head_dim;
+            let native_head = &native_q_f32[start..end];
+            let (best_idx, best_delta) = (0..num_q_heads)
+                .map(|cand| {
+                    let cand_start = cand * head_dim;
+                    let cand_end = cand_start + head_dim;
+                    (
+                        cand,
+                        validate::max_abs_delta(
+                            native_head,
+                            &native_q_rope_f32[cand_start..cand_end],
+                        ),
+                    )
+                })
+                .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((h, f32::INFINITY));
+            format!("{h}->{best_idx}:{best_delta:.6}")
+        })
         .collect::<Vec<_>>()
         .join(",");
     let (score_row_delta, per_head_score_str) = if let (Some(scale_k), Some(k_cache)) = (
@@ -6275,9 +3115,10 @@ fn trace_persistent_full_attn_layer(
                 let base = (kvh * max_t + t) * hd;
                 let mut acc = 0.0f32;
                 for d in 0..hd {
-                    let k_val =
-                        half::bf16::from_f32(fp8_e4m3_to_f32_host(k_bytes[base + d]) * scale_val)
-                            .to_f32();
+                    let k_val = half::bf16::from_f32(
+                        fp8_e4m3_to_f32_host(k_bytes[base + d]) * scale_val
+                    )
+                    .to_f32();
                     acc += q_head[d] * k_val;
                 }
                 host_scores.push(acc / (hd as f32).sqrt());
@@ -6330,18 +3171,30 @@ fn trace_persistent_full_attn_layer(
             &native_component.v_proj,
         )
         .map_err(|e| anyhow::anyhow!("trace fp8 temp V H2D: {e}"))?;
-        let mut tmp_k_fp8 =
-            gpu_hal::GpuBuffer::zeros(ordinal, gpu_hal::ScalarType::U8, &[nkv, max_t, hd])
-                .map_err(|e| anyhow::anyhow!("trace fp8 temp K cache alloc: {e}"))?;
-        let mut tmp_v_fp8 =
-            gpu_hal::GpuBuffer::zeros(ordinal, gpu_hal::ScalarType::U8, &[nkv, max_t, hd])
-                .map_err(|e| anyhow::anyhow!("trace fp8 temp V cache alloc: {e}"))?;
-        let mut tmp_k_scale =
-            gpu_hal::GpuBuffer::zeros(ordinal, gpu_hal::ScalarType::F32, &[nkv, max_t])
-                .map_err(|e| anyhow::anyhow!("trace fp8 temp K scale alloc: {e}"))?;
-        let mut tmp_v_scale =
-            gpu_hal::GpuBuffer::zeros(ordinal, gpu_hal::ScalarType::F32, &[nkv, max_t])
-                .map_err(|e| anyhow::anyhow!("trace fp8 temp V scale alloc: {e}"))?;
+        let mut tmp_k_fp8 = gpu_hal::GpuBuffer::zeros(
+            ordinal,
+            gpu_hal::ScalarType::U8,
+            &[nkv, max_t, hd],
+        )
+        .map_err(|e| anyhow::anyhow!("trace fp8 temp K cache alloc: {e}"))?;
+        let mut tmp_v_fp8 = gpu_hal::GpuBuffer::zeros(
+            ordinal,
+            gpu_hal::ScalarType::U8,
+            &[nkv, max_t, hd],
+        )
+        .map_err(|e| anyhow::anyhow!("trace fp8 temp V cache alloc: {e}"))?;
+        let mut tmp_k_scale = gpu_hal::GpuBuffer::zeros(
+            ordinal,
+            gpu_hal::ScalarType::F32,
+            &[nkv, max_t],
+        )
+        .map_err(|e| anyhow::anyhow!("trace fp8 temp K scale alloc: {e}"))?;
+        let mut tmp_v_scale = gpu_hal::GpuBuffer::zeros(
+            ordinal,
+            gpu_hal::ScalarType::F32,
+            &[nkv, max_t],
+        )
+        .map_err(|e| anyhow::anyhow!("trace fp8 temp V scale alloc: {e}"))?;
         kernel_ffi::prefill_ffi::quantize_kv_to_fp8(
             ordinal,
             gpu_hal::ScalarType::BF16,
@@ -6440,7 +3293,10 @@ fn trace_persistent_full_attn_layer(
         for qh in 0..num_q_heads {
             let kvh = qh / kv_groups;
             let row = &native_scores_f32[qh * (seqlen_offset + 1)..(qh + 1) * (seqlen_offset + 1)];
-            let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let row_max = row
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut denom = 0.0f32;
             let mut weights = vec![0.0f32; row.len()];
             for (idx, score) in row.iter().copied().enumerate() {
@@ -6454,7 +3310,7 @@ fn trace_persistent_full_attn_layer(
                     let scale_val = native_v_scales[kvh * max_t + t];
                     let base = (kvh * max_t + t) * hd + d;
                     let v_val = half::bf16::from_f32(
-                        fp8_e4m3_to_f32_host(native_v_cache_bytes[base]) * scale_val,
+                        fp8_e4m3_to_f32_host(native_v_cache_bytes[base]) * scale_val
                     )
                     .to_f32();
                     acc += w * v_val;
@@ -6462,15 +3318,13 @@ fn trace_persistent_full_attn_layer(
                 host_pre_gate[qh * hd + d] = if denom > 0.0 { acc / denom } else { 0.0 };
             }
         }
-        let native_vs_host_pre_gate = validate::max_abs_delta(&native_pre_gate_f32, &host_pre_gate);
+        let native_vs_host_pre_gate =
+            validate::max_abs_delta(&native_pre_gate_f32, &host_pre_gate);
         let per_head_host_pre_gate = (0..num_q_heads)
             .map(|h| {
                 let start = h * hd;
                 let end = start + hd;
-                validate::max_abs_delta(
-                    &native_pre_gate_f32[start..end],
-                    &host_pre_gate[start..end],
-                )
+                validate::max_abs_delta(&native_pre_gate_f32[start..end], &host_pre_gate[start..end])
             })
             .collect::<Vec<_>>();
         let per_head_host_pre_gate_str = per_head_host_pre_gate
@@ -6495,15 +3349,10 @@ fn trace_persistent_full_attn_layer(
         let kv_vs_bf16_cache_v = kv_vs_bf16_cache_v.unwrap_or(0.0);
         let kv_vs_bf16_scores_heads_str = kv_vs_bf16_scores_heads
             .as_ref()
-            .map(|vals| {
-                vals.iter()
-                    .map(|v| format!("{v:.6}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            })
+            .map(|vals| vals.iter().map(|v| format!("{v:.6}")).collect::<Vec<_>>().join(","))
             .unwrap_or_default();
         eprintln!(
-            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_vs_host_pre_gate={native_vs_host_pre_gate:.6} kv_vs_bf16_hidden={kv_vs_bf16_hidden:.6} kv_vs_bf16_cache_k={kv_vs_bf16_cache_k:.6} kv_vs_bf16_cache_v={kv_vs_bf16_cache_v:.6} kv_vs_bf16_q={kv_vs_bf16_q:.6} kv_vs_bf16_saved_gate={kv_vs_bf16_saved_gate:.6} kv_vs_bf16_scores={kv_vs_bf16_scores:.6} kv_vs_bf16_scores_heads=[{kv_vs_bf16_scores_heads_str}] kv_vs_bf16_pre_gate={kv_vs_bf16_pre_gate:.6} per_head_host_pre_gate=[{per_head_host_pre_gate_str}] native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_host_gated={native_vs_host_gated:.6} kv_vs_bf16_gated={kv_vs_bf16_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} kv_vs_bf16_attn_hidden={kv_vs_bf16_attn_hidden:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_quant_k_mismatches={cache_vs_quant_k} cache_vs_quant_v_mismatches={cache_vs_quant_v} cache_vs_quant_k_scale_delta={scale_vs_quant_k:.6} cache_vs_quant_v_scale_delta={scale_vs_quant_v:.6}"
+            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] q_best_match=[{q_best_match}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_vs_host_pre_gate={native_vs_host_pre_gate:.6} kv_vs_bf16_hidden={kv_vs_bf16_hidden:.6} kv_vs_bf16_cache_k={kv_vs_bf16_cache_k:.6} kv_vs_bf16_cache_v={kv_vs_bf16_cache_v:.6} kv_vs_bf16_q={kv_vs_bf16_q:.6} kv_vs_bf16_saved_gate={kv_vs_bf16_saved_gate:.6} kv_vs_bf16_scores={kv_vs_bf16_scores:.6} kv_vs_bf16_scores_heads=[{kv_vs_bf16_scores_heads_str}] kv_vs_bf16_pre_gate={kv_vs_bf16_pre_gate:.6} per_head_host_pre_gate=[{per_head_host_pre_gate_str}] native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_host_gated={native_vs_host_gated:.6} kv_vs_bf16_gated={kv_vs_bf16_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} kv_vs_bf16_attn_hidden={kv_vs_bf16_attn_hidden:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] pre_gate_best_match=[{pre_gate_best_match}] cache_vs_quant_k_mismatches={cache_vs_quant_k} cache_vs_quant_v_mismatches={cache_vs_quant_v} cache_vs_quant_k_scale_delta={scale_vs_quant_k:.6} cache_vs_quant_v_scale_delta={scale_vs_quant_v:.6}"
         );
     } else {
         let native_cache = engine.full_attention_cache_step_bytes(trace_layer, 0, seqlen_offset)?;
@@ -6514,7 +3363,7 @@ fn trace_persistent_full_attn_layer(
         let cache_vs_replay_k = validate::max_abs_delta(&native_cache_k_f32, &replay_comp_k_f32);
         let cache_vs_replay_v = validate::max_abs_delta(&native_cache_v_f32, &replay_comp_v_f32);
         eprintln!(
-            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] cache_vs_component_k={cache_vs_component_k:.6} cache_vs_component_v={cache_vs_component_v:.6} cache_vs_replay_k={cache_vs_replay_k:.6} cache_vs_replay_v={cache_vs_replay_v:.6}"
+            "[trace-persistent-full-attn] layer={trace_layer} hidden_delta={hidden_delta:.6} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} native_vs_component_q={native_vs_component_q:.6} per_head_q=[{per_head_q_str}] q_best_match=[{q_best_match}] native_comp_vs_replay_k={native_vs_replay_k:.6} native_comp_vs_replay_v={native_vs_replay_v:.6} native_vs_component_saved_gate={native_vs_component_saved_gate:.6} native_vs_component_pre_gate={native_vs_component_pre_gate:.6} native_score_row_delta={score_row_delta:.6} per_head_score=[{per_head_score_str}] native_vs_component_gated={native_vs_component_gated:.6} native_vs_component_attn_hidden={native_vs_component_attn_hidden:.6} native_vs_host_o_proj={native_vs_host_o_proj:.6} native_vs_replay_attn_hidden={native_vs_replay_attn_hidden:.6} native_cache_vs_replay_cache_attn_hidden={native_cache_vs_replay_cache_attn_hidden:.6} component_vs_replay_attn_hidden={component_vs_replay_attn_hidden:.6} per_head_pre_gate=[{per_head_pre_gate_str}] pre_gate_best_match=[{pre_gate_best_match}] cache_vs_component_k={cache_vs_component_k:.6} cache_vs_component_v={cache_vs_component_v:.6} cache_vs_replay_k={cache_vs_replay_k:.6} cache_vs_replay_v={cache_vs_replay_v:.6}"
         );
     }
     Ok(())
@@ -6558,8 +3407,6 @@ fn trace_persistent_linear_layer(
         use_4b_kernel,
         true,
         None,
-        None,
-        None,
     )?;
     let replay_hidden = if trace_layer == 0 {
         None
@@ -6569,9 +3416,7 @@ fn trace_persistent_linear_layer(
                 .layer_hidden_trace
                 .as_ref()
                 .and_then(|layers| layers.get(trace_layer - 1))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("missing replay hidden trace for layer {trace_layer}")
-                })?,
+                .ok_or_else(|| anyhow::anyhow!("missing replay hidden trace for layer {trace_layer}"))?,
         )
     };
     let replay_layer = replay_state
@@ -6594,9 +3439,7 @@ fn trace_persistent_linear_layer(
         .layer_hidden_trace
         .as_ref()
         .and_then(|layers| layers.get(trace_layer))
-        .ok_or_else(|| {
-            anyhow::anyhow!("missing replay output hidden trace for layer {trace_layer}")
-        })?;
+        .ok_or_else(|| anyhow::anyhow!("missing replay output hidden trace for layer {trace_layer}"))?;
     let replay_attn = replay
         .layer_attn_trace
         .as_ref()
@@ -6622,20 +3465,39 @@ fn trace_persistent_linear_layer(
         .get(..token_ids.len().saturating_sub(1))
         .ok_or_else(|| anyhow::anyhow!("missing prefix token ids for persistent linear trace"))?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
+    let pre_step_conv = engine
+        .state_for_batch(0)
+        .layers
+        .get(trace_layer)
+        .ok_or_else(|| anyhow::anyhow!("missing pre-step layer {trace_layer}"))?
+        .conv_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing pre-step conv state for layer {trace_layer}"))?
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("pre-step conv D2H layer {trace_layer}: {e}"))?;
     engine.set_hidden_from_bytes(&native_hidden)?;
     let (native_comp_trace, native_comp_conv, native_comp_recurrent, native_comp_hidden) =
         engine.component_trace_linear_layer_from_current_hidden(trace_layer)?;
     engine.rebuild_prefill_state(prefix_ids, true)?;
     engine.set_hidden_from_bytes(&native_hidden)?;
-    let native_comp_layer = engine.component_trace_full_layer_from_current_hidden(trace_layer)?;
+    let native_comp_layer = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
+        trace_layer,
+        seqlen_offset,
+    )?;
 
     engine.rebuild_prefill_state(prefix_ids, true)?;
-    let native_hidden_out = engine.decode_step_batch_trace_hidden_after_layers(
-        trace_tokens,
-        seqlen_offset,
-        trace_layer + 1,
-        0,
-    )?;
+    let native_hidden_out = engine
+        .decode_step_batch_trace_hidden_after_layers(trace_tokens, seqlen_offset, trace_layer + 1, 0)?;
+    let native_partial_conv = engine
+        .state_for_batch(0)
+        .layers
+        .get(trace_layer)
+        .ok_or_else(|| anyhow::anyhow!("missing native partial layer {trace_layer}"))?
+        .conv_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("missing native partial conv state for layer {trace_layer}"))?
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("native partial conv D2H layer {trace_layer}: {e}"))?;
     let cfg = engine.weights().config.clone();
     let qkv_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim * 2
         + cfg.linear_num_value_heads * cfg.linear_value_head_dim;
@@ -6669,10 +3531,7 @@ fn trace_persistent_linear_layer(
         .map_err(|e| anyhow::anyhow!("native recurrent D2H layer {trace_layer}: {e}"))?;
     let hidden_delta = replay_hidden
         .map(|replay_hidden| {
-            validate::max_abs_delta(
-                &decode_bf16_le(&native_hidden),
-                &decode_bf16_le(replay_hidden),
-            )
+            validate::max_abs_delta(&decode_bf16_le(&native_hidden), &decode_bf16_le(replay_hidden))
         })
         .unwrap_or(0.0);
     let replay_comp_trace = if let Some(replay_hidden) = replay_hidden {
@@ -6682,161 +3541,422 @@ fn trace_persistent_linear_layer(
     } else {
         None
     };
-    let comp_vs_replay_conv = validate::max_abs_delta(
-        &decode_bf16_le(&native_comp_conv),
-        &decode_bf16_le(&replay_conv),
-    );
-    let comp_vs_replay_recurrent = validate::max_abs_delta(
-        &decode_f32_le(&native_comp_recurrent),
-        &decode_f32_le(&replay_recurrent),
-    );
-    let comp_vs_replay_hidden = validate::max_abs_delta(
-        &decode_bf16_le(&native_comp_hidden),
-        &decode_bf16_le(replay_hidden_out),
-    );
-    let native_vs_comp_conv = validate::max_abs_delta(
-        &decode_bf16_le(&native_conv),
-        &decode_bf16_le(&native_comp_conv),
-    );
-    let native_vs_comp_recurrent = validate::max_abs_delta(
-        &decode_f32_le(&native_recurrent),
-        &decode_f32_le(&native_comp_recurrent),
-    );
+    let comp_vs_replay_conv = validate::max_abs_delta(&decode_bf16_le(&native_comp_conv), &decode_bf16_le(&replay_conv));
+    let comp_vs_replay_recurrent =
+        validate::max_abs_delta(&decode_f32_le(&native_comp_recurrent), &decode_f32_le(&replay_recurrent));
+    let comp_vs_replay_hidden = validate::max_abs_delta(&decode_bf16_le(&native_comp_hidden), &decode_bf16_le(replay_hidden_out));
+    let native_vs_comp_conv = validate::max_abs_delta(&decode_bf16_le(&native_conv), &decode_bf16_le(&native_comp_conv));
+    let native_vs_comp_recurrent =
+        validate::max_abs_delta(&decode_f32_le(&native_recurrent), &decode_f32_le(&native_comp_recurrent));
     let native_vs_comp_proj_residual = validate::max_abs_delta(
         &decode_bf16_le(&native_hidden_out),
         &bf16_residual_sum(&native_hidden, &native_comp_trace.proj_out),
     );
-    let native_vs_comp_qkv_proj = validate::max_abs_delta(
-        &decode_f32_le(&native_qkv_proj),
-        &decode_bf16_le(&native_comp_trace.qkv),
-    );
-    let native_vs_comp_z_proj = validate::max_abs_delta(
-        &decode_f32_le(&native_z_proj),
-        &decode_bf16_le(&native_comp_trace.z),
-    );
-    let native_vs_comp_b_proj = validate::max_abs_delta(
-        &decode_f32_le(&native_b_proj),
-        &decode_bf16_le(&native_comp_trace.b),
-    );
-    let native_vs_comp_a_proj = validate::max_abs_delta(
-        &decode_f32_le(&native_a_proj),
-        &decode_bf16_le(&native_comp_trace.a),
-    );
-    let native_vs_comp_post_norm = validate::max_abs_delta(
-        &decode_f32_le(&native_post_norm),
-        &decode_bf16_le(&native_comp_layer.post_attn_norm),
-    );
-    let native_vs_comp_gated = validate::max_abs_delta(
-        &decode_f32_le(&native_gated),
-        &decode_bf16_le(&native_comp_trace.gated),
-    );
-    let native_vs_comp_swiglu = validate::max_abs_delta(
-        &decode_f32_le(&native_swiglu),
-        &decode_bf16_le(&native_comp_layer.mlp_swiglu),
-    );
-    let native_vs_comp_token_mixer = validate::max_abs_delta(
-        &decode_f32_le(&native_token_mixer),
-        &decode_bf16_le(&native_comp_layer.attn_hidden),
-    );
-    let native_vs_comp_mlp_down = validate::max_abs_delta(
-        &decode_f32_le(&native_mlp_down),
-        &decode_bf16_le(&native_comp_layer.mlp_out),
-    );
-    let native_vs_replay_post_norm = validate::max_abs_delta(
-        &decode_f32_le(&native_post_norm),
-        &decode_bf16_le(replay_post),
-    );
-    let native_vs_replay_gated = replay_comp_trace
-        .as_ref()
-        .map(|trace| {
-            validate::max_abs_delta(
-                &decode_f32_le(&native_gated),
-                &decode_bf16_le(&trace.0.gated),
-            )
-        })
-        .unwrap_or(0.0);
-    let native_vs_replay_swiglu = validate::max_abs_delta(
-        &decode_f32_le(&native_swiglu),
-        &decode_bf16_le(replay_swiglu),
-    );
-    let native_vs_replay_token_mixer = validate::max_abs_delta(
-        &decode_f32_le(&native_token_mixer),
-        &decode_bf16_le(replay_attn),
-    );
-    let native_vs_replay_mlp_down = validate::max_abs_delta(
-        &decode_f32_le(&native_mlp_down),
-        &decode_bf16_le(replay_mlp_out),
-    );
-    let native_vs_replay_qkv_proj = replay_comp_trace
-        .as_ref()
-        .map(|trace| {
-            validate::max_abs_delta(
-                &decode_f32_le(&native_qkv_proj),
-                &decode_bf16_le(&trace.0.qkv),
-            )
-        })
-        .unwrap_or(0.0);
-    let native_vs_replay_z_proj = replay_comp_trace
-        .as_ref()
-        .map(|trace| {
-            validate::max_abs_delta(&decode_f32_le(&native_z_proj), &decode_bf16_le(&trace.0.z))
-        })
-        .unwrap_or(0.0);
-    let native_vs_replay_b_proj = replay_comp_trace
-        .as_ref()
-        .map(|trace| {
-            validate::max_abs_delta(&decode_f32_le(&native_b_proj), &decode_bf16_le(&trace.0.b))
-        })
-        .unwrap_or(0.0);
-    let native_vs_replay_a_proj = replay_comp_trace
-        .as_ref()
-        .map(|trace| {
-            validate::max_abs_delta(&decode_f32_le(&native_a_proj), &decode_bf16_le(&trace.0.a))
-        })
-        .unwrap_or(0.0);
-    let comp_layer_vs_replay_hidden = validate::max_abs_delta(
-        &decode_bf16_le(&native_comp_layer.layer_hidden),
-        &decode_bf16_le(replay_hidden_out),
-    );
-    let native_vs_comp_layer_hidden = validate::max_abs_delta(
-        &decode_bf16_le(&native_hidden_out),
-        &decode_bf16_le(&native_comp_layer.layer_hidden),
-    );
-    let native_vs_replay_hidden = validate::max_abs_delta(
-        &decode_bf16_le(&native_hidden_out),
-        &decode_bf16_le(replay_hidden_out),
-    );
+    let native_vs_comp_qkv_proj =
+        validate::max_abs_delta(&decode_f32_le(&native_qkv_proj), &decode_bf16_le(&native_comp_trace.qkv));
+    let native_vs_comp_z_proj =
+        validate::max_abs_delta(&decode_f32_le(&native_z_proj), &decode_bf16_le(&native_comp_trace.z));
+    let native_vs_comp_b_proj =
+        validate::max_abs_delta(&decode_f32_le(&native_b_proj), &decode_bf16_le(&native_comp_trace.b));
+    let native_vs_comp_a_proj =
+        validate::max_abs_delta(&decode_f32_le(&native_a_proj), &decode_bf16_le(&native_comp_trace.a));
+    let native_vs_comp_post_norm =
+        validate::max_abs_delta(&decode_f32_le(&native_post_norm), &decode_bf16_le(&native_comp_layer.post_attn_norm));
+    let native_vs_comp_gated =
+        validate::max_abs_delta(&decode_f32_le(&native_gated), &decode_bf16_le(&native_comp_trace.gated));
+    let native_vs_comp_swiglu =
+        validate::max_abs_delta(&decode_f32_le(&native_swiglu), &decode_bf16_le(&native_comp_layer.mlp_swiglu));
+    let native_vs_comp_token_mixer =
+        validate::max_abs_delta(&decode_f32_le(&native_token_mixer), &decode_bf16_le(&native_comp_layer.attn_hidden));
+    let native_vs_comp_mlp_down =
+        validate::max_abs_delta(&decode_f32_le(&native_mlp_down), &decode_bf16_le(&native_comp_layer.mlp_out));
+    let conv_state_len = cfg.linear_conv_kernel_dim - 1;
+    let expected_conv_tail = {
+        let start = decode_bf16_le(&pre_step_conv);
+        let qkv = decode_bf16_le(&native_comp_trace.qkv);
+        let mut expected = vec![0.0f32; qkv_dim * conv_state_len];
+        for c in 0..qkv_dim {
+            let base = c * conv_state_len;
+            for t in 0..conv_state_len.saturating_sub(1) {
+                expected[base + t] = start[base + t + 1];
+            }
+            expected[base + conv_state_len - 1] = qkv[c];
+        }
+        expected
+    };
+    let native_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&native_conv), &expected_conv_tail);
+    let comp_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&native_comp_conv), &expected_conv_tail);
+    let replay_conv_vs_expected_tail =
+        validate::max_abs_delta(&decode_bf16_le(&replay_conv), &expected_conv_tail);
+    let native_conv_tap_deltas = {
+        let native = decode_bf16_le(&native_conv);
+        let mut deltas = vec![0.0f32; conv_state_len];
+        for c in 0..qkv_dim {
+            let base = c * conv_state_len;
+            for t in 0..conv_state_len {
+                deltas[t] = deltas[t].max((native[base + t] - expected_conv_tail[base + t]).abs());
+            }
+        }
+        deltas
+            .iter()
+            .map(|v| format!("{v:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let native_qkv_proj_f32 = decode_f32_le(&native_qkv_proj);
     let native_z_proj_f32 = decode_f32_le(&native_z_proj);
     let comp_qkv_proj_f32 = decode_bf16_le(&native_comp_trace.qkv);
     let comp_z_proj_f32 = decode_bf16_le(&native_comp_trace.z);
-    let sample_qkv_native = native_qkv_proj_f32
-        .iter()
-        .take(4)
-        .map(|v| format!("{v:.4}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sample_qkv_comp = comp_qkv_proj_f32
-        .iter()
-        .take(4)
-        .map(|v| format!("{v:.4}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sample_z_native = native_z_proj_f32
-        .iter()
-        .take(4)
-        .map(|v| format!("{v:.4}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let sample_z_comp = comp_z_proj_f32
-        .iter()
-        .take(4)
-        .map(|v| format!("{v:.4}"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let (max_append_channel, max_append_mismatch) = {
+        let native = decode_bf16_le(&native_conv);
+        let start = decode_bf16_le(&pre_step_conv);
+        let qkv = decode_bf16_le(&native_comp_trace.qkv);
+        let conv_w = decode_bf16_le(
+            &engine
+                .weights()
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing weights for layer {trace_layer}"))?
+                .linear
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {trace_layer} is not linear"))?
+                .conv1d_w
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("conv1d_w D2H layer {trace_layer}: {e}"))?,
+        );
+        let mut best = (0usize, 0.0f32);
+        for c in 0..qkv_dim {
+            let idx = c * conv_state_len + (conv_state_len - 1);
+            let delta = (native[idx] - expected_conv_tail[idx]).abs();
+            if delta > best.1 {
+                best = (c, delta);
+            }
+        }
+        let channel = best.0;
+        let idx = channel * conv_state_len + (conv_state_len - 1);
+        let weight_base = channel * cfg.linear_conv_kernel_dim;
+        let state_base = channel * conv_state_len;
+        let mut conv_acc = 0.0f32;
+        for tap in 0..cfg.linear_conv_kernel_dim {
+            let x = if tap + 1 == cfg.linear_conv_kernel_dim {
+                qkv[channel]
+            } else {
+                start[state_base + tap]
+            };
+            conv_acc += x * conv_w[weight_base + tap];
+        }
+        let conv_out = bf16_round(conv_acc * sigmoid_fast(conv_acc));
+        let native_last = native[idx];
+        let mut nearest_qkv = (0usize, f32::INFINITY);
+        for (i, &v) in native_qkv_proj_f32.iter().enumerate() {
+            let delta = (v - native_last).abs();
+            if delta < nearest_qkv.1 {
+                nearest_qkv = (i, delta);
+            }
+        }
+        (
+            channel,
+            format!(
+                "channel={channel},native={:.6},expected={:.6},prev_last={:.6},qkv_comp={:.6},qkv_native={:.6},conv_out={:.6},nearest_qkv=(channel={},value={:.6},delta={:.6}),delta={:.6}",
+                native[idx],
+                expected_conv_tail[idx],
+                start[idx],
+                qkv[channel],
+                native_qkv_proj_f32[channel],
+                conv_out,
+                nearest_qkv.0,
+                native_qkv_proj_f32[nearest_qkv.0],
+                nearest_qkv.1,
+                best.1
+            )
+        )
+    };
+    engine.rebuild_prefill_state(prefix_ids, true)?;
+    let step_b_debug_raw = engine.trace_persistent_linear_step_b_after_layers(
+        trace_tokens,
+        seqlen_offset,
+        trace_layer + 1,
+        trace_layer,
+        max_append_channel,
+    )?;
+    let step_b_debug = {
+        let debug = decode_f32_le(&step_b_debug_raw);
+        let native = decode_bf16_le(&native_conv);
+        let partial = decode_bf16_le(&native_partial_conv);
+        let start = decode_bf16_le(&pre_step_conv);
+        let base = max_append_channel * conv_state_len;
+        let idx = base + (conv_state_len - 1);
+        let state_values = debug
+            .iter()
+            .take(conv_state_len)
+            .map(|v| format!("{v:.6}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let step_b_last = debug
+            .get(conv_state_len - 1)
+            .copied()
+            .unwrap_or_default();
+        let step_b_vs_expected = (step_b_last - expected_conv_tail[idx]).abs();
+        let final_vs_step_b = (native[idx] - step_b_last).abs();
+        let partial_vs_step_b = (partial[idx] - step_b_last).abs();
+        let partial_vs_expected = (partial[idx] - expected_conv_tail[idx]).abs();
+        format!(
+            "channel={max_append_channel},state=[{state_values}],qkv={:.6},conv_out={:.6},shift0_expected={:.6},shift1_expected={:.6},append_expected={:.6},step_b_vs_expected={:.6},partial_last={:.6},partial_vs_step_b={:.6},partial_vs_expected={:.6},final_vs_step_b={:.6}",
+            debug.get(conv_state_len).copied().unwrap_or_default(),
+            debug.get(conv_state_len + 1).copied().unwrap_or_default(),
+            start.get(base + 1).copied().unwrap_or_default(),
+            start.get(base + 2).copied().unwrap_or_default(),
+            expected_conv_tail[idx],
+            step_b_vs_expected,
+            partial[idx],
+            partial_vs_step_b,
+            partial_vs_expected,
+            final_vs_step_b,
+        )
+    };
+    let first_later_clobber = {
+        let native = decode_bf16_le(&native_conv);
+        let partial = decode_bf16_le(&native_partial_conv);
+        let base = max_append_channel * conv_state_len;
+        let idx = base + (conv_state_len - 1);
+        let step_b_last = partial[idx];
+        if (native[idx] - step_b_last).abs() == 0.0 || trace_layer + 1 >= text_config.num_hidden_layers {
+            "none".to_string()
+        } else {
+            let mut lo = trace_layer + 1;
+            let mut hi = text_config.num_hidden_layers;
+            let mut hi_last = native[idx];
+            while lo + 1 < hi {
+                let mid = lo + (hi - lo) / 2;
+                engine.rebuild_prefill_state(prefix_ids, true)?;
+                let _ = engine.decode_step_batch_trace_hidden_after_layers(
+                    trace_tokens,
+                    seqlen_offset,
+                    mid,
+                    0,
+                )?;
+                let mid_conv = engine
+                    .state_for_batch(0)
+                    .layers
+                    .get(trace_layer)
+                    .ok_or_else(|| anyhow::anyhow!("missing binary-search layer {trace_layer}"))?
+                    .conv_state
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing binary-search conv state for layer {trace_layer}"))?
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("binary-search conv D2H layer {trace_layer}: {e}"))?;
+                let mid_vals = decode_bf16_le(&mid_conv);
+                let mid_last = mid_vals[idx];
+                if (mid_last - step_b_last).abs() > 0.0 {
+                    hi = mid;
+                    hi_last = mid_last;
+                } else {
+                    lo = mid;
+                }
+            }
+            format!(
+                "after_layers={hi},clobber_layer={},partial_last={:.6},clobbered_last={:.6},delta={:.6}",
+                hi - 1,
+                step_b_last,
+                hi_last,
+                (hi_last - step_b_last).abs()
+            )
+        }
+    };
+    let pointer_debug = {
+        let state0 = engine.state_for_batch(0);
+        let trace_layer_state = state0
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing trace layer state {trace_layer}"))?;
+        let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
+        let final_layer_state = state0
+            .layers
+            .get(final_layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("missing final layer state {final_layer_idx}"))?;
+        let trace_conv = trace_layer_state
+            .conv_state
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let trace_rec = trace_layer_state
+            .recurrent_state
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_k = final_layer_state
+            .kv_cache_k
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_v = final_layer_state
+            .kv_cache_v
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_shadow_k = final_layer_state
+            .kv_shadow_k
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        let final_shadow_v = final_layer_state
+            .kv_shadow_v
+            .as_ref()
+            .map(|b| b.as_ptr() as usize)
+            .unwrap_or(0);
+        format!(
+            "trace_conv=0x{trace_conv:x},trace_rec=0x{trace_rec:x},final_k=0x{final_k:x},final_v=0x{final_v:x},final_shadow_k=0x{final_shadow_k:x},final_shadow_v=0x{final_shadow_v:x},workspace=0x{:x}",
+            engine.scratch_debug_ptr(),
+        )
+    };
+    let isolated_tail_windows = {
+        let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
+        let starts = [4usize, 5, 6, 7, 8];
+        let mut samples = Vec::new();
+        for &start_layer in &starts {
+            if start_layer >= text_config.num_hidden_layers {
+                continue;
+            }
+            let window_layers = text_config.num_hidden_layers - start_layer;
+            engine.rebuild_prefill_state(prefix_ids, true)?;
+            let pre_hidden = engine.decode_step_batch_trace_hidden_after_layers(
+                trace_tokens,
+                seqlen_offset,
+                start_layer,
+                0,
+            )?;
+            let before_conv = engine
+                .state_for_batch(0)
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing pre-window layer {trace_layer}"))?
+                .conv_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing pre-window conv state for layer {trace_layer}"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("pre-window conv D2H layer {trace_layer}: {e}"))?;
+            let _ = engine.debug_decode_window_from_hidden_bf16(
+                &pre_hidden,
+                seqlen_offset,
+                start_layer,
+                window_layers,
+                0,
+            )?;
+            let after_conv = engine
+                .state_for_batch(0)
+                .layers
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("missing post-window layer {trace_layer}"))?
+                .conv_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing post-window conv state for layer {trace_layer}"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("post-window conv D2H layer {trace_layer}: {e}"))?;
+            let before_vals = decode_bf16_le(&before_conv);
+            let after_vals = decode_bf16_le(&after_conv);
+            let base = max_append_channel * conv_state_len;
+            let idx = base + (conv_state_len - 1);
+            samples.push(format!(
+                "{}:{}:{:.6}",
+                start_layer,
+                window_layers,
+                (after_vals[idx] - before_vals[idx]).abs()
+            ));
+        }
+        samples.join(",")
+    };
+    let append_mismatch_samples = {
+        let native = decode_bf16_le(&native_conv);
+        let mut mismatches = Vec::with_capacity(qkv_dim);
+        for c in 0..qkv_dim {
+            let idx = c * conv_state_len + (conv_state_len - 1);
+            mismatches.push((c, native[idx], expected_conv_tail[idx], (native[idx] - expected_conv_tail[idx]).abs()));
+        }
+        mismatches.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        mismatches
+            .into_iter()
+            .take(8)
+            .map(|(channel, native_last, expected_last, delta)| {
+                let mut nearest_qkv = (0usize, f32::INFINITY);
+                for (i, &v) in native_qkv_proj_f32.iter().enumerate() {
+                    let qkv_delta = (v - native_last).abs();
+                    if qkv_delta < nearest_qkv.1 {
+                        nearest_qkv = (i, qkv_delta);
+                    }
+                }
+                format!(
+                    "c{channel}->q{} native={:.6} expected={:.6} self_q={:.6} match_q={:.6} match_delta={:.6} delta={:.6}",
+                    nearest_qkv.0,
+                    native_last,
+                    expected_last,
+                    native_qkv_proj_f32[channel],
+                    native_qkv_proj_f32[nearest_qkv.0],
+                    nearest_qkv.1,
+                    delta
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    let comp_conv_tap_deltas = {
+        let comp = decode_bf16_le(&native_comp_conv);
+        let mut deltas = vec![0.0f32; conv_state_len];
+        for c in 0..qkv_dim {
+            let base = c * conv_state_len;
+            for t in 0..conv_state_len {
+                deltas[t] = deltas[t].max((comp[base + t] - expected_conv_tail[base + t]).abs());
+            }
+        }
+        deltas
+            .iter()
+            .map(|v| format!("{v:.6}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let native_vs_replay_post_norm =
+        validate::max_abs_delta(&decode_f32_le(&native_post_norm), &decode_bf16_le(replay_post));
+    let native_vs_replay_gated =
+        replay_comp_trace
+            .as_ref()
+            .map(|trace| validate::max_abs_delta(&decode_f32_le(&native_gated), &decode_bf16_le(&trace.0.gated)))
+            .unwrap_or(0.0);
+    let native_vs_replay_swiglu =
+        validate::max_abs_delta(&decode_f32_le(&native_swiglu), &decode_bf16_le(replay_swiglu));
+    let native_vs_replay_token_mixer =
+        validate::max_abs_delta(&decode_f32_le(&native_token_mixer), &decode_bf16_le(replay_attn));
+    let native_vs_replay_mlp_down =
+        validate::max_abs_delta(&decode_f32_le(&native_mlp_down), &decode_bf16_le(replay_mlp_out));
+    let native_vs_replay_qkv_proj = replay_comp_trace
+        .as_ref()
+        .map(|trace| validate::max_abs_delta(&decode_f32_le(&native_qkv_proj), &decode_bf16_le(&trace.0.qkv)))
+        .unwrap_or(0.0);
+    let native_vs_replay_z_proj = replay_comp_trace
+        .as_ref()
+        .map(|trace| validate::max_abs_delta(&decode_f32_le(&native_z_proj), &decode_bf16_le(&trace.0.z)))
+        .unwrap_or(0.0);
+    let native_vs_replay_b_proj = replay_comp_trace
+        .as_ref()
+        .map(|trace| validate::max_abs_delta(&decode_f32_le(&native_b_proj), &decode_bf16_le(&trace.0.b)))
+        .unwrap_or(0.0);
+    let native_vs_replay_a_proj = replay_comp_trace
+        .as_ref()
+        .map(|trace| validate::max_abs_delta(&decode_f32_le(&native_a_proj), &decode_bf16_le(&trace.0.a)))
+        .unwrap_or(0.0);
+    let comp_layer_vs_replay_hidden =
+        validate::max_abs_delta(&decode_bf16_le(&native_comp_layer.layer_hidden), &decode_bf16_le(replay_hidden_out));
+    let native_vs_comp_layer_hidden =
+        validate::max_abs_delta(&decode_bf16_le(&native_hidden_out), &decode_bf16_le(&native_comp_layer.layer_hidden));
+    let native_vs_replay_hidden =
+        validate::max_abs_delta(&decode_bf16_le(&native_hidden_out), &decode_bf16_le(replay_hidden_out));
+    let sample_qkv_native = native_qkv_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
+    let sample_qkv_comp = comp_qkv_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
+    let sample_z_native = native_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
+    let sample_z_comp = comp_z_proj_f32.iter().take(4).map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",");
 
     eprintln!(
-        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
+        "[trace-persistent-linear] layer={trace_layer} hidden_delta={hidden_delta:.6} comp_vs_replay_conv={comp_vs_replay_conv:.6} comp_vs_replay_recurrent={comp_vs_replay_recurrent:.6} comp_linear_hidden_vs_replay={comp_vs_replay_hidden:.6} native_vs_comp_qkv_proj={native_vs_comp_qkv_proj:.6} native_vs_replay_qkv_proj={native_vs_replay_qkv_proj:.6} native_vs_comp_z_proj={native_vs_comp_z_proj:.6} native_vs_replay_z_proj={native_vs_replay_z_proj:.6} native_vs_comp_b_proj={native_vs_comp_b_proj:.6} native_vs_replay_b_proj={native_vs_replay_b_proj:.6} native_vs_comp_a_proj={native_vs_comp_a_proj:.6} native_vs_replay_a_proj={native_vs_replay_a_proj:.6} native_vs_comp_conv={native_vs_comp_conv:.6} native_vs_comp_recurrent={native_vs_comp_recurrent:.6} native_conv_vs_expected_tail={native_conv_vs_expected_tail:.6} comp_conv_vs_expected_tail={comp_conv_vs_expected_tail:.6} replay_conv_vs_expected_tail={replay_conv_vs_expected_tail:.6} native_conv_tap_deltas=[{native_conv_tap_deltas}] comp_conv_tap_deltas=[{comp_conv_tap_deltas}] max_append_mismatch=({max_append_mismatch}) step_b_debug=({step_b_debug}) first_later_clobber=({first_later_clobber}) pointer_debug=({pointer_debug}) isolated_tail_windows=[{isolated_tail_windows}] append_mismatch_samples=[{append_mismatch_samples}] native_vs_comp_token_mixer={native_vs_comp_token_mixer:.6} native_vs_replay_token_mixer={native_vs_replay_token_mixer:.6} native_vs_comp_post_norm={native_vs_comp_post_norm:.6} native_vs_replay_post_norm={native_vs_replay_post_norm:.6} native_vs_comp_gated={native_vs_comp_gated:.6} native_vs_replay_gated={native_vs_replay_gated:.6} native_vs_comp_swiglu={native_vs_comp_swiglu:.6} native_vs_replay_swiglu={native_vs_replay_swiglu:.6} native_vs_comp_mlp_down={native_vs_comp_mlp_down:.6} native_vs_replay_mlp_down={native_vs_replay_mlp_down:.6} native_vs_comp_proj_residual={native_vs_comp_proj_residual:.6} comp_layer_hidden_vs_replay={comp_layer_vs_replay_hidden:.6} native_vs_comp_layer_hidden={native_vs_comp_layer_hidden:.6} native_vs_replay_hidden={native_vs_replay_hidden:.6} sample_qkv_native=[{sample_qkv_native}] sample_qkv_comp=[{sample_qkv_comp}] sample_z_native=[{sample_z_native}] sample_z_comp=[{sample_z_comp}]"
     );
     Ok(())
 }
@@ -6864,8 +3984,6 @@ fn trace_component_layer(
         use_4b_kernel,
         true,
         None,
-        None,
-        None,
     )?;
     let attn = replay
         .layer_attn_trace
@@ -6887,20 +4005,524 @@ fn trace_component_layer(
         .as_ref()
         .and_then(|layers| layers.get(trace_layer))
         .ok_or_else(|| anyhow::anyhow!("missing replay hidden trace for layer {trace_layer}"))?;
-    let attn_delta =
-        validate::max_abs_delta(&decode_bf16_le(&native.attn_hidden), &decode_bf16_le(attn));
-    let post_delta = validate::max_abs_delta(
-        &decode_bf16_le(&native.post_attn_norm),
-        &decode_bf16_le(post),
-    );
+    let attn_delta = validate::max_abs_delta(&decode_bf16_le(&native.attn_hidden), &decode_bf16_le(attn));
+    let post_delta = validate::max_abs_delta(&decode_bf16_le(&native.post_attn_norm), &decode_bf16_le(post));
     let mlp_delta = validate::max_abs_delta(&decode_bf16_le(&native.mlp_out), &decode_bf16_le(mlp));
-    let hidden_delta = validate::max_abs_delta(
-        &decode_bf16_le(&native.layer_hidden),
-        &decode_bf16_le(hidden),
-    );
+    let hidden_delta = validate::max_abs_delta(&decode_bf16_le(&native.layer_hidden), &decode_bf16_le(hidden));
     eprintln!(
         "[trace-component-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
     );
+    Ok(())
+}
+
+fn trace_oracle_prefill_layer(
+    engine: &mut DecodeEngine,
+    trace_layer: usize,
+    prompt_ids: &[u32],
+    oracle_script: &Path,
+    model_id: &str,
+    oracle_dtype: &str,
+    oracle_device: &str,
+    fp8_oracle_dir: Option<&Path>,
+    oracle_full: &oracle::OracleOutput,
+) -> Result<()> {
+    anyhow::ensure!(trace_layer > 0, "--trace-oracle-prefill-layer currently requires layer > 0");
+    let row_bytes = engine.weights().config.hidden_size * 2;
+    let prefix_ids = &prompt_ids[..prompt_ids.len() - 1];
+    let prefix_oracle = if prefix_ids.is_empty() {
+        None
+    } else {
+        Some(oracle::run_oracle(
+            oracle_script,
+            model_id,
+            prefix_ids,
+            1,
+            oracle_dtype,
+            oracle_device,
+            true,
+            false,
+            fp8_oracle_dir,
+            None,
+        )?)
+    };
+    let mut native_prefix_k_delta = None;
+    let mut native_prefix_v_delta = None;
+    let mut native_prefix_conv_delta = None;
+    let mut native_prefix_recurrent_delta = None;
+    if engine.weights().config.is_full_attention(trace_layer) {
+        if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.reset()?;
+        let _ = engine.prefill_native(prefix_ids)?;
+        let (native_prefix_k, native_prefix_v, native_prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        engine.reset()?;
+        engine.load_prefill_state(&prefix_oracle)?;
+        let (oracle_prefix_k, oracle_prefix_v, oracle_prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        anyhow::ensure!(
+            native_prefix_len == oracle_prefix_len,
+            "trace layer {trace_layer} native prefix len {} != oracle prefix len {}",
+            native_prefix_len,
+            oracle_prefix_len,
+        );
+        native_prefix_k_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_prefix_k),
+            &decode_bf16_le(&oracle_prefix_k),
+        ));
+        native_prefix_v_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_prefix_v),
+            &decode_bf16_le(&oracle_prefix_v),
+        ));
+        }
+    } else {
+        if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.reset()?;
+        let _ = engine.prefill_native(prefix_ids)?;
+        let native_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing native prefix layer {trace_layer}"))?;
+        let native_conv = native_layer
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native prefix layer {trace_layer} missing conv_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("native prefix conv D2H layer {trace_layer}: {e}"))?;
+        let native_recurrent = native_layer
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("native prefix layer {trace_layer} missing recurrent_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("native prefix recurrent D2H layer {trace_layer}: {e}"))?;
+
+        engine.reset()?;
+        engine.load_prefill_state(&prefix_oracle)?;
+        let oracle_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing oracle prefix layer {trace_layer}"))?;
+        let oracle_conv = oracle_layer
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("oracle prefix layer {trace_layer} missing conv_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("oracle prefix conv D2H layer {trace_layer}: {e}"))?;
+        let oracle_recurrent = oracle_layer
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("oracle prefix layer {trace_layer} missing recurrent_state"))?
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("oracle prefix recurrent D2H layer {trace_layer}: {e}"))?;
+
+        native_prefix_conv_delta = Some(validate::max_abs_delta(
+            &decode_bf16_le(&native_conv),
+            &decode_bf16_le(&oracle_conv),
+        ));
+        native_prefix_recurrent_delta = Some(validate::max_abs_delta(
+            &decode_f32_le(&native_recurrent),
+            &decode_f32_le(&oracle_recurrent),
+        ));
+        }
+    }
+    engine.reset()?;
+    if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+        engine.load_prefill_state(prefix_oracle)?;
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let last_row = |bytes: Vec<u8>, label: &str| -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            bytes.len() % row_bytes == 0,
+            "{label} bytes {} not divisible by row_bytes {}",
+            bytes.len(),
+            row_bytes,
+        );
+        if bytes.len() == row_bytes {
+            return Ok(bytes);
+        }
+        let start = bytes.len() - row_bytes;
+        Ok(bytes[start..].to_vec())
+    };
+    let oracle_inputs = oracle_full
+        .layer_hidden_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_hidden_states"))?;
+    let oracle_attn = oracle_full
+        .layer_attn_residual_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_attn_residual_states"))?;
+    let oracle_post = oracle_full
+        .layer_post_attn_norm_states
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_post_attn_norm_states"))?;
+    let oracle_mlp = oracle_full
+        .layer_mlp_outputs
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("oracle output missing layer_mlp_outputs"))?;
+
+    let oracle_input_bytes = last_row(
+        b64.decode(
+            oracle_inputs
+                .get(trace_layer - 1)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {}", trace_layer - 1))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?,
+        "oracle input hidden",
+    )?;
+    let oracle_attn_bytes = last_row(
+        b64.decode(
+            oracle_attn
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?,
+        "oracle attn",
+    )?;
+    let oracle_post_bytes = last_row(
+        b64.decode(
+            oracle_post
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?,
+        "oracle post-norm",
+    )?;
+    let oracle_mlp_bytes = last_row(
+        b64.decode(
+            oracle_mlp
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_mlp_outputs missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?,
+        "oracle mlp",
+    )?;
+    let oracle_hidden_bytes = last_row(
+        b64.decode(
+            oracle_inputs
+                .get(trace_layer)
+                .ok_or_else(|| anyhow::anyhow!("oracle layer_hidden_states missing layer {trace_layer}"))?,
+        )
+        .map_err(|e| anyhow::anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?,
+        "oracle hidden",
+    )?;
+
+    engine.set_hidden_from_bytes(&oracle_input_bytes)?;
+    let trace = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
+        trace_layer,
+        prefix_ids.len(),
+    )?;
+    let attn_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.attn_hidden), &decode_bf16_le(&oracle_attn_bytes));
+    let post_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.post_attn_norm), &decode_bf16_le(&oracle_post_bytes));
+    let mlp_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.mlp_out), &decode_bf16_le(&oracle_mlp_bytes));
+    let hidden_delta =
+        validate::max_abs_delta(&decode_bf16_le(&trace.layer_hidden), &decode_bf16_le(&oracle_hidden_bytes));
+    eprintln!(
+        "[trace-oracle-prefill-layer] layer={trace_layer} attn_delta={attn_delta:.6} post_norm_delta={post_delta:.6} mlp_delta={mlp_delta:.6} hidden_delta={hidden_delta:.6}"
+    );
+    if let (Some(k_delta), Some(v_delta)) = (native_prefix_k_delta, native_prefix_v_delta) {
+        eprintln!(
+            "[trace-oracle-prefix-kv] layer={trace_layer} k_delta={k_delta:.6} v_delta={v_delta:.6}"
+        );
+    }
+    if let (Some(conv_delta), Some(recurrent_delta)) =
+        (native_prefix_conv_delta, native_prefix_recurrent_delta)
+    {
+        eprintln!(
+            "[trace-oracle-prefix-linear] layer={trace_layer} conv_delta={conv_delta:.6} recurrent_delta={recurrent_delta:.6}"
+        );
+    }
+
+    if engine.weights().config.is_full_attention(trace_layer)
+        && oracle_full.traced_full_attn_layer == Some(trace_layer)
+    {
+        let prefix_oracle = if let Some(prefix_oracle) = prefix_oracle.as_ref() {
+            prefix_oracle
+        } else {
+            return Ok(());
+        };
+        // `component_trace_full_layer_from_current_hidden()` reuses the mutable
+        // component decode path and overwrites slot 0 of the full-attention KV
+        // cache for `trace_layer`. Reload the prefix oracle state so the deeper
+        // attention trace below sees the original prefix cache, not the
+        // trace-mutated one.
+        engine.reset()?;
+        engine.load_prefill_state(prefix_oracle)?;
+        let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
+            let bytes = b64
+                .decode(field.as_ref().ok_or_else(|| anyhow::anyhow!("oracle output missing {label}"))?)
+                .map_err(|e| anyhow::anyhow!("decode oracle {label}: {e}"))?;
+            Ok(decode_bf16_le(&bytes))
+        };
+        let oracle_normed = decode_opt_bf16(&oracle_full.traced_full_attn_normed, "traced_full_attn_normed")?;
+        let oracle_q_proj = decode_opt_bf16(&oracle_full.traced_full_attn_q_proj, "traced_full_attn_q_proj")?;
+        let oracle_gate = decode_opt_bf16(&oracle_full.traced_full_attn_gate_proj, "traced_full_attn_gate_proj")?;
+        let oracle_k_proj = decode_opt_bf16(&oracle_full.traced_full_attn_k_proj, "traced_full_attn_k_proj")?;
+        let oracle_v_proj = decode_opt_bf16(&oracle_full.traced_full_attn_v_proj, "traced_full_attn_v_proj")?;
+        let oracle_q_rope = decode_opt_bf16(&oracle_full.traced_full_attn_q_rope, "traced_full_attn_q_rope")?;
+        let oracle_k_rope = decode_opt_bf16(&oracle_full.traced_full_attn_k_rope, "traced_full_attn_k_rope")?;
+        let oracle_pre_gate = decode_opt_bf16(&oracle_full.traced_full_attn_pre_gate, "traced_full_attn_pre_gate")?;
+        let oracle_gated = decode_opt_bf16(&oracle_full.traced_full_attn_gated, "traced_full_attn_gated")?;
+        let oracle_gated_actual = decode_opt_bf16(
+            &oracle_full.traced_full_attn_gated_actual,
+            "traced_full_attn_gated_actual",
+        )?;
+        let (prefix_k_bytes, prefix_v_bytes, prefix_len) =
+            engine.full_attention_prefix_cache_bf16_host(trace_layer, 0)?;
+        let oracle_prefix_kv = prefix_oracle
+            .kv_caches
+            .as_ref()
+            .and_then(|caches| caches.iter().find(|kv| kv.layer == trace_layer))
+            .ok_or_else(|| anyhow::anyhow!("prefix oracle missing kv cache for layer {trace_layer}"))?;
+        let oracle_prefix_k = decode_bf16_le(
+            &b64.decode(&oracle_prefix_kv.k)
+                .map_err(|e| anyhow::anyhow!("decode prefix oracle K cache layer {trace_layer}: {e}"))?,
+        );
+        let oracle_prefix_v = decode_bf16_le(
+            &b64.decode(&oracle_prefix_kv.v)
+                .map_err(|e| anyhow::anyhow!("decode prefix oracle V cache layer {trace_layer}: {e}"))?,
+        );
+
+        let stage = engine.trace_full_attention_stages_from_hidden(trace_layer, &oracle_input_bytes, prefix_ids.len())?;
+        let stage_out = engine.trace_full_attention_layer_output_from_hidden_current_state(
+            trace_layer,
+            0,
+            &oracle_input_bytes,
+            prefix_ids.len(),
+        )?;
+        let normed_delta = validate::max_abs_delta(&decode_bf16_le(&stage.normed), &oracle_normed);
+        let q_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_proj), &oracle_q_proj);
+        let gate_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.gate_proj), &oracle_gate);
+        let k_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_proj), &oracle_k_proj);
+        let v_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.v_proj), &oracle_v_proj);
+        let q_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_rope), &oracle_q_rope);
+        let k_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_rope), &oracle_k_rope);
+        let pre_gate_stage_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.pre_gate), &oracle_pre_gate);
+        let gated_stage_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.gated), &oracle_gated);
+        let gated_actual_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage_out.gated), &oracle_gated_actual);
+        let gated_reconstruct_delta =
+            validate::max_abs_delta(&oracle_gated, &oracle_gated_actual);
+        let head_dim = engine.weights().config.head_dim;
+        let num_heads = engine.weights().config.num_attention_heads;
+        let num_kv_heads = engine.weights().config.num_key_value_heads;
+        let kv_groups = num_heads / num_kv_heads;
+        let pre_gate_host = decode_bf16_le(&stage_out.pre_gate);
+        let q_rope_host = decode_bf16_le(&stage.q_rope);
+        let k_rope_step = decode_bf16_le(&stage.k_rope);
+        let v_step = decode_bf16_le(&stage.v_proj);
+        let prefix_k = decode_bf16_le(&prefix_k_bytes);
+        let prefix_v = decode_bf16_le(&prefix_v_bytes);
+        let loaded_layer = engine
+            .state_for_batch(0)
+            .layers
+            .get(trace_layer)
+            .ok_or_else(|| anyhow::anyhow!("missing loaded layer {trace_layer}"))?;
+        let loaded_raw_k = decode_bf16_le(
+            &loaded_layer
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loaded layer {trace_layer} missing K cache"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("loaded layer {trace_layer} K cache D2H: {e}"))?,
+        );
+        let loaded_raw_v = decode_bf16_le(
+            &loaded_layer
+                .kv_cache_v
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("loaded layer {trace_layer} missing V cache"))?
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("loaded layer {trace_layer} V cache D2H: {e}"))?,
+        );
+        anyhow::ensure!(
+            prefix_len == prefix_ids.len(),
+            "trace layer {trace_layer} prefix len {} != prompt prefix len {}",
+            prefix_len,
+            prefix_ids.len(),
+        );
+        let kv_len = prefix_len + 1;
+        let mut full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        let mut full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        for kvh in 0..num_kv_heads {
+            let prefix_base = kvh * prefix_len * head_dim;
+            let full_base = kvh * kv_len * head_dim;
+            let step_base = kvh * head_dim;
+            full_k[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
+            full_v[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
+            full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&k_rope_step[step_base..step_base + head_dim]);
+            full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&v_step[step_base..step_base + head_dim]);
+        }
+        let mut host_attn_pre_gate = vec![0.0f32; num_heads * head_dim];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        for qh in 0..num_heads {
+            let kvh = qh / kv_groups;
+            let q_base = qh * head_dim;
+            let mut scores = vec![0.0f32; kv_len];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_base = (kvh * kv_len + t) * head_dim;
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += q_rope_host[q_base + d] * full_k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            let mut weights = vec![0.0f32; kv_len];
+            for (idx, score) in scores.iter().copied().enumerate() {
+                let w = (score - row_max).exp();
+                weights[idx] = w;
+                denom += w;
+            }
+            let out_base = qh * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, &w) in weights.iter().enumerate() {
+                    let v_base = (kvh * kv_len + t) * head_dim;
+                    acc += w * full_v[v_base + d];
+                }
+                host_attn_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
+            }
+        }
+        let mut oracle_host_pre_gate = vec![0.0f32; num_heads * head_dim];
+        let mut oracle_full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        let mut oracle_full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+        for kvh in 0..num_kv_heads {
+            let prefix_base = kvh * prefix_len * head_dim;
+            let full_base = kvh * kv_len * head_dim;
+            let step_base = kvh * head_dim;
+            oracle_full_k[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&oracle_prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
+            oracle_full_v[full_base..full_base + prefix_len * head_dim]
+                .copy_from_slice(&oracle_prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
+            oracle_full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&oracle_k_rope[step_base..step_base + head_dim]);
+            oracle_full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+                .copy_from_slice(&oracle_v_proj[step_base..step_base + head_dim]);
+        }
+        for qh in 0..num_heads {
+            let kvh = qh / kv_groups;
+            let q_base = qh * head_dim;
+            let mut scores = vec![0.0f32; kv_len];
+            for (t, score) in scores.iter_mut().enumerate() {
+                let k_base = (kvh * kv_len + t) * head_dim;
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    acc += oracle_q_rope[q_base + d] * oracle_full_k[k_base + d];
+                }
+                *score = acc * scale;
+            }
+            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            let mut weights = vec![0.0f32; kv_len];
+            for (idx, score) in scores.iter().copied().enumerate() {
+                let w = (score - row_max).exp();
+                weights[idx] = w;
+                denom += w;
+            }
+            let out_base = qh * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0f32;
+                for (t, &w) in weights.iter().enumerate() {
+                    let v_base = (kvh * kv_len + t) * head_dim;
+                    acc += w * oracle_full_v[v_base + d];
+                }
+                oracle_host_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
+            }
+        }
+        let host_pre_gate_vs_stage =
+            validate::max_abs_delta(&host_attn_pre_gate, &pre_gate_host);
+        let host_pre_gate_vs_oracle =
+            validate::max_abs_delta(&host_attn_pre_gate, &oracle_pre_gate);
+        let oracle_host_pre_gate_vs_oracle =
+            validate::max_abs_delta(&oracle_host_pre_gate, &oracle_pre_gate);
+        let kernel_pre_gate_direct = {
+            let ordinal = engine.ordinal();
+            let q_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_heads, 1, head_dim],
+                &f32_to_bf16_bytes(q_rope_host.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn q H2D: {e}"))?;
+            let k_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &f32_to_bf16_bytes(full_k.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn k H2D: {e}"))?;
+            let v_gpu = gpu_hal::GpuBuffer::from_host_bytes(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &f32_to_bf16_bytes(full_v.iter().copied()),
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn v H2D: {e}"))?;
+            let mut out_gpu = gpu_hal::GpuBuffer::zeros(
+                ordinal,
+                gpu_hal::ScalarType::F32,
+                &[num_heads, 1, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn out alloc: {e}"))?;
+            kernel_ffi::prefill_ffi::full_attention_prefill(
+                ordinal,
+                gpu_hal::ScalarType::BF16,
+                1,
+                num_heads,
+                num_kv_heads,
+                1,
+                kv_len,
+                head_dim,
+                scale,
+                prefix_len,
+                &q_gpu,
+                &k_gpu,
+                &v_gpu,
+                &mut out_gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("trace direct attn kernel: {e}"))?;
+            decode_f32_le(
+                &out_gpu
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("trace direct attn out D2H: {e}"))?,
+            )
+        };
+        let direct_kernel_vs_host =
+            validate::max_abs_delta(&kernel_pre_gate_direct, &host_attn_pre_gate);
+        let direct_kernel_vs_oracle =
+            validate::max_abs_delta(&kernel_pre_gate_direct, &oracle_pre_gate);
+        let loaded_prefix_k_vs_oracle =
+            validate::max_abs_delta(&prefix_k, &oracle_prefix_k);
+        let loaded_prefix_v_vs_oracle =
+            validate::max_abs_delta(&prefix_v, &oracle_prefix_v);
+        let loaded_raw_k_vs_oracle =
+            validate::max_abs_delta(&loaded_raw_k, &oracle_prefix_k);
+        let loaded_raw_v_vs_oracle =
+            validate::max_abs_delta(&loaded_raw_v, &oracle_prefix_v);
+        let mut head_deltas = Vec::with_capacity(num_heads);
+        for head in 0..num_heads {
+            let start = head * head_dim;
+            let end = start + head_dim;
+            head_deltas.push(validate::max_abs_delta(
+                &pre_gate_host[start..end],
+                &oracle_pre_gate[start..end],
+            ));
+        }
+        eprintln!(
+            "[trace-oracle-full-attn] layer={trace_layer} normed_delta={normed_delta:.6} q_proj_delta={q_proj_delta:.6} gate_proj_delta={gate_proj_delta:.6} k_proj_delta={k_proj_delta:.6} v_proj_delta={v_proj_delta:.6} q_rope_delta={q_rope_delta:.6} k_rope_delta={k_rope_delta:.6} pre_gate_delta={pre_gate_stage_delta:.6} host_pre_gate_vs_stage={host_pre_gate_vs_stage:.6} host_pre_gate_vs_oracle={host_pre_gate_vs_oracle:.6} oracle_host_pre_gate_vs_oracle={oracle_host_pre_gate_vs_oracle:.6} direct_kernel_vs_host={direct_kernel_vs_host:.6} direct_kernel_vs_oracle={direct_kernel_vs_oracle:.6} loaded_prefix_k_vs_oracle={loaded_prefix_k_vs_oracle:.6} loaded_prefix_v_vs_oracle={loaded_prefix_v_vs_oracle:.6} loaded_raw_k_vs_oracle={loaded_raw_k_vs_oracle:.6} loaded_raw_v_vs_oracle={loaded_raw_v_vs_oracle:.6} gated_delta={gated_stage_delta:.6} gated_actual_delta={gated_actual_delta:.6} gated_reconstruct_delta={gated_reconstruct_delta:.6} pre_gate_head_deltas={head_deltas:?}"
+        );
+    }
     Ok(())
 }
 
@@ -6927,15 +4549,12 @@ fn trace_component_linear_layer(
         use_4b_kernel,
         false,
         Some(trace_layer),
-        None,
-        None,
     )?;
     let replay = replay
         .linear_debug_trace
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing replay linear trace for layer {trace_layer}"))?;
-    let qkv_delta =
-        validate::max_abs_delta(&decode_bf16_le(&native.qkv), &decode_bf16_le(&replay.qkv));
+    let qkv_delta = validate::max_abs_delta(&decode_bf16_le(&native.qkv), &decode_bf16_le(&replay.qkv));
     let z_delta = validate::max_abs_delta(&decode_bf16_le(&native.z), &decode_bf16_le(&replay.z));
     let packed_native = decode_f32_le(&native.packed);
     let packed_replay = decode_f32_le(&replay.packed);
@@ -7003,23 +4622,18 @@ fn trace_component_linear_layer(
             &packed_replay[base + 2 * khd..base + 2 * khd + vhd],
             &v_ref[v_ref_base..v_ref_base + vhd],
         ));
-        beta_delta = beta_delta
-            .max((packed_native[base + 2 * khd + vhd] - packed_replay[base + 2 * khd + vhd]).abs());
+        beta_delta = beta_delta.max(
+            (packed_native[base + 2 * khd + vhd] - packed_replay[base + 2 * khd + vhd]).abs(),
+        );
         gexp_delta = gexp_delta.max(
-            (packed_native[base + 2 * khd + vhd + 1] - packed_replay[base + 2 * khd + vhd + 1])
-                .abs(),
+            (packed_native[base + 2 * khd + vhd + 1] - packed_replay[base + 2 * khd + vhd + 1]).abs(),
         );
     }
-    let rec_apply_delta = validate::max_abs_delta(
-        &decode_f32_le(&native.rec_apply),
-        &decode_f32_le(&replay.rec_apply),
-    );
-    let attn_delta =
-        validate::max_abs_delta(&decode_bf16_le(&native.attn), &decode_bf16_le(&replay.attn));
-    let gated_delta = validate::max_abs_delta(
-        &decode_bf16_le(&native.gated),
-        &decode_bf16_le(&replay.gated),
-    );
+    let rec_apply_delta =
+        validate::max_abs_delta(&decode_f32_le(&native.rec_apply), &decode_f32_le(&replay.rec_apply));
+    let attn_delta = validate::max_abs_delta(&decode_bf16_le(&native.attn), &decode_bf16_le(&replay.attn));
+    let gated_delta =
+        validate::max_abs_delta(&decode_bf16_le(&native.gated), &decode_bf16_le(&replay.gated));
     let proj_out_delta = validate::max_abs_delta(
         &decode_bf16_le(&native.proj_out),
         &decode_bf16_le(&replay.proj_out),
@@ -7154,8 +4768,6 @@ fn trace_component_linear_state_layer(
         use_4b_kernel,
         false,
         None,
-        None,
-        None,
     )?;
     let replay_layer = replay_state
         .layers
@@ -7174,10 +4786,8 @@ fn trace_component_linear_state_layer(
         .to_host_bytes()
         .map_err(|e| anyhow::anyhow!("replay recurrent_state D2H: {e}"))?;
 
-    let conv_delta =
-        validate::max_abs_delta(&decode_bf16_le(&native_conv), &decode_bf16_le(&replay_conv));
-    let rec_delta =
-        validate::max_abs_delta(&decode_f32_le(&native_rec), &decode_f32_le(&replay_rec));
+    let conv_delta = validate::max_abs_delta(&decode_bf16_le(&native_conv), &decode_bf16_le(&replay_conv));
+    let rec_delta = validate::max_abs_delta(&decode_f32_le(&native_rec), &decode_f32_le(&replay_rec));
     eprintln!(
         "[trace-component-linear-state] layer={trace_layer} conv_delta={conv_delta:.6} recurrent_delta={rec_delta:.6}"
     );
@@ -7193,11 +4803,7 @@ fn compare_kv_layer(native: &LayerState, replay: &LayerState) -> Result<KvFp8Lay
         .dtype();
     let mut diff = KvFp8LayerDiff {
         filled,
-        dtype: if matches!(kv_dtype, gpu_hal::ScalarType::U8) {
-            "fp8"
-        } else {
-            "bf16"
-        },
+        dtype: if matches!(kv_dtype, gpu_hal::ScalarType::U8) { "fp8" } else { "bf16" },
         k_mismatches: 0,
         v_mismatches: 0,
         max_k_delta: 0.0,
@@ -7333,8 +4939,13 @@ fn compare_kv_layer(native: &LayerState, replay: &LayerState) -> Result<KvFp8Lay
                     if kd > 0.0 {
                         diff.k_mismatches += 1;
                         if diff.first_k_mismatch.is_none() {
-                            diff.first_k_mismatch =
-                                Some((h, t, d, native_k[native_idx * 2], replay_k[replay_idx * 2]));
+                            diff.first_k_mismatch = Some((
+                                h,
+                                t,
+                                d,
+                                native_k[native_idx * 2],
+                                replay_k[replay_idx * 2],
+                            ));
                         }
                     }
                     let nv = native_v_f32[native_idx];
@@ -7344,8 +4955,13 @@ fn compare_kv_layer(native: &LayerState, replay: &LayerState) -> Result<KvFp8Lay
                     if vd > 0.0 {
                         diff.v_mismatches += 1;
                         if diff.first_v_mismatch.is_none() {
-                            diff.first_v_mismatch =
-                                Some((h, t, d, native_v[native_idx * 2], replay_v[replay_idx * 2]));
+                            diff.first_v_mismatch = Some((
+                                h,
+                                t,
+                                d,
+                                native_v[native_idx * 2],
+                                replay_v[replay_idx * 2],
+                            ));
                         }
                     }
                 }

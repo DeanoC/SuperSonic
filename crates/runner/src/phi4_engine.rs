@@ -33,7 +33,7 @@ pub fn run_phi4(
 ) -> Result<()> {
     let params = match &entry.params {
         FamilyParams::Phi4(p) => p,
-        FamilyParams::Qwen35(_) | FamilyParams::Gemma4(_) => {
+        FamilyParams::Qwen35(_) | FamilyParams::Gemma4(_) | FamilyParams::Llama31(_) => {
             unreachable!("run_phi4 dispatched for non-Phi4 variant {model_variant}")
         }
     };
