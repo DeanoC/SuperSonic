@@ -765,6 +765,48 @@ pub fn cuda_lm_head_argmax_bf16(
     }
 }
 
+pub fn metal_lm_head_argmax_bf16(
+    ordinal: usize,
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<u32, GpuError> {
+    if hidden.backend() != Backend::Metal || weight.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_lm_head_argmax_bf16 requires Metal buffers".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_lm_head_argmax_bf16 requires BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])?;
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    {
+        crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
+            crate::metal_native::lm_head_argmax_bf16(
+                hidden,
+                weight,
+                &mut out_index,
+                hidden_dim,
+                vocab_size,
+            )
+        })?;
+        let bytes = out_index.to_host_bytes()?;
+        let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        Ok(token)
+    }
+    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    {
+        let _ = (hidden, weight, hidden_dim, vocab_size, out_index);
+        Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+    }
+}
+
 /// 4B variant of RMSNorm (same logic, separate compilation).
 pub fn rms_norm_4b(
     ordinal: usize,

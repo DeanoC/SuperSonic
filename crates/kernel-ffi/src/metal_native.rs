@@ -25,6 +25,13 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_lm_head_argmax_bf16(
+        in_dim: usize,
+        vocab_size: usize,
+        hidden_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_index_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_full_attention_prefill_bf16_f32(
         q_heads: usize,
         kv_heads: usize,
@@ -239,6 +246,48 @@ unsafe extern "C" {
         g_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn lm_head_argmax_bf16(
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+    in_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native lm_head_argmax_bf16 expects BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "metal native lm_head_argmax_bf16 requires a U32[1] output buffer".into(),
+        ));
+    }
+    if in_dim > u32::MAX as usize || vocab_size > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native lm_head_argmax_bf16 dimensions exceed u32: in_dim={in_dim}, vocab_size={vocab_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_lm_head_argmax_bf16(
+            in_dim,
+            vocab_size,
+            hidden.as_ptr(),
+            weight.as_ptr(),
+            out_index.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native lm_head_argmax_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -1251,6 +1300,19 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn lm_head_argmax_bf16(
+    _hidden: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out_index: &mut GpuBuffer,
+    _in_dim: usize,
+    _vocab_size: usize,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native lm_head_argmax_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn full_attention_prefill_bf16_f32(
     _q_heads: usize,
     _kv_heads: usize,
@@ -1323,7 +1385,9 @@ pub(crate) fn l2norm(
     _input: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::Metal("metal native l2norm is not compiled".into()))
+    Err(GpuError::Metal(
+        "metal native l2norm is not compiled".into(),
+    ))
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
@@ -1594,6 +1658,40 @@ mod tests {
     }
 
     #[test]
+    fn metal_native_lm_head_argmax_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden_vals = [1.0f32, -2.0, 0.5];
+        let weight_vals = [
+            0.0f32, 0.0, 1.0, // 0.5
+            1.0, 1.0, 1.0, // -0.5
+            -1.0, -2.0, 0.0, // 3.0
+            0.25, 0.0, 0.25, // 0.375
+        ];
+        let hidden = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 3],
+            &bf16_bytes(&hidden_vals),
+        )
+        .expect("upload hidden");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4, 3],
+            &bf16_bytes(&weight_vals),
+        )
+        .expect("upload weight");
+        let mut out_index =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("allocate out_index");
+
+        lm_head_argmax_bf16(&hidden, &weight, &mut out_index, 3, 4)
+            .expect("run native lm-head argmax");
+
+        assert_eq!(read_u32(&out_index), vec![2]);
+    }
+
+    #[test]
     fn metal_native_full_attention_prefill_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
@@ -1697,13 +1795,9 @@ mod tests {
             &bf16_bytes(&hidden_vals),
         )
         .expect("upload hidden");
-        let gate = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[2, 3],
-            &bf16_bytes(&gate_vals),
-        )
-        .expect("upload gate");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2, 3], &bf16_bytes(&gate_vals))
+                .expect("upload gate");
         let weight = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -1891,20 +1985,12 @@ mod tests {
 
         let data_vals = [1.0f32, -2.0, 0.5, 10.0];
         let gate_vals = [0.0f32, 1.0, -1.0, 3.0];
-        let data = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[4],
-            &bf16_bytes(&data_vals),
-        )
-        .expect("upload bf16 data");
-        let gate = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[4],
-            &bf16_bytes(&gate_vals),
-        )
-        .expect("upload bf16 gate");
+        let data =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&data_vals))
+                .expect("upload bf16 data");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&gate_vals))
+                .expect("upload bf16 gate");
         let mut out_native =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
         let mut out_ref =
@@ -1925,20 +2011,12 @@ mod tests {
             );
         }
 
-        let data = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[4],
-            &f32_bytes(&data_vals),
-        )
-        .expect("upload f32 data");
-        let gate = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[4],
-            &f32_bytes(&gate_vals),
-        )
-        .expect("upload f32 gate");
+        let data =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&data_vals))
+                .expect("upload f32 data");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&gate_vals))
+                .expect("upload f32 gate");
         let mut out_native =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
         let mut out_ref =
@@ -1967,16 +2045,11 @@ mod tests {
 
         let gate_vals = [0.0f32, 1.0, -1.0, 3.0];
         let up_vals = [1.0f32, -2.0, 0.5, 10.0];
-        let gate = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[4],
-            &bf16_bytes(&gate_vals),
-        )
-        .expect("upload bf16 gate");
-        let up =
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&up_vals))
-                .expect("upload bf16 up");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&gate_vals))
+                .expect("upload bf16 gate");
+        let up = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[4], &bf16_bytes(&up_vals))
+            .expect("upload bf16 up");
         let mut out_native =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate native bf16 out");
         let mut out_ref =
@@ -1997,24 +2070,18 @@ mod tests {
             );
         }
 
-        let gate = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[4],
-            &f32_bytes(&gate_vals),
-        )
-        .expect("upload f32 gate");
-        let up =
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&up_vals))
-                .expect("upload f32 up");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&gate_vals))
+                .expect("upload f32 gate");
+        let up = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[4], &f32_bytes(&up_vals))
+            .expect("upload f32 up");
         let mut out_native =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate native f32 out");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("allocate ref f32 out");
         crate::metal_host::swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_ref)
             .expect("host f32 swiglu_mul");
-        swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_native)
-            .expect("native f32 swiglu_mul");
+        swiglu_mul(ScalarType::F32, 4, &gate, &up, &mut out_native).expect("native f32 swiglu_mul");
         for (idx, (a, e)) in read_f32(&out_native)
             .iter()
             .zip(read_f32(&out_ref).iter())
@@ -2250,8 +2317,8 @@ mod tests {
         assert_eq!(
             read_f32(&out),
             vec![
-                1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 10.0, 20.0, 10.0,
-                20.0, 10.0, 20.0, 30.0, 40.0, 30.0, 40.0, 30.0, 40.0
+                1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 10.0, 20.0, 10.0, 20.0,
+                10.0, 20.0, 30.0, 40.0, 30.0, 40.0, 30.0, 40.0
             ]
         );
     }
@@ -2282,13 +2349,9 @@ mod tests {
             &f32_bytes(&a_vals),
         )
         .expect("upload a");
-        let dt_bias = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[nv],
-            &f32_bytes(&dt_bias_vals),
-        )
-        .expect("upload dt_bias");
+        let dt_bias =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[nv], &f32_bytes(&dt_bias_vals))
+                .expect("upload dt_bias");
         let a_log_exp = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::F32,
@@ -2302,7 +2365,8 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g native");
         let mut beta_ref =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc beta ref");
-        let mut g_ref = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g ref");
+        let mut g_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, seq_len]).expect("alloc g ref");
 
         crate::metal_host::compute_beta_g(
             ScalarType::F32,
@@ -2332,7 +2396,11 @@ mod tests {
         let beta_native_vals = read_f32(&beta_native);
         let g_ref_vals = read_f32(&g_ref);
         let g_native_vals = read_f32(&g_native);
-        for (idx, (a, e)) in beta_native_vals.iter().zip(beta_ref_vals.iter()).enumerate() {
+        for (idx, (a, e)) in beta_native_vals
+            .iter()
+            .zip(beta_ref_vals.iter())
+            .enumerate()
+        {
             let delta = (a - e).abs();
             assert!(
                 delta <= 1e-6,
@@ -2341,7 +2409,10 @@ mod tests {
         }
         for (idx, (a, e)) in g_native_vals.iter().zip(g_ref_vals.iter()).enumerate() {
             let delta = (a - e).abs();
-            assert!(delta <= 1e-6, "g idx {idx}: expected {e}, got {a}, delta {delta}");
+            assert!(
+                delta <= 1e-6,
+                "g idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
         }
     }
 

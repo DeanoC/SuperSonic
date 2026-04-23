@@ -337,6 +337,12 @@ fn metal_f32_bf16_projection(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefillOutputMode {
+    FullLogits,
+    GreedyToken,
+}
+
 /// Compute per-position logits for a contiguous range of the hidden-state
 /// buffer.
 ///
@@ -483,10 +489,74 @@ pub fn compute_logits_for_range(
     Ok((logits_per_pos, normed))
 }
 
+pub fn compute_greedy_token_for_range(
+    hidden: &GpuBuffer,
+    weights: &Qwen35Weights,
+    config: &TextConfig,
+    start: usize,
+    use_4b_kernel: bool,
+    ordinal: usize,
+) -> Result<(u32, GpuBuffer)> {
+    if hidden.backend() != Backend::Metal || use_4b_kernel || metal_force_f32_final_norm() {
+        let (mut logits_per_pos, normed) =
+            compute_logits_for_range(hidden, weights, config, start, 1, use_4b_kernel, ordinal)?;
+        let logits = logits_per_pos
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("greedy fallback produced no logits"))?;
+        let (token, _) = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(_, lhs), (_, rhs)| lhs.total_cmp(rhs))
+            .ok_or_else(|| anyhow::anyhow!("cannot sample from empty logits"))?;
+        return Ok((token as u32, normed));
+    }
+
+    let hidden_dim = config.hidden_size;
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+
+    let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy range slice alloc: {e}"))?;
+    let src_offset = start * hidden_dim * elem_bytes;
+    gpu_hal::copy_d2d(
+        ordinal,
+        slice.as_ptr() as *mut c_void,
+        hidden.offset_ptr(src_offset),
+        hidden_dim * elem_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy range slice copy: {e}"))?;
+
+    let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy range normed alloc: {e}"))?;
+    prefill_ffi::rms_norm_rows(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        hidden_dim,
+        config.rms_norm_eps as f32,
+        &slice,
+        &weights.norm_weight,
+        &mut normed,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy range final norm: {e}"))?;
+
+    let token = kernel_ffi::metal_lm_head_argmax_bf16(
+        ordinal,
+        &normed,
+        &*weights.lm_head,
+        hidden_dim,
+        config.vocab_size,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy range lm_head argmax: {e}"))?;
+    Ok((token, normed))
+}
+
 /// Result of a prefill pass.
 pub struct PrefillResult {
     /// Logits for the last token position [vocab_size] as F32 on CPU.
     pub logits: Vec<f32>,
+    /// Device-side greedy token when prefill was run in token-only mode.
+    pub sampled_token: Option<u32>,
     /// Optional BF16 last-token dump after final RMSNorm and before lm_head.
     pub final_norm_trace: Option<Vec<u8>>,
     /// Optional BF16 last-token hidden dump after token-mixer residual for each layer.
@@ -682,7 +752,44 @@ pub fn prefill(
         debug_mlp_layer,
         None,
         None,
+        PrefillOutputMode::FullLogits,
     )
+}
+
+pub fn prefill_greedy_token(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+) -> Result<u32> {
+    let result = prefill_inner(
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        None,
+        0,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        PrefillOutputMode::GreedyToken,
+    )?;
+    result
+        .sampled_token
+        .ok_or_else(|| anyhow::anyhow!("prefill_greedy_token did not produce a sampled token"))
 }
 
 pub fn prefill_with_trace_position(
@@ -719,6 +826,7 @@ pub fn prefill_with_trace_position(
         debug_mlp_layer,
         None,
         trace_position,
+        PrefillOutputMode::FullLogits,
     )
 }
 
@@ -759,6 +867,7 @@ pub fn prefill_tail_from_hidden(
         debug_mlp_layer,
         None,
         None,
+        PrefillOutputMode::FullLogits,
     )
 }
 
@@ -797,6 +906,7 @@ pub fn prefill_tail_from_hidden_with_trace_position(
         debug_mlp_layer,
         None,
         trace_position,
+        PrefillOutputMode::FullLogits,
     )
 }
 
@@ -838,6 +948,7 @@ pub fn prefill_with_taps(
         debug_mlp_layer,
         Some(tap_layers),
         None,
+        PrefillOutputMode::FullLogits,
     )
 }
 
@@ -859,6 +970,7 @@ fn prefill_inner(
     debug_mlp_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
     trace_position: Option<usize>,
+    output_mode: PrefillOutputMode,
 ) -> Result<PrefillResult> {
     let config = &weights.config;
     let hidden_dim = config.hidden_size;
@@ -1305,18 +1417,34 @@ fn prefill_inner(
     // Extract logits for the last token of the final chunk. Refactored out
     // into `compute_logits_for_range` so the DFlash verify path can request
     // count=B and walk the block argmax in one shot (M3; see docs/dflash.md §6).
-    let (mut logits_per_pos, normed_last) = compute_logits_for_range(
-        &scratch.hidden,
-        weights,
-        config,
-        last_chunk_len - 1,
-        1,
-        use_4b_kernel,
-        ordinal,
-    )?;
-    let logits = logits_per_pos
-        .pop()
-        .expect("count=1 produces exactly one row");
+    let (logits, sampled_token, normed_last) = match output_mode {
+        PrefillOutputMode::FullLogits => {
+            let (mut logits_per_pos, normed_last) = compute_logits_for_range(
+                &scratch.hidden,
+                weights,
+                config,
+                last_chunk_len - 1,
+                1,
+                use_4b_kernel,
+                ordinal,
+            )?;
+            let logits = logits_per_pos
+                .pop()
+                .expect("count=1 produces exactly one row");
+            (logits, None, normed_last)
+        }
+        PrefillOutputMode::GreedyToken => {
+            let (token, normed_last) = compute_greedy_token_for_range(
+                &scratch.hidden,
+                weights,
+                config,
+                last_chunk_len - 1,
+                use_4b_kernel,
+                ordinal,
+            )?;
+            (Vec::new(), Some(token), normed_last)
+        }
+    };
     let final_norm_trace = if trace_layers {
         Some(
             normed_last
@@ -1336,6 +1464,7 @@ fn prefill_inner(
 
     Ok(PrefillResult {
         logits,
+        sampled_token,
         final_norm_trace,
         layer_attn_trace,
         layer_post_attn_norm_trace,

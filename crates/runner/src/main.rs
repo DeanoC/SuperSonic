@@ -1230,6 +1230,16 @@ fn main() -> Result<()> {
         .to_path_buf();
     let oracle_script = oracle_root.join("oracle/run_oracle.py");
     let qwen35_trace_script = oracle_root.join("oracle/qwen35_oracle.py");
+    let metal_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_METAL_FAST_GREEDY").is_some();
+    let metal_prefill_fast_greedy_enabled = backend == Backend::Metal
+        && model_variant == ModelVariant::Qwen3_5_0_8B
+        && cli.batch_size == 1
+        && !params.use_4b_kernel
+        && !cli.validate
+        && !cli.gpu_validate
+        && !cli.trace_prefill_layers
+        && !cli.oracle_prefill
+        && !metal_fast_greedy_disabled;
 
     // Run prefill (native GPU or oracle)
     let prefill_start = Instant::now();
@@ -1272,9 +1282,26 @@ fn main() -> Result<()> {
                 trace_prefill_mlp_layer,
                 trace_prefill_position,
             )?
+        } else if metal_prefill_fast_greedy_enabled {
+            let first = engine.prefill_native_greedy_token(&prompt_ids)?;
+            prefill_engine::PrefillResult {
+                logits: Vec::new(),
+                sampled_token: Some(first),
+                final_norm_trace: None,
+                layer_attn_trace: None,
+                layer_post_attn_norm_trace: None,
+                layer_mlp_swiglu_trace: None,
+                layer_mlp_out_trace: None,
+                layer_hidden_trace: None,
+                tap_hiddens: None,
+                linear_debug_trace: None,
+                layer3_full_attn_trace: None,
+                mlp_debug_trace: None,
+            }
         } else {
             prefill_engine::PrefillResult {
                 logits: engine.prefill_native(&prompt_ids)?,
+                sampled_token: None,
                 final_norm_trace: None,
                 layer_attn_trace: None,
                 layer_post_attn_norm_trace: None,
@@ -1287,7 +1314,9 @@ fn main() -> Result<()> {
                 mlp_debug_trace: None,
             }
         };
-        let first = DecodeEngine::greedy_sample(&prefill_result.logits);
+        let first = prefill_result
+            .sampled_token
+            .unwrap_or_else(|| DecodeEngine::greedy_sample(&prefill_result.logits));
         eprintln!(
             "[prefill] native GPU prefill done in {:.0}ms",
             prefill_start.elapsed().as_millis()
@@ -1556,8 +1585,16 @@ fn main() -> Result<()> {
         && oracle_output.is_none()
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
+    let metal_replay_fast_greedy_enabled = metal_prefill_fast_greedy_enabled
+        && replay_decode_enabled
+        && oracle_output.is_none()
+        && !gpu_validate_enabled
+        && !cli.emit_stage_timings
+        && cli.trace_replay_decode_step.is_none();
     if replay_decode_enabled {
-        if backend == Backend::Metal {
+        if metal_replay_fast_greedy_enabled {
+            eprintln!("[decode] Metal fast greedy replay-prefill path enabled");
+        } else if backend == Backend::Metal {
             eprintln!("[decode] Metal v1 replays native prefill for each decode step");
         } else {
             eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
@@ -1791,17 +1828,23 @@ fn main() -> Result<()> {
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if replay_decode_enabled {
-                prefill_engine::gpu_reference_replay_step(
-                    &engine.weights(),
-                    &engine.rotary(),
-                    replay_token_ids
-                        .as_ref()
-                        .expect("replay token ids are present when replay decode is enabled"),
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    params.use_4b_kernel,
-                )?
+                let token_ids = replay_token_ids
+                    .as_ref()
+                    .expect("replay token ids are present when replay decode is enabled");
+                if metal_replay_fast_greedy_enabled {
+                    maybe_fast_token = Some(engine.rebuild_prefill_state_greedy_token(token_ids)?);
+                    Vec::new()
+                } else {
+                    prefill_engine::gpu_reference_replay_step(
+                        &engine.weights(),
+                        &engine.rotary(),
+                        token_ids,
+                        ordinal,
+                        params.kv_chunk_size,
+                        cli.prefill_chunk_size,
+                        params.use_4b_kernel,
+                    )?
+                }
             } else if replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()

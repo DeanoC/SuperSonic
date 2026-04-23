@@ -122,6 +122,13 @@ struct L2NormParams {
     uint32_t block_size;
 };
 
+struct LmHeadArgmaxParams {
+    uint32_t in_dim;
+    uint32_t vocab_size;
+    uint32_t block_size;
+    uint32_t partial_count;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -240,6 +247,205 @@ kernel void supersonic_matmul_rhs_transposed_bf16(
         *error_out = build_error;
     }
     return pipeline;
+}
+
+id<MTLComputePipelineState> lm_head_argmax_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            NSError* err = [NSError errorWithDomain:@"SuperSonicMetal"
+                                               code:260
+                                           userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            errors[function_name] = err;
+            if (error_out != nullptr) {
+                *error_out = err;
+            }
+            return nil;
+        }
+
+        static const char* kSource = R"LMARGMAX(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LmHeadArgmaxParams {
+    uint in_dim;
+    uint vocab_size;
+    uint block_size;
+    uint partial_count;
+};
+
+inline bool supersonic_argmax_better(float value, uint index, float best_value, uint best_index) {
+    return value > best_value || (value == best_value && index < best_index);
+}
+
+kernel void supersonic_lm_head_argmax_stage1_bf16(
+    device const bfloat* hidden [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device float* partial_values [[buffer(2)]],
+    device uint* partial_indices [[buffer(3)]],
+    constant LmHeadArgmaxParams& params [[buffer(4)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+
+    float best_value = -INFINITY;
+    uint best_index = 0;
+    uint row = group_id * params.block_size + tid;
+    if (tid < params.block_size && row < params.vocab_size) {
+        float acc = 0.0f;
+        uint weight_base = row * params.in_dim;
+        for (uint kk = 0; kk < params.in_dim; ++kk) {
+            acc += float(hidden[kk]) * float(weight[weight_base + kk]);
+        }
+        best_value = acc;
+        best_index = row;
+    }
+
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other_value = values[tid + stride];
+            uint other_index = indices[tid + stride];
+            if (supersonic_argmax_better(other_value, other_index, values[tid], indices[tid])) {
+                values[tid] = other_value;
+                indices[tid] = other_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        partial_values[group_id] = values[0];
+        partial_indices[group_id] = indices[0];
+    }
+}
+
+kernel void supersonic_lm_head_argmax_stage2(
+    device const float* partial_values [[buffer(0)]],
+    device const uint* partial_indices [[buffer(1)]],
+    device uint* out_index [[buffer(2)]],
+    constant LmHeadArgmaxParams& params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float values[256];
+    threadgroup uint indices[256];
+
+    float best_value = -INFINITY;
+    uint best_index = 0;
+    for (uint idx = tid; idx < params.partial_count; idx += params.block_size) {
+        float value = partial_values[idx];
+        uint index = partial_indices[idx];
+        if (supersonic_argmax_better(value, index, best_value, best_index)) {
+            best_value = value;
+            best_index = index;
+        }
+    }
+
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other_value = values[tid + stride];
+            uint other_index = indices[tid + stride];
+            if (supersonic_argmax_better(other_value, other_index, values[tid], indices[tid])) {
+                values[tid] = other_value;
+                indices[tid] = other_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out_index[0] = indices[0];
+    }
+}
+)LMARGMAX";
+
+        NSString* source = [NSString stringWithUTF8String:kSource];
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        configure_precise_math(options);
+        NSError* library_error = nil;
+        id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                      options:options
+                                                        error:&library_error];
+        if (library == nil || library_error != nil) {
+            NSError* err = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                 code:261
+                                                             userInfo:@{
+                                                                 NSLocalizedDescriptionKey :
+                                                                     @"Failed to compile lm-head argmax library"
+                                                             }];
+            errors[function_name] = err;
+            if (error_out != nullptr) {
+                *error_out = err;
+            }
+            return nil;
+        }
+
+        id<MTLFunction> function = [library newFunctionWithName:function_name];
+        if (function == nil) {
+            NSError* err = [NSError errorWithDomain:@"SuperSonicMetal"
+                                               code:262
+                                           userInfo:@{
+                                               NSLocalizedDescriptionKey :
+                                                   @"Failed to load lm-head argmax function"
+                                           }];
+            errors[function_name] = err;
+            if (error_out != nullptr) {
+                *error_out = err;
+            }
+            return nil;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function
+                                                                                     error:&pipeline_error];
+        if (pipeline == nil || pipeline_error != nil) {
+            NSError* err = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                 code:263
+                                                             userInfo:@{
+                                                                 NSLocalizedDescriptionKey :
+                                                                     @"Failed to create lm-head argmax pipeline"
+                                                             }];
+            errors[function_name] = err;
+            if (error_out != nullptr) {
+                *error_out = err;
+            }
+            return nil;
+        }
+
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
 }
 
 id<MTLComputePipelineState> full_attention_pipeline_bf16_f32(NSError** error_out) {
@@ -3804,6 +4010,112 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return 9;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_lm_head_argmax_bf16(
+    size_t in_dim,
+    size_t vocab_size,
+    const void* hidden_ptr,
+    const void* weight_ptr,
+    void* out_index_ptr
+) {
+    @autoreleasepool {
+        if (in_dim == 0 || vocab_size == 0 || hidden_ptr == nullptr || weight_ptr == nullptr ||
+            out_index_ptr == nullptr) {
+            return 270;
+        }
+        if (in_dim > UINT32_MAX || vocab_size > UINT32_MAX) {
+            return 271;
+        }
+
+        NSError* stage1_error = nil;
+        NSError* stage2_error = nil;
+        id<MTLComputePipelineState> stage1 =
+            lm_head_argmax_pipeline(@"supersonic_lm_head_argmax_stage1_bf16", &stage1_error);
+        id<MTLComputePipelineState> stage2 =
+            lm_head_argmax_pipeline(@"supersonic_lm_head_argmax_stage2", &stage2_error);
+        if (stage1 == nil || stage2 == nil) {
+            return 272;
+        }
+
+        id<MTLBuffer> hidden = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> out_index = nil;
+        size_t hidden_offset = 0;
+        size_t weight_offset = 0;
+        size_t out_index_offset = 0;
+        if (lookup_buffer(hidden_ptr, &hidden, &hidden_offset) != 0) {
+            return 273;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 274;
+        }
+        if (lookup_buffer(out_index_ptr, &out_index, &out_index_offset) != 0) {
+            return 275;
+        }
+
+        id<MTLDevice> device = metal_device();
+        id<MTLCommandQueue> queue = metal_queue();
+        if (device == nil || queue == nil) {
+            return 276;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 277;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 278;
+        }
+
+        const uint32_t block_size = 256;
+        const size_t partial_count = (vocab_size + block_size - 1) / block_size;
+        if (partial_count == 0 || partial_count > UINT32_MAX) {
+            return 279;
+        }
+        id<MTLBuffer> partial_values = [device newBufferWithLength:partial_count * sizeof(float)
+                                                           options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> partial_indices = [device newBufferWithLength:partial_count * sizeof(uint32_t)
+                                                            options:MTLResourceStorageModePrivate];
+        if (partial_values == nil || partial_indices == nil) {
+            return 280;
+        }
+
+        LmHeadArgmaxParams params = {
+            static_cast<uint32_t>(in_dim),
+            static_cast<uint32_t>(vocab_size),
+            block_size,
+            static_cast<uint32_t>(partial_count),
+        };
+
+        [encoder setComputePipelineState:stage1];
+        [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
+        [encoder setBuffer:weight offset:weight_offset atIndex:1];
+        [encoder setBuffer:partial_values offset:0 atIndex:2];
+        [encoder setBuffer:partial_indices offset:0 atIndex:3];
+        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        MTLSize groups = MTLSizeMake(partial_count, 1, 1);
+        MTLSize threads = MTLSizeMake(block_size, 1, 1);
+        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:stage2];
+        [encoder setBuffer:partial_values offset:0 atIndex:0];
+        [encoder setBuffer:partial_indices offset:0 atIndex:1];
+        [encoder setBuffer:out_index offset:out_index_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:threads];
+
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 281;
         }
         return 0;
     }

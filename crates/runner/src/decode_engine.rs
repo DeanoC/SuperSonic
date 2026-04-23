@@ -3053,6 +3053,28 @@ impl DecodeEngine {
         Ok(result.logits)
     }
 
+    /// Run native GPU prefill and return only the greedy next token. Metal uses
+    /// this to avoid materializing the full vocabulary logits during generation.
+    pub fn prefill_native_greedy_token(&mut self, prompt_ids: &[u32]) -> Result<u32> {
+        let token = prefill_engine::prefill_greedy_token(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+        )?;
+
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after greedy prefill: {e}"))?;
+
+        Ok(token)
+    }
+
     /// Rebuild sequence-0 state from scratch by replaying native GPU prefill
     /// over the provided token history. Optionally replicates that state across
     /// extra batch slots for lockstep batch decoding.
@@ -3068,6 +3090,13 @@ impl DecodeEngine {
             self.replicate_state_to_batch()?;
         }
         Ok(logits)
+    }
+
+    /// Rebuild sequence-0 state from scratch and return only the greedy token.
+    pub fn rebuild_prefill_state_greedy_token(&mut self, token_ids: &[u32]) -> Result<u32> {
+        self.state = ModelState::new(&self.weights.config, self.ordinal)
+            .map_err(|e| anyhow::anyhow!("rebuild greedy model state init: {e}"))?;
+        self.prefill_native_greedy_token(token_ids)
     }
 
     /// DFlash prefill: runs `prefill_with_taps` against the engine's own
