@@ -33,7 +33,7 @@ pub fn run_phi4(
 ) -> Result<()> {
     let params = match &entry.params {
         FamilyParams::Phi4(p) => p,
-        FamilyParams::Qwen35(_) | FamilyParams::Gemma4(_) => {
+        FamilyParams::Qwen35(_) | FamilyParams::Gemma4(_) | FamilyParams::Llama31(_) => {
             unreachable!("run_phi4 dispatched for non-Phi4 variant {model_variant}")
         }
     };
@@ -127,25 +127,14 @@ pub fn run_phi4(
             .join("oracle/phi4_oracle.py");
         let oracle_device =
             crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
-        let oracle = if cli.prompt_ids.is_some() {
-            oracle_mod::run_phi4_oracle_ids(
-                &oracle_script,
-                &cli.model_dir,
-                &prompt_ids,
-                cli.max_new_tokens,
-                &cli.oracle_dtype,
-                &oracle_device,
-            )?
-        } else {
-            oracle_mod::run_phi4_oracle(
-                &oracle_script,
-                &cli.model_dir,
-                cli.prompt.as_deref().unwrap_or_default(),
-                cli.max_new_tokens,
-                &cli.oracle_dtype,
-                &oracle_device,
-            )?
-        };
+        let oracle = oracle_mod::run_phi4_oracle(
+            &oracle_script,
+            &cli.model_dir,
+            cli.prompt.as_deref().unwrap_or(""),
+            cli.max_new_tokens,
+            &cli.oracle_dtype,
+            &oracle_device,
+        )?;
         if let Some(ref oracle_ids) = oracle.prompt_token_ids {
             if oracle_ids != &prompt_ids {
                 bail!(

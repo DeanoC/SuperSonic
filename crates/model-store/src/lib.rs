@@ -59,6 +59,14 @@ pub fn bake_dir_int4(model_dir: &Path) -> PathBuf {
         .join(format!("v{FORMAT_VERSION}-int4-gptq"))
 }
 
+/// Return the bake directory for INT8 BitsAndBytes-style weights.
+/// Uses a separate directory so BF16/FP8/INT4/INT8 baked packages coexist.
+pub fn bake_dir_int8(model_dir: &Path) -> PathBuf {
+    model_dir
+        .join(".supersonic")
+        .join(format!("v{FORMAT_VERSION}-int8-bnb"))
+}
+
 /// Path to manifest.json within a bake directory.
 pub fn manifest_path(bake_dir: &Path) -> PathBuf {
     bake_dir.join("manifest.json")

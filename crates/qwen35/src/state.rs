@@ -372,6 +372,7 @@ mod tests {
             hidden_act: Activation::default(),
             max_position_embeddings: 64,
             rms_norm_eps: 1e-6,
+            rms_norm_add_unit_offset: true,
             tie_word_embeddings: false,
             eos_token_id: None,
             head_dim: 16,

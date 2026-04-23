@@ -9,6 +9,7 @@
 //! root present, the same files get compiled once into the library crate
 //! (`runner::…`) for external consumers.
 
+#[cfg(feature = "bughunt")]
 pub mod bughunt;
 pub mod decode_engine;
 pub mod gemma4_engine;

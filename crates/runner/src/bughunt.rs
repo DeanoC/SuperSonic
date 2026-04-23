@@ -1599,6 +1599,7 @@ fn analyze_gate_prompt(
         "bf16",
         &runtime.oracle_device,
         false,
+        false,
         None,
         None,
     )?;
@@ -1788,6 +1789,7 @@ fn run_restart_layer_sweep(
         0,
         "bf16",
         &runtime.oracle_device,
+        false,
         false,
         None,
         None,

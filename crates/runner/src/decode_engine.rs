@@ -1150,6 +1150,14 @@ impl DecodeEngine {
             fw.v_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
         )?;
+        let q_norm_w = fw
+            .q_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_norm_w"))?;
+        let k_norm_w = fw
+            .k_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
@@ -1158,7 +1166,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             &query_buf,
-            &fw.q_norm_w,
+            q_norm_w,
             &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q norm: {e}"))?;
@@ -1177,7 +1185,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             &k_buf,
-            &fw.k_norm_w,
+            k_norm_w,
             &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace k norm: {e}"))?;
@@ -1392,6 +1400,14 @@ impl DecodeEngine {
             fw.v_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
         )?;
+        let q_norm_w = fw
+            .q_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_norm_w"))?;
+        let k_norm_w = fw
+            .k_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
             ScalarType::BF16,
@@ -1399,7 +1415,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             &query_buf,
-            &fw.q_norm_w,
+            q_norm_w,
             &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q norm: {e}"))?;
@@ -1417,7 +1433,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             &k_buf,
-            &fw.k_norm_w,
+            k_norm_w,
             &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k norm: {e}"))?;
@@ -2234,6 +2250,14 @@ impl DecodeEngine {
                 self.weights.int4_group_size,
             )?;
         }
+        let q_norm_w = fw
+            .q_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_norm_w"))?;
+        let k_norm_w = fw
+            .k_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
             self.ordinal,
@@ -2242,7 +2266,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             query_buf,
-            &fw.q_norm_w,
+            q_norm_w,
             q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
@@ -2254,7 +2278,7 @@ impl DecodeEngine {
             head_dim,
             1e-6,
             k_buf,
-            &fw.k_norm_w,
+            k_norm_w,
             k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;

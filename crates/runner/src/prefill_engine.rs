@@ -2037,6 +2037,14 @@ fn prefill_full_attention_layer(
             &mut k_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K cast to f32: {e}"))?;
+        let q_norm_w = fw
+            .q_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_norm_w"))?;
+        let k_norm_w = fw
+            .k_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
         prefill_ffi::rms_norm_rows(
             ordinal,
             ScalarType::F32,
@@ -2044,7 +2052,7 @@ fn prefill_full_attention_layer(
             head_dim,
             1e-6,
             &query_f32,
-            &fw.q_norm_w,
+            q_norm_w,
             &mut q_normed_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q norm f32: {e}"))?;
@@ -2055,7 +2063,7 @@ fn prefill_full_attention_layer(
             head_dim,
             1e-6,
             &k_f32,
-            &fw.k_norm_w,
+            k_norm_w,
             &mut k_normed_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K norm f32: {e}"))?;
@@ -2122,6 +2130,14 @@ fn prefill_full_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE cast: {e}"))?;
     } else {
+        let q_norm_w = fw
+            .q_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing q_norm_w"))?;
+        let k_norm_w = fw
+            .k_norm_w
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx} missing k_norm_w"))?;
         prefill_ffi::rms_norm_rows(
             ordinal,
             ScalarType::BF16,
@@ -2129,7 +2145,7 @@ fn prefill_full_attention_layer(
             head_dim,
             1e-6,
             &query_buf,
-            &fw.q_norm_w,
+            q_norm_w,
             &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
@@ -2149,7 +2165,7 @@ fn prefill_full_attention_layer(
             head_dim,
             1e-6,
             &scratch.proj_buf2,
-            &fw.k_norm_w,
+            k_norm_w,
             &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;

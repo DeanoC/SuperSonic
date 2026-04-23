@@ -713,6 +713,11 @@ fn main() -> Result<()> {
 
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
+        ModelFamily::Llama31 => {
+            anyhow::bail!(
+                "Llama 3.1 support is present on main but not integrated into this Metal perf branch yet."
+            );
+        }
         ModelFamily::Phi4 => {
             return phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram);
         }
@@ -770,6 +775,7 @@ fn main() -> Result<()> {
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => p,
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
+        FamilyParams::Llama31(_) => unreachable!("llama31 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
     };
 
@@ -1259,6 +1265,7 @@ fn main() -> Result<()> {
             &cli.oracle_dtype,
             &oracle_device,
             true,
+            false,
             fp8_oracle_dir.as_deref(),
             None,
         )?;
@@ -1347,6 +1354,7 @@ fn main() -> Result<()> {
             &cli.oracle_dtype,
             &oracle_device,
             cli.trace_prefill_layers,
+            false,
             fp8_oracle_dir.as_deref(),
             None,
         )?;
@@ -2152,6 +2160,7 @@ fn main() -> Result<()> {
                     &cli.oracle_dtype,
                     &oracle_device,
                     true,
+                    false,
                     fp8_oracle_dir.as_deref(),
                     None,
                 )?;
@@ -2328,6 +2337,7 @@ fn run_gemma4(
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
     if cli.fp8_runtime || cli.kv_fp8 {
@@ -3972,7 +3982,11 @@ fn emit_qwen35_trace_report_with_offset(
                     trace_full_layer, idx, native_v, oracle_v, delta
                 );
                 if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                    let q_norm_w = decode_gpu_buffer_f32(&full.q_norm_w)?;
+                    let q_norm_w = decode_gpu_buffer_f32(
+                        full.q_norm_w
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("layer {trace_full_layer} missing q_norm_w"))?,
+                    )?;
                     let detail = rms_norm_head_detail(
                         &native_q_proj,
                         &oracle_q_proj,
@@ -4037,7 +4051,11 @@ fn emit_qwen35_trace_report_with_offset(
                     trace_full_layer, idx, native_v, oracle_v, delta
                 );
                 if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
-                    let k_norm_w = decode_gpu_buffer_f32(&full.k_norm_w)?;
+                    let k_norm_w = decode_gpu_buffer_f32(
+                        full.k_norm_w
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("layer {trace_full_layer} missing k_norm_w"))?,
+                    )?;
                     let detail = rms_norm_head_detail(
                         &native_k_proj,
                         &oracle_k_proj,
@@ -4062,7 +4080,11 @@ fn emit_qwen35_trace_report_with_offset(
             if let Some(position) = trace_prefill_position {
                 if let Some(full) = engine.weights().layers[trace_full_layer].full.as_ref() {
                     let eps = cfg.rms_norm_eps as f32;
-                    let q_norm_w = decode_gpu_buffer_f32(&full.q_norm_w)?;
+                    let q_norm_w = decode_gpu_buffer_f32(
+                        full.q_norm_w
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("layer {trace_full_layer} missing q_norm_w"))?,
+                    )?;
                     let q_norm_ref = apply_rms_norm_reference(
                         &native_q_proj,
                         &q_norm_w,
@@ -4079,7 +4101,11 @@ fn emit_qwen35_trace_report_with_offset(
                         trace_full_layer, q_norm_selfcheck_delta, idx, native_v, ref_v, delta
                     );
                     let num_kv_heads = cfg.num_key_value_heads;
-                    let k_norm_w = decode_gpu_buffer_f32(&full.k_norm_w)?;
+                    let k_norm_w = decode_gpu_buffer_f32(
+                        full.k_norm_w
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("layer {trace_full_layer} missing k_norm_w"))?,
+                    )?;
                     let k_norm_ref = apply_rms_norm_reference(
                         &native_k_proj,
                         &k_norm_w,

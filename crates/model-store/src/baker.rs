@@ -269,8 +269,11 @@ pub fn bake_qwen35(
                 let (b, s) = transforms::a_log_to_exp_bf16(raw_bytes, &shape);
                 (b, s, "bf16")
             }
-            LayoutTag::Fp8Dequantized | LayoutTag::Fp8Native | LayoutTag::Int4Quantized => {
-                unreachable!("FP8/INT4 tensors are handled before this match")
+            LayoutTag::Fp8Dequantized
+            | LayoutTag::Fp8Native
+            | LayoutTag::Int8Quantized
+            | LayoutTag::Int4Quantized => {
+                unreachable!("FP8/INT8/INT4 tensors are handled before this match")
             }
         };
 
@@ -547,4 +550,3 @@ mod tests {
         assert!(split_phi4_gate_up_name("model.layers.3.mlp.down_proj.weight").is_none());
     }
 }
-
