@@ -3971,6 +3971,224 @@ mod tests {
     }
 
     #[test]
+    fn metal_native_linear_conv_value_decay_update_matches_two_step_path() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let conv_dim = 4usize;
+        let state_len = 2usize;
+        let kernel_size = 3usize;
+        let num_heads = 2usize;
+        let mixed_qkv = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[conv_dim],
+            &bf16_bytes(&[0.5, -1.0, 2.0, 3.0]),
+        )
+        .expect("upload mixed_qkv");
+        let state_vals = [0.25f32, -0.5, 1.0, 1.5, -2.0, 0.75, 0.0, 4.0];
+        let mut state_ref = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[conv_dim, state_len],
+            &bf16_bytes(&state_vals),
+        )
+        .expect("upload ref state");
+        let mut state_fused = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[conv_dim, state_len],
+            &bf16_bytes(&state_vals),
+        )
+        .expect("upload fused state");
+        let weights = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[conv_dim, kernel_size],
+            &bf16_bytes(&[
+                0.5, -0.25, 1.0, -1.0, 0.75, 0.25, 0.125, 0.5, -0.5, 1.5, -0.75, 0.25,
+            ]),
+        )
+        .expect("upload conv weights");
+        let a = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_heads],
+            &bf16_bytes(&[0.25, -1.25]),
+        )
+        .expect("upload a");
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_heads],
+            &bf16_bytes(&[0.5, -0.25]),
+        )
+        .expect("upload dt_bias");
+        let a_log_exp = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_heads],
+            &bf16_bytes(&[0.75, 1.5]),
+        )
+        .expect("upload a_log_exp");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[conv_dim + num_heads]).expect("out ref");
+        let mut out_fused =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[conv_dim + num_heads]).expect("out fused");
+
+        linear_conv_value_decay_bf16(
+            conv_dim,
+            state_len,
+            kernel_size,
+            num_heads,
+            &mixed_qkv,
+            &state_ref,
+            &weights,
+            &a,
+            &dt_bias,
+            &a_log_exp,
+            &mut out_ref,
+        )
+        .expect("run unfused conv/value decay");
+        conv_state_update_bf16(conv_dim, state_len, &mixed_qkv, &mut state_ref)
+            .expect("run state update");
+        linear_conv_value_decay_update_bf16(
+            conv_dim,
+            state_len,
+            kernel_size,
+            num_heads,
+            &mixed_qkv,
+            &mut state_fused,
+            &weights,
+            &a,
+            &dt_bias,
+            &a_log_exp,
+            &mut out_fused,
+        )
+        .expect("run fused conv/value decay update");
+
+        assert_eq!(read_bf16(&out_fused), read_bf16(&out_ref));
+        assert_eq!(read_bf16(&state_fused), read_bf16(&state_ref));
+    }
+
+    #[test]
+    fn metal_native_qwen_linear_decode_apply_inplace_matches_out_buffer_path() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let num_v_heads = 2usize;
+        let num_k_heads = 1usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 2usize;
+        let value_dim = num_v_heads * head_v_dim;
+        let state_dim = num_v_heads * head_k_dim * head_v_dim;
+        let conv_pack = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2 * num_k_heads * head_k_dim + value_dim],
+            &bf16_bytes(&[0.5, 1.0, -0.25, 0.75, 1.5, -1.0, 0.25, 2.0]),
+        )
+        .expect("upload conv_pack");
+        let a = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_v_heads],
+            &bf16_bytes(&[0.25, -0.5]),
+        )
+        .expect("upload a");
+        let b = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_v_heads],
+            &bf16_bytes(&[1.0, -1.5]),
+        )
+        .expect("upload b");
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_v_heads],
+            &bf16_bytes(&[0.125, -0.25]),
+        )
+        .expect("upload dt_bias");
+        let a_log_exp = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[num_v_heads],
+            &bf16_bytes(&[0.75, 1.25]),
+        )
+        .expect("upload a_log_exp");
+        let state_vals = [0.5f32, -0.25, 1.0, 0.75, -1.5, 0.25, 0.0, 2.0];
+        let initial_state = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[state_dim],
+            &f32_bytes(&state_vals),
+        )
+        .expect("upload initial state");
+        let mut inplace_state = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[state_dim],
+            &f32_bytes(&state_vals),
+        )
+        .expect("upload inplace state");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[value_dim + state_dim]).expect("out ref");
+        let mut attn_inplace =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[value_dim]).expect("attn inplace");
+
+        qwen_linear_prep_decode_apply_bf16_f32(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            &conv_pack,
+            &a,
+            &b,
+            &dt_bias,
+            &a_log_exp,
+            &initial_state,
+            &mut out_ref,
+        )
+        .expect("run out-buffer decode apply");
+        qwen_linear_decode_apply_inplace_bf16(
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            &conv_pack,
+            &a,
+            &b,
+            &dt_bias,
+            &a_log_exp,
+            &mut inplace_state,
+            &mut attn_inplace,
+        )
+        .expect("run in-place decode apply");
+
+        let out_ref_f32 = read_f32(&out_ref);
+        let expected_attn: Vec<f32> = out_ref_f32[..value_dim]
+            .iter()
+            .map(|value| bf16::from_f32(*value).to_f32())
+            .collect();
+        for (idx, (actual, expected)) in read_bf16(&attn_inplace).iter().zip(expected_attn.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.0,
+                "attn {idx}: expected {expected}, got {actual}"
+            );
+        }
+        for (idx, (actual, expected)) in read_f32(&inplace_state)
+            .iter()
+            .zip(out_ref_f32[value_dim..].iter())
+            .enumerate()
+        {
+            let delta = (actual - expected).abs();
+            assert!(
+                delta <= 1e-5,
+                "state {idx}: expected {expected}, got {actual}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
     fn metal_native_matmul_rhs_transposed_f32_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
