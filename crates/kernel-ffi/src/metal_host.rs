@@ -48,11 +48,6 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
 }
 
 #[inline(always)]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
-
-#[inline(always)]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -63,6 +58,36 @@ fn softplus(x: f32) -> f32 {
         x
     } else {
         (1.0 + x.exp()).ln()
+    }
+}
+
+#[inline(always)]
+fn use_fast_silu() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_USE_FAST_SILU").is_some()
+}
+
+#[inline(always)]
+fn sigmoid_fast(x: f32) -> f32 {
+    if x >= 0.0 {
+        let e = (-x).exp();
+        1.0 / (1.0 + e)
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+#[inline(always)]
+fn silu_fast(x: f32) -> f32 {
+    x * sigmoid_fast(x)
+}
+
+#[inline(always)]
+fn qwen_silu(x: f32) -> f32 {
+    if use_fast_silu() {
+        silu_fast(x)
+    } else {
+        x / (1.0 + (-x).exp())
     }
 }
 
@@ -260,6 +285,104 @@ pub(crate) fn standalone_matvec(
     matmul_rhs_transposed(dtype, 1, 1, out_dim, in_dim, input, weight, output)
 }
 
+pub(crate) fn fused_rms_norm_linear_rows(
+    dtype: ScalarType,
+    n_rows: usize,
+    hidden_dim: usize,
+    out_dim: usize,
+    eps: f32,
+    hidden: &GpuBuffer,
+    norm_weight: &GpuBuffer,
+    proj_weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    match dtype {
+        ScalarType::BF16 => {
+            if hidden.dtype() != ScalarType::BF16 || out.dtype() != ScalarType::BF16 {
+                return Err(unsupported(
+                    "fused_rms_norm_linear_rows",
+                    format!(
+                        "expected BF16 hidden/out buffers, got {:?}/{:?}",
+                        hidden.dtype(),
+                        out.dtype()
+                    ),
+                ));
+            }
+            let hidden = unsafe { bf16_slice(hidden.as_ptr(), n_rows * hidden_dim) };
+            let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), n_rows * out_dim) };
+            let mut normed = vec![0.0f32; hidden_dim];
+            for row in 0..n_rows {
+                let hidden_base = row * hidden_dim;
+                let out_base = row * out_dim;
+                let mut mean_sq = 0.0f32;
+                for col in 0..hidden_dim {
+                    let value = bf16_to_f32(hidden[hidden_base + col]);
+                    mean_sq += value * value;
+                    normed[col] = value;
+                }
+                let inv_rms = 1.0f32 / ((mean_sq / hidden_dim as f32) + eps).sqrt();
+                for col in 0..hidden_dim {
+                    let scale = read_weight_f32(norm_weight, col)? + 1.0f32;
+                    normed[col] *= inv_rms * scale;
+                }
+                for out_col in 0..out_dim {
+                    let weight_base = out_col * hidden_dim;
+                    let mut acc = 0.0f32;
+                    for col in 0..hidden_dim {
+                        acc += normed[col] * read_weight_f32(proj_weight, weight_base + col)?;
+                    }
+                    out[out_base + out_col] = f32_to_bf16_bits(acc);
+                }
+            }
+        }
+        ScalarType::F32 => {
+            if hidden.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+                return Err(unsupported(
+                    "fused_rms_norm_linear_rows",
+                    format!(
+                        "expected F32 hidden/out buffers, got {:?}/{:?}",
+                        hidden.dtype(),
+                        out.dtype()
+                    ),
+                ));
+            }
+            let hidden = unsafe { f32_slice(hidden.as_ptr(), n_rows * hidden_dim) };
+            let out = unsafe { f32_slice_mut(out.as_mut_ptr(), n_rows * out_dim) };
+            let mut normed = vec![0.0f32; hidden_dim];
+            for row in 0..n_rows {
+                let hidden_base = row * hidden_dim;
+                let out_base = row * out_dim;
+                let mut mean_sq = 0.0f32;
+                for col in 0..hidden_dim {
+                    let value = hidden[hidden_base + col];
+                    mean_sq += value * value;
+                    normed[col] = value;
+                }
+                let inv_rms = 1.0f32 / ((mean_sq / hidden_dim as f32) + eps).sqrt();
+                for col in 0..hidden_dim {
+                    let scale = read_weight_f32(norm_weight, col)? + 1.0f32;
+                    normed[col] *= inv_rms * scale;
+                }
+                for out_col in 0..out_dim {
+                    let weight_base = out_col * hidden_dim;
+                    let mut acc = 0.0f32;
+                    for col in 0..hidden_dim {
+                        acc += normed[col] * read_weight_f32(proj_weight, weight_base + col)?;
+                    }
+                    out[out_base + out_col] = acc;
+                }
+            }
+        }
+        other => {
+            return Err(unsupported(
+                "fused_rms_norm_linear_rows",
+                format!("unsupported dtype {other:?}"),
+            ))
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn standalone_matvec_host_f32(
     dtype: ScalarType,
     input: &GpuBuffer,
@@ -397,7 +520,8 @@ pub(crate) fn rms_norm_rows(
                 let inv_rms = 1.0 / ((mean_sq / n_cols as f32) + eps).sqrt();
                 for col in 0..n_cols {
                     let value = bf16_to_f32(input[row_base + col]);
-                    let scale = read_weight_f32(weight, col)? + if add_unit_offset { 1.0 } else { 0.0 };
+                    let scale =
+                        read_weight_f32(weight, col)? + if add_unit_offset { 1.0 } else { 0.0 };
                     out[row_base + col] = f32_to_bf16_bits(value * inv_rms * scale);
                 }
             }
@@ -414,7 +538,8 @@ pub(crate) fn rms_norm_rows(
                 }
                 let inv_rms = 1.0 / ((mean_sq / n_cols as f32) + eps).sqrt();
                 for col in 0..n_cols {
-                    let scale = read_weight_f32(weight, col)? + if add_unit_offset { 1.0 } else { 0.0 };
+                    let scale =
+                        read_weight_f32(weight, col)? + if add_unit_offset { 1.0 } else { 0.0 };
                     out[row_base + col] = input[row_base + col] * inv_rms * scale;
                 }
             }
@@ -516,28 +641,49 @@ pub(crate) fn apply_rope_prefill(
     pos_offset: usize,
     data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    if dtype != ScalarType::BF16 {
-        return Err(unsupported(
-            "apply_rope_prefill",
-            format!("expected BF16 dtype, got {dtype:?}"),
-        ));
-    }
     let half_rot = rotary_dim / 2;
     let cos = unsafe { bf16_slice(cos_table.as_ptr(), cos_table.elem_count()) };
     let sin = unsafe { bf16_slice(sin_table.as_ptr(), sin_table.elem_count()) };
-    let data = unsafe { bf16_slice_mut(data.as_mut_ptr(), seq_len * num_heads * head_dim) };
-    for pos in 0..seq_len {
-        let table_base = (pos_offset + pos) * half_rot;
-        for head in 0..num_heads {
-            let base = (pos * num_heads + head) * head_dim;
-            for i in 0..half_rot {
-                let c = bf16_to_f32(cos[table_base + i]);
-                let s = bf16_to_f32(sin[table_base + i]);
-                let x0 = bf16_to_f32(data[base + i]);
-                let x1 = bf16_to_f32(data[base + i + half_rot]);
-                data[base + i] = f32_to_bf16_bits(x0 * c - x1 * s);
-                data[base + i + half_rot] = f32_to_bf16_bits(x1 * c + x0 * s);
+    match dtype {
+        ScalarType::BF16 => {
+            let data = unsafe { bf16_slice_mut(data.as_mut_ptr(), seq_len * num_heads * head_dim) };
+            for pos in 0..seq_len {
+                let table_base = (pos_offset + pos) * half_rot;
+                for head in 0..num_heads {
+                    let base = (pos * num_heads + head) * head_dim;
+                    for i in 0..half_rot {
+                        let c = bf16_to_f32(cos[table_base + i]);
+                        let s = bf16_to_f32(sin[table_base + i]);
+                        let x0 = bf16_to_f32(data[base + i]);
+                        let x1 = bf16_to_f32(data[base + i + half_rot]);
+                        data[base + i] = f32_to_bf16_bits(x0 * c - x1 * s);
+                        data[base + i + half_rot] = f32_to_bf16_bits(x1 * c + x0 * s);
+                    }
+                }
             }
+        }
+        ScalarType::F32 => {
+            let data = unsafe { f32_slice_mut(data.as_mut_ptr(), seq_len * num_heads * head_dim) };
+            for pos in 0..seq_len {
+                let table_base = (pos_offset + pos) * half_rot;
+                for head in 0..num_heads {
+                    let base = (pos * num_heads + head) * head_dim;
+                    for i in 0..half_rot {
+                        let c = bf16_to_f32(cos[table_base + i]);
+                        let s = bf16_to_f32(sin[table_base + i]);
+                        let x0 = data[base + i];
+                        let x1 = data[base + i + half_rot];
+                        data[base + i] = x0 * c - x1 * s;
+                        data[base + i + half_rot] = x1 * c + x0 * s;
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(unsupported(
+                "apply_rope_prefill",
+                format!("unsupported dtype {other:?}"),
+            ))
         }
     }
     Ok(())
@@ -683,8 +829,7 @@ pub(crate) fn sigmoid_mul(
             let gate = unsafe { bf16_slice(gate.as_ptr(), total_elems) };
             let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), total_elems) };
             for i in 0..total_elems {
-                out[i] =
-                    f32_to_bf16_bits(bf16_to_f32(data[i]) * sigmoid(bf16_to_f32(gate[i])));
+                out[i] = f32_to_bf16_bits(bf16_to_f32(data[i]) * sigmoid(bf16_to_f32(gate[i])));
             }
         }
         ScalarType::F32 => {
@@ -783,9 +928,8 @@ pub(crate) fn split_qgate(
                     let dst_base = row * dst_stride + head * head_dim;
                     query_out[dst_base..dst_base + head_dim]
                         .copy_from_slice(&src[src_base..src_base + head_dim]);
-                    gate_out[dst_base..dst_base + head_dim].copy_from_slice(
-                        &src[src_base + head_dim..src_base + 2 * head_dim],
-                    );
+                    gate_out[dst_base..dst_base + head_dim]
+                        .copy_from_slice(&src[src_base + head_dim..src_base + 2 * head_dim]);
                 }
             }
         }
@@ -799,9 +943,8 @@ pub(crate) fn split_qgate(
                     let dst_base = row * dst_stride + head * head_dim;
                     query_out[dst_base..dst_base + head_dim]
                         .copy_from_slice(&src[src_base..src_base + head_dim]);
-                    gate_out[dst_base..dst_base + head_dim].copy_from_slice(
-                        &src[src_base + head_dim..src_base + 2 * head_dim],
-                    );
+                    gate_out[dst_base..dst_base + head_dim]
+                        .copy_from_slice(&src[src_base + head_dim..src_base + 2 * head_dim]);
                 }
             }
         }
@@ -886,7 +1029,8 @@ pub(crate) fn repeat_interleave_heads(
                 for head in 0..n_heads {
                     let src_base = (row * n_heads + head) * head_dim;
                     for rep in 0..repeats {
-                        let dst_base = (row * (n_heads * repeats) + head * repeats + rep) * head_dim;
+                        let dst_base =
+                            (row * (n_heads * repeats) + head * repeats + rep) * head_dim;
                         dst[dst_base..dst_base + head_dim]
                             .copy_from_slice(&src[src_base..src_base + head_dim]);
                     }
@@ -900,7 +1044,8 @@ pub(crate) fn repeat_interleave_heads(
                 for head in 0..n_heads {
                     let src_base = (row * n_heads + head) * head_dim;
                     for rep in 0..repeats {
-                        let dst_base = (row * (n_heads * repeats) + head * repeats + rep) * head_dim;
+                        let dst_base =
+                            (row * (n_heads * repeats) + head * repeats + rep) * head_dim;
                         dst[dst_base..dst_base + head_dim]
                             .copy_from_slice(&src[src_base..src_base + head_dim]);
                     }
@@ -934,33 +1079,75 @@ pub(crate) fn linear_prefill_conv_pack(
             format!("batch_size={batch_size} is not supported"),
         ));
     }
-    if dtype != ScalarType::BF16 || mixed_qkv.dtype() != ScalarType::BF16 || weights.dtype() != ScalarType::BF16 || out.dtype() != ScalarType::BF16 {
-        return Err(unsupported(
-            "linear_prefill_conv_pack",
-            format!(
-                "expected BF16 buffers, got mixed={:?} weights={:?} out={:?}",
-                mixed_qkv.dtype(),
-                weights.dtype(),
-                out.dtype()
-            ),
-        ));
-    }
-    let mixed = unsafe { bf16_slice(mixed_qkv.as_ptr(), conv_dim * total_len) };
-    let weights = unsafe { bf16_slice(weights.as_ptr(), conv_dim * kernel_size) };
-    let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), seq_len * conv_dim) };
-    for t in 0..seq_len {
-        for ch in 0..conv_dim {
-            let mixed_base = ch * total_len + t;
-            let weight_base = ch * kernel_size;
-            let mut acc = 0.0f32;
-            for k_idx in 0..kernel_size {
-                acc += bf16_to_f32(mixed[mixed_base + k_idx])
-                    * bf16_to_f32(weights[weight_base + k_idx]);
+    match dtype {
+        ScalarType::BF16 => {
+            if mixed_qkv.dtype() != ScalarType::BF16
+                || weights.dtype() != ScalarType::BF16
+                || out.dtype() != ScalarType::BF16
+            {
+                return Err(unsupported(
+                    "linear_prefill_conv_pack",
+                    format!(
+                        "expected BF16 buffers, got mixed={:?} weights={:?} out={:?}",
+                        mixed_qkv.dtype(),
+                        weights.dtype(),
+                        out.dtype()
+                    ),
+                ));
             }
-            out[t * conv_dim + ch] = f32_to_bf16_bits(silu(acc));
+            let mixed = unsafe { bf16_slice(mixed_qkv.as_ptr(), conv_dim * total_len) };
+            let weights = unsafe { bf16_slice(weights.as_ptr(), conv_dim * kernel_size) };
+            let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), seq_len * conv_dim) };
+            for t in 0..seq_len {
+                for ch in 0..conv_dim {
+                    let mixed_base = ch * total_len + t;
+                    let weight_base = ch * kernel_size;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..kernel_size {
+                        acc += bf16_to_f32(mixed[mixed_base + k_idx])
+                            * bf16_to_f32(weights[weight_base + k_idx]);
+                    }
+                    out[t * conv_dim + ch] = f32_to_bf16_bits(qwen_silu(acc));
+                }
+            }
+            Ok(())
         }
+        ScalarType::F32 => {
+            if mixed_qkv.dtype() != ScalarType::F32
+                || weights.dtype() != ScalarType::F32
+                || out.dtype() != ScalarType::F32
+            {
+                return Err(unsupported(
+                    "linear_prefill_conv_pack",
+                    format!(
+                        "expected F32 buffers, got mixed={:?} weights={:?} out={:?}",
+                        mixed_qkv.dtype(),
+                        weights.dtype(),
+                        out.dtype()
+                    ),
+                ));
+            }
+            let mixed = unsafe { f32_slice(mixed_qkv.as_ptr(), conv_dim * total_len) };
+            let weights = unsafe { f32_slice(weights.as_ptr(), conv_dim * kernel_size) };
+            let out = unsafe { f32_slice_mut(out.as_mut_ptr(), seq_len * conv_dim) };
+            for t in 0..seq_len {
+                for ch in 0..conv_dim {
+                    let mixed_base = ch * total_len + t;
+                    let weight_base = ch * kernel_size;
+                    let mut acc = 0.0f32;
+                    for k_idx in 0..kernel_size {
+                        acc += mixed[mixed_base + k_idx] * weights[weight_base + k_idx];
+                    }
+                    out[t * conv_dim + ch] = qwen_silu(acc);
+                }
+            }
+            Ok(())
+        }
+        other => Err(unsupported(
+            "linear_prefill_conv_pack",
+            format!("unsupported dtype {other:?}"),
+        )),
     }
-    Ok(())
 }
 
 pub(crate) fn l2norm(
@@ -1004,7 +1191,12 @@ pub(crate) fn l2norm(
                 }
             }
         }
-        other => return Err(unsupported("l2norm", format!("unsupported dtype {other:?}"))),
+        other => {
+            return Err(unsupported(
+                "l2norm",
+                format!("unsupported dtype {other:?}"),
+            ))
+        }
     }
     Ok(())
 }
@@ -1054,7 +1246,7 @@ pub(crate) fn swiglu_mul(
             let up = unsafe { bf16_slice(up.as_ptr(), elem_count) };
             let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), elem_count) };
             for i in 0..elem_count {
-                out[i] = f32_to_bf16_bits(silu(bf16_to_f32(gate[i])) * bf16_to_f32(up[i]));
+                out[i] = f32_to_bf16_bits(qwen_silu(bf16_to_f32(gate[i])) * bf16_to_f32(up[i]));
             }
         }
         ScalarType::F32 => {
@@ -1062,10 +1254,15 @@ pub(crate) fn swiglu_mul(
             let up = unsafe { f32_slice(up.as_ptr(), elem_count) };
             let out = unsafe { f32_slice_mut(out.as_mut_ptr(), elem_count) };
             for i in 0..elem_count {
-                out[i] = silu(gate[i]) * up[i];
+                out[i] = qwen_silu(gate[i]) * up[i];
             }
         }
-        other => return Err(unsupported("swiglu_mul", format!("unsupported dtype {other:?}"))),
+        other => {
+            return Err(unsupported(
+                "swiglu_mul",
+                format!("unsupported dtype {other:?}"),
+            ))
+        }
     }
     Ok(())
 }
@@ -1096,7 +1293,8 @@ pub(crate) fn rms_norm_gated(
                 for col in 0..n_cols {
                     let scale = read_weight_f32(weight, col)?;
                     let value = bf16_to_f32(hidden[base + col]) * inv_rms * scale;
-                    out[base + col] = f32_to_bf16_bits(value * silu(bf16_to_f32(gate[base + col])));
+                    out[base + col] =
+                        f32_to_bf16_bits(value * qwen_silu(bf16_to_f32(gate[base + col])));
                 }
             }
         }
@@ -1114,7 +1312,8 @@ pub(crate) fn rms_norm_gated(
                 let inv_rms = 1.0 / ((mean_sq / n_cols as f32) + eps).sqrt();
                 for col in 0..n_cols {
                     let scale = read_weight_f32(weight, col)?;
-                    out[base + col] = hidden[base + col] * inv_rms * scale * silu(gate[base + col]);
+                    out[base + col] =
+                        hidden[base + col] * inv_rms * scale * qwen_silu(gate[base + col]);
                 }
             }
         }
@@ -1224,7 +1423,12 @@ pub(crate) fn delta_recurrent_prefill(
             format!("expected F32 dtype, got {dtype:?}"),
         ));
     }
-    let initial_state = unsafe { f32_slice(initial_state.as_ptr(), batch_heads * k_head_dim * v_head_dim) };
+    let initial_state = unsafe {
+        f32_slice(
+            initial_state.as_ptr(),
+            batch_heads * k_head_dim * v_head_dim,
+        )
+    };
     let query = unsafe { f32_slice(query.as_ptr(), batch_heads * seq_len * k_head_dim) };
     let key = unsafe { f32_slice(key.as_ptr(), batch_heads * seq_len * k_head_dim) };
     let value = unsafe { f32_slice(value.as_ptr(), batch_heads * seq_len * v_head_dim) };
@@ -1254,7 +1458,7 @@ pub(crate) fn delta_recurrent_prefill(
                 let key_t = key[k_base + kk];
                 let state_row = &state[kk * v_head_dim..(kk + 1) * v_head_dim];
                 for vv in 0..v_head_dim {
-                    kv_mem[vv] += state_row[vv] * key_t;
+                    kv_mem[vv] = state_row[vv].mul_add(key_t, kv_mem[vv]);
                 }
             }
 
@@ -1267,7 +1471,7 @@ pub(crate) fn delta_recurrent_prefill(
                 let key_t = key[k_base + kk];
                 let state_row = &mut state[kk * v_head_dim..(kk + 1) * v_head_dim];
                 for vv in 0..v_head_dim {
-                    state_row[vv] += key_t * delta[vv];
+                    state_row[vv] = key_t.mul_add(delta[vv], state_row[vv]);
                 }
             }
 
@@ -1275,7 +1479,7 @@ pub(crate) fn delta_recurrent_prefill(
             for vv in 0..v_head_dim {
                 let mut acc = 0.0f32;
                 for kk in 0..k_head_dim {
-                    acc += state[kk * v_head_dim + vv] * query[q_base + kk];
+                    acc = state[kk * v_head_dim + vv].mul_add(query[q_base + kk], acc);
                 }
                 out[out_base + vv] = acc;
             }
@@ -1314,14 +1518,16 @@ mod tests {
 
     fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
         let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
-        bytes.chunks_exact(2)
+        bytes
+            .chunks_exact(2)
             .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
             .collect()
     }
 
     fn read_f32(buffer: &GpuBuffer) -> Vec<f32> {
         let bytes = buffer.to_host_bytes().expect("download f32 buffer");
-        bytes.chunks_exact(4)
+        bytes
+            .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -1391,8 +1597,7 @@ mod tests {
             &bf16_bytes(&[10.0, 1.0, 1.0, 20.0]),
         )
         .expect("upload value");
-        let mut out =
-            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
 
         full_attention_prefill(
             ScalarType::BF16,
@@ -1424,16 +1629,70 @@ mod tests {
     }
 
     #[test]
+    fn metal_host_fused_rms_norm_linear_rows_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let hidden = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 2.0, 2.0, 2.0, 0.0, 2.0]),
+        )
+        .expect("upload hidden");
+        let norm_weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3],
+            &f32_bytes(&[0.0, 0.5, -0.5]),
+        )
+        .expect("upload norm weight");
+        let proj_weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 0.0, -1.0, 0.5, 1.0, 0.5]),
+        )
+        .expect("upload proj weight");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 2]).expect("allocate out");
+
+        fused_rms_norm_linear_rows(
+            ScalarType::BF16,
+            2,
+            3,
+            2,
+            1e-5,
+            &hidden,
+            &norm_weight,
+            &proj_weight,
+            &mut out,
+        )
+        .expect("run fused rms norm linear");
+
+        let actual = read_bf16(&out);
+        let row0_inv = 1.0f32 / ((3.0f32 + 1e-5).sqrt());
+        let row1_inv = 1.0f32 / (((8.0f32 / 3.0f32) + 1e-5).sqrt());
+        let row0 = [
+            1.0 * row0_inv * 1.0,
+            2.0 * row0_inv * 1.5,
+            2.0 * row0_inv * 0.5,
+        ];
+        let row1 = [2.0 * row1_inv * 1.0, 0.0, 2.0 * row1_inv * 0.5];
+        let expected = vec![
+            row0[0] * 1.0 + row0[1] * 0.0 + row0[2] * -1.0,
+            row0[0] * 0.5 + row0[1] * 1.0 + row0[2] * 0.5,
+            row1[0] * 1.0 + row1[1] * 0.0 + row1[2] * -1.0,
+            row1[0] * 0.5 + row1[1] * 1.0 + row1[2] * 0.5,
+        ];
+        assert_close(&actual, &expected, 0.03);
+    }
+
+    #[test]
     fn metal_host_delta_recurrent_prefill_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
-        let initial_state = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[1, 1, 1],
-            &f32_bytes(&[0.5]),
-        )
-        .expect("upload initial_state");
+        let initial_state =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[1, 1, 1], &f32_bytes(&[0.5]))
+                .expect("upload initial_state");
         let query = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::F32,
@@ -1455,22 +1714,13 @@ mod tests {
             &f32_bytes(&[1.0, 4.0]),
         )
         .expect("upload value");
-        let beta = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[1, 2],
-            &f32_bytes(&[0.25, 0.5]),
-        )
-        .expect("upload beta");
-        let g = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::F32,
-            &[1, 2],
-            &f32_bytes(&[0.0, 0.0]),
-        )
-        .expect("upload g");
-        let mut out =
-            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 3, 1]).expect("allocate out");
+        let beta =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[1, 2], &f32_bytes(&[0.25, 0.5]))
+                .expect("upload beta");
+        let g =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[1, 2], &f32_bytes(&[0.0, 0.0]))
+                .expect("upload g");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 3, 1]).expect("allocate out");
 
         delta_recurrent_prefill(
             ScalarType::F32,
@@ -1522,20 +1772,12 @@ mod tests {
     fn metal_host_qwen_rms_norm_standalone_matvec_host_f32_matches_reference() {
         use_metal_backend();
         let ordinal = 0usize;
-        let input = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[2],
-            &bf16_bytes(&[3.0, 4.0]),
-        )
-        .expect("upload input");
-        let norm_weight = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[2],
-            &bf16_bytes(&[0.5, -0.5]),
-        )
-        .expect("upload norm weight");
+        let input =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2], &bf16_bytes(&[3.0, 4.0]))
+                .expect("upload input");
+        let norm_weight =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2], &bf16_bytes(&[0.5, -0.5]))
+                .expect("upload norm weight");
         let weight = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -1563,5 +1805,4 @@ mod tests {
         ];
         assert_close(&actual, &expected, 1e-6);
     }
-
 }

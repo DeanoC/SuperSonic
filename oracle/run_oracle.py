@@ -32,8 +32,10 @@ import safetensors.torch
 
 
 def tensor_to_b64(t: torch.Tensor) -> str:
-    # Use torch's raw bytes — numpy doesn't support BF16
-    raw = bytes(t.contiguous().cpu().untyped_storage())
+    # Serialize the tensor's logical byte view, not the full backing storage.
+    # Some hooked tensors are views; exporting the entire storage can append
+    # unrelated bytes and poison downstream parity checks.
+    raw = t.contiguous().cpu().view(torch.uint8).numpy().tobytes()
     return base64.b64encode(raw).decode("ascii")
 
 

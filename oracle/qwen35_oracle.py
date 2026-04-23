@@ -8,6 +8,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
+from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,7 +33,20 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Optional Qwen MLP layer index to dump prefill internals for.",
     )
+    parser.add_argument(
+        "--trace-position",
+        type=int,
+        help="Optional prompt-token position whose prefill final-norm/logit row should be emitted.",
+    )
     return parser.parse_args()
+
+
+def repeat_kv_local(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    if n_rep == 1:
+        return hidden_states
+    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
+    expanded = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
+    return expanded.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
 
 
 def main() -> None:
@@ -177,6 +191,7 @@ def main() -> None:
     trace_linear_layer_idx = args.trace_linear_layer
     trace_full_layer_idx = args.trace_full_layer
     trace_mlp_layer_idx = args.trace_mlp_layer
+    trace_position_idx = args.trace_position
     trace_linear_qkv_output = None
     trace_linear_z_output = None
     trace_linear_input_layernorm_output = None
@@ -196,12 +211,20 @@ def main() -> None:
     trace_full_prepared_query_output = None
     trace_full_prepared_key_output = None
     trace_full_prepared_value_output = None
+    trace_full_rotary_cos = None
+    trace_full_rotary_sin = None
+    trace_full_rotated_query_output = None
+    trace_full_rotated_key_output = None
+    trace_full_raw_attention_output = None
     trace_full_attention_output = None
+    trace_mlp_post_attention_layernorm_input = None
     trace_mlp_post_attention_layernorm_output = None
     trace_mlp_gate_proj_output = None
     trace_mlp_up_proj_output = None
     trace_mlp_activated_hidden = None
     trace_mlp_down_proj_output = None
+    trace_position_prefill_final_norm_output = None
+    trace_position_prefill_logits = None
 
     # Dictionary-based capture for middle decode layers (15-18)
     mid_layer_captures: dict[str, Any] = {}
@@ -832,9 +855,24 @@ def main() -> None:
             attn.o_proj.register_forward_pre_hook(o_proj_pre_hook),
         ]
 
+    def trace_rotary_emb_hook(_module, _inputs, output):
+        nonlocal trace_full_rotary_cos
+        nonlocal trace_full_rotary_sin
+        if capture_phase != "prefill" or trace_full_layer_idx is None:
+            return
+        cos, sin = output
+        trace_full_rotary_cos = cos.detach().to(dtype=torch.float32).cpu()
+        trace_full_rotary_sin = sin.detach().to(dtype=torch.float32).cpu()
+
     def make_trace_mlp_hooks(layer_idx: int):
         layer = model.model.layers[layer_idx]
         mlp = layer.mlp
+
+        def post_attention_layernorm_pre_hook(_module, inputs):
+            nonlocal trace_mlp_post_attention_layernorm_input
+            if capture_phase != "prefill":
+                return
+            trace_mlp_post_attention_layernorm_input = capture_tensor(inputs[0])
 
         def post_attention_layernorm_hook(_module, _inputs, output):
             nonlocal trace_mlp_post_attention_layernorm_output
@@ -867,6 +905,7 @@ def main() -> None:
             trace_mlp_down_proj_output = capture_tensor(output)
 
         return [
+            layer.post_attention_layernorm.register_forward_pre_hook(post_attention_layernorm_pre_hook),
             layer.post_attention_layernorm.register_forward_hook(post_attention_layernorm_hook),
             mlp.gate_proj.register_forward_hook(gate_proj_hook),
             mlp.up_proj.register_forward_hook(up_proj_hook),
@@ -1351,12 +1390,14 @@ def main() -> None:
             )
         trace_linear_handles = make_trace_linear_hooks(trace_linear_layer_idx)
     trace_full_handles: list[Any] = []
+    trace_rotary_handle = None
     if trace_full_layer_idx is not None:
         if not hasattr(model.model.layers[trace_full_layer_idx], "self_attn"):
             raise RuntimeError(
                 f"trace-full-layer={trace_full_layer_idx} is not a full-attention layer"
             )
         trace_full_handles = make_trace_full_hooks(trace_full_layer_idx)
+        trace_rotary_handle = model.model.rotary_emb.register_forward_hook(trace_rotary_emb_hook)
     trace_mlp_handles: list[Any] = []
     if trace_mlp_layer_idx is not None:
         if trace_mlp_layer_idx < 0 or trace_mlp_layer_idx >= len(model.model.layers):
@@ -1370,6 +1411,25 @@ def main() -> None:
             prefill_last_token_logits = (
                 outputs.logits[0, -1, :].to(dtype=torch.float32).cpu().tolist()
             )
+            if trace_position_idx is not None:
+                if trace_position_idx < 0 or trace_position_idx >= len(prompt_ids):
+                    raise RuntimeError(
+                        f"trace-position={trace_position_idx} is out of range for prompt length {len(prompt_ids)}"
+                    )
+                trace_position_prefill_final_norm_output = (
+                    outputs.hidden_states[-1][0, trace_position_idx, :]
+                    .detach()
+                    .to(dtype=torch.float32)
+                    .cpu()
+                    .tolist()
+                )
+                trace_position_prefill_logits = (
+                    outputs.logits[0, trace_position_idx, :]
+                    .detach()
+                    .to(dtype=torch.float32)
+                    .cpu()
+                    .tolist()
+                )
             past_key_values = outputs.past_key_values
             next_token = int(torch.argmax(outputs.logits[:, -1, :], dim=-1).item())
             if args.max_new_tokens > 0:
@@ -1444,6 +1504,8 @@ def main() -> None:
             handle.remove()
         for handle in trace_full_handles:
             handle.remove()
+        if trace_rotary_handle is not None:
+            trace_rotary_handle.remove()
         for handle in trace_mlp_handles:
             handle.remove()
         for handle in mid_layer_handles:
@@ -1476,6 +1538,42 @@ def main() -> None:
         trace_full_prepared_key_output = (
             k_normed * (k_weight + 1.0)
         ).transpose(1, 2).contiguous().cpu()
+        seq_len = input_ids.shape[1]
+        if trace_full_rotary_cos is None or trace_full_rotary_sin is None:
+            raise RuntimeError("missing rotary_emb trace output for full-attention debug capture")
+        cos = trace_full_rotary_cos.to(device=input_ids.device, dtype=model.dtype)
+        sin = trace_full_rotary_sin.to(device=input_ids.device, dtype=model.dtype)
+        q_rot, k_rot = apply_rotary_pos_emb(
+            trace_full_prepared_query_output.to(device=input_ids.device, dtype=model.dtype),
+            trace_full_prepared_key_output.to(device=input_ids.device, dtype=model.dtype),
+            cos,
+            sin,
+        )
+        trace_full_rotated_query_output = q_rot.to(dtype=torch.float32).cpu()
+        trace_full_rotated_key_output = k_rot.to(dtype=torch.float32).cpu()
+
+        value_states = trace_full_prepared_value_output.to(device=input_ids.device, dtype=model.dtype)
+        key_states = repeat_kv_local(k_rot, trace_full_attn.num_key_value_groups)
+        value_states = repeat_kv_local(value_states, trace_full_attn.num_key_value_groups)
+        attn_weights = torch.matmul(q_rot, key_states.transpose(2, 3)) * float(trace_full_attn.scaling)
+        causal_mask = torch.full(
+            (input_ids.shape[0], 1, seq_len, seq_len),
+            torch.finfo(torch.float32).min,
+            dtype=torch.float32,
+            device=input_ids.device,
+        )
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        attn_weights = attn_weights + causal_mask
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q_rot.dtype)
+        # Kept under the existing JSON field name for compatibility with the Rust
+        # trace parser. This is the ungated attention output after softmax(QK^T)V,
+        # not the pre-softmax attention score matrix.
+        raw_attn = torch.matmul(attn_weights, value_states).transpose(1, 2).contiguous()
+        trace_full_raw_attention_output = raw_attn.to(dtype=torch.float32).cpu()
+        gated_attn = raw_attn.reshape(input_ids.shape[0], seq_len, -1) * torch.sigmoid(
+            trace_full_gate_output.to(device=input_ids.device, dtype=raw_attn.dtype)
+        )
+        trace_full_attention_output = gated_attn.to(dtype=torch.float32).cpu()
 
     if layer3_q_and_gate_output is not None and layer3_k_proj_output is not None:
         layer3_attn = model.model.layers[3].self_attn
@@ -1571,19 +1669,6 @@ def main() -> None:
         "layer4_post_attention_layernorm_output": layer4_post_attention_layernorm_output,
         "layer4_mlp_output": layer4_mlp_output,
         "layer4_output": layer4_output,
-        "decode_layer23_input_layernorm_output": decode_layer23_input_layernorm_output,
-        "decode_layer23_input_layernorm_input": decode_layer23_input_layernorm_input,
-        "decode_layer23_input_layernorm_mean_square": decode_layer23_input_layernorm_mean_square,
-        "decode_layer23_input_layernorm_rsqrt": decode_layer23_input_layernorm_rsqrt,
-        "decode_layer23_input_layernorm_weighted_hidden": decode_layer23_input_layernorm_weighted_hidden,
-        "decode_layer23_token_mixer_output": decode_layer23_token_mixer_output,
-        "decode_layer23_post_attention_layernorm_output": decode_layer23_post_attention_layernorm_output,
-        "decode_layer23_mlp_gate_proj_output": decode_layer23_mlp_gate_proj_output,
-        "decode_layer23_mlp_up_proj_output": decode_layer23_mlp_up_proj_output,
-        "decode_layer23_mlp_activated_hidden": decode_layer23_mlp_activated_hidden,
-        "decode_layer23_mlp_down_proj_output": decode_layer23_mlp_down_proj_output,
-        "decode_layer23_mlp_output": decode_layer23_mlp_output,
-        "decode_layer23_output": decode_layer23_output,
     }
     missing.extend(name for name, value in required_scalars.items() if value is None)
     if any(layer_output is None for layer_output in decoder_layer_outputs):
@@ -1793,6 +1878,9 @@ def main() -> None:
         "trace_linear_layer": trace_linear_layer_idx,
         "trace_full_layer": trace_full_layer_idx,
         "trace_mlp_layer": trace_mlp_layer_idx,
+        "trace_position": trace_position_idx,
+        "trace_position_prefill_final_norm_output": trace_position_prefill_final_norm_output,
+        "trace_position_prefill_logits": trace_position_prefill_logits,
         "trace_linear_input_layernorm_output": trace_linear_input_layernorm_output.tolist() if trace_linear_input_layernorm_output is not None else None,
         "trace_linear_qkv_output": trace_linear_qkv_output.tolist() if trace_linear_qkv_output is not None else None,
         "trace_linear_z_output": trace_linear_z_output.tolist() if trace_linear_z_output is not None else None,
@@ -1812,7 +1900,11 @@ def main() -> None:
         "trace_full_prepared_query_output": trace_full_prepared_query_output.tolist() if trace_full_prepared_query_output is not None else None,
         "trace_full_prepared_key_output": trace_full_prepared_key_output.tolist() if trace_full_prepared_key_output is not None else None,
         "trace_full_prepared_value_output": trace_full_prepared_value_output.tolist() if trace_full_prepared_value_output is not None else None,
+        "trace_full_rotated_query_output": trace_full_rotated_query_output.tolist() if trace_full_rotated_query_output is not None else None,
+        "trace_full_rotated_key_output": trace_full_rotated_key_output.tolist() if trace_full_rotated_key_output is not None else None,
+        "trace_full_raw_attention_output": trace_full_raw_attention_output.tolist() if trace_full_raw_attention_output is not None else None,
         "trace_full_attention_output": trace_full_attention_output.tolist() if trace_full_attention_output is not None else None,
+        "trace_mlp_post_attention_layernorm_input": trace_mlp_post_attention_layernorm_input.tolist() if trace_mlp_post_attention_layernorm_input is not None else None,
         "trace_mlp_post_attention_layernorm_output": trace_mlp_post_attention_layernorm_output.tolist() if trace_mlp_post_attention_layernorm_output is not None else None,
         "trace_mlp_gate_proj_output": trace_mlp_gate_proj_output.tolist() if trace_mlp_gate_proj_output is not None else None,
         "trace_mlp_up_proj_output": trace_mlp_up_proj_output.tolist() if trace_mlp_up_proj_output is not None else None,

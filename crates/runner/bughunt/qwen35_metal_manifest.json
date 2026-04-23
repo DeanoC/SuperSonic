@@ -1,0 +1,45 @@
+{
+  "prompts": [
+    {
+      "name": "hello_world",
+      "prompt_ids": [9419, 1814],
+      "positions": [0, 1],
+      "thresholds": {
+        "prefill_logit_max_abs": 0.20,
+        "layer_hidden_max_abs": 0.15,
+        "restart_tail_logit_max_abs": 0.16
+      },
+      "notes": "short_smoke"
+    },
+    {
+      "name": "forest_prompt",
+      "prompt_ids": [
+        760, 3841, 13477, 37550, 33075, 888, 279, 15217, 5388, 13,
+        4844, 424, 10298, 1083, 279, 13245, 1518, 41564, 13
+      ],
+      "positions": [0, 9, 18],
+      "thresholds": {
+        "prefill_logit_max_abs": 0.15,
+        "layer_hidden_max_abs": 0.12,
+        "restart_tail_logit_max_abs": 0.14
+      },
+      "notes": "forest_prompt"
+    },
+    {
+      "name": "code_prompt",
+      "prompt_ids": [
+        814, 20139, 1092, 411, 32671, 709, 1503, 25, 5003, 884,
+        2784, 25, 585, 18, 17, 11, 292, 25, 585, 18,
+        17, 8, 1411, 585, 18, 17, 313, 264, 478, 292,
+        333
+      ],
+      "positions": [0, 15, 30],
+      "thresholds": {
+        "prefill_logit_max_abs": 0.17,
+        "layer_hidden_max_abs": 0.13,
+        "restart_tail_logit_max_abs": 0.16
+      },
+      "notes": "code_prompt"
+    }
+  ]
+}

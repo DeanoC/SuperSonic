@@ -52,7 +52,8 @@ fn detect_cuda_archs() -> Vec<String> {
     }
     let Ok(output) = Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .output() else {
+        .output()
+    else {
         return vec!["86".to_string()];
     };
     if !output.status.success() {
@@ -82,15 +83,18 @@ fn detect_cuda_root() -> Option<PathBuf> {
     let Ok(output) = Command::new("sh")
         .arg("-lc")
         .arg("command -v nvcc")
-        .output() else {
+        .output()
+    else {
         return None;
     };
     if !output.status.success() {
         return None;
     }
 
-    let nvcc = fs::canonicalize(PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
-        .ok()?;
+    let nvcc = fs::canonicalize(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+    .ok()?;
     nvcc.parent()
         .and_then(|bin| bin.parent())
         .map(Path::to_path_buf)
@@ -135,18 +139,41 @@ fn archive(out_dir: &Path, lib_name: &str, objects: &[PathBuf], context: &str) {
 
 fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
     let sources = [
-        ("full_attention_bridge.cpp", "qwen35_megakernel_hip.o", "building qwen35 megakernel HIP bridge"),
-        ("full_attention_bridge_4b.cpp", "qwen35_4b_megakernel_hip.o", "building qwen35-4b megakernel HIP bridge"),
-        ("prefill_helpers_bridge.cpp", "qwen35_prefill_helpers_hip.o", "building prefill helpers HIP bridge"),
-        ("gemma4_bridge.cpp", "gemma4_hip.o", "building Gemma 4 HIP bridge"),
+        (
+            "full_attention_bridge.cpp",
+            "qwen35_megakernel_hip.o",
+            "building qwen35 megakernel HIP bridge",
+        ),
+        (
+            "full_attention_bridge_4b.cpp",
+            "qwen35_4b_megakernel_hip.o",
+            "building qwen35-4b megakernel HIP bridge",
+        ),
+        (
+            "prefill_helpers_bridge.cpp",
+            "qwen35_prefill_helpers_hip.o",
+            "building prefill helpers HIP bridge",
+        ),
+        (
+            "gemma4_bridge.cpp",
+            "gemma4_hip.o",
+            "building Gemma 4 HIP bridge",
+        ),
         ("phi4_bridge.cpp", "phi4_hip.o", "building Phi-4 HIP bridge"),
-        ("dflash_draft_bridge.cpp", "dflash_draft_hip.o", "building DFlash draft HIP bridge"),
+        (
+            "dflash_draft_bridge.cpp",
+            "dflash_draft_hip.o",
+            "building DFlash draft HIP bridge",
+        ),
     ];
     let archs = detect_hip_archs();
     if archs.is_empty() {
         println!("cargo:warning=no HIP arch detected (set HIP_ARCH or install rocminfo); kernel binary may not run on the target GPU");
     } else {
-        println!("cargo:warning=building HIP kernels for arch(es): {}", archs.join(", "));
+        println!(
+            "cargo:warning=building HIP kernels for arch(es): {}",
+            archs.join(", ")
+        );
     }
 
     let mut objects = Vec::new();
@@ -184,12 +211,27 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
 
 fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
     let sources = [
-        ("full_attention_bridge_cuda.cu", "qwen35_megakernel_cuda.o", "building qwen35 megakernel CUDA bridge"),
-        ("full_attention_bridge_4b_cuda.cu", "qwen35_4b_megakernel_cuda.o", "building qwen35-4b megakernel CUDA bridge"),
-        ("prefill_helpers_bridge_cuda.cu", "qwen35_prefill_helpers_cuda.o", "building prefill helpers CUDA bridge"),
+        (
+            "full_attention_bridge_cuda.cu",
+            "qwen35_megakernel_cuda.o",
+            "building qwen35 megakernel CUDA bridge",
+        ),
+        (
+            "full_attention_bridge_4b_cuda.cu",
+            "qwen35_4b_megakernel_cuda.o",
+            "building qwen35-4b megakernel CUDA bridge",
+        ),
+        (
+            "prefill_helpers_bridge_cuda.cu",
+            "qwen35_prefill_helpers_cuda.o",
+            "building prefill helpers CUDA bridge",
+        ),
     ];
     let archs = detect_cuda_archs();
-    println!("cargo:warning=building CUDA kernels for arch(es): {}", archs.join(", "));
+    println!(
+        "cargo:warning=building CUDA kernels for arch(es): {}",
+        archs.join(", ")
+    );
 
     let mut objects = Vec::new();
     for (src_name, obj_name, context) in sources {
@@ -236,6 +278,14 @@ fn compile_metal_stubs(manifest_dir: &Path) {
         .file(manifest_dir.join("src/metal_link_stubs.cc"))
         .flag_if_supported("-std=c++17")
         .compile("kernel_ffi_metal_stubs");
+    cc::Build::new()
+        .cpp(true)
+        .file(manifest_dir.join("src/metal_native.mm"))
+        .flag_if_supported("-std=c++17")
+        .flag("-fobjc-arc")
+        .compile("kernel_ffi_metal_native");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=Metal");
     println!("cargo:rustc-cfg=supersonic_backend_metal");
 }
 
@@ -283,12 +333,17 @@ fn main() {
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src/metal_link_stubs.cc").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src/metal_native.mm").display()
+    );
 
     let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
     let want_hip = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "hip");
     let want_cuda = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "cuda");
-    let want_metal = normalized == "auto" || normalized.split(',').any(|part| part.trim() == "metal");
+    let want_metal =
+        normalized == "auto" || normalized.split(',').any(|part| part.trim() == "metal");
     let have_hip_toolchain = want_hip && command_exists("hipcc");
     let have_cuda_toolchain = want_cuda && command_exists("nvcc");
     let have_metal_backend = want_metal

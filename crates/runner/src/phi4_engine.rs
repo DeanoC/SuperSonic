@@ -66,8 +66,8 @@ pub fn run_phi4(
         params.weight_prefix, params.kv_chunk_size
     );
 
-    let config = load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("loading Phi-4 config.json: {e}"))?;
+    let config =
+        load_config(&cli.model_dir).map_err(|e| anyhow!("loading Phi-4 config.json: {e}"))?;
     eprintln!(
         "[phi4] hidden={} layers={} vocab={} heads={} kv_heads={} head_dim={} rot_dim={} max_pos={} mscale={:.4} tied_lm_head={}",
         config.hidden_size,
@@ -83,16 +83,8 @@ pub fn run_phi4(
     );
 
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow!("load tokenizer: {e}"))?;
-    let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
-        .map_err(|e| anyhow!("tokenize: {e}"))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
-    if prompt_ids.is_empty() {
-        bail!("empty prompt after tokenization");
-    }
+    let tokenizer = crate::load_tokenizer(&tokenizer_path)?;
+    let prompt_ids = crate::resolve_prompt_token_ids(cli, &tokenizer)?;
 
     let context_tokens = cli
         .context_size
@@ -135,14 +127,25 @@ pub fn run_phi4(
             .join("oracle/phi4_oracle.py");
         let oracle_device =
             crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
-        let oracle = oracle_mod::run_phi4_oracle(
-            &oracle_script,
-            &cli.model_dir,
-            &cli.prompt,
-            cli.max_new_tokens,
-            &cli.oracle_dtype,
-            &oracle_device,
-        )?;
+        let oracle = if cli.prompt_ids.is_some() {
+            oracle_mod::run_phi4_oracle_ids(
+                &oracle_script,
+                &cli.model_dir,
+                &prompt_ids,
+                cli.max_new_tokens,
+                &cli.oracle_dtype,
+                &oracle_device,
+            )?
+        } else {
+            oracle_mod::run_phi4_oracle(
+                &oracle_script,
+                &cli.model_dir,
+                cli.prompt.as_deref().unwrap_or_default(),
+                cli.max_new_tokens,
+                &cli.oracle_dtype,
+                &oracle_device,
+            )?
+        };
         if let Some(ref oracle_ids) = oracle.prompt_token_ids {
             if oracle_ids != &prompt_ids {
                 bail!(
@@ -168,7 +171,10 @@ pub fn run_phi4(
                 cli.model_dir.display(),
             );
         }
-        eprintln!("[weights] loading INT4 GPTQ bake from {}", bake_dir.display());
+        eprintln!(
+            "[weights] loading INT4 GPTQ bake from {}",
+            bake_dir.display()
+        );
         let store = model_store::BakedStore::open(&bake_dir)
             .map_err(|e| anyhow!("open Phi-4 INT4 bake: {e}"))?;
         Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
@@ -198,7 +204,10 @@ pub fn run_phi4(
             .map_err(|e| anyhow!("bake Phi-4 weights: {e}"))?;
             eprintln!("[bake] done in {:.1}s", bake_start.elapsed().as_secs_f64());
         }
-        eprintln!("[weights] loading BF16 baked package from {}", bake_dir.display());
+        eprintln!(
+            "[weights] loading BF16 baked package from {}",
+            bake_dir.display()
+        );
         let store = model_store::BakedStore::open(&bake_dir)
             .map_err(|e| anyhow!("open Phi-4 BF16 bake: {e}"))?;
         Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
@@ -212,8 +221,8 @@ pub fn run_phi4(
     }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
-    let rope = Phi4LongRope::build(&config, ordinal)
-        .map_err(|e| anyhow!("build LongRoPE tables: {e}"))?;
+    let rope =
+        Phi4LongRope::build(&config, ordinal).map_err(|e| anyhow!("build LongRoPE tables: {e}"))?;
     let mut state = Phi4ModelState::new(&config);
 
     let hidden_size = config.hidden_size;
@@ -233,15 +242,13 @@ pub fn run_phi4(
     // QK-norm and no attention-output gate, so no Q/gate/pre-gate saves.
     // Size against full context capacity rounded up to kv_chunk_size.
     let kv_chunk = params.kv_chunk_size;
-    let max_kv_cap =
-        ((context_tokens + kv_chunk - 1) / kv_chunk).max(1) * kv_chunk;
+    let max_kv_cap = ((context_tokens + kv_chunk - 1) / kv_chunk).max(1) * kv_chunk;
     let attn_scratch_floats = num_heads * max_kv_cap;
     let workspace_floats =
         4 * hidden_size + 2 * intermediate_size + proj_buf_floats + attn_scratch_floats;
 
-    let mut workspace =
-        GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
-            .map_err(|e| anyhow!("alloc workspace: {e}"))?;
+    let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+        .map_err(|e| anyhow!("alloc workspace: {e}"))?;
     // sync_buf: 32 bytes — work-stealing counter at offset 0, grid-barrier
     // counter+flag at offsets 16/20 (same layout as persistent_decode_4b).
     let mut sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[32])
@@ -279,8 +286,10 @@ pub fn run_phi4(
                 descs.len() * std::mem::size_of::<phi4_ffi::Phi4INT4ScaleDesc>(),
             )
         };
-        Some(GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], bytes)
-            .map_err(|e| anyhow!("upload phi4 int4 scale descs: {e}"))?)
+        Some(
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], bytes)
+                .map_err(|e| anyhow!("upload phi4 int4 scale descs: {e}"))?,
+        )
     } else {
         None
     };
@@ -335,12 +344,8 @@ pub fn run_phi4(
         .map_err(|e| anyhow!("upload layer descs at step {step}: {e}"))?;
 
         // 4. Reset per-step scratch (workspace + counters/barrier).
-        gpu_hal::memset_zeros(
-            ordinal,
-            workspace.as_mut_ptr(),
-            workspace.len_bytes(),
-        )
-        .map_err(|e| anyhow!("clear workspace at step {step}: {e}"))?;
+        gpu_hal::memset_zeros(ordinal, workspace.as_mut_ptr(), workspace.len_bytes())
+            .map_err(|e| anyhow!("clear workspace at step {step}: {e}"))?;
         gpu_hal::memset_zeros(ordinal, sync_buf.as_mut_ptr(), sync_buf.len_bytes())
             .map_err(|e| anyhow!("reset sync_buf at step {step}: {e}"))?;
 
@@ -419,7 +424,9 @@ pub fn run_phi4(
             if let Some(ref oracle) = oracle_output {
                 if in_prefill {
                     let delta = validate::max_abs_delta(&logits_f32, &oracle.prefill_logits);
-                    if delta > max_delta { max_delta = delta; }
+                    if delta > max_delta {
+                        max_delta = delta;
+                    }
                     let oracle_first = oracle.generated_token_ids.first().copied();
                     let mismatch = match oracle_first {
                         Some(o) if o != next => {
@@ -428,14 +435,14 @@ pub fn run_phi4(
                         }
                         _ => String::new(),
                     };
-                    eprintln!(
-                        "[validate] prefill delta={delta:.4} rust_next={next}{mismatch}"
-                    );
+                    eprintln!("[validate] prefill delta={delta:.4} rust_next={next}{mismatch}");
                 } else {
                     let decode_idx = step - prompt_ids.len();
                     if let Some(oracle_logits) = oracle.decode_logits.get(decode_idx) {
                         let delta = validate::max_abs_delta(&logits_f32, oracle_logits);
-                        if delta > max_delta { max_delta = delta; }
+                        if delta > max_delta {
+                            max_delta = delta;
+                        }
                         let oracle_next = oracle.generated_token_ids.get(decode_idx + 1).copied();
                         let mismatch = match oracle_next {
                             Some(o) if o != next => {
@@ -485,7 +492,11 @@ pub fn run_phi4(
         .map(|s| s.elapsed().as_secs_f64() * 1000.0)
         .unwrap_or(0.0);
 
-    let all_ids: Vec<u32> = prompt_ids.iter().copied().chain(generated.iter().copied()).collect();
+    let all_ids: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(generated.iter().copied())
+        .collect();
     let text = tokenizer
         .decode(&all_ids, true)
         .map_err(|e| anyhow!("detokenize: {e}"))?;
@@ -498,16 +509,18 @@ pub fn run_phi4(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let ms_per_step = if generated.is_empty() { 0.0 } else { decode_ms / generated.len() as f64 };
+    let ms_per_step = if generated.is_empty() {
+        0.0
+    } else {
+        decode_ms / generated.len() as f64
+    };
     eprintln!(
         "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_step={ms_per_step:.1}",
         prompt_ids.len(),
         generated.len(),
     );
     if oracle_output.is_some() {
-        eprintln!(
-            "[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}"
-        );
+        eprintln!("[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}");
     }
 
     Ok(())
@@ -589,9 +602,7 @@ fn descriptor_bytes(descs: &[phi4_ffi::Phi4DecodeLayerDesc]) -> &[u8] {
 fn build_int4_descs(weights: &Phi4Weights) -> Vec<phi4_ffi::Phi4INT4ScaleDesc> {
     use std::ffi::c_void;
     let ptr = |opt: &Option<GpuBuffer>| -> *const c_void {
-        opt.as_ref()
-            .map(|b| b.as_ptr())
-            .unwrap_or(std::ptr::null())
+        opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
     };
     let group_size = weights.int4_group_size as std::ffi::c_int;
     let mut descs = Vec::with_capacity(weights.layers.len());

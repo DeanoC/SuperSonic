@@ -5,8 +5,11 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use gpu_hal::{GpuBuffer, ScalarType};
 
-use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs, build_batch_seq_descs};
 use qwen35::config::TextConfig;
+use qwen35::desc_builder::{
+    build_batch_seq_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs,
+    build_layer_descs,
+};
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
@@ -43,7 +46,17 @@ fn matmul_proj(
 ) -> Result<()> {
     if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
         kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-            ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
+            ordinal,
+            batch,
+            m,
+            n,
+            k,
+            lhs,
+            weight,
+            sc,
+            zr,
+            int4_group_size,
+            out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
     } else {
@@ -53,7 +66,15 @@ fn matmul_proj(
             )
             .map_err(|e| anyhow::anyhow!("matmul_fp8: {e}")),
             None => kernel_ffi::prefill_ffi::matmul_rhs_transposed(
-                ordinal, ScalarType::BF16, batch, m, n, k, lhs, weight, out,
+                ordinal,
+                ScalarType::BF16,
+                batch,
+                m,
+                n,
+                k,
+                lhs,
+                weight,
+                out,
             )
             .map_err(|e| anyhow::anyhow!("matmul: {e}")),
         }
@@ -67,15 +88,8 @@ fn residual_add(
     src: &GpuBuffer,
 ) -> Result<()> {
     let lhs: &GpuBuffer = unsafe { &*(dst as *const GpuBuffer) };
-    kernel_ffi::prefill_ffi::element_add(
-        ordinal,
-        ScalarType::BF16,
-        total_elems,
-        lhs,
-        src,
-        dst,
-    )
-    .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
+    kernel_ffi::prefill_ffi::element_add(ordinal, ScalarType::BF16, total_elems, lhs, src, dst)
+        .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
     Ok(())
 }
 
@@ -91,7 +105,11 @@ fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
     } else {
         (1.0 + mantissa as f32 / 8.0) * 2f32.powi(exp as i32 - 7)
     };
-    if sign != 0 { -val } else { val }
+    if sign != 0 {
+        -val
+    } else {
+        val
+    }
 }
 
 fn f32_to_bf16_bytes_host(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
@@ -197,38 +215,17 @@ impl DFlashFusedVerifyCache {
             + hidden_dim
             + proj_buf_floats
             + attn_scratch_floats;
-        let workspace = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::F32,
-            &[per_item_floats * block_size],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, hidden_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, hidden_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
-        let logits_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, vocab_size],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
-        let batch_desc_bytes =
-            num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
-        let batch_desc_device = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::U8,
-            &[batch_desc_bytes],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
+        let workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[per_item_floats * block_size])
+            .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, vocab_size])
+            .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
+        let batch_desc_bytes = num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
+        let batch_desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[batch_desc_bytes])
+            .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
         Ok(Self {
             block_size,
             workspace,
@@ -420,10 +417,8 @@ fn decode_persistent_4b_timing_slots(
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + b);
             full_attn_out_cycles +=
                 load_slot(layer_base + PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + b);
-            linear_core_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
-            linear_out_cycles +=
-                load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
+            linear_core_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + b);
+            linear_out_cycles += load_slot(layer_base + PERSISTENT_4B_TIMING_LINEAR_OUT_BASE + b);
         }
         for b in 0..split_batches {
             linear_core_conv_cycles +=
@@ -436,10 +431,7 @@ fn decode_persistent_4b_timing_slots(
     }
 
     DecodeStageTimings {
-        persistent_full_attn_ms: persistent_4b_clock_cycles_to_ms(
-            full_attn_cycles,
-            clock_rate_khz,
-        ),
+        persistent_full_attn_ms: persistent_4b_clock_cycles_to_ms(full_attn_cycles, clock_rate_khz),
         persistent_full_attn_proj_ms: persistent_4b_clock_cycles_to_ms(
             full_attn_proj_cycles,
             clock_rate_khz,
@@ -480,10 +472,7 @@ fn decode_persistent_4b_timing_slots(
             mlp_gate_up_cycles,
             clock_rate_khz,
         ),
-        persistent_mlp_down_ms: persistent_4b_clock_cycles_to_ms(
-            mlp_down_cycles,
-            clock_rate_khz,
-        ),
+        persistent_mlp_down_ms: persistent_4b_clock_cycles_to_ms(mlp_down_cycles, clock_rate_khz),
         ..DecodeStageTimings::default()
     }
 }
@@ -495,10 +484,10 @@ mod tests {
 
     #[test]
     fn persistent_4b_timing_ranges_do_not_overlap() {
-        let full_attn_core = PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE
-            ..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
-        let full_attn_out = PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE
-            ..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
+        let full_attn_core =
+            PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
+        let full_attn_out =
+            PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
         let linear_core =
             PERSISTENT_4B_TIMING_LINEAR_CORE_BASE..PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + 8;
         let linear_out =
@@ -567,7 +556,9 @@ impl DecodeEngine {
             }
 
             let (prefix_k_host, prefix_v_host, prefix_len) =
-                Self::assemble_full_attention_prefix_cache_bf16_host_static(config, state, layer_idx)?;
+                Self::assemble_full_attention_prefix_cache_bf16_host_static(
+                    config, state, layer_idx,
+                )?;
             if prefix_len == 0 {
                 state.layers[layer_idx].kv_shadow_start = 0;
                 continue;
@@ -711,7 +702,11 @@ impl DecodeEngine {
         state: &ModelState,
         layer_idx: usize,
     ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        Self::assemble_full_attention_prefix_cache_bf16_host_static(&self.weights.config, state, layer_idx)
+        Self::assemble_full_attention_prefix_cache_bf16_host_static(
+            &self.weights.config,
+            state,
+            layer_idx,
+        )
     }
 
     pub fn full_attention_prefix_cache_bf16_host(
@@ -774,15 +769,27 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace k alloc: {e}"))?;
         let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace k_normed alloc: {e}"))?;
+        let mut q_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace q_normed alloc: {e}"))?;
+        let mut k_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace k_normed alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            q_proj_dim,
+            hidden_dim,
+            &normed,
+            &fw.q_proj_w,
+            fw.q_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut q_full,
+            fw.q_proj_int4_scale.as_ref(),
+            fw.q_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::split_qgate(
             self.ordinal,
@@ -797,19 +804,45 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} trace split qgate: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.k_proj_w,
+            fw.k_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut k_buf,
+            fw.k_proj_int4_scale.as_ref(),
+            fw.k_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.v_proj_w,
+            fw.v_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut v_buf,
+            fw.v_proj_int4_scale.as_ref(),
+            fw.v_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_q_heads,
+            head_dim,
+            1e-6,
+            &query_buf,
+            &fw.q_norm_w,
+            &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -821,8 +854,14 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q norm copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_kv_heads,
+            head_dim,
+            1e-6,
+            &k_buf,
+            &fw.k_norm_w,
+            &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace k norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -847,13 +886,29 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace v D2H: {e}"))?;
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace k rope: {e}"))?;
 
@@ -928,20 +983,28 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k alloc: {e}"))?;
         let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k_normed alloc: {e}"))?;
-        let mut attn_q = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q alloc: {e}"))?;
-        let mut step_k = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_k alloc: {e}"))?;
-        let mut step_v = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_v alloc: {e}"))?;
-        let mut attn_out_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out alloc: {e}"))?;
-        let mut attn_out_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out bf16 alloc: {e}"))?;
+        let mut q_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_normed alloc: {e}"))?;
+        let mut k_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k_normed alloc: {e}"))?;
+        let mut attn_q =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q alloc: {e}"))?;
+        let mut step_k =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_k alloc: {e}"))?;
+        let mut step_v =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_v alloc: {e}"))?;
+        let mut attn_out_f32 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out alloc: {e}"))?;
+        let mut attn_out_bf16 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim]).map_err(
+                |e| anyhow::anyhow!("layer {idx} trace full layer attn_out bf16 alloc: {e}"),
+            )?;
         let mut attn_flat = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat alloc: {e}"))?;
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
@@ -957,9 +1020,19 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer hidden copy H2D: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            q_proj_dim,
+            hidden_dim,
+            &normed,
+            &fw.q_proj_w,
+            fw.q_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut q_full,
+            fw.q_proj_int4_scale.as_ref(),
+            fw.q_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::split_qgate(
             self.ordinal,
@@ -973,18 +1046,44 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer split qgate: {e}"))?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.k_proj_w,
+            fw.k_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut k_buf,
+            fw.k_proj_int4_scale.as_ref(),
+            fw.k_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.v_proj_w,
+            fw.v_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut v_buf,
+            fw.v_proj_int4_scale.as_ref(),
+            fw.v_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_q_heads,
+            head_dim,
+            1e-6,
+            &query_buf,
+            &fw.q_norm_w,
+            &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -995,8 +1094,14 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q norm copy: {e}"))?;
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_kv_heads,
+            head_dim,
+            1e-6,
+            &k_buf,
+            &fw.k_norm_w,
+            &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -1007,26 +1112,60 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k norm copy: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope: {e}"))?;
 
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            &query_buf,
+            &mut attn_q,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q transpose: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &k_buf, &mut step_k,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            &k_buf,
+            &mut step_k,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k transpose: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &v_buf, &mut step_v,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            &v_buf,
+            &mut step_v,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v transpose: {e}"))?;
 
@@ -1083,27 +1222,64 @@ impl DecodeEngine {
         }
 
         kernel_ffi::prefill_ffi::full_attention_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-            1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-            &attn_q, &kv_k_contig, &kv_v_contig, &mut attn_out_f32,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            1,
+            kv_len,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            seqlen_offset,
+            &attn_q,
+            &kv_k_contig,
+            &kv_v_contig,
+            &mut attn_out_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attention: {e}"))?;
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            num_q_heads * head_dim,
+            &attn_out_f32,
+            &mut attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn cast: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
+            self.ordinal,
+            ScalarType::BF16,
+            num_q_heads,
+            1,
+            head_dim,
+            &attn_out_bf16,
+            &mut attn_flat,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn transpose: {e}"))?;
         kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+            self.ordinal,
+            ScalarType::BF16,
+            q_dim,
+            &attn_flat,
+            &gate_buf,
+            &mut gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate apply: {e}"))?;
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
-            fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            q_dim,
+            &gated,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut proj_out,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut hidden_out, &proj_out)?;
         Ok(FullAttentionLayerOutputTrace {
@@ -1113,9 +1289,9 @@ impl DecodeEngine {
             gated: gated
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gated D2H: {e}"))?,
-            attn_hidden: hidden_out
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_hidden D2H: {e}"))?,
+            attn_hidden: hidden_out.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace full layer attn_hidden D2H: {e}")
+            })?,
         })
     }
 
@@ -1196,13 +1372,17 @@ impl DecodeEngine {
         let conv = ls
             .conv_state
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state after component trace"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("layer {idx}: missing conv state after component trace")
+            })?
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} component conv D2H: {e}"))?;
         let recurrent = ls
             .recurrent_state
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state after component trace"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("layer {idx}: missing recurrent state after component trace")
+            })?
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} component recurrent D2H: {e}"))?;
         let hidden = self
@@ -1235,10 +1415,9 @@ impl DecodeEngine {
             self.component_decode_linear_attention_layer(idx, false)?;
         }
         let row_bytes = self.weights.config.hidden_size * ScalarType::BF16.size_in_bytes();
-        let attn_hidden = self
-            .hidden_io
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden D2H: {e}"))?[..row_bytes]
+        let attn_hidden = self.hidden_io.to_host_bytes().map_err(|e| {
+            anyhow::anyhow!("layer {idx} component full-layer attn hidden D2H: {e}")
+        })?[..row_bytes]
             .to_vec();
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
@@ -1252,19 +1431,18 @@ impl DecodeEngine {
             &mut self.normed_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer post rms_norm: {e}"))?;
-        let post_attn_norm = self
-            .normed_buf
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer post norm D2H: {e}"))?[..row_bytes]
-            .to_vec();
+        let post_attn_norm =
+            self.normed_buf.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} component full-layer post norm D2H: {e}")
+            })?[..row_bytes]
+                .to_vec();
 
         let mlp_trace = self
             .component_decode_mlp_layer(idx, true)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx} component full-layer missing mlp trace"))?;
-        let layer_hidden = self
-            .hidden_io
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer final hidden D2H: {e}"))?[..row_bytes]
+        let layer_hidden = self.hidden_io.to_host_bytes().map_err(|e| {
+            anyhow::anyhow!("layer {idx} component full-layer final hidden D2H: {e}")
+        })?[..row_bytes]
             .to_vec();
 
         Ok(ComponentLayerTrace {
@@ -1283,12 +1461,19 @@ impl DecodeEngine {
         seq_pos: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let config = &self.weights.config;
-        let ls = self.state_for_batch(batch_index)
+        let ls = self
+            .state_for_batch(batch_index)
             .layers
             .get(layer_idx)
             .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?;
-        let cache_k = ls.kv_cache_k.as_ref().ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
-        let cache_v = ls.kv_cache_v.as_ref().ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
+        let cache_k = ls
+            .kv_cache_k
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
+        let cache_v = ls
+            .kv_cache_v
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -1336,7 +1521,12 @@ impl DecodeEngine {
         trace_input_layer: Option<usize>,
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
-    ) -> Result<(Vec<f32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
+    ) -> Result<(
+        Vec<f32>,
+        Option<Vec<u8>>,
+        Option<ComponentLayerTrace>,
+        Option<ComponentLinearTrace>,
+    )> {
         let hidden_dim = self.weights.config.hidden_size;
         let rms_norm_eps = self.weights.config.rms_norm_eps as f32;
         let vocab_size = self.weights.config.vocab_size;
@@ -1364,25 +1554,24 @@ impl DecodeEngine {
                         .map_err(|e| anyhow::anyhow!("layer {i} hidden trace D2H: {e}"))?,
                 );
             }
-        kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            hidden_dim,
-            rms_norm_eps,
-            &self.hidden_io,
-            &self.weights.layers[i].input_norm_w,
-            &mut self.normed_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {i} input rms_norm: {e}"))?;
+            kernel_ffi::prefill_ffi::rms_norm_rows(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                hidden_dim,
+                rms_norm_eps,
+                &self.hidden_io,
+                &self.weights.layers[i].input_norm_w,
+                &mut self.normed_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {i} input rms_norm: {e}"))?;
 
             if self.weights.config.is_full_attention(i) {
                 self.component_decode_full_attention_layer(i, seqlen_offset)?;
             } else {
-                if let Some(trace) = self.component_decode_linear_attention_layer(
-                    i,
-                    trace_linear_layer == Some(i),
-                )? {
+                if let Some(trace) =
+                    self.component_decode_linear_attention_layer(i, trace_linear_layer == Some(i))?
+                {
                     traced_linear = Some(trace);
                 }
             }
@@ -1419,13 +1608,14 @@ impl DecodeEngine {
 
             let maybe_mlp = self.component_decode_mlp_layer(i, trace_layer == Some(i))?;
             if trace_layer == Some(i) {
-                let mlp_trace = maybe_mlp
-                    .ok_or_else(|| anyhow::anyhow!("missing mlp trace for layer {i}"))?;
+                let mlp_trace =
+                    maybe_mlp.ok_or_else(|| anyhow::anyhow!("missing mlp trace for layer {i}"))?;
                 traced_layer = Some(ComponentLayerTrace {
                     attn_hidden: trace_attn_hidden
                         .ok_or_else(|| anyhow::anyhow!("missing attn trace for layer {i}"))?,
-                    post_attn_norm: trace_post_attn_norm
-                        .ok_or_else(|| anyhow::anyhow!("missing post-attn norm trace for layer {i}"))?,
+                    post_attn_norm: trace_post_attn_norm.ok_or_else(|| {
+                        anyhow::anyhow!("missing post-attn norm trace for layer {i}")
+                    })?,
                     mlp_swiglu: mlp_trace.swiglu,
                     mlp_out: mlp_trace.down,
                     layer_hidden: self
@@ -1482,7 +1672,11 @@ impl DecodeEngine {
         ))
     }
 
-    fn component_decode_step_4b(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
+    fn component_decode_step_4b(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<Vec<f32>> {
         let (logits, _, _, _) =
             self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None)?;
         Ok(logits)
@@ -1501,7 +1695,8 @@ impl DecodeEngine {
             None,
             None,
         )?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing trace for layer {trace_input_layer}"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing trace for layer {trace_input_layer}"))?;
         Ok((logits, trace))
     }
 
@@ -1518,7 +1713,8 @@ impl DecodeEngine {
             Some(trace_layer),
             None,
         )?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
 
@@ -1535,11 +1731,16 @@ impl DecodeEngine {
             None,
             Some(trace_layer),
         )?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
 
-    fn component_decode_full_attention_layer(&mut self, idx: usize, seqlen_offset: usize) -> Result<()> {
+    fn component_decode_full_attention_layer(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+    ) -> Result<()> {
         let config = &self.weights.config;
         let fw = self.weights.layers[idx]
             .full
@@ -1566,29 +1767,46 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} k alloc: {e}"))?;
         let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_normed alloc: {e}"))?;
-        let mut attn_q = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_q alloc: {e}"))?;
-        let mut attn_k_step = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_k alloc: {e}"))?;
-        let mut attn_v_step = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_v alloc: {e}"))?;
-        let mut attn_out_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_out alloc: {e}"))?;
-        let mut attn_out_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_out bf16 alloc: {e}"))?;
+        let mut q_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} q_normed alloc: {e}"))?;
+        let mut k_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} k_normed alloc: {e}"))?;
+        let mut attn_q =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn_q alloc: {e}"))?;
+        let mut attn_k_step =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn_k alloc: {e}"))?;
+        let mut attn_v_step =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn_v alloc: {e}"))?;
+        let mut attn_out_f32 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn_out alloc: {e}"))?;
+        let mut attn_out_bf16 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} attn_out bf16 alloc: {e}"))?;
         let mut attn_flat = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} attn_flat alloc: {e}"))?;
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            q_proj_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &fw.q_proj_w,
+            fw.q_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut q_full,
+            fw.q_proj_int4_scale.as_ref(),
+            fw.q_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::split_qgate(
             self.ordinal,
@@ -1603,19 +1821,45 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &fw.k_proj_w,
+            fw.k_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut k_buf,
+            fw.k_proj_int4_scale.as_ref(),
+            fw.k_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &fw.v_proj_w,
+            fw.v_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut v_buf,
+            fw.v_proj_int4_scale.as_ref(),
+            fw.v_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_q_heads, head_dim, 1e-6,
-            &query_buf, &fw.q_norm_w, &mut q_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_q_heads,
+            head_dim,
+            1e-6,
+            &query_buf,
+            &fw.q_norm_w,
+            &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -1627,8 +1871,14 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::rms_norm_rows(
-            self.ordinal, ScalarType::BF16, num_kv_heads, head_dim, 1e-6,
-            &k_buf, &fw.k_norm_w, &mut k_normed,
+            self.ordinal,
+            ScalarType::BF16,
+            num_kv_heads,
+            head_dim,
+            1e-6,
+            &k_buf,
+            &fw.k_norm_w,
+            &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -1640,26 +1890,72 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
 
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, &query_buf, &mut attn_q)
-            .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &k_buf, &mut attn_k_step)
-            .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, &v_buf, &mut attn_v_step)
-            .map_err(|e| anyhow::anyhow!("layer {idx} v transpose: {e}"))?;
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            &query_buf,
+            &mut attn_q,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            &k_buf,
+            &mut attn_k_step,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
+        kernel_ffi::prefill_ffi::transpose_shd_hsd(
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            &v_buf,
+            &mut attn_v_step,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} v transpose: {e}"))?;
 
         let ls = &mut self.state.layers[idx];
-        ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-            .map_err(|e| anyhow::anyhow!("layer {idx} kv alloc: {e}"))?;
+        ls.ensure_kv_capacity(
+            seqlen_offset,
+            self.ordinal,
+            config,
+            self.kv_chunk_size,
+            self.kv_fp8,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} kv alloc: {e}"))?;
         if let Some(ref mut cache_k) = ls.kv_cache_k {
             let cap = cache_k.shape()[2];
             let cap_stride = cap * head_dim * elem_bytes;
@@ -1702,10 +1998,18 @@ impl DecodeEngine {
             attn_k_ref = cache_k_ref;
             attn_v_ref = cache_v_ref;
         } else {
-            kv_k_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
-            kv_v_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
+            kv_k_contig = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
+            kv_v_contig = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
             let cap_stride = cap * head_dim * elem_bytes;
             let contig_stride = kv_len * head_dim * elem_bytes;
             let copy_bytes = kv_len * head_dim * elem_bytes;
@@ -1730,32 +2034,69 @@ impl DecodeEngine {
         }
 
         kernel_ffi::prefill_ffi::full_attention_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-            1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-            &attn_q, attn_k_ref, attn_v_ref, &mut attn_out_f32,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            1,
+            kv_len,
+            head_dim,
+            1.0 / (head_dim as f32).sqrt(),
+            seqlen_offset,
+            &attn_q,
+            attn_k_ref,
+            attn_v_ref,
+            &mut attn_out_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            num_q_heads * head_dim,
+            &attn_out_f32,
+            &mut attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, &attn_out_bf16, &mut attn_flat,
+            self.ordinal,
+            ScalarType::BF16,
+            num_q_heads,
+            1,
+            head_dim,
+            &attn_out_bf16,
+            &mut attn_flat,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
         kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+            self.ordinal,
+            ScalarType::BF16,
+            q_dim,
+            &attn_flat,
+            &gate_buf,
+            &mut gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
-            fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            q_dim,
+            &gated,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut proj_out,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
         Ok(())
@@ -1791,8 +2132,12 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} b alloc: {e}"))?;
         let a_beta_raw = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, nv * 2])
             .map_err(|e| anyhow::anyhow!("layer {idx} a_beta alloc: {e}"))?;
-        let mut rec_apply = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, val_dim + nv * khd * vhd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} rec_apply alloc: {e}"))?;
+        let mut rec_apply = GpuBuffer::zeros(
+            self.ordinal,
+            ScalarType::F32,
+            &[1, val_dim + nv * khd * vhd],
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} rec_apply alloc: {e}"))?;
         let mut attn_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[nv, vhd])
             .map_err(|e| anyhow::anyhow!("layer {idx} attn_bf16 alloc: {e}"))?;
         let mut norm_w_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[vhd])
@@ -1803,34 +2148,80 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, qkv_dim, hidden_dim,
-            &self.normed_buf, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), self.weights.fp8_block_size, &mut qkv,
-            lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            qkv_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.qkv_proj_w,
+            lw.qkv_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut qkv,
+            lw.qkv_proj_int4_scale.as_ref(),
+            lw.qkv_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let qkv_trace = if trace_output {
-            Some(qkv.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} qkv trace D2H: {e}"))?)
+            Some(
+                qkv.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} qkv trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         matmul_proj(
-            self.ordinal, 1, 1, val_dim, hidden_dim,
-            &self.normed_buf, &lw.z_proj_w, lw.z_proj_scale.as_ref(), self.weights.fp8_block_size, &mut z,
-            lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            val_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.z_proj_w,
+            lw.z_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut z,
+            lw.z_proj_int4_scale.as_ref(),
+            lw.z_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let z_trace = if trace_output {
-            Some(z.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} z trace D2H: {e}"))?)
+            Some(
+                z.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} z trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         matmul_proj(
-            self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.a_proj_w, lw.a_proj_scale.as_ref(), self.weights.fp8_block_size, &mut a,
-            None, None, self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            nv,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.a_proj_w,
+            lw.a_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut a,
+            None,
+            None,
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.b_proj_w, lw.b_proj_scale.as_ref(), self.weights.fp8_block_size, &mut b,
-            None, None, self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            nv,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.b_proj_w,
+            lw.b_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut b,
+            None,
+            None,
+            self.weights.int4_group_size,
         )?;
 
         let ab_bytes = nv * ScalarType::BF16.size_in_bytes();
@@ -1849,26 +2240,34 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} copy B: {e}"))?;
         let a_trace = if trace_output {
-            Some(a.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} a trace D2H: {e}"))?)
+            Some(
+                a.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} a trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         let b_trace = if trace_output {
-            Some(b.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} b trace D2H: {e}"))?)
+            Some(
+                b.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} b trace D2H: {e}"))?,
+            )
         } else {
             None
         };
 
         let ls = &mut self.state.layers[idx];
-        let conv_state = ls.conv_state.as_ref().ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
-        let recurrent_state = ls.recurrent_state.as_ref().ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
+        let conv_state = ls
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+        let recurrent_state = ls
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
 
-        let mut conv_pack = GpuBuffer::zeros(
-            self.ordinal,
-            ScalarType::BF16,
-            &[1, qkv_dim + nv],
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} conv_pack alloc: {e}"))?;
+        let mut conv_pack = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, qkv_dim + nv])
+            .map_err(|e| anyhow::anyhow!("layer {idx} conv_pack alloc: {e}"))?;
         kernel_ffi::prefill_ffi::linear_stateful_conv_value_decay_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2045,8 +2444,7 @@ impl DecodeEngine {
             }
             packed_host[out_base + 2 * khd + vhd] = 1.0f32 / (1.0f32 + (-b_bf16[v_head]).exp());
             let softplus = (1.0f32 + (a_bf16[v_head] + dt_bias_bf16[v_head]).exp()).ln();
-            packed_host[out_base + 2 * khd + vhd + 1] =
-                (-softplus * a_log_exp_bf16[v_head]).exp();
+            packed_host[out_base + 2 * khd + vhd + 1] = (-softplus * a_log_exp_bf16[v_head]).exp();
         }
         let packed = GpuBuffer::from_host_bytes(
             self.ordinal,
@@ -2073,8 +2471,9 @@ impl DecodeEngine {
 
         let state_len = config.linear_conv_kernel_dim - 1;
         let state_bytes = ScalarType::BF16.size_in_bytes();
-        let new_conv_state = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
-            .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
+        let new_conv_state =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
+                .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
         for c in 0..qkv_dim {
             let channel_base = c * state_len * state_bytes;
             if state_len > 1 {
@@ -2088,7 +2487,8 @@ impl DecodeEngine {
             }
             gpu_hal::copy_d2d(
                 self.ordinal,
-                new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes) as *mut c_void,
+                new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
+                    as *mut c_void,
                 qkv.offset_ptr(c * state_bytes),
                 state_bytes,
             )
@@ -2103,11 +2503,20 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, val_dim, &rec_apply, &mut attn_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            val_dim,
+            &rec_apply,
+            &mut attn_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
         let attn_trace = if trace_output {
-            Some(attn_bf16.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?)
+            Some(
+                attn_bf16
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?,
+            )
         } else {
             None
         };
@@ -2129,7 +2538,12 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} recurrent update copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, vhd, &lw.norm_w, &mut norm_w_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            vhd,
+            &lw.norm_w,
+            &mut norm_w_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
         kernel_ffi::prefill_ffi::rms_norm_gated(
@@ -2145,18 +2559,36 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gated norm: {e}"))?;
         let gated_trace = if trace_output {
-            Some(gated.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?)
+            Some(
+                gated
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
+            )
         } else {
             None
         };
 
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, val_dim,
-            &gated, &lw.out_proj_w, lw.out_proj_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
-            lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            val_dim,
+            &gated,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut proj_out,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let proj_trace = if trace_output {
-            Some(proj_out.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?)
+            Some(
+                proj_out
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
+            )
         } else {
             None
         };
@@ -2187,7 +2619,11 @@ impl DecodeEngine {
         })
     }
 
-    fn component_decode_mlp_layer(&mut self, idx: usize, trace_output: bool) -> Result<Option<ComponentMlpTrace>> {
+    fn component_decode_mlp_layer(
+        &mut self,
+        idx: usize,
+        trace_output: bool,
+    ) -> Result<Option<ComponentMlpTrace>> {
         let config = &self.weights.config;
         let lw = &self.weights.layers[idx];
         let hidden_dim = config.hidden_size;
@@ -2202,14 +2638,34 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} mlp down alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
-            lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            intermediate,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.gate_proj_w,
+            lw.gate_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut gate,
+            lw.gate_proj_int4_scale.as_ref(),
+            lw.gate_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, intermediate, hidden_dim,
-            &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), self.weights.fp8_block_size, &mut up,
-            lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            intermediate,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.up_proj_w,
+            lw.up_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut up,
+            lw.up_proj_int4_scale.as_ref(),
+            lw.up_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         kernel_ffi::prefill_ffi::swiglu_mul(
             self.ordinal,
@@ -2221,9 +2677,19 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, intermediate,
-            &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), self.weights.fp8_block_size, &mut down,
-            lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            intermediate,
+            &mlp,
+            &lw.down_proj_w,
+            lw.down_proj_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut down,
+            lw.down_proj_int4_scale.as_ref(),
+            lw.down_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let trace = if trace_output {
             Some(ComponentMlpTrace {
@@ -2248,7 +2714,9 @@ impl DecodeEngine {
             .prefill_hidden
             .as_ref()
             .context("oracle output missing prefill_hidden (use --emit-state)")?;
-        let hidden_bytes = b64.decode(hidden_b64).context("decode prefill_hidden base64")?;
+        let hidden_bytes = b64
+            .decode(hidden_b64)
+            .context("decode prefill_hidden base64")?;
         let hidden_shape = oracle
             .prefill_hidden_shape
             .as_ref()
@@ -2262,13 +2730,9 @@ impl DecodeEngine {
         } else {
             &hidden_bytes
         };
-        self.hidden_io = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::BF16,
-            hidden_shape,
-            actual_hidden,
-        )
-        .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
+        self.hidden_io =
+            GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, hidden_shape, actual_hidden)
+                .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
         Ok(())
     }
 
@@ -2301,7 +2765,6 @@ impl DecodeEngine {
         Ok(())
     }
 
-
     fn apply_oracle_conv_state(&mut self, oracle: &OracleOutput) -> Result<()> {
         let b64 = base64::engine::general_purpose::STANDARD;
         let conv_states = oracle
@@ -2326,7 +2789,9 @@ impl DecodeEngine {
             .as_ref()
             .context("oracle output missing recurrent_states")?;
         for rs in rec_states {
-            let bytes = b64.decode(&rs.data).context("decode recurrent_state base64")?;
+            let bytes = b64
+                .decode(&rs.data)
+                .context("decode recurrent_state base64")?;
             let ls = &mut self.state.layers[rs.layer];
             ls.recurrent_state = Some(
                 GpuBuffer::from_host_bytes(self.ordinal, ScalarType::F32, &rs.shape, &bytes)
@@ -2372,13 +2837,24 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
         let rotary =
             RotaryTables::build(config, ordinal).map_err(|e| anyhow::anyhow!("rotary: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])
-            .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])
-            .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
-        let logits_buf =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.vocab_size])
-                .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.hidden_size],
+        )
+        .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.hidden_size],
+        )
+        .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.vocab_size],
+        )
+        .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
         let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
         let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
@@ -2519,7 +2995,9 @@ impl DecodeEngine {
         // Convert BF16 KV caches to FP8 if requested
         if self.kv_fp8 {
             prefill_engine::convert_kv_caches_to_fp8(
-                &mut self.state, &self.weights.config, self.ordinal,
+                &mut self.state,
+                &self.weights.config,
+                self.ordinal,
             )?;
         }
 
@@ -2628,8 +3106,9 @@ impl DecodeEngine {
         debug_linear_layer: Option<usize>,
         debug_full_layer: Option<usize>,
         debug_mlp_layer: Option<usize>,
+        trace_position: Option<usize>,
     ) -> Result<prefill_engine::PrefillResult> {
-        let result = prefill_engine::prefill(
+        let result = prefill_engine::prefill_with_trace_position(
             &self.weights,
             &mut self.state,
             &self.rotary,
@@ -2643,6 +3122,7 @@ impl DecodeEngine {
             debug_linear_layer,
             debug_full_layer,
             debug_mlp_layer,
+            trace_position,
         )?;
 
         self.scratch
@@ -2650,6 +3130,39 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
 
         Ok(result)
+    }
+
+    /// Debug-only helper that replays the tail of prefill starting from a
+    /// caller-supplied BF16 hidden-state tensor `[seq_len, hidden_dim]`.
+    /// Uses a fresh temporary model state so the live decode state is untouched.
+    pub fn prefill_tail_from_hidden_with_trace(
+        &self,
+        hidden_bytes: &[u8],
+        start_layer: usize,
+        debug_linear_layer: Option<usize>,
+        debug_full_layer: Option<usize>,
+        debug_mlp_layer: Option<usize>,
+        trace_position: Option<usize>,
+    ) -> Result<prefill_engine::PrefillResult> {
+        let mut state = ModelState::new(&self.weights.config, self.ordinal)
+            .map_err(|e| anyhow::anyhow!("tail replay model state init: {e}"))?;
+        prefill_engine::prefill_tail_from_hidden_with_trace_position(
+            &self.weights,
+            &mut state,
+            &self.rotary,
+            hidden_bytes,
+            start_layer,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            true,
+            debug_linear_layer,
+            debug_full_layer,
+            debug_mlp_layer,
+            trace_position,
+        )
     }
 
     fn decode_step_non_4b(
@@ -2675,13 +3188,23 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for full-attention layers
         for (i, ls) in self.state.layers.iter_mut().enumerate() {
             if config.is_full_attention(i) {
-                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-                    .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
+                ls.ensure_kv_capacity(
+                    seqlen_offset,
+                    self.ordinal,
+                    config,
+                    self.kv_chunk_size,
+                    self.kv_fp8,
+                )
+                .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }
         self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
+            Self::load_kv_shadow_for_state_static(
+                &self.weights.config,
+                self.ordinal,
+                &mut self.state,
+            )?;
         }
 
         // 3. Build layer descriptors
@@ -2744,8 +3267,7 @@ impl DecodeEngine {
                 self.rotary.rotary_dim,
             )
         };
-        persist_result
-            .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
+        persist_result.map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         // 6. Update KV filled counts
@@ -2792,11 +3314,10 @@ impl DecodeEngine {
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
                 timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let sampled_token = u32::from_le_bytes(
-                    token_bytes[..4]
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
-                );
+                let sampled_token =
+                    u32::from_le_bytes(token_bytes[..4].try_into().map_err(|_| {
+                        anyhow::anyhow!("argmax D2H returned truncated token buffer")
+                    })?);
 
                 Ok(DecodeStepOutput {
                     logits: None,
@@ -2856,11 +3377,10 @@ impl DecodeEngine {
                         .to_host_bytes()
                         .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
                     timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let sampled_token = u32::from_le_bytes(
-                        token_bytes[..4]
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
-                    );
+                    let sampled_token =
+                        u32::from_le_bytes(token_bytes[..4].try_into().map_err(|_| {
+                            anyhow::anyhow!("argmax D2H returned truncated token buffer")
+                        })?);
 
                     return Ok(DecodeStepOutput {
                         logits: None,
@@ -2909,7 +3429,8 @@ impl DecodeEngine {
             let logits = self.component_decode_step_4b(token_id, seqlen_offset)?;
             return Ok((logits, DecodeStageTimings::default()));
         }
-        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::HostLogits)?;
+        let out =
+            self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::HostLogits)?;
         let logits = out
             .logits
             .ok_or_else(|| anyhow::anyhow!("decode_step_with_timings missing logits"))?;
@@ -2929,7 +3450,8 @@ impl DecodeEngine {
         if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
             anyhow::bail!("decode_step_cuda_fast_greedy requires CUDA backend");
         }
-        let out = self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::CudaFastGreedy)?;
+        let out =
+            self.decode_step_non_4b(token_id, seqlen_offset, DecodeSamplingMode::CudaFastGreedy)?;
         Ok((out.sampled_token, out.timings))
     }
 
@@ -3019,9 +3541,7 @@ impl DecodeEngine {
         let num_layers = config.num_hidden_layers;
         for &li in tap_layers {
             if li >= num_layers {
-                anyhow::bail!(
-                    "tap layer {li} out of range (num_hidden_layers={num_layers})"
-                );
+                anyhow::bail!("tap layer {li} out of range (num_hidden_layers={num_layers})");
             }
         }
 
@@ -3040,12 +3560,9 @@ impl DecodeEngine {
         let (mut tap_workspace, tap_layers_buf) = match self.dflash_tap_cache.take() {
             Some((cached, ws, lb)) if cached.as_slice() == tap_layers => (ws, lb),
             _ => {
-                let workspace = GpuBuffer::zeros(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    &[num_taps, hidden_dim],
-                )
-                .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
+                let workspace =
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_taps, hidden_dim])
+                        .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
                 let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
                 let tap_ints_bytes: Vec<u8> =
                     tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -3361,14 +3878,10 @@ impl DecodeEngine {
         // offset for RoPE + KV append + causal read.
         let state_refs: Vec<&ModelState> = (0..b).map(|_| &self.state).collect();
         let seqlen_offsets: Vec<usize> = (0..b).map(|bi| pos_offset + bi).collect();
-        let batch_descs = build_batch_seq_descs(
-            &state_refs,
-            &seqlen_offsets,
-            /* kv_fp8 */ false,
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}")
-        })?;
+        let batch_descs =
+            build_batch_seq_descs(&state_refs, &seqlen_offsets, /* kv_fp8 */ false).ok_or_else(
+                || anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}"),
+            )?;
         let desc_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 batch_descs.as_ptr() as *const u8,
@@ -3391,9 +3904,7 @@ impl DecodeEngine {
             let dst_offset = bi * row_bytes;
             gpu_hal::copy_d2d(
                 self.ordinal,
-                unsafe {
-                    (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void
-                },
+                unsafe { (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
                 self.weights.embed_tokens.offset_ptr(src_offset),
                 row_bytes,
             )
@@ -3437,8 +3948,8 @@ impl DecodeEngine {
             self.int4_scale_device.as_ref(),
             false, // enable_timing_slots
             false, // enable_attention_trace
-            None, // tap_workspace: verify doesn't capture taps — re-decode does
-            None, // tap_layers: ignored when tap_workspace is None
+            None,  // tap_workspace: verify doesn't capture taps — re-decode does
+            None,  // tap_layers: ignored when tap_workspace is None
         )
         .map_err(|e| anyhow::anyhow!("fused verify persistent_decode_4b: {e}"))?;
 
@@ -3507,7 +4018,8 @@ impl DecodeEngine {
     /// Call after load_prefill_state() or prefill_native() to initialize batch items.
     pub fn replicate_state_to_batch(&mut self) -> Result<()> {
         for b in 0..self.extra_states.len() {
-            self.extra_states[b] = self.state
+            self.extra_states[b] = self
+                .state
                 .clone_gpu()
                 .map_err(|e| anyhow::anyhow!("clone state to batch {}: {e}", b + 1))?;
         }
@@ -3565,19 +4077,37 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for all batch items
         let seqlen_offsets: Vec<usize> = vec![seqlen_offset; b];
         for bi in 0..b {
-            let st = if bi == 0 { &mut self.state } else { &mut self.extra_states[bi - 1] };
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
             for (i, ls) in st.layers.iter_mut().enumerate() {
                 if config.is_full_attention(i) {
-                    ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-                        .map_err(|e| anyhow::anyhow!("ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                    ls.ensure_kv_capacity(
+                        seqlen_offset,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("ensure KV capacity batch {bi} layer {i}: {e}"))?;
                 }
             }
         }
         self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
+            Self::load_kv_shadow_for_state_static(
+                &self.weights.config,
+                self.ordinal,
+                &mut self.state,
+            )?;
             for bi in 0..self.extra_states.len() {
-                Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.extra_states[bi])?;
+                Self::load_kv_shadow_for_state_static(
+                    &self.weights.config,
+                    self.ordinal,
+                    &mut self.extra_states[bi],
+                )?;
             }
         }
 
@@ -3591,7 +4121,8 @@ impl DecodeEngine {
         let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
             .chain(self.extra_states.iter())
             .collect();
-        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8)
+        {
             self.scratch
                 .upload_batch_seq_descs(&batch_descs)
                 .map_err(|e| anyhow::anyhow!("upload batch seq descs: {e}"))?;
@@ -3616,12 +4147,11 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
-        let use_qwen35_4b_cuda_hero =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8;
+        let use_qwen35_4b_cuda_hero = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8;
         let persist_result = if use_qwen35_4b_cuda_hero {
             kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
                 self.ordinal,
@@ -3677,8 +4207,7 @@ impl DecodeEngine {
                 None, // tap_layers: DFlash-only, off in batched decode
             )
         };
-        persist_result
-            .map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
+        persist_result.map_err(|e| anyhow::anyhow!("persistent_decode_4b batch kernel: {e}"))?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
         if enable_timing_slots {
             let clock_rate_khz = match self.hidden_io.backend() {
@@ -3707,7 +4236,11 @@ impl DecodeEngine {
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;
         for bi in 0..b {
-            let st = if bi == 0 { &mut self.state } else { &mut self.extra_states[bi - 1] };
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
             for (i, ls) in st.layers.iter_mut().enumerate() {
                 if config.is_full_attention(i) {
                     ls.set_kv_filled(filled);
@@ -3823,7 +4356,9 @@ impl DecodeEngine {
                         self.kv_chunk_size,
                         self.kv_fp8,
                     )
-                    .map_err(|e| anyhow::anyhow!("trace ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("trace ensure KV capacity batch {bi} layer {i}: {e}")
+                    })?;
                 }
             }
         }
@@ -3836,7 +4371,8 @@ impl DecodeEngine {
         let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
             .chain(self.extra_states.iter())
             .collect();
-        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8)
+        {
             self.scratch
                 .upload_batch_seq_descs(&batch_descs)
                 .map_err(|e| anyhow::anyhow!("trace upload batch seq descs: {e}"))?;
@@ -3922,7 +4458,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = start_floats * ScalarType::F32.size_in_bytes();
         let end = start + total_floats * ScalarType::F32.size_in_bytes();
-        anyhow::ensure!(end <= bytes.len(), "persistent projection slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent projection slice out of bounds"
+        );
         let slice = &bytes[start..end];
         let qkv_end = qkv_dim * 4;
         let z_end = qkv_end + z_dim * 4;
@@ -3965,7 +4504,10 @@ impl DecodeEngine {
         let mlp_out_end = mlp_out_start + hidden * 4;
         let token_out_start = (token_out_base + batch_index * hidden) * 4;
         let token_out_end = token_out_start + hidden * 4;
-        anyhow::ensure!(token_out_end <= bytes.len(), "persistent MLP slice out of bounds");
+        anyhow::ensure!(
+            token_out_end <= bytes.len(),
+            "persistent MLP slice out of bounds"
+        );
         Ok((
             bytes[normed_start..normed_end].to_vec(),
             bytes[gate_start..gate_end].to_vec(),
@@ -4030,7 +4572,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (proj_buf_base + batch_index * self.proj_buf_floats) * 4;
         let end = start + hidden * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn gated slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn gated slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -4044,8 +4589,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -4062,7 +4606,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn saved_gate slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn saved_gate slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -4076,8 +4623,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -4094,7 +4640,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn q slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn q slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -4108,8 +4657,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -4126,7 +4674,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 2) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn pre_gate slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn pre_gate slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -4141,8 +4692,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -4157,10 +4707,12 @@ impl DecodeEngine {
             .workspace
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
-        let start =
-            (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
+        let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
         let end = start + self.weights.config.num_attention_heads * self.kv_chunk_size * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn scores slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn scores slice out of bounds"
+        );
         let full = &bytes[start..end];
         let mut out = Vec::with_capacity(self.weights.config.num_attention_heads * kv_len * 4);
         let stride = self.kv_chunk_size * 4;

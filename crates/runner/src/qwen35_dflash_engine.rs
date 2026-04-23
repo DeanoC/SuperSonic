@@ -53,9 +53,7 @@ pub fn run_qwen35_dflash(
         bail!("--dflash requires --int4 (Qwen3.5-9B INT4 target)");
     }
     if model_variant.to_string() != "qwen3.5-9b" {
-        bail!(
-            "--dflash is only supported for --model qwen3.5-9b (got {model_variant})"
-        );
+        bail!("--dflash is only supported for --model qwen3.5-9b (got {model_variant})");
     }
     let draft_dir = cli
         .dflash_draft_dir
@@ -98,16 +96,8 @@ pub fn run_qwen35_dflash(
     );
 
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow!("load tokenizer: {e}"))?;
-    let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
-        .map_err(|e| anyhow!("tokenize: {e}"))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
-    if prompt_ids.is_empty() {
-        bail!("empty prompt after tokenization");
-    }
+    let tokenizer = crate::load_tokenizer(&tokenizer_path)?;
+    let prompt_ids = crate::resolve_prompt_token_ids(cli, &tokenizer)?;
 
     // --------- 3. VRAM estimate (target INT4 + ~2 GiB draft) -------------
     let context_tokens = cli
@@ -184,8 +174,8 @@ pub fn run_qwen35_dflash(
     )?;
 
     // --------- 6. Load DFlash draft --------------------------------------
-    let draft_config = dflash::load_config(draft_dir)
-        .map_err(|e| anyhow!("load draft config.json: {e}"))?;
+    let draft_config =
+        dflash::load_config(draft_dir).map_err(|e| anyhow!("load draft config.json: {e}"))?;
     if draft_config.num_target_layers != text_config.num_hidden_layers {
         bail!(
             "draft num_target_layers={} != target layers={}",
@@ -276,7 +266,8 @@ pub fn run_qwen35_dflash(
         prompt_ids.len(),
         prefill_start.elapsed().as_millis(),
     );
-    let mut round_taps: Vec<u8> = flatten_tap_blobs(&prefill_result.tap_hiddens.unwrap_or_default());
+    let mut round_taps: Vec<u8> =
+        flatten_tap_blobs(&prefill_result.tap_hiddens.unwrap_or_default());
     let mut round_taps_len: usize = 1; // T=1 after prefill (last prompt token).
 
     // Sample the first bonus_seed from prefill's last logits (greedy @ T=0).
@@ -426,14 +417,13 @@ pub fn run_qwen35_dflash(
         // `[1, ctx_len, num_taps * hidden]` BF16, row-major per ctx pos.
         let per_tap_row_bytes =
             tap_layers.len() * text_config.hidden_size * ScalarType::BF16.size_in_bytes();
-        let mut stacked_taps: Vec<u8> =
-            Vec::with_capacity(accepted_len * per_tap_row_bytes);
+        let mut stacked_taps: Vec<u8> = Vec::with_capacity(accepted_len * per_tap_row_bytes);
         let mut final_round_logits: Option<Vec<f32>> = None;
         let t_redecode = Instant::now();
         for (i, &tok) in committed_block.iter().enumerate() {
             let seqlen_offset = l + i;
-            let (logits, taps_bytes) = target_engine
-                .decode_step_with_taps_kernel(tok, seqlen_offset, &tap_layers)?;
+            let (logits, taps_bytes) =
+                target_engine.decode_step_with_taps_kernel(tok, seqlen_offset, &tap_layers)?;
             if taps_bytes.len() != per_tap_row_bytes {
                 bail!(
                     "decode_step_with_taps_kernel returned {} bytes, expected {}",
@@ -626,18 +616,15 @@ fn draft_forward_and_sample(
     // 1) Build noise_embedding = embed([bonus_seed, MASK, …, MASK]).
     let target_embed = &target_engine.weights().embed_tokens;
     let row_bytes = hidden * ScalarType::BF16.size_in_bytes();
-    let noise_embedding =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, block_size, hidden])
-            .map_err(|e| anyhow!("alloc noise_embedding: {e}"))?;
+    let noise_embedding = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, block_size, hidden])
+        .map_err(|e| anyhow!("alloc noise_embedding: {e}"))?;
     for i in 0..block_size {
         let tok = if i == 0 { bonus_seed } else { mask_token_id };
         let src_off = tok as usize * row_bytes;
         let dst_off = i * row_bytes;
         gpu_hal::copy_d2d(
             ordinal,
-            unsafe {
-                (noise_embedding.as_ptr() as *mut u8).add(dst_off) as *mut std::ffi::c_void
-            },
+            unsafe { (noise_embedding.as_ptr() as *mut u8).add(dst_off) as *mut std::ffi::c_void },
             target_embed.offset_ptr(src_off),
             row_bytes,
         )
