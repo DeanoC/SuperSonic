@@ -35,6 +35,10 @@ fn metal_force_host_mul_scalar() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MUL_SCALAR").is_some()
 }
 
+fn metal_force_host_l2norm() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_L2NORM").is_some()
+}
+
 fn metal_force_host_transpose_shd_hsd() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_TRANSPOSE_SHD_HSD").is_some()
 }
@@ -996,6 +1000,7 @@ pub fn l2norm(
     if out.backend() == Backend::Metal {
         let _ = ordinal;
         if !metal_native::disabled_by_env()
+            && !metal_force_host_l2norm()
             && metal_native::l2norm(dtype, n_rows, n_cols, eps, input, out).is_ok()
         {
             return Ok(());

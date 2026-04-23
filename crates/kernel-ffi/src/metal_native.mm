@@ -119,6 +119,7 @@ struct L2NormParams {
     uint32_t n_cols;
     float eps;
     uint32_t total_elems;
+    uint32_t block_size;
 };
 
 id<MTLDevice> metal_device() {
@@ -2124,48 +2125,73 @@ struct L2NormParams {
     uint n_cols;
     float eps;
     uint total_elems;
+    uint block_size;
 };
 
 kernel void supersonic_l2norm_f32(
     device const float* input [[buffer(0)]],
     device float* out [[buffer(1)]],
     constant L2NormParams& params [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    if (gid >= params.total_elems) {
+    if (row >= params.n_rows || tid >= params.block_size) {
         return;
     }
-    uint row = gid / params.n_cols;
-    uint col = gid - row * params.n_cols;
+    threadgroup float scratch[256];
     uint base = row * params.n_cols;
     float norm_sq = 0.0f;
-    for (uint c = 0; c < params.n_cols; ++c) {
+    for (uint c = tid; c < params.n_cols; c += params.block_size) {
         float v = input[base + c];
         norm_sq = fma(v, v, norm_sq);
     }
-    float inv_norm = rsqrt(norm_sq + params.eps);
-    out[base + col] = input[base + col] * inv_norm;
+    scratch[tid] = norm_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_norm = rsqrt(scratch[0] + params.eps);
+    for (uint c = tid; c < params.n_cols; c += params.block_size) {
+        out[base + c] = input[base + c] * inv_norm;
+    }
 }
 
 kernel void supersonic_l2norm_bf16(
     device const bfloat* input [[buffer(0)]],
     device bfloat* out [[buffer(1)]],
     constant L2NormParams& params [[buffer(2)]],
-    uint gid [[thread_position_in_grid]]
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
 ) {
-    if (gid >= params.total_elems) {
+    if (row >= params.n_rows || tid >= params.block_size) {
         return;
     }
-    uint row = gid / params.n_cols;
-    uint col = gid - row * params.n_cols;
+    threadgroup float scratch[256];
     uint base = row * params.n_cols;
     float norm_sq = 0.0f;
-    for (uint c = 0; c < params.n_cols; ++c) {
+    for (uint c = tid; c < params.n_cols; c += params.block_size) {
         float v = float(input[base + c]);
         norm_sq = fma(v, v, norm_sq);
     }
-    float inv_norm = rsqrt(norm_sq + params.eps);
-    out[base + col] = bfloat(float(input[base + col]) * inv_norm);
+    scratch[tid] = norm_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_norm = rsqrt(scratch[0] + params.eps);
+    for (uint c = tid; c < params.n_cols; c += params.block_size) {
+        out[base + c] = bfloat(float(input[base + c]) * inv_norm);
+    }
 }
 )L2N";
                 NSString* source = [NSString stringWithUTF8String:kSource];
@@ -3557,11 +3583,22 @@ static int supersonic_metal_l2norm_impl(
             return 189;
         }
 
+        // Qwen's real l2norm path is F32 after BF16->F32 casts. Keep that
+        // accumulation order identical to the host/oracle path; the parallel
+        // reduction is faster but nudges tight logit thresholds over the line.
+        const bool preserve_f32_order = [function_name isEqualToString:@"supersonic_l2norm_f32"];
+        NSUInteger block_size = preserve_f32_order
+            ? 1
+            : std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
         L2NormParams params = {
             static_cast<uint32_t>(n_rows),
             static_cast<uint32_t>(n_cols),
             eps,
             static_cast<uint32_t>(total_elems),
+            static_cast<uint32_t>(block_size),
         };
 
         [encoder setComputePipelineState:pipeline];
@@ -3569,11 +3606,9 @@ static int supersonic_metal_l2norm_impl(
         [encoder setBuffer:out offset:out_offset atIndex:1];
         [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        NSUInteger tg_width =
-            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         [encoder endEncoding];
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
