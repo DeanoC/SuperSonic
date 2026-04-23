@@ -843,7 +843,6 @@ extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16_range(
         block_size
     );
     if (cudaGetLastError() != cudaSuccess) return 4;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 5;
     return 0;
 }
 
@@ -905,7 +904,6 @@ extern "C" int dotcache_llama31_certified_kv_quantize_values_bf16_range(
         value_group_size
     );
     if (cudaGetLastError() != cudaSuccess) return 4;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 5;
     return 0;
 }
 
