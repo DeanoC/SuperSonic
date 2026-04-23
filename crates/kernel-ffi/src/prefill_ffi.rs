@@ -1053,6 +1053,13 @@ pub fn rms_norm_gated(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if dtype == ScalarType::BF16
+            && !metal_native::disabled_by_env()
+            && metal_native::rms_norm_gated_bf16(n_rows, n_cols, eps, hidden, gate, weight, out)
+                .is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out);
     }
     let status = unsafe {

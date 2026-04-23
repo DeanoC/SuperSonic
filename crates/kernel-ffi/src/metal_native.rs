@@ -39,6 +39,15 @@ unsafe extern "C" {
         weight_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_rms_norm_gated_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        hidden_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_l2norm_f32(
         n_rows: usize,
         n_cols: usize,
@@ -353,6 +362,48 @@ pub(crate) fn rms_norm_rows_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native rms_norm_rows_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn rms_norm_gated_bf16(
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    hidden: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if hidden.dtype() != ScalarType::BF16
+        || gate.dtype() != ScalarType::BF16
+        || weight.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native rms_norm_gated_bf16 expects BF16 buffers, got {:?}/{:?}/{:?}/{:?}",
+            hidden.dtype(),
+            gate.dtype(),
+            weight.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_rms_norm_gated_bf16(
+            n_rows,
+            n_cols,
+            eps,
+            hidden.as_ptr(),
+            gate.as_ptr(),
+            weight.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native rms_norm_gated_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -1166,6 +1217,21 @@ pub(crate) fn rms_norm_rows_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn rms_norm_gated_bf16(
+    _n_rows: usize,
+    _n_cols: usize,
+    _eps: f32,
+    _hidden: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native rms_norm_gated_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn linear_prefill_conv_pack_bf16(
     _conv_dim: usize,
     _total_len: usize,
@@ -1512,6 +1578,65 @@ mod tests {
             2.0 * row1_inv * 0.5,
         ];
         for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_rms_norm_gated_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden_vals = [1.0f32, 2.0, 2.0, 2.0, 0.0, 2.0];
+        let gate_vals = [0.0f32, 1.0, -1.0, 3.0, -2.0, 0.5];
+        let hidden = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&hidden_vals),
+        )
+        .expect("upload hidden");
+        let gate = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&gate_vals),
+        )
+        .expect("upload gate");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[1.0, 0.5, -0.5]),
+        )
+        .expect("upload weight");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("allocate native out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("allocate ref out");
+
+        crate::metal_host::rms_norm_gated(
+            ScalarType::BF16,
+            2,
+            3,
+            1e-5,
+            &hidden,
+            &gate,
+            &weight,
+            &mut out_ref,
+        )
+        .expect("host gated rms norm");
+        rms_norm_gated_bf16(2, 3, 1e-5, &hidden, &gate, &weight, &mut out_native)
+            .expect("native gated rms norm");
+
+        for (idx, (a, e)) in read_bf16(&out_native)
+            .iter()
+            .zip(read_bf16(&out_ref).iter())
+            .enumerate()
+        {
             let delta = (a - e).abs();
             assert!(
                 delta <= 0.02,
