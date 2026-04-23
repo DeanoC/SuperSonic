@@ -440,6 +440,8 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
     int num_blocks,
     int block_size,
     int tail_len,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
     int score_stride_tokens,
     int value_stride_tokens,
     int head_dim,
@@ -472,7 +474,10 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
         for (int d = 0; d < head_dim; ++d) {
             const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
             const float k = bf16_to_float(
-                tail_key[(static_cast<size_t>(kvh) * tail_len + tail_tok) * head_dim + d]
+                tail_key[
+                    (static_cast<size_t>(kvh) * tail_key_stride_tokens +
+                     tail_key_start_tokens + tail_tok) * head_dim + d
+                ]
             );
             acc += q * k;
         }
@@ -843,6 +848,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values(
         num_blocks,
         block_size,
         tail_len,
+        0,
+        tail_len,
         num_blocks * block_size + tail_len,
         num_blocks * block_size + tail_len,
         head_dim,
@@ -868,6 +875,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
     int num_blocks,
     int block_size,
     int tail_len,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
     int score_stride_tokens,
     int value_stride_tokens,
     int head_dim,
@@ -882,13 +891,14 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
         return 52;
     }
     if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
-        tail_len < 0 || score_stride_tokens <= 0 || value_stride_tokens <= 0 ||
-        head_dim <= 0 || gqa_group <= 0) {
+        tail_len < 0 || tail_key_start_tokens < 0 || score_stride_tokens <= 0 ||
+        value_stride_tokens <= 0 || head_dim <= 0 || gqa_group <= 0) {
         return 53;
     }
     const int total_tokens = num_blocks * block_size + tail_len;
     if (block_size > 256 || q_heads != kv_heads * gqa_group ||
-        score_stride_tokens < total_tokens || value_stride_tokens < total_tokens) {
+        score_stride_tokens < total_tokens || value_stride_tokens < total_tokens ||
+        (tail_len > 0 && tail_key_stride_tokens < tail_key_start_tokens + tail_len)) {
         return 54;
     }
     ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
@@ -905,6 +915,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
         num_blocks,
         block_size,
         tail_len,
+        tail_key_start_tokens,
+        tail_key_stride_tokens,
         score_stride_tokens,
         value_stride_tokens,
         head_dim,

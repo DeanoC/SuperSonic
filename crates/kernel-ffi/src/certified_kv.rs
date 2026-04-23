@@ -115,6 +115,8 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         tail_len: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
         score_stride_tokens: c_int,
         value_stride_tokens: c_int,
         head_dim: c_int,
@@ -1009,21 +1011,44 @@ pub fn attend_int8_bf16_values_strided(
             output_f32.shape()
         )));
     }
-    if let Some(tail_key) = tail_key_bf16 {
-        if tail_key.dtype() != ScalarType::BF16
-            || tail_key.shape() != [kv_heads, tail_len, head_dim]
-        {
+    let (tail_key_start_tokens, tail_key_stride_tokens) = if let Some(tail_key) = tail_key_bf16 {
+        let tail_shape = tail_key.shape();
+        let compact_3d = tail_shape == [kv_heads, tail_len, head_dim];
+        let strided_3d =
+            tail_shape.len() == 3 && tail_shape[0] == kv_heads && tail_shape[2] == head_dim;
+        let strided_4d = tail_shape.len() == 4
+            && tail_shape[0] == 1
+            && tail_shape[1] == kv_heads
+            && tail_shape[3] == head_dim;
+        if tail_key.dtype() != ScalarType::BF16 || (!compact_3d && !strided_3d && !strided_4d) {
             return Err(GpuError::InvalidArg(format!(
-                "certified KV strided INT8/BF16-value tail key expects BF16 [{kv_heads}, {tail_len}, {head_dim}], got {:?} {:?}",
+                "certified KV strided INT8/BF16-value tail key expects BF16 [{kv_heads}, {tail_len}, {head_dim}], [{kv_heads}, stride, {head_dim}], or [1, {kv_heads}, stride, {head_dim}], got {:?} {:?}",
                 tail_key.dtype(),
                 tail_key.shape()
             )));
+        }
+        if compact_3d {
+            (0, tail_len)
+        } else {
+            let stride = if tail_shape.len() == 3 {
+                tail_shape[1]
+            } else {
+                tail_shape[2]
+            };
+            if stride < total_tokens {
+                return Err(GpuError::InvalidArg(format!(
+                    "certified KV strided INT8/BF16-value full tail key stride={stride} must cover total_tokens={total_tokens}"
+                )));
+            }
+            (aligned_tokens, stride)
         }
     } else if tail_len != 0 {
         return Err(GpuError::InvalidArg(format!(
             "certified KV strided INT8/BF16-value needs tail key for tail_len={tail_len}"
         )));
-    }
+    } else {
+        (0, 0)
+    };
 
     let backend = query_bf16.backend();
     match backend {
@@ -1046,6 +1071,8 @@ pub fn attend_int8_bf16_values_strided(
                         num_blocks as c_int,
                         block_size as c_int,
                         tail_len as c_int,
+                        tail_key_start_tokens as c_int,
+                        tail_key_stride_tokens as c_int,
                         score_stride_tokens as c_int,
                         value_stride_tokens as c_int,
                         head_dim as c_int,
@@ -1615,6 +1642,86 @@ mod tests {
             assert!(
                 (value - expected).abs() < 0.01,
                 "tail should dominate strided INT8-key/BF16-value softmax: got={value} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_int8_key_bf16_value_attend_accepts_strided_tail_key() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 4],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .expect("upload query");
+        let key_i8 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 2, 4],
+            &[0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .expect("upload key_i8");
+        let key_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 4],
+            &f32_bytes(&[1.0, 1.0, 1.0, 1.0]),
+        )
+        .expect("upload key_scale");
+        let values = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 5, 4],
+            &bf16_bytes(&[
+                1.0, 2.0, 3.0, 4.0,
+                5.0, 6.0, 7.0, 8.0,
+                9.0, 10.0, 11.0, 12.0,
+                -100.0, -100.0, -100.0, -100.0,
+                -200.0, -200.0, -200.0, -200.0,
+            ]),
+        )
+        .expect("upload values");
+        let tail_key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 5, 4],
+            &bf16_bytes(&[
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+                10.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+            ]),
+        )
+        .expect("upload tail_key");
+        let mut score_scratch =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 5]).expect("score_scratch");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 4]).expect("output");
+
+        attend_int8_bf16_values_strided(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &values,
+            Some(&tail_key),
+            3,
+            2,
+            1,
+            1.0,
+            &mut score_scratch,
+            &mut output,
+        )
+        .expect("attend int8 keys with strided bf16 values and tail key");
+
+        let out = f32s(&output.to_host_bytes().expect("download output"));
+        for (value, expected) in out.iter().zip([9.0_f32, 10.0, 11.0, 12.0]) {
+            assert!(
+                (value - expected).abs() < 0.01,
+                "tail should dominate strided tail-key softmax: got={value} expected={expected}"
             );
         }
     }

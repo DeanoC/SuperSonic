@@ -3594,27 +3594,7 @@ impl DecodeEngine {
             let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
             let key_i8 = ls.certified_kv_key_i8.as_ref().unwrap();
             let key_scale = ls.certified_kv_key_scale.as_ref().unwrap();
-            let cap_stride = cap * head_dim * elem_bytes;
-            let tail_key_bf16 = if tail_len > 0 {
-                let tail =
-                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, tail_len, head_dim])
-                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode tail key alloc: {e}"))?;
-                let tail_stride = tail_len * head_dim * elem_bytes;
-                let tail_src_offset = aligned * head_dim * elem_bytes;
-                let tail_bytes = tail_len * head_dim * elem_bytes;
-                for h in 0..num_kv_heads {
-                    gpu_hal::copy_d2d(
-                        self.ordinal,
-                        tail.offset_ptr(h * tail_stride) as *mut c_void,
-                        cache_k_ref.offset_ptr(h * cap_stride + tail_src_offset),
-                        tail_bytes,
-                    )
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode tail key copy h={h}: {e}"))?;
-                }
-                Some(tail)
-            } else {
-                None
-            };
+            let tail_key_bf16 = (tail_len > 0).then_some(cache_k_ref);
             let score_shape = [num_q_heads, cap];
             if scratch
                 .certified_score_scratch
@@ -3635,7 +3615,7 @@ impl DecodeEngine {
                 key_i8,
                 key_scale,
                 cache_v_ref,
-                tail_key_bf16.as_ref(),
+                tail_key_bf16,
                 kv_len,
                 block_size,
                 num_q_heads / num_kv_heads,
