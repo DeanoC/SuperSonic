@@ -48,6 +48,11 @@ struct ElementwiseParams {
     uint32_t total_elems;
 };
 
+struct MulScalarParams {
+    uint32_t total_elems;
+    float scalar;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -753,6 +758,111 @@ kernel void supersonic_cast_f32_to_bf16(
     return nil;
 }
 
+id<MTLComputePipelineState> mul_scalar_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_mul_scalar_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:91
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"MSCL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MulScalarParams {
+    uint total_elems;
+    float scalar;
+};
+
+kernel void supersonic_mul_scalar_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device bfloat* out [[buffer(1)]],
+    constant MulScalarParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = bfloat(float(input[gid]) * params.scalar);
+}
+
+kernel void supersonic_mul_scalar_f32(
+    device const float* input [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant MulScalarParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = input[gid] * params.scalar;
+}
+)MSCL";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:92
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile mul-scalar library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:93
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load mul-scalar function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:94
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create mul-scalar pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -982,6 +1092,103 @@ extern "C" int supersonic_metal_cast_f32_to_bf16(
     void* out_ptr
 ) {
     return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_f32_to_bf16");
+}
+
+static int supersonic_metal_mul_scalar_impl(
+    size_t total_elems,
+    float scalar,
+    const void* input_ptr,
+    void* out_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (total_elems == 0) {
+            return 0;
+        }
+        if (total_elems > UINT32_MAX || input_ptr == nullptr || out_ptr == nullptr) {
+            return 91;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = mul_scalar_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 92;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> out = nil;
+        size_t input_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 93;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 94;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 95;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 96;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 97;
+        }
+
+        MulScalarParams params = {static_cast<uint32_t>(total_elems), scalar};
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input offset:input_offset atIndex:0];
+        [encoder setBuffer:out offset:out_offset atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 98;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_mul_scalar_bf16(
+    size_t total_elems,
+    float scalar,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_mul_scalar_impl(
+        total_elems,
+        scalar,
+        input_ptr,
+        out_ptr,
+        @"supersonic_mul_scalar_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_mul_scalar_f32(
+    size_t total_elems,
+    float scalar,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_mul_scalar_impl(
+        total_elems,
+        scalar,
+        input_ptr,
+        out_ptr,
+        @"supersonic_mul_scalar_f32"
+    );
 }
 
 extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(

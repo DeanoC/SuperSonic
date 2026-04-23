@@ -85,6 +85,18 @@ unsafe extern "C" {
         input_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_mul_scalar_bf16(
+        total_elems: usize,
+        scalar: f32,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_mul_scalar_f32(
+        total_elems: usize,
+        scalar: f32,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -366,6 +378,57 @@ pub(crate) fn cast(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn mul_scalar(
+    dtype: ScalarType,
+    total_elems: usize,
+    scalar: f32,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native mul_scalar supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if input.dtype() != dtype || out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native mul_scalar expects dtype {dtype:?}, got {:?}->{:?}",
+            input.dtype(),
+            out.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_mul_scalar_bf16(
+                total_elems,
+                scalar,
+                input.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_mul_scalar_f32(
+                total_elems,
+                scalar,
+                input.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native mul_scalar does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native mul_scalar failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -452,6 +515,19 @@ pub(crate) fn cast(
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal("metal native cast is not compiled".into()))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn mul_scalar(
+    _dtype: ScalarType,
+    _total_elems: usize,
+    _scalar: f32,
+    _input: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native mul_scalar is not compiled".into(),
+    ))
 }
 
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
@@ -809,5 +885,41 @@ mod tests {
         let mut out = GpuBuffer::zeros(ordinal, ScalarType::U32, &[3]).expect("allocate u32 out");
         cast(ScalarType::U32, ScalarType::U32, 3, &input, &mut out).expect("run u32 copy cast");
         assert_eq!(read_u32(&out), vec![7, 42, u32::MAX - 1]);
+    }
+
+    #[test]
+    fn metal_native_mul_scalar_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[4],
+            &bf16_bytes(&[1.0, -2.0, 0.5, 8.0]),
+        )
+        .expect("upload bf16 input");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[4]).expect("allocate bf16 out");
+        mul_scalar(ScalarType::BF16, 4, -0.5, &input, &mut out).expect("run bf16 mul_scalar");
+        let actual = read_bf16(&out);
+        let expected = [-0.5f32, 1.0, -0.25, -4.0];
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3],
+            &f32_bytes(&[1.25, -4.0, 8.0]),
+        )
+        .expect("upload f32 input");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
+        mul_scalar(ScalarType::F32, 3, 2.0, &input, &mut out).expect("run f32 mul_scalar");
+        assert_eq!(read_f32(&out), vec![2.5, -8.0, 16.0]);
     }
 }

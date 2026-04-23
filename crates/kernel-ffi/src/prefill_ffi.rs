@@ -31,6 +31,10 @@ fn metal_force_host_cast() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_CAST").is_some()
 }
 
+fn metal_force_host_mul_scalar() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_MUL_SCALAR").is_some()
+}
+
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
@@ -1040,6 +1044,12 @@ pub fn mul_scalar(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_mul_scalar()
+            && metal_native::mul_scalar(dtype, total_elems, scalar, input, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::mul_scalar(dtype, total_elems, scalar, input, out);
     }
     let status = unsafe {
