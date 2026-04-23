@@ -3,7 +3,7 @@
 //! orchestrates them layer by layer.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void, CStr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -132,6 +132,37 @@ where
     entry.total_ms += elapsed_ms;
     entry.max_ms = entry.max_ms.max(elapsed_ms);
     result
+}
+
+#[no_mangle]
+pub extern "C" fn supersonic_metal_profile_record(
+    op: *const c_char,
+    path: *const c_char,
+    elapsed_ms: f64,
+) {
+    if !metal_profile_enabled() || op.is_null() || path.is_null() || !elapsed_ms.is_finite() {
+        return;
+    }
+
+    let op = unsafe { CStr::from_ptr(op) }.to_string_lossy().into_owned();
+    let path = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .into_owned();
+    let profile = METAL_PROFILE.get_or_init(|| Mutex::new(MetalProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("metal profile mutex poisoned");
+    let entry = profile
+        .entries
+        .entry((op.clone(), path.clone()))
+        .or_insert_with(|| MetalProfileEntry {
+            op,
+            path,
+            calls: 0,
+            total_ms: 0.0,
+            max_ms: 0.0,
+        });
+    entry.calls += 1;
+    entry.total_ms += elapsed_ms.max(0.0);
+    entry.max_ms = entry.max_ms.max(elapsed_ms.max(0.0));
 }
 
 fn metal_profile_host_time<T, F>(op: &'static str, f: F) -> Result<T, GpuError>

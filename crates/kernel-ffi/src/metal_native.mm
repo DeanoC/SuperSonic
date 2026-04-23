@@ -2,6 +2,7 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <stdint.h>
 
@@ -10,8 +11,23 @@ extern "C" int supersonic_metal_lookup_buffer(
     void** buffer_out,
     size_t* offset_out
 );
+extern "C" void supersonic_metal_profile_record(
+    const char* op,
+    const char* path,
+    double elapsed_ms
+);
 
 namespace {
+
+using MetalClock = std::chrono::steady_clock;
+
+inline void record_runtime_profile(const char* op, MetalClock::time_point start) {
+    supersonic_metal_profile_record(
+        op,
+        "runtime",
+        std::chrono::duration<double, std::milli>(MetalClock::now() - start).count()
+    );
+}
 
 struct MatmulParams {
     uint32_t batch_elems;
@@ -257,11 +273,15 @@ int metal_batch_start_encoder() {
     if (queue == nil) {
         return 901;
     }
+    auto command_buffer_start = MetalClock::now();
     metal_batch_state->command_buffer = [queue commandBuffer];
+    record_runtime_profile("command_buffer_create", command_buffer_start);
     if (metal_batch_state->command_buffer == nil) {
         return 902;
     }
+    auto encoder_start = MetalClock::now();
     metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
+    record_runtime_profile("compute_encoder_create", encoder_start);
     if (metal_batch_state->encoder == nil) {
         metal_batch_state->command_buffer = nil;
         return 903;
@@ -282,10 +302,16 @@ int metal_batch_close_encoder(bool restart) {
     metal_batch_state->command_buffer = nil;
     metal_batch_state->has_work = false;
 
+    auto end_encoding_start = MetalClock::now();
     [encoder endEncoding];
+    record_runtime_profile("encoder_end", end_encoding_start);
     if (has_work) {
+        auto commit_start = MetalClock::now();
         [command_buffer commit];
+        record_runtime_profile("command_buffer_commit", commit_start);
+        auto wait_start = MetalClock::now();
         [command_buffer waitUntilCompleted];
+        record_runtime_profile("command_buffer_wait", wait_start);
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return 904;
         }
@@ -338,19 +364,29 @@ int encode_or_submit(EncodeFn encode, int queue_error, int command_buffer_error,
     if (queue == nil) {
         return queue_error;
     }
+    auto command_buffer_start = MetalClock::now();
     id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    record_runtime_profile("command_buffer_create", command_buffer_start);
     if (command_buffer == nil) {
         return command_buffer_error;
     }
+    auto encoder_start = MetalClock::now();
     id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    record_runtime_profile("compute_encoder_create", encoder_start);
     if (encoder == nil) {
         return encoder_error;
     }
 
     encode(encoder);
+    auto end_encoding_start = MetalClock::now();
     [encoder endEncoding];
+    record_runtime_profile("encoder_end", end_encoding_start);
+    auto commit_start = MetalClock::now();
     [command_buffer commit];
+    record_runtime_profile("command_buffer_commit", commit_start);
+    auto wait_start = MetalClock::now();
     [command_buffer waitUntilCompleted];
+    record_runtime_profile("command_buffer_wait", wait_start);
 
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         return completion_error;
@@ -377,11 +413,15 @@ int encode_blit_copy_or_submit(
             }
         }
         if (metal_batch_state->encoder != nil) {
+            auto end_encoding_start = MetalClock::now();
             [metal_batch_state->encoder endEncoding];
+            record_runtime_profile("encoder_end", end_encoding_start);
             metal_batch_state->encoder = nil;
         }
 
+        auto blit_start = MetalClock::now();
         id<MTLBlitCommandEncoder> blit = [metal_batch_state->command_buffer blitCommandEncoder];
+        record_runtime_profile("blit_encoder_create", blit_start);
         if (blit == nil) {
             return encoder_error;
         }
@@ -390,10 +430,14 @@ int encode_blit_copy_or_submit(
                     toBuffer:dst
            destinationOffset:dst_offset
                         size:bytes];
+        auto blit_end_start = MetalClock::now();
         [blit endEncoding];
+        record_runtime_profile("encoder_end", blit_end_start);
         metal_batch_state->has_work = true;
 
+        auto encoder_start = MetalClock::now();
         metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
+        record_runtime_profile("compute_encoder_create", encoder_start);
         if (metal_batch_state->encoder == nil) {
             return encoder_error;
         }
@@ -404,11 +448,15 @@ int encode_blit_copy_or_submit(
     if (queue == nil) {
         return queue_error;
     }
+    auto command_buffer_start = MetalClock::now();
     id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    record_runtime_profile("command_buffer_create", command_buffer_start);
     if (command_buffer == nil) {
         return command_buffer_error;
     }
+    auto blit_start = MetalClock::now();
     id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    record_runtime_profile("blit_encoder_create", blit_start);
     if (blit == nil) {
         return encoder_error;
     }
@@ -417,9 +465,15 @@ int encode_blit_copy_or_submit(
                 toBuffer:dst
        destinationOffset:dst_offset
                     size:bytes];
+    auto blit_end_start = MetalClock::now();
     [blit endEncoding];
+    record_runtime_profile("encoder_end", blit_end_start);
+    auto commit_start = MetalClock::now();
     [command_buffer commit];
+    record_runtime_profile("command_buffer_commit", commit_start);
+    auto wait_start = MetalClock::now();
     [command_buffer waitUntilCompleted];
+    record_runtime_profile("command_buffer_wait", wait_start);
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         return completion_error;
     }
