@@ -164,7 +164,8 @@ Implications for future work:
 ## CUDA — `sm86` (NVIDIA RTX 3090-class)
 
 24 GB VRAM, 936 GB/s memory bandwidth. Measurements below were refreshed on
-2026-04-22 at commit `5a34190`.
+2026-04-23 at commit `7837902` for the Llama INT8 lane and commit `5a34190`
+for the Qwen rows.
 
 Quick checked paths (`PROMPT_REPEAT=8`, `MAX_NEW_TOKENS=8`, `RUNS=1`):
 
@@ -181,13 +182,12 @@ Warmed native single-stream `4B` hero lane
 |----------------------------|-------------------------|-----------|------------|------------|
 | qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 101.5 tok/s | 22.0 tok/s | 654.6 ms   |
 
-Warmed native `llama3.1-8b` single-sequence lane
-(`./tests/sm86/bench_llama31_8b.sh`, `pp577 / tg128`, commit `9cd7e91` plus
-local benchmark script):
+Current `llama3.1-8b` CUDA INT8 single-sequence lane
+(`--int8`, prompt `Hello`, `tg32`, commit `7837902`):
 
 | Model         | Path                    | Prefill   | Decode     |
 |---------------|-------------------------|-----------|------------|
-| llama3.1-8b   | default CUDA BF16 path  | 54.6 tok/s | 6.2 tok/s |
+| llama3.1-8b   | baked INT8 component path | n/a     | 38.9 tok/s |
 
 Notes:
 
@@ -197,10 +197,12 @@ Notes:
 - The warmed `4B` hero-lane benchmark above also recorded these stage means:
   `full_attn_core=121.1 ms`, `linear_proj=35.1 ms`, `linear_out=78.7 ms`,
   `mlp_gate_up=160.6 ms`, `mlp_down=212.9 ms`.
-- `llama3.1-8b` currently runs through the shared component decode path, not a
-  dedicated persistent kernel. End-to-end throughput is recorded above, but
-  `--emit-stage-timings` still reports zeroed per-stage buckets on that path,
-  so there is no reliable section-by-section timing breakdown yet.
+- `llama3.1-8b --int8` currently runs through the shared component decode path,
+  not a dedicated persistent kernel. It uses CUDA fast-greedy lm-head scoring,
+  reusable component MLP scratch, and strided-KV decode attention. A `pp2/tg16`
+  staged run recorded `392.4 ms` total over 15 timed tokens
+  (`26.2 ms/token`): `full_attn=154.1 ms`, `mlp=205.6 ms`,
+  `rms_norm=13.1 ms`, `lm_head=19.5 ms`.
 - ¹ The batched decode figure is aggregate tokens/second across
   `--batch-size 2`.
 
@@ -228,7 +230,12 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench.sh \
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_qwen4b_single.sh \
   /path/to/Qwen3.5-4B
 
-# CUDA / sm86 warmed Llama 3.1 8B single-sequence lane
-SUPERSONIC_BACKENDS=cuda ./tests/sm86/bench_llama31_8b.sh \
-  /path/to/Meta-Llama-3.1-8B
+# CUDA / sm86 Llama 3.1 8B INT8 single-sequence lane
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
+  --backend cuda \
+  --model llama3.1-8b \
+  --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --int8
 ```
