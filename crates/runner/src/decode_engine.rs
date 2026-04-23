@@ -2191,7 +2191,6 @@ impl DecodeEngine {
                 }
                 out
             };
-            key_only_pre_gate = Some(f32_to_bf16_bytes_host(host_attention(true, false)));
             value_only_pre_gate = Some(f32_to_bf16_bytes_host(host_attention(false, true)));
             let query_cert = GpuBuffer::from_host_bytes(
                 self.ordinal,
@@ -2206,6 +2205,74 @@ impl DecodeEngine {
             let mut cert_attn_out =
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
                     .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attn alloc: {e}"))?;
+            let full_v_cert = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &full_v_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV BF16 value H2D: {e}"))?;
+            let tail_k_for_bf16_values = if tail_len > 0 {
+                let mut tail_k_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
+                let tail_row_bytes = tail_len * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    let full_src = h * kv_row_bytes + aligned * head_dim * elem_bytes;
+                    let tail_dst = h * tail_row_bytes;
+                    tail_k_bytes[tail_dst..tail_dst + tail_row_bytes]
+                        .copy_from_slice(&full_k_bytes[full_src..full_src + tail_row_bytes]);
+                }
+                Some(
+                    GpuBuffer::from_host_bytes(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        &[num_kv_heads, tail_len, head_dim],
+                        &tail_k_bytes,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} trace certified KV BF16-value tail K H2D: {e}")
+                    })?,
+                )
+            } else {
+                None
+            };
+            let mut key_only_score_scratch =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len]).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value score alloc: {e}"),
+                )?;
+            let mut key_only_attn_out =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim]).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value attn alloc: {e}"),
+                )?;
+            kernel_ffi::certified_kv::attend_int8_bf16_values(
+                self.ordinal,
+                &query_cert,
+                &key_i8,
+                &key_scale,
+                &full_v_cert,
+                tail_k_for_bf16_values.as_ref(),
+                block_size,
+                num_q_heads / num_kv_heads,
+                1.0 / (head_dim as f32).sqrt(),
+                &mut key_only_score_scratch,
+                &mut key_only_attn_out,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value attention: {e}"))?;
+            let mut key_only_attn_out_bf16 =
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim]).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value cast alloc: {e}"),
+                )?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                &key_only_attn_out,
+                &mut key_only_attn_out_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value cast: {e}"))?;
+            key_only_pre_gate = Some(key_only_attn_out_bf16.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV BF16-value D2H: {e}")
+            })?);
             if tail_len > 0 {
                 let mut tail_k_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
                 let mut tail_v_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];

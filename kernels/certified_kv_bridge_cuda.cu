@@ -427,6 +427,88 @@ __global__ void certified_kv_attend_int8_int4_bf16_tail_kernel(
     }
 }
 
+__global__ void certified_kv_attend_int8_bf16_values_kernel(
+    const __nv_bfloat16* query,
+    const uint8_t* key_int8,
+    const float* key_scale,
+    const __nv_bfloat16* value_bf16,
+    const __nv_bfloat16* tail_key,
+    float* score_scratch,
+    float* output_f32,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int tail_len,
+    int head_dim,
+    int gqa_group,
+    float q_scale
+) {
+    const int qh = blockIdx.x;
+    if (qh >= q_heads) return;
+    const int kvh = qh / gqa_group;
+    if (kvh >= kv_heads) return;
+    const int aligned_tokens = num_blocks * block_size;
+    const int total_tokens = aligned_tokens + tail_len;
+
+    for (int tok = threadIdx.x; tok < aligned_tokens; tok += blockDim.x) {
+        const int block_id = tok / block_size;
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+            const int8_t kq = static_cast<int8_t>(
+                key_int8[(static_cast<size_t>(kvh) * aligned_tokens + tok) * head_dim + d]
+            );
+            const float ks =
+                key_scale[(static_cast<size_t>(kvh) * num_blocks + block_id) * head_dim + d];
+            acc += q * (static_cast<float>(kq) * ks);
+        }
+        score_scratch[static_cast<size_t>(qh) * total_tokens + tok] = acc * q_scale;
+    }
+    for (int tail_tok = threadIdx.x; tail_tok < tail_len; tail_tok += blockDim.x) {
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+            const float k = bf16_to_float(
+                tail_key[(static_cast<size_t>(kvh) * tail_len + tail_tok) * head_dim + d]
+            );
+            acc += q * k;
+        }
+        score_scratch[static_cast<size_t>(qh) * total_tokens + aligned_tokens + tail_tok] =
+            acc * q_scale;
+    }
+    __syncthreads();
+
+    __shared__ float max_score;
+    __shared__ float denom;
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            m = fmaxf(m, score_scratch[static_cast<size_t>(qh) * total_tokens + tok]);
+        }
+        float s = 0.0f;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            s += expf(score_scratch[static_cast<size_t>(qh) * total_tokens + tok] - m);
+        }
+        max_score = m;
+        denom = s;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            const float w =
+                expf(score_scratch[static_cast<size_t>(qh) * total_tokens + tok] - max_score) / denom;
+            const float v = bf16_to_float(
+                value_bf16[(static_cast<size_t>(kvh) * total_tokens + tok) * head_dim + d]
+            );
+            acc += w * v;
+        }
+        output_f32[static_cast<size_t>(qh) * head_dim + d] = acc;
+    }
+}
+
 } // namespace
 
 extern "C" int dotcache_llama31_certified_kv_quantize_bf16(
@@ -668,5 +750,60 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail(
     );
     if (cudaGetLastError() != cudaSuccess) return 34;
     if (cudaDeviceSynchronize() != cudaSuccess) return 35;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values(
+    size_t device_ordinal,
+    const void* query_bf16,
+    const void* key_int8,
+    const void* key_scale,
+    const void* value_bf16,
+    const void* tail_key_bf16,
+    void* score_scratch,
+    void* output_f32,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int tail_len,
+    int head_dim,
+    int gqa_group,
+    float q_scale
+) {
+    if (query_bf16 == nullptr || key_int8 == nullptr || key_scale == nullptr ||
+        value_bf16 == nullptr || score_scratch == nullptr || output_f32 == nullptr) {
+        return 41;
+    }
+    if (tail_len > 0 && tail_key_bf16 == nullptr) {
+        return 42;
+    }
+    if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
+        tail_len < 0 || head_dim <= 0 || gqa_group <= 0) {
+        return 43;
+    }
+    if (block_size > 256 || q_heads != kv_heads * gqa_group) {
+        return 44;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    certified_kv_attend_int8_bf16_values_kernel<<<q_heads, 256>>>(
+        static_cast<const __nv_bfloat16*>(query_bf16),
+        static_cast<const uint8_t*>(key_int8),
+        static_cast<const float*>(key_scale),
+        static_cast<const __nv_bfloat16*>(value_bf16),
+        static_cast<const __nv_bfloat16*>(tail_key_bf16),
+        static_cast<float*>(score_scratch),
+        static_cast<float*>(output_f32),
+        q_heads,
+        kv_heads,
+        num_blocks,
+        block_size,
+        tail_len,
+        head_dim,
+        gqa_group,
+        q_scale
+    );
+    if (cudaGetLastError() != cudaSuccess) return 45;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 46;
     return 0;
 }
