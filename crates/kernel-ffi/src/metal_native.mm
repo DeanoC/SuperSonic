@@ -91,6 +91,14 @@ struct ComputeBetaGParams {
     uint32_t total_elems;
 };
 
+struct DeltaRecurrentPrefillParams {
+    uint32_t seq_len;
+    uint32_t k_head_dim;
+    uint32_t v_head_dim;
+    uint32_t out_rows;
+    uint32_t total_threads;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -1482,6 +1490,141 @@ kernel void supersonic_compute_beta_g_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> delta_recurrent_prefill_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:157
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"DRP(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DeltaRecurrentPrefillParams {
+    uint seq_len;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint out_rows;
+    uint total_threads;
+};
+
+kernel void supersonic_delta_recurrent_prefill_f32(
+    device const float* initial_state [[buffer(0)]],
+    device const float* query [[buffer(1)]],
+    device const float* key [[buffer(2)]],
+    device const float* value [[buffer(3)]],
+    device const float* beta [[buffer(4)]],
+    device const float* g [[buffer(5)]],
+    device float* out [[buffer(6)]],
+    constant DeltaRecurrentPrefillParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+    uint head = gid / params.v_head_dim;
+    uint vv = gid - head * params.v_head_dim;
+
+    uint state_head_base = head * params.k_head_dim * params.v_head_dim;
+    uint qk_head_base = head * params.seq_len * params.k_head_dim;
+    uint v_head_base = head * params.seq_len * params.v_head_dim;
+    uint bg_head_base = head * params.seq_len;
+    uint out_head_base = head * params.out_rows * params.v_head_dim;
+
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        uint src_idx = state_head_base + kk * params.v_head_dim + vv;
+        uint dst_idx = out_head_base + (params.seq_len + kk) * params.v_head_dim + vv;
+        out[dst_idx] = initial_state[src_idx];
+    }
+
+    for (uint t = 0; t < params.seq_len; ++t) {
+        float decay = exp(g[bg_head_base + t]);
+        for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+            uint state_idx = out_head_base + (params.seq_len + kk) * params.v_head_dim + vv;
+            out[state_idx] *= decay;
+        }
+
+        uint qk_t_base = qk_head_base + t * params.k_head_dim;
+        uint v_t_base = v_head_base + t * params.v_head_dim;
+        float kv_mem = 0.0f;
+        for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+            uint state_idx = out_head_base + (params.seq_len + kk) * params.v_head_dim + vv;
+            kv_mem = fma(out[state_idx], key[qk_t_base + kk], kv_mem);
+        }
+
+        float delta = (value[v_t_base + vv] - kv_mem) * beta[bg_head_base + t];
+        for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+            uint state_idx = out_head_base + (params.seq_len + kk) * params.v_head_dim + vv;
+            out[state_idx] = fma(key[qk_t_base + kk], delta, out[state_idx]);
+        }
+
+        float acc = 0.0f;
+        for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+            uint state_idx = out_head_base + (params.seq_len + kk) * params.v_head_dim + vv;
+            acc = fma(out[state_idx], query[qk_t_base + kk], acc);
+        }
+        out[out_head_base + t * params.v_head_dim + vv] = acc;
+    }
+}
+)DRP";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:158
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile delta-recurrent-prefill library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_delta_recurrent_prefill_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:159
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load delta-recurrent-prefill function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:160
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create delta-recurrent-prefill pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -2430,6 +2573,134 @@ extern "C" int supersonic_metal_compute_beta_g_f32(
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return 156;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_delta_recurrent_prefill_f32(
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state_ptr,
+    const void* query_ptr,
+    const void* key_ptr,
+    const void* value_ptr,
+    const void* beta_ptr,
+    const void* g_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (batch_heads == 0 || seq_len == 0 || k_head_dim == 0 || v_head_dim == 0) {
+            return 161;
+        }
+        if (batch_heads > UINT32_MAX || seq_len > UINT32_MAX || k_head_dim > UINT32_MAX ||
+            v_head_dim > UINT32_MAX || initial_state_ptr == nullptr || query_ptr == nullptr ||
+            key_ptr == nullptr || value_ptr == nullptr || beta_ptr == nullptr || g_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 162;
+        }
+
+        if (v_head_dim != 0 && batch_heads > SIZE_MAX / v_head_dim) {
+            return 163;
+        }
+        size_t total_threads = batch_heads * v_head_dim;
+        if (total_threads > UINT32_MAX) {
+            return 164;
+        }
+        if (k_head_dim > SIZE_MAX - seq_len) {
+            return 165;
+        }
+        size_t out_rows = seq_len + k_head_dim;
+        if (out_rows > UINT32_MAX) {
+            return 165;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = delta_recurrent_prefill_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 166;
+        }
+
+        id<MTLBuffer> initial_state = nil;
+        id<MTLBuffer> query = nil;
+        id<MTLBuffer> key = nil;
+        id<MTLBuffer> value = nil;
+        id<MTLBuffer> beta = nil;
+        id<MTLBuffer> g = nil;
+        id<MTLBuffer> out = nil;
+        size_t initial_state_offset = 0;
+        size_t query_offset = 0;
+        size_t key_offset = 0;
+        size_t value_offset = 0;
+        size_t beta_offset = 0;
+        size_t g_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(initial_state_ptr, &initial_state, &initial_state_offset) != 0) {
+            return 167;
+        }
+        if (lookup_buffer(query_ptr, &query, &query_offset) != 0) {
+            return 168;
+        }
+        if (lookup_buffer(key_ptr, &key, &key_offset) != 0) {
+            return 169;
+        }
+        if (lookup_buffer(value_ptr, &value, &value_offset) != 0) {
+            return 170;
+        }
+        if (lookup_buffer(beta_ptr, &beta, &beta_offset) != 0) {
+            return 171;
+        }
+        if (lookup_buffer(g_ptr, &g, &g_offset) != 0) {
+            return 172;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 173;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 174;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 175;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 176;
+        }
+
+        DeltaRecurrentPrefillParams params = {
+            static_cast<uint32_t>(seq_len),
+            static_cast<uint32_t>(k_head_dim),
+            static_cast<uint32_t>(v_head_dim),
+            static_cast<uint32_t>(out_rows),
+            static_cast<uint32_t>(total_threads),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:initial_state offset:initial_state_offset atIndex:0];
+        [encoder setBuffer:query offset:query_offset atIndex:1];
+        [encoder setBuffer:key offset:key_offset atIndex:2];
+        [encoder setBuffer:value offset:value_offset atIndex:3];
+        [encoder setBuffer:beta offset:beta_offset atIndex:4];
+        [encoder setBuffer:g offset:g_offset atIndex:5];
+        [encoder setBuffer:out offset:out_offset atIndex:6];
+        [encoder setBytes:&params length:sizeof(params) atIndex:7];
+
+        NSUInteger tg_width =
+            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_threads, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 177;
         }
         return 0;
     }

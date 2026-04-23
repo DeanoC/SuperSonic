@@ -171,6 +171,19 @@ unsafe extern "C" {
         beta_ptr: *mut c_void,
         g_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_delta_recurrent_prefill_f32(
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state_ptr: *const c_void,
+        query_ptr: *const c_void,
+        key_ptr: *const c_void,
+        value_ptr: *const c_void,
+        beta_ptr: *const c_void,
+        g_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -841,6 +854,78 @@ pub(crate) fn compute_beta_g_f32(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn delta_recurrent_prefill_f32(
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total_threads = batch_heads.checked_mul(v_head_dim).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native delta_recurrent_prefill_f32 shape overflows: batch_heads={batch_heads} v_head_dim={v_head_dim}"
+        ))
+    })?;
+    if total_threads > u32::MAX as usize
+        || batch_heads > u32::MAX as usize
+        || seq_len > u32::MAX as usize
+        || k_head_dim > u32::MAX as usize
+        || v_head_dim > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native delta_recurrent_prefill_f32 supports u32-sized shapes, got batch_heads={batch_heads} seq_len={seq_len} k_head_dim={k_head_dim} v_head_dim={v_head_dim}"
+        )));
+    }
+    if initial_state.dtype() != ScalarType::F32
+        || query.dtype() != ScalarType::F32
+        || key.dtype() != ScalarType::F32
+        || value.dtype() != ScalarType::F32
+        || beta.dtype() != ScalarType::F32
+        || g.dtype() != ScalarType::F32
+        || out.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native delta_recurrent_prefill_f32 expects F32 buffers, got initial_state={:?} query={:?} key={:?} value={:?} beta={:?} g={:?} out={:?}",
+            initial_state.dtype(),
+            query.dtype(),
+            key.dtype(),
+            value.dtype(),
+            beta.dtype(),
+            g.dtype(),
+            out.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        supersonic_metal_delta_recurrent_prefill_f32(
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            initial_state.as_ptr(),
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            beta.as_ptr(),
+            g.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native delta_recurrent_prefill_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -1015,6 +1100,25 @@ pub(crate) fn compute_beta_g_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native compute_beta_g_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn delta_recurrent_prefill_f32(
+    _batch_heads: usize,
+    _seq_len: usize,
+    _k_head_dim: usize,
+    _v_head_dim: usize,
+    _initial_state: &GpuBuffer,
+    _query: &GpuBuffer,
+    _key: &GpuBuffer,
+    _value: &GpuBuffer,
+    _beta: &GpuBuffer,
+    _g: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native delta_recurrent_prefill_f32 is not compiled".into(),
     ))
 }
 
@@ -1643,6 +1747,133 @@ mod tests {
         for (idx, (a, e)) in g_native_vals.iter().zip(g_ref_vals.iter()).enumerate() {
             let delta = (a - e).abs();
             assert!(delta <= 1e-6, "g idx {idx}: expected {e}, got {a}, delta {delta}");
+        }
+    }
+
+    #[test]
+    fn metal_native_delta_recurrent_prefill_f32_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let batch_heads = 2usize;
+        let seq_len = 3usize;
+        let k_head_dim = 2usize;
+        let v_head_dim = 2usize;
+
+        let initial_state_vals = vec![
+            0.1f32, 0.2, 0.3, 0.4, // head0 [k=2,v=2]
+            -0.2, 0.5, 0.7, -0.1, // head1
+        ];
+        let query_vals = vec![
+            0.5f32, -0.3, 0.1, 0.2, -0.4, 0.8, // head0 [t=3,k=2]
+            0.2, 0.6, -0.7, 0.4, 0.3, -0.5, // head1
+        ];
+        let key_vals = vec![
+            -0.1f32, 0.9, 0.3, -0.2, 0.4, 0.5, // head0
+            0.2, -0.6, 0.8, 0.1, -0.3, 0.7, // head1
+        ];
+        let value_vals = vec![
+            0.3f32, -0.4, 0.9, 0.2, -0.5, 0.7, // head0 [t=3,v=2]
+            0.6, -0.1, -0.2, 0.4, 0.8, -0.9, // head1
+        ];
+        let beta_vals = vec![0.2f32, 0.5, 0.7, 0.4, 0.6, 0.3];
+        let g_vals = vec![-0.3f32, 0.1, -0.2, 0.0, -0.4, 0.2];
+
+        let initial_state = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, k_head_dim, v_head_dim],
+            &f32_bytes(&initial_state_vals),
+        )
+        .expect("upload initial_state");
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, seq_len, k_head_dim],
+            &f32_bytes(&query_vals),
+        )
+        .expect("upload query");
+        let key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, seq_len, k_head_dim],
+            &f32_bytes(&key_vals),
+        )
+        .expect("upload key");
+        let value = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, seq_len, v_head_dim],
+            &f32_bytes(&value_vals),
+        )
+        .expect("upload value");
+        let beta = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, seq_len],
+            &f32_bytes(&beta_vals),
+        )
+        .expect("upload beta");
+        let g = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, seq_len],
+            &f32_bytes(&g_vals),
+        )
+        .expect("upload g");
+
+        let out_rows = seq_len + k_head_dim;
+        let mut out_native = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, out_rows, v_head_dim],
+        )
+        .expect("alloc native out");
+        let mut out_ref = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[batch_heads, out_rows, v_head_dim],
+        )
+        .expect("alloc ref out");
+
+        crate::metal_host::delta_recurrent_prefill(
+            ScalarType::F32,
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            &initial_state,
+            &query,
+            &key,
+            &value,
+            &beta,
+            &g,
+            &mut out_ref,
+        )
+        .expect("host delta recurrent");
+        delta_recurrent_prefill_f32(
+            batch_heads,
+            seq_len,
+            k_head_dim,
+            v_head_dim,
+            &initial_state,
+            &query,
+            &key,
+            &value,
+            &beta,
+            &g,
+            &mut out_native,
+        )
+        .expect("native delta recurrent");
+
+        let ref_vals = read_f32(&out_ref);
+        let native_vals = read_f32(&out_native);
+        for (idx, (a, e)) in native_vals.iter().zip(ref_vals.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
         }
     }
 }

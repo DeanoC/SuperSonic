@@ -910,6 +910,25 @@ pub fn delta_recurrent_prefill(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && metal_native::delta_recurrent_prefill_f32(
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                initial_state,
+                query,
+                key,
+                value,
+                beta,
+                g,
+                out,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::delta_recurrent_prefill(
             dtype,
             batch_heads,
