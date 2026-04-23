@@ -693,17 +693,36 @@ pub fn run_llama31(
 
     let decode_start = Instant::now();
     let mut stage_totals = DecodeStageTimings::default();
+    let cuda_fast_greedy_enabled = oracle_output.is_none()
+        && !gpu_validate_enabled
+        && std::env::var_os("SUPERSONIC_DISABLE_CUDA_LLAMA31_FAST_GREEDY").is_none();
+    if cuda_fast_greedy_enabled {
+        eprintln!("[decode] CUDA Llama31 fast greedy lm_head argmax enabled");
+    }
     while generated.len() < cli.max_new_tokens && !eos_ids.contains(&next_token) {
         let pos = prompt_ids.len() + generated.len() - 1;
-        let logits = if cli.emit_stage_timings {
-            let (logits, timings) = engine.decode_step_with_timings(next_token, pos)?;
-            stage_totals.add_assign(timings);
-            logits
+        let (native_next, logits_for_validation) = if cuda_fast_greedy_enabled {
+            let (token, timings) =
+                engine.component_decode_step_4b_cuda_fast_greedy(next_token, pos, cli.emit_stage_timings)?;
+            if cli.emit_stage_timings {
+                stage_totals.add_assign(timings);
+            }
+            (token, None)
         } else {
-            engine.decode_step(next_token, pos)?
+            let logits = if cli.emit_stage_timings {
+                let (logits, timings) = engine.decode_step_with_timings(next_token, pos)?;
+                stage_totals.add_assign(timings);
+                logits
+            } else {
+                engine.decode_step(next_token, pos)?
+            };
+            let native_next = DecodeEngine::greedy_sample(&logits);
+            (native_next, Some(logits))
         };
-        let native_next = DecodeEngine::greedy_sample(&logits);
         if let Some(ref oracle) = oracle_output {
+            let logits = logits_for_validation
+                .as_ref()
+                .ok_or_else(|| anyhow!("validation requires logits; fast greedy should be disabled"))?;
             let decode_idx = generated.len() - 1;
             if let Some(oracle_logits) = oracle.decode_logits.get(decode_idx) {
                 let delta = validate::max_abs_delta(&logits, oracle_logits);
@@ -738,6 +757,9 @@ pub fn run_llama31(
                 cli.prefill_chunk_size,
                 true,
             )?;
+            let logits = logits_for_validation
+                .as_ref()
+                .ok_or_else(|| anyhow!("GPU validation requires logits; fast greedy should be disabled"))?;
             let delta = validate::max_abs_delta(&logits, &gpu_logits);
             if delta > gpu_max_delta {
                 gpu_max_delta = delta;

@@ -1944,8 +1944,9 @@ impl DecodeEngine {
         trace_input_layer: Option<usize>,
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
+        cuda_greedy: bool,
         mut timings: Option<&mut DecodeStageTimings>,
-    ) -> Result<(Vec<f32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
+    ) -> Result<(Option<Vec<f32>>, Option<u32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
         let hidden_dim = self.weights.config.hidden_size;
         let vocab_size = self.weights.config.vocab_size;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -2102,6 +2103,40 @@ impl DecodeEngine {
             t.rms_norm_ms += final_norm_start.elapsed().as_secs_f64() * 1000.0;
         }
 
+        if cuda_greedy {
+            let lm_head_start = Instant::now();
+            kernel_ffi::cuda_lm_head_argmax_bf16(
+                self.ordinal,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                &mut self.lm_head_block_best_vals,
+                &mut self.lm_head_block_best_idxs,
+                &mut self.argmax_buf,
+                hidden_dim,
+                vocab_size,
+            )
+            .map_err(|e| anyhow::anyhow!("cuda fused lm_head argmax 4b: {e}"))?;
+            self.sync_stage_if_requested(collect_timings, "cuda fused lm_head argmax 4b")?;
+            if let Some(t) = timings.as_mut() {
+                t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
+            }
+
+            let token_d2h_start = Instant::now();
+            let token_bytes = self
+                .argmax_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
+            if let Some(t) = timings.as_mut() {
+                t.token_d2h_ms += token_d2h_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            let sampled_token = u32::from_le_bytes(
+                token_bytes[..4]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
+            );
+            return Ok((None, Some(sampled_token), traced_hidden, traced_layer, traced_linear));
+        }
+
         let lm_head_start = Instant::now();
         kernel_ffi::standalone_matvec_4b(
             self.ordinal,
@@ -2128,10 +2163,13 @@ impl DecodeEngine {
             t.logits_d2h_ms += logits_d2h_start.elapsed().as_secs_f64() * 1000.0;
         }
         Ok((
-            logits_bytes
-                .chunks_exact(2)
-                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
-                .collect(),
+            Some(
+                logits_bytes
+                    .chunks_exact(2)
+                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                    .collect(),
+            ),
+            None,
             traced_hidden,
             traced_layer,
             traced_linear,
@@ -2139,9 +2177,9 @@ impl DecodeEngine {
     }
 
     fn component_decode_step_4b(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
-        let (logits, _, _, _) =
-            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, None)?;
-        Ok(logits)
+        let (logits, _, _, _, _) =
+            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, false, None)?;
+        logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
     }
 
     fn component_decode_step_4b_with_timings(
@@ -2150,18 +2188,45 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
         let mut timings = DecodeStageTimings::default();
-        let (logits, _, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
             None,
             None,
+            false,
             Some(&mut timings),
         )?;
+        let logits = logits.ok_or_else(|| anyhow::anyhow!("component decode timings missing logits"))?;
         let sampling_start = Instant::now();
         let _ = Self::greedy_sample(&logits);
         timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
         Ok((logits, timings))
+    }
+
+    pub fn component_decode_step_4b_cuda_fast_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        collect_timings: bool,
+    ) -> Result<(u32, DecodeStageTimings)> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
+            anyhow::bail!("component_decode_step_4b_cuda_fast_greedy requires CUDA backend");
+        }
+        let mut timings = DecodeStageTimings::default();
+        let timing_slot = if collect_timings { Some(&mut timings) } else { None };
+        let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            true,
+            timing_slot,
+        )?;
+        let sampled_token = sampled_token
+            .ok_or_else(|| anyhow::anyhow!("component CUDA fast greedy missing sampled token"))?;
+        Ok((sampled_token, timings))
     }
 
     pub fn component_decode_step_4b_traced(
@@ -2170,14 +2235,16 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_input_layer: usize,
     ) -> Result<(Vec<f32>, Vec<u8>)> {
-        let (logits, trace, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, trace, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             Some(trace_input_layer),
             None,
             None,
+            false,
             None,
         )?;
+        let logits = logits.ok_or_else(|| anyhow::anyhow!("component trace missing logits"))?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing trace for layer {trace_input_layer}"))?;
         Ok((logits, trace))
     }
@@ -2188,14 +2255,16 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLayerTrace)> {
-        let (logits, _, trace, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, trace, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
             Some(trace_layer),
             None,
+            false,
             None,
         )?;
+        let logits = logits.ok_or_else(|| anyhow::anyhow!("component layer trace missing logits"))?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
@@ -2206,14 +2275,16 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLinearTrace)> {
-        let (logits, _, _, trace) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, trace) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
             None,
             Some(trace_layer),
+            false,
             None,
         )?;
+        let logits = logits.ok_or_else(|| anyhow::anyhow!("component linear trace missing logits"))?;
         let trace = trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
