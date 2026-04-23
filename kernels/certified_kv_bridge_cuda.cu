@@ -380,11 +380,26 @@ __device__ __forceinline__ float certified_kv_dequant_int4_value(
 ) {
     const int packed_dim = head_dim / 2;
     const int groups = head_dim / value_group_size;
+    const int group = d / value_group_size;
     const uint8_t packed =
         value_int4[(static_cast<size_t>(kvh) * value_stride_tokens + tok) * packed_dim + (d / 2)];
     const int q = (d & 1) == 0 ? (packed & 0x0f) : ((packed >> 4) & 0x0f);
-    const int group = d / value_group_size;
     const size_t meta_idx = (static_cast<size_t>(kvh) * value_stride_tokens + tok) * groups + group;
+
+    if (value_group_size == 16 && head_dim <= blockDim.x) {
+        const int lane = threadIdx.x & 31;
+        const int leader_lane = lane & ~15;
+        float scale = 0.0f;
+        float zero = 0.0f;
+        if ((d & 15) == 0) {
+            scale = __half2float(value_scale[meta_idx]);
+            zero = __half2float(value_zero[meta_idx]);
+        }
+        scale = __shfl_sync(0xffffffff, scale, leader_lane);
+        zero = __shfl_sync(0xffffffff, zero, leader_lane);
+        return static_cast<float>(q) * scale + zero;
+    }
+
     return static_cast<float>(q) * __half2float(value_scale[meta_idx]) + __half2float(value_zero[meta_idx]);
 }
 
