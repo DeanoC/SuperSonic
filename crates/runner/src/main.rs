@@ -392,9 +392,13 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     certified_kv_shadow_validate: bool,
 
-    /// Debug-only: compare one block-aligned full-attention layer using dense KV vs certified KV.
+    /// Debug-only: compare one full-attention layer using dense KV vs certified KV.
     #[arg(long, hide = true)]
     certified_kv_trace_layer: Option<usize>,
+
+    /// Debug-only: sweep all full-attention layers using dense KV vs certified KV.
+    #[arg(long, hide = true)]
+    certified_kv_trace_all: bool,
 
     /// Certified KV cache block size in tokens.
     #[arg(long, default_value = "16", hide = true)]

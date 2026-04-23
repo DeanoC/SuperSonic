@@ -1108,8 +1108,12 @@ pub fn run_llama31(
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
     }
-    if let (Some(cfg), Some(trace_layer)) = (&certified_kv_cfg, cli.certified_kv_trace_layer) {
-        trace_llama31_certified_kv_layer(&mut engine, &prompt_ids, trace_layer, cfg)?;
+    if let Some(cfg) = &certified_kv_cfg {
+        if cli.certified_kv_trace_all {
+            trace_llama31_certified_kv_all_layers(&mut engine, &prompt_ids, cfg)?;
+        } else if let Some(trace_layer) = cli.certified_kv_trace_layer {
+            trace_llama31_certified_kv_layer(&mut engine, &prompt_ids, trace_layer, cfg)?;
+        }
     }
     if let Some(cfg) = &certified_kv_cfg {
         if let Some(path) = cfg.telemetry_path.as_ref() {
@@ -1178,12 +1182,63 @@ pub fn run_llama31(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CertifiedKvLayerTrace {
+    layer: usize,
+    trace_tokens: usize,
+    prefix_tokens: usize,
+    pre_gate_delta: f32,
+    gated_delta: f32,
+    attn_hidden_delta: f32,
+}
+
+fn trace_llama31_certified_kv_all_layers(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    cfg: &crate::certified_kv::CertifiedKvConfig,
+) -> Result<()> {
+    let text_config = engine.weights().config.clone();
+    let mut traces = Vec::new();
+    for layer in 1..text_config.num_hidden_layers {
+        if text_config.is_full_attention(layer) {
+            traces.push(trace_llama31_certified_kv_layer(engine, prompt_ids, layer, cfg)?);
+        }
+    }
+    let Some(worst_pre) = traces
+        .iter()
+        .max_by(|a, b| a.pre_gate_delta.total_cmp(&b.pre_gate_delta))
+    else {
+        bail!("certified KV trace found no full-attention layers");
+    };
+    let worst_hidden = traces
+        .iter()
+        .max_by(|a, b| a.attn_hidden_delta.total_cmp(&b.attn_hidden_delta))
+        .expect("trace list is non-empty");
+    let worst_gated = traces
+        .iter()
+        .max_by(|a, b| a.gated_delta.total_cmp(&b.gated_delta))
+        .expect("trace list is non-empty");
+    eprintln!(
+        "[certified-kv-trace-summary] layers={} trace_tokens={} prefix_tokens={} worst_pre_gate_layer={} worst_pre_gate_delta={:.6} worst_gated_layer={} worst_gated_delta={:.6} worst_attn_hidden_layer={} worst_attn_hidden_delta={:.6}",
+        traces.len(),
+        worst_pre.trace_tokens,
+        worst_pre.prefix_tokens,
+        worst_pre.layer,
+        worst_pre.pre_gate_delta,
+        worst_gated.layer,
+        worst_gated.gated_delta,
+        worst_hidden.layer,
+        worst_hidden.attn_hidden_delta,
+    );
+    Ok(())
+}
+
 fn trace_llama31_certified_kv_layer(
     engine: &mut DecodeEngine,
     prompt_ids: &[u32],
     trace_layer: usize,
     cfg: &crate::certified_kv::CertifiedKvConfig,
-) -> Result<()> {
+) -> Result<CertifiedKvLayerTrace> {
     let text_config = engine.weights().config.clone();
     anyhow::ensure!(
         text_config.is_full_attention(trace_layer),
@@ -1247,7 +1302,14 @@ fn trace_llama31_certified_kv_layer(
         gated_delta,
         attn_hidden_delta,
     );
-    Ok(())
+    Ok(CertifiedKvLayerTrace {
+        layer: trace_layer,
+        trace_tokens: trace_len,
+        prefix_tokens: seqlen_offset,
+        pre_gate_delta,
+        gated_delta,
+        attn_hidden_delta,
+    })
 }
 
 fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
