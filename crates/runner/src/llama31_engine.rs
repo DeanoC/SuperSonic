@@ -1193,15 +1193,15 @@ fn trace_llama31_certified_kv_layer(
         trace_layer > 0,
         "--certified-kv-trace-layer currently requires layer > 0"
     );
-    let aligned_len = (prompt_ids.len() / cfg.block_size) * cfg.block_size;
+    let trace_len = prompt_ids.len();
     anyhow::ensure!(
-        aligned_len >= cfg.block_size && aligned_len > 1,
-        "prompt has {} tokens, not enough for block-aligned certified KV trace with block_size={}",
+        trace_len >= cfg.block_size && trace_len > 1,
+        "prompt has {} tokens, not enough for certified KV trace with block_size={}",
         prompt_ids.len(),
         cfg.block_size
     );
-    let trace_ids = &prompt_ids[..aligned_len];
-    let prefix_ids = &trace_ids[..aligned_len - 1];
+    let trace_ids = &prompt_ids[..trace_len];
+    let prefix_ids = &trace_ids[..trace_len - 1];
     let seqlen_offset = prefix_ids.len();
     let replay = engine.prefill_native_with_trace(trace_ids)?;
     let replay_hidden = replay
@@ -1240,7 +1240,7 @@ fn trace_llama31_certified_kv_layer(
     eprintln!(
         "[certified-kv-trace] layer={} trace_tokens={} prefix_tokens={} pre_gate_delta={:.6} gated_delta={:.6} attn_hidden_delta={:.6}",
         trace_layer,
-        aligned_len,
+        trace_len,
         seqlen_offset,
         pre_gate_delta,
         gated_delta,

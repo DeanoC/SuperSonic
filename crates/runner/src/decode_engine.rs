@@ -2044,9 +2044,11 @@ impl DecodeEngine {
                 .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
         }
         if let Some((block_size, value_group_size)) = certified_kv {
+            let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
+            let tail_len = kv_len - aligned;
             anyhow::ensure!(
-                kv_len % block_size == 0,
-                "layer {idx} certified KV trace requires block-aligned kv_len={kv_len} block_size={block_size}"
+                aligned > 0,
+                "layer {idx} certified KV trace requires at least one complete block, kv_len={kv_len} block_size={block_size}"
             );
             let kv_k_cert = GpuBuffer::from_host_bytes(
                 self.ordinal,
@@ -2116,22 +2118,68 @@ impl DecodeEngine {
             let mut cert_attn_out =
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
                     .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attn alloc: {e}"))?;
-            kernel_ffi::certified_kv::attend_int8_int4(
-                self.ordinal,
-                &query_cert,
-                &key_i8,
-                &key_scale,
-                &value_i4,
-                &value_scale,
-                &value_zero,
-                block_size,
-                value_group_size,
-                num_q_heads / num_kv_heads,
-                1.0 / (head_dim as f32).sqrt(),
-                &mut score_scratch,
-                &mut cert_attn_out,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attention: {e}"))?;
+            if tail_len > 0 {
+                let mut tail_k_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
+                let mut tail_v_bytes = vec![0u8; num_kv_heads * tail_len * head_dim * elem_bytes];
+                let tail_row_bytes = tail_len * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    let full_src = h * kv_row_bytes + aligned * head_dim * elem_bytes;
+                    let tail_dst = h * tail_row_bytes;
+                    tail_k_bytes[tail_dst..tail_dst + tail_row_bytes]
+                        .copy_from_slice(&full_k_bytes[full_src..full_src + tail_row_bytes]);
+                    tail_v_bytes[tail_dst..tail_dst + tail_row_bytes]
+                        .copy_from_slice(&full_v_bytes[full_src..full_src + tail_row_bytes]);
+                }
+                let tail_k = GpuBuffer::from_host_bytes(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, tail_len, head_dim],
+                    &tail_k_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV tail K H2D: {e}"))?;
+                let tail_v = GpuBuffer::from_host_bytes(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, tail_len, head_dim],
+                    &tail_v_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV tail V H2D: {e}"))?;
+                kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail(
+                    self.ordinal,
+                    &query_cert,
+                    &key_i8,
+                    &key_scale,
+                    &value_i4,
+                    &value_scale,
+                    &value_zero,
+                    &tail_k,
+                    &tail_v,
+                    block_size,
+                    value_group_size,
+                    num_q_heads / num_kv_heads,
+                    1.0 / (head_dim as f32).sqrt(),
+                    &mut score_scratch,
+                    &mut cert_attn_out,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV hybrid attention: {e}"))?;
+            } else {
+                kernel_ffi::certified_kv::attend_int8_int4(
+                    self.ordinal,
+                    &query_cert,
+                    &key_i8,
+                    &key_scale,
+                    &value_i4,
+                    &value_scale,
+                    &value_zero,
+                    block_size,
+                    value_group_size,
+                    num_q_heads / num_kv_heads,
+                    1.0 / (head_dim as f32).sqrt(),
+                    &mut score_scratch,
+                    &mut cert_attn_out,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attention: {e}"))?;
+            }
             kernel_ffi::prefill_ffi::cast(
                 self.ordinal,
                 ScalarType::F32,
