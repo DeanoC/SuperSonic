@@ -353,6 +353,8 @@ pub struct DecodeEngine {
     /// Avoids per-layer-per-step allocation churn on single-sequence
     /// component decode paths.
     component_full_attn_scratch: Option<ComponentFullAttentionScratch>,
+    /// Reusable fixed-size scratch for component MLP decode.
+    component_mlp_scratch: Option<ComponentMlpScratch>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -446,6 +448,28 @@ impl ComponentFullAttentionScratch {
                 .map_err(|e| anyhow::anyhow!("component full-attn gated alloc: {e}"))?,
             proj_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
                 .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
+        })
+    }
+}
+
+struct ComponentMlpScratch {
+    gate: GpuBuffer,
+    up: GpuBuffer,
+    mlp: GpuBuffer,
+    down: GpuBuffer,
+}
+
+impl ComponentMlpScratch {
+    fn alloc(config: &TextConfig, ordinal: usize) -> Result<Self> {
+        Ok(Self {
+            gate: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.intermediate_size])
+                .map_err(|e| anyhow::anyhow!("component mlp gate alloc: {e}"))?,
+            up: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.intermediate_size])
+                .map_err(|e| anyhow::anyhow!("component mlp up alloc: {e}"))?,
+            mlp: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.intermediate_size])
+                .map_err(|e| anyhow::anyhow!("component mlp act alloc: {e}"))?,
+            down: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
+                .map_err(|e| anyhow::anyhow!("component mlp down alloc: {e}"))?,
         })
     }
 }
@@ -3181,17 +3205,14 @@ impl DecodeEngine {
 
     fn component_decode_mlp_layer(&mut self, idx: usize, trace_output: bool) -> Result<Option<ComponentMlpTrace>> {
         let config = &self.weights.config;
-        let lw = &self.weights.layers[idx];
         let hidden_dim = config.hidden_size;
         let intermediate = config.intermediate_size;
-        let mut gate = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp gate alloc: {e}"))?;
-        let mut up = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp up alloc: {e}"))?;
-        let mut mlp = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp act alloc: {e}"))?;
-        let mut down = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp down alloc: {e}"))?;
+        let mut scratch = self
+            .component_mlp_scratch
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| ComponentMlpScratch::alloc(config, self.ordinal))?;
+        let lw = &self.weights.layers[idx];
         let gate_up_mixed_lhs = if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
             prefill_engine::prepare_int8_mixed_lhs(
                 self.ordinal,
@@ -3217,13 +3238,13 @@ impl DecodeEngine {
                 &format!("{}.layers.{idx}.mlp.gate_proj.weight", self.weights.weight_prefix),
                 &lw.gate_proj_w,
                 sc,
-                &mut gate,
+                &mut scratch.gate,
                 gate_up_mixed_lhs.as_ref(),
             )?;
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, intermediate, hidden_dim,
-                &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut gate,
+                &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.gate,
                 lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
@@ -3239,13 +3260,13 @@ impl DecodeEngine {
                 &format!("{}.layers.{idx}.mlp.up_proj.weight", self.weights.weight_prefix),
                 &lw.up_proj_w,
                 sc,
-                &mut up,
+                &mut scratch.up,
                 gate_up_mixed_lhs.as_ref(),
             )?;
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, intermediate, hidden_dim,
-                &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut up,
+                &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.up,
                 lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
@@ -3253,9 +3274,9 @@ impl DecodeEngine {
             self.ordinal,
             ScalarType::BF16,
             intermediate,
-            &gate,
-            &up,
-            &mut mlp,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.mlp,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
@@ -3265,39 +3286,40 @@ impl DecodeEngine {
                 1,
                 hidden_dim,
                 intermediate,
-                &mlp,
+                &scratch.mlp,
                 &self.weights,
                 &format!("{}.layers.{idx}.mlp.down_proj.weight", self.weights.weight_prefix),
                 &lw.down_proj_w,
                 sc,
-                &mut down,
+                &mut scratch.down,
             )?;
         } else {
             matmul_proj(
                 self.ordinal, 1, 1, hidden_dim, intermediate,
-                &mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut down,
+                &scratch.mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.down,
                 lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
             )?;
         }
         let trace = if trace_output {
             Some(ComponentMlpTrace {
-                gate: gate
+                gate: scratch.gate
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp gate trace D2H: {e}"))?,
-                up: up
+                up: scratch.up
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp up trace D2H: {e}"))?,
-                swiglu: mlp
+                swiglu: scratch.mlp
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp swiglu trace D2H: {e}"))?,
-                down: down
+                down: scratch.down
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp down trace D2H: {e}"))?,
             })
         } else {
             None
         };
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &down)?;
+        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &scratch.down)?;
+        self.component_mlp_scratch = Some(scratch);
         Ok(trace)
     }
 
@@ -3568,6 +3590,11 @@ impl DecodeEngine {
         } else {
             None
         };
+        let component_mlp_scratch = if use_4b_kernel {
+            Some(ComponentMlpScratch::alloc(config, ordinal)?)
+        } else {
+            None
+        };
 
         Ok(Self {
             weights,
@@ -3595,6 +3622,7 @@ impl DecodeEngine {
             dflash_tap_cache: None,
             dflash_fused_verify_cache: None,
             component_full_attn_scratch,
+            component_mlp_scratch,
         })
     }
 
