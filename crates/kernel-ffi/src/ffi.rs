@@ -1247,7 +1247,7 @@ pub fn standalone_matvec(
     if backend == Backend::Metal {
         let _ = (ordinal, counter_buf);
         if crate::metal_native::disabled_by_env()
-            || std::env::var_os("SUPERSONIC_METAL_ENABLE_NATIVE_STANDALONE_MATVEC").is_none()
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_STANDALONE_MATVEC").is_some()
         {
             crate::metal_native::flush_batch()?;
             return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
