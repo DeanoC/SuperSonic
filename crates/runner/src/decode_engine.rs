@@ -4147,7 +4147,11 @@ impl DecodeEngine {
 
         // 5. Launch batched persistent decode kernel
         let start = Instant::now();
+        // The sm86 hero kernel is tuned and validated only for Qwen3.5 4B geometry.
+        // Qwen3.5 2B/9B also use the 4B persistent lane, so we must gate explicitly.
+        let is_qwen35_4b_geometry = config.hidden_size == 2560;
         let use_qwen35_4b_cuda_hero = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_geometry
             && b == 1
             && self.fp8_scale_device.is_none()
             && self.int4_scale_device.is_none()

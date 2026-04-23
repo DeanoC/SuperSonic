@@ -1372,19 +1372,24 @@ pub fn rms_norm_rows_plain_inplace(
     weight: &GpuBuffer,
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
-        let _ = ordinal;
-        let input = unsafe { &*(data as *const GpuBuffer) };
+        let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            input.as_mut_ptr(),
+            data.as_ptr(),
+            data.len_bytes(),
+        )?;
         if dtype == ScalarType::BF16
             && !metal_native::disabled_by_env()
             && !metal_force_host_rms_norm()
         {
-            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, data)
+            if metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
                 .is_ok()
             {
                 return Ok(());
             }
         }
-        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, data);
+        return metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data);
     }
     let ptr = data.as_mut_ptr();
     let status = unsafe {
@@ -1418,15 +1423,20 @@ pub fn element_add_inplace(
     rhs: &GpuBuffer,
 ) -> Result<(), GpuError> {
     if lhs_out.backend() == Backend::Metal {
-        let _ = ordinal;
-        let lhs = unsafe { &*(lhs_out as *const GpuBuffer) };
+        let mut lhs = GpuBuffer::zeros(ordinal, dtype, lhs_out.shape())?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            lhs.as_mut_ptr(),
+            lhs_out.as_ptr(),
+            lhs_out.len_bytes(),
+        )?;
         if !metal_native::disabled_by_env()
             && !metal_force_host_element_add()
-            && metal_native::element_add(dtype, total_elems, lhs, rhs, lhs_out).is_ok()
+            && metal_native::element_add(dtype, total_elems, &lhs, rhs, lhs_out).is_ok()
         {
             return Ok(());
         }
-        return metal_host::element_add(dtype, total_elems, lhs, rhs, lhs_out);
+        return metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out);
     }
     let ptr = lhs_out.as_mut_ptr();
     let status = unsafe {
