@@ -229,17 +229,22 @@ Llama 3.1 8B PG-19 teacher-forced smoke QA is covered separately by
 `--teacher-forced` scorer, which prefills the first token, feeds the true next
 token through dense or certified-KV CUDA decode, and accumulates NLL from the
 returned logits. A tiny local-text probe (`CONTEXTS=32`, one chunk, commit
-work-in-progress after `9d00178`) passed the dense-vs-certified gate:
+`8bffbca`) passed the dense-vs-certified gate:
 
 | Source        | Path              | Context | Chunks | PPL     | Decode ms/tok |
 |---------------|-------------------|--------:|-------:|--------:|--------------:|
 | local fixture | dense INT8        |      32 |      1 | 239.558 |          37.0 |
 | local fixture | certified KV INT8 |      32 |      1 | 235.822 |          36.6 |
+| PG-19 stream  | dense INT8        |     512 |      1 |   6.727 |          53.6 |
+| PG-19 stream  | certified KV INT8 |     512 |      1 |   6.783 |          38.6 |
 
-This is a harness sanity check, not a PG-19 quality number. For PG-19 arxiv_v1
-comparison, run the same script with `CONTEXTS=4096` and
-`REFERENCE_SMOKE=1`; that path compares against the DotCache PG-19 smoke JSON
-when a matching reference cell is present.
+The 512-token PG-19 smoke (`target/pg19_smoke_real_512.json`, one streamed
+test chunk, commit `8bffbca` + docs update) passed the default
+`MAX_CERTIFIED_DELTA=0.10` gate with certified delta `+0.055` ppl. This is
+still a smoke baseline rather than a final quality number. For PG-19 arxiv_v1
+comparison, run the same script with `CONTEXTS=4096` and `REFERENCE_SMOKE=1`;
+that path compares against the DotCache PG-19 smoke JSON when a matching
+reference cell is present.
 
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
