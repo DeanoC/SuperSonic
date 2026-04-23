@@ -84,7 +84,7 @@ fn llama31_int8_late_full_mixed_component_enabled(component: &str) -> bool {
                 .map(|piece| piece.trim().to_ascii_lowercase())
                 .any(|piece| piece == component)
         })
-        .unwrap_or(matches!(component, "q"))
+        .unwrap_or(matches!(component, "q" | "k" | "v"))
 }
 
 fn residual_add(
