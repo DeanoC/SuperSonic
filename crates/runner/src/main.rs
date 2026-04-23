@@ -1,3 +1,4 @@
+mod certified_kv;
 mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
@@ -379,6 +380,54 @@ pub(crate) struct Cli {
     #[arg(long)]
     kv_fp8: bool,
 
+    /// Enable the staged certified tiered KV path for Llama 3.1 CUDA INT8.
+    #[arg(long)]
+    certified_kv: bool,
+
+    /// Optional JSONL telemetry path for certified KV stage and fallback counters.
+    #[arg(long)]
+    certified_kv_telemetry: Option<PathBuf>,
+
+    /// Certified KV cache block size in tokens.
+    #[arg(long, default_value = "16", hide = true)]
+    certified_kv_block_size: usize,
+
+    /// Certified KV INT4 value quantization group size.
+    #[arg(long, default_value = "16", hide = true)]
+    certified_kv_value_group_size: usize,
+
+    /// Certified KV adaptive coverage target.
+    #[arg(long, default_value = "0.995", hide = true)]
+    certified_kv_tau_cov: f32,
+
+    /// Certified KV minimum FP16 key blocks per head.
+    #[arg(long, default_value = "2", hide = true)]
+    certified_kv_k_min: usize,
+
+    /// Certified KV maximum FP16 key blocks per head before Rung 1 expansion.
+    #[arg(long, default_value = "128", hide = true)]
+    certified_kv_k_max: usize,
+
+    /// Certified KV value error promotion threshold.
+    #[arg(long, default_value = "0.05", hide = true)]
+    certified_kv_v_tol: f32,
+
+    /// Certified KV ranking-consistency depth.
+    #[arg(long, default_value = "1", hide = true)]
+    certified_kv_ranking_r: usize,
+
+    /// Certified KV Rung 1 tail-mass threshold.
+    #[arg(long, default_value = "0.005", hide = true)]
+    certified_kv_rung1_threshold: f32,
+
+    /// Certified KV Rung 1 K expansion multiplier.
+    #[arg(long, default_value = "2.0", hide = true)]
+    certified_kv_rung1_multiplier: f32,
+
+    /// Certified KV score-consistency guard epsilon.
+    #[arg(long, default_value = "0.0001", hide = true)]
+    certified_kv_eps_guard: f32,
+
     /// Validate decode against a replayed GPU prefill reference.
     /// Replays the full token history through native GPU prefill on each step and
     /// compares the resulting last-token logits against decode. Slower than decode,
@@ -677,6 +726,21 @@ fn main() -> Result<()> {
     }
     if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
         anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");
+    }
+    if cli.certified_kv {
+        if model_variant.family() != ModelFamily::Llama31 {
+            anyhow::bail!("--certified-kv is currently supported only for llama3.1-8b on CUDA");
+        }
+        if backend != Backend::Cuda {
+            anyhow::bail!("--certified-kv requires --backend cuda");
+        }
+        if !cli.int8 {
+            anyhow::bail!("--certified-kv requires the Llama 3.1 INT8 bake path (--int8)");
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("--certified-kv is single-sequence at launch (--batch-size must be 1)");
+        }
+        let _ = certified_kv::CertifiedKvConfig::from_cli(&cli)?;
     }
 
     // 2. Detect GPU

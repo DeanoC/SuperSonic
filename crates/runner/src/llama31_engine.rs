@@ -434,6 +434,14 @@ pub fn run_llama31(
     if cli.fp8_runtime || cli.int4 || cli.kv_fp8 {
         bail!("Llama 3.1 CUDA path does not support --fp8-runtime, --int4, or --kv-fp8");
     }
+    if cli.certified_kv {
+        let cfg = crate::certified_kv::CertifiedKvConfig::from_cli(cli)?;
+        eprintln!("[certified-kv] {}", cfg.summary());
+        bail!(
+            "--certified-kv Rust/CUDA integration is staged but not wired into llama31_engine yet; \
+             run tests/sm86/run_llama31_certified_kv_oracle.sh for the current oracle baseline"
+        );
+    }
     if cli.int8 && cli.no_bake {
         bail!("--int8 requires the baked path; drop --no-bake");
     }
