@@ -654,6 +654,7 @@ pub fn run_llama31(
                 cfg.tau_cov,
                 cfg.k_min,
                 cfg.k_max,
+                cfg.v_tol,
                 cfg.rung1_threshold,
                 cfg.rung1_multiplier,
             )?;
@@ -663,7 +664,7 @@ pub fn run_llama31(
                 stats.selector_selected_blocks as f32 / stats.selector_heads as f32
             };
             eprintln!(
-                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={}",
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={} value_bound_max={:.6} value_escalation_blocks={}",
                 stats.layers,
                 stats.aligned_tokens,
                 stats.compressed_vram_bytes,
@@ -676,6 +677,8 @@ pub fn run_llama31(
                 selector_mean_k,
                 stats.selector_max_tail_mass,
                 stats.selector_rung1_heads,
+                stats.value_bound_max,
+                stats.value_escalation_blocks,
             );
             Some(stats)
         } else {
@@ -1140,6 +1143,9 @@ pub fn run_llama31(
                 }),
                 "shadow_selector_max_tail_mass": certified_kv_shadow_stats.map(|s| s.selector_max_tail_mass),
                 "shadow_selector_rung1_heads": certified_kv_shadow_stats.map(|s| s.selector_rung1_heads),
+                "shadow_value_bound_heads": certified_kv_shadow_stats.map(|s| s.value_bound_heads),
+                "shadow_value_bound_max": certified_kv_shadow_stats.map(|s| s.value_bound_max),
+                "shadow_value_escalation_blocks": certified_kv_shadow_stats.map(|s| s.value_escalation_blocks),
             });
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {

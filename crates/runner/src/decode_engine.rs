@@ -52,10 +52,10 @@ fn certified_kv_select_blocks_from_scores(
     k_max: usize,
     rung1_threshold: f32,
     rung1_multiplier: f32,
-) -> Result<(usize, f32, bool)> {
+) -> Result<(usize, f32, bool, Vec<f32>)> {
     let num_blocks = block_max.len();
     if num_blocks == 0 || block_sum.len() != num_blocks {
-        return Ok((0, 0.0, false));
+        return Ok((0, 0.0, false, Vec::new()));
     }
     let mut log_mass = Vec::with_capacity(num_blocks);
     for (&m, &s) in block_max.iter().zip(block_sum.iter()) {
@@ -112,7 +112,7 @@ fn certified_kv_select_blocks_from_scores(
         tail = (1.0 - covered).max(0.0);
         rung1 = true;
     }
-    Ok((selected, tail, rung1))
+    Ok((selected, tail, rung1, probs))
 }
 
 fn matmul_proj(
@@ -712,6 +712,9 @@ pub struct CertifiedKvShadowStats {
     pub selector_selected_blocks: usize,
     pub selector_max_tail_mass: f32,
     pub selector_rung1_heads: usize,
+    pub value_bound_heads: usize,
+    pub value_bound_max: f32,
+    pub value_escalation_blocks: usize,
 }
 
 pub struct ComponentLayerTrace {
@@ -1170,6 +1173,7 @@ impl DecodeEngine {
         tau_cov: f32,
         k_min: usize,
         k_max: usize,
+        v_tol: f32,
         rung1_threshold: f32,
         rung1_multiplier: f32,
     ) -> Result<CertifiedKvShadowStats> {
@@ -1245,7 +1249,7 @@ impl DecodeEngine {
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_error D2H: {e}"))?,
             );
-            let layer_max = errors.into_iter().fold(0.0f32, f32::max);
+            let layer_max = errors.iter().copied().fold(0.0f32, f32::max);
             stats.max_value_error = stats.max_value_error.max(layer_max);
             stats.layers += 1;
             stats.aligned_tokens = stats.aligned_tokens.max(aligned);
@@ -1328,7 +1332,7 @@ impl DecodeEngine {
             for qh in 0..num_q_heads {
                 let start = qh * num_blocks;
                 let end = start + num_blocks;
-                let (selected, tail, rung1) = certified_kv_select_blocks_from_scores(
+                let (selected, tail, rung1, probs) = certified_kv_select_blocks_from_scores(
                     &block_max_host[start..end],
                     &block_sum_host[start..end],
                     tau_cov,
@@ -1344,6 +1348,18 @@ impl DecodeEngine {
                 if rung1 {
                     stats.selector_rung1_heads += 1;
                 }
+                let kvh = qh / gqa_group;
+                let mut value_bound = 0.0f32;
+                for (block, &prob) in probs.iter().enumerate() {
+                    let eta = errors[kvh * num_blocks + block];
+                    let contribution = prob * eta;
+                    value_bound += contribution;
+                    if contribution > v_tol {
+                        stats.value_escalation_blocks += 1;
+                    }
+                }
+                stats.value_bound_heads += 1;
+                stats.value_bound_max = stats.value_bound_max.max(value_bound);
             }
 
             let query_f32 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
