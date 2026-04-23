@@ -981,6 +981,11 @@ pub fn l2norm(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && metal_native::l2norm(dtype, n_rows, n_cols, eps, input, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out);
     }
     let status = unsafe {

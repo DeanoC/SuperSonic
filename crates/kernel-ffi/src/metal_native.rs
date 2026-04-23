@@ -39,6 +39,20 @@ unsafe extern "C" {
         weight_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_l2norm_f32(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_l2norm_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_linear_prefill_conv_pack_bf16(
         conv_dim: usize,
         total_len: usize,
@@ -355,6 +369,56 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native linear_prefill_conv_pack_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn l2norm(
+    dtype: ScalarType,
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total = n_rows.checked_mul(n_cols).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native l2norm shape overflows: n_rows={n_rows} n_cols={n_cols}"
+        ))
+    })?;
+    if total > u32::MAX as usize || n_rows > u32::MAX as usize || n_cols > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native l2norm supports u32-sized shapes, got n_rows={n_rows} n_cols={n_cols}"
+        )));
+    }
+    if input.dtype() != dtype || out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native l2norm expects dtype {dtype:?}, got {:?}->{:?}",
+            input.dtype(),
+            out.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::F32 => {
+                supersonic_metal_l2norm_f32(n_rows, n_cols, eps, input.as_ptr(), out.as_mut_ptr())
+            }
+            ScalarType::BF16 => {
+                supersonic_metal_l2norm_bf16(n_rows, n_cols, eps, input.as_ptr(), out.as_mut_ptr())
+            }
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native l2norm does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native l2norm failed with status {status}"
         )));
     }
     Ok(())
@@ -988,6 +1052,18 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     Err(GpuError::Metal(
         "metal native linear_prefill_conv_pack_bf16 is not compiled".into(),
     ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn l2norm(
+    _dtype: ScalarType,
+    _n_rows: usize,
+    _n_cols: usize,
+    _eps: f32,
+    _input: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal("metal native l2norm is not compiled".into()))
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
@@ -1747,6 +1823,61 @@ mod tests {
         for (idx, (a, e)) in g_native_vals.iter().zip(g_ref_vals.iter()).enumerate() {
             let delta = (a - e).abs();
             assert!(delta <= 1e-6, "g idx {idx}: expected {e}, got {a}, delta {delta}");
+        }
+    }
+
+    #[test]
+    fn metal_native_l2norm_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input_f32 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 3],
+            &f32_bytes(&[3.0f32, 4.0, 0.0, 1.0, 2.0, 2.0]),
+        )
+        .expect("upload f32 input");
+        let mut out_f32 =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("alloc f32 out");
+        let mut ref_f32 =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("alloc f32 ref");
+        crate::metal_host::l2norm(ScalarType::F32, 2, 3, 1e-6, &input_f32, &mut ref_f32)
+            .expect("host f32 l2norm");
+        l2norm(ScalarType::F32, 2, 3, 1e-6, &input_f32, &mut out_f32).expect("native f32 l2norm");
+        let actual_f32 = read_f32(&out_f32);
+        let expect_f32 = read_f32(&ref_f32);
+        for (idx, (a, e)) in actual_f32.iter().zip(expect_f32.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-6,
+                "f32 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let input_bf16 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[3.0f32, 4.0, 0.0, 1.0, 2.0, 2.0]),
+        )
+        .expect("upload bf16 input");
+        let mut out_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("alloc bf16 out");
+        let mut ref_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("alloc bf16 ref");
+        crate::metal_host::l2norm(ScalarType::BF16, 2, 3, 1e-6, &input_bf16, &mut ref_bf16)
+            .expect("host bf16 l2norm");
+        l2norm(ScalarType::BF16, 2, 3, 1e-6, &input_bf16, &mut out_bf16)
+            .expect("native bf16 l2norm");
+        let actual_bf16 = read_bf16(&out_bf16);
+        let expect_bf16 = read_bf16(&ref_bf16);
+        for (idx, (a, e)) in actual_bf16.iter().zip(expect_bf16.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.01,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
         }
     }
 
