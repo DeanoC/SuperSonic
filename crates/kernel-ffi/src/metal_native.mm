@@ -20,6 +20,14 @@ struct MatmulParams {
     uint32_t k;
 };
 
+struct QwenLinearProjectionParams {
+    uint32_t hidden_dim;
+    uint32_t qkv_dim;
+    uint32_t val_dim;
+    uint32_t num_value_heads;
+    uint32_t total_cols;
+};
+
 struct FullAttentionParams {
     uint32_t q_heads;
     uint32_t kv_heads;
@@ -576,6 +584,129 @@ kernel void supersonic_matmul_rhs_transposed_f32(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create F32 matmul pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> qwen_linear_projection_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:320
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"QWENLINEAR(
+#include <metal_stdlib>
+using namespace metal;
+
+struct QwenLinearProjectionParams {
+    uint hidden_dim;
+    uint qkv_dim;
+    uint val_dim;
+    uint num_value_heads;
+    uint total_cols;
+};
+
+kernel void supersonic_qwen_linear_projections_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* qkv_weight [[buffer(1)]],
+    device const bfloat* z_weight [[buffer(2)]],
+    device const bfloat* a_weight [[buffer(3)]],
+    device const bfloat* b_weight [[buffer(4)]],
+    device bfloat* qkv_out [[buffer(5)]],
+    device bfloat* z_out [[buffer(6)]],
+    device bfloat* a_out [[buffer(7)]],
+    device bfloat* b_out [[buffer(8)]],
+    constant QwenLinearProjectionParams& params [[buffer(9)]],
+    uint col [[thread_position_in_grid]]
+) {
+    if (col >= params.total_cols) {
+        return;
+    }
+
+    device const bfloat* weight = qkv_weight;
+    device bfloat* out = qkv_out;
+    uint local_col = col;
+    if (local_col >= params.qkv_dim) {
+        local_col -= params.qkv_dim;
+        if (local_col < params.val_dim) {
+            weight = z_weight;
+            out = z_out;
+        } else {
+            local_col -= params.val_dim;
+            if (local_col < params.num_value_heads) {
+                weight = a_weight;
+                out = a_out;
+            } else {
+                local_col -= params.num_value_heads;
+                weight = b_weight;
+                out = b_out;
+            }
+        }
+    }
+
+    float acc = 0.0f;
+    uint weight_base = local_col * params.hidden_dim;
+    for (uint kk = 0; kk < params.hidden_dim; ++kk) {
+        acc += float(input[kk]) * float(weight[weight_base + kk]);
+    }
+    out[local_col] = bfloat(acc);
+}
+)QWENLINEAR";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:321
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen linear projection library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen_linear_projections_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:322
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen linear projection function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:323
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create Qwen linear projection pipeline"
                                                                              }];
                         }
                     }
@@ -5803,6 +5934,116 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_f32(
             MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 315, 316, 317, 318);
+    }
+}
+
+extern "C" int supersonic_metal_qwen_linear_projections_bf16(
+    size_t hidden_dim,
+    size_t qkv_dim,
+    size_t val_dim,
+    size_t num_value_heads,
+    const void* input_ptr,
+    const void* qkv_weight_ptr,
+    const void* z_weight_ptr,
+    const void* a_weight_ptr,
+    const void* b_weight_ptr,
+    void* qkv_out_ptr,
+    void* z_out_ptr,
+    void* a_out_ptr,
+    void* b_out_ptr
+) {
+    @autoreleasepool {
+        if (hidden_dim == 0 || qkv_dim == 0 || val_dim == 0 || num_value_heads == 0 ||
+            input_ptr == nullptr || qkv_weight_ptr == nullptr || z_weight_ptr == nullptr ||
+            a_weight_ptr == nullptr || b_weight_ptr == nullptr || qkv_out_ptr == nullptr ||
+            z_out_ptr == nullptr || a_out_ptr == nullptr || b_out_ptr == nullptr) {
+            return 320;
+        }
+        size_t total_cols = qkv_dim + val_dim + num_value_heads * 2;
+        if (hidden_dim > UINT32_MAX || qkv_dim > UINT32_MAX || val_dim > UINT32_MAX ||
+            num_value_heads > UINT32_MAX || total_cols > UINT32_MAX) {
+            return 321;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = qwen_linear_projection_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 322;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> qkv_weight = nil;
+        id<MTLBuffer> z_weight = nil;
+        id<MTLBuffer> a_weight = nil;
+        id<MTLBuffer> b_weight = nil;
+        id<MTLBuffer> qkv_out = nil;
+        id<MTLBuffer> z_out = nil;
+        id<MTLBuffer> a_out = nil;
+        id<MTLBuffer> b_out = nil;
+        size_t input_offset = 0;
+        size_t qkv_weight_offset = 0;
+        size_t z_weight_offset = 0;
+        size_t a_weight_offset = 0;
+        size_t b_weight_offset = 0;
+        size_t qkv_out_offset = 0;
+        size_t z_out_offset = 0;
+        size_t a_out_offset = 0;
+        size_t b_out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 323;
+        }
+        if (lookup_buffer(qkv_weight_ptr, &qkv_weight, &qkv_weight_offset) != 0) {
+            return 324;
+        }
+        if (lookup_buffer(z_weight_ptr, &z_weight, &z_weight_offset) != 0) {
+            return 325;
+        }
+        if (lookup_buffer(a_weight_ptr, &a_weight, &a_weight_offset) != 0) {
+            return 326;
+        }
+        if (lookup_buffer(b_weight_ptr, &b_weight, &b_weight_offset) != 0) {
+            return 327;
+        }
+        if (lookup_buffer(qkv_out_ptr, &qkv_out, &qkv_out_offset) != 0) {
+            return 328;
+        }
+        if (lookup_buffer(z_out_ptr, &z_out, &z_out_offset) != 0) {
+            return 329;
+        }
+        if (lookup_buffer(a_out_ptr, &a_out, &a_out_offset) != 0) {
+            return 330;
+        }
+        if (lookup_buffer(b_out_ptr, &b_out, &b_out_offset) != 0) {
+            return 331;
+        }
+
+        QwenLinearProjectionParams params = {
+            static_cast<uint32_t>(hidden_dim),
+            static_cast<uint32_t>(qkv_dim),
+            static_cast<uint32_t>(val_dim),
+            static_cast<uint32_t>(num_value_heads),
+            static_cast<uint32_t>(total_cols),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:qkv_weight offset:qkv_weight_offset atIndex:1];
+            [encoder setBuffer:z_weight offset:z_weight_offset atIndex:2];
+            [encoder setBuffer:a_weight offset:a_weight_offset atIndex:3];
+            [encoder setBuffer:b_weight offset:b_weight_offset atIndex:4];
+            [encoder setBuffer:qkv_out offset:qkv_out_offset atIndex:5];
+            [encoder setBuffer:z_out offset:z_out_offset atIndex:6];
+            [encoder setBuffer:a_out offset:a_out_offset atIndex:7];
+            [encoder setBuffer:b_out offset:b_out_offset atIndex:8];
+            [encoder setBytes:&params length:sizeof(params) atIndex:9];
+
+            NSUInteger threads_per_group =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_grid = MTLSizeMake(total_cols, 1, 1);
+            MTLSize group = MTLSizeMake(threads_per_group, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:group];
+        }, 332, 333, 334, 335);
     }
 }
 

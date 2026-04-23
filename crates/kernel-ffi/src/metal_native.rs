@@ -42,6 +42,21 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_linear_projections_bf16(
+        hidden_dim: usize,
+        qkv_dim: usize,
+        val_dim: usize,
+        num_value_heads: usize,
+        input_ptr: *const c_void,
+        qkv_weight_ptr: *const c_void,
+        z_weight_ptr: *const c_void,
+        a_weight_ptr: *const c_void,
+        b_weight_ptr: *const c_void,
+        qkv_out_ptr: *mut c_void,
+        z_out_ptr: *mut c_void,
+        a_out_ptr: *mut c_void,
+        b_out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_lm_head_argmax_bf16(
         in_dim: usize,
         vocab_size: usize,
@@ -617,6 +632,69 @@ pub(crate) fn matmul_rhs_transposed_f32(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_projections_bf16(
+    hidden_dim: usize,
+    qkv_dim: usize,
+    val_dim: usize,
+    num_value_heads: usize,
+    input: &GpuBuffer,
+    qkv_weight: &GpuBuffer,
+    z_weight: &GpuBuffer,
+    a_weight: &GpuBuffer,
+    b_weight: &GpuBuffer,
+    qkv_out: &mut GpuBuffer,
+    z_out: &mut GpuBuffer,
+    a_out: &mut GpuBuffer,
+    b_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        input.dtype(),
+        qkv_weight.dtype(),
+        z_weight.dtype(),
+        a_weight.dtype(),
+        b_weight.dtype(),
+        qkv_out.dtype(),
+        z_out.dtype(),
+        a_out.dtype(),
+        b_out.dtype(),
+    ];
+    if dtypes.iter().any(|dtype| *dtype != ScalarType::BF16) {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_projections_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || qkv_dim == 0 || val_dim == 0 || num_value_heads == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_projections_bf16 invalid shape: hidden_dim={hidden_dim} qkv_dim={qkv_dim} val_dim={val_dim} num_value_heads={num_value_heads}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_projections_bf16(
+            hidden_dim,
+            qkv_dim,
+            val_dim,
+            num_value_heads,
+            input.as_ptr(),
+            qkv_weight.as_ptr(),
+            z_weight.as_ptr(),
+            a_weight.as_ptr(),
+            b_weight.as_ptr(),
+            qkv_out.as_mut_ptr(),
+            z_out.as_mut_ptr(),
+            a_out.as_mut_ptr(),
+            b_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_projections_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -2059,6 +2137,28 @@ pub(crate) fn matmul_rhs_transposed_f32(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_projections_bf16(
+    _hidden_dim: usize,
+    _qkv_dim: usize,
+    _val_dim: usize,
+    _num_value_heads: usize,
+    _input: &GpuBuffer,
+    _qkv_weight: &GpuBuffer,
+    _z_weight: &GpuBuffer,
+    _a_weight: &GpuBuffer,
+    _b_weight: &GpuBuffer,
+    _qkv_out: &mut GpuBuffer,
+    _z_out: &mut GpuBuffer,
+    _a_out: &mut GpuBuffer,
+    _b_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_projections_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
     _weight: &GpuBuffer,
@@ -2488,6 +2588,72 @@ mod tests {
                 delta <= 0.02,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
             );
+        }
+    }
+
+    #[test]
+    fn metal_native_qwen_linear_projections_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 3],
+            &bf16_bytes(&[1.0, 2.0, -1.0]),
+        )
+        .expect("upload input");
+        let qkv_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0]),
+        )
+        .expect("upload qkv weight");
+        let z_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[0.0, 1.0, 1.0, -1.0, 0.5, 0.0]),
+        )
+        .expect("upload z weight");
+        let a_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 3],
+            &bf16_bytes(&[2.0, 1.0, -1.0]),
+        )
+        .expect("upload a weight");
+        let b_w = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 3],
+            &bf16_bytes(&[-1.0, 0.0, 0.5]),
+        )
+        .expect("upload b weight");
+        let mut qkv = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2]).expect("qkv out");
+        let mut z = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2]).expect("z out");
+        let mut a = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1]).expect("a out");
+        let mut b = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1]).expect("b out");
+
+        qwen_linear_projections_bf16(
+            3, 2, 2, 1, &input, &qkv_w, &z_w, &a_w, &b_w, &mut qkv, &mut z, &mut a, &mut b,
+        )
+        .expect("run fused qwen projections");
+
+        let cases = [
+            ("qkv", read_bf16(&qkv), vec![0.0, -3.5]),
+            ("z", read_bf16(&z), vec![1.0, 0.0]),
+            ("a", read_bf16(&a), vec![5.0]),
+            ("b", read_bf16(&b), vec![-1.5]),
+        ];
+        for (name, actual, expected) in cases {
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let delta = (a - e).abs();
+                assert!(
+                    delta <= 0.02,
+                    "{name}[{idx}]: expected {e}, got {a}, delta {delta}"
+                );
+            }
         }
     }
 

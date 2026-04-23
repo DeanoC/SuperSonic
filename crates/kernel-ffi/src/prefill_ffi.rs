@@ -191,6 +191,41 @@ pub fn metal_conv_state_update_bf16(
     metal_native::conv_state_update_bf16(channels, state_len, qkv, state)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_projections_bf16(
+    hidden_dim: usize,
+    qkv_dim: usize,
+    val_dim: usize,
+    num_value_heads: usize,
+    input: &GpuBuffer,
+    qkv_weight: &GpuBuffer,
+    z_weight: &GpuBuffer,
+    a_weight: &GpuBuffer,
+    b_weight: &GpuBuffer,
+    qkv_out: &mut GpuBuffer,
+    z_out: &mut GpuBuffer,
+    a_out: &mut GpuBuffer,
+    b_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_projections", "native", || {
+        metal_native::qwen_linear_projections_bf16(
+            hidden_dim,
+            qkv_dim,
+            val_dim,
+            num_value_heads,
+            input,
+            qkv_weight,
+            z_weight,
+            a_weight,
+            b_weight,
+            qkv_out,
+            z_out,
+            a_out,
+            b_out,
+        )
+    })
+}
+
 pub struct MetalBatchGuard {
     inner: Option<metal_native::MetalBatchGuard>,
 }

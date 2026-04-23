@@ -2454,21 +2454,56 @@ impl DecodeEngine {
             None
         };
 
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            qkv_dim,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.qkv_proj_w,
-            lw.qkv_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut qkv,
-            lw.qkv_proj_int4_scale.as_ref(),
-            lw.qkv_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
+        let use_fused_linear_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && linear_normed_f32.is_none()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_PROJ").is_none()
+            && lw.qkv_proj_scale.is_none()
+            && lw.qkv_proj_int4_scale.is_none()
+            && lw.qkv_proj_int4_zero.is_none()
+            && lw.z_proj_scale.is_none()
+            && lw.z_proj_int4_scale.is_none()
+            && lw.z_proj_int4_zero.is_none()
+            && lw.a_proj_scale.is_none()
+            && lw.b_proj_scale.is_none()
+            && lw.qkv_proj_w.dtype() == ScalarType::BF16
+            && lw.z_proj_w.dtype() == ScalarType::BF16
+            && lw.a_proj_w.dtype() == ScalarType::BF16
+            && lw.b_proj_w.dtype() == ScalarType::BF16;
+
+        if use_fused_linear_proj {
+            kernel_ffi::prefill_ffi::metal_qwen_linear_projections_bf16(
+                hidden_dim,
+                qkv_dim,
+                val_dim,
+                nv,
+                &self.normed_buf,
+                &lw.qkv_proj_w,
+                &lw.z_proj_w,
+                &lw.a_proj_w,
+                &lw.b_proj_w,
+                &mut qkv,
+                &mut z,
+                &mut a,
+                &mut b,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear projections: {e}"))?;
+        } else {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                qkv_dim,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.qkv_proj_w,
+                lw.qkv_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut qkv,
+                lw.qkv_proj_int4_scale.as_ref(),
+                lw.qkv_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+        }
         let normed_trace = if trace_output {
             Some(
                 self.normed_buf
@@ -2486,21 +2521,23 @@ impl DecodeEngine {
         } else {
             None
         };
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            val_dim,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.z_proj_w,
-            lw.z_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut z,
-            lw.z_proj_int4_scale.as_ref(),
-            lw.z_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
+        if !use_fused_linear_proj {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                val_dim,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.z_proj_w,
+                lw.z_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut z,
+                lw.z_proj_int4_scale.as_ref(),
+                lw.z_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+        }
         let z_trace = if trace_output {
             Some(
                 z.to_host_bytes()
@@ -2509,36 +2546,38 @@ impl DecodeEngine {
         } else {
             None
         };
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            nv,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.a_proj_w,
-            lw.a_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut a,
-            None,
-            None,
-            self.weights.int4_group_size,
-        )?;
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            nv,
-            hidden_dim,
-            &self.normed_buf,
-            &lw.b_proj_w,
-            lw.b_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut b,
-            None,
-            None,
-            self.weights.int4_group_size,
-        )?;
+        if !use_fused_linear_proj {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                nv,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.a_proj_w,
+                lw.a_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut a,
+                None,
+                None,
+                self.weights.int4_group_size,
+            )?;
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                nv,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.b_proj_w,
+                lw.b_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut b,
+                None,
+                None,
+                self.weights.int4_group_size,
+            )?;
+        }
 
         let mut a_for_beta_f32: Option<Vec<f32>> = None;
         let mut b_for_beta_f32: Option<Vec<f32>> = None;
