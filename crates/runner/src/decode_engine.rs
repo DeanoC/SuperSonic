@@ -262,6 +262,8 @@ pub struct DecodeEngine {
     component_mlp_scratch: Option<ComponentMlpScratch>,
     /// Reused single-token component decode linear-attention temporaries.
     component_linear_scratch: Option<ComponentLinearScratch>,
+    /// Reused single-token component decode full-attention temporaries.
+    component_full_scratch: Option<ComponentFullScratch>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -367,6 +369,24 @@ struct ComponentLinearScratch {
     k_normed: GpuBuffer,
 }
 
+struct ComponentFullScratch {
+    q_full: GpuBuffer,
+    query_buf: GpuBuffer,
+    gate_buf: GpuBuffer,
+    k_buf: GpuBuffer,
+    v_buf: GpuBuffer,
+    q_normed: GpuBuffer,
+    k_normed: GpuBuffer,
+    attn_q: GpuBuffer,
+    attn_k_step: GpuBuffer,
+    attn_v_step: GpuBuffer,
+    attn_out_f32: GpuBuffer,
+    attn_out_bf16: GpuBuffer,
+    attn_flat: GpuBuffer,
+    gated: GpuBuffer,
+    proj_out: GpuBuffer,
+}
+
 impl ComponentLinearScratch {
     fn alloc(ordinal: usize, config: &TextConfig) -> Result<Self> {
         let hidden_dim = config.hidden_size;
@@ -439,6 +459,69 @@ impl ComponentLinearScratch {
             q_normed,
             q_scaled,
             k_normed,
+        })
+    }
+}
+
+impl ComponentFullScratch {
+    fn alloc(ordinal: usize, config: &TextConfig) -> Result<Self> {
+        let hidden_dim = config.hidden_size;
+        let num_q_heads = config.num_attention_heads;
+        let num_kv_heads = config.num_key_value_heads;
+        let head_dim = config.head_dim;
+        let q_dim = num_q_heads * head_dim;
+        let q_proj_dim = q_dim * 2;
+        let kv_dim = num_kv_heads * head_dim;
+        let q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_proj_dim])
+            .map_err(|e| anyhow::anyhow!("component full q_full scratch alloc: {e}"))?;
+        let query_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+            .map_err(|e| anyhow::anyhow!("component full query scratch alloc: {e}"))?;
+        let gate_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+            .map_err(|e| anyhow::anyhow!("component full gate scratch alloc: {e}"))?;
+        let k_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+            .map_err(|e| anyhow::anyhow!("component full k scratch alloc: {e}"))?;
+        let v_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+            .map_err(|e| anyhow::anyhow!("component full v scratch alloc: {e}"))?;
+        let q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+            .map_err(|e| anyhow::anyhow!("component full q_normed scratch alloc: {e}"))?;
+        let k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+            .map_err(|e| anyhow::anyhow!("component full k_normed scratch alloc: {e}"))?;
+        let attn_q = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+            .map_err(|e| anyhow::anyhow!("component full attn_q scratch alloc: {e}"))?;
+        let attn_k_step =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full attn_k scratch alloc: {e}"))?;
+        let attn_v_step =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full attn_v scratch alloc: {e}"))?;
+        let attn_out_f32 =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full attn_out scratch alloc: {e}"))?;
+        let attn_out_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("component full attn_out bf16 scratch alloc: {e}"))?;
+        let attn_flat = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+            .map_err(|e| anyhow::anyhow!("component full attn_flat scratch alloc: {e}"))?;
+        let gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+            .map_err(|e| anyhow::anyhow!("component full gated scratch alloc: {e}"))?;
+        let proj_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("component full proj_out scratch alloc: {e}"))?;
+        Ok(Self {
+            q_full,
+            query_buf,
+            gate_buf,
+            k_buf,
+            v_buf,
+            q_normed,
+            k_normed,
+            attn_q,
+            attn_k_step,
+            attn_v_step,
+            attn_out_f32,
+            attn_out_bf16,
+            attn_flat,
+            gated,
+            proj_out,
         })
     }
 }
@@ -1995,6 +2078,32 @@ impl DecodeEngine {
         idx: usize,
         seqlen_offset: usize,
     ) -> Result<()> {
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal && !component_scratch_reuse_disabled()
+        {
+            let mut scratch = match self.component_full_scratch.take() {
+                Some(scratch) => scratch,
+                None => ComponentFullScratch::alloc(self.ordinal, &self.weights.config)?,
+            };
+            let result = self.component_decode_full_attention_layer_with_scratch(
+                idx,
+                seqlen_offset,
+                &mut scratch,
+            );
+            self.component_full_scratch = Some(scratch);
+            return result;
+        }
+
+        let mut scratch = ComponentFullScratch::alloc(self.ordinal, &self.weights.config)
+            .map_err(|e| anyhow::anyhow!("layer {idx} full scratch alloc: {e}"))?;
+        self.component_decode_full_attention_layer_with_scratch(idx, seqlen_offset, &mut scratch)
+    }
+
+    fn component_decode_full_attention_layer_with_scratch(
+        &mut self,
+        idx: usize,
+        seqlen_offset: usize,
+        scratch: &mut ComponentFullScratch,
+    ) -> Result<()> {
         let config = &self.weights.config;
         let fw = self.weights.layers[idx]
             .full
@@ -2011,41 +2120,23 @@ impl DecodeEngine {
         let kv_len = seqlen_offset + 1;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
 
-        let mut q_full = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_proj_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_full alloc: {e}"))?;
-        let mut query_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} query alloc: {e}"))?;
-        let mut gate_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} gate alloc: {e}"))?;
-        let mut k_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k alloc: {e}"))?;
-        let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} v alloc: {e}"))?;
-        let mut q_normed =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} q_normed alloc: {e}"))?;
-        let mut k_normed =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} k_normed alloc: {e}"))?;
-        let mut attn_q =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} attn_q alloc: {e}"))?;
-        let mut attn_k_step =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} attn_k alloc: {e}"))?;
-        let mut attn_v_step =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} attn_v alloc: {e}"))?;
-        let mut attn_out_f32 =
-            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} attn_out alloc: {e}"))?;
-        let mut attn_out_bf16 =
-            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} attn_out bf16 alloc: {e}"))?;
-        let mut attn_flat = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_flat alloc: {e}"))?;
-        let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
+        let ComponentFullScratch {
+            q_full,
+            query_buf,
+            gate_buf,
+            k_buf,
+            v_buf,
+            q_normed,
+            k_normed,
+            attn_q,
+            attn_k_step,
+            attn_v_step,
+            attn_out_f32,
+            attn_out_bf16,
+            attn_flat,
+            gated,
+            proj_out,
+        } = scratch;
 
         let use_fused_full_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !metal_fused_full_projection_disabled()
@@ -2071,9 +2162,9 @@ impl DecodeEngine {
                 &fw.q_proj_w,
                 &fw.k_proj_w,
                 &fw.v_proj_w,
-                &mut q_full,
-                &mut k_buf,
-                &mut v_buf,
+                q_full,
+                k_buf,
+                v_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} fused full projections: {e}"))?;
         } else {
@@ -2087,7 +2178,7 @@ impl DecodeEngine {
                 &fw.q_proj_w,
                 fw.q_proj_scale.as_ref(),
                 self.weights.fp8_block_size,
-                &mut q_full,
+                q_full,
                 fw.q_proj_int4_scale.as_ref(),
                 fw.q_proj_int4_zero.as_ref(),
                 self.weights.int4_group_size,
@@ -2099,9 +2190,9 @@ impl DecodeEngine {
             1,
             num_q_heads,
             head_dim,
-            &q_full,
-            &mut query_buf,
-            &mut gate_buf,
+            q_full,
+            query_buf,
+            gate_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
 
@@ -2116,7 +2207,7 @@ impl DecodeEngine {
                 &fw.k_proj_w,
                 fw.k_proj_scale.as_ref(),
                 self.weights.fp8_block_size,
-                &mut k_buf,
+                k_buf,
                 fw.k_proj_int4_scale.as_ref(),
                 fw.k_proj_int4_zero.as_ref(),
                 self.weights.int4_group_size,
@@ -2131,7 +2222,7 @@ impl DecodeEngine {
                 &fw.v_proj_w,
                 fw.v_proj_scale.as_ref(),
                 self.weights.fp8_block_size,
-                &mut v_buf,
+                v_buf,
                 fw.v_proj_int4_scale.as_ref(),
                 fw.v_proj_int4_zero.as_ref(),
                 self.weights.int4_group_size,
@@ -2144,9 +2235,9 @@ impl DecodeEngine {
             num_q_heads,
             head_dim,
             1e-6,
-            &query_buf,
+            query_buf,
             &fw.q_norm_w,
-            &mut q_normed,
+            q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -2163,9 +2254,9 @@ impl DecodeEngine {
             num_kv_heads,
             head_dim,
             1e-6,
-            &k_buf,
+            k_buf,
             &fw.k_norm_w,
-            &mut k_normed,
+            k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k norm: {e}"))?;
         gpu_hal::copy_d2d(
@@ -2186,7 +2277,7 @@ impl DecodeEngine {
             &self.rotary.cos,
             &self.rotary.sin,
             seqlen_offset,
-            &mut query_buf,
+            query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
@@ -2199,7 +2290,7 @@ impl DecodeEngine {
             &self.rotary.cos,
             &self.rotary.sin,
             seqlen_offset,
-            &mut k_buf,
+            k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
 
@@ -2209,8 +2300,8 @@ impl DecodeEngine {
             1,
             num_q_heads,
             head_dim,
-            &query_buf,
-            &mut attn_q,
+            query_buf,
+            attn_q,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
@@ -2219,8 +2310,8 @@ impl DecodeEngine {
             1,
             num_kv_heads,
             head_dim,
-            &k_buf,
-            &mut attn_k_step,
+            k_buf,
+            attn_k_step,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
@@ -2229,8 +2320,8 @@ impl DecodeEngine {
             1,
             num_kv_heads,
             head_dim,
-            &v_buf,
-            &mut attn_v_step,
+            v_buf,
+            attn_v_step,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} v transpose: {e}"))?;
 
@@ -2335,10 +2426,10 @@ impl DecodeEngine {
             head_dim,
             1.0 / (head_dim as f32).sqrt(),
             seqlen_offset,
-            &attn_q,
+            attn_q,
             attn_k_ref,
             attn_v_ref,
-            &mut attn_out_f32,
+            attn_out_f32,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
@@ -2347,8 +2438,8 @@ impl DecodeEngine {
             ScalarType::F32,
             ScalarType::BF16,
             num_q_heads * head_dim,
-            &attn_out_f32,
-            &mut attn_out_bf16,
+            attn_out_f32,
+            attn_out_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
         kernel_ffi::prefill_ffi::transpose_shd_hsd(
@@ -2357,20 +2448,18 @@ impl DecodeEngine {
             num_q_heads,
             1,
             head_dim,
-            &attn_out_bf16,
-            &mut attn_flat,
+            attn_out_bf16,
+            attn_flat,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
-        let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
         kernel_ffi::prefill_ffi::sigmoid_mul(
             self.ordinal,
             ScalarType::BF16,
             q_dim,
-            &attn_flat,
-            &gate_buf,
-            &mut gated,
+            attn_flat,
+            gate_buf,
+            gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
 
@@ -2380,16 +2469,16 @@ impl DecodeEngine {
             1,
             hidden_dim,
             q_dim,
-            &gated,
+            gated,
             &fw.o_proj_w,
             fw.o_proj_scale.as_ref(),
             self.weights.fp8_block_size,
-            &mut proj_out,
+            proj_out,
             fw.o_proj_int4_scale.as_ref(),
             fw.o_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
         )?;
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
+        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, proj_out)?;
         Ok(())
     }
 
@@ -3588,6 +3677,7 @@ impl DecodeEngine {
             dflash_fused_verify_cache: None,
             component_mlp_scratch: None,
             component_linear_scratch: None,
+            component_full_scratch: None,
         })
     }
 
