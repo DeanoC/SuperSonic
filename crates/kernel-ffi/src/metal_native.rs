@@ -377,6 +377,22 @@ unsafe extern "C" {
         initial_state_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_linear_prep_bf16_f32(
+        key_dim: usize,
+        val_dim: usize,
+        num_key_heads: usize,
+        key_head_dim: usize,
+        conv_pack_ptr: *const c_void,
+        q_bf16_ptr: *mut c_void,
+        k_bf16_ptr: *mut c_void,
+        v_bf16_ptr: *mut c_void,
+        q_f32_ptr: *mut c_void,
+        k_f32_ptr: *mut c_void,
+        v_f32_ptr: *mut c_void,
+        q_normed_ptr: *mut c_void,
+        q_scaled_ptr: *mut c_void,
+        k_normed_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_conv_state_update_bf16(
         channels: usize,
         state_len: usize,
@@ -1918,6 +1934,80 @@ pub(crate) fn linear_decode_apply_parts_f32(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_prep_bf16_f32(
+    key_dim: usize,
+    val_dim: usize,
+    num_key_heads: usize,
+    key_head_dim: usize,
+    conv_pack: &GpuBuffer,
+    q_bf16: &mut GpuBuffer,
+    k_bf16: &mut GpuBuffer,
+    v_bf16: &mut GpuBuffer,
+    q_f32: &mut GpuBuffer,
+    k_f32: &mut GpuBuffer,
+    v_f32: &mut GpuBuffer,
+    q_normed: &mut GpuBuffer,
+    q_scaled: &mut GpuBuffer,
+    k_normed: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_pack.dtype() != ScalarType::BF16
+        || q_bf16.dtype() != ScalarType::BF16
+        || k_bf16.dtype() != ScalarType::BF16
+        || v_bf16.dtype() != ScalarType::BF16
+        || q_f32.dtype() != ScalarType::F32
+        || k_f32.dtype() != ScalarType::F32
+        || v_f32.dtype() != ScalarType::F32
+        || q_normed.dtype() != ScalarType::F32
+        || q_scaled.dtype() != ScalarType::F32
+        || k_normed.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_prep_bf16_f32 expects BF16 conv/q/k/v and F32 q/k/v/norms, got conv={:?} q={:?} k={:?} v={:?} qf={:?} kf={:?} vf={:?} qn={:?} qs={:?} kn={:?}",
+            conv_pack.dtype(),
+            q_bf16.dtype(),
+            k_bf16.dtype(),
+            v_bf16.dtype(),
+            q_f32.dtype(),
+            k_f32.dtype(),
+            v_f32.dtype(),
+            q_normed.dtype(),
+            q_scaled.dtype(),
+            k_normed.dtype()
+        )));
+    }
+    if key_dim == 0 || val_dim == 0 || num_key_heads == 0 || key_dim != num_key_heads * key_head_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_prep_bf16_f32 invalid shape: key_dim={key_dim} val_dim={val_dim} num_key_heads={num_key_heads} key_head_dim={key_head_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_prep_bf16_f32(
+            key_dim,
+            val_dim,
+            num_key_heads,
+            key_head_dim,
+            conv_pack.as_ptr(),
+            q_bf16.as_mut_ptr(),
+            k_bf16.as_mut_ptr(),
+            v_bf16.as_mut_ptr(),
+            q_f32.as_mut_ptr(),
+            k_f32.as_mut_ptr(),
+            v_f32.as_mut_ptr(),
+            q_normed.as_mut_ptr(),
+            q_scaled.as_mut_ptr(),
+            k_normed.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_prep_bf16_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn conv_state_update_bf16(
     channels: usize,
     state_len: usize,
@@ -2058,6 +2148,29 @@ pub(crate) fn linear_decode_apply_parts_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native linear_decode_apply_parts_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_prep_bf16_f32(
+    _key_dim: usize,
+    _val_dim: usize,
+    _num_key_heads: usize,
+    _key_head_dim: usize,
+    _conv_pack: &GpuBuffer,
+    _q_bf16: &mut GpuBuffer,
+    _k_bf16: &mut GpuBuffer,
+    _v_bf16: &mut GpuBuffer,
+    _q_f32: &mut GpuBuffer,
+    _k_f32: &mut GpuBuffer,
+    _v_f32: &mut GpuBuffer,
+    _q_normed: &mut GpuBuffer,
+    _q_scaled: &mut GpuBuffer,
+    _k_normed: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_prep_bf16_f32 is not compiled".into(),
     ))
 }
 
@@ -2651,6 +2764,82 @@ mod tests {
                 let delta = (a - e).abs();
                 assert!(
                     delta <= 0.02,
+                    "{name}[{idx}]: expected {e}, got {a}, delta {delta}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metal_native_qwen_linear_prep_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let conv_pack = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 11],
+            &bf16_bytes(&[3.0, 4.0, 0.0, 5.0, 1.0, 2.0, 2.0, 1.0, -1.0, 0.5, 7.0]),
+        )
+        .expect("upload conv_pack");
+        let mut q_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 4]).expect("q bf16");
+        let mut k_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 4]).expect("k bf16");
+        let mut v_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 3]).expect("v bf16");
+        let mut q_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 4]).expect("q f32");
+        let mut k_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 4]).expect("k f32");
+        let mut v_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 3]).expect("v f32");
+        let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("q normed");
+        let mut q_scaled = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("q scaled");
+        let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("k normed");
+
+        qwen_linear_prep_bf16_f32(
+            4,
+            3,
+            2,
+            2,
+            &conv_pack,
+            &mut q_bf16,
+            &mut k_bf16,
+            &mut v_bf16,
+            &mut q_f32,
+            &mut k_f32,
+            &mut v_f32,
+            &mut q_normed,
+            &mut q_scaled,
+            &mut k_normed,
+        )
+        .expect("run fused qwen linear prep");
+
+        assert_eq!(read_bf16(&q_bf16), vec![3.0, 4.0, 0.0, 5.0]);
+        assert_eq!(read_bf16(&k_bf16), vec![1.0, 2.0, 2.0, 1.0]);
+        assert_eq!(read_bf16(&v_bf16), vec![-1.0, 0.5, 7.0]);
+        assert_eq!(read_f32(&q_f32), vec![3.0, 4.0, 0.0, 5.0]);
+        assert_eq!(read_f32(&k_f32), vec![1.0, 2.0, 2.0, 1.0]);
+        assert_eq!(read_f32(&v_f32), vec![-1.0, 0.5, 7.0]);
+
+        let inv_sqrt_2 = 2.0f32.sqrt().recip();
+        let cases = [
+            ("q_normed", read_f32(&q_normed), vec![0.6, 0.8, 0.0, 1.0]),
+            (
+                "q_scaled",
+                read_f32(&q_scaled),
+                vec![0.6 * inv_sqrt_2, 0.8 * inv_sqrt_2, 0.0, inv_sqrt_2],
+            ),
+            (
+                "k_normed",
+                read_f32(&k_normed),
+                vec![
+                    1.0 / 5.0f32.sqrt(),
+                    2.0 / 5.0f32.sqrt(),
+                    2.0 / 5.0f32.sqrt(),
+                    1.0 / 5.0f32.sqrt(),
+                ],
+            ),
+        ];
+        for (name, actual, expected) in cases {
+            for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+                let delta = (a - e).abs();
+                assert!(
+                    delta <= 1e-4,
                     "{name}[{idx}]: expected {e}, got {a}, delta {delta}"
                 );
             }

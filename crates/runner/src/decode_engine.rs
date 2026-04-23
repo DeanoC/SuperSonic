@@ -2695,76 +2695,99 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
 
-        kernel_ffi::prefill_ffi::split_qkv(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            key_dim,
-            val_dim,
-            &conv_pack,
-            &mut q_linear,
-            &mut k_linear,
-            &mut v_linear,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} split_qkv: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_PREP").is_none()
+        {
+            kernel_ffi::prefill_ffi::metal_qwen_linear_prep_bf16_f32(
+                key_dim,
+                val_dim,
+                nk,
+                khd,
+                &conv_pack,
+                &mut q_linear,
+                &mut k_linear,
+                &mut v_linear,
+                &mut q_linear_f32,
+                &mut k_linear_f32,
+                &mut v_linear_f32,
+                &mut q_normed,
+                &mut q_scaled,
+                &mut k_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused linear prep: {e}"))?;
+        } else {
+            kernel_ffi::prefill_ffi::split_qkv(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                key_dim,
+                val_dim,
+                &conv_pack,
+                &mut q_linear,
+                &mut k_linear,
+                &mut v_linear,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} split_qkv: {e}"))?;
 
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::BF16,
-            ScalarType::F32,
-            key_dim,
-            &q_linear,
-            &mut q_linear_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q cast: {e}"))?;
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::BF16,
-            ScalarType::F32,
-            key_dim,
-            &k_linear,
-            &mut k_linear_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k cast: {e}"))?;
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::BF16,
-            ScalarType::F32,
-            val_dim,
-            &v_linear,
-            &mut v_linear_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} v cast: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                key_dim,
+                &q_linear,
+                &mut q_linear_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q cast: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                key_dim,
+                &k_linear,
+                &mut k_linear_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} k cast: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::BF16,
+                ScalarType::F32,
+                val_dim,
+                &v_linear,
+                &mut v_linear_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} v cast: {e}"))?;
 
-        kernel_ffi::prefill_ffi::l2norm(
-            self.ordinal,
-            ScalarType::F32,
-            nk,
-            khd,
-            1e-6,
-            &q_linear_f32,
-            &mut q_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q l2norm: {e}"))?;
-        kernel_ffi::prefill_ffi::mul_scalar(
-            self.ordinal,
-            ScalarType::F32,
-            key_dim,
-            (khd as f32).sqrt().recip(),
-            &q_normed,
-            &mut q_scaled,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q scale: {e}"))?;
-        kernel_ffi::prefill_ffi::l2norm(
-            self.ordinal,
-            ScalarType::F32,
-            nk,
-            khd,
-            1e-6,
-            &k_linear_f32,
-            &mut k_normed,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k l2norm: {e}"))?;
+            kernel_ffi::prefill_ffi::l2norm(
+                self.ordinal,
+                ScalarType::F32,
+                nk,
+                khd,
+                1e-6,
+                &q_linear_f32,
+                &mut q_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q l2norm: {e}"))?;
+            kernel_ffi::prefill_ffi::mul_scalar(
+                self.ordinal,
+                ScalarType::F32,
+                key_dim,
+                (khd as f32).sqrt().recip(),
+                &q_normed,
+                &mut q_scaled,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q scale: {e}"))?;
+            kernel_ffi::prefill_ffi::l2norm(
+                self.ordinal,
+                ScalarType::F32,
+                nk,
+                khd,
+                1e-6,
+                &k_linear_f32,
+                &mut k_normed,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} k l2norm: {e}"))?;
+        }
 
         let mut packed_trace = None;
         if self.hidden_io.backend() == gpu_hal::Backend::Metal
