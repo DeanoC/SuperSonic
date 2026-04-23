@@ -5878,9 +5878,37 @@ fn trace_component_input_layer(
         None,
         None,
     )?;
-    let replay_hidden = if trace_layer == 0 {
-        None
-    } else {
+    if trace_layer == 0 {
+        let token_id = *token_ids
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("component input trace has empty token_ids"))?;
+        let hidden_dim = engine.weights().config.hidden_size;
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let row_bytes = hidden_dim * elem_bytes;
+        let embedding = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("component input trace embedding alloc: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            embedding.as_ptr() as *mut c_void,
+            engine
+                .weights()
+                .embed_tokens
+                .offset_ptr(token_id as usize * row_bytes),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("component input trace embedding copy: {e}"))?;
+        let embedding_bytes = embedding
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("component input trace embedding D2H: {e}"))?;
+        let native_f32 = decode_bf16_le(native_hidden);
+        let replay_f32 = decode_bf16_le(&embedding_bytes);
+        let delta = validate::max_abs_delta(&native_f32, &replay_f32);
+        eprintln!(
+            "[trace-component-input] layer=0 token={token_id} embedding_delta={delta:.6}"
+        );
+        return Ok(());
+    }
+    let replay_hidden = {
         replay
             .layer_hidden_trace
             .as_ref()
@@ -7074,6 +7102,83 @@ fn trace_component_linear_layer(
     let qkv_delta =
         validate::max_abs_delta(&decode_bf16_le(&native.qkv), &decode_bf16_le(&replay.qkv));
     let z_delta = validate::max_abs_delta(&decode_bf16_le(&native.z), &decode_bf16_le(&replay.z));
+    let native_normed = decode_bf16_le(&native.normed);
+    let replay_normed = decode_bf16_le(&replay.normed);
+    let native_qkv = decode_bf16_le(&native.qkv);
+    let replay_qkv = decode_bf16_le(&replay.qkv);
+    let native_z = decode_bf16_le(&native.z);
+    let replay_z = decode_bf16_le(&replay.z);
+    let (normed_idx, normed_native_v, normed_replay_v, normed_detail_delta) =
+        max_abs_delta_details(&native_normed, &replay_normed);
+    if trace_layer == 0 {
+        let token_id = *token_ids
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("component linear trace has empty token_ids"))?;
+        let hidden_dim = engine.weights().config.hidden_size;
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let row_bytes = hidden_dim * elem_bytes;
+        let embedding = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("component linear trace embedding alloc: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            embedding.as_ptr() as *mut c_void,
+            engine
+                .weights()
+                .embed_tokens
+                .offset_ptr(token_id as usize * row_bytes),
+            row_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("component linear trace embedding copy: {e}"))?;
+        let embedding_f32 = decode_bf16_le(
+            &embedding
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("component linear trace embedding D2H: {e}"))?,
+        );
+        let norm_ref = compute_qwen_rms_norm_from_hidden_row(
+            &embedding_f32,
+            &engine.weights().layers[trace_layer].input_norm_w,
+            engine.weights().config.rms_norm_eps as f32,
+        )?;
+        let (native_norm_idx, native_norm_v, native_norm_ref_v, native_norm_delta) =
+            max_abs_delta_details(&native_normed, &norm_ref);
+        let (replay_norm_idx, replay_norm_v, replay_norm_ref_v, replay_norm_delta) =
+            max_abs_delta_details(&replay_normed, &norm_ref);
+        eprintln!(
+            "[trace-component-linear-normcheck] layer=0 token={token_id} native_norm_delta={native_norm_delta:.6} native_idx={native_norm_idx} native={native_norm_v:.6} ref={native_norm_ref_v:.6} replay_norm_delta={replay_norm_delta:.6} replay_idx={replay_norm_idx} replay={replay_norm_v:.6} ref={replay_norm_ref_v:.6} native_vs_replay_idx={normed_idx} native_vs_replay_native={normed_native_v:.6} native_vs_replay_replay={normed_replay_v:.6} native_vs_replay_delta={normed_detail_delta:.6}"
+        );
+    }
+    if let Some(linear) = engine.weights().layers[trace_layer].linear.as_ref() {
+        let hidden_dim = engine.weights().config.hidden_size;
+        let qkv_w = decode_gpu_buffer_f32(&linear.qkv_proj_w)?;
+        let z_w = decode_gpu_buffer_f32(&linear.z_proj_w)?;
+        let native_qkv_ref = apply_matmul_rhs_transposed_reference(
+            &native_normed,
+            &qkv_w,
+            native_qkv.len(),
+            hidden_dim,
+        )?;
+        let replay_qkv_ref = apply_matmul_rhs_transposed_reference(
+            &replay_normed,
+            &qkv_w,
+            replay_qkv.len(),
+            hidden_dim,
+        )?;
+        let native_z_ref =
+            apply_matmul_rhs_transposed_reference(&native_normed, &z_w, native_z.len(), hidden_dim)?;
+        let replay_z_ref =
+            apply_matmul_rhs_transposed_reference(&replay_normed, &z_w, replay_z.len(), hidden_dim)?;
+        let (native_qkv_idx, native_qkv_v, native_qkv_ref_v, native_qkv_self_delta) =
+            max_abs_delta_details(&native_qkv, &native_qkv_ref);
+        let (replay_qkv_idx, replay_qkv_v, replay_qkv_ref_v, replay_qkv_self_delta) =
+            max_abs_delta_details(&replay_qkv, &replay_qkv_ref);
+        let (native_z_idx, native_z_v, native_z_ref_v, native_z_self_delta) =
+            max_abs_delta_details(&native_z, &native_z_ref);
+        let (replay_z_idx, replay_z_v, replay_z_ref_v, replay_z_self_delta) =
+            max_abs_delta_details(&replay_z, &replay_z_ref);
+        eprintln!(
+            "[trace-component-linear-selfcheck] layer={trace_layer} native_qkv_delta={native_qkv_self_delta:.6} native_qkv_idx={native_qkv_idx} native_qkv={native_qkv_v:.6} native_qkv_ref={native_qkv_ref_v:.6} replay_qkv_delta={replay_qkv_self_delta:.6} replay_qkv_idx={replay_qkv_idx} replay_qkv={replay_qkv_v:.6} replay_qkv_ref={replay_qkv_ref_v:.6} native_z_delta={native_z_self_delta:.6} native_z_idx={native_z_idx} native_z={native_z_v:.6} native_z_ref={native_z_ref_v:.6} replay_z_delta={replay_z_self_delta:.6} replay_z_idx={replay_z_idx} replay_z={replay_z_v:.6} replay_z_ref={replay_z_ref_v:.6}"
+        );
+    }
     let packed_native = decode_f32_le(&native.packed);
     let packed_replay = decode_f32_le(&replay.packed);
     let packed_delta = validate::max_abs_delta(&packed_native, &packed_replay);

@@ -29,6 +29,14 @@ pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn flush_metal_batch_for_host_boundary(buffer: &GpuBuffer, label: &str) -> Result<()> {
+    if buffer.backend() == gpu_hal::Backend::Metal {
+        kernel_ffi::prefill_ffi::flush_metal_batch()
+            .map_err(|e| anyhow::anyhow!("{label} Metal flush: {e}"))?;
+    }
+    Ok(())
+}
+
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -1572,6 +1580,13 @@ impl DecodeEngine {
 
         let row_bytes = hidden_dim * elem_bytes;
         let src_offset = token_id as usize * row_bytes;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            // The Metal component path batches GPU kernels, but this embedding
+            // copy is a CPU memcpy into shared storage. Close any open encoder
+            // before and after the write so the first RMSNorm sees the token.
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("embedding pre-copy Metal flush: {e}"))?;
+        }
         gpu_hal::copy_d2d(
             self.ordinal,
             self.hidden_io.as_ptr() as *mut c_void,
@@ -1579,6 +1594,10 @@ impl DecodeEngine {
             row_bytes,
         )
         .map_err(|e| anyhow::anyhow!("embedding lookup: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("embedding post-copy Metal flush: {e}"))?;
+        }
 
         let layer_count = self.state.layers.len();
         let mut traced_hidden = None;
@@ -2556,6 +2575,10 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} k l2norm: {e}"))?;
 
+        flush_metal_batch_for_host_boundary(
+            &self.hidden_io,
+            &format!("layer {idx} linear packed host-read boundary"),
+        )?;
         let q_scaled_host = q_scaled
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} q_scaled D2H: {e}"))?;
@@ -2714,6 +2737,10 @@ impl DecodeEngine {
         } else {
             None
         };
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent pre-copy Metal flush: {e}"))?;
+        }
         gpu_hal::copy_d2d(
             self.ordinal,
             recurrent_state.as_ptr() as *mut c_void,
@@ -2721,6 +2748,10 @@ impl DecodeEngine {
             nv * khd * vhd * ScalarType::F32.size_in_bytes(),
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} recurrent update copy: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            kernel_ffi::prefill_ffi::flush_metal_batch()
+                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent post-copy Metal flush: {e}"))?;
+        }
 
         kernel_ffi::prefill_ffi::cast(
             self.ordinal,
@@ -3743,11 +3774,10 @@ impl DecodeEngine {
             );
         }
         let start = Instant::now();
-        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none() {
-            Some(
-                kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
-                    .map_err(|e| anyhow::anyhow!("begin Metal component decode trace batch: {e}"))?,
-            )
+        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_TRACE_WITH_BATCH").is_some() {
+            Some(kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
+                anyhow::anyhow!("begin Metal component decode trace batch: {e}")
+            })?)
         } else {
             None
         };
@@ -3789,11 +3819,10 @@ impl DecodeEngine {
             );
         }
         let start = Instant::now();
-        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none() {
-            Some(
-                kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
-                    .map_err(|e| anyhow::anyhow!("begin Metal component decode input trace batch: {e}"))?,
-            )
+        let metal_batch_guard = if std::env::var_os("SUPERSONIC_METAL_TRACE_WITH_BATCH").is_some() {
+            Some(kernel_ffi::prefill_ffi::MetalBatchGuard::begin().map_err(|e| {
+                anyhow::anyhow!("begin Metal component decode input trace batch: {e}")
+            })?)
         } else {
             None
         };
