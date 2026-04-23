@@ -45,6 +45,34 @@ struct RmsNormParams {
     uint32_t block_size;
 };
 
+struct RopeParams {
+    uint32_t seq_len;
+    uint32_t num_heads;
+    uint32_t head_dim;
+    uint32_t rotary_dim;
+    uint32_t half_rot;
+    uint32_t pos_offset;
+    uint32_t total_pairs;
+};
+
+struct TransposePadConvParams {
+    uint32_t s;
+    uint32_t c;
+    uint32_t pad;
+    uint32_t stride;
+    uint32_t total_dst;
+};
+
+struct ExtractConvStateParams {
+    uint32_t s;
+    uint32_t c;
+    uint32_t kern_minus_1;
+    uint32_t copy;
+    uint32_t start;
+    uint32_t dst_start;
+    uint32_t total_dst;
+};
+
 struct RmsNormGatedParams {
     uint32_t n_rows;
     uint32_t n_cols;
@@ -356,6 +384,104 @@ kernel void supersonic_matmul_rhs_transposed_bf16(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create matmul pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> matmul_pipeline_f32(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:301
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"MATMULF32(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulParams {
+    uint batch_elems;
+    uint m;
+    uint n;
+    uint k;
+};
+
+kernel void supersonic_matmul_rhs_transposed_f32(
+    device const float* lhs [[buffer(0)]],
+    device const float* rhs [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant MatmulParams& params [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    uint batch = gid.z;
+    if (batch >= params.batch_elems || row >= params.m || col >= params.n) {
+        return;
+    }
+    float acc = 0.0f;
+    uint lhs_base = (batch * params.m + row) * params.k;
+    uint rhs_base = col * params.k;
+    for (uint kk = 0; kk < params.k; ++kk) {
+        acc = fma(lhs[lhs_base + kk], rhs[rhs_base + kk], acc);
+    }
+    out[(batch * params.m + row) * params.n + col] = acc;
+}
+)MATMULF32";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:302
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile F32 matmul library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_matmul_rhs_transposed_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:303
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load F32 matmul function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:304
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create F32 matmul pipeline"
                                                                              }];
                         }
                     }
@@ -904,6 +1030,508 @@ kernel void supersonic_rms_norm_rows_bf16(
     return pipeline;
 }
 
+id<MTLComputePipelineState> rms_norm_pipeline_f32(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    NSError* build_error = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                              code:340
+                                          userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+        } else {
+            static const char* kSource = R"RMSF32(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RmsNormParams {
+    uint n_rows;
+    uint n_cols;
+    float eps;
+    uint add_unit_offset;
+    uint block_size;
+};
+
+kernel void supersonic_rms_norm_rows_f32_weight_bf16(
+    device const float* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant RmsNormParams& params [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= params.n_rows || tid >= params.block_size) {
+        return;
+    }
+
+    threadgroup float scratch[256];
+    uint row_base = row * params.n_cols;
+    float mean_sq = 0.0f;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = input[row_base + col];
+        mean_sq = fma(value, value, mean_sq);
+    }
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float scale = float(weight[col]) + (params.add_unit_offset != 0 ? 1.0f : 0.0f);
+        out[row_base + col] = input[row_base + col] * inv_rms * scale;
+    }
+}
+
+kernel void supersonic_rms_norm_rows_f32_weight_f32(
+    device const float* input [[buffer(0)]],
+    device const float* weight [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant RmsNormParams& params [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= params.n_rows || tid >= params.block_size) {
+        return;
+    }
+
+    threadgroup float scratch[256];
+    uint row_base = row * params.n_cols;
+    float mean_sq = 0.0f;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = input[row_base + col];
+        mean_sq = fma(value, value, mean_sq);
+    }
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float scale = weight[col] + (params.add_unit_offset != 0 ? 1.0f : 0.0f);
+        out[row_base + col] = input[row_base + col] * inv_rms * scale;
+    }
+}
+)RMSF32";
+
+            NSString* source = [NSString stringWithUTF8String:kSource];
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            configure_precise_math(options);
+            NSError* library_error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                          options:options
+                                                            error:&library_error];
+            if (library == nil || library_error != nil) {
+                build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                   code:341
+                                                               userInfo:@{
+                                                                   NSLocalizedDescriptionKey :
+                                                                       @"Failed to compile F32 RMSNorm library"
+                                                               }];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                       code:342
+                                                   userInfo:@{
+                                                       NSLocalizedDescriptionKey :
+                                                           @"Failed to load F32 RMSNorm function"
+                                                   }];
+                } else {
+                    NSError* pipeline_error = nil;
+                    pipeline = [device newComputePipelineStateWithFunction:function
+                                                                     error:&pipeline_error];
+                    if (pipeline == nil || pipeline_error != nil) {
+                        build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                             code:343
+                                                                         userInfo:@{
+                                                                             NSLocalizedDescriptionKey :
+                                                                                 @"Failed to create F32 RMSNorm pipeline"
+                                                                         }];
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline != nil) {
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
+    if (build_error != nil) {
+        errors[function_name] = build_error;
+    }
+    if (error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return nil;
+}
+
+id<MTLComputePipelineState> rope_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    NSError* build_error = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                              code:350
+                                          userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+        } else {
+            static const char* kSource = R"ROPE(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RopeParams {
+    uint seq_len;
+    uint num_heads;
+    uint head_dim;
+    uint rotary_dim;
+    uint half_rot;
+    uint pos_offset;
+    uint total_pairs;
+};
+
+kernel void supersonic_apply_rope_prefill_bf16(
+    device bfloat* data [[buffer(0)]],
+    device const bfloat* cos_table [[buffer(1)]],
+    device const bfloat* sin_table [[buffer(2)]],
+    constant RopeParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_pairs) {
+        return;
+    }
+    uint i = gid % params.half_rot;
+    uint tmp = gid / params.half_rot;
+    uint head = tmp % params.num_heads;
+    uint pos = tmp / params.num_heads;
+    uint base = (pos * params.num_heads + head) * params.head_dim;
+    uint table_base = (params.pos_offset + pos) * params.half_rot;
+    float c = float(cos_table[table_base + i]);
+    float s = float(sin_table[table_base + i]);
+    float x0 = float(data[base + i]);
+    float x1 = float(data[base + i + params.half_rot]);
+    data[base + i] = bfloat(x0 * c - x1 * s);
+    data[base + i + params.half_rot] = bfloat(x1 * c + x0 * s);
+}
+
+kernel void supersonic_apply_rope_prefill_f32(
+    device float* data [[buffer(0)]],
+    device const bfloat* cos_table [[buffer(1)]],
+    device const bfloat* sin_table [[buffer(2)]],
+    constant RopeParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_pairs) {
+        return;
+    }
+    uint i = gid % params.half_rot;
+    uint tmp = gid / params.half_rot;
+    uint head = tmp % params.num_heads;
+    uint pos = tmp / params.num_heads;
+    uint base = (pos * params.num_heads + head) * params.head_dim;
+    uint table_base = (params.pos_offset + pos) * params.half_rot;
+    float c = float(cos_table[table_base + i]);
+    float s = float(sin_table[table_base + i]);
+    float x0 = data[base + i];
+    float x1 = data[base + i + params.half_rot];
+    data[base + i] = x0 * c - x1 * s;
+    data[base + i + params.half_rot] = x1 * c + x0 * s;
+}
+)ROPE";
+
+            NSString* source = [NSString stringWithUTF8String:kSource];
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            configure_precise_math(options);
+            NSError* library_error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                          options:options
+                                                            error:&library_error];
+            if (library == nil || library_error != nil) {
+                build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                   code:351
+                                                               userInfo:@{
+                                                                   NSLocalizedDescriptionKey :
+                                                                       @"Failed to compile RoPE library"
+                                                               }];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                       code:352
+                                                   userInfo:@{
+                                                       NSLocalizedDescriptionKey :
+                                                           @"Failed to load RoPE function"
+                                                   }];
+                } else {
+                    NSError* pipeline_error = nil;
+                    pipeline = [device newComputePipelineStateWithFunction:function
+                                                                     error:&pipeline_error];
+                    if (pipeline == nil || pipeline_error != nil) {
+                        build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                             code:353
+                                                                         userInfo:@{
+                                                                             NSLocalizedDescriptionKey :
+                                                                                 @"Failed to create RoPE pipeline"
+                                                                         }];
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline != nil) {
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
+    if (build_error != nil) {
+        errors[function_name] = build_error;
+    }
+    if (error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return nil;
+}
+
+id<MTLComputePipelineState> conv_layout_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    NSError* build_error = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                              code:360
+                                          userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+        } else {
+            static const char* kSource = R"CONVLAYOUT(
+#include <metal_stdlib>
+using namespace metal;
+
+struct TransposePadConvParams {
+    uint s;
+    uint c;
+    uint pad;
+    uint stride;
+    uint total_dst;
+};
+
+struct ExtractConvStateParams {
+    uint s;
+    uint c;
+    uint kern_minus_1;
+    uint copy;
+    uint start;
+    uint dst_start;
+    uint total_dst;
+};
+
+kernel void supersonic_transpose_pad_conv_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant TransposePadConvParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_dst) {
+        return;
+    }
+    uint ch = gid / params.stride;
+    uint pos = gid - ch * params.stride;
+    if (pos < params.pad) {
+        dst[gid] = bfloat(0.0f);
+        return;
+    }
+    uint row = pos - params.pad;
+    dst[gid] = src[row * params.c + ch];
+}
+
+kernel void supersonic_transpose_pad_conv_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant TransposePadConvParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_dst) {
+        return;
+    }
+    uint ch = gid / params.stride;
+    uint pos = gid - ch * params.stride;
+    if (pos < params.pad) {
+        dst[gid] = 0.0f;
+        return;
+    }
+    uint row = pos - params.pad;
+    dst[gid] = src[row * params.c + ch];
+}
+
+kernel void supersonic_extract_conv_state_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* dst [[buffer(1)]],
+    constant ExtractConvStateParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_dst) {
+        return;
+    }
+    uint ch = gid / params.kern_minus_1;
+    uint i = gid - ch * params.kern_minus_1;
+    if (i < params.dst_start) {
+        dst[gid] = bfloat(0.0f);
+        return;
+    }
+    uint src_row = params.start + (i - params.dst_start);
+    dst[gid] = src[src_row * params.c + ch];
+}
+
+kernel void supersonic_extract_conv_state_f32(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant ExtractConvStateParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_dst) {
+        return;
+    }
+    uint ch = gid / params.kern_minus_1;
+    uint i = gid - ch * params.kern_minus_1;
+    if (i < params.dst_start) {
+        dst[gid] = 0.0f;
+        return;
+    }
+    uint src_row = params.start + (i - params.dst_start);
+    dst[gid] = src[src_row * params.c + ch];
+}
+)CONVLAYOUT";
+
+            NSString* source = [NSString stringWithUTF8String:kSource];
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            configure_precise_math(options);
+            NSError* library_error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                          options:options
+                                                            error:&library_error];
+            if (library == nil || library_error != nil) {
+                build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                   code:361
+                                                               userInfo:@{
+                                                                   NSLocalizedDescriptionKey :
+                                                                       @"Failed to compile conv layout library"
+                                                               }];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                       code:362
+                                                   userInfo:@{
+                                                       NSLocalizedDescriptionKey :
+                                                           @"Failed to load conv layout function"
+                                                   }];
+                } else {
+                    NSError* pipeline_error = nil;
+                    pipeline = [device newComputePipelineStateWithFunction:function
+                                                                     error:&pipeline_error];
+                    if (pipeline == nil || pipeline_error != nil) {
+                        build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                             code:363
+                                                                         userInfo:@{
+                                                                             NSLocalizedDescriptionKey :
+                                                                                 @"Failed to create conv layout pipeline"
+                                                                         }];
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline != nil) {
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
+    if (build_error != nil) {
+        errors[function_name] = build_error;
+    }
+    if (error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return nil;
+}
+
 id<MTLComputePipelineState> rms_norm_gated_pipeline_bf16(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -1018,6 +1646,179 @@ kernel void supersonic_rms_norm_gated_bf16(
         *error_out = build_error;
     }
     return pipeline;
+}
+
+id<MTLComputePipelineState> rms_norm_gated_pipeline_f32(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    NSError* build_error = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                              code:320
+                                          userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+        } else {
+            static const char* kSource = R"RMSGF32(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RmsNormGatedParams {
+    uint n_rows;
+    uint n_cols;
+    float eps;
+    uint block_size;
+};
+
+kernel void supersonic_rms_norm_gated_f32_weight_bf16(
+    device const float* hidden [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    device const bfloat* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant RmsNormGatedParams& params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= params.n_rows || tid >= params.block_size) {
+        return;
+    }
+
+    threadgroup float scratch[256];
+    uint row_base = row * params.n_cols;
+    float mean_sq = 0.0f;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = hidden[row_base + col];
+        mean_sq = fma(value, value, mean_sq);
+    }
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float gate_value = gate[row_base + col];
+        float silu_gate = gate_value / (1.0f + exp(-gate_value));
+        out[row_base + col] = hidden[row_base + col] * inv_rms * float(weight[col]) * silu_gate;
+    }
+}
+
+kernel void supersonic_rms_norm_gated_f32_weight_f32(
+    device const float* hidden [[buffer(0)]],
+    device const float* gate [[buffer(1)]],
+    device const float* weight [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant RmsNormGatedParams& params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= params.n_rows || tid >= params.block_size) {
+        return;
+    }
+
+    threadgroup float scratch[256];
+    uint row_base = row * params.n_cols;
+    float mean_sq = 0.0f;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = hidden[row_base + col];
+        mean_sq = fma(value, value, mean_sq);
+    }
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float gate_value = gate[row_base + col];
+        float silu_gate = gate_value / (1.0f + exp(-gate_value));
+        out[row_base + col] = hidden[row_base + col] * inv_rms * weight[col] * silu_gate;
+    }
+}
+)RMSGF32";
+
+            NSString* source = [NSString stringWithUTF8String:kSource];
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            configure_precise_math(options);
+            NSError* library_error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                          options:options
+                                                            error:&library_error];
+            if (library == nil || library_error != nil) {
+                build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                   code:321
+                                                               userInfo:@{
+                                                                   NSLocalizedDescriptionKey :
+                                                                       @"Failed to compile F32 gated RMSNorm library"
+                                                               }];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                       code:322
+                                                   userInfo:@{
+                                                       NSLocalizedDescriptionKey :
+                                                           @"Failed to load F32 gated RMSNorm function"
+                                                   }];
+                } else {
+                    NSError* pipeline_error = nil;
+                    pipeline = [device newComputePipelineStateWithFunction:function
+                                                                     error:&pipeline_error];
+                    if (pipeline == nil || pipeline_error != nil) {
+                        build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                             code:323
+                                                                         userInfo:@{
+                                                                             NSLocalizedDescriptionKey :
+                                                                                 @"Failed to create F32 gated RMSNorm pipeline"
+                                                                         }];
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline != nil) {
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
+    if (build_error != nil) {
+        errors[function_name] = build_error;
+    }
+    if (error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return nil;
 }
 
 id<MTLComputePipelineState> linear_prefill_conv_pack_pipeline_bf16(NSError** error_out) {
@@ -3123,6 +3924,324 @@ extern "C" int supersonic_metal_transpose_shd_hsd_f32(
     );
 }
 
+static int supersonic_metal_apply_rope_prefill_impl(
+    size_t seq_len,
+    size_t num_heads,
+    size_t head_dim,
+    size_t rotary_dim,
+    size_t pos_offset,
+    const void* cos_ptr,
+    const void* sin_ptr,
+    void* data_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (seq_len == 0 || num_heads == 0 || head_dim == 0 || rotary_dim == 0) {
+            return 0;
+        }
+        if (seq_len > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX ||
+            rotary_dim > UINT32_MAX || pos_offset > UINT32_MAX || cos_ptr == nullptr ||
+            sin_ptr == nullptr || data_ptr == nullptr) {
+            return 354;
+        }
+        size_t half_rot = rotary_dim / 2;
+        if (half_rot == 0 || half_rot > head_dim || half_rot > UINT32_MAX) {
+            return 355;
+        }
+        size_t total_pairs = seq_len * num_heads * half_rot;
+        if (total_pairs > UINT32_MAX || total_pairs / half_rot / num_heads != seq_len) {
+            return 356;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = rope_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 357;
+        }
+
+        id<MTLBuffer> data = nil;
+        id<MTLBuffer> cos_table = nil;
+        id<MTLBuffer> sin_table = nil;
+        size_t data_offset = 0;
+        size_t cos_offset = 0;
+        size_t sin_offset = 0;
+        if (lookup_buffer(data_ptr, &data, &data_offset) != 0) {
+            return 358;
+        }
+        if (lookup_buffer(cos_ptr, &cos_table, &cos_offset) != 0) {
+            return 359;
+        }
+        if (lookup_buffer(sin_ptr, &sin_table, &sin_offset) != 0) {
+            return 360;
+        }
+
+        RopeParams params = {
+            static_cast<uint32_t>(seq_len),
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(head_dim),
+            static_cast<uint32_t>(rotary_dim),
+            static_cast<uint32_t>(half_rot),
+            static_cast<uint32_t>(pos_offset),
+            static_cast<uint32_t>(total_pairs),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:data offset:data_offset atIndex:0];
+            [encoder setBuffer:cos_table offset:cos_offset atIndex:1];
+            [encoder setBuffer:sin_table offset:sin_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_pairs, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 361, 362, 363, 364);
+    }
+}
+
+extern "C" int supersonic_metal_apply_rope_prefill_bf16(
+    size_t seq_len,
+    size_t num_heads,
+    size_t head_dim,
+    size_t rotary_dim,
+    size_t pos_offset,
+    const void* cos_ptr,
+    const void* sin_ptr,
+    void* data_ptr
+) {
+    return supersonic_metal_apply_rope_prefill_impl(
+        seq_len,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        pos_offset,
+        cos_ptr,
+        sin_ptr,
+        data_ptr,
+        @"supersonic_apply_rope_prefill_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_apply_rope_prefill_f32(
+    size_t seq_len,
+    size_t num_heads,
+    size_t head_dim,
+    size_t rotary_dim,
+    size_t pos_offset,
+    const void* cos_ptr,
+    const void* sin_ptr,
+    void* data_ptr
+) {
+    return supersonic_metal_apply_rope_prefill_impl(
+        seq_len,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        pos_offset,
+        cos_ptr,
+        sin_ptr,
+        data_ptr,
+        @"supersonic_apply_rope_prefill_f32"
+    );
+}
+
+static int supersonic_metal_transpose_pad_conv_impl(
+    size_t s,
+    size_t c,
+    size_t pad,
+    const void* src_ptr,
+    void* dst_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (s == 0 || c == 0) {
+            return 0;
+        }
+        if (s > UINT32_MAX || c > UINT32_MAX || pad > UINT32_MAX || src_ptr == nullptr || dst_ptr == nullptr) {
+            return 365;
+        }
+        size_t stride = pad + s;
+        size_t total_dst = c * stride;
+        if (stride > UINT32_MAX || total_dst > UINT32_MAX || total_dst / stride != c) {
+            return 366;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = conv_layout_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 367;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 368;
+        }
+        if (lookup_buffer(dst_ptr, &dst, &dst_offset) != 0) {
+            return 369;
+        }
+
+        TransposePadConvParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(c),
+            static_cast<uint32_t>(pad),
+            static_cast<uint32_t>(stride),
+            static_cast<uint32_t>(total_dst),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:dst offset:dst_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_dst, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 370, 371, 372, 373);
+    }
+}
+
+extern "C" int supersonic_metal_transpose_pad_conv_bf16(
+    size_t s,
+    size_t c,
+    size_t pad,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_transpose_pad_conv_impl(
+        s,
+        c,
+        pad,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_transpose_pad_conv_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_transpose_pad_conv_f32(
+    size_t s,
+    size_t c,
+    size_t pad,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_transpose_pad_conv_impl(
+        s,
+        c,
+        pad,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_transpose_pad_conv_f32"
+    );
+}
+
+static int supersonic_metal_extract_conv_state_impl(
+    size_t s,
+    size_t c,
+    size_t kern_minus_1,
+    const void* src_ptr,
+    void* dst_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (c == 0 || kern_minus_1 == 0) {
+            return 0;
+        }
+        if (s > UINT32_MAX || c > UINT32_MAX || kern_minus_1 > UINT32_MAX ||
+            src_ptr == nullptr || dst_ptr == nullptr) {
+            return 374;
+        }
+        size_t total_dst = c * kern_minus_1;
+        if (total_dst > UINT32_MAX || total_dst / kern_minus_1 != c) {
+            return 375;
+        }
+        size_t copy = std::min(s, kern_minus_1);
+        size_t start = s >= copy ? s - copy : 0;
+        size_t dst_start = kern_minus_1 - copy;
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = conv_layout_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 376;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 377;
+        }
+        if (lookup_buffer(dst_ptr, &dst, &dst_offset) != 0) {
+            return 378;
+        }
+
+        ExtractConvStateParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(c),
+            static_cast<uint32_t>(kern_minus_1),
+            static_cast<uint32_t>(copy),
+            static_cast<uint32_t>(start),
+            static_cast<uint32_t>(dst_start),
+            static_cast<uint32_t>(total_dst),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:dst offset:dst_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_dst, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 379, 380, 381, 382);
+    }
+}
+
+extern "C" int supersonic_metal_extract_conv_state_bf16(
+    size_t s,
+    size_t c,
+    size_t kern_minus_1,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_extract_conv_state_impl(
+        s,
+        c,
+        kern_minus_1,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_extract_conv_state_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_extract_conv_state_f32(
+    size_t s,
+    size_t c,
+    size_t kern_minus_1,
+    const void* src_ptr,
+    void* dst_ptr
+) {
+    return supersonic_metal_extract_conv_state_impl(
+        s,
+        c,
+        kern_minus_1,
+        src_ptr,
+        dst_ptr,
+        @"supersonic_extract_conv_state_f32"
+    );
+}
+
 static int supersonic_metal_split_qkv_impl(
     size_t s,
     size_t key_dim,
@@ -3896,6 +5015,70 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
     }
 }
 
+extern "C" int supersonic_metal_matmul_rhs_transposed_f32(
+    size_t batch_elems,
+    size_t m,
+    size_t n,
+    size_t k,
+    const void* lhs_ptr,
+    const void* rhs_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (batch_elems == 0 || m == 0 || n == 0 || k == 0 || lhs_ptr == nullptr || rhs_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 310;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = matmul_pipeline_f32(&pipeline_error);
+        if (pipeline == nil) {
+            return 311;
+        }
+
+        id<MTLBuffer> lhs = nil;
+        id<MTLBuffer> rhs = nil;
+        id<MTLBuffer> out = nil;
+        size_t lhs_offset = 0;
+        size_t rhs_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(lhs_ptr, &lhs, &lhs_offset) != 0) {
+            return 312;
+        }
+        if (lookup_buffer(rhs_ptr, &rhs, &rhs_offset) != 0) {
+            return 313;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 314;
+        }
+
+        MatmulParams params = {
+            static_cast<uint32_t>(batch_elems),
+            static_cast<uint32_t>(m),
+            static_cast<uint32_t>(n),
+            static_cast<uint32_t>(k),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            NSUInteger tg_width = std::min<NSUInteger>(8, std::max<NSUInteger>(1, n));
+            NSUInteger tg_height =
+                std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
+            if (tg_height == 0) {
+                tg_height = 1;
+            }
+            MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
+            MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 315, 316, 317, 318);
+    }
+}
+
 extern "C" int supersonic_metal_lm_head_argmax_bf16(
     size_t in_dim,
     size_t vocab_size,
@@ -4120,6 +5303,111 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
     }
 }
 
+int supersonic_metal_rms_norm_rows_f32_impl(
+    NSString* function_name,
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    bool add_unit_offset,
+    const void* input_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (n_rows == 0 || n_cols == 0 || input_ptr == nullptr || weight_ptr == nullptr || out_ptr == nullptr) {
+            return 344;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = rms_norm_pipeline_f32(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 345;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> out = nil;
+        size_t input_offset = 0;
+        size_t weight_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 346;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 347;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 348;
+        }
+
+        NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
+        RmsNormParams params = {
+            static_cast<uint32_t>(n_rows),
+            static_cast<uint32_t>(n_cols),
+            eps,
+            add_unit_offset ? 1u : 0u,
+            static_cast<uint32_t>(block_size),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:weight offset:weight_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 349, 350, 351, 352);
+    }
+}
+
+extern "C" int supersonic_metal_rms_norm_rows_f32_weight_bf16(
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    bool add_unit_offset,
+    const void* input_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_rms_norm_rows_f32_impl(
+        @"supersonic_rms_norm_rows_f32_weight_bf16",
+        n_rows,
+        n_cols,
+        eps,
+        add_unit_offset,
+        input_ptr,
+        weight_ptr,
+        out_ptr
+    );
+}
+
+extern "C" int supersonic_metal_rms_norm_rows_f32_weight_f32(
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    bool add_unit_offset,
+    const void* input_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_rms_norm_rows_f32_impl(
+        @"supersonic_rms_norm_rows_f32_weight_f32",
+        n_rows,
+        n_cols,
+        eps,
+        add_unit_offset,
+        input_ptr,
+        weight_ptr,
+        out_ptr
+    );
+}
+
 extern "C" int supersonic_metal_rms_norm_gated_bf16(
     size_t n_rows,
     size_t n_cols,
@@ -4186,6 +5474,117 @@ extern "C" int supersonic_metal_rms_norm_gated_bf16(
             [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         }, 234, 235, 236, 237);
     }
+}
+
+int supersonic_metal_rms_norm_gated_f32_impl(
+    NSString* function_name,
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    const void* hidden_ptr,
+    const void* gate_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (n_rows == 0 || n_cols == 0 || n_rows > UINT32_MAX || n_cols > UINT32_MAX ||
+            hidden_ptr == nullptr || gate_ptr == nullptr || weight_ptr == nullptr || out_ptr == nullptr) {
+            return 330;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = rms_norm_gated_pipeline_f32(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 331;
+        }
+
+        id<MTLBuffer> hidden = nil;
+        id<MTLBuffer> gate = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> out = nil;
+        size_t hidden_offset = 0;
+        size_t gate_offset = 0;
+        size_t weight_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(hidden_ptr, &hidden, &hidden_offset) != 0) {
+            return 332;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 333;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 334;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 335;
+        }
+
+        NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
+        RmsNormGatedParams params = {
+            static_cast<uint32_t>(n_rows),
+            static_cast<uint32_t>(n_cols),
+            eps,
+            static_cast<uint32_t>(block_size),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:weight offset:weight_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 336, 337, 338, 339);
+    }
+}
+
+extern "C" int supersonic_metal_rms_norm_gated_f32_weight_bf16(
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    const void* hidden_ptr,
+    const void* gate_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_rms_norm_gated_f32_impl(
+        @"supersonic_rms_norm_gated_f32_weight_bf16",
+        n_rows,
+        n_cols,
+        eps,
+        hidden_ptr,
+        gate_ptr,
+        weight_ptr,
+        out_ptr
+    );
+}
+
+extern "C" int supersonic_metal_rms_norm_gated_f32_weight_f32(
+    size_t n_rows,
+    size_t n_cols,
+    float eps,
+    const void* hidden_ptr,
+    const void* gate_ptr,
+    const void* weight_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_rms_norm_gated_f32_impl(
+        @"supersonic_rms_norm_gated_f32_weight_f32",
+        n_rows,
+        n_cols,
+        eps,
+        hidden_ptr,
+        gate_ptr,
+        weight_ptr,
+        out_ptr
+    );
 }
 
 extern "C" int supersonic_metal_linear_prefill_conv_pack_bf16(

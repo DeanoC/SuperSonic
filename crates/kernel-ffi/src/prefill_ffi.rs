@@ -1261,6 +1261,14 @@ pub fn rms_norm_gated(
                 return result;
             }
         }
+        if dtype == ScalarType::F32 && !metal_native::disabled_by_env() {
+            let result = metal_profile_time("rms_norm_gated", "native", || {
+                metal_native::rms_norm_gated_f32(n_rows, n_cols, eps, hidden, gate, weight, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("rms_norm_gated", || {
             metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
         });
@@ -1416,6 +1424,17 @@ pub fn matmul_rhs_transposed(
                 return result;
             }
         }
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_matmul()
+        {
+            let result = metal_profile_time("matmul_rhs_transposed", "native", || {
+                metal_native::matmul_rhs_transposed_f32(batch_elems, m, n, k, lhs, rhs, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("matmul_rhs_transposed", || {
             metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
@@ -1542,6 +1561,17 @@ pub fn rms_norm_rows(
                 return result;
             }
         }
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            let result = metal_profile_time("rms_norm_rows", "native", || {
+                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, true, input, weight, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("rms_norm_rows", || {
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
@@ -1586,6 +1616,17 @@ pub fn rms_norm_rows_plain(
         {
             let result = metal_profile_time("rms_norm_rows_plain", "native", || {
                 metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, input, weight, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            let result = metal_profile_time("rms_norm_rows_plain", "native", || {
+                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, false, input, weight, out)
             });
             if result.is_ok() {
                 return result;
@@ -1636,6 +1677,17 @@ pub fn rms_norm_rows_plain_inplace(
         {
             let result = metal_profile_time("rms_norm_rows_plain_inplace", "native", || {
                 metal_native::rms_norm_rows_bf16(n_rows, n_cols, eps, false, &input, weight, data)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
+        if dtype == ScalarType::F32
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_rms_norm()
+        {
+            let result = metal_profile_time("rms_norm_rows_plain_inplace", "native", || {
+                metal_native::rms_norm_rows_f32(n_rows, n_cols, eps, false, &input, weight, data)
             });
             if result.is_ok() {
                 return result;
@@ -1817,6 +1869,17 @@ pub fn apply_rope_prefill(
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("apply_rope_prefill", "native", || {
+                metal_native::apply_rope_prefill(
+                    dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table,
+                    pos_offset, data,
+                )
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("apply_rope_prefill", || {
             metal_host::apply_rope_prefill(
                 dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
@@ -1907,6 +1970,14 @@ pub fn transpose_pad_conv(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("transpose_pad_conv", "native", || {
+                metal_native::transpose_pad_conv(dtype, s, c, pad, src, dst)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("transpose_pad_conv", || {
             metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst)
         });
@@ -1942,6 +2013,14 @@ pub fn extract_conv_state(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env() {
+            let result = metal_profile_time("extract_conv_state", "native", || {
+                metal_native::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_host_time("extract_conv_state", || {
             metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
         });

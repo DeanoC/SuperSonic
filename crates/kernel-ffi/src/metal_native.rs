@@ -28,6 +28,15 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_f32(
+        batch_elems: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_lm_head_argmax_bf16(
         in_dim: usize,
         vocab_size: usize,
@@ -57,7 +66,43 @@ unsafe extern "C" {
         weight_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_rms_norm_rows_f32_weight_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        add_unit_offset: bool,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_rms_norm_rows_f32_weight_f32(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        add_unit_offset: bool,
+        input_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_rms_norm_gated_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        hidden_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_rms_norm_gated_f32_weight_bf16(
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        hidden_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_rms_norm_gated_f32_weight_f32(
         n_rows: usize,
         n_cols: usize,
         eps: f32,
@@ -173,6 +218,54 @@ unsafe extern "C" {
         s: usize,
         h: usize,
         d: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_apply_rope_prefill_bf16(
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        pos_offset: usize,
+        cos_ptr: *const c_void,
+        sin_ptr: *const c_void,
+        data_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_apply_rope_prefill_f32(
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        pos_offset: usize,
+        cos_ptr: *const c_void,
+        sin_ptr: *const c_void,
+        data_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_transpose_pad_conv_bf16(
+        s: usize,
+        c: usize,
+        pad: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_transpose_pad_conv_f32(
+        s: usize,
+        c: usize,
+        pad: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_extract_conv_state_bf16(
+        s: usize,
+        c: usize,
+        kern_minus_1: usize,
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_extract_conv_state_f32(
+        s: usize,
+        c: usize,
+        kern_minus_1: usize,
         src_ptr: *const c_void,
         dst_ptr: *mut c_void,
     ) -> c_int;
@@ -435,6 +528,43 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_f32(
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::F32 || rhs.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_f32 expects F32 buffers, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_f32(
+            batch_elems,
+            m,
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn full_attention_prefill_bf16_f32(
     q_heads: usize,
     kv_heads: usize,
@@ -529,6 +659,58 @@ pub(crate) fn rms_norm_rows_bf16(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn rms_norm_rows_f32(
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    add_unit_offset: bool,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if input.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native rms_norm_rows_f32 expects F32 input/out, got {:?}/{:?}",
+            input.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        match weight.dtype() {
+            ScalarType::BF16 => supersonic_metal_rms_norm_rows_f32_weight_bf16(
+                n_rows,
+                n_cols,
+                eps,
+                add_unit_offset,
+                input.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_rms_norm_rows_f32_weight_f32(
+                n_rows,
+                n_cols,
+                eps,
+                add_unit_offset,
+                input.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native rms_norm_rows_f32 expects BF16 or F32 weight, got {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native rms_norm_rows_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn rms_norm_gated_bf16(
     n_rows: usize,
     n_cols: usize,
@@ -565,6 +747,59 @@ pub(crate) fn rms_norm_gated_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native rms_norm_gated_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn rms_norm_gated_f32(
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    hidden: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if hidden.dtype() != ScalarType::F32 || gate.dtype() != ScalarType::F32 || out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native rms_norm_gated_f32 expects F32 hidden/gate/out, got {:?}/{:?}/{:?}",
+            hidden.dtype(),
+            gate.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        match weight.dtype() {
+            ScalarType::BF16 => supersonic_metal_rms_norm_gated_f32_weight_bf16(
+                n_rows,
+                n_cols,
+                eps,
+                hidden.as_ptr(),
+                gate.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_rms_norm_gated_f32_weight_f32(
+                n_rows,
+                n_cols,
+                eps,
+                hidden.as_ptr(),
+                gate.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native rms_norm_gated_f32 expects BF16 or F32 weight, got {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native rms_norm_gated_f32 failed with status {status}"
         )));
     }
     Ok(())
@@ -976,6 +1211,145 @@ pub(crate) fn transpose_shd_hsd(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn apply_rope_prefill(
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    pos_offset: usize,
+    data: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if data.dtype() != dtype || cos_table.dtype() != ScalarType::BF16 || sin_table.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native apply_rope_prefill expects data={dtype:?} and BF16 tables, got data={:?} cos={:?} sin={:?}",
+            data.dtype(),
+            cos_table.dtype(),
+            sin_table.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_apply_rope_prefill_bf16(
+                seq_len,
+                num_heads,
+                head_dim,
+                rotary_dim,
+                pos_offset,
+                cos_table.as_ptr(),
+                sin_table.as_ptr(),
+                data.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_apply_rope_prefill_f32(
+                seq_len,
+                num_heads,
+                head_dim,
+                rotary_dim,
+                pos_offset,
+                cos_table.as_ptr(),
+                sin_table.as_ptr(),
+                data.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native apply_rope_prefill does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native apply_rope_prefill failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn transpose_pad_conv(
+    dtype: ScalarType,
+    s: usize,
+    c: usize,
+    pad: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if src.dtype() != dtype || dst.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native transpose_pad_conv expects dtype {dtype:?}, got {:?}->{:?}",
+            src.dtype(),
+            dst.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => {
+                supersonic_metal_transpose_pad_conv_bf16(s, c, pad, src.as_ptr(), dst.as_mut_ptr())
+            }
+            ScalarType::F32 => {
+                supersonic_metal_transpose_pad_conv_f32(s, c, pad, src.as_ptr(), dst.as_mut_ptr())
+            }
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native transpose_pad_conv does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native transpose_pad_conv failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn extract_conv_state(
+    dtype: ScalarType,
+    s: usize,
+    c: usize,
+    kern_minus_1: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if src.dtype() != dtype || dst.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native extract_conv_state expects dtype {dtype:?}, got {:?}->{:?}",
+            src.dtype(),
+            dst.dtype()
+        )));
+    }
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_extract_conv_state_bf16(
+                s,
+                c,
+                kern_minus_1,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            ),
+            ScalarType::F32 => {
+                supersonic_metal_extract_conv_state_f32(s, c, kern_minus_1, src.as_ptr(), dst.as_mut_ptr())
+            }
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native extract_conv_state does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native extract_conv_state failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn split_qkv(
     dtype: ScalarType,
     s: usize,
@@ -1374,6 +1748,21 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_f32(
+    _batch_elems: usize,
+    _m: usize,
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
     _weight: &GpuBuffer,
@@ -1421,6 +1810,21 @@ pub(crate) fn rms_norm_rows_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn rms_norm_rows_f32(
+    _n_rows: usize,
+    _n_cols: usize,
+    _eps: f32,
+    _add_unit_offset: bool,
+    _input: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native rms_norm_rows_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn rms_norm_gated_bf16(
     _n_rows: usize,
     _n_cols: usize,
@@ -1432,6 +1836,21 @@ pub(crate) fn rms_norm_gated_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native rms_norm_gated_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn rms_norm_gated_f32(
+    _n_rows: usize,
+    _n_cols: usize,
+    _eps: f32,
+    _hidden: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native rms_norm_gated_f32 is not compiled".into(),
     ))
 }
 
@@ -1538,6 +1957,51 @@ pub(crate) fn transpose_shd_hsd(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native transpose_shd_hsd is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn apply_rope_prefill(
+    _dtype: ScalarType,
+    _seq_len: usize,
+    _num_heads: usize,
+    _head_dim: usize,
+    _rotary_dim: usize,
+    _cos_table: &GpuBuffer,
+    _sin_table: &GpuBuffer,
+    _pos_offset: usize,
+    _data: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native apply_rope_prefill is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn transpose_pad_conv(
+    _dtype: ScalarType,
+    _s: usize,
+    _c: usize,
+    _pad: usize,
+    _src: &GpuBuffer,
+    _dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native transpose_pad_conv is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn extract_conv_state(
+    _dtype: ScalarType,
+    _s: usize,
+    _c: usize,
+    _kern_minus_1: usize,
+    _src: &GpuBuffer,
+    _dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native extract_conv_state is not compiled".into(),
     ))
 }
 
@@ -1732,6 +2196,40 @@ mod tests {
     }
 
     #[test]
+    fn metal_native_matmul_rhs_transposed_f32_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 3],
+            &f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .expect("upload lhs");
+        let rhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 3],
+            &f32_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0]),
+        )
+        .expect("upload rhs");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate out");
+
+        matmul_rhs_transposed_f32(1, 2, 2, 3, &lhs, &rhs, &mut out).expect("run native F32 matmul");
+
+        let actual = read_f32(&out);
+        let expected = [4.0f32, 4.5, 10.0, 9.0];
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
     fn metal_native_lm_head_argmax_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
@@ -1857,6 +2355,56 @@ mod tests {
     }
 
     #[test]
+    fn metal_native_rms_norm_rows_f32_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 3],
+            &f32_bytes(&[1.0, 2.0, 2.0, 2.0, 0.0, 2.0]),
+        )
+        .expect("upload input");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[0.0, 0.5, -0.5]),
+        )
+        .expect("upload weight");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate native out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate ref out");
+
+        crate::metal_host::rms_norm_rows(
+            ScalarType::F32,
+            2,
+            3,
+            1e-5,
+            true,
+            &input,
+            &weight,
+            &mut out_ref,
+        )
+        .expect("host F32 rms norm");
+        rms_norm_rows_f32(2, 3, 1e-5, true, &input, &weight, &mut out_native)
+            .expect("native F32 rms norm");
+
+        for (idx, (a, e)) in read_f32(&out_native)
+            .iter()
+            .zip(read_f32(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
     fn metal_native_rms_norm_gated_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
@@ -1906,6 +2454,61 @@ mod tests {
             let delta = (a - e).abs();
             assert!(
                 delta <= 0.02,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_rms_norm_gated_f32_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden_vals = [1.0f32, 2.0, 2.0, 2.0, 0.0, 2.0];
+        let gate_vals = [0.0f32, 1.0, -1.0, 3.0, -2.0, 0.5];
+        let hidden = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 3],
+            &f32_bytes(&hidden_vals),
+        )
+        .expect("upload hidden");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[2, 3], &f32_bytes(&gate_vals))
+                .expect("upload gate");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[1.0, 0.5, -0.5]),
+        )
+        .expect("upload weight");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate native out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 3]).expect("allocate ref out");
+
+        crate::metal_host::rms_norm_gated(
+            ScalarType::F32,
+            2,
+            3,
+            1e-5,
+            &hidden,
+            &gate,
+            &weight,
+            &mut out_ref,
+        )
+        .expect("host gated F32 rms norm");
+        rms_norm_gated_f32(2, 3, 1e-5, &hidden, &gate, &weight, &mut out_native)
+            .expect("native gated F32 rms norm");
+
+        for (idx, (a, e)) in read_f32(&out_native)
+            .iter()
+            .zip(read_f32(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
             );
         }
@@ -2283,6 +2886,103 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2, 2]).expect("allocate f32 out");
         transpose_shd_hsd(ScalarType::F32, 2, 2, 2, &input, &mut out).expect("run f32 transpose");
         assert_eq!(read_f32(&out), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn metal_native_apply_rope_prefill_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input_vals = [1.0f32, 2.0, 3.0, 4.0, -1.0, 0.5, 2.0, -3.0];
+        let cos_vals = [1.0f32, 1.0, 0.5, 0.25, -0.5, 0.75];
+        let sin_vals = [0.0f32, 0.0, 0.5, -0.25, 0.25, 0.5];
+        let mut native = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 1, 4],
+            &f32_bytes(&input_vals),
+        )
+        .expect("upload native data");
+        let mut reference = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 1, 4],
+            &f32_bytes(&input_vals),
+        )
+        .expect("upload reference data");
+        let cos = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3, 2],
+            &bf16_bytes(&cos_vals),
+        )
+        .expect("upload cos");
+        let sin = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3, 2],
+            &bf16_bytes(&sin_vals),
+        )
+        .expect("upload sin");
+
+        crate::metal_host::apply_rope_prefill(
+            ScalarType::F32,
+            2,
+            1,
+            4,
+            4,
+            &cos,
+            &sin,
+            1,
+            &mut reference,
+        )
+        .expect("host rope");
+        apply_rope_prefill(ScalarType::F32, 2, 1, 4, 4, &cos, &sin, 1, &mut native)
+            .expect("native rope");
+
+        for (idx, (a, e)) in read_f32(&native)
+            .iter()
+            .zip(read_f32(&reference).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_conv_layout_helpers_match_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3, 2],
+            &f32_bytes(&[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]),
+        )
+        .expect("upload input");
+
+        let mut pad_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 5]).expect("allocate pad native");
+        let mut pad_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 5]).expect("allocate pad ref");
+        crate::metal_host::transpose_pad_conv(ScalarType::F32, 3, 2, 2, &input, &mut pad_ref)
+            .expect("host transpose_pad_conv");
+        transpose_pad_conv(ScalarType::F32, 3, 2, 2, &input, &mut pad_native)
+            .expect("native transpose_pad_conv");
+        assert_eq!(read_f32(&pad_native), read_f32(&pad_ref));
+
+        let mut state_native =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 4]).expect("allocate state native");
+        let mut state_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 4]).expect("allocate state ref");
+        crate::metal_host::extract_conv_state(ScalarType::F32, 3, 2, 4, &input, &mut state_ref)
+            .expect("host extract_conv_state");
+        extract_conv_state(ScalarType::F32, 3, 2, 4, &input, &mut state_native)
+            .expect("native extract_conv_state");
+        assert_eq!(read_f32(&state_native), read_f32(&state_ref));
     }
 
     #[test]
