@@ -151,6 +151,43 @@ impl WeightLoader {
         Ok(buf)
     }
 
+    /// Load one BF16 row from a 2D tensor and expand it to F32 on CPU.
+    pub fn load_bf16_row_f32(&self, name: &str, row: usize) -> Result<Vec<f32>, LoadError> {
+        let &shard_idx = self
+            .index
+            .get(name)
+            .ok_or_else(|| LoadError::NotFound(name.to_string()))?;
+        let tensors = SafeTensors::deserialize(&self.shards[shard_idx])?;
+        let view = tensors.tensor(name)?;
+        if view.dtype() != safetensors::Dtype::BF16 {
+            return Err(LoadError::UnsupportedDtype(format!(
+                "{name}: expected BF16, got {:?}",
+                view.dtype()
+            )));
+        }
+        let shape = view.shape();
+        if shape.len() != 2 {
+            return Err(LoadError::UnsupportedDtype(format!(
+                "{name}: expected rank-2 tensor, got shape {shape:?}"
+            )));
+        }
+        let rows = shape[0];
+        let cols = shape[1];
+        if row >= rows {
+            return Err(LoadError::NotFound(format!(
+                "{name}: row {row} out of range for {rows} rows"
+            )));
+        }
+        let row_bytes = cols * 2;
+        let start = row * row_bytes;
+        let end = start + row_bytes;
+        let data = &view.data()[start..end];
+        Ok(data
+            .chunks_exact(2)
+            .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect())
+    }
+
     /// List all tensor names.
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.index.keys().map(String::as_str)

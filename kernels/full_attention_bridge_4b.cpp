@@ -2,7 +2,29 @@
 
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
+
+namespace {
+
+// Per-model launch preset, set once at startup by the Rust registry via
+// `dotcache_qwen35_4b_hip_set_launch_preset`. Read by the persistent-decode
+// bridge when the user hasn't supplied `SUPERSONIC_QWEN4B_BLOCKS`. Zero
+// means "no preset, use the hardcoded gfx11xx default".
+int g_preset_blocks = 0;
+int g_preset_coop = 0;
+
+inline void qwen4b_get_launch_preset(int& blocks, int& coop) {
+    blocks = g_preset_blocks;
+    coop = g_preset_coop;
+}
+
+} // anonymous namespace
+
+extern "C" void dotcache_qwen35_4b_hip_set_launch_preset(int blocks, int coop) {
+    g_preset_blocks = blocks;
+    g_preset_coop = coop;
+}
 
 namespace {
 
@@ -77,7 +99,17 @@ int full_attention_prefill_device(
     if (hipMalloc(&d_row_counter, sizeof(unsigned int)) != hipSuccess) return 2;
     if (hipMemset(d_row_counter, 0, sizeof(unsigned int)) != hipSuccess) return 10;
 
-    const int grid = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    // RDNA3 `multiProcessorCount` reports WGPs, not CUs. Oversubscribe 2x
+    // on gfx11xx so the prefill attention kernel fills every CU; the
+    // kernel's atomic row-counter already handles extra blocks gracefully.
+    int grid = props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    {
+        const char* arch = props.gcnArchName;
+        const bool is_rdna3_wgp_arch =
+            arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+            arch[3] == '1' && arch[4] == '1';
+        if (is_rdna3_wgp_arch) grid *= 2;
+    }
     const int block = props.warpSize > 0 ? props.warpSize : 32;
     if (head_dim > block * 8) return 14;
     hipLaunchKernelGGL(
@@ -3578,6 +3610,76 @@ int matmul_rhs_transposed_tiled_device(
     return 0;
 }
 
+// Cached per-device arch flag: does this device support RDNA3 WMMA intrinsics?
+// gfx11xx (RDNA3 / RDNA3.5) supports v_wmma_f32_16x16x16_bf16; older arches
+// (gfx10, gfx9, CDNA gfx9xx) do not, and gfx12 uses a different opcode the
+// kernel isn't compiled for yet. Env var SUPERSONIC_QWEN4B_DISABLE_WMMA=1
+// forces the scalar path for debugging / perf comparison.
+//
+// `supersonic-serve` can call this concurrently from multiple request threads,
+// so initialization goes through `std::call_once` — plain non-atomic writes
+// would be a data race.
+static bool device_supports_wmma_bf16(int device_ordinal) {
+    static std::once_flag env_once;
+    static bool env_disabled = false;
+    std::call_once(env_once, [] {
+        const char* env = std::getenv("SUPERSONIC_QWEN4B_DISABLE_WMMA");
+        env_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+    });
+    if (env_disabled) return false;
+
+    auto probe_arch = [](int ordinal) -> bool {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
+        const char* arch = props.gcnArchName;
+        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+               arch[3] == '1' && arch[4] == '1';
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) {
+        // Uncached lookup for unusual ordinals — happens at most once per call
+        // for a device outside the cached range.
+        return probe_arch(device_ordinal);
+    }
+
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
+    return cached[device_ordinal];
+}
+
+static int matmul_rhs_transposed_tiled_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    // Must match the TILED_WMMA_B{M,N} constants in full_attention_4b.hip.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = 128;  // 4 wavefronts per block, arranged 2x2
+    hipLaunchKernelGGL(
+        dotcache_qwen35_matmul_rhs_transposed_tiled_wmma_kernel,
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const hip_bfloat16*>(rhs),
+        static_cast<hip_bfloat16*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 280;
+    if (sync_err != hipSuccess) return 281;
+    return 0;
+}
+
 extern "C" int dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
     int dtype,
     size_t device_ordinal,
@@ -3588,6 +3690,11 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
     void* out) {
     switch (dtype) {
     case 2:
+        if (device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
+            return matmul_rhs_transposed_tiled_wmma_bf16_device(
+                static_cast<int>(device_ordinal), batch_elems, m, n, k,
+                lhs, rhs, out);
+        }
         return matmul_rhs_transposed_tiled_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
             lhs, rhs, out);
@@ -3633,6 +3740,45 @@ int matmul_fp8_dequant_device(
     return 0;
 }
 
+// WMMA-tiled FP8 dequant matmul for BF16 activations. Same 64x64 block tile
+// shape as the BF16 tiled path; reads FP8 bytes from global, dequantizes
+// into LDS as BF16, then runs WMMAs from LDS. Only activated when
+// block_size is a multiple of TILED_WMMA_BK=64 so every BK-aligned K slab
+// (and the 64-row N slab) lies inside a single FP8 scale block. The
+// shipped lovedheart Qwen FP8 bakes use block_size=128.
+static int matmul_fp8_dequant_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_fp8,
+    const void* scale,
+    int block_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    constexpr int threads = 128;  // 4 wavefronts 2x2
+    hipLaunchKernelGGL(
+        dotcache_qwen35_matmul_fp8_dequant_wmma_kernel,
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const uint8_t*>(rhs_fp8),
+        static_cast<const hip_bfloat16*>(scale),
+        block_size,
+        static_cast<hip_bfloat16*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 262;
+    if (sync_err != hipSuccess) return 263;
+    return 0;
+}
+
 extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
     int dtype,
     size_t device_ordinal,
@@ -3644,10 +3790,24 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_fp8_dequant(
     int block_size,
     void* out) {
     switch (dtype) {
-    case 2:
+    case 2: {
+        // WMMA fast path when block_size is a multiple of the tile's K slab
+        // (= 64), and m is large enough that the 64-row tile doesn't waste
+        // most of its compute on overhang. Otherwise fall back to the scalar
+        // FP32-accumulate tiled kernel (which is what shipped before WMMA).
+        constexpr int TILED_BK = 64;
+        constexpr int TILED_M_THRESHOLD = 32;
+        const int ordinal = static_cast<int>(device_ordinal);
+        if (m >= TILED_M_THRESHOLD && block_size % TILED_BK == 0 &&
+            device_supports_wmma_bf16(ordinal)) {
+            return matmul_fp8_dequant_wmma_bf16_device(
+                ordinal, batch_elems, m, n, k,
+                lhs, rhs_fp8, scale, block_size, out);
+        }
         return matmul_fp8_dequant_device<hip_bfloat16>(
-            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            ordinal, batch_elems, m, n, k,
             lhs, rhs_fp8, scale, block_size, out);
+    }
     default:
         return 262;
     }
@@ -3690,6 +3850,74 @@ int matmul_int4_dequant_device(
     return 0;
 }
 
+static int matmul_int4_dequant_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    int group_size,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    // INT4 tiled WMMA is a clear win when M is large enough to use most of
+    // the 64-row block tile (long-ctx prefill). For small M (short prompts,
+    // decode-like) the 4x compute waste from tile overhang outweighs the
+    // tiling bandwidth savings — INT4 saves 4x global data vs BF16 before
+    // any tiling, so there's less for tiling to recover. Dispatch to the
+    // one-wave-per-tile kernel in that regime.
+    constexpr int TILED_M_THRESHOLD = 32;
+    if (m < TILED_M_THRESHOLD) {
+        constexpr int TILE_M = 16;
+        constexpr int TILE_N = 16;
+        const int grid_x = (n + TILE_N - 1) / TILE_N;
+        const int grid_y = (m + TILE_M - 1) / TILE_M;
+        const int grid_z = static_cast<int>(batch_elems);
+        const int threads = 32;
+        hipLaunchKernelGGL(
+            dotcache_qwen35_matmul_int4_dequant_wmma_small_m_kernel,
+            dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+            batch_elems, m, n, k,
+            static_cast<const hip_bfloat16*>(lhs),
+            static_cast<const uint8_t*>(rhs_int4),
+            static_cast<const hip_bfloat16*>(scale),
+            static_cast<const hip_bfloat16*>(zero),
+            group_size,
+            static_cast<hip_bfloat16*>(out));
+        hipError_t launch_err = hipGetLastError();
+        hipError_t sync_err = hipDeviceSynchronize();
+        if (launch_err != hipSuccess) return 290;
+        if (sync_err != hipSuccess) return 291;
+        return 0;
+    }
+
+    // Large-M: tiled 64x64 block tile, 4 waves in 2x2.
+    constexpr int TILE_M = 64;
+    constexpr int TILE_N = 64;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_y = (m + TILE_M - 1) / TILE_M;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = 128;
+    hipLaunchKernelGGL(
+        dotcache_qwen35_matmul_int4_dequant_wmma_kernel,
+        dim3(grid_x, grid_y, grid_z), dim3(threads), 0, 0,
+        batch_elems, m, n, k,
+        static_cast<const hip_bfloat16*>(lhs),
+        static_cast<const uint8_t*>(rhs_int4),
+        static_cast<const hip_bfloat16*>(scale),
+        static_cast<const hip_bfloat16*>(zero),
+        group_size,
+        static_cast<hip_bfloat16*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 290;
+    if (sync_err != hipSuccess) return 291;
+    return 0;
+}
+
 extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     int dtype,
     size_t device_ordinal,
@@ -3702,10 +3930,24 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     int group_size,
     void* out) {
     switch (dtype) {
-    case 2:
+    case 2: {
+        // The tiled WMMA kernel fetches one (scale, zero) pair per BK-wide
+        // K slab per row, so it's only correct when every BK-aligned slab
+        // stays inside a single quantization group. That requires
+        // group_size to be a multiple of TILED_WMMA_BK (= 64). The shipped
+        // GPTQ bakes use group_size=128, so this path activates in
+        // practice; other group sizes fall back to the scalar kernel.
+        constexpr int TILED_BK = 64;
+        if (group_size % TILED_BK == 0 &&
+            device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
+            return matmul_int4_dequant_wmma_bf16_device(
+                static_cast<int>(device_ordinal), batch_elems, m, n, k,
+                lhs, rhs_int4, scale, zero, group_size, out);
+        }
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
             lhs, rhs_int4, scale, zero, group_size, out);
+    }
     default:
         return 272;
     }
@@ -4603,11 +4845,32 @@ int persistent_decode_device(
     // Higher multipliers (3x+) hang silently on models with more
     // transformer layers (qwen3.5-2b at 4x produces no output) —
     // suspected grid_barrier scaling issue. Env var
-    // `SUPERSONIC_QWEN4B_BLOCKS` allows runtime override for tuning.
+    // Grid-size priority (first match wins):
+    //   1. SUPERSONIC_QWEN4B_BLOCKS env var (explicit user override).
+    //   2. Per-model preset set via `dotcache_qwen35_4b_hip_set_launch_preset`
+    //      from the Rust registry (e.g. 0.8B gets 32 + cooperative).
+    //   3. 2x multiProcessorCount default on RDNA3/gfx11xx (empirically
+    //      safe at non-cooperative launch on every tested Qwen variant).
+    //
+    // Cooperative launch is enabled when SUPERSONIC_QWEN4B_COOP is set OR
+    // when the active preset opts in. The homebrew `grid_barrier` assumes
+    // every block is co-resident; cooperative launch enforces that and
+    // fails cleanly on over-subscription instead of deadlocking.
+    //
+    // Why cooperative is opt-in rather than always-on: `hipOccupancyMax-
+    // ActiveBlocksPerMultiprocessor` is strictly conservative — on 4B it
+    // reports 1 block/MP while non-cooperative launch empirically handles
+    // 2. Cooperative-by-default would regress 4B throughput.
     int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    int preset_blocks = 0, preset_coop = 0;
+    qwen4b_get_launch_preset(preset_blocks, preset_coop);
+    bool preset_coop_hint = false;
     if (const char* bs_env = std::getenv("SUPERSONIC_QWEN4B_BLOCKS")) {
         int override_val = std::atoi(bs_env);
-        if (override_val > 0) num_blocks = override_val;
+        if (override_val > 0) { num_blocks = override_val; }
+    } else if (preset_blocks > 0) {
+        num_blocks = preset_blocks;
+        preset_coop_hint = preset_coop != 0;
     } else {
         const char* arch = props.gcnArchName;
         const bool is_rdna3_wgp_arch =
@@ -4617,6 +4880,8 @@ int persistent_decode_device(
             num_blocks *= 2;
         }
     }
+    const bool coop_requested =
+        std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr || preset_coop_hint;
     constexpr int block_size = 256;
     // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
     //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
@@ -4626,38 +4891,111 @@ int persistent_decode_device(
     const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
-        dim3(static_cast<unsigned int>(num_blocks)),
-        dim3(block_size),
-        shared_bytes,
-        0,
-        num_layers,
-        hidden_dim,
-        intermediate_size,
-        seqlen_offset,
-        static_cast<const Qwen35DecodeLayerDesc*>(layers),
-        static_cast<T*>(hidden_io),
-        workspace,
-        counters,
-        barrier_counter,
-        barrier_flag,
-        timing_slots,
-        static_cast<const T*>(cos_table),
-        static_cast<const T*>(sin_table),
-        rotary_dim,
-        proj_buf_floats,
-        attn_scratch_floats,
-        enable_attention_trace,
-        static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
-        static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
-        batch_size,
-        static_cast<const BatchSeqDesc*>(batch_descs),
-        static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
-        static_cast<T*>(tap_workspace),
-        tap_layers,
-        num_taps);
-    hipError_t launch_err = hipGetLastError();
+    int coop_supported = 0;
+    int max_blocks_per_mp = 0;
+    const void* kernel_fp = reinterpret_cast<const void*>(
+        &dotcache_qwen35_persistent_decode_kernel<T>);
+    if (coop_requested) {
+        (void)hipDeviceGetAttribute(
+            &coop_supported, hipDeviceAttributeCooperativeLaunch, device_ordinal);
+        if (coop_supported) {
+            if (hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                    &max_blocks_per_mp, kernel_fp, block_size, shared_bytes) !=
+                hipSuccess) {
+                max_blocks_per_mp = 0;
+            }
+            if (max_blocks_per_mp > 0) {
+                int coop_max_grid = props.multiProcessorCount * max_blocks_per_mp;
+                if (num_blocks > coop_max_grid) num_blocks = coop_max_grid;
+            }
+        }
+    }
+
+    // If the caller asked for cooperative launch but the device or runtime
+    // can't actually provide it, refuse rather than fall back to the
+    // non-cooperative path. A `SUPERSONIC_QWEN4B_BLOCKS=128` with `COOP=1`
+    // expects the cooperative cap to keep it safe; silently running the
+    // non-coop launcher with 128 blocks is exactly the grid_barrier
+    // oversubscription hang the opt-in was designed to prevent.
+    if (coop_requested && (!coop_supported || max_blocks_per_mp <= 0)) {
+        return 261;
+    }
+
+    hipError_t launch_err;
+    if (coop_requested && coop_supported && max_blocks_per_mp > 0) {
+        // Args for cooperative launch: void** where each entry points to
+        // local storage holding one argument value. Locals must stay alive
+        // through the launch — they're destroyed at function exit, and
+        // we call hipDeviceSynchronize before returning.
+        const Qwen35DecodeLayerDesc* layers_typed =
+            static_cast<const Qwen35DecodeLayerDesc*>(layers);
+        T* hidden_io_typed = static_cast<T*>(hidden_io);
+        const T* cos_typed = static_cast<const T*>(cos_table);
+        const T* sin_typed = static_cast<const T*>(sin_table);
+        const Qwen35FP8ScaleDesc* fp8_typed =
+            static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales);
+        const KVCacheFp8Desc* kv_fp8_typed =
+            static_cast<const KVCacheFp8Desc*>(kv_fp8_descs);
+        const BatchSeqDesc* batch_descs_typed =
+            static_cast<const BatchSeqDesc*>(batch_descs);
+        const Qwen35INT4ScaleDesc* int4_typed =
+            static_cast<const Qwen35INT4ScaleDesc*>(int4_scales);
+        T* tap_ws_typed = static_cast<T*>(tap_workspace);
+
+        void* args[] = {
+            &num_layers, &hidden_dim, &intermediate_size, &seqlen_offset,
+            &layers_typed, &hidden_io_typed, &workspace, &counters,
+            &barrier_counter, &barrier_flag,
+            &timing_slots,
+            &cos_typed, &sin_typed, &rotary_dim,
+            &proj_buf_floats, &attn_scratch_floats, &enable_attention_trace,
+            &fp8_typed, &kv_fp8_typed, &batch_size,
+            &batch_descs_typed, &int4_typed,
+            &tap_ws_typed, &tap_layers, &num_taps,
+        };
+
+        launch_err = hipLaunchCooperativeKernel(
+            kernel_fp,
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            args,
+            static_cast<uint32_t>(shared_bytes),
+            0);
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            shared_bytes,
+            0,
+            num_layers,
+            hidden_dim,
+            intermediate_size,
+            seqlen_offset,
+            static_cast<const Qwen35DecodeLayerDesc*>(layers),
+            static_cast<T*>(hidden_io),
+            workspace,
+            counters,
+            barrier_counter,
+            barrier_flag,
+            timing_slots,
+            static_cast<const T*>(cos_table),
+            static_cast<const T*>(sin_table),
+            rotary_dim,
+            proj_buf_floats,
+            attn_scratch_floats,
+            enable_attention_trace,
+            static_cast<const Qwen35FP8ScaleDesc*>(fp8_scales),
+            static_cast<const KVCacheFp8Desc*>(kv_fp8_descs),
+            batch_size,
+            static_cast<const BatchSeqDesc*>(batch_descs),
+            static_cast<const Qwen35INT4ScaleDesc*>(int4_scales),
+            static_cast<T*>(tap_workspace),
+            tap_layers,
+            num_taps);
+        launch_err = hipGetLastError();
+    }
+
     hipError_t sync_err = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;

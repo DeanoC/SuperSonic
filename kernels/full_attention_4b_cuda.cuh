@@ -20,6 +20,13 @@ enum Qwen35Persistent4BTimingSlot {
     QWEN35_4B_TIMING_FULL_ATTN = 0,
     QWEN35_4B_TIMING_FULL_ATTN_PROJ = 1,
     QWEN35_4B_TIMING_FULL_ATTN_CORE_BASE = 2,
+    // Slots 3..7 are otherwise unused on the validated single-batch CUDA 4B
+    // hero lane. Reuse them there for deeper full-attention-core attribution.
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_PREP = 3,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_UNUSED = 4,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_LOOP = 5,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_MERGE = 6,
+    QWEN35_4B_TIMING_FULL_ATTN_HERO_GATE = 7,
     QWEN35_4B_TIMING_FULL_ATTN_OUT_BASE = 10,
     QWEN35_4B_TIMING_LINEAR_PROJ = 18,
     QWEN35_4B_TIMING_LINEAR_CORE_BASE = 19,
@@ -88,6 +95,8 @@ struct Qwen35DecodeLayerDesc {
     void* kv_shadow_k;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     void* kv_shadow_v;                 // optional BF16 KV sidecar for KV-FP8 bring-up / parity-sensitive reads
     int kv_shadow_start;               // first position covered by the sidecar, -1 when disabled
+    void* debug_linear_trace_out;      // optional F32[(kern-1)+2] export for one linear channel's Step-B state
+    int debug_linear_trace_channel;    // selected linear channel for debug_linear_trace_out, -1 disables
 };
 
 // =============================================================================
@@ -3785,14 +3794,53 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 // eliminating syncthreads from the hot matvec loop.
 // =============================================================================
 
-// Wave-level sum reduction using DPP/shuffle (Wave32 on RDNA3.5)
+// Wave-level sum reduction using shuffle. Uses runtime warpSize so this
+// agrees with matvec loops that partition columns by `warpSize * N`.
+// On NVIDIA (warp=32) the loop unrolls to the same 5 ops; kept size-
+// agnostic for parity with the HIP twin (wave32 on RDNA, wave64 on CDNA).
 __device__ inline float wave_reduce_sum_f32(float val) {
-    val += __shfl_xor(val, 16);
-    val += __shfl_xor(val, 8);
-    val += __shfl_xor(val, 4);
-    val += __shfl_xor(val, 2);
-    val += __shfl_xor(val, 1);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        val += __shfl_xor(val, offset);
+    }
     return val;
+}
+
+template <typename T>
+__device__ inline float dotcache_qwen35_dot_row_input_bf16_warp_hero_4b(
+    const T* lhs,
+    const T* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int lane = threadIdx.x & (warpSize - 1);
+    for (int idx = lane; idx < size; idx += warpSize) {
+        dot += dotcache_qwen35_to_float(lhs[idx]) * dotcache_qwen35_to_float(rhs[idx]);
+    }
+    return wave_reduce_sum_f32(dot);
+}
+
+template <>
+__device__ inline float dotcache_qwen35_dot_row_input_bf16_warp_hero_4b<hip_bfloat16>(
+    const hip_bfloat16* lhs,
+    const hip_bfloat16* rhs,
+    int size
+) {
+    float dot = 0.0f;
+    const int lane = threadIdx.x & (warpSize - 1);
+    for (int idx = lane * 2; idx + 1 < size; idx += warpSize * 2) {
+        const __nv_bfloat162 packed_lhs =
+            *reinterpret_cast<const __nv_bfloat162*>(lhs + idx);
+        const __nv_bfloat162 packed_rhs =
+            *reinterpret_cast<const __nv_bfloat162*>(rhs + idx);
+        const float2 w = __bfloat1622float2(packed_lhs);
+        const float2 x = __bfloat1622float2(packed_rhs);
+        dot += w.x * x.x + w.y * x.y;
+    }
+    if ((size & 1) != 0 && lane == 0) {
+        dot += dotcache_qwen35_to_float(lhs[size - 1]) *
+               dotcache_qwen35_to_float(rhs[size - 1]);
+    }
+    return wave_reduce_sum_f32(dot);
 }
 
 // Packed 2×BF16 vector type for v_dot2_f32_bf16 instruction.
@@ -3967,7 +4015,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     const int nb = gridDim.x;
     constexpr bool hero_specialized = SINGLE_STREAM_BF16_SPECIALIZED;
     const int B = hero_specialized ? 1 : batch_size;
-    const bool emit_attention_trace = hero_specialized ? false : (enable_attention_trace != 0);
+    // Keep the hot single-stream hero path unchanged for normal execution, but
+    // allow debug tracing to force the trace-capable fallback path in this same
+    // kernel so the exported attention scratch is valid on 4B CUDA.
+    const bool emit_attention_trace = (enable_attention_trace != 0);
+    // The validated CUDA 4B lane runs in split windows on long context, so
+    // `num_layers` is the current window size there rather than the full model
+    // depth. Gate the 4B specializations on the stable hidden/intermediate
+    // geometry instead of the launch window length.
+    const bool runtime_qwen35_4b_shape =
+        hidden_dim == 2560 &&
+        intermediate_size == 9216;
 
     // Workspace layout (F32 unless noted).
     // Each section is multiplied by batch_size. Per-batch offset: section + b * section_size.
@@ -3982,7 +4040,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     float* proj_buf     = token_out + B * hidden_dim;                    // [B * proj_buf_floats]
     float* attn_scratch = proj_buf + B * proj_buf_floats;                // [B * attn_scratch_floats]
 
-    extern __shared__ float lds[];
+    extern __shared__ __align__(16) unsigned char shared_raw[];
+    float* lds = reinterpret_cast<float*>(shared_raw);
     // LDS layout: lds[0..bs-1] = reduction scratch, lds[bs..] = input vector cache (F32)
     float* lds_input = lds + bs;
 
@@ -3991,6 +4050,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
     // LDS is sized by the bridge as: block_size + max(B*hidden_dim, intermediate_size).
     // The LUT sits after the input cache region.
     const int lds_input_size = (B * hidden_dim > intermediate_size) ? B * hidden_dim : intermediate_size;
+    T* lds_input_bf16 = hero_specialized
+        ? reinterpret_cast<T*>(lds_input + lds_input_size)
+        : nullptr;
     float* fp8_lut = hero_specialized ? nullptr : (lds + bs + lds_input_size);
 
     // Populate FP8 LUT: thread i fills entry i (256 threads → 256 entries, one pass).
@@ -4350,6 +4412,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
 
                 float* proj_b = proj_buf + b * proj_buf_floats;
                 const bool qwen4b_full_attn_core_hero =
+                    runtime_qwen35_4b_shape &&
                     B == 2 &&
                     bs == 256 &&
                     hd == 256 &&
@@ -4480,7 +4543,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* cv = static_cast<const T*>(kv_v_b);
                     const size_t kv_head_base =
                         static_cast<size_t>(kvh) * kv_max_b * hd;
-
                     float my_acc = 0.0f;
                     float my_max = -1e30f;
                     float my_sum = 0.0f;
@@ -4540,6 +4602,11 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 float* q_f32 = proj_b;
                 float* k_f32 = proj_b + L.q_out_dim;
                 float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
+                const bool qwen4b_single_bf16_attn_core_hero =
+                    runtime_qwen35_4b_shape &&
+                    B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
+                const unsigned long long hero_prep_clock =
+                    qwen4b_single_bf16_attn_core_hero ? clock64() : 0;
 
                 // Step B: QK-norm — RMSNorm per head on head_dim
                 // Wave-level reduce + cross-wave LDS reduce (2 syncthreads vs 8)
@@ -4598,9 +4665,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const size_t cos_off =
                         static_cast<size_t>(seq_off_b) * half_rot;
 
-                    if (tid < nh * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nh * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* qh = q_f32 + h * hd * 2;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -4611,9 +4678,9 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     }
                     __syncthreads();
 
-                    if (tid < nkv * half_rot) {
-                        const int h = tid / half_rot;
-                        const int i = tid % half_rot;
+                    for (int idx = tid; idx < nkv * half_rot; idx += bs) {
+                        const int h = idx / half_rot;
+                        const int i = idx % half_rot;
                         float* kh = k_f32 + h * hd;
                         float c = dotcache_qwen35_to_float(cos_table[cos_off + i]);
                         float s = dotcache_qwen35_to_float(sin_table[cos_off + i]);
@@ -4716,6 +4783,12 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                         q_f32[h * hd * 2 + hd + d]);
                 }
                 __syncthreads();
+                if (qwen4b_single_bf16_attn_core_hero) {
+                    qwen35_record_persistent_4b_timing(
+                        layer_timing_slots,
+                        QWEN35_4B_TIMING_FULL_ATTN_HERO_PREP,
+                        hero_prep_clock);
+                }
 
                 // Step E: Parallel attention — Flash-style online softmax
                 float* attn_flat = proj_b;  // reuse projection buffer
@@ -4804,8 +4877,6 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const T* ck = static_cast<const T*>(kv_k_b);
                     const T* cv = static_cast<const T*>(kv_v_b);
                     T* q_head_bf16 = reinterpret_cast<T*>(lds_input);
-                    const bool qwen4b_single_bf16_attn_core_hero =
-                        B == 1 && bs == 256 && hd == 256 && !emit_attention_trace;
 
                     if (qwen4b_single_bf16_attn_core_hero) {
                         for (int qh = 0; qh < nh; ++qh) {
@@ -4813,10 +4884,15 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             const float* q_head = q_f32 + qh * hd * 2;
                             const size_t kv_head_base =
                                 static_cast<size_t>(kvh) * kv_max_b * hd;
-                            const int hero_warps = bs / warpSize;
+                            // Short contexts were stable with the original 8-warp striping,
+                            // while long contexts needed a tighter 4-warp merge to keep the
+                            // softmax numerics on the right side of the token boundary.
+                            const int hero_warps = (kv_len_b >= 256) ? 4 : (bs / warpSize);
                             const int hero_warp = tid / warpSize;
                             const int hero_lane = tid % warpSize;
-                            const bool attn_lane_active = hero_lane < (hd / 8);
+                            const bool hero_warp_active = hero_warp < hero_warps;
+                            const bool attn_lane_active =
+                                hero_warp_active && hero_lane < (hd / 8);
 
                             if (tid < hd) {
                                 saved_gate[qh * hd + tid] = bf16_round_rne_f32_finite(
@@ -4835,6 +4911,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             }
                             __syncthreads();
 
+                            const unsigned long long hero_loop_clock = clock64();
                             float2 qv0 = make_float2(0.0f, 0.0f);
                             float2 qv1 = make_float2(0.0f, 0.0f);
                             float2 qv2 = make_float2(0.0f, 0.0f);
@@ -4918,7 +4995,14 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     my_sum = my_sum * rescale + w;
                                 }
                             }
+                            if (qh == 0) {
+                                qwen35_record_persistent_4b_timing(
+                                    layer_timing_slots,
+                                    QWEN35_4B_TIMING_FULL_ATTN_HERO_LOOP,
+                                    hero_loop_clock);
+                            }
 
+                            const unsigned long long hero_merge_clock = clock64();
                             float* hero_max_buf = lds_input;
                             float* hero_sum_buf = hero_max_buf + hero_warps * warpSize;
                             float* hero_acc0_buf = hero_sum_buf + hero_warps * warpSize;
@@ -4929,17 +5013,19 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             float* hero_acc5_buf = hero_acc4_buf + hero_warps * warpSize;
                             float* hero_acc6_buf = hero_acc5_buf + hero_warps * warpSize;
                             float* hero_acc7_buf = hero_acc6_buf + hero_warps * warpSize;
-                            const int hero_idx = hero_warp * warpSize + hero_lane;
-                            hero_max_buf[hero_idx] = my_max;
-                            hero_sum_buf[hero_idx] = my_sum;
-                            hero_acc0_buf[hero_idx] = my_acc0;
-                            hero_acc1_buf[hero_idx] = my_acc1;
-                            hero_acc2_buf[hero_idx] = my_acc2;
-                            hero_acc3_buf[hero_idx] = my_acc3;
-                            hero_acc4_buf[hero_idx] = my_acc4;
-                            hero_acc5_buf[hero_idx] = my_acc5;
-                            hero_acc6_buf[hero_idx] = my_acc6;
-                            hero_acc7_buf[hero_idx] = my_acc7;
+                            if (hero_warp_active) {
+                                const int hero_idx = hero_warp * warpSize + hero_lane;
+                                hero_max_buf[hero_idx] = my_max;
+                                hero_sum_buf[hero_idx] = my_sum;
+                                hero_acc0_buf[hero_idx] = my_acc0;
+                                hero_acc1_buf[hero_idx] = my_acc1;
+                                hero_acc2_buf[hero_idx] = my_acc2;
+                                hero_acc3_buf[hero_idx] = my_acc3;
+                                hero_acc4_buf[hero_idx] = my_acc4;
+                                hero_acc5_buf[hero_idx] = my_acc5;
+                                hero_acc6_buf[hero_idx] = my_acc6;
+                                hero_acc7_buf[hero_idx] = my_acc7;
+                            }
                             __syncthreads();
 
                             if (hero_warp == 0) {
@@ -4991,12 +5077,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                     bf16_round_rne_f32_finite(final_acc7 * inv_sum);
                             }
                             __syncthreads();
+                            if (qh == 0) {
+                                qwen35_record_persistent_4b_timing(
+                                    layer_timing_slots,
+                                    QWEN35_4B_TIMING_FULL_ATTN_HERO_MERGE,
+                                    hero_merge_clock);
+                            }
                         }
                     } else {
                         for (int qh = 0; qh < nh; ++qh) {
                             const int kvh = qh / kv_groups;
                             const float* q_head = q_f32 + qh * hd * 2;
-
                             float my_acc = 0.0f;
                             float my_max = -1e30f;
                             float my_sum = 0.0f;
@@ -5054,12 +5145,20 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                 __syncthreads();
 
                 // Step F: Gate
+                const unsigned long long hero_gate_clock =
+                    qwen4b_single_bf16_attn_core_hero ? clock64() : 0;
                 for (int i = tid; i < nh * hd; i += bs) {
                     float gate_val = saved_gate[i];
                     float sigmoid_gate = dotcache_qwen35_sigmoid_fast(gate_val);
                     attn_flat[i] = bf16_round_rne_f32_finite(attn_flat[i] * sigmoid_gate);
                 }
                 __syncthreads();
+                if (qwen4b_single_bf16_attn_core_hero) {
+                    qwen35_record_persistent_4b_timing(
+                        layer_timing_slots,
+                        QWEN35_4B_TIMING_FULL_ATTN_HERO_GATE,
+                        hero_gate_clock);
+                }
 
                 } // end if (blockIdx.x == 0)
                 // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
@@ -5200,16 +5299,18 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             const int nv_heads = L.linear_num_v_heads;
             const int total_proj = L.qkv_out_dim + L.z_out_dim + nv_heads + nv_heads;
             {
-                for (;;) {
-                    unsigned int sr;
-                    if (tid == 0) sr = atomicAdd(&counters[0], 1u);
-                    __shared__ unsigned int shared_sr;
-                    if (tid == 0) shared_sr = sr;
+                if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
+                    for (int c = tid; c < hidden_dim; c += bs) {
+                        lds_input_bf16[c] = dotcache_qwen35_from_float<T>(lds_input[c]);
+                    }
                     __syncthreads();
-                    sr = shared_sr;
-                    if (sr >= static_cast<unsigned int>(total_proj)) break;
 
-                    if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
+                    const int lane_p = tid & (warpSize - 1);
+                    const int warp_p = tid / warpSize;
+                    const int warps_per_block = bs / warpSize;
+                    for (int sr = blockIdx.x * warps_per_block + warp_p;
+                         sr < total_proj;
+                         sr += nb * warps_per_block) {
                         const T* w_rows;
                         int row;
                         if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
@@ -5226,108 +5327,102 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
                         }
                         const T* wr = w_rows + static_cast<size_t>(row) * hidden_dim;
-                        float p = 0.0f;
-                        const int vd4 = hidden_dim & ~3;
-                        for (int c = tid * 4; c < vd4; c += bs * 4) {
-                            float w0 = dotcache_qwen35_to_float(wr[c]);
-                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
-                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
-                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
-                            p += w0 * lds_input[c] + w1 * lds_input[c+1] + w2 * lds_input[c+2] + w3 * lds_input[c+3];
-                        }
-                        for (int c = vd4 + tid; c < hidden_dim; c += bs) {
-                            float w = dotcache_qwen35_to_float(wr[c]);
-                            p += w * lds_input[c];
-                        }
-                        lds[tid] = p;
-                        __syncthreads();
-                        for (int stride = bs / 2; stride > 0; stride >>= 1) {
-                            if (tid < stride) lds[tid] += lds[tid + stride];
-                            __syncthreads();
-                        }
-                        if (tid == 0)
-                            proj_buf[sr] = bf16_round_rne_f32_finite(lds[0]);
-                        __syncthreads();
-                    } else {
-                    const void* w_raw;
-                    const void* w_scale = nullptr;
-                    const void* w_i4_scale = nullptr;
-                    const void* w_i4_zero = nullptr;
-                    int row;
-                    if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
-                        w_raw = L.qkv_proj_w;
-                        row = sr;
-                        if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
-                        w_raw = L.z_proj_w;
-                        row = sr - L.qkv_out_dim;
-                        if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
-                    } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
-                        w_raw = L.b_proj_w;
-                        row = sr - L.qkv_out_dim - L.z_out_dim;
-                        if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
-                        // b_proj: keep BF16 (only 16 rows, no INT4)
-                    } else {
-                        w_raw = L.a_proj_w;
-                        row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
-                        if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
-                        // a_proj: keep BF16 (only 16 rows, no INT4)
+                        const float sum =
+                            dotcache_qwen35_dot_row_input_bf16_warp_hero_4b(
+                                wr, lds_input_bf16, hidden_dim);
+                        if (lane_p == 0)
+                            proj_buf[sr] = sum;
                     }
+                    __syncthreads();
+                } else {
+                    for (;;) {
+                        unsigned int sr;
+                        if (tid == 0) sr = atomicAdd(&counters[0], 1u);
+                        __shared__ unsigned int shared_sr;
+                        if (tid == 0) shared_sr = sr;
+                        __syncthreads();
+                        sr = shared_sr;
+                        if (sr >= static_cast<unsigned int>(total_proj)) break;
 
-                    float p[MAX_BATCH_SIZE];
-                    for (int b = 0; b < B; b++) p[b] = 0.0f;
-                    if (int4_scales != nullptr && w_i4_scale != nullptr) {
-                        // INT4 dequant path for qkv/z projections
-                        const int gsz = int4_scales[layer].group_size;
-                        const int byte_cols = hidden_dim / 2;
-                        const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
-                        const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(w_i4_scale);
-                        const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(w_i4_zero);
-                        const int sr_g = row / gsz;
-                        const int sc_cols = (hidden_dim + gsz - 1) / gsz;
-                        const int vd8 = hidden_dim & ~7;
-                        for (int c = tid * 8; c < vd8; c += bs * 8) {
-                            uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
-                            float w[8];
-                            int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
-                                      + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
+                        const void* w_raw;
+                        const void* w_scale = nullptr;
+                        const void* w_i4_scale = nullptr;
+                        const void* w_i4_zero = nullptr;
+                        int row;
+                        if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
+                            w_raw = L.qkv_proj_w;
+                            row = sr;
+                            if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
+                            if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
+                        } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
+                            w_raw = L.z_proj_w;
+                            row = sr - L.qkv_out_dim;
+                            if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
+                            if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
+                        } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
+                            w_raw = L.b_proj_w;
+                            row = sr - L.qkv_out_dim - L.z_out_dim;
+                            if (fp8_scales) w_scale = fp8_scales[layer].b_proj_scale;
+                            // b_proj: keep BF16 (only 16 rows, no INT4)
+                        } else {
+                            w_raw = L.a_proj_w;
+                            row = sr - L.qkv_out_dim - L.z_out_dim - nv_heads;
+                            if (fp8_scales) w_scale = fp8_scales[layer].a_proj_scale;
+                            // a_proj: keep BF16 (only 16 rows, no INT4)
+                        }
+
+                        float p[MAX_BATCH_SIZE];
+                        for (int b = 0; b < B; b++) p[b] = 0.0f;
+                        if (int4_scales != nullptr && w_i4_scale != nullptr) {
+                            // INT4 dequant path for qkv/z projections
+                            const int gsz = int4_scales[layer].group_size;
+                            const int byte_cols = hidden_dim / 2;
+                            const uint8_t* i4_row = static_cast<const uint8_t*>(w_raw) + static_cast<size_t>(row) * byte_cols;
+                            const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(w_i4_scale);
+                            const hip_bfloat16* zr = static_cast<const hip_bfloat16*>(w_i4_zero);
+                            const int sr_g = row / gsz;
+                            const int sc_cols = (hidden_dim + gsz - 1) / gsz;
+                            const int vd8 = hidden_dim & ~7;
+                            for (int c = tid * 8; c < vd8; c += bs * 8) {
+                                uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
+                                float w[8];
+                                int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                                for (int b = 0; b < B; b++) {
+                                    const float* inp = lds_input + b * hidden_dim + c;
+                                    p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
+                                          + w[4]*inp[4] + w[5]*inp[5] + w[6]*inp[6] + w[7]*inp[7];
+                                }
+                            }
+                            for (int c = vd8 + tid; c < hidden_dim; c += bs) {
+                                float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
+                            }
+                        } else if (fp8_scales != nullptr && w_scale != nullptr) {
+                            for (int c = tid; c < hidden_dim; c += bs) {
+                                float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
+                            }
+                        } else {
+                            const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
+                            const int vd4 = hidden_dim & ~3;
+                            for (int c = tid * 4; c < vd4; c += bs * 4) {
+                                float w0 = dotcache_qwen35_to_float(wr[c]);
+                                float w1 = dotcache_qwen35_to_float(wr[c+1]);
+                                float w2 = dotcache_qwen35_to_float(wr[c+2]);
+                                float w3 = dotcache_qwen35_to_float(wr[c+3]);
+                                for (int b = 0; b < B; b++) {
+                                    const float* inp = lds_input + b * hidden_dim + c;
+                                    p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
+                                }
+                            }
+                            for (int c = vd4 + tid; c < hidden_dim; c += bs) {
+                                float w = dotcache_qwen35_to_float(wr[c]);
+                                for (int b = 0; b < B; b++)
+                                    p[b] += w * lds_input[b * hidden_dim + c];
                             }
                         }
-                        for (int c = vd8 + tid; c < hidden_dim; c += bs) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    } else if (fp8_scales != nullptr && w_scale != nullptr) {
-                        for (int c = tid; c < hidden_dim; c += bs) {
-                            float w = fp8_dequant_weight_lut(w_raw, w_scale, row, c, hidden_dim, fp8_scales[layer].block_size, fp8_lut);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    } else {
-                        const T* wr = static_cast<const T*>(w_raw) + static_cast<size_t>(row) * hidden_dim;
-                        const int vd4 = hidden_dim & ~3;
-                        for (int c = tid * 4; c < vd4; c += bs * 4) {
-                            float w0 = dotcache_qwen35_to_float(wr[c]);
-                            float w1 = dotcache_qwen35_to_float(wr[c+1]);
-                            float w2 = dotcache_qwen35_to_float(wr[c+2]);
-                            float w3 = dotcache_qwen35_to_float(wr[c+3]);
-                            for (int b = 0; b < B; b++) {
-                                const float* inp = lds_input + b * hidden_dim + c;
-                                p[b] += w0 * inp[0] + w1 * inp[1] + w2 * inp[2] + w3 * inp[3];
-                            }
-                        }
-                        for (int c = vd4 + tid; c < hidden_dim; c += bs) {
-                            float w = dotcache_qwen35_to_float(wr[c]);
-                            for (int b = 0; b < B; b++)
-                                p[b] += w * lds_input[b * hidden_dim + c];
-                        }
-                    }
                         for (int b = 0; b < B; b++) {
                             lds[tid] = p[b];
                             __syncthreads();
@@ -5336,7 +5431,7 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                                 __syncthreads();
                             }
                             if (tid == 0)
-                                proj_buf[b * proj_buf_floats + sr] = bf16_round_rne_f32_finite(lds[0]);
+                                proj_buf[b * proj_buf_floats + sr] = lds[0];
                             __syncthreads();
                         }
                     }
@@ -5356,25 +5451,23 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
             void* conv_b = hero_specialized ? L.conv_state : (batch_descs ? batch_descs[layer].conv_state[b] : L.conv_state);
             void* rec_b  = hero_specialized ? L.recurrent_state : (batch_descs ? batch_descs[layer].recurrent_state[b] : L.recurrent_state);
             float* proj_b = proj_buf + b * proj_buf_floats;
+            float* gate_up_b = gate_up + b * intermediate_size * 2;
+            float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
+            float* mlp_out_b = mlp_out + b * hidden_dim;
+            const int conv_dim = L.qkv_out_dim;
+            const int kern = L.conv_kernel_size;
+            const int nv = L.linear_num_v_heads;
+            const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
+            const int hkd = L.linear_head_k_dim;
+            const int hvd = L.linear_head_v_dim;
+            const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
+            const int val_dim = L.linear_value_dim; // 2048
 
             if (blockIdx.x == 0) {
                 float* qkv_f32 = proj_b;
                 float* z_f32 = proj_b + L.qkv_out_dim;
                 float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
                 float* a_f32 = b_f32 + nv_heads;
-                // Batch-strided scratch aliases
-                float* gate_up_b = gate_up + b * intermediate_size * 2;
-                float* attn_scratch_b = attn_scratch + b * attn_scratch_floats;
-                float* mlp_out_b = mlp_out + b * hidden_dim;
-
-                const int conv_dim = L.qkv_out_dim;
-                const int kern = L.conv_kernel_size;
-                const int nv = L.linear_num_v_heads;
-                const int nk = (L.qkv_out_dim - nv * L.linear_head_v_dim) / (2 * L.linear_head_k_dim);
-                const int hkd = L.linear_head_k_dim;
-                const int hvd = L.linear_head_v_dim;
-                const int key_dim = nk * hkd;         // num_k_heads * k_head_dim
-                const int val_dim = L.linear_value_dim; // 2048
                 const unsigned long long linear_conv_clock = clock64();
 
                 // Step B: Conv1d stateful update
@@ -5423,6 +5516,17 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                             cs[c * (kern-1) + t] = cs[c * (kern-1) + t + 1];
                         }
                         cs[c * (kern-1) + (kern-2)] = qkv_bf16;
+
+                        if (L.debug_linear_trace_out != nullptr &&
+                            c == L.debug_linear_trace_channel) {
+                            float* debug = static_cast<float*>(L.debug_linear_trace_out);
+                            const int state_base = c * (kern - 1);
+                            for (int t = 0; t < kern - 1; ++t) {
+                                debug[t] = dotcache_qwen35_to_float(cs[state_base + t]);
+                            }
+                            debug[kern - 1] = dotcache_qwen35_to_float(qkv_bf16);
+                            debug[kern] = conv_out[c];
+                        }
                     }
                     __syncthreads();
 
@@ -5480,21 +5584,22 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_CONV_BASE + min(b, 1),
                     linear_conv_clock);
+            } // end if (blockIdx.x == 0) conv/qk prep
 
-                const unsigned long long linear_recurrent_clock = clock64();
+            // Grid barrier: block 0 wrote normalized Q/K/V scratch needed below.
+            __threadfence();
+            grid_barrier(barrier_counter, barrier_flag, nb);
 
-                // Step C: Parallel delta recurrent state update
-                // state: [nv, hkd, hvd] F32 — the recurrent memory
-                // 256 threads process 2 heads at a time: threads 0-127 → head h,
-                // threads 128-255 → head h+1. Each thread owns one v-dimension.
-                // Per head: kv_mem = state @ key, delta = (val - kv_mem) * beta,
-                //           state += outer(key, delta), output = state @ query
-                {
+            const unsigned long long linear_recurrent_clock = clock64();
+            // Step C: Parallel delta recurrent state update
+            // Hero lane spreads one head-pair per block; the generic path keeps
+            // the existing block-0-only implementation.
+            if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
+                const int hero_pairs = (nv + 1) / 2;
+                if (blockIdx.x < hero_pairs) {
+                    const int hp = static_cast<int>(blockIdx.x) * 2;
                     float* conv_out = gate_up_b;  // reused
                     float* state = static_cast<float*>(rec_b);
-                    // Reuse the front of lds_input as a tiny per-head staging area
-                    // so the recurrent body does not keep reloading the same Q/K
-                    // vectors from global scratch.
                     float* q_stage = lds_input;
                     float* k_stage = q_stage + 2 * hkd;
 
@@ -5504,105 +5609,164 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     const int q_key_offset = 0;
                     const int k_key_offset = key_dim;
                     const int v_val_offset = key_dim * 2;
-                    const int v = tid % hvd;          // v-dimension for this thread
-                    const bool qwen4b_single_linear_decayless_store_hero =
-                        B == 1 && bs == 256 && kern == 4 &&
-                        nv == 16 && nk == 16 && hkd == 128 && hvd == 128;
+                    const int v = tid % hvd;
+                    // Keep the cross-block recurrent split conservative: the
+                    // single-block decayless-store shortcut is numerically
+                    // safe on the original hero path, but it changes long-
+                    // context behavior once head pairs are distributed across
+                    // blocks. Re-evaluate it only after parity is restored.
+                    const bool qwen4b_single_linear_decayless_store_hero = false;
 
-                    // Process 2 heads per iteration (256 threads / 128 hvd)
-                    for (int hp = 0; hp < nv; hp += 2) {
-                        if (tid < 2 * hkd) {
-                            const int pair_head = tid / hkd;
-                            const int d = tid % hkd;
-                            const int staged_h = hp + pair_head;
-                            if (staged_h < nv) {
-                                const int staged_hk = staged_h * nk / nv;
-                                q_stage[tid] =
-                                    conv_out[q_key_offset + staged_hk * hkd + d];
-                                k_stage[tid] =
-                                    conv_out[k_key_offset + staged_hk * hkd + d];
-                            }
+                    if (tid < 2 * hkd) {
+                        const int pair_head = tid / hkd;
+                        const int d = tid % hkd;
+                        const int staged_h = hp + pair_head;
+                        if (staged_h < nv) {
+                            const int staged_hk = staged_h * nk / nv;
+                            q_stage[tid] =
+                                conv_out[q_key_offset + staged_hk * hkd + d];
+                            k_stage[tid] =
+                                conv_out[k_key_offset + staged_hk * hkd + d];
                         }
-                        __syncthreads();
-
-                        const int h = hp + (tid >= hvd ? 1 : 0);
-
-                        if (h < nv) {
-                            float* sh = state + h * hkd * hvd;
-                            // b/a/dt_bias/a_log are indexed by value head (nv elements each)
-                            const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
-                            float decay = 1.0f;
-                            if (dt_bw != nullptr && ale_w != nullptr) {
-                                const float sp = logf(1.0f + expf(
-                                    a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
-                                decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
-                            }
-
-                            // Map value head to key head for Q/K indexing
-                            // nk key heads shared among nv value heads
-                            const int pair_head = h - hp;
-                            const float* qh = q_stage + pair_head * hkd;
-                            const float* kh = k_stage + pair_head * hkd;
-
-                            // First pass: accumulate kv_mem from the decayed state.
-                            // On the single-stream hero lane we skip the intermediate
-                            // "write decayed state" step and apply decay only when the
-                            // final updated state is written back in the second pass.
-                            float kv_mem_v = 0.0f;
-                            if (qwen4b_single_linear_decayless_store_hero) {
-                                for (int k = 0; k < 128; ++k) {
-                                    const float state_orig = sh[k * 128 + v];
-                                    const float state_decay = state_orig * decay;
-                                    kv_mem_v += state_decay * kh[k];
-                                }
-                            } else {
-                                for (int k = 0; k < hkd; ++k) {
-                                    float* state_kv = sh + k * hvd + v;
-                                    const float state_decay = (*state_kv) * decay;
-                                    *state_kv = state_decay;
-                                    kv_mem_v += state_decay * kh[k];
-                                }
-                            }
-
-                            // delta = (value - kv_mem) * beta
-                            const float val = conv_out[v_val_offset + h * hvd + v];
-                            const float delta = (val - kv_mem_v) * beta;
-
-                            // Second pass: update the state and accumulate the output
-                            // from the updated value in the same walk.
-                            float out_v = 0.0f;
-                            if (qwen4b_single_linear_decayless_store_hero) {
-                                for (int k = 0; k < 128; ++k) {
-                                    float* state_kv = sh + k * 128 + v;
-                                    const float state_orig = *state_kv;
-                                    const float state_decay = state_orig * decay;
-                                    const float state_update =
-                                        state_decay + kh[k] * delta;
-                                    *state_kv = state_update;
-                                    out_v += state_update * qh[k];
-                                }
-                            } else {
-                                for (int k = 0; k < hkd; ++k) {
-                                    float* state_kv = sh + k * hvd + v;
-                                    const float state_update = (*state_kv) + kh[k] * delta;
-                                    *state_kv = state_update;
-                                    out_v += state_update * qh[k];
-                                }
-                            }
-
-                            attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
-                        }
-                        __syncthreads();
                     }
-                }
+                    __syncthreads();
 
-                __syncthreads();
+                    const int h = hp + (tid >= hvd ? 1 : 0);
+                    if (h < nv) {
+                        float* sh = state + h * hkd * hvd;
+                        const float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
+                        const float* a_f32 = b_f32 + nv_heads;
+                        const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
+                        float decay = 1.0f;
+                        if (dt_bw != nullptr && ale_w != nullptr) {
+                            const float sp = logf(1.0f + expf(
+                                a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                            decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
+                        }
+
+                        const int pair_head = h - hp;
+                        const float* qh = q_stage + pair_head * hkd;
+                        const float* kh = k_stage + pair_head * hkd;
+
+                        float kv_mem_v = 0.0f;
+                        if (qwen4b_single_linear_decayless_store_hero) {
+                            for (int k = 0; k < 128; ++k) {
+                                const float state_orig = sh[k * 128 + v];
+                                const float state_decay = state_orig * decay;
+                                kv_mem_v += state_decay * kh[k];
+                            }
+                        } else {
+                            for (int k = 0; k < hkd; ++k) {
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_decay = (*state_kv) * decay;
+                                *state_kv = state_decay;
+                                kv_mem_v += state_decay * kh[k];
+                            }
+                        }
+
+                        const float val = conv_out[v_val_offset + h * hvd + v];
+                        const float delta = (val - kv_mem_v) * beta;
+                        float out_v = 0.0f;
+                        if (qwen4b_single_linear_decayless_store_hero) {
+                            for (int k = 0; k < 128; ++k) {
+                                float* state_kv = sh + k * 128 + v;
+                                const float state_orig = *state_kv;
+                                const float state_decay = state_orig * decay;
+                                const float state_update = state_decay + kh[k] * delta;
+                                *state_kv = state_update;
+                                out_v += state_update * qh[k];
+                            }
+                        } else {
+                            for (int k = 0; k < hkd; ++k) {
+                                float* state_kv = sh + k * hvd + v;
+                                const float state_update = (*state_kv) + kh[k] * delta;
+                                *state_kv = state_update;
+                                out_v += state_update * qh[k];
+                            }
+                        }
+                        attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    }
+                    __syncthreads();
+                }
+            } else if (blockIdx.x == 0) {
+                float* conv_out = gate_up_b;  // reused
+                float* state = static_cast<float*>(rec_b);
+                float* q_stage = lds_input;
+                float* k_stage = q_stage + 2 * hkd;
+
+                const T* dt_bw = static_cast<const T*>(L.dt_bias_w);
+                const T* ale_w = static_cast<const T*>(L.a_log_exp_w);
+
+                const int q_key_offset = 0;
+                const int k_key_offset = key_dim;
+                const int v_val_offset = key_dim * 2;
+                const int v = tid % hvd;
+
+                for (int hp = 0; hp < nv; hp += 2) {
+                    if (tid < 2 * hkd) {
+                        const int pair_head = tid / hkd;
+                        const int d = tid % hkd;
+                        const int staged_h = hp + pair_head;
+                        if (staged_h < nv) {
+                            const int staged_hk = staged_h * nk / nv;
+                            q_stage[tid] =
+                                conv_out[q_key_offset + staged_hk * hkd + d];
+                            k_stage[tid] =
+                                conv_out[k_key_offset + staged_hk * hkd + d];
+                        }
+                    }
+                    __syncthreads();
+
+                    const int h = hp + (tid >= hvd ? 1 : 0);
+                    if (h < nv) {
+                        float* sh = state + h * hkd * hvd;
+                        const float* b_f32 = proj_b + L.qkv_out_dim + L.z_out_dim;
+                        const float* a_f32 = b_f32 + nv_heads;
+                        const float beta = 1.0f / (1.0f + expf(-b_f32[h]));
+                        float decay = 1.0f;
+                        if (dt_bw != nullptr && ale_w != nullptr) {
+                            const float sp = logf(1.0f + expf(
+                                a_f32[h] + dotcache_qwen35_to_float(dt_bw[h])));
+                            decay = expf(-sp * dotcache_qwen35_to_float(ale_w[h]));
+                        }
+
+                        const int pair_head = h - hp;
+                        const float* qh = q_stage + pair_head * hkd;
+                        const float* kh = k_stage + pair_head * hkd;
+                        float kv_mem_v = 0.0f;
+                        for (int k = 0; k < hkd; ++k) {
+                            float* state_kv = sh + k * hvd + v;
+                            const float state_decay = (*state_kv) * decay;
+                            *state_kv = state_decay;
+                            kv_mem_v += state_decay * kh[k];
+                        }
+
+                        const float val = conv_out[v_val_offset + h * hvd + v];
+                        const float delta = (val - kv_mem_v) * beta;
+                        float out_v = 0.0f;
+                        for (int k = 0; k < hkd; ++k) {
+                            float* state_kv = sh + k * hvd + v;
+                            const float state_update = (*state_kv) + kh[k] * delta;
+                            *state_kv = state_update;
+                            out_v += state_update * qh[k];
+                        }
+                        attn_scratch_b[h * hvd + v] = bf16_round_rne_f32_finite(out_v);
+                    }
+                    __syncthreads();
+                }
+            }
+
+            __threadfence();
+            grid_barrier(barrier_counter, barrier_flag, nb);
+
+            if (blockIdx.x == 0) {
                 qwen35_record_persistent_4b_timing(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_RECURRENT_BASE + min(b, 1),
                     linear_recurrent_clock);
 
                 const unsigned long long linear_post_clock = clock64();
+                float* z_f32 = proj_b + L.qkv_out_dim;
 
                 // Step D: Per-head RMSNorm + weight + SiLU(z) gating
                 {
@@ -5632,9 +5796,8 @@ __global__ void dotcache_qwen35_persistent_decode_kernel(
                     layer_timing_slots,
                     QWEN35_4B_TIMING_LINEAR_CORE_POST_BASE + min(b, 1),
                     linear_post_clock);
-
-            } // end if (blockIdx.x == 0) for linear attention core
-            // Grid barrier: block 0 wrote attn_scratch_b, all blocks need it for out_proj
+            }
+            // Grid barrier: recurrent/post wrote attn_scratch_b, all blocks need it for out_proj
             qwen35_record_persistent_4b_timing(
                 layer_timing_slots, QWEN35_4B_TIMING_LINEAR_CORE_BASE + b, linear_core_clock);
             grid_barrier(barrier_counter, barrier_flag, nb);

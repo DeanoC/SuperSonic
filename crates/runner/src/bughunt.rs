@@ -977,6 +977,7 @@ fn analyze_gate_prompt(
         &runtime.oracle_device,
         false,
         None,
+        None,
     )?;
     eprintln!("[bughunt] gate prompt={} oracle_trace", prompt.name);
     let trace = run_trace_oracle(runtime, &prompt.prompt_ids, None, None, None)?;
@@ -1143,6 +1144,7 @@ fn run_restart_layer_sweep(
         "bf16",
         &runtime.oracle_device,
         false,
+        None,
         None,
     )?;
     let num_layers = runtime.weights.config.num_hidden_layers;

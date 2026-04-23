@@ -1250,6 +1250,7 @@ fn main() -> Result<()> {
             &oracle_device,
             true,
             fp8_oracle_dir.as_deref(),
+            None,
         )?;
         engine.load_prefill_state(&output)?;
         let first = output
@@ -1318,6 +1319,7 @@ fn main() -> Result<()> {
             &oracle_device,
             cli.trace_prefill_layers,
             fp8_oracle_dir.as_deref(),
+            None,
         )?;
 
         // Compare prefill logits
@@ -2016,6 +2018,7 @@ fn main() -> Result<()> {
                     &oracle_device,
                     true,
                     fp8_oracle_dir.as_deref(),
+                    None,
                 )?;
                 let replay_qwen_trace = match oracle::run_qwen35_trace_oracle(
                     &qwen35_trace_script,

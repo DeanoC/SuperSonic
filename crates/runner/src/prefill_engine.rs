@@ -10,7 +10,7 @@ use gpu_hal::{Backend, GpuBuffer, ScalarType};
 
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, ModelState};
+use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
@@ -415,8 +415,11 @@ pub fn compute_logits_for_range(
         .map_err(|e| anyhow::anyhow!("range final norm: {e}"))?;
     }
 
-    // lm_head projection. For count=1 the standalone matvec is competitive with
-    // the tiled path on gfx1150; for count>1 we must use the tiled matmul.
+    // lm_head projection. For count=1, prefer the standalone matvec even on
+    // 4B-capable models: it avoids the tiled matmul path's extra packing and
+    // keeps the single-row score path numerically aligned with decode. Metal can
+    // optionally keep the final norm + lm_head in the host-F32 reference path
+    // while debugging final-logit parity.
     let logits_per_pos = if use_f32_final_norm {
         vec![kernel_ffi::qwen_rms_norm_standalone_matvec_host_f32(
             ordinal,
@@ -429,21 +432,37 @@ pub fn compute_logits_for_range(
             vocab_size,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head final-norm host-f32 matvec: {e}"))?]
-    } else if use_4b_kernel || count > 1 {
+    } else {
         let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
             .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-        kernel_ffi::matmul_rhs_transposed_4b(
-            ordinal,
-            ScalarType::BF16,
-            1,          // batch
-            count,      // m
-            vocab_size, // n
-            hidden_dim, // k
-            &normed,
-            &*weights.lm_head,
-            &mut logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
+        if count > 1 {
+            kernel_ffi::matmul_rhs_transposed_4b(
+                ordinal,
+                ScalarType::BF16,
+                1,          // batch
+                count,      // m
+                vocab_size, // n
+                hidden_dim, // k
+                &normed,
+                &*weights.lm_head,
+                &mut logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
+        } else {
+            let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+                .map_err(|e| anyhow::anyhow!("range matvec counter: {e}"))?;
+            kernel_ffi::standalone_matvec(
+                ordinal,
+                ScalarType::BF16,
+                &mut logits_buf,
+                &normed,
+                &*weights.lm_head,
+                hidden_dim,
+                vocab_size,
+                &mut counter,
+            )
+            .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
+        }
         let host_bytes = logits_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("range logits D2H: {e}"))?;
@@ -459,16 +478,6 @@ pub fn compute_logits_for_range(
             logits_per_pos.push(row_vec);
         }
         logits_per_pos
-    } else {
-        vec![kernel_ffi::standalone_matvec_host_f32(
-            ordinal,
-            ScalarType::BF16,
-            &normed,
-            &*weights.lm_head,
-            hidden_dim,
-            vocab_size,
-        )
-        .map_err(|e| anyhow::anyhow!("range lm_head host-f32 matvec: {e}"))?]
     };
 
     Ok((logits_per_pos, normed))
@@ -1446,7 +1455,9 @@ pub fn convert_kv_caches_to_fp8(
         if kv_fp8_bf16_sidecar_enabled() {
             ls.kv_shadow_k = Some(bf16_k);
             ls.kv_shadow_v = Some(bf16_v);
-            ls.kv_shadow_start = 0;
+            ls.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
+                .map(|window| kv_len.saturating_sub(window))
+                .unwrap_or(0);
         } else {
             ls.kv_shadow_k = None;
             ls.kv_shadow_v = None;

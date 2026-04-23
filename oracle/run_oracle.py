@@ -100,6 +100,8 @@ def main():
     parser.add_argument("--fp8-model-dir",
                         help="Path to FP8 safetensors dir. Weights are dequanted to BF16 "
                              "and injected into --model-id's architecture.")
+    parser.add_argument("--trace-full-attn-layer", type=int,
+                        help="Emit internal tensors for one full-attention layer at the last prompt token")
     args = parser.parse_args()
 
     prompt_ids = [int(x) for x in args.prompt_ids.split(",") if x]
@@ -139,8 +141,39 @@ def main():
         post_attn_norm_states = [None] * len(model.model.layers)
         mlp_outputs = [None] * len(model.model.layers)
         layer_outputs = [None] * len(model.model.layers)
+        trace_layer_input = None
+        trace_normed_input = None
+        trace_gated_actual = None
         hooks = []
         for layer_idx, layer in enumerate(model.model.layers):
+            if args.trace_full_attn_layer == layer_idx:
+                def capture_layer_input(module, inputs):
+                    nonlocal trace_layer_input
+                    trace_layer_input = inputs[0].detach()
+                def capture_normed_input(module, inputs, kwargs):
+                    nonlocal trace_normed_input
+                    hidden_states = kwargs.get("hidden_states")
+                    if hidden_states is None and len(inputs) > 0:
+                        hidden_states = inputs[0]
+                    if hidden_states is None:
+                        raise RuntimeError(
+                            f"Failed to capture self_attn hidden_states for layer {args.trace_full_attn_layer}"
+                        )
+                    trace_normed_input = hidden_states.detach()
+                def capture_gated_actual(module, inputs):
+                    nonlocal trace_gated_actual
+                    if len(inputs) == 0:
+                        raise RuntimeError(
+                            f"Failed to capture o_proj input for layer {args.trace_full_attn_layer}"
+                        )
+                    trace_gated_actual = inputs[0].detach()
+                hooks.append(layer.register_forward_pre_hook(capture_layer_input))
+                hooks.append(
+                    layer.self_attn.register_forward_pre_hook(
+                        capture_normed_input, with_kwargs=True
+                    )
+                )
+                hooks.append(layer.self_attn.o_proj.register_forward_pre_hook(capture_gated_actual))
             def make_pre_hook(idx):
                 def hook(module, inputs):
                     attn_residual_states[idx] = inputs[0][:, -1:, :].detach().to(torch_dtype).cpu()
@@ -222,6 +255,90 @@ def main():
         state_payload["kv_caches"] = kv_caches
         state_payload["conv_states"] = conv_states
         state_payload["recurrent_states"] = recurrent_states
+
+        if args.trace_full_attn_layer is not None:
+            if trace_layer_input is None or trace_normed_input is None:
+                raise RuntimeError(f"Failed to capture full-attention trace inputs for layer {args.trace_full_attn_layer}")
+            from transformers.models.qwen3_5.modeling_qwen3_5 import (
+                ALL_ATTENTION_FUNCTIONS,
+                apply_rotary_pos_emb,
+                create_causal_mask,
+                eager_attention_forward,
+            )
+
+            layer_idx = args.trace_full_attn_layer
+            layer = model.model.layers[layer_idx]
+            attn = layer.self_attn
+            input_shape = trace_normed_input.shape[:-1]
+            hidden_shape = (*input_shape, -1, attn.head_dim)
+            seq_len = trace_layer_input.shape[1]
+            position_ids = torch.arange(seq_len, device=device).view(1, 1, -1).expand(
+                4, trace_layer_input.shape[0], -1
+            )
+            text_position_ids = position_ids[0]
+            rope_position_ids = position_ids[1:]
+            causal_mask = create_causal_mask(
+                config=model.model.config,
+                inputs_embeds=trace_layer_input,
+                attention_mask=None,
+                past_key_values=None,
+                position_ids=text_position_ids,
+            )
+            position_embeddings = model.model.rotary_emb(trace_normed_input, rope_position_ids)
+            q_raw, gate = torch.chunk(
+                attn.q_proj(trace_normed_input).view(*input_shape, -1, attn.head_dim * 2), 2, dim=-1
+            )
+            gate = gate.reshape(*input_shape, -1)
+            query_states = attn.q_norm(q_raw.view(hidden_shape)).transpose(1, 2)
+            key_states = attn.k_norm(attn.k_proj(trace_normed_input).view(hidden_shape)).transpose(1, 2)
+            value_states = attn.v_proj(trace_normed_input).view(hidden_shape).transpose(1, 2)
+            q_pre_rope = query_states
+            k_pre_rope = key_states
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+            attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                attn.config._attn_implementation, eager_attention_forward
+            )
+            attn_output, _ = attention_interface(
+                attn,
+                query_states,
+                key_states,
+                value_states,
+                causal_mask,
+                dropout=0.0,
+                scaling=attn.scaling,
+            )
+            attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+            gate_last = gate[:, -1:, :]
+            pre_gate_last = attn_output[:, -1:, :]
+            gated_last = pre_gate_last * torch.sigmoid(gate_last)
+            state_payload["traced_full_attn_layer"] = layer_idx
+            state_payload["traced_full_attn_normed"] = tensor_to_b64(trace_normed_input[:, -1:, :].to(torch_dtype))
+            state_payload["traced_full_attn_q_proj"] = tensor_to_b64(
+                q_pre_rope.transpose(1, 2).reshape(*input_shape, -1)[:, -1:, :].to(torch_dtype)
+            )
+            state_payload["traced_full_attn_gate_proj"] = tensor_to_b64(gate_last.to(torch_dtype))
+            state_payload["traced_full_attn_k_proj"] = tensor_to_b64(
+                k_pre_rope.transpose(1, 2).reshape(*input_shape, -1)[:, -1:, :].to(torch_dtype)
+            )
+            state_payload["traced_full_attn_v_proj"] = tensor_to_b64(
+                value_states.transpose(1, 2).reshape(*input_shape, -1)[:, -1:, :].to(torch_dtype)
+            )
+            state_payload["traced_full_attn_q_rope"] = tensor_to_b64(
+                query_states.transpose(1, 2).reshape(*input_shape, -1)[:, -1:, :].to(torch_dtype)
+            )
+            state_payload["traced_full_attn_k_rope"] = tensor_to_b64(
+                key_states.transpose(1, 2).reshape(*input_shape, -1)[:, -1:, :].to(torch_dtype)
+            )
+            state_payload["traced_full_attn_pre_gate"] = tensor_to_b64(pre_gate_last.to(torch_dtype))
+            state_payload["traced_full_attn_gated"] = tensor_to_b64(gated_last.to(torch_dtype))
+            if trace_gated_actual is None:
+                raise RuntimeError(
+                    f"Failed to capture actual gated tensor for layer {args.trace_full_attn_layer}"
+                )
+            state_payload["traced_full_attn_gated_actual"] = tensor_to_b64(
+                trace_gated_actual[:, -1:, :].to(torch_dtype)
+            )
 
     # Decode
     decode_logits = []

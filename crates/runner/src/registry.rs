@@ -126,6 +126,15 @@ pub struct Qwen35KernelParams {
     pub weight_prefix: &'static str,
     pub kv_chunk_size: usize,
     pub use_4b_kernel: bool,
+    /// Per-model launch preset for the HIP 4B persistent decode kernel.
+    /// `None` (default) keeps the non-cooperative 2x multiProcessorCount
+    /// grid — empirically safe across every tested variant. `Some((blocks,
+    /// cooperative))` installs a different grid size + cooperative-launch
+    /// flag via `kernel_ffi::set_qwen35_4b_launch_preset`; this is how
+    /// models opt into the larger grids that only stay hang-free when
+    /// co-residence is enforced by `hipLaunchCooperativeKernel`. User env
+    /// vars `SUPERSONIC_QWEN4B_BLOCKS` / `_COOP` still override any preset.
+    pub hip_launch_preset: Option<(i32, bool)>,
 }
 
 pub struct Gemma4KernelParams {
@@ -189,6 +198,12 @@ static REGISTRY: &[RegistryEntry] = &[
             // the BF16 page-fault + hipcc codegen sensitivity warnings were
             // both found stale in the 2026-04-20 diagnostic pass.
             use_4b_kernel: true,
+            // Cooperative launch at 32 blocks caps conservatively at 24 on
+            // 0.8B's 14 KB LDS and runs at 77 ms/tok vs. the non-coop 2x
+            // default's 91 ms/tok (measured 2026-04-20). Other variants
+            // see no gain because their higher LDS usage caps the coop
+            // grid at or below 2x — they stay on the default path.
+            hip_launch_preset: Some((32, true)),
         }),
     },
     RegistryEntry {
@@ -205,6 +220,7 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -221,6 +237,7 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -237,6 +254,7 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -253,6 +271,24 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -269,6 +305,7 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -285,6 +322,24 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -365,4 +420,25 @@ pub fn supported_archs_for(model: &ModelVariant, backend: &Backend) -> Vec<Strin
         .filter(|e| e.model == *model && e.backend == *backend)
         .map(|e| e.arch.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
+        assert!(lookup(
+            &ModelVariant::Qwen3_5_2B,
+            &Backend::Cuda,
+            &GpuArch::Sm86,
+        )
+        .is_some());
+        assert!(lookup(
+            &ModelVariant::Qwen3_5_9B,
+            &Backend::Cuda,
+            &GpuArch::Sm86,
+        )
+        .is_some());
+    }
 }
