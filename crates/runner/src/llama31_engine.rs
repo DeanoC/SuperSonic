@@ -434,14 +434,11 @@ pub fn run_llama31(
     if cli.fp8_runtime || cli.int4 || cli.kv_fp8 {
         bail!("Llama 3.1 CUDA path does not support --fp8-runtime, --int4, or --kv-fp8");
     }
-    if cli.certified_kv {
-        let cfg = crate::certified_kv::CertifiedKvConfig::from_cli(cli)?;
-        eprintln!("[certified-kv] {}", cfg.summary());
-        bail!(
-            "--certified-kv Rust/CUDA integration is staged but not wired into llama31_engine yet; \
-             run tests/sm86/run_llama31_certified_kv_oracle.sh for the current oracle baseline"
-        );
-    }
+    let certified_kv_cfg = if cli.certified_kv {
+        Some(crate::certified_kv::CertifiedKvConfig::from_cli(cli)?)
+    } else {
+        None
+    };
     if cli.int8 && cli.no_bake {
         bail!("--int8 requires the baked path; drop --no-bake");
     }
@@ -623,6 +620,12 @@ pub fn run_llama31(
         false,
         1,
     )?;
+    if let Some(cfg) = &certified_kv_cfg {
+        eprintln!("[certified-kv] {}", cfg.summary());
+        eprintln!(
+            "[certified-kv] Rust/CUDA baseline uses unconditional dense fallback (Rung 4) on the existing CUDA BF16 KV attention path"
+        );
+    }
 
     let prefill_start = Instant::now();
     let prefill = if cli.trace_prefill_layers {
@@ -1059,6 +1062,44 @@ pub fn run_llama31(
     }
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
+    }
+    if let Some(cfg) = &certified_kv_cfg {
+        if let Some(path) = cfg.telemetry_path.as_ref() {
+            let payload = serde_json::json!({
+                "backend": "cuda",
+                "model": model_variant.to_string(),
+                "mode": "certified_kv_dense_fallback",
+                "prompt_tokens": prompt_ids.len(),
+                "generated_tokens": generated.len(),
+                "decode_ms": decode_ms,
+                "ms_per_step": ms_per_step,
+                "block_size": cfg.block_size,
+                "value_group_size": cfg.value_group_size,
+                "tau_cov": cfg.tau_cov,
+                "k_min": cfg.k_min,
+                "k_max": cfg.k_max,
+                "v_tol": cfg.v_tol,
+                "ranking_r": cfg.ranking_r,
+                "rung1_threshold": cfg.rung1_threshold,
+                "rung1_multiplier": cfg.rung1_multiplier,
+                "eps_guard": cfg.eps_guard,
+                "rung4_forced_dense_steps": generated.len(),
+            });
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)
+                        .with_context(|| format!("create certified KV telemetry dir {}", parent.display()))?;
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open certified KV telemetry {}", path.display()))?;
+            use std::io::Write as _;
+            writeln!(file, "{payload}")
+                .with_context(|| format!("write certified KV telemetry {}", path.display()))?;
+        }
     }
 
     Ok(())
