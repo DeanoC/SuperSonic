@@ -6,10 +6,12 @@ from pathlib import Path
 
 from oracle.pg19_smoke import (
     aggregate,
+    certified_dense_prefix_len,
     evaluate_gates,
     load_reference,
     parse_contexts,
     parse_teacher_forced_json,
+    resolve_eval_start_frac,
 )
 
 
@@ -45,6 +47,12 @@ class Pg19SmokeTests(unittest.TestCase):
         self.assertEqual(ref.metric, "perplexity")
         self.assertEqual(ref.value, 6.85)
         self.assertEqual(ref.dense_value, 6.84)
+
+    def test_reference_mode_defaults_to_dotcache_eval_start(self):
+        self.assertEqual(resolve_eval_start_frac(None, reference_mode=True), 0.5)
+        self.assertEqual(resolve_eval_start_frac(None, reference_mode=False), 0.0)
+        self.assertEqual(certified_dense_prefix_len("dense", 4096, 0.5), None)
+        self.assertEqual(certified_dense_prefix_len("certified", 4096, 0.5), 2048)
 
     def test_aggregate_and_gates_detect_certified_delta(self):
         payload = {

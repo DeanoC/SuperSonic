@@ -459,6 +459,18 @@ fn run_llama31_teacher_forced(
     {
         bail!("--teacher-forced does not support trace/debug validation flags yet");
     }
+    let dense_prefix_len = cli.teacher_forced_dense_prefix_len.unwrap_or(0);
+    if dense_prefix_len > 0 {
+        if certified_kv_cfg.is_none() {
+            bail!("--teacher-forced-dense-prefix-len requires --certified-kv");
+        }
+        if dense_prefix_len >= prompt_ids.len() {
+            bail!(
+                "--teacher-forced-dense-prefix-len ({dense_prefix_len}) must be less than prompt token count ({})",
+                prompt_ids.len()
+            );
+        }
+    }
 
     let score_start = Instant::now();
     let prefill_start = Instant::now();
@@ -467,16 +479,29 @@ fn run_llama31_teacher_forced(
 
     let mut total_nll = 0.0f64;
     let mut scored_tokens = 0usize;
+    let mut skipped_boundary_tokens = 0usize;
     let mut decode_steps = 0usize;
+    let mut certified_decode_steps = 0usize;
     let mut stage_totals = DecodeStageTimings::default();
 
     for target_idx in 1..prompt_ids.len() {
-        total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
-        scored_tokens += 1;
+        let score_token = dense_prefix_len == 0
+            || target_idx < dense_prefix_len
+            || target_idx > dense_prefix_len;
+        if score_token {
+            total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
+            scored_tokens += 1;
+        } else {
+            skipped_boundary_tokens += 1;
+        }
         if target_idx + 1 < prompt_ids.len() {
             let input_token = prompt_ids[target_idx];
             let pos = target_idx;
-            logits = if let Some(cfg) = certified_kv_cfg {
+            let use_certified_decode =
+                certified_kv_cfg.is_some() && (dense_prefix_len == 0 || pos >= dense_prefix_len);
+            logits = if use_certified_decode {
+                let cfg = certified_kv_cfg.expect("checked above");
+                certified_decode_steps += 1;
                 engine.component_decode_step_4b_certified_kv(
                     input_token,
                     pos,
@@ -494,6 +519,9 @@ fn run_llama31_teacher_forced(
             decode_steps += 1;
         }
     }
+    if scored_tokens == 0 {
+        bail!("--teacher-forced scored zero tokens");
+    }
 
     let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
     let avg_nll = total_nll / scored_tokens as f64;
@@ -501,10 +529,13 @@ fn run_llama31_teacher_forced(
     let bits_per_token = avg_nll / std::f64::consts::LN_2;
     let ms_per_token = total_ms / scored_tokens as f64;
     eprintln!(
-        "[teacher_forced] tokens={} scored_tokens={} decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        "[teacher_forced] tokens={} scored_tokens={} skipped_boundary_tokens={} dense_prefix_len={} decode_steps={} certified_decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
         prompt_ids.len(),
         scored_tokens,
+        skipped_boundary_tokens,
+        dense_prefix_len,
         decode_steps,
+        certified_decode_steps,
         total_nll,
         avg_nll,
         perplexity,
@@ -521,7 +552,10 @@ fn run_llama31_teacher_forced(
             "mode": if certified_kv_cfg.is_some() { "certified_kv" } else { "dense" },
             "prompt_tokens": prompt_ids.len(),
             "scored_tokens": scored_tokens,
+            "skipped_boundary_tokens": skipped_boundary_tokens,
+            "dense_prefix_len": dense_prefix_len,
             "decode_steps": decode_steps,
+            "certified_decode_steps": certified_decode_steps,
             "total_nll": total_nll,
             "avg_nll": avg_nll,
             "perplexity": perplexity,

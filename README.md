@@ -193,6 +193,12 @@ CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
   ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 
+# Llama 3.1 8B PG-19 DotCache reference smoke QA
+CONTEXTS='4096' NUM_CHUNKS=1 CONFIG=both REFERENCE_SMOKE=1 \
+  FAIL_ABOVE_REFERENCE=1 TIMEOUT=1200 \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
 # Combined wrapper
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
@@ -365,6 +371,10 @@ CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
   ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+CONTEXTS='4096' NUM_CHUNKS=1 CONFIG=both REFERENCE_SMOKE=1 \
+  FAIL_ABOVE_REFERENCE=1 TIMEOUT=1200 \
   ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 ```

@@ -237,14 +237,24 @@ returned logits. A tiny local-text probe (`CONTEXTS=32`, one chunk, commit
 | local fixture | certified KV INT8 |      32 |      1 | 235.822 |          36.6 |
 | PG-19 stream  | dense INT8        |     512 |      1 |   6.727 |          53.6 |
 | PG-19 stream  | certified KV INT8 |     512 |      1 |   6.783 |          38.6 |
+| PG-19 stream  | dense INT8        |    4096 |      1 |   6.279 |         222.7 |
+| PG-19 stream  | certified KV INT8 |    4096 |      1 |   6.294 |          99.1 |
 
 The 512-token PG-19 smoke (`target/pg19_smoke_real_512.json`, one streamed
 test chunk, commit `8bffbca` + docs update) passed the default
 `MAX_CERTIFIED_DELTA=0.10` gate with certified delta `+0.055` ppl. This is
-still a smoke baseline rather than a final quality number. For PG-19 arxiv_v1
-comparison, run the same script with `CONTEXTS=4096` and `REFERENCE_SMOKE=1`;
-that path compares against the DotCache PG-19 smoke JSON when a matching
-reference cell is present.
+still a quick smoke baseline rather than a final quality number.
+
+The 4K reference-grade smoke (`target/pg19_smoke_reference_4k.json`) uses the
+DotCache PG-19 protocol: dense scores the full 4095-token target stream, while
+certified uses a 50% dense prefix (`dense_prefix_len=2048`), skips the boundary
+target, and scores the certified suffix (`4094` scored tokens,
+`2047` certified decode steps). It passed `REFERENCE_SMOKE=1` and
+`FAIL_ABOVE_REFERENCE=1` against
+`/workspace/DotCache/benchmarks/results/arxiv_v1_20260420`: dense PPL
+`6.279` vs DotCache `6.259`, certified PPL `6.294` vs DotCache `6.284`, and
+certified-vs-dense delta `+0.015` ppl. Use:
+`CONTEXTS=4096 REFERENCE_SMOKE=1 FAIL_ABOVE_REFERENCE=1` for this lane.
 
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in

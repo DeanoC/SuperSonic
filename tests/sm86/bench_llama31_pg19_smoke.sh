@@ -12,6 +12,8 @@ set -euo pipefail
 #   MAX_CERTIFIED_DELTA=0.10     fail if certified ppl exceeds dense by this much
 #   FAIL_ABOVE_REFERENCE=0       compare to DotCache arxiv_v1 reference when present
 #   REFERENCE_TOLERANCE=0.05     additive ppl tolerance vs DotCache reference
+#   EVAL_START_FRAC=             certified dense-prefix fraction; defaults to
+#                                 0.5 with reference checks, else full scoring
 #   SOURCE_TEXT=/path/text.txt   optional local text instead of HF PG-19 streaming
 
 MODEL_DIR="${1:-${SUPERSONIC_MODEL_DIR_LLAMA31:-}}"
@@ -48,6 +50,9 @@ if [[ "${FAIL_ABOVE_REFERENCE:-0}" == "1" ]]; then
 fi
 if [[ "${REFERENCE_SMOKE:-0}" == "1" ]]; then
   ARGS+=(--reference-smoke)
+fi
+if [[ -n "${EVAL_START_FRAC:-}" ]]; then
+  ARGS+=(--eval-start-frac "$EVAL_START_FRAC")
 fi
 
 python3 oracle/pg19_smoke.py "${ARGS[@]}"

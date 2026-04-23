@@ -345,6 +345,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     teacher_forced: bool,
 
+    /// For certified teacher-forced scoring, use dense decode through this
+    /// prefix length, skip the boundary target, then score the suffix with the
+    /// certified path. This matches the DotCache PG-19 protocol.
+    #[arg(long, hide = true)]
+    teacher_forced_dense_prefix_len: Option<usize>,
+
     /// Run PyTorch oracle and compare logits
     #[arg(long)]
     validate: bool,

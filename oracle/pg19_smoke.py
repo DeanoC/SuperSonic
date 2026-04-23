@@ -84,6 +84,19 @@ def load_reference(
     )
 
 
+def resolve_eval_start_frac(raw: float | None, reference_mode: bool) -> float:
+    frac = 0.5 if raw is None and reference_mode else (raw or 0.0)
+    if frac < 0.0 or frac >= 1.0:
+        raise ValueError("--eval-start-frac must be in [0.0, 1.0)")
+    return frac
+
+
+def certified_dense_prefix_len(config: str, context: int, eval_start_frac: float) -> int | None:
+    if config != "certified" or eval_start_frac <= 0.0:
+        return None
+    return int(context * eval_start_frac)
+
+
 def load_text_chunks(
     tokenizer: Any,
     context: int,
@@ -126,6 +139,7 @@ def run_supersonic(
     context: int,
     config: str,
     timeout: int,
+    dense_prefix_len: int | None = None,
 ) -> dict[str, Any]:
     cmd = [
         str(binary),
@@ -147,6 +161,8 @@ def run_supersonic(
     ]
     if config == "certified":
         cmd.append("--certified-kv")
+        if dense_prefix_len is not None and dense_prefix_len > 0:
+            cmd.extend(["--teacher-forced-dense-prefix-len", str(dense_prefix_len)])
     proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
     combined = proc.stdout + proc.stderr
     if proc.returncode != 0:
@@ -226,7 +242,19 @@ def main() -> int:
     parser.add_argument("--fail-above-reference", action="store_true")
     parser.add_argument("--reference-tolerance", type=float, default=0.05)
     parser.add_argument("--max-certified-delta", type=float, default=0.10)
+    parser.add_argument(
+        "--eval-start-frac",
+        type=float,
+        default=None,
+        help=(
+            "Dense prefix fraction for certified PG-19 scoring. Defaults to 0.5 "
+            "when reference comparison is enabled, otherwise 0.0."
+        ),
+    )
     args = parser.parse_args()
+    eval_start_frac = resolve_eval_start_frac(
+        args.eval_start_frac, args.reference_smoke or args.fail_above_reference
+    )
 
     try:
         from transformers import AutoTokenizer
@@ -243,9 +271,18 @@ def main() -> int:
         chunks = load_text_chunks(tokenizer, ctx, args.num_chunks, args.stride, args.source_text)
         for config in configs:
             per_chunk = []
+            dense_prefix_len = certified_dense_prefix_len(config, ctx, eval_start_frac)
             for idx, prompt in enumerate(chunks):
                 print(f"[pg19] context={ctx} config={config} chunk={idx + 1}/{len(chunks)}", flush=True)
-                result = run_supersonic(args.binary, args.model_dir, prompt, ctx, config, args.timeout)
+                result = run_supersonic(
+                    args.binary,
+                    args.model_dir,
+                    prompt,
+                    ctx,
+                    config,
+                    args.timeout,
+                    dense_prefix_len=dense_prefix_len,
+                )
                 result.update({"chunk_idx": idx, "context_length": ctx, "config": config})
                 per_chunk.append(result)
                 rows.append(result)
@@ -259,6 +296,8 @@ def main() -> int:
                 "total_tokens": agg["total_tokens"],
                 "ms_per_token": agg["ms_per_token"],
                 "chunks": agg["chunks"],
+                "eval_start_frac": eval_start_frac,
+                "dense_prefix_len": dense_prefix_len,
                 "reference_perplexity": ref.value if ref else None,
                 "reference_path": str(ref.path) if ref else None,
             })
@@ -269,6 +308,7 @@ def main() -> int:
         "contexts": contexts,
         "configs": configs,
         "num_chunks": args.num_chunks,
+        "eval_start_frac": eval_start_frac,
         "summary": summary,
         "results": rows,
     }
