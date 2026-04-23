@@ -3584,6 +3584,10 @@ impl DecodeEngine {
                 let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
                 let start_block = ls.certified_kv_key_tokens / block_size;
                 let block_count = (aligned - ls.certified_kv_key_tokens) / block_size;
+                if timings.is_some() {
+                    gpu_hal::sync(self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV key quantize pre-sync: {e}"))?;
+                }
                 let key_quantize_start = Instant::now();
                 kernel_ffi::certified_kv::quantize_bf16_keys_range(
                     self.ordinal,
@@ -3596,6 +3600,9 @@ impl DecodeEngine {
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
                 if let Some(t) = timings.as_mut() {
+                    gpu_hal::sync(self.ordinal).map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV key quantize synchronize: {e}")
+                    })?;
                     t.certified_kv_key_quantize_ms +=
                         key_quantize_start.elapsed().as_secs_f64() * 1000.0;
                 }
@@ -3623,6 +3630,10 @@ impl DecodeEngine {
             }
             let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
             if bf16_values {
+                if timings.is_some() {
+                    gpu_hal::sync(self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}"))?;
+                }
                 let attend_start = Instant::now();
                 kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                     self.ordinal,
@@ -3640,6 +3651,9 @@ impl DecodeEngine {
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
                 if let Some(t) = timings.as_mut() {
+                    gpu_hal::sync(self.ordinal).map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV attention synchronize: {e}")
+                    })?;
                     t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
                 }
             } else {
@@ -3707,6 +3721,11 @@ impl DecodeEngine {
                 if ls.certified_kv_value_tokens < aligned {
                     let start_block = ls.certified_kv_value_tokens / block_size;
                     let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
+                    if timings.is_some() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV value quantize pre-sync: {e}")
+                        })?;
+                    }
                     let value_quantize_start = Instant::now();
                     kernel_ffi::certified_kv::quantize_bf16_values_range(
                         self.ordinal,
@@ -3724,10 +3743,19 @@ impl DecodeEngine {
                         anyhow::anyhow!("layer {idx} certified KV decode value quantize: {e}")
                     })?;
                     if let Some(t) = timings.as_mut() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV value quantize synchronize: {e}"
+                            )
+                        })?;
                         t.certified_kv_value_quantize_ms +=
                             value_quantize_start.elapsed().as_secs_f64() * 1000.0;
                     }
                     ls.certified_kv_value_tokens = aligned;
+                }
+                if timings.is_some() {
+                    gpu_hal::sync(self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}"))?;
                 }
                 let attend_start = Instant::now();
                 kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail_strided(
@@ -3752,6 +3780,9 @@ impl DecodeEngine {
                     anyhow::anyhow!("layer {idx} certified KV decode INT4 attention: {e}")
                 })?;
                 if let Some(t) = timings.as_mut() {
+                    gpu_hal::sync(self.ordinal).map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV INT4 attention synchronize: {e}")
+                    })?;
                     t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
                 }
             }
