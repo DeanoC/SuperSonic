@@ -608,6 +608,52 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
+def evaluate_quality_gates(payload: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    failures: list[str] = []
+    for key, row in payload.get("summary", {}).items():
+        mean_score = float(row.get("mean_score", 0.0))
+        if args.min_score is not None and mean_score < args.min_score:
+            failures.append(
+                f"{key}: mean_score={mean_score:.3f} below min_score={args.min_score:.3f}"
+            )
+        ref = row.get("reference_score")
+        if args.fail_below_reference and ref is not None:
+            ref_f = float(ref)
+            if mean_score + args.reference_tolerance < ref_f:
+                failures.append(
+                    f"{key}: mean_score={mean_score:.3f} below reference={ref_f:.3f} "
+                    f"minus tolerance={args.reference_tolerance:.3f}"
+                )
+
+    if args.fail_on_critical:
+        dense_scores: dict[tuple[int, str, int], float] = {}
+        cert_scores: dict[tuple[int, str, int], float] = {}
+        for row in payload.get("results", []):
+            sample_key = (row["context_length"], row["subtask"], row["sample_idx"])
+            if row["config"] == "dense":
+                dense_scores[sample_key] = float(row["score"])
+            elif row["config"] == "certified":
+                cert_scores[sample_key] = float(row["score"])
+        critical = [
+            sample_key
+            for sample_key, dense_score in dense_scores.items()
+            if dense_score >= 1.0 and cert_scores.get(sample_key, 1.0) < 1.0
+        ]
+        payload["critical_failures"] = len(critical)
+        payload["critical_failure_keys"] = [
+            {"context_length": ctx, "subtask": subtask, "sample_idx": sample_idx}
+            for ctx, subtask, sample_idx in critical
+        ]
+        if critical:
+            failures.append(f"certified critical failures vs dense: {len(critical)}")
+    else:
+        payload["critical_failures"] = None
+        payload["critical_failure_keys"] = []
+
+    payload["gate_failures"] = failures
+    return failures
+
+
 def require_reference_dir(path: str) -> Path:
     path = Path(path)
     if not path.exists():
@@ -633,6 +679,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--emit-stage-timings", action="store_true")
+    parser.add_argument("--min-score", type=float, default=None)
+    parser.add_argument("--fail-below-reference", action="store_true")
+    parser.add_argument("--reference-tolerance", type=float, default=0.0)
+    parser.add_argument("--fail-on-critical", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("target/arxiv_v1_smoke.json"))
     args = parser.parse_args(argv)
     unknown = [name for name in args.subtasks if name not in SUBTASK_BUILDERS]
@@ -646,9 +696,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     payload = run_ruler_smoke(args)
+    failures = evaluate_quality_gates(payload, args)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"\nJSON -> {args.output}")
+    if failures:
+        print("\nQUALITY GATE FAILED")
+        for failure in failures:
+            print(f"  - {failure}")
+        return 1
+    print("QUALITY GATE PASSED")
     return 0
 
 

@@ -30,6 +30,10 @@ SAMPLES="${SAMPLES:-3}"
 CONFIG="${CONFIG:-both}"
 OUTPUT="${OUTPUT:-$REPO_ROOT/target/arxiv_v1_smoke.json}"
 TIMEOUT="${TIMEOUT:-900}"
+MIN_SCORE="${MIN_SCORE:-}"
+FAIL_BELOW_REFERENCE="${FAIL_BELOW_REFERENCE:-1}"
+REFERENCE_TOLERANCE="${REFERENCE_TOLERANCE:-0.0}"
+FAIL_ON_CRITICAL="${FAIL_ON_CRITICAL:-1}"
 
 read -r -a CONTEXT_ARGS <<< "$CONTEXTS"
 read -r -a SUBTASK_ARGS <<< "${SUBTASKS:-niah_single niah_multikey}"
@@ -41,10 +45,24 @@ echo "Contexts:       ${CONTEXT_ARGS[*]}"
 echo "Subtasks:       ${SUBTASK_ARGS[*]}"
 echo "Samples:        $SAMPLES"
 echo "Config:         $CONFIG"
+echo "Min score:      ${MIN_SCORE:-<unset>}"
+echo "Ref gate:       $FAIL_BELOW_REFERENCE tolerance=$REFERENCE_TOLERANCE"
+echo "Critical gate:  $FAIL_ON_CRITICAL"
 echo "Output:         $OUTPUT"
 echo ""
 
 cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" --bin supersonic
+
+EXTRA_ARGS=()
+if [ -n "$MIN_SCORE" ]; then
+    EXTRA_ARGS+=(--min-score "$MIN_SCORE")
+fi
+if [ "$FAIL_BELOW_REFERENCE" = "1" ]; then
+    EXTRA_ARGS+=(--fail-below-reference --reference-tolerance "$REFERENCE_TOLERANCE")
+fi
+if [ "$FAIL_ON_CRITICAL" = "1" ]; then
+    EXTRA_ARGS+=(--fail-on-critical)
+fi
 
 python3 "$REPO_ROOT/oracle/arxiv_v1_smoke.py" \
     --model-dir "$MODEL_DIR" \
@@ -55,4 +73,5 @@ python3 "$REPO_ROOT/oracle/arxiv_v1_smoke.py" \
     --samples "$SAMPLES" \
     --config "$CONFIG" \
     --timeout "$TIMEOUT" \
-    --output "$OUTPUT"
+    --output "$OUTPUT" \
+    "${EXTRA_ARGS[@]}"

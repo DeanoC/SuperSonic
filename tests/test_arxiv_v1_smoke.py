@@ -2,9 +2,11 @@ import json
 import random
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 from oracle.arxiv_v1_smoke import (
+    evaluate_quality_gates,
     load_reference,
     make_niah_single,
     parse_supersonic_generation,
@@ -79,6 +81,41 @@ class ArxivV1SmokeTests(unittest.TestCase):
         self.assertTrue(prompt.startswith("A special magic number is hidden"))
         self.assertEqual(len(refs), 1)
         self.assertIn(refs[0], prompt)
+
+    def test_quality_gates_detect_reference_and_critical_regressions(self):
+        payload = {
+            "summary": {
+                "certified:niah_single_4K": {
+                    "mean_score": 0.0,
+                    "reference_score": 1.0,
+                }
+            },
+            "results": [
+                {
+                    "config": "dense",
+                    "context_length": 4096,
+                    "subtask": "niah_single",
+                    "sample_idx": 0,
+                    "score": 1.0,
+                },
+                {
+                    "config": "certified",
+                    "context_length": 4096,
+                    "subtask": "niah_single",
+                    "sample_idx": 0,
+                    "score": 0.0,
+                },
+            ],
+        }
+        args = Namespace(
+            min_score=0.5,
+            fail_below_reference=True,
+            reference_tolerance=0.0,
+            fail_on_critical=True,
+        )
+        failures = evaluate_quality_gates(payload, args)
+        self.assertEqual(payload["critical_failures"], 1)
+        self.assertEqual(len(failures), 3)
 
 
 if __name__ == "__main__":
