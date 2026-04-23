@@ -656,6 +656,10 @@ pub struct DecodeStageTimings {
     pub persistent_full_attn_ms: f64,
     pub persistent_full_attn_proj_ms: f64,
     pub persistent_full_attn_core_ms: f64,
+    pub certified_kv_key_quantize_ms: f64,
+    pub certified_kv_value_quantize_ms: f64,
+    pub certified_kv_attend_ms: f64,
+    pub certified_kv_cast_ms: f64,
     pub persistent_full_attn_out_ms: f64,
     pub persistent_linear_proj_ms: f64,
     pub persistent_linear_core_ms: f64,
@@ -679,6 +683,10 @@ impl DecodeStageTimings {
         self.persistent_full_attn_ms += rhs.persistent_full_attn_ms;
         self.persistent_full_attn_proj_ms += rhs.persistent_full_attn_proj_ms;
         self.persistent_full_attn_core_ms += rhs.persistent_full_attn_core_ms;
+        self.certified_kv_key_quantize_ms += rhs.certified_kv_key_quantize_ms;
+        self.certified_kv_value_quantize_ms += rhs.certified_kv_value_quantize_ms;
+        self.certified_kv_attend_ms += rhs.certified_kv_attend_ms;
+        self.certified_kv_cast_ms += rhs.certified_kv_cast_ms;
         self.persistent_full_attn_out_ms += rhs.persistent_full_attn_out_ms;
         self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
         self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
@@ -3576,6 +3584,7 @@ impl DecodeEngine {
                 let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
                 let start_block = ls.certified_kv_key_tokens / block_size;
                 let block_count = (aligned - ls.certified_kv_key_tokens) / block_size;
+                let key_quantize_start = Instant::now();
                 kernel_ffi::certified_kv::quantize_bf16_keys_range(
                     self.ordinal,
                     cache_k_ref,
@@ -3586,6 +3595,10 @@ impl DecodeEngine {
                     key_scale,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
+                if let Some(t) = timings.as_mut() {
+                    t.certified_kv_key_quantize_ms +=
+                        key_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                }
                 ls.certified_kv_key_tokens = aligned;
             }
 
@@ -3610,6 +3623,7 @@ impl DecodeEngine {
             }
             let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
             if bf16_values {
+                let attend_start = Instant::now();
                 kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                     self.ordinal,
                     attn_q,
@@ -3625,6 +3639,9 @@ impl DecodeEngine {
                     attn_out_f32,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
+                if let Some(t) = timings.as_mut() {
+                    t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
+                }
             } else {
                 let value_i4_shape = [num_kv_heads, cap_aligned, head_dim / 2];
                 let value_meta_shape = [num_kv_heads, cap_aligned, head_dim / value_group_size];
@@ -3690,6 +3707,7 @@ impl DecodeEngine {
                 if ls.certified_kv_value_tokens < aligned {
                     let start_block = ls.certified_kv_value_tokens / block_size;
                     let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
+                    let value_quantize_start = Instant::now();
                     kernel_ffi::certified_kv::quantize_bf16_values_range(
                         self.ordinal,
                         cache_v_ref,
@@ -3705,8 +3723,13 @@ impl DecodeEngine {
                     .map_err(|e| {
                         anyhow::anyhow!("layer {idx} certified KV decode value quantize: {e}")
                     })?;
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_value_quantize_ms +=
+                            value_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     ls.certified_kv_value_tokens = aligned;
                 }
+                let attend_start = Instant::now();
                 kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail_strided(
                     self.ordinal,
                     attn_q,
@@ -3728,7 +3751,11 @@ impl DecodeEngine {
                 .map_err(|e| {
                     anyhow::anyhow!("layer {idx} certified KV decode INT4 attention: {e}")
                 })?;
+                if let Some(t) = timings.as_mut() {
+                    t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
+                }
             }
+            let cast_start = Instant::now();
             kernel_ffi::prefill_ffi::cast(
                 self.ordinal,
                 ScalarType::F32,
@@ -3738,6 +3765,9 @@ impl DecodeEngine {
                 attn_out_bf16,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attn cast: {e}"))?;
+            if let Some(t) = timings.as_mut() {
+                t.certified_kv_cast_ms += cast_start.elapsed().as_secs_f64() * 1000.0;
+            }
             if has_attn_gate {
                 kernel_ffi::prefill_ffi::transpose_shd_hsd(
                     self.ordinal,

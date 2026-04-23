@@ -395,7 +395,7 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         return;
     }
     eprintln!(
-        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} layer_compute={:.1} full_attn={:.1} full_attn_proj={:.1} full_attn_core={:.1} full_attn_out={:.1} linear={:.1} mlp={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
+        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} layer_compute={:.1} full_attn={:.1} full_attn_proj={:.1} full_attn_core={:.1} cert_key_q={:.1} cert_val_q={:.1} cert_attend={:.1} cert_cast={:.1} full_attn_out={:.1} linear={:.1} mlp={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
         tokens,
         timings.total_ms(),
         timings.total_ms() / tokens as f64,
@@ -403,6 +403,10 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         timings.persistent_full_attn_ms,
         timings.persistent_full_attn_proj_ms,
         timings.persistent_full_attn_core_ms,
+        timings.certified_kv_key_quantize_ms,
+        timings.certified_kv_value_quantize_ms,
+        timings.certified_kv_attend_ms,
+        timings.certified_kv_cast_ms,
         timings.persistent_full_attn_out_ms,
         timings.persistent_linear_core_ms,
         timings.persistent_mlp_down_ms,
