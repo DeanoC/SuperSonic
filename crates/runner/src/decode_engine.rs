@@ -222,6 +222,12 @@ pub struct DecodeEngine {
     /// only once per fused-verify call chain. Re-allocated if the block
     /// size changes between calls.
     dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
+    /// Reused single-token component decode MLP temporaries. Metal component
+    /// decode executes many small ops, so avoiding per-layer allocation churn
+    /// is currently more important than the tiny retained memory footprint.
+    component_mlp_scratch: Option<ComponentMlpScratch>,
+    /// Reused single-token component decode linear-attention temporaries.
+    component_linear_scratch: Option<ComponentLinearScratch>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -295,6 +301,135 @@ impl DFlashFusedVerifyCache {
             batch_desc_device,
         })
     }
+}
+
+struct ComponentMlpScratch {
+    gate: GpuBuffer,
+    up: GpuBuffer,
+    mlp: GpuBuffer,
+    down: GpuBuffer,
+}
+
+struct ComponentLinearScratch {
+    qkv: GpuBuffer,
+    z: GpuBuffer,
+    a: GpuBuffer,
+    b: GpuBuffer,
+    a_beta_raw: GpuBuffer,
+    rec_apply: GpuBuffer,
+    attn_bf16: GpuBuffer,
+    norm_w_bf16: GpuBuffer,
+    gated: GpuBuffer,
+    proj_out: GpuBuffer,
+    conv_pack: GpuBuffer,
+    q_linear: GpuBuffer,
+    k_linear: GpuBuffer,
+    v_linear: GpuBuffer,
+    q_linear_f32: GpuBuffer,
+    k_linear_f32: GpuBuffer,
+    v_linear_f32: GpuBuffer,
+    q_normed: GpuBuffer,
+    q_scaled: GpuBuffer,
+    k_normed: GpuBuffer,
+}
+
+impl ComponentLinearScratch {
+    fn alloc(ordinal: usize, config: &TextConfig) -> Result<Self> {
+        let hidden_dim = config.hidden_size;
+        let nk = config.linear_num_key_heads;
+        let nv = config.linear_num_value_heads;
+        let khd = config.linear_key_head_dim;
+        let vhd = config.linear_value_head_dim;
+        let key_dim = nk * khd;
+        let val_dim = nv * vhd;
+        let qkv_dim = key_dim * 2 + val_dim;
+        let rec_apply_dim = val_dim + nv * khd * vhd;
+        let qkv = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, qkv_dim])
+            .map_err(|e| anyhow::anyhow!("component linear qkv scratch alloc: {e}"))?;
+        let z = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, val_dim])
+            .map_err(|e| anyhow::anyhow!("component linear z scratch alloc: {e}"))?;
+        let a = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nv])
+            .map_err(|e| anyhow::anyhow!("component linear a scratch alloc: {e}"))?;
+        let b = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nv])
+            .map_err(|e| anyhow::anyhow!("component linear b scratch alloc: {e}"))?;
+        let a_beta_raw = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nv * 2])
+            .map_err(|e| anyhow::anyhow!("component linear a_beta scratch alloc: {e}"))?;
+        let rec_apply = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, rec_apply_dim])
+            .map_err(|e| anyhow::anyhow!("component linear rec_apply scratch alloc: {e}"))?;
+        let attn_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, vhd])
+            .map_err(|e| anyhow::anyhow!("component linear attn scratch alloc: {e}"))?;
+        let norm_w_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[vhd])
+            .map_err(|e| anyhow::anyhow!("component linear norm_w scratch alloc: {e}"))?;
+        let gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, vhd])
+            .map_err(|e| anyhow::anyhow!("component linear gated scratch alloc: {e}"))?;
+        let proj_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("component linear proj_out scratch alloc: {e}"))?;
+        let conv_pack = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, qkv_dim + nv])
+            .map_err(|e| anyhow::anyhow!("component linear conv_pack scratch alloc: {e}"))?;
+        let q_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, key_dim])
+            .map_err(|e| anyhow::anyhow!("component linear q scratch alloc: {e}"))?;
+        let k_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, key_dim])
+            .map_err(|e| anyhow::anyhow!("component linear k scratch alloc: {e}"))?;
+        let v_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, val_dim])
+            .map_err(|e| anyhow::anyhow!("component linear v scratch alloc: {e}"))?;
+        let q_linear_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, key_dim])
+            .map_err(|e| anyhow::anyhow!("component linear q_f32 scratch alloc: {e}"))?;
+        let k_linear_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, key_dim])
+            .map_err(|e| anyhow::anyhow!("component linear k_f32 scratch alloc: {e}"))?;
+        let v_linear_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, val_dim])
+            .map_err(|e| anyhow::anyhow!("component linear v_f32 scratch alloc: {e}"))?;
+        let q_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nk, khd])
+            .map_err(|e| anyhow::anyhow!("component linear q_norm scratch alloc: {e}"))?;
+        let q_scaled = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nk, khd])
+            .map_err(|e| anyhow::anyhow!("component linear q_scale scratch alloc: {e}"))?;
+        let k_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nk, khd])
+            .map_err(|e| anyhow::anyhow!("component linear k_norm scratch alloc: {e}"))?;
+        Ok(Self {
+            qkv,
+            z,
+            a,
+            b,
+            a_beta_raw,
+            rec_apply,
+            attn_bf16,
+            norm_w_bf16,
+            gated,
+            proj_out,
+            conv_pack,
+            q_linear,
+            k_linear,
+            v_linear,
+            q_linear_f32,
+            k_linear_f32,
+            v_linear_f32,
+            q_normed,
+            q_scaled,
+            k_normed,
+        })
+    }
+}
+
+impl ComponentMlpScratch {
+    fn alloc(ordinal: usize, hidden_dim: usize, intermediate: usize) -> Result<Self> {
+        let gate = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+            .map_err(|e| anyhow::anyhow!("component mlp gate scratch alloc: {e}"))?;
+        let up = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+            .map_err(|e| anyhow::anyhow!("component mlp up scratch alloc: {e}"))?;
+        let mlp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+            .map_err(|e| anyhow::anyhow!("component mlp act scratch alloc: {e}"))?;
+        let down = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("component mlp down scratch alloc: {e}"))?;
+        Ok(Self {
+            gate,
+            up,
+            mlp,
+            down,
+        })
+    }
+}
+
+fn component_scratch_reuse_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_COMPONENT_SCRATCH_REUSE").is_some()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2197,44 +2332,72 @@ impl DecodeEngine {
         trace_output: bool,
     ) -> Result<Option<ComponentLinearTrace>> {
         let config = &self.weights.config;
-        let lw = self.weights.layers[idx]
-            .linear
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected linear attention weights"))?;
-        let hidden_dim = config.hidden_size;
-        let nk = config.linear_num_key_heads;
-        let nv = config.linear_num_value_heads;
-        let khd = config.linear_key_head_dim;
-        let vhd = config.linear_value_head_dim;
-        let key_dim = nk * khd;
-        let val_dim = nv * vhd;
-        let qkv_dim = key_dim * 2 + val_dim;
-        let head_repeat = nv / nk;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && !component_scratch_reuse_disabled()
+            && std::env::var_os("SUPERSONIC_METAL_ENABLE_COMPONENT_F32_LINEAR_INPUT").is_none()
+        {
+            let scratch = match self.component_linear_scratch.take() {
+                Some(scratch) => scratch,
+                None => ComponentLinearScratch::alloc(self.ordinal, config)?,
+            };
+            let (result, scratch) =
+                self.component_decode_linear_attention_layer_with_scratch(idx, trace_output, scratch);
+            self.component_linear_scratch = Some(scratch);
+            return result;
+        }
 
-        let mut qkv = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, qkv_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} qkv alloc: {e}"))?;
-        let mut z = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, val_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} z alloc: {e}"))?;
-        let mut a = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, nv])
-            .map_err(|e| anyhow::anyhow!("layer {idx} a alloc: {e}"))?;
-        let mut b = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, nv])
-            .map_err(|e| anyhow::anyhow!("layer {idx} b alloc: {e}"))?;
-        let a_beta_raw = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, nv * 2])
-            .map_err(|e| anyhow::anyhow!("layer {idx} a_beta alloc: {e}"))?;
-        let mut rec_apply = GpuBuffer::zeros(
-            self.ordinal,
-            ScalarType::F32,
-            &[1, val_dim + nv * khd * vhd],
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} rec_apply alloc: {e}"))?;
-        let mut attn_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[nv, vhd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn_bf16 alloc: {e}"))?;
-        let mut norm_w_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[vhd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} norm_w alloc: {e}"))?;
-        let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[nv, vhd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} gated alloc: {e}"))?;
-        let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
+        let scratch = ComponentLinearScratch::alloc(self.ordinal, config)
+            .map_err(|e| anyhow::anyhow!("layer {idx} linear scratch alloc: {e}"))?;
+        let (result, _scratch) =
+            self.component_decode_linear_attention_layer_with_scratch(idx, trace_output, scratch);
+        result
+    }
+
+    fn component_decode_linear_attention_layer_with_scratch(
+        &mut self,
+        idx: usize,
+        trace_output: bool,
+        scratch: ComponentLinearScratch,
+    ) -> (Result<Option<ComponentLinearTrace>>, ComponentLinearScratch) {
+        let ComponentLinearScratch {
+            mut qkv,
+            mut z,
+            mut a,
+            mut b,
+            a_beta_raw,
+            mut rec_apply,
+            mut attn_bf16,
+            mut norm_w_bf16,
+            mut gated,
+            mut proj_out,
+            mut conv_pack,
+            mut q_linear,
+            mut k_linear,
+            mut v_linear,
+            mut q_linear_f32,
+            mut k_linear_f32,
+            mut v_linear_f32,
+            mut q_normed,
+            mut q_scaled,
+            mut k_normed,
+        } = scratch;
+
+        let result = (|| -> Result<Option<ComponentLinearTrace>> {
+            let config = &self.weights.config;
+            let lw = self.weights.layers[idx]
+                .linear
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {idx}: expected linear attention weights"))?;
+            let hidden_dim = config.hidden_size;
+            let nk = config.linear_num_key_heads;
+            let nv = config.linear_num_value_heads;
+            let khd = config.linear_key_head_dim;
+            let vhd = config.linear_value_head_dim;
+            let key_dim = nk * khd;
+            let val_dim = nv * vhd;
+            let qkv_dim = key_dim * 2 + val_dim;
+            let head_repeat = nv / nk;
 
         let use_metal_f32_linear_input = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && std::env::var_os("SUPERSONIC_METAL_ENABLE_COMPONENT_F32_LINEAR_INPUT").is_some()
@@ -2474,8 +2637,6 @@ impl DecodeEngine {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
 
-        let mut conv_pack = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, qkv_dim + nv])
-            .map_err(|e| anyhow::anyhow!("layer {idx} conv_pack alloc: {e}"))?;
         kernel_ffi::prefill_ffi::linear_stateful_conv_value_decay_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -2495,12 +2656,6 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} linear conv/value_decay: {e}"))?;
 
-        let mut q_linear = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, key_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_linear alloc: {e}"))?;
-        let mut k_linear = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, key_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_linear alloc: {e}"))?;
-        let mut v_linear = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, val_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} v_linear alloc: {e}"))?;
         kernel_ffi::prefill_ffi::split_qkv(
             self.ordinal,
             ScalarType::BF16,
@@ -2514,12 +2669,6 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} split_qkv: {e}"))?;
 
-        let mut q_linear_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, key_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_linear_f32 alloc: {e}"))?;
-        let mut k_linear_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, key_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_linear_f32 alloc: {e}"))?;
-        let mut v_linear_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, val_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} v_linear_f32 alloc: {e}"))?;
         kernel_ffi::prefill_ffi::cast(
             self.ordinal,
             ScalarType::BF16,
@@ -2548,12 +2697,6 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} v cast: {e}"))?;
 
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[nk, khd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_normed alloc: {e}"))?;
-        let mut q_scaled = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[nk, khd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} q_scaled alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[nk, khd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} k_normed alloc: {e}"))?;
         kernel_ffi::prefill_ffi::l2norm(
             self.ordinal,
             ScalarType::F32,
@@ -2880,6 +3023,31 @@ impl DecodeEngine {
         } else {
             None
         })
+        })();
+
+        let scratch = ComponentLinearScratch {
+            qkv,
+            z,
+            a,
+            b,
+            a_beta_raw,
+            rec_apply,
+            attn_bf16,
+            norm_w_bf16,
+            gated,
+            proj_out,
+            conv_pack,
+            q_linear,
+            k_linear,
+            v_linear,
+            q_linear_f32,
+            k_linear_f32,
+            v_linear_f32,
+            q_normed,
+            q_scaled,
+            k_normed,
+        };
+        (result, scratch)
     }
 
     fn component_decode_mlp_layer(
@@ -2888,17 +3056,41 @@ impl DecodeEngine {
         trace_output: bool,
     ) -> Result<Option<ComponentMlpTrace>> {
         let config = &self.weights.config;
+        let hidden_dim = config.hidden_size;
+        let intermediate = config.intermediate_size;
+
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && !component_scratch_reuse_disabled()
+        {
+            let mut scratch = match self.component_mlp_scratch.take() {
+                Some(scratch) => scratch,
+                None => ComponentMlpScratch::alloc(self.ordinal, hidden_dim, intermediate)?,
+            };
+            let result = self.component_decode_mlp_layer_with_scratch(idx, trace_output, &mut scratch);
+            self.component_mlp_scratch = Some(scratch);
+            return result;
+        }
+
+        let mut scratch = ComponentMlpScratch::alloc(self.ordinal, hidden_dim, intermediate)
+            .map_err(|e| anyhow::anyhow!("layer {idx} mlp scratch alloc: {e}"))?;
+        self.component_decode_mlp_layer_with_scratch(idx, trace_output, &mut scratch)
+    }
+
+    fn component_decode_mlp_layer_with_scratch(
+        &mut self,
+        idx: usize,
+        trace_output: bool,
+        scratch: &mut ComponentMlpScratch,
+    ) -> Result<Option<ComponentMlpTrace>> {
+        let config = &self.weights.config;
         let lw = &self.weights.layers[idx];
         let hidden_dim = config.hidden_size;
         let intermediate = config.intermediate_size;
-        let mut gate = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp gate alloc: {e}"))?;
-        let mut up = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp up alloc: {e}"))?;
-        let mut mlp = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, intermediate])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp act alloc: {e}"))?;
-        let mut down = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} mlp down alloc: {e}"))?;
+        let gate = &mut scratch.gate;
+        let up = &mut scratch.up;
+        let mlp = &mut scratch.mlp;
+        let down = &mut scratch.down;
 
         matmul_proj(
             self.ordinal,
@@ -2910,7 +3102,7 @@ impl DecodeEngine {
             &lw.gate_proj_w,
             lw.gate_proj_scale.as_ref(),
             self.weights.fp8_block_size,
-            &mut gate,
+            gate,
             lw.gate_proj_int4_scale.as_ref(),
             lw.gate_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
@@ -2925,7 +3117,7 @@ impl DecodeEngine {
             &lw.up_proj_w,
             lw.up_proj_scale.as_ref(),
             self.weights.fp8_block_size,
-            &mut up,
+            up,
             lw.up_proj_int4_scale.as_ref(),
             lw.up_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
@@ -2934,9 +3126,9 @@ impl DecodeEngine {
             self.ordinal,
             ScalarType::BF16,
             intermediate,
-            &gate,
-            &up,
-            &mut mlp,
+            gate,
+            up,
+            mlp,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         matmul_proj(
@@ -2949,7 +3141,7 @@ impl DecodeEngine {
             &lw.down_proj_w,
             lw.down_proj_scale.as_ref(),
             self.weights.fp8_block_size,
-            &mut down,
+            down,
             lw.down_proj_int4_scale.as_ref(),
             lw.down_proj_int4_zero.as_ref(),
             self.weights.int4_group_size,
@@ -2966,7 +3158,7 @@ impl DecodeEngine {
         } else {
             None
         };
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &down)?;
+        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, down)?;
         Ok(trace)
     }
 
@@ -3190,6 +3382,8 @@ impl DecodeEngine {
             batch_size,
             dflash_tap_cache: None,
             dflash_fused_verify_cache: None,
+            component_mlp_scratch: None,
+            component_linear_scratch: None,
         })
     }
 
