@@ -29,6 +29,7 @@ fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
         Backend::Hip => GpuError::Hip(format!("{what} failed with status {status}")),
         Backend::Cuda => GpuError::Cuda(format!("{what} failed with status {status}")),
+        Backend::Metal => GpuError::Metal(format!("{what} failed with status {status}")),
     }
 }
 
@@ -88,6 +89,11 @@ pub fn bidir_attention(
         Backend::Cuda => {
             return Err(GpuError::InvalidArg(
                 "dflash::bidir_attention: CUDA backend not wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "dflash::bidir_attention: Metal backend not wired".into(),
             ));
         }
     };

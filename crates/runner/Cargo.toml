@@ -59,6 +59,10 @@ path = "src/bin/gemma4_fused_int4_validate.rs"
 name = "gemma4_int4_layer_diag"
 path = "src/bin/gemma4_int4_layer_diag.rs"
 
+[[bin]]
+name = "qwen35_bughunt"
+path = "src/bin/qwen35_bughunt.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

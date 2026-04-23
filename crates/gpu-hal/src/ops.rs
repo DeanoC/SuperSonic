@@ -4,9 +4,11 @@ use std::ptr::NonNull;
 use crate::backend::{current_backend, Backend, DeviceInfo};
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
-use crate::error::{cuda_error, hip_error, GpuError, Result};
+use crate::error::{cuda_error, hip_error, metal_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
+#[cfg(supersonic_backend_metal)]
+use crate::metal_sys::*;
 use crate::scalar_type::ScalarType;
 
 fn with_device_impl<T>(
@@ -40,6 +42,13 @@ fn with_device_impl<T>(
             #[cfg(not(supersonic_backend_cuda))]
             return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
         }
+        Backend::Metal => {
+            if ordinal != 0 {
+                return Err(GpuError::InvalidArg(
+                    "Metal backend currently supports only device ordinal 0".into(),
+                ));
+            }
+        }
     }
     let restore = if prev != ordinal_i32 {
         let status = match backend {
@@ -59,11 +68,13 @@ fn with_device_impl<T>(
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => 0,
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipSetDevice", status),
                 Backend::Cuda => cuda_error("cudaSetDevice", status),
+                Backend::Metal => metal_error("metalSetDevice", status),
             });
         }
         Some(prev)
@@ -89,11 +100,13 @@ fn with_device_impl<T>(
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => 0,
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipSetDevice(restore)", status),
                 Backend::Cuda => cuda_error("cudaSetDevice(restore)", status),
+                Backend::Metal => metal_error("metalSetDevice(restore)", status),
             });
         }
     }
@@ -121,11 +134,21 @@ pub fn set_device(ordinal: usize) -> Result<()> {
             #[cfg(not(supersonic_backend_cuda))]
             1
         }
+        Backend::Metal => {
+            if ordinal == 0 {
+                0
+            } else {
+                1
+            }
+        }
     };
     if status != 0 {
         return Err(match backend {
             Backend::Hip => hip_error("hipSetDevice", status),
             Backend::Cuda => cuda_error("cudaSetDevice", status),
+            Backend::Metal => GpuError::InvalidArg(
+                "Metal backend currently supports only device ordinal 0".into(),
+            ),
         });
     }
     Ok(())
@@ -156,16 +179,26 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                #[cfg(supersonic_backend_metal)]
+                unsafe {
+                    supersonic_metal_alloc(len_bytes, &mut ptr)
+                }
+                #[cfg(not(supersonic_backend_metal))]
+                1
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipMalloc", status),
                 Backend::Cuda => cuda_error("cudaMalloc", status),
+                Backend::Metal => metal_error("metalAlloc", status),
             });
         }
         NonNull::new(ptr).ok_or_else(|| match backend {
             Backend::Hip => GpuError::Hip("hipMalloc returned null".into()),
             Backend::Cuda => GpuError::Cuda("cudaMalloc returned null".into()),
+            Backend::Metal => GpuError::Metal("metalAlloc returned null".into()),
         })
     })
 }
@@ -200,11 +233,20 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                #[cfg(supersonic_backend_metal)]
+                unsafe {
+                    supersonic_metal_free(ptr)
+                }
+                #[cfg(not(supersonic_backend_metal))]
+                1
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipFree", status),
                 Backend::Cuda => cuda_error("cudaFree", status),
+                Backend::Metal => metal_error("metalFree", status),
             });
         }
         Ok(())
@@ -235,11 +277,18 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                }
+                0
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipMemcpy(H2D)", status),
                 Backend::Cuda => cuda_error("cudaMemcpy(H2D)", status),
+                Backend::Metal => metal_error("metalMemcpy(H2D)", status),
             });
         }
         Ok(())
@@ -270,11 +319,18 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                }
+                0
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipMemcpy(D2H)", status),
                 Backend::Cuda => cuda_error("cudaMemcpy(D2H)", status),
+                Backend::Metal => metal_error("metalMemcpy(D2H)", status),
             });
         }
         Ok(())
@@ -305,11 +361,18 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                unsafe {
+                    std::ptr::copy(src as *const u8, dst as *mut u8, len);
+                }
+                0
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipMemcpy(D2D)", status),
                 Backend::Cuda => cuda_error("cudaMemcpy(D2D)", status),
+                Backend::Metal => metal_error("metalMemcpy(D2D)", status),
             });
         }
         Ok(())
@@ -340,11 +403,18 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => {
+                unsafe {
+                    std::ptr::write_bytes(dst as *mut u8, 0, len);
+                }
+                0
+            }
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipMemset", status),
                 Backend::Cuda => cuda_error("cudaMemset", status),
+                Backend::Metal => metal_error("metalMemset", status),
             });
         }
         Ok(())
@@ -372,11 +442,13 @@ pub fn sync(ordinal: usize) -> Result<()> {
                 #[cfg(not(supersonic_backend_cuda))]
                 1
             }
+            Backend::Metal => 0,
         };
         if status != 0 {
             return Err(match backend {
                 Backend::Hip => hip_error("hipDeviceSynchronize", status),
                 Backend::Cuda => cuda_error("cudaDeviceSynchronize", status),
+                Backend::Metal => metal_error("metalDeviceSynchronize", status),
             });
         }
         Ok(())
@@ -413,6 +485,9 @@ impl GpuEvent {
             Backend::Cuda => Err(GpuError::InvalidArg(
                 "GpuEvent is not implemented for CUDA yet".into(),
             )),
+            Backend::Metal => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for Metal yet".into(),
+            )),
         })?;
         Ok(Self {
             backend,
@@ -438,6 +513,9 @@ impl GpuEvent {
             Backend::Cuda => Err(GpuError::InvalidArg(
                 "GpuEvent is not implemented for CUDA yet".into(),
             )),
+            Backend::Metal => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for Metal yet".into(),
+            )),
         })
     }
 
@@ -457,6 +535,9 @@ impl GpuEvent {
             }
             Backend::Cuda => Err(GpuError::InvalidArg(
                 "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for Metal yet".into(),
             )),
         })
     }
@@ -487,6 +568,9 @@ impl GpuEvent {
             Backend::Cuda => Err(GpuError::InvalidArg(
                 "GpuEvent is not implemented for CUDA yet".into(),
             )),
+            Backend::Metal => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for Metal yet".into(),
+            )),
         }
     }
 }
@@ -510,6 +594,7 @@ impl Drop for GpuEvent {
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
             Backend::Cuda => Ok(()),
+            Backend::Metal => Ok(()),
         });
     }
 }
@@ -542,7 +627,59 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                 Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
             }
         }
+        Backend::Metal => {
+            #[cfg(supersonic_backend_metal)]
+            {
+                let mut arch_name = vec![0i8; 64];
+                let mut total_vram_bytes = 0u64;
+                let mut warp_size = 0u32;
+                let mut clock_rate_khz = 0u32;
+                let status = unsafe {
+                    supersonic_metal_query_device_info(
+                        ordinal,
+                        arch_name.as_mut_ptr(),
+                        arch_name.len(),
+                        &mut total_vram_bytes,
+                        &mut warp_size,
+                        &mut clock_rate_khz,
+                    )
+                };
+                if status != 0 {
+                    return Err(metal_error("metalQueryDeviceInfo", status));
+                }
+                let nul_pos = arch_name
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(arch_name.len());
+                let arch_name = String::from_utf8_lossy(
+                    &arch_name[..nul_pos]
+                        .iter()
+                        .map(|&c| c as u8)
+                        .collect::<Vec<_>>(),
+                )
+                .to_string();
+                Ok(DeviceInfo {
+                    arch_name,
+                    total_vram_bytes,
+                    warp_size,
+                    clock_rate_khz,
+                })
+            }
+            #[cfg(not(supersonic_backend_metal))]
+            {
+                Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+            }
+        }
     }
+}
+
+#[cfg(supersonic_backend_metal)]
+fn metal_runtime_compile_smoke() -> Result<()> {
+    let status = unsafe { supersonic_metal_compile_shader_smoke() };
+    if status != 0 {
+        return Err(metal_error("metalCompileShaderSmoke", status));
+    }
+    Ok(())
 }
 
 /// Dtype-aware element count from shape.
@@ -553,4 +690,65 @@ pub fn elem_count(shape: &[usize]) -> usize {
 /// Byte size for a given dtype and element count.
 pub fn byte_len(dtype: ScalarType, elems: usize) -> usize {
     elems * dtype.size_in_bytes()
+}
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod tests {
+    use super::*;
+    use crate::{set_backend, Backend, GpuBuffer, ScalarType};
+
+    fn use_metal_backend() {
+        set_backend(Backend::Metal);
+    }
+
+    #[test]
+    fn metal_device_info_reports_expected_shape() {
+        use_metal_backend();
+        let info = query_device_info(Backend::Metal, 0).expect("query metal device info");
+        assert!(
+            info.arch_name.contains("apple"),
+            "unexpected metal arch name: {}",
+            info.arch_name
+        );
+        assert!(info.total_vram_bytes > 0, "missing working set budget");
+        assert_eq!(info.warp_size, 32);
+    }
+
+    #[test]
+    fn metal_buffer_round_trip_copy_zero_and_sync() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let host = [1.0f32, -2.5, 3.25, 4.5];
+        let host_bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let src = GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[host.len()], &host_bytes)
+            .expect("upload source buffer");
+        let mut dst = GpuBuffer::zeros(ordinal, ScalarType::F32, &[host.len()])
+            .expect("allocate zero destination");
+
+        copy_d2d(ordinal, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes()).expect("copy_d2d");
+        sync(ordinal).expect("sync after copy_d2d");
+        let copied = dst.to_host_bytes().expect("download copied bytes");
+        assert_eq!(copied, host_bytes);
+
+        memset_zeros(ordinal, dst.as_mut_ptr(), dst.len_bytes()).expect("memset zeros");
+        sync(ordinal).expect("sync after memset");
+        let zeroed = dst.to_host_bytes().expect("download zeroed bytes");
+        assert!(zeroed.iter().all(|&b| b == 0), "destination buffer not zeroed");
+    }
+
+    #[test]
+    fn metal_runtime_shader_compile_smoke_succeeds() {
+        use_metal_backend();
+        metal_runtime_compile_smoke().expect("runtime Metal shader compilation should succeed");
+    }
+
+    #[test]
+    fn metal_rejects_nonzero_ordinal() {
+        use_metal_backend();
+        let err = alloc(1, 16).expect_err("metal ordinal 1 should be rejected");
+        assert!(
+            err.to_string().contains("ordinal 0"),
+            "unexpected error: {err}"
+        );
+    }
 }

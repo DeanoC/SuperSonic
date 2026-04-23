@@ -85,6 +85,7 @@ impl fmt::Display for ModelVariant {
 pub enum GpuArch {
     Gfx1150,
     Sm86,
+    AppleM4,
     Unknown(String),
 }
 
@@ -99,6 +100,10 @@ impl GpuArch {
                 "sm86" => Self::Sm86,
                 other => Self::Unknown(other.to_owned()),
             },
+            Backend::Metal => match name.trim() {
+                "apple-m4" => Self::AppleM4,
+                other => Self::Unknown(other.to_owned()),
+            },
         }
     }
 }
@@ -108,6 +113,7 @@ impl fmt::Display for GpuArch {
         match self {
             Self::Gfx1150 => write!(f, "gfx1150"),
             Self::Sm86 => write!(f, "sm86"),
+            Self::AppleM4 => write!(f, "apple-m4"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -282,6 +288,23 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM4,
+        vram: VramBudget {
+            fixed_bytes: 4 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
             hip_launch_preset: None,
         }),
     },

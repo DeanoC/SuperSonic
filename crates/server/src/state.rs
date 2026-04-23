@@ -53,6 +53,9 @@ pub struct LoaderConfig {
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
+    if backend == Backend::Metal {
+        bail!("supersonic-serve does not support --backend metal yet; use the supersonic CLI for Metal v1");
+    }
     gpu_hal::set_backend(backend);
 
     let variant = ModelVariant::from_cli_str(&cfg.model).ok_or_else(|| {
@@ -74,6 +77,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
                 .map_err(|e| anyhow!("GPU query failed for device {}: {}", cfg.device, e))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)
         }
+        Backend::Metal => unreachable!("metal backend is rejected above"),
     };
     let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
     tracing::info!(
@@ -107,8 +111,8 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             tokenizer_path.display()
         );
     }
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow!("load tokenizer: {e}"))?;
+    let tokenizer =
+        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
     let chat_template = ChatTemplate::try_load(&cfg.model_dir)?;
     if chat_template.is_none() {
         tracing::warn!(
@@ -123,9 +127,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
         ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
         ModelFamily::Phi4 => {
-            bail!(
-                "Phi-4 engine is under development — not yet exposed via supersonic-serve"
-            );
+            bail!("Phi-4 engine is under development — not yet exposed via supersonic-serve");
         }
     };
 
@@ -208,8 +210,7 @@ fn try_download_bake(
         target_model_dir: &cfg.model_dir,
         progress: &fetch_progress_logger(),
     };
-    model_store::fetch::fetch_bake(req)
-        .map_err(|e| anyhow!("fetch {} bake: {}", variant, e))?;
+    model_store::fetch::fetch_bake(req).map_err(|e| anyhow!("fetch {} bake: {}", variant, e))?;
     Ok(true)
 }
 
@@ -221,7 +222,12 @@ fn fetch_progress_logger() -> impl Fn(model_store::fetch::FetchProgress) {
         use model_store::fetch::FetchProgress::*;
         match p {
             ResolvingIndex => tracing::info!("[fetch] resolving release index..."),
-            Downloading { part, total_parts, bytes_done, bytes_total } => {
+            Downloading {
+                part,
+                total_parts,
+                bytes_done,
+                bytes_total,
+            } => {
                 let pct = if bytes_total > 0 {
                     (bytes_done * 100 / bytes_total) as i32
                 } else {
@@ -239,10 +245,12 @@ fn fetch_progress_logger() -> impl Fn(model_store::fetch::FetchProgress) {
                 }
                 if pct >= last_pct.get() + 10 {
                     last_pct.set(pct);
-                    tracing::info!("[fetch]   {}% ({} / {} MiB)",
+                    tracing::info!(
+                        "[fetch]   {}% ({} / {} MiB)",
                         pct,
                         bytes_done / (1024 * 1024),
-                        bytes_total / (1024 * 1024));
+                        bytes_total / (1024 * 1024)
+                    );
                 }
             }
             Verifying => tracing::info!("[fetch] verifying checksums..."),
@@ -256,22 +264,23 @@ fn resolve_backend(choice: &str, ordinal: usize) -> Result<Backend> {
     match choice.to_ascii_lowercase().as_str() {
         "hip" => Ok(Backend::Hip),
         "cuda" => Ok(Backend::Cuda),
+        "metal" => Ok(Backend::Metal),
         "auto" | "" => {
-            // Prefer HIP when a HIP device is reachable; otherwise try
-            // CUDA. Failing both is a hard error here rather than later —
-            // keeps the "no usable backend" case actionable.
-            if kernel_ffi::query_gpu_info(ordinal).is_ok() {
-                return Ok(Backend::Hip);
-            }
             if gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok() {
                 return Ok(Backend::Cuda);
             }
+            if kernel_ffi::query_gpu_info(ordinal).is_ok() {
+                return Ok(Backend::Hip);
+            }
+            if gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok() {
+                return Ok(Backend::Metal);
+            }
             bail!(
-                "--backend auto: neither HIP nor CUDA device is reachable at ordinal {ordinal}; \
-                 pass --backend hip or --backend cuda explicitly if you know one is available"
+                "--backend auto: neither CUDA, HIP, nor Metal device is reachable at ordinal {ordinal}; \
+                 pass --backend cuda, --backend hip, or --backend metal explicitly if you know one is available"
             )
         }
-        other => bail!("unknown --backend '{other}' (auto | hip | cuda)"),
+        other => bail!("unknown --backend '{other}' (auto | hip | cuda | metal)"),
     }
 }
 
@@ -359,8 +368,8 @@ fn build_qwen(
         }
     }
 
-    let store = model_store::BakedStore::open(&bake_dir)
-        .map_err(|e| anyhow!("open baked store: {e}"))?;
+    let store =
+        model_store::BakedStore::open(&bake_dir).map_err(|e| anyhow!("open baked store: {e}"))?;
     let weights = qwen35::weights::Qwen35Weights::load_baked(
         &store,
         &text_config,
@@ -370,14 +379,15 @@ fn build_qwen(
     .map_err(|e| anyhow!("load baked weights: {e}"))?;
     tracing::info!("weights loaded in {:.0}ms", t0.elapsed().as_millis());
 
-    let attn_scratch_floats = params.attn_scratch_floats.max(
-        qwen35::scratch::required_attn_scratch_floats(
-            text_config.num_attention_heads,
-            text_config.head_dim,
-            context_tokens,
-            params.kv_chunk_size,
-        ),
-    );
+    let attn_scratch_floats =
+        params
+            .attn_scratch_floats
+            .max(qwen35::scratch::required_attn_scratch_floats(
+                text_config.num_attention_heads,
+                text_config.head_dim,
+                context_tokens,
+                params.kv_chunk_size,
+            ));
 
     let engine = DecodeEngine::new(
         weights,
@@ -417,11 +427,8 @@ fn build_gemma4(
     let session = if cfg.int4 {
         if !gemma4_int4_engine::int4_bake_ok(&cfg.model_dir) {
             let target = gemma4_int4_engine::int4_bake_dir(&cfg.model_dir);
-            let downloaded = try_download_bake(
-                cfg,
-                model_store::fetch::BakeVariant::Int4Gptq,
-                &target,
-            )?;
+            let downloaded =
+                try_download_bake(cfg, model_store::fetch::BakeVariant::Int4Gptq, &target)?;
             if !downloaded || !gemma4_int4_engine::int4_bake_ok(&cfg.model_dir) {
                 bail!(
                     "no Gemma 4 INT4 bake at {} and download unavailable. Run \

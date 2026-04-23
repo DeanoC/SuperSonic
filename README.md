@@ -8,10 +8,11 @@ Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-Two backends are validated today:
+Three backend surfaces are validated today:
 
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
+- **Metal / `apple-m4`** — Apple M4 bring-up path for Qwen3.5 0.8B
 
 ### HIP on `gfx1150`
 
@@ -287,6 +288,81 @@ That single-stream lane is for Lucebox-style native-kernel optimization work.
 Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 [docs/qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md).
 
+## Metal
+
+Metal support is currently a Qwen3.5 0.8B correctness checkpoint on Apple M4.
+It is meant to make Apple silicon development reproducible before the next
+performance pass, not to compete with the HIP/CUDA persistent decode kernels yet.
+
+Validated Metal scope:
+
+- `qwen3.5-0.8b`
+- Apple M4 / `apple-m4`
+- BF16 prefill parity against the Python CPU oracle
+- CLI/debug harness path only
+- checked token-ID prompt corpus via `qwen35_bughunt`
+
+Metal currently rejects or defers:
+
+- models other than `qwen3.5-0.8b`
+- `--int4`
+- `--fp8-runtime`
+- `--kv-fp8`
+- batched decode
+- persistent/component decode optimization paths
+- server runtime support
+
+The current Metal implementation intentionally mixes native Metal kernels with
+shared-memory host fallbacks. Native kernels are already used for the key
+Qwen bring-up primitives that have been promoted so far:
+
+- matmul RHS-transposed
+- full-attention prefill core
+- RMSNorm rows
+- linear prefill conv pack
+- element add
+- cast
+- scalar multiply
+- SHD-to-HSD transpose
+- QKV split
+- Q-gate split
+
+Remaining prefill primitives still fall back through the Metal shared-memory host
+path, and decode is still correctness-first. Treat Metal throughput numbers as
+pre-optimization until those fallbacks are replaced and a dedicated benchmark is
+added.
+
+### Metal validation
+
+The canonical Apple silicon gate is:
+
+```bash
+SUPERSONIC_BACKENDS=metal \
+QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B \
+QWEN35_BUGHUNT_REPORT_JSON=/tmp/qwen35_bughunt_gate.json \
+./tests/metal/qwen35_bughunt_gate.sh
+```
+
+The script builds `qwen35_bughunt`, runs the checked-in manifest at
+`crates/runner/bughunt/qwen35_metal_manifest.json`, and compares native Metal
+prefill, GPU replay, selected hidden rows, and final prefill logits against the
+Python oracle on CPU.
+
+To run one prompt from the manifest:
+
+```bash
+SUPERSONIC_BACKENDS=metal \
+QWEN35_BUGHUNT_PROMPT=code_prompt \
+QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B \
+./tests/metal/qwen35_bughunt_gate.sh
+```
+
+Current checkpoint quality on Apple M4:
+
+- `hello_world`: PASS against Python CPU oracle
+- `forest_prompt`: PASS against Python CPU oracle
+- `code_prompt`: PASS against Python CPU oracle
+
 ## E2E Tests
 
 Tests are machine-specific — each GPU architecture has its own test script under `tests/`. A test runs the full decode pipeline with PyTorch oracle validation and checks that the output delta is below a threshold.
@@ -311,6 +387,9 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run.sh /path/to/Qwen3.5-0.8B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_4b.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh /path/to/Qwen3.5-0.8B /path/to/Qwen3.5-4B
+
+# apple-m4 (Apple silicon) — Qwen3.5-0.8B Metal bughunt gate
+SUPERSONIC_BACKENDS=metal QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B ./tests/metal/qwen35_bughunt_gate.sh
 ```
 
 ### Adding tests for a new machine
@@ -321,7 +400,7 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh /path/to/Qwen3.5-0.8B /path/to/
 
 ### Test prerequisites
 
-- ROCm/HIP runtime for HIP builds, or CUDA toolkit/runtime for CUDA builds
+- ROCm/HIP runtime for HIP builds, CUDA toolkit/runtime for CUDA builds, or Apple silicon with Metal for Metal builds
 - Python 3 with `torch` and `transformers` (for oracle)
 - Model weights downloaded locally
 
@@ -340,3 +419,6 @@ TIMEOUT=180 ./tests/gfx1150/run.sh /path/to/model
 The persistent decode megakernel can occasionally hang the GPU at 100% utilization. The test script has a timeout (default 120s) and will report failure rather than blocking forever. If this happens you may need to reset the GPU (`rocm-smi --resetgpu`) or reboot before re-running.
 
 For CUDA specifically, treat `sm86` as the validated target for now. Other NVIDIA architectures may work, but they are not yet part of the checked support matrix.
+
+For Metal specifically, treat Apple M4 as the validated target for now. Other
+Apple GPUs may work, but they are not yet part of the checked support matrix.

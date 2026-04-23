@@ -4,6 +4,7 @@ use std::fmt;
 pub enum GpuError {
     Hip(String),
     Cuda(String),
+    Metal(String),
     InvalidArg(String),
 }
 
@@ -12,6 +13,7 @@ impl fmt::Display for GpuError {
         match self {
             Self::Hip(msg) => write!(f, "HIP error: {msg}"),
             Self::Cuda(msg) => write!(f, "CUDA error: {msg}"),
+            Self::Metal(msg) => write!(f, "Metal error: {msg}"),
             Self::InvalidArg(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
@@ -27,4 +29,8 @@ pub(crate) fn hip_error(op: &str, status: i32) -> GpuError {
 
 pub(crate) fn cuda_error(op: &str, status: i32) -> GpuError {
     GpuError::Cuda(format!("{op} failed with status {status}"))
+}
+
+pub(crate) fn metal_error(op: &str, status: i32) -> GpuError {
+    GpuError::Metal(format!("{op} failed with status {status}"))
 }

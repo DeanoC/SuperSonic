@@ -731,6 +731,7 @@ dependencies = [
 name = "gpu-hal"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "half",
  "safetensors",
  "thiserror",
@@ -1098,6 +1099,7 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "gpu-hal",
+ "half",
  "thiserror",
 ]
 

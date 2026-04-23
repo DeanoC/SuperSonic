@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub enum Backend {
     Hip,
     Cuda,
+    Metal,
 }
 
 impl Backend {
@@ -12,6 +13,7 @@ impl Backend {
         match s.trim().to_ascii_lowercase().as_str() {
             "hip" => Some(Self::Hip),
             "cuda" => Some(Self::Cuda),
+            "metal" => Some(Self::Metal),
             _ => None,
         }
     }
@@ -20,6 +22,7 @@ impl Backend {
         match self {
             Self::Hip => 1,
             Self::Cuda => 2,
+            Self::Metal => 3,
         }
     }
 
@@ -27,6 +30,7 @@ impl Backend {
         match code {
             1 => Some(Self::Hip),
             2 => Some(Self::Cuda),
+            3 => Some(Self::Metal),
             _ => None,
         }
     }
@@ -37,6 +41,7 @@ impl fmt::Display for Backend {
         match self {
             Self::Hip => write!(f, "HIP"),
             Self::Cuda => write!(f, "CUDA"),
+            Self::Metal => write!(f, "Metal"),
         }
     }
 }
@@ -57,6 +62,8 @@ pub fn compiled_backends() -> Vec<Backend> {
     backends.push(Backend::Hip);
     #[cfg(supersonic_backend_cuda)]
     backends.push(Backend::Cuda);
+    #[cfg(supersonic_backend_metal)]
+    backends.push(Backend::Metal);
     backends
 }
 
