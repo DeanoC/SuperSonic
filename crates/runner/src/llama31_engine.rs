@@ -1203,6 +1203,7 @@ fn trace_llama31_certified_kv_layer(
     let trace_ids = &prompt_ids[..trace_len];
     let prefix_ids = &trace_ids[..trace_len - 1];
     let seqlen_offset = prefix_ids.len();
+    engine.reset()?;
     let replay = engine.prefill_native_with_trace(trace_ids)?;
     let replay_hidden = replay
         .layer_hidden_trace
