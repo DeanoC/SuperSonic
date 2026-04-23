@@ -1246,8 +1246,25 @@ pub fn standalone_matvec(
     let backend = output.backend();
     if backend == Backend::Metal {
         let _ = (ordinal, counter_buf);
-        return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
-            metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
+        if crate::metal_native::disabled_by_env()
+            || std::env::var_os("SUPERSONIC_METAL_ENABLE_NATIVE_STANDALONE_MATVEC").is_none()
+        {
+            return crate::prefill_ffi::metal_profile_time("standalone_matvec", "host", || {
+                metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
+            });
+        }
+        return crate::prefill_ffi::metal_profile_time("standalone_matvec", "native", || {
+            match dtype {
+                ScalarType::BF16 => crate::metal_native::matmul_rhs_transposed_bf16(
+                    1, 1, out_dim, in_dim, input, weight, output,
+                ),
+                ScalarType::F32 => crate::metal_native::matmul_rhs_transposed_f32(
+                    1, 1, out_dim, in_dim, input, weight, output,
+                ),
+                other => Err(GpuError::InvalidArg(format!(
+                    "standalone_matvec unsupported Metal dtype {other:?}"
+                ))),
+            }
         });
     }
     // Reset the atomic row counter to 0
