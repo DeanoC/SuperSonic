@@ -146,6 +146,10 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
+    metal_native::copy_d2d(src, dst, bytes)
+}
+
 pub struct MetalBatchGuard {
     inner: Option<metal_native::MetalBatchGuard>,
 }

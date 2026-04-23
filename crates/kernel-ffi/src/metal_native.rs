@@ -11,6 +11,11 @@ unsafe extern "C" {
     fn supersonic_metal_batch_begin() -> c_int;
     fn supersonic_metal_batch_flush() -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
+    fn supersonic_metal_copy_d2d(
+        src_ptr: *const c_void,
+        dst_ptr: *mut c_void,
+        bytes: usize,
+    ) -> c_int;
     fn supersonic_metal_embedding_lookup_bf16(
         token_count: usize,
         vocab_size: usize,
@@ -394,6 +399,22 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native batch flush failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
+    if src.is_null() || dst.is_null() || bytes == 0 {
+        return Err(GpuError::InvalidArg(
+            "metal native copy_d2d requires non-null pointers and non-zero bytes".into(),
+        ));
+    }
+    let status = unsafe { supersonic_metal_copy_d2d(src, dst, bytes) };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native copy_d2d failed with status {status}"
         )));
     }
     Ok(())
@@ -1716,6 +1737,17 @@ impl MetalBatchGuard {
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn flush_batch() -> Result<(), GpuError> {
     Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn copy_d2d(
+    _src: *const c_void,
+    _dst: *mut c_void,
+    _bytes: usize,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native copy_d2d is not compiled".into(),
+    ))
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]

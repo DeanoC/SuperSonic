@@ -37,6 +37,24 @@ fn flush_metal_batch_for_host_boundary(buffer: &GpuBuffer, label: &str) -> Resul
     Ok(())
 }
 
+fn copy_d2d_ordered(
+    ordinal: usize,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    backend_hint: &GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    if backend_hint.backend() == gpu_hal::Backend::Metal {
+        kernel_ffi::prefill_ffi::metal_copy_d2d(src, dst, bytes)
+            .map_err(|e| anyhow::anyhow!("{label} Metal blit copy: {e}"))?;
+    } else {
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes)
+            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -1580,24 +1598,14 @@ impl DecodeEngine {
 
         let row_bytes = hidden_dim * elem_bytes;
         let src_offset = token_id as usize * row_bytes;
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
-            // The Metal component path batches GPU kernels, but this embedding
-            // copy is a CPU memcpy into shared storage. Close any open encoder
-            // before and after the write so the first RMSNorm sees the token.
-            kernel_ffi::prefill_ffi::flush_metal_batch()
-                .map_err(|e| anyhow::anyhow!("embedding pre-copy Metal flush: {e}"))?;
-        }
-        gpu_hal::copy_d2d(
+        copy_d2d_ordered(
             self.ordinal,
             self.hidden_io.as_ptr() as *mut c_void,
             self.weights.embed_tokens.offset_ptr(src_offset),
             row_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("embedding lookup: {e}"))?;
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
-            kernel_ffi::prefill_ffi::flush_metal_batch()
-                .map_err(|e| anyhow::anyhow!("embedding post-copy Metal flush: {e}"))?;
-        }
+            &self.hidden_io,
+            "embedding lookup",
+        )?;
 
         let layer_count = self.state.layers.len();
         let mut traced_hidden = None;
@@ -2737,21 +2745,14 @@ impl DecodeEngine {
         } else {
             None
         };
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
-            kernel_ffi::prefill_ffi::flush_metal_batch()
-                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent pre-copy Metal flush: {e}"))?;
-        }
-        gpu_hal::copy_d2d(
+        copy_d2d_ordered(
             self.ordinal,
             recurrent_state.as_ptr() as *mut c_void,
             rec_apply.offset_ptr(val_dim * ScalarType::F32.size_in_bytes()),
             nv * khd * vhd * ScalarType::F32.size_in_bytes(),
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} recurrent update copy: {e}"))?;
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
-            kernel_ffi::prefill_ffi::flush_metal_batch()
-                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent post-copy Metal flush: {e}"))?;
-        }
+            recurrent_state,
+            &format!("layer {idx} recurrent update copy"),
+        )?;
 
         kernel_ffi::prefill_ffi::cast(
             self.ordinal,

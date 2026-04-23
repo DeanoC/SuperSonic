@@ -288,6 +288,74 @@ int encode_or_submit(EncodeFn encode, int queue_error, int command_buffer_error,
     return 0;
 }
 
+int encode_blit_copy_or_submit(
+    id<MTLBuffer> src,
+    NSUInteger src_offset,
+    id<MTLBuffer> dst,
+    NSUInteger dst_offset,
+    NSUInteger bytes,
+    int queue_error,
+    int command_buffer_error,
+    int encoder_error,
+    int completion_error
+) {
+    if (metal_batch_depth > 0 && metal_batch_state != nullptr) {
+        if (metal_batch_state->command_buffer == nil) {
+            int status = metal_batch_start_encoder();
+            if (status != 0) {
+                return status;
+            }
+        }
+        if (metal_batch_state->encoder != nil) {
+            [metal_batch_state->encoder endEncoding];
+            metal_batch_state->encoder = nil;
+        }
+
+        id<MTLBlitCommandEncoder> blit = [metal_batch_state->command_buffer blitCommandEncoder];
+        if (blit == nil) {
+            return encoder_error;
+        }
+        [blit copyFromBuffer:src
+                sourceOffset:src_offset
+                    toBuffer:dst
+           destinationOffset:dst_offset
+                        size:bytes];
+        [blit endEncoding];
+        metal_batch_state->has_work = true;
+
+        metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
+        if (metal_batch_state->encoder == nil) {
+            return encoder_error;
+        }
+        return 0;
+    }
+
+    id<MTLCommandQueue> queue = metal_queue();
+    if (queue == nil) {
+        return queue_error;
+    }
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    if (command_buffer == nil) {
+        return command_buffer_error;
+    }
+    id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+    if (blit == nil) {
+        return encoder_error;
+    }
+    [blit copyFromBuffer:src
+            sourceOffset:src_offset
+                toBuffer:dst
+       destinationOffset:dst_offset
+                    size:bytes];
+    [blit endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        return completion_error;
+    }
+    return 0;
+}
+
 void configure_precise_math(MTLCompileOptions* options) {
     if (@available(macOS 15.0, *)) {
         options.mathMode = MTLMathModeSafe;
@@ -3406,6 +3474,42 @@ extern "C" int supersonic_metal_batch_flush() {
 extern "C" int supersonic_metal_batch_end() {
     @autoreleasepool {
         return metal_batch_end();
+    }
+}
+
+extern "C" int supersonic_metal_copy_d2d(
+    const void* src_ptr,
+    void* dst_ptr,
+    size_t bytes
+) {
+    @autoreleasepool {
+        if (src_ptr == nullptr || dst_ptr == nullptr || bytes == 0) {
+            return 930;
+        }
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> dst = nil;
+        size_t src_offset = 0;
+        size_t dst_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 931;
+        }
+        if (lookup_buffer(dst_ptr, &dst, &dst_offset) != 0) {
+            return 932;
+        }
+        if (bytes > NSUIntegerMax || src_offset > NSUIntegerMax || dst_offset > NSUIntegerMax) {
+            return 933;
+        }
+        return encode_blit_copy_or_submit(
+            src,
+            static_cast<NSUInteger>(src_offset),
+            dst,
+            static_cast<NSUInteger>(dst_offset),
+            static_cast<NSUInteger>(bytes),
+            934,
+            935,
+            936,
+            937
+        );
     }
 }
 
