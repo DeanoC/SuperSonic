@@ -1,3 +1,4 @@
+pub mod certified_kv;
 pub mod dflash;
 mod ffi;
 pub mod gemma4;
