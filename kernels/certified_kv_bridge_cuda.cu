@@ -1445,7 +1445,6 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_
         q_scale
     );
     if (cudaGetLastError() != cudaSuccess) return 75;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 76;
     return 0;
 }
 
@@ -1519,6 +1518,5 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out
         q_scale
     );
     if (cudaGetLastError() != cudaSuccess) return 85;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 86;
     return 0;
 }
