@@ -68,6 +68,14 @@ struct SplitQkvParams {
     uint32_t total_elems;
 };
 
+struct SplitQgateParams {
+    uint32_t s;
+    uint32_t num_heads;
+    uint32_t head_dim;
+    uint32_t src_stride;
+    uint32_t total_elems;
+};
+
 id<MTLDevice> metal_device() {
     static id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     return device;
@@ -1121,6 +1129,126 @@ kernel void supersonic_split_qkv_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> split_qgate_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted_bf16 = false;
+    static bool attempted_f32 = false;
+    static __strong id<MTLComputePipelineState> pipeline_bf16 = nil;
+    static __strong id<MTLComputePipelineState> pipeline_f32 = nil;
+    static __strong NSError* build_error_bf16 = nil;
+    static __strong NSError* build_error_f32 = nil;
+
+    const bool want_bf16 = [function_name isEqualToString:@"supersonic_split_qgate_bf16"];
+    bool& attempted = want_bf16 ? attempted_bf16 : attempted_f32;
+    __strong id<MTLComputePipelineState>& pipeline = want_bf16 ? pipeline_bf16 : pipeline_f32;
+    __strong NSError*& build_error = want_bf16 ? build_error_bf16 : build_error_f32;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:123
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"SQGT(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SplitQgateParams {
+    uint s;
+    uint num_heads;
+    uint head_dim;
+    uint src_stride;
+    uint total_elems;
+};
+
+kernel void supersonic_split_qgate_bf16(
+    device const bfloat* src [[buffer(0)]],
+    device bfloat* query [[buffer(1)]],
+    device bfloat* gate [[buffer(2)]],
+    constant SplitQgateParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.head_dim;
+    uint head = (gid / params.head_dim) % params.num_heads;
+    uint row = gid / (params.head_dim * params.num_heads);
+    uint src_idx = row * params.src_stride + head * params.head_dim * 2 + elem;
+    query[gid] = src[src_idx];
+    gate[gid] = src[src_idx + params.head_dim];
+}
+
+kernel void supersonic_split_qgate_f32(
+    device const float* src [[buffer(0)]],
+    device float* query [[buffer(1)]],
+    device float* gate [[buffer(2)]],
+    constant SplitQgateParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint elem = gid % params.head_dim;
+    uint head = (gid / params.head_dim) % params.num_heads;
+    uint row = gid / (params.head_dim * params.num_heads);
+    uint src_idx = row * params.src_stride + head * params.head_dim * 2 + elem;
+    query[gid] = src[src_idx];
+    gate[gid] = src[src_idx + params.head_dim];
+}
+)SQGT";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:124
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile split-qgate library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:125
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load split-qgate function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:126
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create split-qgate pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -1699,6 +1827,145 @@ extern "C" int supersonic_metal_split_qkv_f32(
         k_ptr,
         v_ptr,
         @"supersonic_split_qkv_f32"
+    );
+}
+
+static int supersonic_metal_split_qgate_impl(
+    size_t s,
+    size_t num_heads,
+    size_t head_dim,
+    const void* src_ptr,
+    void* query_ptr,
+    void* gate_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (s == 0 || num_heads == 0 || head_dim == 0) {
+            return 0;
+        }
+        if (s > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX ||
+            src_ptr == nullptr || query_ptr == nullptr || gate_ptr == nullptr) {
+            return 123;
+        }
+        if (num_heads != 0 && head_dim > SIZE_MAX / num_heads) {
+            return 124;
+        }
+        size_t dst_stride = num_heads * head_dim;
+        if (head_dim > SIZE_MAX / 2) {
+            return 124;
+        }
+        size_t per_head_src = head_dim * 2;
+        if (num_heads != 0 && per_head_src > SIZE_MAX / num_heads) {
+            return 124;
+        }
+        size_t src_stride = num_heads * per_head_src;
+        if (s != 0 && dst_stride > SIZE_MAX / s) {
+            return 125;
+        }
+        size_t total_elems = s * dst_stride;
+        if (total_elems > UINT32_MAX || src_stride > UINT32_MAX) {
+            return 125;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = split_qgate_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 126;
+        }
+
+        id<MTLBuffer> src = nil;
+        id<MTLBuffer> query = nil;
+        id<MTLBuffer> gate = nil;
+        size_t src_offset = 0;
+        size_t query_offset = 0;
+        size_t gate_offset = 0;
+        if (lookup_buffer(src_ptr, &src, &src_offset) != 0) {
+            return 127;
+        }
+        if (lookup_buffer(query_ptr, &query, &query_offset) != 0) {
+            return 128;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 129;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 130;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 131;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 132;
+        }
+
+        SplitQgateParams params = {
+            static_cast<uint32_t>(s),
+            static_cast<uint32_t>(num_heads),
+            static_cast<uint32_t>(head_dim),
+            static_cast<uint32_t>(src_stride),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:src offset:src_offset atIndex:0];
+        [encoder setBuffer:query offset:query_offset atIndex:1];
+        [encoder setBuffer:gate offset:gate_offset atIndex:2];
+        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 133;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_split_qgate_bf16(
+    size_t s,
+    size_t num_heads,
+    size_t head_dim,
+    const void* src_ptr,
+    void* query_ptr,
+    void* gate_ptr
+) {
+    return supersonic_metal_split_qgate_impl(
+        s,
+        num_heads,
+        head_dim,
+        src_ptr,
+        query_ptr,
+        gate_ptr,
+        @"supersonic_split_qgate_bf16"
+    );
+}
+
+extern "C" int supersonic_metal_split_qgate_f32(
+    size_t s,
+    size_t num_heads,
+    size_t head_dim,
+    const void* src_ptr,
+    void* query_ptr,
+    void* gate_ptr
+) {
+    return supersonic_metal_split_qgate_impl(
+        s,
+        num_heads,
+        head_dim,
+        src_ptr,
+        query_ptr,
+        gate_ptr,
+        @"supersonic_split_qgate_f32"
     );
 }
 

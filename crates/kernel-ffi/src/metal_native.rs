@@ -129,6 +129,22 @@ unsafe extern "C" {
         k_ptr: *mut c_void,
         v_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_split_qgate_bf16(
+        s: usize,
+        num_heads: usize,
+        head_dim: usize,
+        src_ptr: *const c_void,
+        query_ptr: *mut c_void,
+        gate_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_split_qgate_f32(
+        s: usize,
+        num_heads: usize,
+        head_dim: usize,
+        src_ptr: *const c_void,
+        query_ptr: *mut c_void,
+        gate_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -597,6 +613,75 @@ pub(crate) fn split_qkv(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn split_qgate(
+    dtype: ScalarType,
+    s: usize,
+    num_heads: usize,
+    head_dim: usize,
+    src: &GpuBuffer,
+    query_out: &mut GpuBuffer,
+    gate_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total = s
+        .checked_mul(num_heads)
+        .and_then(|v| v.checked_mul(head_dim))
+        .ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "metal native split_qgate shape overflows: s={s} heads={num_heads} head_dim={head_dim}"
+            ))
+        })?;
+    if total > u32::MAX as usize
+        || s > u32::MAX as usize
+        || num_heads > u32::MAX as usize
+        || head_dim > u32::MAX as usize
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native split_qgate supports u32-sized shapes, got s={s} heads={num_heads} head_dim={head_dim}"
+        )));
+    }
+    if src.dtype() != dtype || query_out.dtype() != dtype || gate_out.dtype() != dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native split_qgate expects dtype {dtype:?}, got src={:?} query={:?} gate={:?}",
+            src.dtype(),
+            query_out.dtype(),
+            gate_out.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match dtype {
+            ScalarType::BF16 => supersonic_metal_split_qgate_bf16(
+                s,
+                num_heads,
+                head_dim,
+                src.as_ptr(),
+                query_out.as_mut_ptr(),
+                gate_out.as_mut_ptr(),
+            ),
+            ScalarType::F32 => supersonic_metal_split_qgate_f32(
+                s,
+                num_heads,
+                head_dim,
+                src.as_ptr(),
+                query_out.as_mut_ptr(),
+                gate_out.as_mut_ptr(),
+            ),
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native split_qgate does not support dtype {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native split_qgate failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -725,6 +810,21 @@ pub(crate) fn split_qkv(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native split_qkv is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn split_qgate(
+    _dtype: ScalarType,
+    _s: usize,
+    _num_heads: usize,
+    _head_dim: usize,
+    _src: &GpuBuffer,
+    _query_out: &mut GpuBuffer,
+    _gate_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native split_qgate is not compiled".into(),
     ))
 }
 
@@ -1193,5 +1293,52 @@ mod tests {
         assert_eq!(read_f32(&q), vec![1.0, 2.0, 11.0, 12.0]);
         assert_eq!(read_f32(&k), vec![3.0, 4.0, 13.0, 14.0]);
         assert_eq!(read_f32(&v), vec![5.0, 6.0, 7.0, 15.0, 16.0, 17.0]);
+    }
+
+    #[test]
+    fn metal_native_split_qgate_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 2, 4],
+            &bf16_bytes(&[
+                1.0, 2.0, 101.0, 102.0, 3.0, 4.0, 103.0, 104.0, 10.0, 20.0, 110.0, 120.0, 30.0,
+                40.0, 130.0, 140.0,
+            ]),
+        )
+        .expect("upload bf16 input");
+        let mut query =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 2, 2]).expect("allocate bf16 query");
+        let mut gate =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 2, 2]).expect("allocate bf16 gate");
+        split_qgate(ScalarType::BF16, 2, 2, 2, &input, &mut query, &mut gate)
+            .expect("run bf16 split_qgate");
+        assert_eq!(
+            read_bf16(&query),
+            vec![1.0, 2.0, 3.0, 4.0, 10.0, 20.0, 30.0, 40.0]
+        );
+        assert_eq!(
+            read_bf16(&gate),
+            vec![101.0, 102.0, 103.0, 104.0, 110.0, 120.0, 130.0, 140.0]
+        );
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 4],
+            &f32_bytes(&[1.0, 2.0, 11.0, 12.0, 3.0, 4.0, 13.0, 14.0]),
+        )
+        .expect("upload f32 input");
+        let mut query =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate f32 query");
+        let mut gate =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 2]).expect("allocate f32 gate");
+        split_qgate(ScalarType::F32, 1, 2, 2, &input, &mut query, &mut gate)
+            .expect("run f32 split_qgate");
+        assert_eq!(read_f32(&query), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(read_f32(&gate), vec![11.0, 12.0, 13.0, 14.0]);
     }
 }
