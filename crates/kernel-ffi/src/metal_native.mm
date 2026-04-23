@@ -262,11 +262,11 @@ struct MetalBatchState {
 thread_local int metal_batch_depth = 0;
 thread_local MetalBatchState* metal_batch_state = nullptr;
 
-int metal_batch_start_encoder() {
+int metal_batch_ensure_command_buffer() {
     if (metal_batch_state == nullptr) {
         metal_batch_state = new MetalBatchState();
     }
-    if (metal_batch_state->encoder != nil) {
+    if (metal_batch_state->command_buffer != nil) {
         return 0;
     }
     id<MTLCommandQueue> queue = metal_queue();
@@ -279,6 +279,18 @@ int metal_batch_start_encoder() {
     if (metal_batch_state->command_buffer == nil) {
         return 902;
     }
+    metal_batch_state->has_work = false;
+    return 0;
+}
+
+int metal_batch_ensure_compute_encoder() {
+    int status = metal_batch_ensure_command_buffer();
+    if (status != 0) {
+        return status;
+    }
+    if (metal_batch_state->encoder != nil) {
+        return 0;
+    }
     auto encoder_start = MetalClock::now();
     metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
     record_runtime_profile("compute_encoder_create", encoder_start);
@@ -286,13 +298,12 @@ int metal_batch_start_encoder() {
         metal_batch_state->command_buffer = nil;
         return 903;
     }
-    metal_batch_state->has_work = false;
     return 0;
 }
 
 int metal_batch_close_encoder(bool restart) {
-    if (metal_batch_state == nullptr || metal_batch_state->encoder == nil) {
-        return restart ? metal_batch_start_encoder() : 0;
+    if (metal_batch_state == nullptr || metal_batch_state->command_buffer == nil) {
+        return 0;
     }
 
     id<MTLCommandBuffer> command_buffer = metal_batch_state->command_buffer;
@@ -302,9 +313,11 @@ int metal_batch_close_encoder(bool restart) {
     metal_batch_state->command_buffer = nil;
     metal_batch_state->has_work = false;
 
-    auto end_encoding_start = MetalClock::now();
-    [encoder endEncoding];
-    record_runtime_profile("encoder_end", end_encoding_start);
+    if (encoder != nil) {
+        auto end_encoding_start = MetalClock::now();
+        [encoder endEncoding];
+        record_runtime_profile("encoder_end", end_encoding_start);
+    }
     if (has_work) {
         auto commit_start = MetalClock::now();
         [command_buffer commit];
@@ -317,15 +330,15 @@ int metal_batch_close_encoder(bool restart) {
         }
     }
 
-    if (restart) {
-        return metal_batch_start_encoder();
-    }
+    (void)restart;
     return 0;
 }
 
 int metal_batch_begin() {
     if (metal_batch_depth++ == 0) {
-        return metal_batch_start_encoder();
+        if (metal_batch_state == nullptr) {
+            metal_batch_state = new MetalBatchState();
+        }
     }
     return 0;
 }
@@ -353,7 +366,11 @@ int metal_batch_end() {
 
 template <typename EncodeFn>
 int encode_or_submit(EncodeFn encode, int queue_error, int command_buffer_error, int encoder_error, int completion_error) {
-    if (metal_batch_depth > 0 && metal_batch_state != nullptr && metal_batch_state->encoder != nil) {
+    if (metal_batch_depth > 0 && metal_batch_state != nullptr) {
+        int status = metal_batch_ensure_compute_encoder();
+        if (status != 0) {
+            return status;
+        }
         encode(metal_batch_state->encoder);
         metal_batch_state->has_work = true;
         [metal_batch_state->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -407,7 +424,7 @@ int encode_blit_copy_or_submit(
 ) {
     if (metal_batch_depth > 0 && metal_batch_state != nullptr) {
         if (metal_batch_state->command_buffer == nil) {
-            int status = metal_batch_start_encoder();
+            int status = metal_batch_ensure_command_buffer();
             if (status != 0) {
                 return status;
             }
@@ -434,13 +451,6 @@ int encode_blit_copy_or_submit(
         [blit endEncoding];
         record_runtime_profile("encoder_end", blit_end_start);
         metal_batch_state->has_work = true;
-
-        auto encoder_start = MetalClock::now();
-        metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
-        record_runtime_profile("compute_encoder_create", encoder_start);
-        if (metal_batch_state->encoder == nil) {
-            return encoder_error;
-        }
         return 0;
     }
 
