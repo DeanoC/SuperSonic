@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -176,6 +177,12 @@ pub struct PositionSweepReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PhaseTimingReport {
+    pub phase: String,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PromptGateReport {
     pub name: String,
     pub notes: Option<String>,
@@ -191,6 +198,7 @@ pub struct PromptGateReport {
     pub worst_layer_kind: String,
     pub worst_layer_delta: f32,
     pub checked_positions: Vec<PositionSweepReport>,
+    pub timings: Vec<PhaseTimingReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -967,7 +975,11 @@ fn analyze_gate_prompt(
     runtime: &QwenBughuntRuntime,
     prompt: &PromptManifestEntry,
 ) -> Result<PromptGateAnalysis> {
+    let prompt_start = Instant::now();
+    let mut timings = Vec::new();
+
     eprintln!("[bughunt] gate prompt={} oracle_compact", prompt.name);
+    let phase_start = Instant::now();
     let oracle_output = oracle::run_oracle(
         &runtime.oracle_script,
         runtime.model_variant.hf_model_id(),
@@ -979,11 +991,20 @@ fn analyze_gate_prompt(
         None,
         None,
     )?;
+    timings.push(phase_timing("oracle_compact", phase_start));
+
     eprintln!("[bughunt] gate prompt={} oracle_trace", prompt.name);
+    let phase_start = Instant::now();
     let trace = run_trace_oracle(runtime, &prompt.prompt_ids, None, None, None)?;
+    timings.push(phase_timing("oracle_trace", phase_start));
+
     eprintln!("[bughunt] gate prompt={} native_prefill", prompt.name);
+    let phase_start = Instant::now();
     let native_prefill = run_native_prefill(runtime, &prompt.prompt_ids)?;
+    timings.push(phase_timing("native_prefill", phase_start));
+
     eprintln!("[bughunt] gate prompt={} gpu_reference", prompt.name);
+    let phase_start = Instant::now();
     let gpu_reference_logits = prefill_engine::gpu_reference_replay_step(
         &runtime.weights,
         &runtime.rotary,
@@ -993,12 +1014,16 @@ fn analyze_gate_prompt(
         runtime.prefill_chunk_size,
         runtime.use_4b_kernel,
     )?;
+    timings.push(phase_timing("gpu_reference", phase_start));
+
     eprintln!(
         "[bughunt] gate prompt={} position_sweep count={}",
         prompt.name,
         prompt.positions.len()
     );
+    let phase_start = Instant::now();
     let checked_positions = sweep_prompt_positions(runtime, prompt, &trace)?;
+    timings.push(phase_timing("position_sweep", phase_start));
     let worst_position = choose_worst_position(&checked_positions)
         .ok_or_else(|| anyhow::anyhow!("prompt '{}' produced no checked positions", prompt.name))?;
 
@@ -1018,6 +1043,7 @@ fn analyze_gate_prompt(
         worst_position.worst_layer_delta,
         &prompt.thresholds,
     );
+    timings.push(phase_timing("total", prompt_start));
 
     Ok(PromptGateAnalysis {
         report: PromptGateReport {
@@ -1035,8 +1061,16 @@ fn analyze_gate_prompt(
             worst_layer_kind: worst_position.worst_layer_kind.clone(),
             worst_layer_delta: worst_position.worst_layer_delta,
             checked_positions,
+            timings,
         },
     })
+}
+
+fn phase_timing(phase: &str, start: Instant) -> PhaseTimingReport {
+    PhaseTimingReport {
+        phase: phase.to_string(),
+        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+    }
 }
 
 fn gate_pass(
@@ -2455,8 +2489,20 @@ fn print_report_summary(report: &BughuntReport) {
                     gate.pass
                 );
                 for prompt in &gate.prompt_results {
+                    let native_ms = prompt
+                        .timings
+                        .iter()
+                        .find(|timing| timing.phase == "native_prefill")
+                        .map(|timing| timing.elapsed_ms)
+                        .unwrap_or(0.0);
+                    let total_ms = prompt
+                        .timings
+                        .iter()
+                        .find(|timing| timing.phase == "total")
+                        .map(|timing| timing.elapsed_ms)
+                        .unwrap_or(0.0);
                     println!(
-                        "{} prompt={} prefill_max_abs={:.4} gpu_ref_max_abs={:.4} worst_position={} worst_layer={}({}) worst_layer_delta={:.4}",
+                        "{} prompt={} prefill_max_abs={:.4} gpu_ref_max_abs={:.4} worst_position={} worst_layer={}({}) worst_layer_delta={:.4} native_prefill_ms={:.1} total_ms={:.1}",
                         if prompt.pass { "PASS" } else { "FAIL" },
                         prompt.name,
                         prompt.prefill_logit_max_abs,
@@ -2465,6 +2511,8 @@ fn print_report_summary(report: &BughuntReport) {
                         prompt.worst_layer,
                         prompt.worst_layer_kind,
                         prompt.worst_layer_delta,
+                        native_ms,
+                        total_ms,
                     );
                 }
             }
@@ -2857,6 +2905,10 @@ mod tests {
                     worst_layer_kind: "linear".to_string(),
                     worst_layer_delta: 0.12,
                     checked_positions: Vec::new(),
+                    timings: vec![PhaseTimingReport {
+                        phase: "native_prefill".to_string(),
+                        elapsed_ms: 12.5,
+                    }],
                 },
                 localization: LocalizationSummary {
                     prompt_name: "code_prompt".to_string(),
