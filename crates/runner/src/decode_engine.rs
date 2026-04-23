@@ -2586,42 +2586,47 @@ impl DecodeEngine {
         }
 
         let core_start = Instant::now();
-        kernel_ffi::prefill_ffi::full_attention_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-            1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-            attn_q, attn_k_ref, attn_v_ref, attn_out_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
-
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, attn_out_f32, attn_out_bf16,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(
-            self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, attn_out_bf16, attn_flat,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
-        if trace_output {
-            pre_gate_trace = Some(
-                attn_flat
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
-            );
-        }
-
         if has_attn_gate {
+            kernel_ffi::prefill_ffi::full_attention_prefill(
+                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
+                1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
+                attn_q, attn_k_ref, attn_v_ref, attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, attn_out_f32, attn_out_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+            kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, attn_out_bf16, attn_flat,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+            if trace_output {
+                pre_gate_trace = Some(
+                    attn_flat
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                );
+            }
             kernel_ffi::prefill_ffi::sigmoid_mul(
                 self.ordinal, ScalarType::BF16, q_dim, attn_flat, gate_buf, gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
         } else {
-            gpu_hal::copy_d2d(
-                self.ordinal,
-                gated.as_ptr() as *mut c_void,
-                attn_flat.as_ptr(),
-                q_dim * elem_bytes,
+            kernel_ffi::prefill_ffi::full_attention_decode_flat(
+                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
+                kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(),
+                attn_q, attn_k_ref, attn_v_ref, gated,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} gate bypass copy: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat: {e}"))?;
+            if trace_output {
+                pre_gate_trace = Some(
+                    gated
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                );
+            }
         }
         self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention core"))?;
         if let Some(t) = timings.as_mut() {
