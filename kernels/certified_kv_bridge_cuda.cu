@@ -444,11 +444,16 @@ __global__ void certified_kv_attend_int8_int4_kernel(
     }
     __syncthreads();
 
+    for (int tok = threadIdx.x; tok < aligned_tokens; tok += blockDim.x) {
+        const size_t score_idx = static_cast<size_t>(qh) * aligned_tokens + tok;
+        score_scratch[score_idx] = expf(score_scratch[score_idx] - max_score) / denom;
+    }
+    __syncthreads();
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int tok = 0; tok < aligned_tokens; ++tok) {
-            const float w =
-                expf(score_scratch[static_cast<size_t>(qh) * aligned_tokens + tok] - max_score) / denom;
+            const float w = score_scratch[static_cast<size_t>(qh) * aligned_tokens + tok];
             const float v = certified_kv_dequant_int4_value(
                 value_int4,
                 value_scale,
@@ -551,11 +556,16 @@ __global__ void certified_kv_attend_int8_int4_bf16_tail_kernel(
     }
     __syncthreads();
 
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        const size_t score_idx = static_cast<size_t>(qh) * score_stride_tokens + tok;
+        score_scratch[score_idx] = expf(score_scratch[score_idx] - max_score) / denom;
+    }
+    __syncthreads();
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int tok = 0; tok < total_tokens; ++tok) {
-            const float w =
-                expf(score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - max_score) / denom;
+            const float w = score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
             float v;
             if (tok < aligned_tokens) {
                 v = certified_kv_dequant_int4_value(
@@ -663,11 +673,16 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
     }
     __syncthreads();
 
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        const size_t score_idx = static_cast<size_t>(qh) * score_stride_tokens + tok;
+        score_scratch[score_idx] = expf(score_scratch[score_idx] - max_score) / denom;
+    }
+    __syncthreads();
+
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
         float acc = 0.0f;
         for (int tok = 0; tok < total_tokens; ++tok) {
-            const float w =
-                expf(score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - max_score) / denom;
+            const float w = score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
             const float v = bf16_to_float(
                 value_bf16[(static_cast<size_t>(kvh) * value_stride_tokens + tok) * head_dim + d]
             );
