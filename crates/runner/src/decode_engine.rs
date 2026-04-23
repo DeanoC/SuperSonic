@@ -3116,9 +3116,21 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} mlp act alloc: {e}"))?;
         let mut down = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} mlp down alloc: {e}"))?;
+        let gate_up_mixed_lhs = if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
+            prefill_engine::prepare_int8_mixed_lhs(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                &self.normed_buf,
+                &self.weights,
+            )?
+        } else {
+            None
+        };
 
         if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
-            prefill_engine::matmul_int8_mixed_host(
+            prefill_engine::matmul_int8_mixed_prepared_host(
                 self.ordinal,
                 1,
                 1,
@@ -3130,6 +3142,7 @@ impl DecodeEngine {
                 &lw.gate_proj_w,
                 sc,
                 &mut gate,
+                gate_up_mixed_lhs.as_ref(),
             )?;
         } else {
             matmul_proj(
@@ -3139,7 +3152,7 @@ impl DecodeEngine {
             )?;
         }
         if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
-            prefill_engine::matmul_int8_mixed_host(
+            prefill_engine::matmul_int8_mixed_prepared_host(
                 self.ordinal,
                 1,
                 1,
@@ -3151,6 +3164,7 @@ impl DecodeEngine {
                 &lw.up_proj_w,
                 sc,
                 &mut up,
+                gate_up_mixed_lhs.as_ref(),
             )?;
         } else {
             matmul_proj(
