@@ -608,6 +608,107 @@ kernel void supersonic_matmul_rhs_transposed_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> matmul_residual_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:341
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"MATMULRESIDUAL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulParams {
+    uint batch_elems;
+    uint m;
+    uint n;
+    uint k;
+};
+
+kernel void supersonic_matmul_rhs_transposed_residual_bf16(
+    device const bfloat* lhs [[buffer(0)]],
+    device const bfloat* rhs [[buffer(1)]],
+    device const bfloat* residual [[buffer(2)]],
+    device bfloat* out [[buffer(3)]],
+    constant MatmulParams& params [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    uint batch = gid.z;
+    if (batch >= params.batch_elems || row >= params.m || col >= params.n) {
+        return;
+    }
+    float acc = 0.0f;
+    uint lhs_base = (batch * params.m + row) * params.k;
+    uint rhs_base = col * params.k;
+    for (uint kk = 0; kk < params.k; ++kk) {
+        acc += float(lhs[lhs_base + kk]) * float(rhs[rhs_base + kk]);
+    }
+    uint out_idx = (batch * params.m + row) * params.n + col;
+    // Match the unfused path's rounding: materialize matmul as BF16 before the residual add.
+    out[out_idx] = bfloat(float(bfloat(acc)) + float(residual[out_idx]));
+}
+)MATMULRESIDUAL";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:342
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile matmul residual library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_matmul_rhs_transposed_residual_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:343
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load matmul residual function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:344
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create matmul residual pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> qwen_linear_projection_pipeline(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -6131,6 +6232,77 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
             MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 6, 7, 8, 9);
+    }
+}
+
+extern "C" int supersonic_metal_matmul_rhs_transposed_residual_bf16(
+    size_t batch_elems,
+    size_t m,
+    size_t n,
+    size_t k,
+    const void* lhs_ptr,
+    const void* rhs_ptr,
+    const void* residual_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (batch_elems == 0 || m == 0 || n == 0 || k == 0 || lhs_ptr == nullptr || rhs_ptr == nullptr ||
+            residual_ptr == nullptr || out_ptr == nullptr) {
+            return 345;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = matmul_residual_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 346;
+        }
+
+        id<MTLBuffer> lhs = nil;
+        id<MTLBuffer> rhs = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> out = nil;
+        size_t lhs_offset = 0;
+        size_t rhs_offset = 0;
+        size_t residual_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(lhs_ptr, &lhs, &lhs_offset) != 0) {
+            return 347;
+        }
+        if (lookup_buffer(rhs_ptr, &rhs, &rhs_offset) != 0) {
+            return 348;
+        }
+        if (lookup_buffer(residual_ptr, &residual, &residual_offset) != 0) {
+            return 349;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 350;
+        }
+
+        MatmulParams params = {
+            static_cast<uint32_t>(batch_elems),
+            static_cast<uint32_t>(m),
+            static_cast<uint32_t>(n),
+            static_cast<uint32_t>(k),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:residual offset:residual_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+
+            NSUInteger tg_width = std::min<NSUInteger>(8, std::max<NSUInteger>(1, n));
+            NSUInteger tg_height =
+                std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
+            if (tg_height == 0) {
+                tg_height = 1;
+            }
+            MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
+            MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 351, 352, 353, 354);
     }
 }
 

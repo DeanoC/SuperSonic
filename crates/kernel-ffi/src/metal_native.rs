@@ -33,6 +33,16 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_residual_bf16(
+        batch_elems: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        residual_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
         batch_elems: usize,
         m: usize,
@@ -608,6 +618,50 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_residual_bf16(
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || rhs.dtype() != ScalarType::BF16
+        || residual.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_residual_bf16 expects BF16 buffers, got {:?}/{:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            residual.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_residual_bf16(
+            batch_elems,
+            m,
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            residual.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_residual_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -1976,7 +2030,8 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
             k_normed.dtype()
         )));
     }
-    if key_dim == 0 || val_dim == 0 || num_key_heads == 0 || key_dim != num_key_heads * key_head_dim {
+    if key_dim == 0 || val_dim == 0 || num_key_heads == 0 || key_dim != num_key_heads * key_head_dim
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native qwen_linear_prep_bf16_f32 invalid shape: key_dim={key_dim} val_dim={val_dim} num_key_heads={num_key_heads} key_head_dim={key_head_dim}"
         )));
@@ -2231,6 +2286,22 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native matmul_rhs_transposed_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_residual_bf16(
+    _batch_elems: usize,
+    _m: usize,
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _residual: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_residual_bf16 is not compiled".into(),
     ))
 }
 
@@ -2695,6 +2766,48 @@ mod tests {
 
         let actual = read_bf16(&out);
         let expected = [4.0f32, 4.5, 10.0, 9.0];
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_residual_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 3],
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        )
+        .expect("upload lhs");
+        let rhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0]),
+        )
+        .expect("upload rhs");
+        let residual = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[0.25, -0.5, 1.0, 2.0]),
+        )
+        .expect("upload residual");
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2, 2]).expect("allocate out");
+
+        matmul_rhs_transposed_residual_bf16(1, 2, 2, 3, &lhs, &rhs, &residual, &mut out)
+            .expect("run native matmul residual");
+
+        let actual = read_bf16(&out);
+        let expected = [4.25f32, 4.0, 11.0, 11.0];
         for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
             let delta = (a - e).abs();
             assert!(

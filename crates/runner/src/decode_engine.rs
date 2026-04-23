@@ -153,6 +153,32 @@ fn residual_add(
     Ok(())
 }
 
+fn metal_fused_residual_projection_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_RESIDUAL_PROJ").is_some()
+}
+
+fn metal_matmul_residual_add_bf16(
+    input_dim: usize,
+    output_dim: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    residual_out: &mut GpuBuffer,
+) -> Result<()> {
+    let residual: &GpuBuffer = unsafe { &*(residual_out as *const GpuBuffer) };
+    kernel_ffi::prefill_ffi::metal_matmul_rhs_transposed_residual_bf16(
+        1,
+        1,
+        output_dim,
+        input_dim,
+        input,
+        weight,
+        residual,
+        residual_out,
+    )
+    .map_err(|e| anyhow::anyhow!("fused residual projection failed: {e}"))?;
+    Ok(())
+}
+
 fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
     let sign = (byte >> 7) & 1;
     let exp = (byte >> 3) & 0xF;
@@ -3044,31 +3070,47 @@ impl DecodeEngine {
             None
         };
 
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            hidden_dim,
-            val_dim,
-            &gated,
-            &lw.out_proj_w,
-            lw.out_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            &mut proj_out,
-            lw.out_proj_int4_scale.as_ref(),
-            lw.out_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
-        let proj_trace = if trace_output {
-            Some(
-                proj_out
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
-            )
-        } else {
+        let use_fused_residual_out_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && !metal_fused_residual_projection_disabled()
+            && lw.out_proj_scale.is_none()
+            && lw.out_proj_int4_scale.is_none()
+            && lw.out_proj_int4_zero.is_none()
+            && lw.out_proj_w.dtype() == ScalarType::BF16
+            && gated.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16;
+        let proj_trace = if use_fused_residual_out_proj {
+            metal_matmul_residual_add_bf16(val_dim, hidden_dim, &gated, &lw.out_proj_w, &mut self.hidden_io)
+                .map_err(|e| anyhow::anyhow!("layer {idx} fused residual out proj: {e}"))?;
             None
+        } else {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                val_dim,
+                &gated,
+                &lw.out_proj_w,
+                lw.out_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut proj_out,
+                lw.out_proj_int4_scale.as_ref(),
+                lw.out_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            let trace = if trace_output {
+                Some(
+                    proj_out
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
+                )
+            } else {
+                None
+            };
+            residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
+            trace
         };
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
         Ok(if trace_output {
             Some(ComponentLinearTrace {
                 normed: normed_trace.unwrap_or_default(),
@@ -3193,34 +3235,50 @@ impl DecodeEngine {
             mlp,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
-        matmul_proj(
-            self.ordinal,
-            1,
-            1,
-            hidden_dim,
-            intermediate,
-            &mlp,
-            &lw.down_proj_w,
-            lw.down_proj_scale.as_ref(),
-            self.weights.fp8_block_size,
-            down,
-            lw.down_proj_int4_scale.as_ref(),
-            lw.down_proj_int4_zero.as_ref(),
-            self.weights.int4_group_size,
-        )?;
-        let trace = if trace_output {
-            Some(ComponentMlpTrace {
-                swiglu: mlp
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} mlp swiglu trace D2H: {e}"))?,
-                down: down
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} mlp down trace D2H: {e}"))?,
-            })
-        } else {
+        let use_fused_residual_down_proj = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && !metal_fused_residual_projection_disabled()
+            && lw.down_proj_scale.is_none()
+            && lw.down_proj_int4_scale.is_none()
+            && lw.down_proj_int4_zero.is_none()
+            && lw.down_proj_w.dtype() == ScalarType::BF16
+            && mlp.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16;
+        let trace = if use_fused_residual_down_proj {
+            metal_matmul_residual_add_bf16(intermediate, hidden_dim, mlp, &lw.down_proj_w, &mut self.hidden_io)
+                .map_err(|e| anyhow::anyhow!("layer {idx} fused residual down proj: {e}"))?;
             None
+        } else {
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                intermediate,
+                &mlp,
+                &lw.down_proj_w,
+                lw.down_proj_scale.as_ref(),
+                self.weights.fp8_block_size,
+                down,
+                lw.down_proj_int4_scale.as_ref(),
+                lw.down_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            let trace = if trace_output {
+                Some(ComponentMlpTrace {
+                    swiglu: mlp
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} mlp swiglu trace D2H: {e}"))?,
+                    down: down
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} mlp down trace D2H: {e}"))?,
+                })
+            } else {
+                None
+            };
+            residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, down)?;
+            trace
         };
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, down)?;
         Ok(trace)
     }
 

@@ -1642,6 +1642,24 @@ pub fn matmul_rhs_transposed(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_matmul_rhs_transposed_residual_bf16(
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("matmul_rhs_transposed_residual", "native", || {
+        metal_native::matmul_rhs_transposed_residual_bf16(
+            batch_elems, m, n, k, lhs, rhs, residual, out,
+        )
+    })
+}
+
 /// FP8 dequant matmul: out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_fp8 [batch, n, k])^T
 /// rhs_fp8 is FP8 E4M3 weights, scale is BF16 scale_inv [n/block, k/block].
 pub fn matmul_rhs_transposed_fp8(
