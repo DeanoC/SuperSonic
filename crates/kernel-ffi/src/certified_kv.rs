@@ -55,6 +55,23 @@ unsafe extern "C" {
         head_dim: c_int,
         block_size: c_int,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_quantize_values_bf16_range(
+        device_ordinal: usize,
+        value_bf16: *const c_void,
+        value_int4: *mut c_void,
+        value_scale: *mut c_void,
+        value_zero: *mut c_void,
+        value_error: *mut c_void,
+        num_kv_heads: c_int,
+        max_t: c_int,
+        value_stride_tokens: c_int,
+        value_error_stride_blocks: c_int,
+        start_block: c_int,
+        block_count: c_int,
+        head_dim: c_int,
+        block_size: c_int,
+        value_group_size: c_int,
+    ) -> c_int;
 
     fn dotcache_llama31_certified_kv_score_blocks_int8(
         device_ordinal: usize,
@@ -109,6 +126,36 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         tail_len: c_int,
+        head_dim: c_int,
+        value_group_size: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        value_int4: *const c_void,
+        value_scale: *const c_void,
+        value_zero: *const c_void,
+        tail_key_bf16: *const c_void,
+        tail_value_bf16: *const c_void,
+        score_scratch: *mut c_void,
+        output_f32: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        tail_len: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
+        value_stride_tokens: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
+        tail_value_start_tokens: c_int,
+        tail_value_stride_tokens: c_int,
+        score_stride_tokens: c_int,
         head_dim: c_int,
         value_group_size: c_int,
         gqa_group: c_int,
@@ -528,6 +575,148 @@ pub fn quantize_bf16_keys_range(
         }
         Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
             "certified KV key range quantization is currently CUDA-only".into(),
+        )),
+    }
+}
+
+pub fn quantize_bf16_values_range(
+    ordinal: usize,
+    value_bf16: &GpuBuffer,
+    start_block: usize,
+    block_count: usize,
+    block_size: usize,
+    value_group_size: usize,
+    value_int4: &mut GpuBuffer,
+    value_scale: &mut GpuBuffer,
+    value_zero: &mut GpuBuffer,
+    value_error: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if value_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV value range quantization is currently CUDA-only".into(),
+        ));
+    }
+    if value_bf16.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization expects BF16 value cache, got {:?}",
+            value_bf16.dtype()
+        )));
+    }
+    if value_bf16.shape().len() != 4 || value_bf16.shape()[0] != 1 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization expects [1,nkv,max_t,hd] cache, got {:?}",
+            value_bf16.shape()
+        )));
+    }
+    if block_size == 0 || value_group_size == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization invalid block_size={block_size} value_group_size={value_group_size}"
+        )));
+    }
+    let num_kv_heads = value_bf16.shape()[1];
+    let max_t = value_bf16.shape()[2];
+    let head_dim = value_bf16.shape()[3];
+    if head_dim % 2 != 0 || head_dim % value_group_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization head_dim={head_dim} incompatible with value_group_size={value_group_size}"
+        )));
+    }
+    let groups = head_dim / value_group_size;
+    let value_shape = value_int4.shape();
+    let scale_shape = value_scale.shape();
+    if value_int4.dtype() != ScalarType::U8
+        || value_shape.len() != 3
+        || value_shape[0] != num_kv_heads
+        || value_shape[2] != head_dim / 2
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization value_int4 expects U8 [{num_kv_heads}, stride, {}], got {:?} {:?}",
+            head_dim / 2,
+            value_int4.dtype(),
+            value_int4.shape()
+        )));
+    }
+    if value_scale.dtype() != ScalarType::F16
+        || value_zero.dtype() != ScalarType::F16
+        || scale_shape.len() != 3
+        || scale_shape[0] != num_kv_heads
+        || scale_shape[2] != groups
+        || value_zero.shape() != scale_shape
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization value_scale/value_zero expect F16 [{num_kv_heads}, stride, {groups}], got {:?} {:?} / {:?} {:?}",
+            value_scale.dtype(),
+            value_scale.shape(),
+            value_zero.dtype(),
+            value_zero.shape()
+        )));
+    }
+    if value_error.dtype() != ScalarType::F32
+        || value_error.shape().len() != 2
+        || value_error.shape()[0] != num_kv_heads
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization value_error expects F32 [{num_kv_heads}, blocks], got {:?} {:?}",
+            value_error.dtype(),
+            value_error.shape()
+        )));
+    }
+    let value_stride_tokens = value_shape[1];
+    if scale_shape[1] != value_stride_tokens {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization value/meta strides differ: value={value_stride_tokens} meta={}",
+            scale_shape[1]
+        )));
+    }
+    let end_block = start_block.checked_add(block_count).ok_or_else(|| {
+        GpuError::InvalidArg("certified KV value range quantization block range overflow".into())
+    })?;
+    let value_error_stride_blocks = value_error.shape()[1];
+    if end_block > value_error_stride_blocks
+        || end_block * block_size > value_stride_tokens
+        || end_block * block_size > max_t
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization range start_block={start_block} block_count={block_count} exceeds value_stride={value_stride_tokens} error_blocks={value_error_stride_blocks} max_t={max_t}"
+        )));
+    }
+
+    match value_bf16.backend() {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                let status = dotcache_llama31_certified_kv_quantize_values_bf16_range(
+                    ordinal,
+                    value_bf16.as_ptr(),
+                    value_int4.as_mut_ptr(),
+                    value_scale.as_mut_ptr(),
+                    value_zero.as_mut_ptr(),
+                    value_error.as_mut_ptr(),
+                    num_kv_heads as c_int,
+                    max_t as c_int,
+                    value_stride_tokens as c_int,
+                    value_error_stride_blocks as c_int,
+                    start_block as c_int,
+                    block_count as c_int,
+                    head_dim as c_int,
+                    block_size as c_int,
+                    value_group_size as c_int,
+                );
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        Backend::Cuda,
+                        format!("certified KV CUDA value range quantization failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV value range quantization is currently CUDA-only".into(),
         )),
     }
 }
@@ -980,6 +1169,225 @@ pub fn attend_int8_int4_with_bf16_tail(
         }
         Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
             "certified KV hybrid attention is currently CUDA-only".into(),
+        )),
+    }
+}
+
+pub fn attend_int8_int4_with_bf16_tail_strided(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    key_int8: &GpuBuffer,
+    key_scale: &GpuBuffer,
+    value_int4: &GpuBuffer,
+    value_scale: &GpuBuffer,
+    value_zero: &GpuBuffer,
+    tail_key_bf16: Option<&GpuBuffer>,
+    tail_value_bf16: Option<&GpuBuffer>,
+    total_tokens: usize,
+    block_size: usize,
+    value_group_size: usize,
+    gqa_group: usize,
+    q_scale: f32,
+    score_scratch: &mut GpuBuffer,
+    output_f32: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV strided hybrid attention is currently CUDA-only".into(),
+        ));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || key_int8.dtype() != ScalarType::U8
+        || key_scale.dtype() != ScalarType::F32
+        || value_int4.dtype() != ScalarType::U8
+        || value_scale.dtype() != ScalarType::F16
+        || value_zero.dtype() != ScalarType::F16
+        || score_scratch.dtype() != ScalarType::F32
+        || output_f32.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid dtypes must be BF16/U8/F32/U8/F16/F16/F32/F32, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            query_bf16.dtype(),
+            key_int8.dtype(),
+            key_scale.dtype(),
+            value_int4.dtype(),
+            value_scale.dtype(),
+            value_zero.dtype(),
+            score_scratch.dtype(),
+            output_f32.dtype()
+        )));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if (!query_is_2d && !query_is_3d)
+        || key_int8.shape().len() != 3
+        || key_scale.shape().len() != 3
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid expects query [qh,hd] or [qh,1,hd], key_int8 [kvh,stride,hd], key_scale [kvh,b,hd], got {:?}/{:?}/{:?}",
+            query_bf16.shape(),
+            key_int8.shape(),
+            key_scale.shape()
+        )));
+    }
+    if block_size == 0 || block_size > 256 || value_group_size == 0 || gqa_group == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid invalid block_size={block_size} value_group_size={value_group_size} gqa_group={gqa_group}"
+        )));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d { query_shape[1] } else { query_shape[2] };
+    let kv_heads = key_int8.shape()[0];
+    let active_aligned_tokens = aligned_tokens(total_tokens, block_size);
+    if active_aligned_tokens == 0 {
+        return Err(GpuError::InvalidArg(
+            "certified KV strided hybrid needs at least one complete block".into(),
+        ));
+    }
+    if head_dim % 2 != 0 || head_dim % value_group_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid head_dim={head_dim} must be even and divisible by value_group_size={value_group_size}"
+        )));
+    }
+    let key_stride_tokens = key_int8.shape()[1];
+    if key_int8.shape()[2] != head_dim || key_stride_tokens < active_aligned_tokens {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid key shape {:?} incompatible with active_aligned={active_aligned_tokens} head_dim={head_dim}",
+            key_int8.shape()
+        )));
+    }
+    let num_blocks = active_aligned_tokens / block_size;
+    let key_scale_stride_blocks = if key_scale.shape()[0] == kv_heads && key_scale.shape()[2] == head_dim {
+        key_scale.shape()[1]
+    } else {
+        0
+    };
+    let value_groups = head_dim / value_group_size;
+    let value_stride_tokens = if value_int4.shape().len() == 3
+        && value_int4.shape()[0] == kv_heads
+        && value_int4.shape()[2] == head_dim / 2
+    {
+        value_int4.shape()[1]
+    } else {
+        0
+    };
+    let output_shape = output_f32.shape();
+    let output_is_2d = output_shape == [q_heads, head_dim];
+    let output_is_3d = output_shape == [q_heads, 1, head_dim];
+    if value_scale.shape() != [kv_heads, value_stride_tokens, value_groups]
+        || value_zero.shape() != [kv_heads, value_stride_tokens, value_groups]
+        || key_scale_stride_blocks < num_blocks
+        || value_stride_tokens < active_aligned_tokens
+        || score_scratch.shape().len() != 2
+        || score_scratch.shape()[0] != q_heads
+        || score_scratch.shape()[1] < total_tokens
+        || (!output_is_2d && !output_is_3d)
+        || q_heads != kv_heads * gqa_group
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV strided hybrid shape mismatch key_scale={:?} value_int4={:?} value_scale={:?} value_zero={:?} score_scratch={:?} output={:?}",
+            key_scale.shape(),
+            value_int4.shape(),
+            value_scale.shape(),
+            value_zero.shape(),
+            score_scratch.shape(),
+            output_f32.shape()
+        )));
+    }
+    let tail_len = total_tokens - active_aligned_tokens;
+    let tail_layout = |tail: &GpuBuffer, name: &str| -> Result<(usize, usize), GpuError> {
+        let shape = tail.shape();
+        let compact_3d = shape == [kv_heads, tail_len, head_dim];
+        let strided_3d = shape.len() == 3 && shape[0] == kv_heads && shape[2] == head_dim;
+        let strided_4d =
+            shape.len() == 4 && shape[0] == 1 && shape[1] == kv_heads && shape[3] == head_dim;
+        if tail.dtype() != ScalarType::BF16 || (!compact_3d && !strided_3d && !strided_4d) {
+            return Err(GpuError::InvalidArg(format!(
+                "certified KV strided hybrid {name} expects BF16 compact or strided tail, got {:?} {:?}",
+                tail.dtype(),
+                tail.shape()
+            )));
+        }
+        if compact_3d {
+            Ok((0, tail_len))
+        } else {
+            let stride = if shape.len() == 3 { shape[1] } else { shape[2] };
+            if stride < total_tokens {
+                return Err(GpuError::InvalidArg(format!(
+                    "certified KV strided hybrid {name} stride={stride} must cover total_tokens={total_tokens}"
+                )));
+            }
+            Ok((active_aligned_tokens, stride))
+        }
+    };
+    let (tail_key_start, tail_key_stride, tail_value_start, tail_value_stride) = if tail_len == 0 {
+        (0, 0, 0, 0)
+    } else {
+        let tail_key = tail_key_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "certified KV strided hybrid needs tail key for tail_len={tail_len}"
+            ))
+        })?;
+        let tail_value = tail_value_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "certified KV strided hybrid needs tail value for tail_len={tail_len}"
+            ))
+        })?;
+        let (key_start, key_stride) = tail_layout(tail_key, "tail key")?;
+        let (value_start, value_stride) = tail_layout(tail_value, "tail value")?;
+        (key_start, key_stride, value_start, value_stride)
+    };
+
+    match query_bf16.backend() {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                let status = dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+                    ordinal,
+                    query_bf16.as_ptr(),
+                    key_int8.as_ptr(),
+                    key_scale.as_ptr(),
+                    value_int4.as_ptr(),
+                    value_scale.as_ptr(),
+                    value_zero.as_ptr(),
+                    tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                    tail_value_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+                    score_scratch.as_mut_ptr(),
+                    output_f32.as_mut_ptr(),
+                    q_heads as c_int,
+                    kv_heads as c_int,
+                    num_blocks as c_int,
+                    block_size as c_int,
+                    tail_len as c_int,
+                    key_stride_tokens as c_int,
+                    key_scale_stride_blocks as c_int,
+                    value_stride_tokens as c_int,
+                    tail_key_start as c_int,
+                    tail_key_stride as c_int,
+                    tail_value_start as c_int,
+                    tail_value_stride as c_int,
+                    score_scratch.shape()[1] as c_int,
+                    head_dim as c_int,
+                    value_group_size as c_int,
+                    gqa_group as c_int,
+                    q_scale,
+                );
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        Backend::Cuda,
+                        format!("certified KV CUDA strided hybrid attention failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+        }
+        Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
+            "certified KV strided hybrid attention is currently CUDA-only".into(),
         )),
     }
 }
@@ -1683,6 +2091,132 @@ mod tests {
             assert!(
                 (value - expected).abs() < 0.01,
                 "tail should dominate hybrid softmax: got={value} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_hybrid_attend_accepts_strided_int4_cache_and_tail() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 4],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 0.0]),
+        )
+        .expect("upload query");
+        let key_i8 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 4, 4],
+            &[
+                0, 0, 0, 0,
+                0, 0, 0, 0,
+                99, 99, 99, 99,
+                88, 88, 88, 88,
+            ],
+        )
+        .expect("upload key_i8");
+        let key_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 2, 4],
+            &f32_bytes(&[
+                1.0, 1.0, 1.0, 1.0,
+                99.0, 99.0, 99.0, 99.0,
+            ]),
+        )
+        .expect("upload key_scale");
+        let value_i4 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 4, 2],
+            &[
+                0, 0,
+                0, 0,
+                0xff, 0xff,
+                0xff, 0xff,
+            ],
+        )
+        .expect("upload value_i4");
+        let value_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F16,
+            &[1, 4, 2],
+            &f16_bytes(&[
+                1.0, 1.0,
+                1.0, 1.0,
+                100.0, 100.0,
+                100.0, 100.0,
+            ]),
+        )
+        .expect("upload value_scale");
+        let value_zero = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F16,
+            &[1, 4, 2],
+            &f16_bytes(&[
+                0.0, 0.0,
+                0.0, 0.0,
+                -100.0, -100.0,
+                -100.0, -100.0,
+            ]),
+        )
+        .expect("upload value_zero");
+        let tail_key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 4, 4],
+            &bf16_bytes(&[
+                0.0, 0.0, 0.0, 0.0,
+                0.0, 0.0, 0.0, 0.0,
+                10.0, 0.0, 0.0, 0.0,
+                -10.0, 0.0, 0.0, 0.0,
+            ]),
+        )
+        .expect("upload tail_key");
+        let tail_value = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 4, 4],
+            &bf16_bytes(&[
+                -1.0, -1.0, -1.0, -1.0,
+                -2.0, -2.0, -2.0, -2.0,
+                7.0, 8.0, 9.0, 10.0,
+                -3.0, -3.0, -3.0, -3.0,
+            ]),
+        )
+        .expect("upload tail_value");
+        let mut score_scratch =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 4]).expect("score_scratch");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("output");
+
+        attend_int8_int4_with_bf16_tail_strided(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &value_i4,
+            &value_scale,
+            &value_zero,
+            Some(&tail_key),
+            Some(&tail_value),
+            3,
+            2,
+            2,
+            1,
+            1.0,
+            &mut score_scratch,
+            &mut output,
+        )
+        .expect("strided hybrid attend");
+
+        let out = f32s(&output.to_host_bytes().expect("download output"));
+        for (value, expected) in out.iter().zip([7.0_f32, 8.0, 9.0, 10.0]) {
+            assert!(
+                (value - expected).abs() < 0.01,
+                "tail should dominate strided INT4 hybrid softmax: got={value} expected={expected}"
             );
         }
     }

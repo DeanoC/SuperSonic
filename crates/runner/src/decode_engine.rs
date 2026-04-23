@@ -3085,12 +3085,13 @@ impl DecodeEngine {
         Ok((sampled_token, timings))
     }
 
-    pub fn component_decode_step_4b_certified_kv_bf16_values(
+    pub fn component_decode_step_4b_certified_kv(
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
         block_size: usize,
         value_group_size: usize,
+        bf16_values: bool,
     ) -> Result<Vec<f32>> {
         let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
@@ -3099,22 +3100,23 @@ impl DecodeEngine {
             None,
             None,
             false,
-            Some((block_size, value_group_size, true)),
+            Some((block_size, value_group_size, bf16_values)),
             None,
         )?;
-        logits.ok_or_else(|| anyhow::anyhow!("certified KV BF16-value decode missing logits"))
+        logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
     }
 
-    pub fn component_decode_step_4b_certified_kv_bf16_values_cuda_fast_greedy(
+    pub fn component_decode_step_4b_certified_kv_cuda_fast_greedy(
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
         block_size: usize,
         value_group_size: usize,
+        bf16_values: bool,
         collect_timings: bool,
     ) -> Result<(u32, DecodeStageTimings)> {
         if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
-            anyhow::bail!("certified KV BF16-value fast greedy requires CUDA backend");
+            anyhow::bail!("certified KV fast greedy requires CUDA backend");
         }
         let mut timings = DecodeStageTimings::default();
         let timing_slot = if collect_timings { Some(&mut timings) } else { None };
@@ -3125,11 +3127,11 @@ impl DecodeEngine {
             None,
             None,
             true,
-            Some((block_size, value_group_size, true)),
+            Some((block_size, value_group_size, bf16_values)),
             timing_slot,
         )?;
         let sampled_token = sampled_token
-            .ok_or_else(|| anyhow::anyhow!("certified KV BF16-value fast greedy missing sampled token"))?;
+            .ok_or_else(|| anyhow::anyhow!("certified KV fast greedy missing sampled token"))?;
         Ok((sampled_token, timings))
     }
 
@@ -3529,14 +3531,13 @@ impl DecodeEngine {
         let cap = ls.kv_cache_k.as_ref().unwrap().shape()[2];
 
         let core_start = Instant::now();
-        let use_certified_bf16_values = certified_kv_decode
-            .map(|(block_size, _, bf16_values)| {
-                bf16_values
-                    && kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size) > 0
+        let use_certified_cuda = certified_kv_decode
+            .map(|(block_size, _, _)| {
+                kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size) > 0
             })
             .unwrap_or(false);
-        if use_certified_bf16_values {
-            let (block_size, _value_group_size, _) = certified_kv_decode
+        if use_certified_cuda {
+            let (block_size, value_group_size, bf16_values) = certified_kv_decode
                 .expect("certified KV decode config is present when enabled");
             let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
@@ -3593,6 +3594,7 @@ impl DecodeEngine {
             let key_i8 = ls.certified_kv_key_i8.as_ref().unwrap();
             let key_scale = ls.certified_kv_key_scale.as_ref().unwrap();
             let tail_key_bf16 = (tail_len > 0).then_some(cache_k_ref);
+            let tail_value_bf16 = (tail_len > 0).then_some(cache_v_ref);
             let score_shape = [num_q_heads, cap];
             if scratch
                 .certified_score_scratch
@@ -3607,21 +3609,126 @@ impl DecodeEngine {
                 );
             }
             let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
-            kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
-                self.ordinal,
-                attn_q,
-                key_i8,
-                key_scale,
-                cache_v_ref,
-                tail_key_bf16,
-                kv_len,
-                block_size,
-                num_q_heads / num_kv_heads,
-                1.0 / (head_dim as f32).sqrt(),
-                score_scratch,
-                attn_out_f32,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
+            if bf16_values {
+                kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
+                    self.ordinal,
+                    attn_q,
+                    key_i8,
+                    key_scale,
+                    cache_v_ref,
+                    tail_key_bf16,
+                    kv_len,
+                    block_size,
+                    num_q_heads / num_kv_heads,
+                    1.0 / (head_dim as f32).sqrt(),
+                    score_scratch,
+                    attn_out_f32,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
+            } else {
+                let value_i4_shape = [num_kv_heads, cap_aligned, head_dim / 2];
+                let value_meta_shape = [num_kv_heads, cap_aligned, head_dim / value_group_size];
+                let value_error_shape = [num_kv_heads, cap_aligned / block_size];
+                let needs_value_alloc = ls
+                    .certified_kv_value_i4
+                    .as_ref()
+                    .map(|buf| buf.shape() != value_i4_shape)
+                    .unwrap_or(true)
+                    || ls
+                        .certified_kv_value_scale
+                        .as_ref()
+                        .map(|buf| buf.shape() != value_meta_shape)
+                        .unwrap_or(true)
+                    || ls
+                        .certified_kv_value_zero
+                        .as_ref()
+                        .map(|buf| buf.shape() != value_meta_shape)
+                        .unwrap_or(true)
+                    || ls
+                        .certified_kv_value_error
+                        .as_ref()
+                        .map(|buf| buf.shape() != value_error_shape)
+                        .unwrap_or(true);
+                if needs_value_alloc {
+                    ls.certified_kv_value_i4 = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode value_i4 alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_value_scale = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode value_scale alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_value_zero = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode value_zero alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_value_error = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode value_error alloc: {e}"
+                                )
+                            })?,
+                    );
+                    ls.certified_kv_value_tokens = 0;
+                }
+                if ls.certified_kv_value_tokens < aligned {
+                    let start_block = ls.certified_kv_value_tokens / block_size;
+                    let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
+                    kernel_ffi::certified_kv::quantize_bf16_values_range(
+                        self.ordinal,
+                        cache_v_ref,
+                        start_block,
+                        block_count,
+                        block_size,
+                        value_group_size,
+                        ls.certified_kv_value_i4.as_mut().unwrap(),
+                        ls.certified_kv_value_scale.as_mut().unwrap(),
+                        ls.certified_kv_value_zero.as_mut().unwrap(),
+                        ls.certified_kv_value_error.as_mut().unwrap(),
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV decode value quantize: {e}")
+                    })?;
+                    ls.certified_kv_value_tokens = aligned;
+                }
+                kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail_strided(
+                    self.ordinal,
+                    attn_q,
+                    key_i8,
+                    key_scale,
+                    ls.certified_kv_value_i4.as_ref().unwrap(),
+                    ls.certified_kv_value_scale.as_ref().unwrap(),
+                    ls.certified_kv_value_zero.as_ref().unwrap(),
+                    tail_key_bf16,
+                    tail_value_bf16,
+                    kv_len,
+                    block_size,
+                    value_group_size,
+                    num_q_heads / num_kv_heads,
+                    1.0 / (head_dim as f32).sqrt(),
+                    score_scratch,
+                    attn_out_f32,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} certified KV decode INT4 attention: {e}")
+                })?;
+            }
             kernel_ffi::prefill_ffi::cast(
                 self.ordinal,
                 ScalarType::F32,

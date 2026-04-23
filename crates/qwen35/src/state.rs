@@ -33,6 +33,11 @@ pub struct LayerState {
     pub certified_kv_key_i8: Option<GpuBuffer>,
     pub certified_kv_key_scale: Option<GpuBuffer>,
     pub certified_kv_key_tokens: usize,
+    pub certified_kv_value_i4: Option<GpuBuffer>,
+    pub certified_kv_value_scale: Option<GpuBuffer>,
+    pub certified_kv_value_zero: Option<GpuBuffer>,
+    pub certified_kv_value_error: Option<GpuBuffer>,
+    pub certified_kv_value_tokens: usize,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -71,6 +76,11 @@ impl LayerState {
             certified_kv_key_i8: None,
             certified_kv_key_scale: None,
             certified_kv_key_tokens: 0,
+            certified_kv_value_i4: None,
+            certified_kv_value_scale: None,
+            certified_kv_value_zero: None,
+            certified_kv_value_error: None,
+            certified_kv_value_tokens: 0,
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -90,6 +100,11 @@ impl LayerState {
             certified_kv_key_i8: None,
             certified_kv_key_scale: None,
             certified_kv_key_tokens: 0,
+            certified_kv_value_i4: None,
+            certified_kv_value_scale: None,
+            certified_kv_value_zero: None,
+            certified_kv_value_error: None,
+            certified_kv_value_tokens: 0,
             conv_state: None,
             recurrent_state: None,
         }
@@ -176,8 +191,9 @@ impl LayerState {
     /// Record actual filled KV length (no reallocation).
     pub fn set_kv_filled(&mut self, filled: usize) {
         self.kv_filled = filled;
-        if filled < self.certified_kv_key_tokens {
+        if filled < self.certified_kv_key_tokens || filled < self.certified_kv_value_tokens {
             self.certified_kv_key_tokens = 0;
+            self.certified_kv_value_tokens = 0;
         }
         if self.kv_shadow_k.is_some() && self.kv_shadow_v.is_some() {
             self.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
@@ -217,6 +233,11 @@ impl LayerState {
             certified_kv_key_i8: clone_opt(&self.certified_kv_key_i8)?,
             certified_kv_key_scale: clone_opt(&self.certified_kv_key_scale)?,
             certified_kv_key_tokens: self.certified_kv_key_tokens,
+            certified_kv_value_i4: clone_opt(&self.certified_kv_value_i4)?,
+            certified_kv_value_scale: clone_opt(&self.certified_kv_value_scale)?,
+            certified_kv_value_zero: clone_opt(&self.certified_kv_value_zero)?,
+            certified_kv_value_error: clone_opt(&self.certified_kv_value_error)?,
+            certified_kv_value_tokens: self.certified_kv_value_tokens,
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })
