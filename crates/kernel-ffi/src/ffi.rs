@@ -796,6 +796,7 @@ pub fn metal_lm_head_argmax_bf16(
                 vocab_size,
             )
         })?;
+        crate::metal_native::flush_batch()?;
         let bytes = out_index.to_host_bytes()?;
         let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         Ok(token)

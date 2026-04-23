@@ -134,6 +134,37 @@ where
     result
 }
 
+fn metal_profile_host_time<T, F>(op: &'static str, f: F) -> Result<T, GpuError>
+where
+    F: FnOnce() -> Result<T, GpuError>,
+{
+    metal_native::flush_batch()?;
+    metal_profile_time(op, "host", f)
+}
+
+pub fn flush_metal_batch() -> Result<(), GpuError> {
+    metal_native::flush_batch()
+}
+
+pub struct MetalBatchGuard {
+    inner: Option<metal_native::MetalBatchGuard>,
+}
+
+impl MetalBatchGuard {
+    pub fn begin() -> Result<Self, GpuError> {
+        Ok(Self {
+            inner: Some(metal_native::MetalBatchGuard::begin()?),
+        })
+    }
+
+    pub fn finish(mut self) -> Result<(), GpuError> {
+        if let Some(inner) = self.inner.take() {
+            inner.finish()?;
+        }
+        Ok(())
+    }
+}
+
 fn metal_force_host_rms_norm() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM").is_some()
 }
@@ -618,7 +649,7 @@ pub fn embedding_lookup(
                 return result;
             }
         }
-        return metal_profile_time("embedding_lookup", "host", || {
+        return metal_profile_host_time("embedding_lookup", || {
             metal_host::embedding_lookup(
                 token_count,
                 vocab_size,
@@ -663,7 +694,7 @@ pub fn batched_matmul(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_profile_time("batched_matmul", "host", || {
+        return metal_profile_host_time("batched_matmul", || {
             metal_host::batched_matmul(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
@@ -735,7 +766,7 @@ pub fn full_attention_prefill(
                 return result;
             }
         }
-        return metal_profile_time("full_attention_prefill", "host", || {
+        return metal_profile_host_time("full_attention_prefill", || {
             metal_host::full_attention_prefill(
                 dtype,
                 batch_size,
@@ -816,7 +847,7 @@ pub fn linear_prefill_conv_pack(
                 return result;
             }
         }
-        return metal_profile_time("linear_prefill_conv_pack", "host", || {
+        return metal_profile_host_time("linear_prefill_conv_pack", || {
             metal_host::linear_prefill_conv_pack(
                 dtype,
                 batch_size,
@@ -1086,7 +1117,7 @@ pub fn delta_recurrent_prefill(
                 return result;
             }
         }
-        return metal_profile_time("delta_recurrent_prefill", "host", || {
+        return metal_profile_host_time("delta_recurrent_prefill", || {
             metal_host::delta_recurrent_prefill(
                 dtype,
                 batch_heads,
@@ -1148,7 +1179,7 @@ pub fn l2norm(
                 return result;
             }
         }
-        return metal_profile_time("l2norm", "host", || {
+        return metal_profile_host_time("l2norm", || {
             metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out)
         });
     }
@@ -1188,7 +1219,7 @@ pub fn swiglu_mul(
                 return result;
             }
         }
-        return metal_profile_time("swiglu_mul", "host", || {
+        return metal_profile_host_time("swiglu_mul", || {
             metal_host::swiglu_mul(dtype, elem_count, gate, up, out)
         });
     }
@@ -1230,7 +1261,7 @@ pub fn rms_norm_gated(
                 return result;
             }
         }
-        return metal_profile_time("rms_norm_gated", "host", || {
+        return metal_profile_host_time("rms_norm_gated", || {
             metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
         });
     }
@@ -1272,7 +1303,7 @@ pub fn mul_scalar(
                 return result;
             }
         }
-        return metal_profile_time("mul_scalar", "host", || {
+        return metal_profile_host_time("mul_scalar", || {
             metal_host::mul_scalar(dtype, total_elems, scalar, input, out)
         });
     }
@@ -1312,7 +1343,7 @@ pub fn fused_rms_norm_linear_rows(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_profile_time("fused_rms_norm_linear_rows", "host", || {
+        return metal_profile_host_time("fused_rms_norm_linear_rows", || {
             metal_host::fused_rms_norm_linear_rows(
                 dtype,
                 n_rows,
@@ -1385,7 +1416,7 @@ pub fn matmul_rhs_transposed(
                 return result;
             }
         }
-        return metal_profile_time("matmul_rhs_transposed", "host", || {
+        return metal_profile_host_time("matmul_rhs_transposed", || {
             metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
@@ -1511,7 +1542,7 @@ pub fn rms_norm_rows(
                 return result;
             }
         }
-        return metal_profile_time("rms_norm_rows", "host", || {
+        return metal_profile_host_time("rms_norm_rows", || {
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
     }
@@ -1560,7 +1591,7 @@ pub fn rms_norm_rows_plain(
                 return result;
             }
         }
-        return metal_profile_time("rms_norm_rows_plain", "host", || {
+        return metal_profile_host_time("rms_norm_rows_plain", || {
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
         });
     }
@@ -1597,6 +1628,7 @@ pub fn rms_norm_rows_plain_inplace(
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let mut input = GpuBuffer::zeros(ordinal, dtype, data.shape())?;
+        metal_native::flush_batch()?;
         gpu_hal::copy_d2d(ordinal, input.as_mut_ptr(), data.as_ptr(), data.len_bytes())?;
         if dtype == ScalarType::BF16
             && !metal_native::disabled_by_env()
@@ -1609,7 +1641,7 @@ pub fn rms_norm_rows_plain_inplace(
                 return result;
             }
         }
-        return metal_profile_time("rms_norm_rows_plain_inplace", "host", || {
+        return metal_profile_host_time("rms_norm_rows_plain_inplace", || {
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data)
         });
     }
@@ -1646,6 +1678,7 @@ pub fn element_add_inplace(
 ) -> Result<(), GpuError> {
     if lhs_out.backend() == Backend::Metal {
         let mut lhs = GpuBuffer::zeros(ordinal, dtype, lhs_out.shape())?;
+        metal_native::flush_batch()?;
         gpu_hal::copy_d2d(
             ordinal,
             lhs.as_mut_ptr(),
@@ -1660,7 +1693,7 @@ pub fn element_add_inplace(
                 return result;
             }
         }
-        return metal_profile_time("element_add_inplace", "host", || {
+        return metal_profile_host_time("element_add_inplace", || {
             metal_host::element_add(dtype, total_elems, &lhs, rhs, lhs_out)
         });
     }
@@ -1702,7 +1735,7 @@ pub fn cast(
                 return result;
             }
         }
-        return metal_profile_time("cast", "host", || {
+        return metal_profile_host_time("cast", || {
             metal_host::cast(input_dtype, output_dtype, total_elems, input, out)
         });
     }
@@ -1743,7 +1776,7 @@ pub fn element_add(
                 return result;
             }
         }
-        return metal_profile_time("element_add", "host", || {
+        return metal_profile_host_time("element_add", || {
             metal_host::element_add(dtype, total_elems, lhs, rhs, out)
         });
     }
@@ -1784,7 +1817,7 @@ pub fn apply_rope_prefill(
 ) -> Result<(), GpuError> {
     if data.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_profile_time("apply_rope_prefill", "host", || {
+        return metal_profile_host_time("apply_rope_prefill", || {
             metal_host::apply_rope_prefill(
                 dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table, pos_offset,
                 data,
@@ -1838,7 +1871,7 @@ pub fn transpose_shd_hsd(
                 return result;
             }
         }
-        return metal_profile_time("transpose_shd_hsd", "host", || {
+        return metal_profile_host_time("transpose_shd_hsd", || {
             metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst)
         });
     }
@@ -1874,7 +1907,7 @@ pub fn transpose_pad_conv(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_profile_time("transpose_pad_conv", "host", || {
+        return metal_profile_host_time("transpose_pad_conv", || {
             metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst)
         });
     }
@@ -1909,7 +1942,7 @@ pub fn extract_conv_state(
 ) -> Result<(), GpuError> {
     if dst.backend() == Backend::Metal {
         let _ = ordinal;
-        return metal_profile_time("extract_conv_state", "host", || {
+        return metal_profile_host_time("extract_conv_state", || {
             metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
         });
     }
@@ -1951,7 +1984,7 @@ pub fn sigmoid_mul(
                 return result;
             }
         }
-        return metal_profile_time("sigmoid_mul", "host", || {
+        return metal_profile_host_time("sigmoid_mul", || {
             metal_host::sigmoid_mul(dtype, total_elems, data, gate, out)
         });
     }
@@ -1998,7 +2031,7 @@ pub fn compute_beta_g(
                 return result;
             }
         }
-        return metal_profile_time("compute_beta_g", "host", || {
+        return metal_profile_host_time("compute_beta_g", || {
             metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
         });
     }
@@ -2045,7 +2078,7 @@ pub fn split_qgate(
                 return result;
             }
         }
-        return metal_profile_time("split_qgate", "host", || {
+        return metal_profile_host_time("split_qgate", || {
             metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
         });
     }
@@ -2092,7 +2125,7 @@ pub fn split_qkv(
                 return result;
             }
         }
-        return metal_profile_time("split_qkv", "host", || {
+        return metal_profile_host_time("split_qkv", || {
             metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
         });
     }
@@ -2141,7 +2174,7 @@ pub fn repeat_interleave_heads(
                 return result;
             }
         }
-        return metal_profile_time("repeat_interleave_heads", "host", || {
+        return metal_profile_host_time("repeat_interleave_heads", || {
             metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
         });
     }

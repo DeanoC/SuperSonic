@@ -139,6 +139,127 @@ id<MTLCommandQueue> metal_queue() {
     return queue;
 }
 
+struct MetalBatchState {
+    __strong id<MTLCommandBuffer> command_buffer = nil;
+    __strong id<MTLComputeCommandEncoder> encoder = nil;
+    bool has_work = false;
+};
+
+thread_local int metal_batch_depth = 0;
+thread_local MetalBatchState* metal_batch_state = nullptr;
+
+int metal_batch_start_encoder() {
+    if (metal_batch_state == nullptr) {
+        metal_batch_state = new MetalBatchState();
+    }
+    if (metal_batch_state->encoder != nil) {
+        return 0;
+    }
+    id<MTLCommandQueue> queue = metal_queue();
+    if (queue == nil) {
+        return 901;
+    }
+    metal_batch_state->command_buffer = [queue commandBuffer];
+    if (metal_batch_state->command_buffer == nil) {
+        return 902;
+    }
+    metal_batch_state->encoder = [metal_batch_state->command_buffer computeCommandEncoder];
+    if (metal_batch_state->encoder == nil) {
+        metal_batch_state->command_buffer = nil;
+        return 903;
+    }
+    metal_batch_state->has_work = false;
+    return 0;
+}
+
+int metal_batch_close_encoder(bool restart) {
+    if (metal_batch_state == nullptr || metal_batch_state->encoder == nil) {
+        return restart ? metal_batch_start_encoder() : 0;
+    }
+
+    id<MTLCommandBuffer> command_buffer = metal_batch_state->command_buffer;
+    id<MTLComputeCommandEncoder> encoder = metal_batch_state->encoder;
+    bool has_work = metal_batch_state->has_work;
+    metal_batch_state->encoder = nil;
+    metal_batch_state->command_buffer = nil;
+    metal_batch_state->has_work = false;
+
+    [encoder endEncoding];
+    if (has_work) {
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 904;
+        }
+    }
+
+    if (restart) {
+        return metal_batch_start_encoder();
+    }
+    return 0;
+}
+
+int metal_batch_begin() {
+    if (metal_batch_depth++ == 0) {
+        return metal_batch_start_encoder();
+    }
+    return 0;
+}
+
+int metal_batch_flush() {
+    if (metal_batch_depth <= 0) {
+        return 0;
+    }
+    return metal_batch_close_encoder(true);
+}
+
+int metal_batch_end() {
+    if (metal_batch_depth <= 0) {
+        return 905;
+    }
+    metal_batch_depth--;
+    if (metal_batch_depth == 0) {
+        int status = metal_batch_close_encoder(false);
+        delete metal_batch_state;
+        metal_batch_state = nullptr;
+        return status;
+    }
+    return 0;
+}
+
+template <typename EncodeFn>
+int encode_or_submit(EncodeFn encode, int queue_error, int command_buffer_error, int encoder_error, int completion_error) {
+    if (metal_batch_depth > 0 && metal_batch_state != nullptr && metal_batch_state->encoder != nil) {
+        encode(metal_batch_state->encoder);
+        metal_batch_state->has_work = true;
+        [metal_batch_state->encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        return 0;
+    }
+
+    id<MTLCommandQueue> queue = metal_queue();
+    if (queue == nil) {
+        return queue_error;
+    }
+    id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+    if (command_buffer == nil) {
+        return command_buffer_error;
+    }
+    id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        return encoder_error;
+    }
+
+    encode(encoder);
+    [encoder endEncoding];
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        return completion_error;
+    }
+    return 0;
+}
+
 void configure_precise_math(MTLCompileOptions* options) {
     if (@available(macOS 15.0, *)) {
         options.mathMode = MTLMathModeSafe;
@@ -2469,6 +2590,24 @@ int lookup_buffer(
 
 }  // namespace
 
+extern "C" int supersonic_metal_batch_begin() {
+    @autoreleasepool {
+        return metal_batch_begin();
+    }
+}
+
+extern "C" int supersonic_metal_batch_flush() {
+    @autoreleasepool {
+        return metal_batch_flush();
+    }
+}
+
+extern "C" int supersonic_metal_batch_end() {
+    @autoreleasepool {
+        return metal_batch_end();
+    }
+}
+
 static int supersonic_metal_element_add_impl(
     size_t total_elems,
     const void* lhs_ptr,
@@ -2506,39 +2645,21 @@ static int supersonic_metal_element_add_impl(
             return 75;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 76;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 77;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 78;
-        }
-
         ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
-        [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 79;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 76, 77, 78, 79);
     }
 }
 
@@ -2609,40 +2730,21 @@ static int supersonic_metal_sigmoid_mul_impl(
             return 199;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 200;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 201;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 202;
-        }
-
         ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:data offset:data_offset atIndex:0];
-        [encoder setBuffer:gate offset:gate_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:data offset:data_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width =
-            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 203;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 200, 201, 202, 203);
     }
 }
 
@@ -2713,40 +2815,21 @@ static int supersonic_metal_swiglu_mul_impl(
             return 219;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 220;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 221;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 222;
-        }
-
         ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:gate offset:gate_offset atIndex:0];
-        [encoder setBuffer:up offset:up_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:gate offset:gate_offset atIndex:0];
+            [encoder setBuffer:up offset:up_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width =
-            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 223;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 220, 221, 222, 223);
     }
 }
 
@@ -2811,38 +2894,20 @@ static int supersonic_metal_cast_impl(
             return 84;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 85;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 86;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 87;
-        }
-
         ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input offset:input_offset atIndex:0];
-        [encoder setBuffer:out offset:out_offset atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:out offset:out_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 88;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 85, 86, 87, 88);
     }
 }
 
@@ -2918,38 +2983,20 @@ static int supersonic_metal_mul_scalar_impl(
             return 94;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 95;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 96;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 97;
-        }
-
         MulScalarParams params = {static_cast<uint32_t>(total_elems), scalar};
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input offset:input_offset atIndex:0];
-        [encoder setBuffer:out offset:out_offset atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:out offset:out_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 98;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 95, 96, 97, 98);
     }
 }
 
@@ -3020,19 +3067,6 @@ static int supersonic_metal_transpose_shd_hsd_impl(
             return 105;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 106;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 107;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 108;
-        }
-
         TransposeShdHsdParams params = {
             static_cast<uint32_t>(s),
             static_cast<uint32_t>(h),
@@ -3040,23 +3074,18 @@ static int supersonic_metal_transpose_shd_hsd_impl(
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:src offset:src_offset atIndex:0];
-        [encoder setBuffer:dst offset:dst_offset atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:dst offset:dst_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 109;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 106, 107, 108, 109);
     }
 }
 
@@ -3151,19 +3180,6 @@ static int supersonic_metal_split_qkv_impl(
             return 118;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 119;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 120;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 121;
-        }
-
         SplitQkvParams params = {
             static_cast<uint32_t>(s),
             static_cast<uint32_t>(key_dim),
@@ -3172,25 +3188,20 @@ static int supersonic_metal_split_qkv_impl(
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:src offset:src_offset atIndex:0];
-        [encoder setBuffer:q offset:q_offset atIndex:1];
-        [encoder setBuffer:k offset:k_offset atIndex:2];
-        [encoder setBuffer:v offset:v_offset atIndex:3];
-        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:q offset:q_offset atIndex:1];
+            [encoder setBuffer:k offset:k_offset atIndex:2];
+            [encoder setBuffer:v offset:v_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 122;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 119, 120, 121, 122);
     }
 }
 
@@ -3295,19 +3306,6 @@ static int supersonic_metal_split_qgate_impl(
             return 129;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 130;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 131;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 132;
-        }
-
         SplitQgateParams params = {
             static_cast<uint32_t>(s),
             static_cast<uint32_t>(num_heads),
@@ -3316,24 +3314,19 @@ static int supersonic_metal_split_qgate_impl(
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:src offset:src_offset atIndex:0];
-        [encoder setBuffer:query offset:query_offset atIndex:1];
-        [encoder setBuffer:gate offset:gate_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:query offset:query_offset atIndex:1];
+            [encoder setBuffer:gate offset:gate_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 133;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 130, 131, 132, 133);
     }
 }
 
@@ -3425,19 +3418,6 @@ static int supersonic_metal_repeat_interleave_heads_impl(
             return 139;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 140;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 141;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 142;
-        }
-
         RepeatInterleaveHeadsParams params = {
             static_cast<uint32_t>(s),
             static_cast<uint32_t>(n_heads),
@@ -3447,23 +3427,18 @@ static int supersonic_metal_repeat_interleave_heads_impl(
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:src offset:src_offset atIndex:0];
-        [encoder setBuffer:dst offset:dst_offset atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:src offset:src_offset atIndex:0];
+            [encoder setBuffer:dst offset:dst_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 143;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 140, 141, 142, 143);
     }
 }
 
@@ -3565,46 +3540,28 @@ extern "C" int supersonic_metal_compute_beta_g_f32(
             return 152;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 153;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 154;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 155;
-        }
-
         ComputeBetaGParams params = {
             static_cast<uint32_t>(seq_len),
             static_cast<uint32_t>(nv),
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:b offset:b_offset atIndex:0];
-        [encoder setBuffer:a offset:a_offset atIndex:1];
-        [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:2];
-        [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:3];
-        [encoder setBuffer:beta offset:beta_offset atIndex:4];
-        [encoder setBuffer:g offset:g_offset atIndex:5];
-        [encoder setBytes:&params length:sizeof(params) atIndex:6];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:b offset:b_offset atIndex:0];
+            [encoder setBuffer:a offset:a_offset atIndex:1];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:2];
+            [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:3];
+            [encoder setBuffer:beta offset:beta_offset atIndex:4];
+            [encoder setBuffer:g offset:g_offset atIndex:5];
+            [encoder setBytes:&params length:sizeof(params) atIndex:6];
 
-        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 156;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 153, 154, 155, 156);
     }
 }
 
@@ -3689,19 +3646,6 @@ extern "C" int supersonic_metal_delta_recurrent_prefill_f32(
             return 173;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 174;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 175;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 176;
-        }
-
         DeltaRecurrentPrefillParams params = {
             static_cast<uint32_t>(seq_len),
             static_cast<uint32_t>(k_head_dim),
@@ -3710,29 +3654,23 @@ extern "C" int supersonic_metal_delta_recurrent_prefill_f32(
             static_cast<uint32_t>(total_threads),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:initial_state offset:initial_state_offset atIndex:0];
-        [encoder setBuffer:query offset:query_offset atIndex:1];
-        [encoder setBuffer:key offset:key_offset atIndex:2];
-        [encoder setBuffer:value offset:value_offset atIndex:3];
-        [encoder setBuffer:beta offset:beta_offset atIndex:4];
-        [encoder setBuffer:g offset:g_offset atIndex:5];
-        [encoder setBuffer:out offset:out_offset atIndex:6];
-        [encoder setBytes:&params length:sizeof(params) atIndex:7];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:initial_state offset:initial_state_offset atIndex:0];
+            [encoder setBuffer:query offset:query_offset atIndex:1];
+            [encoder setBuffer:key offset:key_offset atIndex:2];
+            [encoder setBuffer:value offset:value_offset atIndex:3];
+            [encoder setBuffer:beta offset:beta_offset atIndex:4];
+            [encoder setBuffer:g offset:g_offset atIndex:5];
+            [encoder setBuffer:out offset:out_offset atIndex:6];
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
 
-        NSUInteger tg_width =
-            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_threads, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 177;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_threads, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 174, 175, 176, 177);
     }
 }
 
@@ -3776,19 +3714,6 @@ static int supersonic_metal_l2norm_impl(
             return 186;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 187;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 188;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 189;
-        }
-
         // Qwen's real l2norm path is F32 after BF16->F32 casts. Keep that
         // accumulation order identical to the host/oracle path; the parallel
         // reduction is faster but nudges tight logit thresholds over the line.
@@ -3807,22 +3732,16 @@ static int supersonic_metal_l2norm_impl(
             static_cast<uint32_t>(block_size),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input offset:input_offset atIndex:0];
-        [encoder setBuffer:out offset:out_offset atIndex:1];
-        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:out offset:out_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
 
-        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
-        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 190;
-        }
-        return 0;
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 187, 188, 189, 190);
     }
 }
 
@@ -3890,19 +3809,6 @@ extern "C" int supersonic_metal_embedding_lookup_bf16(
             return 248;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 249;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 250;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 251;
-        }
-
         EmbeddingLookupParams params = {
             static_cast<uint32_t>(token_count),
             static_cast<uint32_t>(vocab_size),
@@ -3910,25 +3816,19 @@ extern "C" int supersonic_metal_embedding_lookup_bf16(
             static_cast<uint32_t>(total_elems),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:embeddings offset:embeddings_offset atIndex:0];
-        [encoder setBuffer:indexes offset:indexes_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:embeddings offset:embeddings_offset atIndex:0];
+            [encoder setBuffer:indexes offset:indexes_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width =
-            std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 252;
-        }
-        return 0;
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 249, 250, 251, 252);
     }
 }
 
@@ -3969,19 +3869,6 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
             return 5;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 6;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 7;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 8;
-        }
-
         MatmulParams params = {
             static_cast<uint32_t>(batch_elems),
             static_cast<uint32_t>(m),
@@ -3989,29 +3876,23 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
             static_cast<uint32_t>(k),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
-        [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width = std::min<NSUInteger>(8, std::max<NSUInteger>(1, n));
-        NSUInteger tg_height =
-            std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
-        if (tg_height == 0) {
-            tg_height = 1;
-        }
-        MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
-        MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 9;
-        }
-        return 0;
+            NSUInteger tg_width = std::min<NSUInteger>(8, std::max<NSUInteger>(1, n));
+            NSUInteger tg_height =
+                std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
+            if (tg_height == 0) {
+                tg_height = 1;
+            }
+            MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
+            MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 6, 7, 8, 9);
     }
 }
 
@@ -4058,17 +3939,8 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
         }
 
         id<MTLDevice> device = metal_device();
-        id<MTLCommandQueue> queue = metal_queue();
-        if (device == nil || queue == nil) {
+        if (device == nil) {
             return 276;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 277;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 278;
         }
 
         const uint32_t block_size = 256;
@@ -4091,33 +3963,26 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
             static_cast<uint32_t>(partial_count),
         };
 
-        [encoder setComputePipelineState:stage1];
-        [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
-        [encoder setBuffer:weight offset:weight_offset atIndex:1];
-        [encoder setBuffer:partial_values offset:0 atIndex:2];
-        [encoder setBuffer:partial_indices offset:0 atIndex:3];
-        [encoder setBytes:&params length:sizeof(params) atIndex:4];
-        MTLSize groups = MTLSizeMake(partial_count, 1, 1);
-        MTLSize threads = MTLSizeMake(block_size, 1, 1);
-        [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:stage1];
+            [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
+            [encoder setBuffer:weight offset:weight_offset atIndex:1];
+            [encoder setBuffer:partial_values offset:0 atIndex:2];
+            [encoder setBuffer:partial_indices offset:0 atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            MTLSize groups = MTLSizeMake(partial_count, 1, 1);
+            MTLSize threads = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
 
-        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-        [encoder setComputePipelineState:stage2];
-        [encoder setBuffer:partial_values offset:0 atIndex:0];
-        [encoder setBuffer:partial_indices offset:0 atIndex:1];
-        [encoder setBuffer:out_index offset:out_index_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
-        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:threads];
-
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 281;
-        }
-        return 0;
+            [encoder setComputePipelineState:stage2];
+            [encoder setBuffer:partial_values offset:0 atIndex:0];
+            [encoder setBuffer:partial_indices offset:0 atIndex:1];
+            [encoder setBuffer:out_index offset:out_index_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:threads];
+        }, 276, 277, 278, 281);
     }
 }
 
@@ -4167,19 +4032,6 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             return 26;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 27;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 28;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 29;
-        }
-
         FullAttentionParams params = {
             static_cast<uint32_t>(q_heads),
             static_cast<uint32_t>(kv_heads),
@@ -4190,25 +4042,19 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             scale,
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:query offset:query_offset atIndex:0];
-        [encoder setBuffer:key offset:key_offset atIndex:1];
-        [encoder setBuffer:value offset:value_offset atIndex:2];
-        [encoder setBuffer:out offset:out_offset atIndex:3];
-        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:query offset:query_offset atIndex:0];
+            [encoder setBuffer:key offset:key_offset atIndex:1];
+            [encoder setBuffer:value offset:value_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
 
-        NSUInteger tg_width = std::min<NSUInteger>(16, std::max<NSUInteger>(1, head_dim));
-        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
-        MTLSize threads_per_grid = MTLSizeMake(head_dim, q_len, q_heads);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 30;
-        }
-        return 0;
+            NSUInteger tg_width = std::min<NSUInteger>(16, std::max<NSUInteger>(1, head_dim));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(head_dim, q_len, q_heads);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 27, 28, 29, 30);
     }
 }
 
@@ -4248,19 +4094,6 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
             return 45;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 46;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 47;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 48;
-        }
-
         NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
         if (block_size == 0) {
             block_size = 1;
@@ -4273,23 +4106,17 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
             static_cast<uint32_t>(block_size),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:input offset:input_offset atIndex:0];
-        [encoder setBuffer:weight offset:weight_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:weight offset:weight_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
-        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 49;
-        }
-        return 0;
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 46, 47, 48, 49);
     }
 }
 
@@ -4335,19 +4162,6 @@ extern "C" int supersonic_metal_rms_norm_gated_bf16(
             return 233;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 234;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 235;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 236;
-        }
-
         NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
         if (block_size == 0) {
             block_size = 1;
@@ -4359,24 +4173,18 @@ extern "C" int supersonic_metal_rms_norm_gated_bf16(
             static_cast<uint32_t>(block_size),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
-        [encoder setBuffer:gate offset:gate_offset atIndex:1];
-        [encoder setBuffer:weight offset:weight_offset atIndex:2];
-        [encoder setBuffer:out offset:out_offset atIndex:3];
-        [encoder setBytes:&params length:sizeof(params) atIndex:4];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:weight offset:weight_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
 
-        MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
-        MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
-        [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 237;
-        }
-        return 0;
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 234, 235, 236, 237);
     }
 }
 
@@ -4417,19 +4225,6 @@ extern "C" int supersonic_metal_linear_prefill_conv_pack_bf16(
             return 65;
         }
 
-        id<MTLCommandQueue> queue = metal_queue();
-        if (queue == nil) {
-            return 66;
-        }
-        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
-        if (command_buffer == nil) {
-            return 67;
-        }
-        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-        if (encoder == nil) {
-            return 68;
-        }
-
         LinearConvParams params = {
             static_cast<uint32_t>(conv_dim),
             static_cast<uint32_t>(total_len),
@@ -4437,28 +4232,22 @@ extern "C" int supersonic_metal_linear_prefill_conv_pack_bf16(
             static_cast<uint32_t>(kernel_size),
         };
 
-        [encoder setComputePipelineState:pipeline];
-        [encoder setBuffer:mixed offset:mixed_offset atIndex:0];
-        [encoder setBuffer:weights offset:weights_offset atIndex:1];
-        [encoder setBuffer:out offset:out_offset atIndex:2];
-        [encoder setBytes:&params length:sizeof(params) atIndex:3];
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:mixed offset:mixed_offset atIndex:0];
+            [encoder setBuffer:weights offset:weights_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
 
-        NSUInteger tg_width = std::min<NSUInteger>(32, std::max<NSUInteger>(1, conv_dim));
-        NSUInteger tg_height =
-            std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
-        if (tg_height == 0) {
-            tg_height = 1;
-        }
-        MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
-        MTLSize threads_per_grid = MTLSizeMake(conv_dim, seq_len, 1);
-        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
-        [encoder endEncoding];
-        [command_buffer commit];
-        [command_buffer waitUntilCompleted];
-
-        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
-            return 69;
-        }
-        return 0;
+            NSUInteger tg_width = std::min<NSUInteger>(32, std::max<NSUInteger>(1, conv_dim));
+            NSUInteger tg_height =
+                std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
+            if (tg_height == 0) {
+                tg_height = 1;
+            }
+            MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
+            MTLSize threads_per_grid = MTLSizeMake(conv_dim, seq_len, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 66, 67, 68, 69);
     }
 }

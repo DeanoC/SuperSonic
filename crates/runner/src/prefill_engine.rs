@@ -6,7 +6,7 @@
 use std::ffi::c_void;
 
 use anyhow::Result;
-use gpu_hal::{Backend, GpuBuffer, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 use qwen35::config::TextConfig;
 use qwen35::rotary::RotaryTables;
@@ -14,6 +14,16 @@ use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_toke
 use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
+
+fn copy_d2d_flush_metal(
+    ordinal: usize,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> std::result::Result<(), GpuError> {
+    prefill_ffi::flush_metal_batch()?;
+    gpu_hal::copy_d2d(ordinal, dst, src, bytes)
+}
 
 /// Dispatch matmul to either BF16 or FP8 dequant path.
 /// When `scale` is Some, uses FP8 dequant matmul; otherwise standard BF16 matmul.
@@ -385,7 +395,7 @@ pub fn compute_logits_for_range(
     let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
         .map_err(|e| anyhow::anyhow!("range slice alloc: {e}"))?;
     let src_offset = start * hidden_dim * elem_bytes;
-    gpu_hal::copy_d2d(
+    copy_d2d_flush_metal(
         ordinal,
         slice.as_ptr() as *mut c_void,
         hidden.offset_ptr(src_offset),
@@ -518,7 +528,7 @@ pub fn compute_greedy_token_for_range(
     let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
         .map_err(|e| anyhow::anyhow!("greedy range slice alloc: {e}"))?;
     let src_offset = start * hidden_dim * elem_bytes;
-    gpu_hal::copy_d2d(
+    copy_d2d_flush_metal(
         ordinal,
         slice.as_ptr() as *mut c_void,
         hidden.offset_ptr(src_offset),
@@ -1037,6 +1047,16 @@ fn prefill_inner(
         seq_len
     };
     let mut scratch = PrefillScratch::new(config, max_chunk, ordinal)?;
+    let metal_batch_guard =
+        if output_mode == PrefillOutputMode::GreedyToken && scratch.hidden.backend() == Backend::Metal
+        {
+            Some(
+                prefill_ffi::MetalBatchGuard::begin()
+                    .map_err(|e| anyhow::anyhow!("begin Metal prefill batch: {e}"))?,
+            )
+        } else {
+            None
+        };
     let mut layer_attn_trace = if trace_layers {
         Some(Vec::with_capacity(config.num_hidden_layers))
     } else {
@@ -1151,7 +1171,7 @@ fn prefill_inner(
                 &hidden_bytes[byte_start..byte_end],
             )
             .map_err(|e| anyhow::anyhow!("upload hidden chunk: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 scratch.hidden.as_ptr() as *mut c_void,
                 chunk_hidden.as_ptr(),
@@ -1247,7 +1267,7 @@ fn prefill_inner(
                         .map_err(|e| {
                             anyhow::anyhow!("trace attn last_hidden alloc layer {idx}: {e}")
                         })?;
-                    gpu_hal::copy_d2d(
+                    copy_d2d_flush_metal(
                         ordinal,
                         last_hidden.as_ptr() as *mut c_void,
                         scratch.hidden.offset_ptr(row_offset),
@@ -1294,7 +1314,7 @@ fn prefill_inner(
                         .map_err(|e| {
                             anyhow::anyhow!("trace post-attn norm alloc layer {idx}: {e}")
                         })?;
-                    gpu_hal::copy_d2d(
+                    copy_d2d_flush_metal(
                         ordinal,
                         last_normed.as_ptr() as *mut c_void,
                         scratch.normed.offset_ptr(row_offset),
@@ -1328,7 +1348,7 @@ fn prefill_inner(
                     let row_offset = trace_row * row_bytes;
                     let last_swiglu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, swiglu_dim])
                         .map_err(|e| anyhow::anyhow!("trace mlp swiglu alloc layer {idx}: {e}"))?;
-                    gpu_hal::copy_d2d(
+                    copy_d2d_flush_metal(
                         ordinal,
                         last_swiglu.as_ptr() as *mut c_void,
                         scratch.mlp_buf.offset_ptr(row_offset),
@@ -1346,7 +1366,7 @@ fn prefill_inner(
                     let row_offset = trace_row * hidden_bytes;
                     let last_mlp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
                         .map_err(|e| anyhow::anyhow!("trace mlp out alloc layer {idx}: {e}"))?;
-                    gpu_hal::copy_d2d(
+                    copy_d2d_flush_metal(
                         ordinal,
                         last_mlp.as_ptr() as *mut c_void,
                         scratch.proj_buf.offset_ptr(row_offset),
@@ -1367,7 +1387,7 @@ fn prefill_inner(
                     let row_offset = trace_row * hidden_bytes;
                     let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
                         .map_err(|e| anyhow::anyhow!("trace last_hidden alloc layer {idx}: {e}"))?;
-                    gpu_hal::copy_d2d(
+                    copy_d2d_flush_metal(
                         ordinal,
                         last_hidden.as_ptr() as *mut c_void,
                         scratch.hidden.offset_ptr(row_offset),
@@ -1395,7 +1415,7 @@ fn prefill_inner(
                                     .map_err(|e| {
                                         anyhow::anyhow!("dflash tap alloc layer {idx}: {e}")
                                     })?;
-                            gpu_hal::copy_d2d(
+                            copy_d2d_flush_metal(
                                 ordinal,
                                 last_hidden.as_ptr() as *mut c_void,
                                 scratch.hidden.offset_ptr(last_token_offset),
@@ -1462,7 +1482,7 @@ fn prefill_inner(
         convert_kv_caches_to_fp8(state, config, ordinal)?;
     }
 
-    Ok(PrefillResult {
+    let result = PrefillResult {
         logits,
         sampled_token,
         final_norm_trace,
@@ -1475,7 +1495,13 @@ fn prefill_inner(
         linear_debug_trace,
         layer3_full_attn_trace,
         mlp_debug_trace,
-    })
+    };
+    if let Some(guard) = metal_batch_guard {
+        guard
+            .finish()
+            .map_err(|e| anyhow::anyhow!("finish Metal prefill batch: {e}"))?;
+    }
+    Ok(result)
 }
 
 /// Convert all full-attention KV caches from BF16 to FP8 E4M3 in-place.
@@ -1513,14 +1539,14 @@ pub fn convert_kv_caches_to_fp8(
         let cap_stride = cap * head_dim * elem_bytes;
         let contig_stride = kv_len * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
                 bf16_k.offset_ptr(h * cap_stride),
                 kv_len * head_dim * elem_bytes,
             )
             .map_err(|e| anyhow::anyhow!("kv fp8 convert K assemble h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 v_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
                 bf16_v.offset_ptr(h * cap_stride),
@@ -1831,7 +1857,7 @@ fn prefill_full_attention_layer(
         let norm_offset = trace_row * norm_row_bytes;
         let norm_row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} input_norm alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             norm_row.as_ptr() as *mut c_void,
             scratch.normed.offset_ptr(norm_offset),
@@ -1842,7 +1868,7 @@ fn prefill_full_attention_layer(
         let q_full_offset = trace_row * q_full_row_bytes;
         let q_full_row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_proj_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} q_and_gate alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             q_full_row.as_ptr() as *mut c_void,
             q_full.offset_ptr(q_full_offset),
@@ -1880,7 +1906,7 @@ fn prefill_full_attention_layer(
         let offset = trace_row * row_bytes;
         let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} q_proj alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             row.as_ptr() as *mut c_void,
             query_buf.offset_ptr(offset),
@@ -1939,7 +1965,7 @@ fn prefill_full_attention_layer(
         let offset = trace_row * row_bytes;
         let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} k_proj alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             row.as_ptr() as *mut c_void,
             scratch.proj_buf2.offset_ptr(offset),
@@ -2104,7 +2130,7 @@ fn prefill_full_attention_layer(
             &mut q_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q norm: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             query_buf.as_ptr() as *mut c_void,
             q_normed.as_ptr(),
@@ -2124,7 +2150,7 @@ fn prefill_full_attention_layer(
             &mut k_normed,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} K norm: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             scratch.proj_buf2.as_ptr() as *mut c_void,
             k_normed.as_ptr(),
@@ -2168,7 +2194,7 @@ fn prefill_full_attention_layer(
         let offset = trace_row * row_bytes;
         let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} k_rotated alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             row.as_ptr() as *mut c_void,
             scratch.proj_buf2.offset_ptr(offset),
@@ -2258,7 +2284,7 @@ fn prefill_full_attention_layer(
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 cache_k.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
                 scratch.attn_k.offset_ptr(h * src_stride),
@@ -2274,7 +2300,7 @@ fn prefill_full_attention_layer(
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 cache_v.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
                 scratch.attn_v.offset_ptr(h * src_stride),
@@ -2329,14 +2355,14 @@ fn prefill_full_attention_layer(
         let contig_stride = kv_len * head_dim * elem_bytes;
         let copy_bytes = kv_len * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_k_ref.offset_ptr(h * cap_stride),
                 copy_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_v_ref.offset_ptr(h * cap_stride),
@@ -2397,7 +2423,7 @@ fn prefill_full_attention_layer(
         let offset = trace_row * row_bytes;
         let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} attn_pregate alloc: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             row.as_ptr() as *mut c_void,
             scratch.proj_buf.offset_ptr(offset),
@@ -2423,7 +2449,7 @@ fn prefill_full_attention_layer(
             &mut gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             scratch.proj_buf.as_ptr() as *mut c_void,
             gated.as_ptr(),
@@ -2467,7 +2493,7 @@ fn prefill_full_attention_layer(
             let offset = trace_row * row_bytes;
             let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, row_elems])
                 .map_err(|e| anyhow::anyhow!("layer {idx} {name} alloc: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 row.as_ptr() as *mut c_void,
                 src.offset_ptr(offset),
@@ -2483,7 +2509,7 @@ fn prefill_full_attention_layer(
             let offset = trace_row * row_bytes;
             let row = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[heads, head_dim])
                 .map_err(|e| anyhow::anyhow!("layer {idx} {name} alloc: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 row.as_ptr() as *mut c_void,
                 src.offset_ptr(offset),
@@ -2905,7 +2931,7 @@ fn prefill_linear_attention_layer(
             if keep_old > 0 && chunk_start > 0 {
                 let src_off = ch * tail_stride + chunk_len * elem_bytes;
                 let dst_off = ch * tail_stride;
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     chunk_conv_tail.offset_ptr(src_off),
@@ -2917,7 +2943,7 @@ fn prefill_linear_attention_layer(
             for t in 0..chunk_len {
                 let src_off = t * qkv_dim * elem_bytes + ch * elem_bytes;
                 let dst_off = ch * tail_stride + (keep_old + t) * elem_bytes;
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     scratch.proj_buf.offset_ptr(src_off),
@@ -2931,7 +2957,7 @@ fn prefill_linear_attention_layer(
         let total_bytes = qkv_dim * pad * elem_bytes;
         if is_last_chunk {
             if let Some(ref mut conv_state) = state.layers[idx].conv_state {
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     conv_state.as_ptr() as *mut c_void,
                     new_tail.as_ptr(),
@@ -2940,7 +2966,7 @@ fn prefill_linear_attention_layer(
                 .map_err(|e| anyhow::anyhow!("layer {idx} conv state final: {e}"))?;
             }
         }
-        gpu_hal::copy_d2d(
+        copy_d2d_flush_metal(
             ordinal,
             chunk_conv_tail.as_ptr() as *mut c_void,
             new_tail.as_ptr(),
@@ -3164,7 +3190,7 @@ fn prefill_linear_attention_layer(
             let conv_input_stride = (pad + chunk_len) * ScalarType::F32.size_in_bytes();
             let tail_stride = pad * ScalarType::F32.size_in_bytes();
             for ch in 0..qkv_dim {
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     conv_input_f32.offset_ptr(ch * conv_input_stride) as *mut c_void,
                     chunk_conv_tail_f32.offset_ptr(ch * tail_stride),
@@ -3283,7 +3309,7 @@ fn prefill_linear_attention_layer(
             let conv_input_stride = (pad + chunk_len) * ScalarType::BF16.size_in_bytes();
             let tail_stride = pad * ScalarType::BF16.size_in_bytes();
             for ch in 0..qkv_dim {
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     scratch.conv_input.offset_ptr(ch * conv_input_stride) as *mut c_void,
                     chunk_conv_tail.offset_ptr(ch * tail_stride),
@@ -3727,7 +3753,7 @@ fn prefill_linear_attention_layer(
         for h in 0..nv {
             let src_off = h * out_stride + attn_offset;
             let dst_off = h * state_bytes_per_head;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 state_f32.offset_ptr(dst_off) as *mut c_void,
                 delta_out.offset_ptr(src_off),
@@ -3750,7 +3776,7 @@ fn prefill_linear_attention_layer(
         // On the last chunk, keep the decode-time recurrent state in F32.
         if is_last_chunk {
             if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
-                gpu_hal::copy_d2d(
+                copy_d2d_flush_metal(
                     ordinal,
                     rec_state.as_ptr() as *mut c_void,
                     state_f32.as_ptr(),
@@ -3781,7 +3807,7 @@ fn prefill_linear_attention_layer(
         for h in 0..nv {
             let src_off = h * out_stride;
             let dst_off = h * attn_bytes_per_head;
-            gpu_hal::copy_d2d(
+            copy_d2d_flush_metal(
                 ordinal,
                 attn_output_f32.offset_ptr(dst_off) as *mut c_void,
                 delta_out.offset_ptr(src_off),

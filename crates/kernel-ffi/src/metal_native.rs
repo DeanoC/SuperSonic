@@ -8,6 +8,9 @@ pub(crate) fn disabled_by_env() -> bool {
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 unsafe extern "C" {
+    fn supersonic_metal_batch_begin() -> c_int;
+    fn supersonic_metal_batch_flush() -> c_int;
+    fn supersonic_metal_batch_end() -> c_int;
     fn supersonic_metal_embedding_lookup_bf16(
         token_count: usize,
         vocab_size: usize,
@@ -246,6 +249,61 @@ unsafe extern "C" {
         g_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+}
+
+pub(crate) struct MetalBatchGuard {
+    active: bool,
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+impl MetalBatchGuard {
+    pub(crate) fn begin() -> Result<Self, GpuError> {
+        if std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_some() {
+            return Ok(Self { active: false });
+        }
+        let status = unsafe { supersonic_metal_batch_begin() };
+        if status != 0 {
+            return Err(GpuError::Metal(format!(
+                "metal native batch begin failed with status {status}"
+            )));
+        }
+        Ok(Self { active: true })
+    }
+
+    pub(crate) fn finish(mut self) -> Result<(), GpuError> {
+        if !self.active {
+            return Ok(());
+        }
+        self.active = false;
+        let status = unsafe { supersonic_metal_batch_end() };
+        if status != 0 {
+            return Err(GpuError::Metal(format!(
+                "metal native batch end failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+impl Drop for MetalBatchGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = unsafe { supersonic_metal_batch_end() };
+            self.active = false;
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn flush_batch() -> Result<(), GpuError> {
+    let status = unsafe { supersonic_metal_batch_flush() };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native batch flush failed with status {status}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -1267,6 +1325,22 @@ pub(crate) fn delta_recurrent_prefill_f32(
             "metal native delta_recurrent_prefill_f32 failed with status {status}"
         )));
     }
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+impl MetalBatchGuard {
+    pub(crate) fn begin() -> Result<Self, GpuError> {
+        Ok(Self { active: false })
+    }
+
+    pub(crate) fn finish(self) -> Result<(), GpuError> {
+        Ok(())
+    }
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn flush_batch() -> Result<(), GpuError> {
     Ok(())
 }
 
