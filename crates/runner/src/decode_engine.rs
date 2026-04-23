@@ -28,6 +28,13 @@ pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_bf16_le_host(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect()
+}
+
 fn matmul_proj(
     ordinal: usize,
     batch: usize,
@@ -618,6 +625,9 @@ pub struct CertifiedKvShadowStats {
     pub compressed_vram_bytes: usize,
     pub max_value_error: f32,
     pub quantize_ms: f64,
+    pub score_layers: usize,
+    pub score_ms: f64,
+    pub max_score_ref_delta: f32,
 }
 
 pub struct ComponentLayerTrace {
@@ -1156,6 +1166,104 @@ impl DecodeEngine {
                 + value_scale.len_bytes()
                 + value_zero.len_bytes()
                 + value_error.len_bytes();
+
+            let num_q_heads = self.weights.config.num_attention_heads;
+            if num_q_heads % num_kv_heads != 0 {
+                return Err(anyhow::anyhow!(
+                    "layer {layer_idx} certified KV score probe q_heads={} not divisible by kv_heads={}",
+                    num_q_heads,
+                    num_kv_heads
+                ));
+            }
+            let gqa_group = num_q_heads / num_kv_heads;
+            let num_blocks = aligned / block_size;
+            let cache_k_host = cache_k
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV K cache D2H: {e}"))?;
+            let mut query_host = vec![0u8; num_q_heads * head_dim * ScalarType::BF16.size_in_bytes()];
+            let max_t = cache_k.shape()[2];
+            let elem_bytes = ScalarType::BF16.size_in_bytes();
+            for qh in 0..num_q_heads {
+                let kvh = qh / gqa_group;
+                let src = (kvh * max_t * head_dim) * elem_bytes;
+                let dst = (qh * head_dim) * elem_bytes;
+                let bytes = head_dim * elem_bytes;
+                query_host[dst..dst + bytes].copy_from_slice(&cache_k_host[src..src + bytes]);
+            }
+            let query = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_q_heads, head_dim],
+                &query_host,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV score query H2D: {e}"))?;
+            let mut block_max = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_max alloc: {e}"))?;
+            let mut block_sum = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_sum alloc: {e}"))?;
+            let score_start = Instant::now();
+            kernel_ffi::certified_kv::score_blocks_int8(
+                self.ordinal,
+                &query,
+                &key_i8,
+                &key_scale,
+                block_size,
+                gqa_group,
+                (head_dim as f32).powf(-0.5),
+                &mut block_max,
+                &mut block_sum,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV score blocks: {e}"))?;
+            stats.score_ms += score_start.elapsed().as_secs_f64() * 1000.0;
+
+            let block_max_host = decode_f32_le(
+                &block_max
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_max D2H: {e}"))?,
+            );
+            let block_sum_host = decode_f32_le(
+                &block_sum
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_sum D2H: {e}"))?,
+            );
+            for (idx, (&m, &s)) in block_max_host.iter().zip(block_sum_host.iter()).enumerate() {
+                if !m.is_finite() || !s.is_finite() || s < 1.0 || s > block_size as f32 + 0.001 {
+                    return Err(anyhow::anyhow!(
+                        "layer {layer_idx} certified KV score output invalid at {}: max={} sum={}",
+                        idx,
+                        m,
+                        s
+                    ));
+                }
+            }
+
+            let query_f32 = decode_bf16_le_host(&query_host[0..head_dim * elem_bytes]);
+            let key_i8_host = key_i8
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 D2H: {e}"))?;
+            let key_scale_host = decode_f32_le(
+                &key_scale
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_scale D2H: {e}"))?,
+            );
+            let q_scale = (head_dim as f32).powf(-0.5);
+            let mut ref_scores = Vec::with_capacity(block_size);
+            for t in 0..block_size {
+                let mut acc = 0.0f32;
+                for d in 0..head_dim {
+                    let kq = key_i8_host[t * head_dim + d] as i8 as f32;
+                    let ks = key_scale_host[d];
+                    acc += query_f32[d] * kq * ks;
+                }
+                ref_scores.push(acc * q_scale);
+            }
+            let ref_max = ref_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let ref_sum: f32 = ref_scores.iter().map(|s| (*s - ref_max).exp()).sum();
+            let delta = (block_max_host[0] - ref_max)
+                .abs()
+                .max((block_sum_host[0] - ref_sum).abs());
+            stats.max_score_ref_delta = stats.max_score_ref_delta.max(delta);
+            stats.score_layers += 1;
         }
         Ok(stats)
     }

@@ -653,12 +653,15 @@ pub fn run_llama31(
                 cfg.value_group_size,
             )?;
             eprintln!(
-                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6}",
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6}",
                 stats.layers,
                 stats.aligned_tokens,
                 stats.compressed_vram_bytes,
                 stats.quantize_ms,
                 stats.max_value_error,
+                stats.score_layers,
+                stats.score_ms,
+                stats.max_score_ref_delta,
             );
             Some(stats)
         } else {
@@ -1110,6 +1113,9 @@ pub fn run_llama31(
                 "shadow_tier1_bytes": certified_kv_shadow_stats.map(|s| s.compressed_vram_bytes),
                 "shadow_quantize_ms": certified_kv_shadow_stats.map(|s| s.quantize_ms),
                 "shadow_max_value_error": certified_kv_shadow_stats.map(|s| s.max_value_error),
+                "shadow_score_layers": certified_kv_shadow_stats.map(|s| s.score_layers),
+                "shadow_score_ms": certified_kv_shadow_stats.map(|s| s.score_ms),
+                "shadow_max_score_ref_delta": certified_kv_shadow_stats.map(|s| s.max_score_ref_delta),
             });
             if let Some(parent) = path.parent() {
                 if !parent.as_os_str().is_empty() {

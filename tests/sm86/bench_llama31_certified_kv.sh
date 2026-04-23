@@ -187,10 +187,14 @@ if shadow_runs:
     shadow_bytes = statistics.mean(r.get("shadow_tier1_bytes", 0) for r in shadow_runs)
     shadow_ms = statistics.mean(r.get("shadow_quantize_ms", 0.0) for r in shadow_runs)
     shadow_err = max(r.get("shadow_max_value_error", 0.0) for r in shadow_runs)
+    shadow_score_layers = statistics.mean(r.get("shadow_score_layers", 0) for r in shadow_runs)
+    shadow_score_ms = statistics.mean(r.get("shadow_score_ms", 0.0) for r in shadow_runs)
+    shadow_score_delta = max(r.get("shadow_max_score_ref_delta", 0.0) for r in shadow_runs)
     print(
         "shadow_mean "
         f"layers={shadow_layers:.1f} aligned_tokens={shadow_tokens:.1f} "
         f"tier1_bytes={shadow_bytes:.0f} quantize_ms={shadow_ms:.3f} "
-        f"max_value_error={shadow_err:.6f}"
+        f"max_value_error={shadow_err:.6f} score_layers={shadow_score_layers:.1f} "
+        f"score_ms={shadow_score_ms:.3f} max_score_ref_delta={shadow_score_delta:.6f}"
     )
 PY
