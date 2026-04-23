@@ -1849,6 +1849,7 @@ impl DecodeEngine {
         idx: usize,
         hidden_bytes: &[u8],
         seqlen_offset: usize,
+        certified_kv: Option<(usize, usize)>,
     ) -> Result<FullAttentionLayerOutputTrace> {
         let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
@@ -1910,18 +1911,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_normed alloc: {e}"))?;
         let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k_normed alloc: {e}"))?;
-        let mut attn_q = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q alloc: {e}"))?;
-        let mut step_k = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_k alloc: {e}"))?;
-        let mut step_v = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer step_v alloc: {e}"))?;
         let mut attn_out_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out alloc: {e}"))?;
         let mut attn_out_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out bf16 alloc: {e}"))?;
-        let mut attn_flat = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat alloc: {e}"))?;
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gated alloc: {e}"))?;
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
@@ -2050,39 +2043,155 @@ impl DecodeEngine {
             full_v_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
                 .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
         }
-        let attn_q = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::BF16,
-            &[num_q_heads, 1, head_dim],
-            &q_rope_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q H2D: {e}"))?;
-        let kv_k_contig = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::BF16,
-            &[num_kv_heads, kv_len, head_dim],
-            &full_k_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_k_contig H2D: {e}"))?;
-        let kv_v_contig = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::BF16,
-            &[num_kv_heads, kv_len, head_dim],
-            &full_v_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_v_contig H2D: {e}"))?;
+        if let Some((block_size, value_group_size)) = certified_kv {
+            anyhow::ensure!(
+                kv_len % block_size == 0,
+                "layer {idx} certified KV trace requires block-aligned kv_len={kv_len} block_size={block_size}"
+            );
+            let kv_k_cert = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[1, num_kv_heads, kv_len, head_dim],
+                &full_k_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV K H2D: {e}"))?;
+            let kv_v_cert = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[1, num_kv_heads, kv_len, head_dim],
+                &full_v_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV V H2D: {e}"))?;
+            let (
+                key_i8_shape,
+                key_scale_shape,
+                value_i4_shape,
+                value_meta_shape,
+                value_error_shape,
+            ) = kernel_ffi::certified_kv::quantized_shapes(
+                num_kv_heads,
+                kv_len,
+                head_dim,
+                block_size,
+                value_group_size,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV shapes: {e}"))?;
+            let mut key_i8 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_i8 alloc: {e}"))?;
+            let mut key_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_scale alloc: {e}"))?;
+            let mut value_i4 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_i4 alloc: {e}"))?;
+            let mut value_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_scale alloc: {e}"))?;
+            let mut value_zero = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_zero alloc: {e}"))?;
+            let mut value_error = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_error alloc: {e}"))?;
+            kernel_ffi::certified_kv::quantize_bf16_cache(
+                self.ordinal,
+                &kv_k_cert,
+                &kv_v_cert,
+                kv_len,
+                block_size,
+                value_group_size,
+                &mut key_i8,
+                &mut key_scale,
+                &mut value_i4,
+                &mut value_scale,
+                &mut value_zero,
+                &mut value_error,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV quantize: {e}"))?;
+            let query_cert = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_q_heads, head_dim],
+                &q_rope_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV query H2D: {e}"))?;
+            let mut score_scratch =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV score alloc: {e}"))?;
+            let mut cert_attn_out =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attn alloc: {e}"))?;
+            kernel_ffi::certified_kv::attend_int8_int4(
+                self.ordinal,
+                &query_cert,
+                &key_i8,
+                &key_scale,
+                &value_i4,
+                &value_scale,
+                &value_zero,
+                block_size,
+                value_group_size,
+                num_q_heads / num_kv_heads,
+                1.0 / (head_dim as f32).sqrt(),
+                &mut score_scratch,
+                &mut cert_attn_out,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attention: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                &cert_attn_out,
+                &mut attn_out_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attn cast: {e}"))?;
+        } else {
+            let attn_q = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_q_heads, 1, head_dim],
+                &q_rope_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_q H2D: {e}"))?;
+            let kv_k_contig = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &full_k_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_k_contig H2D: {e}"))?;
+            let kv_v_contig = GpuBuffer::from_host_bytes(
+                self.ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, kv_len, head_dim],
+                &full_v_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer kv_v_contig H2D: {e}"))?;
 
-        kernel_ffi::prefill_ffi::full_attention_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-            1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-            &attn_q, &kv_k_contig, &kv_v_contig, &mut attn_out_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attention: {e}"))?;
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, &attn_out_f32, &mut attn_out_bf16,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn cast: {e}"))?;
-        attn_flat = GpuBuffer::from_host_bytes(
+            kernel_ffi::prefill_ffi::full_attention_prefill(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                num_kv_heads,
+                1,
+                kv_len,
+                head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+                seqlen_offset,
+                &attn_q,
+                &kv_k_contig,
+                &kv_v_contig,
+                &mut attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attention: {e}"))?;
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                &attn_out_f32,
+                &mut attn_out_bf16,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn cast: {e}"))?;
+        }
+        let attn_flat = GpuBuffer::from_host_bytes(
             self.ordinal,
             ScalarType::BF16,
             &[1, q_dim],
@@ -2105,7 +2214,6 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate bypass copy: {e}"))?;
         }
-        let out_start = Instant::now();
         matmul_proj(
             self.ordinal, 1, 1, hidden_dim, q_dim,
             &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
@@ -2137,6 +2245,7 @@ impl DecodeEngine {
             idx,
             hidden_bytes,
             seqlen_offset,
+            None,
         )
     }
 
@@ -2152,6 +2261,44 @@ impl DecodeEngine {
             idx,
             hidden_bytes,
             seqlen_offset,
+            None,
+        )
+    }
+
+    pub fn trace_certified_kv_full_attention_layer_output_from_hidden_state(
+        &self,
+        state: &ModelState,
+        idx: usize,
+        hidden_bytes: &[u8],
+        seqlen_offset: usize,
+        block_size: usize,
+        value_group_size: usize,
+    ) -> Result<FullAttentionLayerOutputTrace> {
+        self.trace_full_attention_layer_output_from_hidden_with_state(
+            state,
+            idx,
+            hidden_bytes,
+            seqlen_offset,
+            Some((block_size, value_group_size)),
+        )
+    }
+
+    pub fn trace_certified_kv_full_attention_layer_output_from_hidden_current_state(
+        &self,
+        idx: usize,
+        batch_index: usize,
+        hidden_bytes: &[u8],
+        seqlen_offset: usize,
+        block_size: usize,
+        value_group_size: usize,
+    ) -> Result<FullAttentionLayerOutputTrace> {
+        self.trace_certified_kv_full_attention_layer_output_from_hidden_state(
+            self.state_for_batch(batch_index),
+            idx,
+            hidden_bytes,
+            seqlen_offset,
+            block_size,
+            value_group_size,
         )
     }
 

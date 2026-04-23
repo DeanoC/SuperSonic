@@ -1108,6 +1108,9 @@ pub fn run_llama31(
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
     }
+    if let (Some(cfg), Some(trace_layer)) = (&certified_kv_cfg, cli.certified_kv_trace_layer) {
+        trace_llama31_certified_kv_layer(&mut engine, &prompt_ids, trace_layer, cfg)?;
+    }
     if let Some(cfg) = &certified_kv_cfg {
         if let Some(path) = cfg.telemetry_path.as_ref() {
             let payload = serde_json::json!({
@@ -1172,6 +1175,77 @@ pub fn run_llama31(
         }
     }
 
+    Ok(())
+}
+
+fn trace_llama31_certified_kv_layer(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    trace_layer: usize,
+    cfg: &crate::certified_kv::CertifiedKvConfig,
+) -> Result<()> {
+    let text_config = engine.weights().config.clone();
+    anyhow::ensure!(
+        text_config.is_full_attention(trace_layer),
+        "certified KV trace layer {trace_layer} is not full attention"
+    );
+    anyhow::ensure!(
+        trace_layer > 0,
+        "--certified-kv-trace-layer currently requires layer > 0"
+    );
+    let aligned_len = (prompt_ids.len() / cfg.block_size) * cfg.block_size;
+    anyhow::ensure!(
+        aligned_len >= cfg.block_size && aligned_len > 1,
+        "prompt has {} tokens, not enough for block-aligned certified KV trace with block_size={}",
+        prompt_ids.len(),
+        cfg.block_size
+    );
+    let trace_ids = &prompt_ids[..aligned_len];
+    let prefix_ids = &trace_ids[..aligned_len - 1];
+    let seqlen_offset = prefix_ids.len();
+    let replay = engine.prefill_native_with_trace(trace_ids)?;
+    let replay_hidden = replay
+        .layer_hidden_trace
+        .as_ref()
+        .and_then(|layers| layers.get(trace_layer - 1))
+        .ok_or_else(|| anyhow!("missing replay hidden before certified KV trace layer {trace_layer}"))?
+        .clone();
+    engine.rebuild_prefill_state(prefix_ids, false)?;
+    let dense = engine.trace_full_attention_layer_output_from_hidden_current_state(
+        trace_layer,
+        0,
+        &replay_hidden,
+        seqlen_offset,
+    )?;
+    let certified = engine.trace_certified_kv_full_attention_layer_output_from_hidden_current_state(
+        trace_layer,
+        0,
+        &replay_hidden,
+        seqlen_offset,
+        cfg.block_size,
+        cfg.value_group_size,
+    )?;
+    let pre_gate_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.pre_gate),
+        &decode_bf16_le(&certified.pre_gate),
+    );
+    let gated_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.gated),
+        &decode_bf16_le(&certified.gated),
+    );
+    let attn_hidden_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.attn_hidden),
+        &decode_bf16_le(&certified.attn_hidden),
+    );
+    eprintln!(
+        "[certified-kv-trace] layer={} trace_tokens={} prefix_tokens={} pre_gate_delta={:.6} gated_delta={:.6} attn_hidden_delta={:.6}",
+        trace_layer,
+        aligned_len,
+        seqlen_offset,
+        pre_gate_delta,
+        gated_delta,
+        attn_hidden_delta,
+    );
     Ok(())
 }
 
