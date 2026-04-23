@@ -31,12 +31,17 @@ import torch
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 
 import safetensors.torch
-from bitsandbytes.backends.cuda.ops import (
-    _cuda_device_of,
-    _get_tensor_stream,
-    get_ptr,
-    lib,
-)
+
+
+def _load_bnb_cuda_ops():
+    from bitsandbytes.backends.cuda.ops import (
+        _cuda_device_of,
+        _get_tensor_stream,
+        get_ptr,
+        lib,
+    )
+
+    return _cuda_device_of, _get_tensor_stream, get_ptr, lib
 
 
 def tensor_to_b64(t: torch.Tensor) -> str:
@@ -49,6 +54,7 @@ def int8_vectorwise_quant_export(a: torch.Tensor, threshold: float):
     """BitsAndBytes CUDA vectorwise quant with the same kernel, minus the
     upstream `.view(-1)` bug that trips on this single-row Llama trace.
     """
+    _cuda_device_of, _get_tensor_stream, get_ptr, lib = _load_bnb_cuda_ops()
     if a.dtype != torch.float16:
         raise TypeError(f"expected float16 activation for export, got {a.dtype}")
     rows = prod(a.shape[:-1])
