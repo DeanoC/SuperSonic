@@ -27,6 +27,10 @@ fn metal_force_host_element_add() -> bool {
     std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_ELEMENT_ADD").is_some()
 }
 
+fn metal_force_host_cast() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_CAST").is_some()
+}
+
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::Hip(msg),
@@ -1432,6 +1436,12 @@ pub fn cast(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        if !metal_native::disabled_by_env()
+            && !metal_force_host_cast()
+            && metal_native::cast(input_dtype, output_dtype, total_elems, input, out).is_ok()
+        {
+            return Ok(());
+        }
         return metal_host::cast(input_dtype, output_dtype, total_elems, input, out);
     }
     let status = unsafe {

@@ -60,6 +60,31 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_cast_bf16_to_bf16(
+        total_elems: usize,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_cast_f32_to_f32(
+        total_elems: usize,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_cast_u32_to_u32(
+        total_elems: usize,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_cast_bf16_to_f32(
+        total_elems: usize,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_cast_f32_to_bf16(
+        total_elems: usize,
+        input_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -287,6 +312,60 @@ pub(crate) fn element_add(
     Ok(())
 }
 
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn cast(
+    input_dtype: ScalarType,
+    output_dtype: ScalarType,
+    total_elems: usize,
+    input: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native cast supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if input.dtype() != input_dtype || out.dtype() != output_dtype {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native cast expects buffer dtypes {input_dtype:?}->{output_dtype:?}, got {:?}->{:?}",
+            input.dtype(),
+            out.dtype()
+        )));
+    }
+
+    let status = unsafe {
+        match (input_dtype, output_dtype) {
+            (ScalarType::BF16, ScalarType::BF16) => {
+                supersonic_metal_cast_bf16_to_bf16(total_elems, input.as_ptr(), out.as_mut_ptr())
+            }
+            (ScalarType::F32, ScalarType::F32) => {
+                supersonic_metal_cast_f32_to_f32(total_elems, input.as_ptr(), out.as_mut_ptr())
+            }
+            (ScalarType::U32, ScalarType::U32) => {
+                supersonic_metal_cast_u32_to_u32(total_elems, input.as_ptr(), out.as_mut_ptr())
+            }
+            (ScalarType::BF16, ScalarType::F32) => {
+                supersonic_metal_cast_bf16_to_f32(total_elems, input.as_ptr(), out.as_mut_ptr())
+            }
+            (ScalarType::F32, ScalarType::BF16) => {
+                supersonic_metal_cast_f32_to_bf16(total_elems, input.as_ptr(), out.as_mut_ptr())
+            }
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "metal native cast does not support {other:?}"
+                )));
+            }
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native cast failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_bf16(
     _batch_elems: usize,
@@ -364,6 +443,17 @@ pub(crate) fn element_add(
     ))
 }
 
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn cast(
+    _input_dtype: ScalarType,
+    _output_dtype: ScalarType,
+    _total_elems: usize,
+    _input: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal("metal native cast is not compiled".into()))
+}
+
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
 mod tests {
     use super::*;
@@ -395,6 +485,18 @@ mod tests {
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn u32_bytes(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn read_u32(buffer: &GpuBuffer) -> Vec<u32> {
+        let bytes = buffer.to_host_bytes().expect("download u32 buffer");
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
     }
 
     #[test]
@@ -661,5 +763,51 @@ mod tests {
         let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
         element_add(ScalarType::F32, 3, &lhs, &rhs, &mut out).expect("run f32 add");
         assert_eq!(read_f32(&out), vec![1.0, -2.0, 8.5]);
+    }
+
+    #[test]
+    fn metal_native_cast_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[1.0, -2.5, 0.25]),
+        )
+        .expect("upload bf16 input");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[3]).expect("allocate f32 out");
+        cast(ScalarType::BF16, ScalarType::F32, 3, &input, &mut out).expect("run bf16->f32 cast");
+        assert_eq!(read_f32(&out), vec![1.0, -2.5, 0.25]);
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[3],
+            &f32_bytes(&[1.0, -2.25, 3.5]),
+        )
+        .expect("upload f32 input");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[3]).expect("allocate bf16 out");
+        cast(ScalarType::F32, ScalarType::BF16, 3, &input, &mut out).expect("run f32->bf16 cast");
+        let actual = read_bf16(&out);
+        for (idx, (a, e)) in actual.iter().zip([1.0f32, -2.25, 3.5].iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "f32->bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U32,
+            &[3],
+            &u32_bytes(&[7, 42, u32::MAX - 1]),
+        )
+        .expect("upload u32 input");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::U32, &[3]).expect("allocate u32 out");
+        cast(ScalarType::U32, ScalarType::U32, 3, &input, &mut out).expect("run u32 copy cast");
+        assert_eq!(read_u32(&out), vec![7, 42, u32::MAX - 1]);
     }
 }

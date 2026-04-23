@@ -602,6 +602,157 @@ kernel void supersonic_element_add_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> cast_pipeline(NSString* function_name, NSError** error_out) {
+    static std::mutex mutex;
+    static __strong NSMutableSet* attempted = nil;
+    static __strong NSMutableDictionary* pipelines = nil;
+    static __strong NSMutableDictionary* build_errors = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (attempted == nil) {
+        attempted = [[NSMutableSet alloc] init];
+        pipelines = [[NSMutableDictionary alloc] init];
+        build_errors = [[NSMutableDictionary alloc] init];
+    }
+
+    id<MTLComputePipelineState> cached = [pipelines objectForKey:function_name];
+    if (cached != nil) {
+        return cached;
+    }
+
+    if (![attempted containsObject:function_name]) {
+        [attempted addObject:function_name];
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                NSError* error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                     code:81
+                                                 userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+                [build_errors setObject:error forKey:function_name];
+            } else {
+                static const char* kSource = R"CAST(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ElementwiseParams {
+    uint total_elems;
+};
+
+kernel void supersonic_cast_bf16_to_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device bfloat* out [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = input[gid];
+}
+
+kernel void supersonic_cast_f32_to_f32(
+    device const float* input [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = input[gid];
+}
+
+kernel void supersonic_cast_u32_to_u32(
+    device const uint* input [[buffer(0)]],
+    device uint* out [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = input[gid];
+}
+
+kernel void supersonic_cast_bf16_to_f32(
+    device const bfloat* input [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = float(input[gid]);
+}
+
+kernel void supersonic_cast_f32_to_bf16(
+    device const float* input [[buffer(0)]],
+    device bfloat* out [[buffer(1)]],
+    constant ElementwiseParams& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    out[gid] = bfloat(input[gid]);
+}
+)CAST";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    NSError* error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                          code:82
+                                                                      userInfo:@{
+                                                                          NSLocalizedDescriptionKey :
+                                                                              @"Failed to compile cast library"
+                                                                      }];
+                    [build_errors setObject:error forKey:function_name];
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:function_name];
+                    if (function == nil) {
+                        NSError* error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                             code:83
+                                                         userInfo:@{
+                                                             NSLocalizedDescriptionKey :
+                                                                 @"Failed to load cast function"
+                                                         }];
+                        [build_errors setObject:error forKey:function_name];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:function
+                                                                                                      error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            NSError* error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                   code:84
+                                                                               userInfo:@{
+                                                                                   NSLocalizedDescriptionKey :
+                                                                                       @"Failed to create cast pipeline"
+                                                                               }];
+                            [build_errors setObject:error forKey:function_name];
+                        } else {
+                            [pipelines setObject:pipeline forKey:function_name];
+                            [build_errors removeObjectForKey:function_name];
+                            return pipeline;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (error_out != nullptr) {
+        *error_out = [build_errors objectForKey:function_name];
+    }
+    return nil;
+}
+
 int lookup_buffer(
     const void* ptr,
     id<MTLBuffer>* buffer_out,
@@ -725,6 +876,112 @@ extern "C" int supersonic_metal_element_add_f32(
         out_ptr,
         @"supersonic_element_add_f32"
     );
+}
+
+static int supersonic_metal_cast_impl(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr,
+    NSString* function_name
+) {
+    @autoreleasepool {
+        if (total_elems == 0) {
+            return 0;
+        }
+        if (total_elems > UINT32_MAX || input_ptr == nullptr || out_ptr == nullptr) {
+            return 81;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = cast_pipeline(function_name, &pipeline_error);
+        if (pipeline == nil) {
+            return 82;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> out = nil;
+        size_t input_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 83;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 84;
+        }
+
+        id<MTLCommandQueue> queue = metal_queue();
+        if (queue == nil) {
+            return 85;
+        }
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 86;
+        }
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (encoder == nil) {
+            return 87;
+        }
+
+        ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
+
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:input offset:input_offset atIndex:0];
+        [encoder setBuffer:out offset:out_offset atIndex:1];
+        [encoder setBytes:&params length:sizeof(params) atIndex:2];
+
+        NSUInteger tg_width = std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+        MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+        MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+        [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            return 88;
+        }
+        return 0;
+    }
+}
+
+extern "C" int supersonic_metal_cast_bf16_to_bf16(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_bf16_to_bf16");
+}
+
+extern "C" int supersonic_metal_cast_f32_to_f32(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_f32_to_f32");
+}
+
+extern "C" int supersonic_metal_cast_u32_to_u32(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_u32_to_u32");
+}
+
+extern "C" int supersonic_metal_cast_bf16_to_f32(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_bf16_to_f32");
+}
+
+extern "C" int supersonic_metal_cast_f32_to_bf16(
+    size_t total_elems,
+    const void* input_ptr,
+    void* out_ptr
+) {
+    return supersonic_metal_cast_impl(total_elems, input_ptr, out_ptr, @"supersonic_cast_f32_to_bf16");
 }
 
 extern "C" int supersonic_metal_matmul_rhs_transposed_bf16(
