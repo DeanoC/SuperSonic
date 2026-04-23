@@ -2645,43 +2645,43 @@ impl DecodeEngine {
         let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
         let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
         let cap = cache_k_ref.shape()[2];
-        let kv_k_contig;
-        let kv_v_contig;
-        let attn_k_ref;
-        let attn_v_ref;
-        if cap == kv_len {
-            attn_k_ref = cache_k_ref;
-            attn_v_ref = cache_v_ref;
-        } else {
-            kv_k_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
-            kv_v_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
-            let cap_stride = cap * head_dim * elem_bytes;
-            let contig_stride = kv_len * head_dim * elem_bytes;
-            let copy_bytes = kv_len * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
-                    self.ordinal,
-                    kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                    cache_k_ref.offset_ptr(h * cap_stride),
-                    copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble k h={h}: {e}"))?;
-                gpu_hal::copy_d2d(
-                    self.ordinal,
-                    kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                    cache_v_ref.offset_ptr(h * cap_stride),
-                    copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble v h={h}: {e}"))?;
-            }
-            attn_k_ref = &kv_k_contig;
-            attn_v_ref = &kv_v_contig;
-        }
 
         let core_start = Instant::now();
         if has_attn_gate {
+            let kv_k_contig;
+            let kv_v_contig;
+            let attn_k_ref;
+            let attn_v_ref;
+            if cap == kv_len {
+                attn_k_ref = cache_k_ref;
+                attn_v_ref = cache_v_ref;
+            } else {
+                kv_k_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
+                kv_v_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                    .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
+                let cap_stride = cap * head_dim * elem_bytes;
+                let contig_stride = kv_len * head_dim * elem_bytes;
+                let copy_bytes = kv_len * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                        cache_k_ref.offset_ptr(h * cap_stride),
+                        copy_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble k h={h}: {e}"))?;
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                        cache_v_ref.offset_ptr(h * cap_stride),
+                        copy_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble v h={h}: {e}"))?;
+                }
+                attn_k_ref = &kv_k_contig;
+                attn_v_ref = &kv_v_contig;
+            }
             kernel_ffi::prefill_ffi::full_attention_prefill(
                 self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
                 1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
@@ -2708,13 +2708,27 @@ impl DecodeEngine {
                 self.ordinal, ScalarType::BF16, q_dim, attn_flat, gate_buf, gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
-        } else {
+        } else if cap == kv_len {
             kernel_ffi::prefill_ffi::full_attention_decode_flat(
                 self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
                 kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(),
-                attn_q, attn_k_ref, attn_v_ref, gated,
+                attn_q, cache_k_ref, cache_v_ref, gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat: {e}"))?;
+            if trace_output {
+                pre_gate_trace = Some(
+                    gated
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                );
+            }
+        } else {
+            kernel_ffi::prefill_ffi::full_attention_decode_flat_strided(
+                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
+                kv_len, cap, head_dim, 1.0 / (head_dim as f32).sqrt(),
+                attn_q, cache_k_ref, cache_v_ref, gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat strided: {e}"))?;
             if trace_output {
                 pre_gate_trace = Some(
                     gated

@@ -307,6 +307,23 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_hip_full_attention_decode_flat_strided(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        kv_len: usize,
+        kv_stride: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_hip_linear_prefill_conv_pack(
         dtype: c_int,
         device_ordinal: usize,
@@ -605,6 +622,51 @@ pub fn full_attention_decode_flat(
     };
     if status != 0 {
         return Err(ffi_error(format!("full_attention_decode_flat failed: {status}")));
+    }
+    Ok(())
+}
+
+/// Decode-only full attention for q_len=1 over a KV cache whose physical
+/// capacity stride can exceed the live `kv_len`. Writes BF16/FP16 flat
+/// `[batch, q_heads * head_dim]`.
+pub fn full_attention_decode_flat_strided(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let num_kv_groups = q_heads / kv_heads;
+    let status = unsafe {
+        dotcache_qwen35_hip_full_attention_decode_flat_strided(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            batch_size,
+            q_heads,
+            kv_heads,
+            kv_len,
+            kv_stride,
+            head_dim,
+            num_kv_groups,
+            scale,
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "full_attention_decode_flat_strided failed: {status}"
+        )));
     }
     Ok(())
 }

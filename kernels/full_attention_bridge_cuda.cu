@@ -186,6 +186,51 @@ int full_attention_decode_flat_device(
 }
 
 template <typename T>
+int full_attention_decode_flat_strided_device(
+    int device_ordinal,
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int kv_len,
+    int kv_stride,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const void* query,
+    const void* key,
+    const void* value,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+
+    const int block = 32;
+    if (head_dim > block * 8) return 26;
+    if (kv_stride < kv_len) return 27;
+    const int rows = batch_size * q_heads;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(dotcache_qwen35_full_attention_decode_flat_strided_kernel<T>),
+        dim3(rows),
+        dim3(block),
+        0,
+        0,
+        batch_size,
+        q_heads,
+        kv_heads,
+        kv_len,
+        kv_stride,
+        head_dim,
+        num_kv_groups,
+        scale,
+        static_cast<const T*>(query),
+        static_cast<const T*>(key),
+        static_cast<const T*>(value),
+        static_cast<T*>(out));
+    if (cudaGetLastError() != cudaSuccess) return 28;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 29;
+    return 0;
+}
+
+template <typename T>
 int linear_prefill_conv_pack_device(
     int device_ordinal,
     int batch_size,
@@ -2064,6 +2109,57 @@ extern "C" int dotcache_qwen35_hip_full_attention_decode_flat(
             out);
     default:
         return 65;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_full_attention_decode_flat_strided(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_size,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t kv_len,
+    size_t kv_stride,
+    size_t head_dim,
+    size_t num_kv_groups,
+    float scale,
+    const void* query,
+    const void* key,
+    const void* value,
+    void* out) {
+    switch (dtype) {
+    case 0:
+        return full_attention_decode_flat_strided_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(q_heads),
+            static_cast<int>(kv_heads),
+            static_cast<int>(kv_len),
+            static_cast<int>(kv_stride),
+            static_cast<int>(head_dim),
+            static_cast<int>(num_kv_groups),
+            scale,
+            query,
+            key,
+            value,
+            out);
+    case 2:
+        return full_attention_decode_flat_strided_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(q_heads),
+            static_cast<int>(kv_heads),
+            static_cast<int>(kv_len),
+            static_cast<int>(kv_stride),
+            static_cast<int>(head_dim),
+            static_cast<int>(num_kv_groups),
+            scale,
+            query,
+            key,
+            value,
+            out);
+    default:
+        return 66;
     }
 }
 

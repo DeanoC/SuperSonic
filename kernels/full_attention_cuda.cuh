@@ -575,6 +575,109 @@ __global__ void dotcache_qwen35_full_attention_decode_flat_kernel(
 }
 
 template <typename T>
+__global__ void dotcache_qwen35_full_attention_decode_flat_strided_kernel(
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int kv_len,
+    int kv_stride,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const T* query,
+    const T* key,
+    const T* value,
+    T* out
+) {
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) {
+        return;
+    }
+
+    const int total_rows = batch_size * q_heads;
+    const int row = blockIdx.x;
+    if (row >= total_rows) {
+        return;
+    }
+
+    const int q_head = row % q_heads;
+    const int batch = row / q_heads;
+    const int kv_head = q_head / num_kv_groups;
+
+    const T* q_row = query + ((batch * q_heads + q_head) * head_dim);
+    const T* k_head_ptr = key + ((batch * kv_heads + kv_head) * kv_stride * head_dim);
+    const T* v_head_ptr = value + ((batch * kv_heads + kv_head) * kv_stride * head_dim);
+    T* out_row = out + ((batch * q_heads + q_head) * head_dim);
+
+    float local_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int local_dims[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int local_count = 0;
+    for (int d = lane; d < head_dim && local_count < 8; d += warpSize) {
+        local_dims[local_count++] = d;
+    }
+
+    __shared__ float shared_max;
+    __shared__ float shared_denom;
+    __shared__ float shared_weight;
+    __shared__ float shared_inv_denom;
+
+    if (lane == 0) {
+        shared_max = -INFINITY;
+    }
+    __syncthreads();
+
+    for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
+        const T* k_row = k_head_ptr + k_pos * head_dim;
+
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += warpSize) {
+            partial += dotcache_qwen35_to_float(q_row[d]) * dotcache_qwen35_to_float(k_row[d]);
+        }
+        float score = dotcache_qwen35_wave_sum(partial) * scale;
+
+        if (lane == 0 && score > shared_max) {
+            shared_max = score;
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        shared_denom = 0.0f;
+    }
+    __syncthreads();
+
+    for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
+        const T* k_row = k_head_ptr + k_pos * head_dim;
+        const T* v_row = v_head_ptr + k_pos * head_dim;
+
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += warpSize) {
+            partial += dotcache_qwen35_to_float(q_row[d]) * dotcache_qwen35_to_float(k_row[d]);
+        }
+        float score = dotcache_qwen35_wave_sum(partial) * scale;
+
+        if (lane == 0) {
+            shared_weight = expf(score - shared_max);
+            shared_denom += shared_weight;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < local_count; ++i) {
+            local_acc[i] += shared_weight * dotcache_qwen35_to_float(v_row[local_dims[i]]);
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) {
+        shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
+    }
+    __syncthreads();
+    for (int i = 0; i < local_count; ++i) {
+        out_row[local_dims[i]] = dotcache_qwen35_from_float<T>(local_acc[i] * shared_inv_denom);
+    }
+}
+
+template <typename T>
 __global__ void dotcache_qwen35_linear_prefill_conv_pack_kernel(
     int batch_size,
     int conv_dim,
