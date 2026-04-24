@@ -415,6 +415,27 @@ pub fn metal_qwen_mlp_gate_up_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_mlp_gate_up_swiglu_bf16(
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    input: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    up_weight: &GpuBuffer,
+    mlp_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_mlp_gate_up_swiglu", "native", || {
+        metal_native::qwen_mlp_gate_up_swiglu_bf16(
+            hidden_dim,
+            intermediate_dim,
+            input,
+            gate_weight,
+            up_weight,
+            mlp_out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn metal_qwen_mlp_down_residual_bf16(
     hidden_dim: usize,
     intermediate_dim: usize,

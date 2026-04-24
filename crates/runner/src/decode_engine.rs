@@ -177,6 +177,10 @@ fn metal_fused_mlp_gate_up_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP").is_none()
 }
 
+fn metal_fused_mlp_gate_up_swiglu_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP_SWIGLU").is_none()
+}
+
 fn metal_fused_full_projection_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
 }
@@ -3703,7 +3707,20 @@ impl DecodeEngine {
             && self.normed_buf.dtype() == ScalarType::BF16
             && lw.gate_proj_w.dtype() == ScalarType::BF16
             && lw.up_proj_w.dtype() == ScalarType::BF16;
-        if use_fused_mlp_gate_up {
+        let use_fused_mlp_gate_up_swiglu = use_fused_mlp_gate_up
+            && !use_fused_mlp
+            && metal_fused_mlp_gate_up_swiglu_enabled();
+        if use_fused_mlp_gate_up_swiglu {
+            kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_swiglu_bf16(
+                hidden_dim,
+                intermediate,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                &lw.up_proj_w,
+                mlp,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused mlp gate/up/swiglu: {e}"))?;
+        } else if use_fused_mlp_gate_up {
             kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_bf16(
                 hidden_dim,
                 intermediate,
@@ -3755,7 +3772,7 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         }
-        if use_fused_mlp_gate_up && !use_fused_mlp {
+        if use_fused_mlp_gate_up && !use_fused_mlp && !use_fused_mlp_gate_up_swiglu {
             kernel_ffi::prefill_ffi::swiglu_mul(
                 self.ordinal,
                 ScalarType::BF16,

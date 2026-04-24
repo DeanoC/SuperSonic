@@ -103,6 +103,14 @@ unsafe extern "C" {
         gate_out_ptr: *mut c_void,
         up_out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_mlp_gate_up_swiglu_bf16(
+        hidden_dim: usize,
+        intermediate_dim: usize,
+        input_ptr: *const c_void,
+        gate_weight_ptr: *const c_void,
+        up_weight_ptr: *const c_void,
+        mlp_out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen_mlp_down_residual_bf16(
         hidden_dim: usize,
         intermediate_dim: usize,
@@ -1022,6 +1030,50 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native qwen_mlp_gate_up_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    input: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    up_weight: &GpuBuffer,
+    mlp_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        input.dtype(),
+        gate_weight.dtype(),
+        up_weight.dtype(),
+        mlp_out.dtype(),
+    ];
+    if dtypes.iter().any(|dtype| *dtype != ScalarType::BF16) {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_gate_up_swiglu_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || intermediate_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_mlp_gate_up_swiglu_bf16 invalid shape: hidden_dim={hidden_dim} intermediate_dim={intermediate_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_mlp_gate_up_swiglu_bf16(
+            hidden_dim,
+            intermediate_dim,
+            input.as_ptr(),
+            gate_weight.as_ptr(),
+            up_weight.as_ptr(),
+            mlp_out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_mlp_gate_up_swiglu_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -3254,6 +3306,21 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
+    _hidden_dim: usize,
+    _intermediate_dim: usize,
+    _input: &GpuBuffer,
+    _gate_weight: &GpuBuffer,
+    _up_weight: &GpuBuffer,
+    _mlp_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_mlp_gate_up_swiglu_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_mlp_down_residual_bf16(
     _hidden_dim: usize,
     _intermediate_dim: usize,
@@ -4063,6 +4130,8 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("gate");
         let mut up =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("up");
+        let mut mlp =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("mlp");
         let mut out =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out");
 
@@ -4114,6 +4183,15 @@ mod tests {
             &mut up,
         )
         .expect("native gate/up");
+        qwen_mlp_gate_up_swiglu_bf16(
+            hidden_dim,
+            intermediate,
+            &input,
+            &gate_w,
+            &up_w,
+            &mut mlp,
+        )
+        .expect("native gate/up/swiglu");
         qwen_mlp_down_residual_bf16(
             hidden_dim,
             intermediate,
@@ -4128,6 +4206,7 @@ mod tests {
         for (label, actual, expected) in [
             ("gate", read_bf16(&gate), read_bf16(&gate_ref)),
             ("up", read_bf16(&up), read_bf16(&up_ref)),
+            ("mlp", read_bf16(&mlp), read_bf16(&mlp_ref)),
             ("out", read_bf16(&out), read_bf16(&out_ref)),
         ] {
             for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
