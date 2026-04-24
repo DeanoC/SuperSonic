@@ -3841,6 +3841,27 @@ impl DecodeEngine {
         logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
     }
 
+    pub fn component_decode_step_4b_certified_kv_with_timings(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        certified_kv_decode: CertifiedKvDecodeParams,
+    ) -> Result<(Vec<f32>, DecodeStageTimings)> {
+        let mut timings = DecodeStageTimings::default();
+        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            Some(certified_kv_decode),
+            Some(&mut timings),
+        )?;
+        let logits = logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))?;
+        Ok((logits, timings))
+    }
+
     pub fn component_decode_step_4b_certified_kv_cuda_fast_greedy(
         &mut self,
         token_id: u32,

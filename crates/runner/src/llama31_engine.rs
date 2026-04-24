@@ -559,11 +559,22 @@ fn run_llama31_teacher_forced(
             logits = if use_certified_decode {
                 let cfg = certified_kv_cfg.expect("checked above");
                 certified_decode_steps += 1;
-                engine.component_decode_step_4b_certified_kv(
-                    input_token,
-                    pos,
-                    certified_kv_decode_params(cfg),
-                )?
+                if cli.emit_stage_timings {
+                    let (next_logits, timings) = engine
+                        .component_decode_step_4b_certified_kv_with_timings(
+                            input_token,
+                            pos,
+                            certified_kv_decode_params(cfg),
+                        )?;
+                    stage_totals.add_assign(timings);
+                    next_logits
+                } else {
+                    engine.component_decode_step_4b_certified_kv(
+                        input_token,
+                        pos,
+                        certified_kv_decode_params(cfg),
+                    )?
+                }
             } else if cli.emit_stage_timings {
                 let (next_logits, timings) = engine.decode_step_with_timings(input_token, pos)?;
                 stage_totals.add_assign(timings);
