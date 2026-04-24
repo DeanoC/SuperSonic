@@ -3,8 +3,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <stdint.h>
+#include <string>
 
 extern "C" int supersonic_metal_lookup_buffer(
     const void* ptr,
@@ -27,6 +29,24 @@ inline void record_runtime_profile(const char* op, MetalClock::time_point start)
         "runtime",
         std::chrono::duration<double, std::milli>(MetalClock::now() - start).count()
     );
+}
+
+inline void record_profile_elapsed(const char* op, const char* path, double elapsed_ms) {
+    if (std::isfinite(elapsed_ms) && elapsed_ms >= 0.0) {
+        supersonic_metal_profile_record(op, path, elapsed_ms);
+    }
+}
+
+inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffer, const std::string& label) {
+    if (command_buffer == nil) {
+        return;
+    }
+    double gpu_elapsed_ms = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
+    record_profile_elapsed("command_buffer_gpu", "runtime", gpu_elapsed_ms);
+    if (!label.empty()) {
+        std::string labeled_op = "command_buffer_gpu:" + label;
+        record_profile_elapsed(labeled_op.c_str(), "runtime", gpu_elapsed_ms);
+    }
 }
 
 struct MatmulParams {
@@ -61,6 +81,7 @@ struct FullAttentionParams {
     uint32_t kv_heads;
     uint32_t q_len;
     uint32_t kv_len;
+    uint32_t kv_stride;
     uint32_t head_dim;
     uint32_t seqlen_offset;
     float scale;
@@ -257,6 +278,7 @@ struct MetalBatchState {
     __strong id<MTLCommandBuffer> command_buffer = nil;
     __strong id<MTLComputeCommandEncoder> encoder = nil;
     bool has_work = false;
+    std::string label;
 };
 
 thread_local int metal_batch_depth = 0;
@@ -309,9 +331,11 @@ int metal_batch_close_encoder(bool restart) {
     id<MTLCommandBuffer> command_buffer = metal_batch_state->command_buffer;
     id<MTLComputeCommandEncoder> encoder = metal_batch_state->encoder;
     bool has_work = metal_batch_state->has_work;
+    std::string label = metal_batch_state->label;
     metal_batch_state->encoder = nil;
     metal_batch_state->command_buffer = nil;
     metal_batch_state->has_work = false;
+    metal_batch_state->label.clear();
 
     if (encoder != nil) {
         auto end_encoding_start = MetalClock::now();
@@ -328,9 +352,21 @@ int metal_batch_close_encoder(bool restart) {
         if (command_buffer.status != MTLCommandBufferStatusCompleted) {
             return 904;
         }
+        record_command_buffer_gpu_profile(command_buffer, label);
     }
 
     (void)restart;
+    return 0;
+}
+
+int metal_batch_set_label(const char* label) {
+    if (metal_batch_depth <= 0) {
+        return 0;
+    }
+    if (metal_batch_state == nullptr) {
+        metal_batch_state = new MetalBatchState();
+    }
+    metal_batch_state->label = label == nullptr ? "" : label;
     return 0;
 }
 
@@ -408,6 +444,7 @@ int encode_or_submit(EncodeFn encode, int queue_error, int command_buffer_error,
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         return completion_error;
     }
+    record_command_buffer_gpu_profile(command_buffer, "");
     return 0;
 }
 
@@ -487,6 +524,7 @@ int encode_blit_copy_or_submit(
     if (command_buffer.status != MTLCommandBufferStatusCompleted) {
         return completion_error;
     }
+    record_command_buffer_gpu_profile(command_buffer, "");
     return 0;
 }
 
@@ -994,6 +1032,116 @@ kernel void supersonic_qwen_mlp_down_residual_bf16(
     return pipeline;
 }
 
+id<MTLComputePipelineState> qwen_linear_out_residual_pipeline_f32_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:385
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"QWENLINEAROUT(
+#include <metal_stdlib>
+using namespace metal;
+
+struct QwenLinearOutParams {
+    uint hidden_dim;
+    uint num_rows;
+    uint row_dim;
+    float eps;
+};
+
+kernel void supersonic_qwen_linear_out_residual_f32_bf16(
+    device const float* attn [[buffer(0)]],
+    device const bfloat* gate [[buffer(1)]],
+    device const bfloat* norm_weight [[buffer(2)]],
+    device const bfloat* out_proj [[buffer(3)]],
+    device const bfloat* residual [[buffer(4)]],
+    device bfloat* out [[buffer(5)]],
+    constant QwenLinearOutParams& params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.hidden_dim) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint row = 0; row < params.num_rows; ++row) {
+        uint row_base = row * params.row_dim;
+        float mean_sq = 0.0f;
+        for (uint col = 0; col < params.row_dim; ++col) {
+            float value = float(bfloat(attn[row_base + col]));
+            mean_sq = fma(value, value, mean_sq);
+        }
+        float inv_rms = rsqrt((mean_sq / float(params.row_dim)) + params.eps);
+        for (uint col = 0; col < params.row_dim; ++col) {
+            uint idx = row_base + col;
+            float gate_v = float(gate[idx]);
+            float sig = 1.0f / (1.0f + exp(-gate_v));
+            float hidden_v = float(bfloat(attn[idx]));
+            bfloat gated = bfloat(hidden_v * inv_rms * float(norm_weight[col]) * (gate_v * sig));
+            acc += float(gated) * float(out_proj[gid * (params.num_rows * params.row_dim) + idx]);
+        }
+    }
+    out[gid] = bfloat(float(bfloat(acc)) + float(residual[gid]));
+}
+)QWENLINEAROUT";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:386
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen linear out library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen_linear_out_residual_f32_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:387
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen linear out function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:388
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create Qwen linear out pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> qwen_full_projection_pipeline_bf16(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -1292,8 +1440,8 @@ kernel void supersonic_lm_head_argmax_stage1_bf16(
     uint group_id [[threadgroup_position_in_grid]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
-    threadgroup float values[256];
-    threadgroup uint indices[256];
+    threadgroup float values[512];
+    threadgroup uint indices[512];
 
     float best_value = -INFINITY;
     uint best_index = 0;
@@ -1330,6 +1478,47 @@ kernel void supersonic_lm_head_argmax_stage1_bf16(
     }
 }
 
+kernel void supersonic_argmax_stage1_bf16(
+    device const bfloat* logits [[buffer(0)]],
+    device float* partial_values [[buffer(1)]],
+    device uint* partial_indices [[buffer(2)]],
+    constant LmHeadArgmaxParams& params [[buffer(3)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float values[512];
+    threadgroup uint indices[512];
+
+    float best_value = -INFINITY;
+    uint best_index = 0;
+    uint row = group_id * params.block_size + tid;
+    if (tid < params.block_size && row < params.vocab_size) {
+        best_value = float(logits[row]);
+        best_index = row;
+    }
+
+    values[tid] = best_value;
+    indices[tid] = best_index;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float other_value = values[tid + stride];
+            uint other_index = indices[tid + stride];
+            if (supersonic_argmax_better(other_value, other_index, values[tid], indices[tid])) {
+                values[tid] = other_value;
+                indices[tid] = other_index;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        partial_values[group_id] = values[0];
+        partial_indices[group_id] = indices[0];
+    }
+}
+
 kernel void supersonic_lm_head_argmax_stage2(
     device const float* partial_values [[buffer(0)]],
     device const uint* partial_indices [[buffer(1)]],
@@ -1337,8 +1526,8 @@ kernel void supersonic_lm_head_argmax_stage2(
     constant LmHeadArgmaxParams& params [[buffer(3)]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
-    threadgroup float values[256];
-    threadgroup uint indices[256];
+    threadgroup float values[512];
+    threadgroup uint indices[512];
 
     float best_value = -INFINITY;
     uint best_index = 0;
@@ -1456,6 +1645,7 @@ struct FullAttentionParams {
     uint kv_heads;
     uint q_len;
     uint kv_len;
+    uint kv_stride;
     uint head_dim;
     uint seqlen_offset;
     float scale;
@@ -1483,7 +1673,7 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
 
     float max_score = -INFINITY;
     for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
-        uint key_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         float dot = 0.0f;
         for (uint kk = 0; kk < params.head_dim; ++kk) {
             dot += float(query[query_base + kk]) * float(key[key_base + kk]);
@@ -1495,14 +1685,14 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
     float denom = 0.0f;
     float numer = 0.0f;
     for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
-        uint key_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         float dot = 0.0f;
         for (uint kk = 0; kk < params.head_dim; ++kk) {
             dot += float(query[query_base + kk]) * float(key[key_base + kk]);
         }
         float weight = exp((dot * params.scale) - max_score);
         denom += weight;
-        uint value_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint value_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         numer += weight * float(value[value_base + d]);
     }
 
@@ -1752,6 +1942,133 @@ kernel void supersonic_rms_norm_rows_bf16(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create RMSNorm pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> rms_norm_rope_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:134
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"RMSROPE(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RmsNormRopeParams {
+    uint n_rows;
+    uint n_cols;
+    uint rotary_dim;
+    uint half_rot;
+    uint pos_offset;
+    float eps;
+    uint block_size;
+};
+
+kernel void supersonic_rms_norm_rope_rows_bf16(
+    device const bfloat* input [[buffer(0)]],
+    device const bfloat* weight [[buffer(1)]],
+    device const bfloat* cos_table [[buffer(2)]],
+    device const bfloat* sin_table [[buffer(3)]],
+    device bfloat* out [[buffer(4)]],
+    constant RmsNormRopeParams& params [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (row >= params.n_rows || tid >= params.block_size) {
+        return;
+    }
+
+    threadgroup float scratch[256];
+    uint row_base = row * params.n_cols;
+    float mean_sq = 0.0f;
+    for (uint col = tid; col < params.n_cols; col += params.block_size) {
+        float value = float(input[row_base + col]);
+        mean_sq = fma(value, value, mean_sq);
+    }
+    scratch[tid] = mean_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = params.block_size >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
+    uint table_base = params.pos_offset * params.half_rot;
+    for (uint col = tid; col < params.half_rot; col += params.block_size) {
+        float x0 = float(input[row_base + col]) * inv_rms * (float(weight[col]) + 1.0f);
+        float x1 = float(input[row_base + col + params.half_rot]) * inv_rms *
+                   (float(weight[col + params.half_rot]) + 1.0f);
+        float c = float(cos_table[table_base + col]);
+        float s = float(sin_table[table_base + col]);
+        out[row_base + col] = bfloat(x0 * c - x1 * s);
+        out[row_base + col + params.half_rot] = bfloat(x1 * c + x0 * s);
+    }
+    for (uint col = params.rotary_dim + tid; col < params.n_cols; col += params.block_size) {
+        out[row_base + col] =
+            bfloat(float(input[row_base + col]) * inv_rms * (float(weight[col]) + 1.0f));
+    }
+}
+)RMSROPE";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:135
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile RMSNorm RoPE library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_rms_norm_rope_rows_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:136
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load RMSNorm RoPE function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:137
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create RMSNorm RoPE pipeline"
                                                                              }];
                         }
                     }
@@ -4360,6 +4677,152 @@ kernel void supersonic_qwen_linear_prep_decode_apply_bf16_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> qwen_linear_decode_apply_inplace_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:584
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"LDAPI(
+#include <metal_stdlib>
+using namespace metal;
+
+struct QwenLinearPrepDecodeApplyParams {
+    uint num_v_heads;
+    uint num_k_heads;
+    uint head_repeat;
+    uint k_head_dim;
+    uint v_head_dim;
+    uint key_dim;
+    uint value_dim;
+    uint state_dim;
+    uint total_threads;
+    float eps;
+    float q_scale;
+};
+
+static inline float softplus_stable(float x) {
+    return (x > 20.0f) ? x : log(1.0f + exp(x));
+}
+
+kernel void supersonic_qwen_linear_decode_apply_inplace_bf16(
+    device const bfloat* conv_pack [[buffer(0)]],
+    device const bfloat* a [[buffer(1)]],
+    device const bfloat* b [[buffer(2)]],
+    device const bfloat* dt_bias [[buffer(3)]],
+    device const bfloat* a_log_exp [[buffer(4)]],
+    device float* state [[buffer(5)]],
+    device bfloat* attn_out [[buffer(6)]],
+    constant QwenLinearPrepDecodeApplyParams& params [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_threads) {
+        return;
+    }
+
+    uint v_head = gid / params.v_head_dim;
+    uint vv = gid - v_head * params.v_head_dim;
+    uint k_head = v_head / params.head_repeat;
+    uint qk_base = k_head * params.k_head_dim;
+    uint v_base = v_head * params.v_head_dim;
+
+    float q_sum = 0.0f;
+    float k_sum = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float qh = float(conv_pack[qk_base + kk]);
+        float kh = float(conv_pack[params.key_dim + qk_base + kk]);
+        q_sum = fma(qh, qh, q_sum);
+        k_sum = fma(kh, kh, k_sum);
+    }
+    float q_inv_norm = rsqrt(q_sum + params.eps) * params.q_scale;
+    float k_inv_norm = rsqrt(k_sum + params.eps);
+
+    float beta = 1.0f / (1.0f + exp(-float(b[v_head])));
+    float g_exp =
+        exp(-softplus_stable(float(a[v_head]) + float(dt_bias[v_head])) * float(a_log_exp[v_head]));
+
+    uint state_head_base = (v_head * params.k_head_dim) * params.v_head_dim + vv;
+    float kv_mem = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        uint state_idx = state_head_base + kk * params.v_head_dim;
+        float k_norm = float(conv_pack[params.key_dim + qk_base + kk]) * k_inv_norm;
+        float prior = state[state_idx] * g_exp;
+        kv_mem = fma(prior, k_norm, kv_mem);
+        state[state_idx] = prior;
+    }
+
+    float v_linear = float(conv_pack[params.key_dim * 2 + v_base + vv]);
+    float delta = (v_linear - kv_mem) * beta;
+    float out_value = 0.0f;
+    for (uint kk = 0; kk < params.k_head_dim; ++kk) {
+        float q_scaled = float(conv_pack[qk_base + kk]) * q_inv_norm;
+        float k_norm = float(conv_pack[params.key_dim + qk_base + kk]) * k_inv_norm;
+        uint state_idx = state_head_base + kk * params.v_head_dim;
+        float updated = fma(k_norm, delta, state[state_idx]);
+        state[state_idx] = updated;
+        out_value = fma(updated, q_scaled, out_value);
+    }
+    attn_out[v_base + vv] = bfloat(out_value);
+}
+)LDAPI";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:585
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen linear decode apply inplace library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen_linear_decode_apply_inplace_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:586
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen linear decode apply inplace function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                code:587
+                                                                            userInfo:@{
+                                                                                NSLocalizedDescriptionKey :
+                                                                                    @"Failed to create Qwen linear decode apply inplace pipeline"
+                                                                            }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> conv_state_update_bf16_pipeline(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -4825,6 +5288,12 @@ extern "C" int supersonic_metal_batch_begin() {
 extern "C" int supersonic_metal_batch_flush() {
     @autoreleasepool {
         return metal_batch_flush();
+    }
+}
+
+extern "C" int supersonic_metal_batch_set_label(const char* label) {
+    @autoreleasepool {
+        return metal_batch_set_label(label);
     }
 }
 
@@ -6659,6 +7128,105 @@ extern "C" int supersonic_metal_qwen_linear_prep_decode_apply_bf16_f32(
     }
 }
 
+extern "C" int supersonic_metal_qwen_linear_decode_apply_inplace_bf16(
+    size_t num_v_heads,
+    size_t num_k_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* conv_pack_ptr,
+    const void* a_ptr,
+    const void* b_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_exp_ptr,
+    void* state_ptr,
+    void* attn_out_ptr
+) {
+    @autoreleasepool {
+        if (num_v_heads == 0 || num_k_heads == 0 || head_k_dim == 0 || head_v_dim == 0 ||
+            num_v_heads % num_k_heads != 0 || conv_pack_ptr == nullptr || a_ptr == nullptr ||
+            b_ptr == nullptr || dt_bias_ptr == nullptr || a_log_exp_ptr == nullptr ||
+            state_ptr == nullptr || attn_out_ptr == nullptr) {
+            return 607;
+        }
+        if (num_v_heads > UINT32_MAX || num_k_heads > UINT32_MAX ||
+            head_k_dim > UINT32_MAX || head_v_dim > UINT32_MAX) {
+            return 608;
+        }
+        size_t total_threads = num_v_heads * head_v_dim;
+        if (total_threads > UINT32_MAX) {
+            return 609;
+        }
+        if (num_k_heads > SIZE_MAX / head_k_dim || num_v_heads > SIZE_MAX / head_k_dim / head_v_dim) {
+            return 610;
+        }
+        size_t key_dim = num_k_heads * head_k_dim;
+        size_t value_dim = total_threads;
+        size_t state_dim = num_v_heads * head_k_dim * head_v_dim;
+        if (key_dim > UINT32_MAX || value_dim > UINT32_MAX || state_dim > UINT32_MAX) {
+            return 611;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            qwen_linear_decode_apply_inplace_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 612;
+        }
+
+        id<MTLBuffer> conv_pack = nil;
+        id<MTLBuffer> a = nil;
+        id<MTLBuffer> b = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log_exp = nil;
+        id<MTLBuffer> state = nil;
+        id<MTLBuffer> attn_out = nil;
+        size_t conv_pack_offset = 0;
+        size_t a_offset = 0;
+        size_t b_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_exp_offset = 0;
+        size_t state_offset = 0;
+        size_t attn_out_offset = 0;
+        if (lookup_buffer(conv_pack_ptr, &conv_pack, &conv_pack_offset) != 0) return 613;
+        if (lookup_buffer(a_ptr, &a, &a_offset) != 0) return 614;
+        if (lookup_buffer(b_ptr, &b, &b_offset) != 0) return 615;
+        if (lookup_buffer(dt_bias_ptr, &dt_bias, &dt_bias_offset) != 0) return 616;
+        if (lookup_buffer(a_log_exp_ptr, &a_log_exp, &a_log_exp_offset) != 0) return 617;
+        if (lookup_buffer(state_ptr, &state, &state_offset) != 0) return 618;
+        if (lookup_buffer(attn_out_ptr, &attn_out, &attn_out_offset) != 0) return 619;
+
+        QwenLinearPrepDecodeApplyParams params = {
+            static_cast<uint32_t>(num_v_heads),
+            static_cast<uint32_t>(num_k_heads),
+            static_cast<uint32_t>(num_v_heads / num_k_heads),
+            static_cast<uint32_t>(head_k_dim),
+            static_cast<uint32_t>(head_v_dim),
+            static_cast<uint32_t>(key_dim),
+            static_cast<uint32_t>(value_dim),
+            static_cast<uint32_t>(state_dim),
+            static_cast<uint32_t>(total_threads),
+            1.0e-6f,
+            1.0f / sqrtf(static_cast<float>(head_k_dim)),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:conv_pack offset:conv_pack_offset atIndex:0];
+            [encoder setBuffer:a offset:a_offset atIndex:1];
+            [encoder setBuffer:b offset:b_offset atIndex:2];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:3];
+            [encoder setBuffer:a_log_exp offset:a_log_exp_offset atIndex:4];
+            [encoder setBuffer:state offset:state_offset atIndex:5];
+            [encoder setBuffer:attn_out offset:attn_out_offset atIndex:6];
+            [encoder setBytes:&params length:sizeof(params) atIndex:7];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(total_threads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        }, 620, 621, 622, 623);
+    }
+}
+
 extern "C" int supersonic_metal_conv_state_update_bf16(
     size_t channels,
     size_t state_len,
@@ -7258,6 +7826,94 @@ extern "C" int supersonic_metal_qwen_mlp_down_residual_bf16(
     }
 }
 
+extern "C" int supersonic_metal_qwen_linear_out_residual_f32_bf16(
+    size_t hidden_dim,
+    size_t num_rows,
+    size_t row_dim,
+    float eps,
+    const void* attn_ptr,
+    const void* gate_ptr,
+    const void* weight_ptr,
+    const void* out_proj_ptr,
+    const void* residual_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (hidden_dim == 0 || num_rows == 0 || row_dim == 0 || attn_ptr == nullptr ||
+            gate_ptr == nullptr || weight_ptr == nullptr || out_proj_ptr == nullptr ||
+            residual_ptr == nullptr || out_ptr == nullptr) {
+            return 399;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            qwen_linear_out_residual_pipeline_f32_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 400;
+        }
+
+        id<MTLBuffer> attn = nil;
+        id<MTLBuffer> gate = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> out_proj = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> out = nil;
+        size_t attn_offset = 0;
+        size_t gate_offset = 0;
+        size_t weight_offset = 0;
+        size_t out_proj_offset = 0;
+        size_t residual_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(attn_ptr, &attn, &attn_offset) != 0) {
+            return 401;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 402;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 403;
+        }
+        if (lookup_buffer(out_proj_ptr, &out_proj, &out_proj_offset) != 0) {
+            return 404;
+        }
+        if (lookup_buffer(residual_ptr, &residual, &residual_offset) != 0) {
+            return 405;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 406;
+        }
+
+        struct QwenLinearOutParams {
+            uint32_t hidden_dim;
+            uint32_t num_rows;
+            uint32_t row_dim;
+            float eps;
+        } params = {
+            static_cast<uint32_t>(hidden_dim),
+            static_cast<uint32_t>(num_rows),
+            static_cast<uint32_t>(row_dim),
+            eps,
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:attn offset:attn_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:weight offset:weight_offset atIndex:2];
+            [encoder setBuffer:out_proj offset:out_proj_offset atIndex:3];
+            [encoder setBuffer:residual offset:residual_offset atIndex:4];
+            [encoder setBuffer:out offset:out_offset atIndex:5];
+            [encoder setBytes:&params length:sizeof(params) atIndex:6];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(hidden_dim, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 407, 408, 409, 410);
+    }
+}
+
 extern "C" int supersonic_metal_qwen_full_projections_bf16(
     size_t hidden_dim,
     size_t q_proj_dim,
@@ -7530,7 +8186,9 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
     size_t vocab_size,
     const void* hidden_ptr,
     const void* weight_ptr,
-    void* out_index_ptr
+    void* out_index_ptr,
+    void* partial_values_ptr,
+    void* partial_indices_ptr
 ) {
     @autoreleasepool {
         if (in_dim == 0 || vocab_size == 0 || hidden_ptr == nullptr || weight_ptr == nullptr ||
@@ -7554,9 +8212,13 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
         id<MTLBuffer> hidden = nil;
         id<MTLBuffer> weight = nil;
         id<MTLBuffer> out_index = nil;
+        id<MTLBuffer> partial_values = nil;
+        id<MTLBuffer> partial_indices = nil;
         size_t hidden_offset = 0;
         size_t weight_offset = 0;
         size_t out_index_offset = 0;
+        size_t partial_values_offset = 0;
+        size_t partial_indices_offset = 0;
         if (lookup_buffer(hidden_ptr, &hidden, &hidden_offset) != 0) {
             return 273;
         }
@@ -7577,10 +8239,22 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
         if (partial_count == 0 || partial_count > UINT32_MAX) {
             return 279;
         }
-        id<MTLBuffer> partial_values = [device newBufferWithLength:partial_count * sizeof(float)
-                                                           options:MTLResourceStorageModePrivate];
-        id<MTLBuffer> partial_indices = [device newBufferWithLength:partial_count * sizeof(uint32_t)
-                                                            options:MTLResourceStorageModePrivate];
+        if (partial_values_ptr != nullptr) {
+            if (lookup_buffer(partial_values_ptr, &partial_values, &partial_values_offset) != 0) {
+                return 282;
+            }
+        } else {
+            partial_values = [device newBufferWithLength:partial_count * sizeof(float)
+                                                 options:MTLResourceStorageModePrivate];
+        }
+        if (partial_indices_ptr != nullptr) {
+            if (lookup_buffer(partial_indices_ptr, &partial_indices, &partial_indices_offset) != 0) {
+                return 283;
+            }
+        } else {
+            partial_indices = [device newBufferWithLength:partial_count * sizeof(uint32_t)
+                                                  options:MTLResourceStorageModePrivate];
+        }
         if (partial_values == nil || partial_indices == nil) {
             return 280;
         }
@@ -7596,8 +8270,8 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
             [encoder setComputePipelineState:stage1];
             [encoder setBuffer:hidden offset:hidden_offset atIndex:0];
             [encoder setBuffer:weight offset:weight_offset atIndex:1];
-            [encoder setBuffer:partial_values offset:0 atIndex:2];
-            [encoder setBuffer:partial_indices offset:0 atIndex:3];
+            [encoder setBuffer:partial_values offset:partial_values_offset atIndex:2];
+            [encoder setBuffer:partial_indices offset:partial_indices_offset atIndex:3];
             [encoder setBytes:&params length:sizeof(params) atIndex:4];
             MTLSize groups = MTLSizeMake(partial_count, 1, 1);
             MTLSize threads = MTLSizeMake(block_size, 1, 1);
@@ -7606,12 +8280,93 @@ extern "C" int supersonic_metal_lm_head_argmax_bf16(
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
             [encoder setComputePipelineState:stage2];
-            [encoder setBuffer:partial_values offset:0 atIndex:0];
-            [encoder setBuffer:partial_indices offset:0 atIndex:1];
+            [encoder setBuffer:partial_values offset:partial_values_offset atIndex:0];
+            [encoder setBuffer:partial_indices offset:partial_indices_offset atIndex:1];
             [encoder setBuffer:out_index offset:out_index_offset atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:threads];
         }, 276, 277, 278, 281);
+    }
+}
+
+extern "C" int supersonic_metal_argmax_bf16(
+    size_t n,
+    const void* logits_ptr,
+    void* out_index_ptr
+) {
+    @autoreleasepool {
+        if (n == 0 || logits_ptr == nullptr || out_index_ptr == nullptr) {
+            return 310;
+        }
+        if (n > UINT32_MAX) {
+            return 311;
+        }
+
+        NSError* stage1_error = nil;
+        NSError* stage2_error = nil;
+        id<MTLComputePipelineState> stage1 =
+            lm_head_argmax_pipeline(@"supersonic_argmax_stage1_bf16", &stage1_error);
+        id<MTLComputePipelineState> stage2 =
+            lm_head_argmax_pipeline(@"supersonic_lm_head_argmax_stage2", &stage2_error);
+        if (stage1 == nil || stage2 == nil) {
+            return 312;
+        }
+
+        id<MTLBuffer> logits = nil;
+        id<MTLBuffer> out_index = nil;
+        size_t logits_offset = 0;
+        size_t out_index_offset = 0;
+        if (lookup_buffer(logits_ptr, &logits, &logits_offset) != 0) {
+            return 313;
+        }
+        if (lookup_buffer(out_index_ptr, &out_index, &out_index_offset) != 0) {
+            return 314;
+        }
+
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            return 315;
+        }
+
+        const uint32_t block_size = 256;
+        const size_t partial_count = (n + block_size - 1) / block_size;
+        if (partial_count == 0 || partial_count > UINT32_MAX) {
+            return 316;
+        }
+        id<MTLBuffer> partial_values = [device newBufferWithLength:partial_count * sizeof(float)
+                                                           options:MTLResourceStorageModePrivate];
+        id<MTLBuffer> partial_indices = [device newBufferWithLength:partial_count * sizeof(uint32_t)
+                                                            options:MTLResourceStorageModePrivate];
+        if (partial_values == nil || partial_indices == nil) {
+            return 317;
+        }
+
+        LmHeadArgmaxParams params = {
+            0,
+            static_cast<uint32_t>(n),
+            block_size,
+            static_cast<uint32_t>(partial_count),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:stage1];
+            [encoder setBuffer:logits offset:logits_offset atIndex:0];
+            [encoder setBuffer:partial_values offset:0 atIndex:1];
+            [encoder setBuffer:partial_indices offset:0 atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(partial_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(block_size, 1, 1)];
+
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [encoder setComputePipelineState:stage2];
+            [encoder setBuffer:partial_values offset:0 atIndex:0];
+            [encoder setBuffer:partial_indices offset:0 atIndex:1];
+            [encoder setBuffer:out_index offset:out_index_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(block_size, 1, 1)];
+        }, 315, 318, 319, 320);
     }
 }
 
@@ -7620,6 +8375,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
     size_t kv_heads,
     size_t q_len,
     size_t kv_len,
+    size_t kv_stride,
     size_t head_dim,
     float scale,
     size_t seqlen_offset,
@@ -7629,7 +8385,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
     void* out_ptr
 ) {
     @autoreleasepool {
-        if (q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 || head_dim == 0 ||
+        if (q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 || kv_stride < kv_len || head_dim == 0 ||
             query_ptr == nullptr || key_ptr == nullptr || value_ptr == nullptr || out_ptr == nullptr) {
             return 21;
         }
@@ -7666,6 +8422,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             static_cast<uint32_t>(kv_heads),
             static_cast<uint32_t>(q_len),
             static_cast<uint32_t>(kv_len),
+            static_cast<uint32_t>(kv_stride),
             static_cast<uint32_t>(head_dim),
             static_cast<uint32_t>(seqlen_offset),
             scale,
@@ -7746,6 +8503,95 @@ extern "C" int supersonic_metal_rms_norm_rows_bf16(
             MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
             [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
         }, 46, 47, 48, 49);
+    }
+}
+
+extern "C" int supersonic_metal_rms_norm_rope_rows_bf16(
+    size_t n_rows,
+    size_t n_cols,
+    size_t rotary_dim,
+    float eps,
+    size_t pos_offset,
+    const void* input_ptr,
+    const void* weight_ptr,
+    const void* cos_ptr,
+    const void* sin_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (n_rows == 0 || n_cols == 0 || input_ptr == nullptr || weight_ptr == nullptr ||
+            cos_ptr == nullptr || sin_ptr == nullptr || out_ptr == nullptr || rotary_dim > n_cols ||
+            (rotary_dim & 1) != 0) {
+            return 138;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = rms_norm_rope_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 139;
+        }
+
+        id<MTLBuffer> input = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> cos_table = nil;
+        id<MTLBuffer> sin_table = nil;
+        id<MTLBuffer> out = nil;
+        size_t input_offset = 0;
+        size_t weight_offset = 0;
+        size_t cos_offset = 0;
+        size_t sin_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(input_ptr, &input, &input_offset) != 0) {
+            return 140;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 141;
+        }
+        if (lookup_buffer(cos_ptr, &cos_table, &cos_offset) != 0) {
+            return 142;
+        }
+        if (lookup_buffer(sin_ptr, &sin_table, &sin_offset) != 0) {
+            return 143;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 144;
+        }
+
+        NSUInteger block_size = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
+        if (block_size == 0) {
+            block_size = 1;
+        }
+        struct RmsNormRopeParams {
+            uint32_t n_rows;
+            uint32_t n_cols;
+            uint32_t rotary_dim;
+            uint32_t half_rot;
+            uint32_t pos_offset;
+            float eps;
+            uint32_t block_size;
+        } params = {
+            static_cast<uint32_t>(n_rows),
+            static_cast<uint32_t>(n_cols),
+            static_cast<uint32_t>(rotary_dim),
+            static_cast<uint32_t>(rotary_dim / 2),
+            static_cast<uint32_t>(pos_offset),
+            eps,
+            static_cast<uint32_t>(block_size),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:input offset:input_offset atIndex:0];
+            [encoder setBuffer:weight offset:weight_offset atIndex:1];
+            [encoder setBuffer:cos_table offset:cos_offset atIndex:2];
+            [encoder setBuffer:sin_table offset:sin_offset atIndex:3];
+            [encoder setBuffer:out offset:out_offset atIndex:4];
+            [encoder setBytes:&params length:sizeof(params) atIndex:5];
+
+            MTLSize threadgroups = MTLSizeMake(n_rows, 1, 1);
+            MTLSize threads_per_group = MTLSizeMake(block_size, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 145, 146, 147, 148);
     }
 }
 

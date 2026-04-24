@@ -826,6 +826,40 @@ pub fn metal_lm_head_argmax_bf16_into(
     }
 }
 
+pub fn metal_argmax_bf16_into(
+    logits: &GpuBuffer,
+    mut out_index: &mut GpuBuffer,
+    n: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Metal || out_index.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_argmax_bf16_into requires Metal buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_argmax_bf16_into requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "metal_argmax_bf16_into requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    {
+        crate::prefill_ffi::metal_profile_time("argmax_bf16", "native", || {
+            crate::metal_native::argmax_bf16(logits, &mut out_index, n)
+        })
+    }
+    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    {
+        let _ = (logits, out_index, n);
+        Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+    }
+}
+
 /// 4B variant of RMSNorm (same logic, separate compilation).
 pub fn rms_norm_4b(
     ordinal: usize,
