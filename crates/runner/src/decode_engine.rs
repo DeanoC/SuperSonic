@@ -176,6 +176,40 @@ fn certified_kv_select_blocks_from_scores(
     Ok((selected, tail, rung1, probs))
 }
 
+fn certified_kv_probs_from_scores(block_max: &[f32], block_sum: &[f32]) -> Result<Vec<f32>> {
+    let num_blocks = block_max.len();
+    if num_blocks == 0 || block_sum.len() != num_blocks {
+        return Ok(Vec::new());
+    }
+    let mut log_mass = Vec::with_capacity(num_blocks);
+    for (&m, &s) in block_max.iter().zip(block_sum.iter()) {
+        if !m.is_finite() || !s.is_finite() || s <= 0.0 {
+            return Err(anyhow::anyhow!(
+                "certified KV probability pass received invalid block score max={} sum={}",
+                m,
+                s
+            ));
+        }
+        log_mass.push(m + s.ln());
+    }
+    let global = logsumexp(&log_mass);
+    if !global.is_finite() {
+        return Err(anyhow::anyhow!(
+            "certified KV probability pass global logsumexp is not finite"
+        ));
+    }
+    let mut probs: Vec<f32> = log_mass.iter().map(|m| (*m - global).exp()).collect();
+    for p in &mut probs {
+        if !p.is_finite() || *p < 0.0 {
+            return Err(anyhow::anyhow!(
+                "certified KV probability pass produced invalid probability {}",
+                *p
+            ));
+        }
+    }
+    Ok(probs)
+}
+
 fn certified_kv_select_block_indices_from_scores(
     block_max: &[f32],
     block_sum: &[f32],
@@ -5528,11 +5562,51 @@ impl DecodeEngine {
                     let mut delta_blocks_by_head = Vec::with_capacity(num_q_heads);
                     let mut probs_by_head = Vec::with_capacity(num_q_heads);
                     let mut e_key_by_head = Vec::with_capacity(num_q_heads);
+                    let key_budget_covers_all_blocks = cfg.k_max >= num_blocks
+                        || ((cfg.k_max as f32) * cfg.rung1_multiplier).ceil() as usize
+                            >= num_blocks;
                     let cert_selector_start = Instant::now();
                     for qh in 0..num_q_heads {
                         let score_start = qh * num_blocks;
                         let score_end = score_start + num_blocks;
                         let kvh = qh / gqa_group;
+                        if key_budget_covers_all_blocks {
+                            let probs = certified_kv_probs_from_scores(
+                                &block_max_host[score_start..score_end],
+                                &block_sum_host[score_start..score_end],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} q_head {qh} certified KV probability pass: {e}"
+                                )
+                            })?;
+                            let mut requires_value_escalation = false;
+                            for (block, prob) in probs.iter().enumerate() {
+                                let value_contribution = prob
+                                    * value_error_host[kvh * value_error_stride_blocks + block];
+                                if value_contribution > cfg.v_tol {
+                                    value_promote_flags[kvh * num_blocks + block] = true;
+                                    requires_value_escalation = true;
+                                }
+                            }
+                            if requires_value_escalation {
+                                value_escalation_heads += 1;
+                            }
+                            let selected_indices: Vec<usize> = (0..num_blocks).collect();
+                            for block in 0..num_blocks {
+                                promote_index_host[score_start + block] = block as u32;
+                            }
+                            probs_by_head.push(probs);
+                            e_key_by_head.push(0.0);
+                            delta_blocks_by_head.push(vec![0.0; num_blocks]);
+                            max_promoted_blocks = max_promoted_blocks.max(num_blocks);
+                            selected_by_head.push(selected_indices);
+                            if let Some(t) = timings.as_mut() {
+                                t.certified_kv_true_tail_bound_max =
+                                    t.certified_kv_true_tail_bound_max.max(0.0);
+                            }
+                            continue;
+                        }
                         let delta_blocks = certified_kv_score_delta_blocks(
                             &query_f32_all,
                             &key_scale_host,
@@ -5853,117 +5927,122 @@ impl DecodeEngine {
                         t.certified_kv_gather_ms +=
                             cert_gather_start.elapsed().as_secs_f64() * 1000.0;
                     }
-                    let score_flags_shape = [num_q_heads];
-                    if scratch
-                        .certified_score_consistency_flags
-                        .as_ref()
-                        .map(|buf| buf.shape() != score_flags_shape)
-                        .unwrap_or(true)
-                    {
-                        scratch.certified_score_consistency_flags = Some(
-                            GpuBuffer::zeros(self.ordinal, ScalarType::U32, &score_flags_shape)
-                                .map_err(|e| {
+                    let mut score_consistency_violations = 0usize;
+                    if !key_budget_covers_all_blocks {
+                        let score_flags_shape = [num_q_heads];
+                        if scratch
+                            .certified_score_consistency_flags
+                            .as_ref()
+                            .map(|buf| buf.shape() != score_flags_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_score_consistency_flags = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &score_flags_shape)
+                                    .map_err(|e| {
                                     anyhow::anyhow!(
                                         "layer {idx} certified KV score-consistency flags alloc: {e}"
                                     )
                                 })?,
-                        );
-                    }
-                    let cert_score_consistency_start = Instant::now();
-                    kernel_ffi::certified_kv::score_consistency(
-                        self.ordinal,
-                        attn_q,
-                        key_i8,
-                        key_scale,
-                        key_zero,
-                        scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                        scratch.certified_promote_index.as_ref().unwrap(),
-                        scratch.certified_score_consistency_flags.as_mut().unwrap(),
-                        block_size,
-                        max_promoted_blocks,
-                        gqa_group,
-                        q_scale,
-                        cfg.eps_guard,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV score consistency: {e}")
-                    })?;
-                    let score_consistency_flags = scratch
-                        .certified_score_consistency_flags
-                        .as_ref()
-                        .unwrap()
-                        .to_host_bytes()
+                            );
+                        }
+                        let cert_score_consistency_start = Instant::now();
+                        kernel_ffi::certified_kv::score_consistency(
+                            self.ordinal,
+                            attn_q,
+                            key_i8,
+                            key_scale,
+                            key_zero,
+                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                            scratch.certified_promote_index.as_ref().unwrap(),
+                            scratch.certified_score_consistency_flags.as_mut().unwrap(),
+                            block_size,
+                            max_promoted_blocks,
+                            gqa_group,
+                            q_scale,
+                            cfg.eps_guard,
+                        )
                         .map_err(|e| {
-                            anyhow::anyhow!(
-                                "layer {idx} certified KV score-consistency flags D2H: {e}"
-                            )
+                            anyhow::anyhow!("layer {idx} certified KV score consistency: {e}")
                         })?;
-                    let score_consistency_violations = score_consistency_flags
-                        .chunks_exact(std::mem::size_of::<u32>())
-                        .filter(|chunk| {
-                            u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
-                        })
-                        .count();
-                    if let Some(t) = timings.as_mut() {
-                        t.certified_kv_score_consistency_ms +=
-                            cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
-                    }
-                    if score_consistency_violations > 0 {
-                        force_dense_layer_fallback = true;
-                    }
-                    let selected_log_mass_shape = [num_q_heads, max_promoted_blocks];
-                    if scratch
-                        .certified_selected_fp16_log_masses
-                        .as_ref()
-                        .map(|buf| buf.shape() != selected_log_mass_shape)
-                        .unwrap_or(true)
-                    {
-                        scratch.certified_selected_fp16_log_masses = Some(
-                            GpuBuffer::zeros(
-                                self.ordinal,
-                                ScalarType::F32,
-                                &selected_log_mass_shape,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} certified KV selected FP16 log-mass alloc: {e}"
-                                )
-                            })?,
-                        );
-                    }
-                    let cert_rank_log_start = Instant::now();
-                    kernel_ffi::certified_kv::selected_fp16_log_masses(
-                        self.ordinal,
-                        attn_q,
-                        scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                        scratch.certified_promote_index.as_ref().unwrap(),
-                        scratch.certified_selected_fp16_log_masses.as_mut().unwrap(),
-                        block_size,
-                        max_promoted_blocks,
-                        q_scale,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV selected FP16 log-masses: {e}")
-                    })?;
-                    let selected_fp16_log_mass_host = decode_f32_le(
-                        &scratch
-                            .certified_selected_fp16_log_masses
+                        let score_consistency_flags = scratch
+                            .certified_score_consistency_flags
                             .as_ref()
                             .unwrap()
                             .to_host_bytes()
                             .map_err(|e| {
                                 anyhow::anyhow!(
-                                    "layer {idx} certified KV selected FP16 log-masses D2H: {e}"
+                                    "layer {idx} certified KV score-consistency flags D2H: {e}"
                                 )
-                            })?,
-                    );
-                    if let Some(t) = timings.as_mut() {
-                        t.certified_kv_rank_log_ms +=
-                            cert_rank_log_start.elapsed().as_secs_f64() * 1000.0;
+                            })?;
+                        score_consistency_violations = score_consistency_flags
+                            .chunks_exact(std::mem::size_of::<u32>())
+                            .filter(|chunk| {
+                                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
+                            })
+                            .count();
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_score_consistency_ms +=
+                                cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                    }
+                    if score_consistency_violations > 0 {
+                        force_dense_layer_fallback = true;
                     }
                     let mut ranking_fallback_qheads = Vec::new();
-                    let cert_ranking_cpu_start = Instant::now();
-                    if cfg.ranking_r > 0 {
+                    if cfg.ranking_r > 0 && !key_budget_covers_all_blocks {
+                        let selected_log_mass_shape = [num_q_heads, max_promoted_blocks];
+                        if scratch
+                            .certified_selected_fp16_log_masses
+                            .as_ref()
+                            .map(|buf| buf.shape() != selected_log_mass_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_selected_fp16_log_masses = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::F32,
+                                    &selected_log_mass_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV selected FP16 log-mass alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        let cert_rank_log_start = Instant::now();
+                        kernel_ffi::certified_kv::selected_fp16_log_masses(
+                            self.ordinal,
+                            attn_q,
+                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                            scratch.certified_promote_index.as_ref().unwrap(),
+                            scratch.certified_selected_fp16_log_masses.as_mut().unwrap(),
+                            block_size,
+                            max_promoted_blocks,
+                            q_scale,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV selected FP16 log-masses: {e}"
+                            )
+                        })?;
+                        let selected_fp16_log_mass_host = decode_f32_le(
+                            &scratch
+                                .certified_selected_fp16_log_masses
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV selected FP16 log-masses D2H: {e}"
+                                    )
+                                })?,
+                        );
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_rank_log_ms +=
+                                cert_rank_log_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let cert_ranking_cpu_start = Instant::now();
                         for qh in 0..num_q_heads {
                             let score_start = qh * num_blocks;
                             let score_end = score_start + num_blocks;
@@ -5989,10 +6068,10 @@ impl DecodeEngine {
                                 ranking_fallback_qheads.push(qh);
                             }
                         }
-                    }
-                    if let Some(t) = timings.as_mut() {
-                        t.certified_kv_ranking_cpu_ms +=
-                            cert_ranking_cpu_start.elapsed().as_secs_f64() * 1000.0;
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_ranking_cpu_ms +=
+                                cert_ranking_cpu_start.elapsed().as_secs_f64() * 1000.0;
+                        }
                     }
                     let ranking_fallback_heads = ranking_fallback_qheads.len();
                     let mut ranking_fallback_kv_slots_by_kvh = vec![usize::MAX; num_kv_heads];
