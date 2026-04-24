@@ -826,6 +826,82 @@ pub fn metal_lm_head_argmax_bf16_into(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_lm_head_argmax_bf16_with_partials_into(
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    mut partial_values: &mut GpuBuffer,
+    mut partial_indices: &mut GpuBuffer,
+    mut out_index: &mut GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if hidden.backend() != Backend::Metal
+        || weight.backend() != Backend::Metal
+        || partial_values.backend() != Backend::Metal
+        || partial_indices.backend() != Backend::Metal
+        || out_index.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "metal_lm_head_argmax_bf16_with_partials_into requires Metal buffers".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_lm_head_argmax_bf16_with_partials_into requires BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    let partial_count = vocab_size.div_ceil(256);
+    if partial_values.dtype() != ScalarType::F32 || partial_values.elem_count() < partial_count {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_lm_head_argmax_bf16_with_partials_into requires F32 partial_values[{partial_count}], got {:?}[{}]",
+            partial_values.dtype(),
+            partial_values.elem_count()
+        )));
+    }
+    if partial_indices.dtype() != ScalarType::U32 || partial_indices.elem_count() < partial_count {
+        return Err(GpuError::InvalidArg(format!(
+            "metal_lm_head_argmax_bf16_with_partials_into requires U32 partial_indices[{partial_count}], got {:?}[{}]",
+            partial_indices.dtype(),
+            partial_indices.elem_count()
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "metal_lm_head_argmax_bf16_with_partials_into requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    {
+        crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
+            crate::metal_native::lm_head_argmax_bf16_with_partials(
+                hidden,
+                weight,
+                &mut out_index,
+                Some(&mut partial_values),
+                Some(&mut partial_indices),
+                hidden_dim,
+                vocab_size,
+            )
+        })
+    }
+    #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+    {
+        let _ = (
+            hidden,
+            weight,
+            partial_values,
+            partial_indices,
+            out_index,
+            hidden_dim,
+            vocab_size,
+        );
+        Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+    }
+}
+
 pub fn metal_argmax_bf16_into(
     logits: &GpuBuffer,
     mut out_index: &mut GpuBuffer,

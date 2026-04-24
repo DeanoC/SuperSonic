@@ -2064,9 +2064,11 @@ impl DecodeEngine {
                 kernel_ffi::metal_argmax_bf16_into(&self.logits_buf, &mut self.argmax_buf, vocab_size)
                     .map_err(|e| anyhow::anyhow!("lm_head matmul argmax reduce: {e}"))?;
             } else {
-                kernel_ffi::metal_lm_head_argmax_bf16_into(
+                kernel_ffi::metal_lm_head_argmax_bf16_with_partials_into(
                     &self.normed_buf,
                     &*self.weights.lm_head,
+                    &mut self.lm_head_block_best_vals,
+                    &mut self.lm_head_block_best_idxs,
                     &mut self.argmax_buf,
                     hidden_dim,
                     vocab_size,
