@@ -1012,6 +1012,12 @@ pub struct DecodeStageTimings {
     pub persistent_full_attn_core_ms: f64,
     pub certified_kv_key_quantize_ms: f64,
     pub certified_kv_value_quantize_ms: f64,
+    pub certified_kv_score_ms: f64,
+    pub certified_kv_selector_ms: f64,
+    pub certified_kv_gather_ms: f64,
+    pub certified_kv_score_consistency_ms: f64,
+    pub certified_kv_rank_log_ms: f64,
+    pub certified_kv_ranking_cpu_ms: f64,
     pub certified_kv_attend_ms: f64,
     pub certified_kv_cast_ms: f64,
     pub certified_kv_value_escalation_heads: usize,
@@ -1056,6 +1062,12 @@ impl DecodeStageTimings {
         self.persistent_full_attn_core_ms += rhs.persistent_full_attn_core_ms;
         self.certified_kv_key_quantize_ms += rhs.certified_kv_key_quantize_ms;
         self.certified_kv_value_quantize_ms += rhs.certified_kv_value_quantize_ms;
+        self.certified_kv_score_ms += rhs.certified_kv_score_ms;
+        self.certified_kv_selector_ms += rhs.certified_kv_selector_ms;
+        self.certified_kv_gather_ms += rhs.certified_kv_gather_ms;
+        self.certified_kv_score_consistency_ms += rhs.certified_kv_score_consistency_ms;
+        self.certified_kv_rank_log_ms += rhs.certified_kv_rank_log_ms;
+        self.certified_kv_ranking_cpu_ms += rhs.certified_kv_ranking_cpu_ms;
         self.certified_kv_attend_ms += rhs.certified_kv_attend_ms;
         self.certified_kv_cast_ms += rhs.certified_kv_cast_ms;
         self.certified_kv_value_escalation_heads += rhs.certified_kv_value_escalation_heads;
@@ -5419,6 +5431,7 @@ impl DecodeEngine {
                                 })?,
                         );
                     }
+                    let cert_score_start = Instant::now();
                     kernel_ffi::certified_kv::score_blocks_int8(
                         self.ordinal,
                         attn_q,
@@ -5456,6 +5469,10 @@ impl DecodeEngine {
                         decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
                         })?);
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_score_ms +=
+                            cert_score_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     let gqa_group = num_q_heads / num_kv_heads;
                     let q_scale = 1.0 / (head_dim as f32).sqrt();
                     let key_stride_tokens = key_i8.shape()[1];
@@ -5511,6 +5528,7 @@ impl DecodeEngine {
                     let mut delta_blocks_by_head = Vec::with_capacity(num_q_heads);
                     let mut probs_by_head = Vec::with_capacity(num_q_heads);
                     let mut e_key_by_head = Vec::with_capacity(num_q_heads);
+                    let cert_selector_start = Instant::now();
                     for qh in 0..num_q_heads {
                         let score_start = qh * num_blocks;
                         let score_end = score_start + num_blocks;
@@ -5683,6 +5701,8 @@ impl DecodeEngine {
                                 .certified_kv_bound_total_max
                                 .max(e_key_by_head[qh] + e_val);
                         }
+                        t.certified_kv_selector_ms +=
+                            cert_selector_start.elapsed().as_secs_f64() * 1000.0;
                     }
                     let promoted_key_shape =
                         [num_q_heads, max_promoted_blocks, block_size, head_dim];
@@ -5764,6 +5784,7 @@ impl DecodeEngine {
                             value_promote_index_host.len() * std::mem::size_of::<u32>(),
                         )
                     };
+                    let cert_gather_start = Instant::now();
                     gpu_hal::copy_h2d(
                         self.ordinal,
                         scratch
@@ -5823,6 +5844,15 @@ impl DecodeEngine {
                     .map_err(|e| {
                         anyhow::anyhow!("layer {idx} certified KV promoted BF16 gather: {e}")
                     })?;
+                    if timings.is_some() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV gather synchronize: {e}")
+                        })?;
+                    }
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_gather_ms +=
+                            cert_gather_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     let score_flags_shape = [num_q_heads];
                     if scratch
                         .certified_score_consistency_flags
@@ -5839,6 +5869,7 @@ impl DecodeEngine {
                                 })?,
                         );
                     }
+                    let cert_score_consistency_start = Instant::now();
                     kernel_ffi::certified_kv::score_consistency(
                         self.ordinal,
                         attn_q,
@@ -5873,6 +5904,10 @@ impl DecodeEngine {
                             u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
                         })
                         .count();
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_score_consistency_ms +=
+                            cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     if score_consistency_violations > 0 {
                         force_dense_layer_fallback = true;
                     }
@@ -5896,6 +5931,7 @@ impl DecodeEngine {
                             })?,
                         );
                     }
+                    let cert_rank_log_start = Instant::now();
                     kernel_ffi::certified_kv::selected_fp16_log_masses(
                         self.ordinal,
                         attn_q,
@@ -5921,7 +5957,12 @@ impl DecodeEngine {
                                 )
                             })?,
                     );
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_rank_log_ms +=
+                            cert_rank_log_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     let mut ranking_fallback_qheads = Vec::new();
+                    let cert_ranking_cpu_start = Instant::now();
                     if cfg.ranking_r > 0 {
                         for qh in 0..num_q_heads {
                             let score_start = qh * num_blocks;
@@ -5948,6 +5989,10 @@ impl DecodeEngine {
                                 ranking_fallback_qheads.push(qh);
                             }
                         }
+                    }
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_ranking_cpu_ms +=
+                            cert_ranking_cpu_start.elapsed().as_secs_f64() * 1000.0;
                     }
                     let ranking_fallback_heads = ranking_fallback_qheads.len();
                     let mut ranking_fallback_kv_slots_by_kvh = vec![usize::MAX; num_kv_heads];
