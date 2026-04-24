@@ -5778,8 +5778,11 @@ impl DecodeEngine {
                         t.certified_kv_selector_ms +=
                             cert_selector_start.elapsed().as_secs_f64() * 1000.0;
                     }
-                    let promoted_key_shape =
-                        [num_q_heads, max_promoted_blocks, block_size, head_dim];
+                    let promoted_key_shape = if key_budget_covers_all_blocks {
+                        [num_kv_heads, num_blocks, block_size, head_dim]
+                    } else {
+                        [num_q_heads, max_promoted_blocks, block_size, head_dim]
+                    };
                     let promoted_value_shape = [
                         num_kv_heads,
                         max_promoted_value_blocks,

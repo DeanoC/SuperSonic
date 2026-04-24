@@ -583,6 +583,31 @@ __global__ void certified_kv_gather_promoted_keys_gqa_union_kernel(
     }
 }
 
+__global__ void certified_kv_gather_all_promoted_keys_compact_kernel(
+    const __nv_bfloat16* __restrict__ tier2_key_bf16,
+    __nv_bfloat16* __restrict__ promoted_key_bf16,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int cap_tokens,
+    int head_dim
+) {
+    const int linear = blockIdx.x;
+    const int kvh = linear / num_blocks;
+    const int block = linear - kvh * num_blocks;
+    if (kvh >= kv_heads || block >= num_blocks) {
+        return;
+    }
+    const int elems_per_block = block_size * head_dim;
+    const size_t src_base =
+        (static_cast<size_t>(kvh) * cap_tokens + static_cast<size_t>(block) * block_size) * head_dim;
+    const size_t dst_base =
+        (static_cast<size_t>(kvh) * num_blocks + block) * elems_per_block;
+    for (int idx = threadIdx.x; idx < elems_per_block; idx += blockDim.x) {
+        promoted_key_bf16[dst_base + idx] = tier2_key_bf16[src_base + idx];
+    }
+}
+
 __global__ void certified_kv_gather_promoted_values_kernel(
     const __nv_bfloat16* __restrict__ tier2_value_bf16,
     const uint32_t* __restrict__ value_promote_index,
@@ -966,6 +991,7 @@ __global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
     int tail_len,
     int key_stride_tokens,
     int key_scale_stride_blocks,
+    int promoted_key_heads,
     int max_promoted_blocks,
     int max_promoted_value_blocks,
     int value_stride_tokens,
@@ -997,9 +1023,10 @@ __global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
             float k;
             if (promote) {
                 const int token_in_block = tok - block_id * block_size;
+                const int promoted_head = (promoted_key_heads == kv_heads) ? kvh : qh;
                 k = bf16_to_float(
                     promoted_key_bf16[
-                        ((static_cast<size_t>(qh) * max_promoted_blocks + promoted_slot) *
+                        ((static_cast<size_t>(promoted_head) * max_promoted_blocks + promoted_slot) *
                              block_size +
                          token_in_block) *
                             head_dim +
@@ -1706,6 +1733,7 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     int num_blocks,
     int block_size,
     int cap_tokens,
+    int promoted_key_heads,
     int max_promoted_blocks,
     int max_promoted_value_blocks,
     int head_dim,
@@ -1718,7 +1746,9 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     }
     if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
         cap_tokens <= 0 || max_promoted_blocks <= 0 ||
-        max_promoted_value_blocks <= 0 || head_dim <= 0 || gqa_group <= 0) {
+        max_promoted_value_blocks <= 0 || head_dim <= 0 || gqa_group <= 0 ||
+        (promoted_key_heads != q_heads && promoted_key_heads != kv_heads) ||
+        (promoted_key_heads == kv_heads && max_promoted_blocks != num_blocks)) {
         return 23;
     }
     if (q_heads != kv_heads * gqa_group || cap_tokens < num_blocks * block_size) {
@@ -1726,19 +1756,31 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     }
     ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
     constexpr int threads = 256;
-    certified_kv_gather_promoted_keys_gqa_union_kernel<<<kv_heads * num_blocks, threads>>>(
-        static_cast<const __nv_bfloat16*>(tier2_key_bf16),
-        static_cast<const uint32_t*>(promote_index),
-        static_cast<__nv_bfloat16*>(promoted_key_bf16),
-        q_heads,
-        kv_heads,
-        num_blocks,
-        block_size,
-        cap_tokens,
-        max_promoted_blocks,
-        head_dim,
-        gqa_group
-    );
+    if (promoted_key_heads == kv_heads && max_promoted_blocks == num_blocks) {
+        certified_kv_gather_all_promoted_keys_compact_kernel<<<kv_heads * num_blocks, threads>>>(
+            static_cast<const __nv_bfloat16*>(tier2_key_bf16),
+            static_cast<__nv_bfloat16*>(promoted_key_bf16),
+            kv_heads,
+            num_blocks,
+            block_size,
+            cap_tokens,
+            head_dim
+        );
+    } else {
+        certified_kv_gather_promoted_keys_gqa_union_kernel<<<kv_heads * num_blocks, threads>>>(
+            static_cast<const __nv_bfloat16*>(tier2_key_bf16),
+            static_cast<const uint32_t*>(promote_index),
+            static_cast<__nv_bfloat16*>(promoted_key_bf16),
+            q_heads,
+            kv_heads,
+            num_blocks,
+            block_size,
+            cap_tokens,
+            max_promoted_blocks,
+            head_dim,
+            gqa_group
+        );
+    }
     if (cudaGetLastError() != cudaSuccess) return 25;
     certified_kv_gather_promoted_values_kernel<<<kv_heads * num_blocks, threads>>>(
         static_cast<const __nv_bfloat16*>(tier2_value_bf16),
@@ -2276,6 +2318,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
     int tail_len,
     int key_stride_tokens,
     int key_scale_stride_blocks,
+    int promoted_key_heads,
     int max_promoted_blocks,
     int max_promoted_value_blocks,
     int value_stride_tokens,
@@ -2301,7 +2344,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
     }
     if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
         tail_len < 0 || key_stride_tokens <= 0 || key_scale_stride_blocks <= 0 ||
-        max_promoted_blocks <= 0 || max_promoted_value_blocks <= 0 ||
+        promoted_key_heads <= 0 || max_promoted_blocks <= 0 || max_promoted_value_blocks <= 0 ||
         value_stride_tokens <= 0 ||
         tail_key_start_tokens < 0 || tail_value_start_tokens < 0 ||
         score_stride_tokens <= 0 || head_dim <= 0 || value_group_size <= 0 || gqa_group <= 0) {
@@ -2311,6 +2354,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
     const int total_tokens = aligned_tokens + tail_len;
     if (head_dim % 2 != 0 || head_dim % value_group_size != 0 ||
         block_size > 256 || q_heads != kv_heads * gqa_group ||
+        (promoted_key_heads != q_heads && promoted_key_heads != kv_heads) ||
+        (promoted_key_heads == kv_heads && max_promoted_blocks != num_blocks) ||
         key_stride_tokens < aligned_tokens || key_scale_stride_blocks < num_blocks ||
         value_stride_tokens < aligned_tokens ||
         score_stride_tokens < total_tokens ||
@@ -2342,6 +2387,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
         tail_len,
         key_stride_tokens,
         key_scale_stride_blocks,
+        promoted_key_heads,
         max_promoted_blocks,
         max_promoted_value_blocks,
         value_stride_tokens,

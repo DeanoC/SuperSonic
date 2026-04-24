@@ -132,6 +132,7 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         cap_tokens: c_int,
+        promoted_key_heads: c_int,
         max_promoted_blocks: c_int,
         max_promoted_value_blocks: c_int,
         head_dim: c_int,
@@ -282,6 +283,7 @@ unsafe extern "C" {
         tail_len: c_int,
         key_stride_tokens: c_int,
         key_scale_stride_blocks: c_int,
+        promoted_key_heads: c_int,
         max_promoted_blocks: c_int,
         max_promoted_value_blocks: c_int,
         value_stride_tokens: c_int,
@@ -1313,10 +1315,13 @@ pub fn gather_promoted_bf16_from_tier2(
     let q_heads = promote_shape[0];
     let num_blocks = promote_shape[1];
     let kv_heads = value_promote_shape[0];
+    let promoted_key_heads = promoted_key_shape[0];
     let head_dim = promoted_key_shape[3];
+    let compact_all_key_layout =
+        promoted_key_heads == kv_heads && max_promoted_blocks == num_blocks;
     if value_promote_shape[1] != num_blocks
         || q_heads != kv_heads * gqa_group
-        || promoted_key_shape[0] != q_heads
+        || (promoted_key_heads != q_heads && !compact_all_key_layout)
         || promoted_key_shape[1] < max_promoted_blocks
         || promoted_key_shape[2] != block_size
         || promoted_value_shape[0] != kv_heads
@@ -1345,6 +1350,7 @@ pub fn gather_promoted_bf16_from_tier2(
             num_blocks as c_int,
             block_size as c_int,
             cap_tokens as c_int,
+            promoted_key_heads as c_int,
             max_promoted_blocks as c_int,
             max_promoted_value_blocks as c_int,
             head_dim as c_int,
@@ -2163,8 +2169,9 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         0
     };
     let promoted_key_shape = promoted_key_bf16.shape();
+    let promoted_key_heads = promoted_key_shape.first().copied().unwrap_or(0);
     let max_promoted_blocks = if promoted_key_shape.len() == 4
-        && promoted_key_shape[0] == q_heads
+        && (promoted_key_shape[0] == q_heads || promoted_key_shape[0] == kv_heads)
         && promoted_key_shape[2] == block_size
         && promoted_key_shape[3] == head_dim
     {
@@ -2196,6 +2203,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         || key_stride_tokens < active_aligned_tokens
         || key_scale_stride_blocks < num_blocks
         || max_promoted_blocks == 0
+        || (promoted_key_heads == kv_heads && max_promoted_blocks != num_blocks)
         || promote_index.shape() != [q_heads, num_blocks]
         || max_promoted_value_blocks == 0
         || value_promote_index.shape() != [kv_heads, num_blocks]
@@ -2292,6 +2300,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
             tail_len as c_int,
             key_stride_tokens as c_int,
             key_scale_stride_blocks as c_int,
+            promoted_key_heads as c_int,
             max_promoted_blocks as c_int,
             max_promoted_value_blocks as c_int,
             value_stride_tokens as c_int,
