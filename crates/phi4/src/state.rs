@@ -41,8 +41,16 @@ impl Phi4LayerState {
             self.kv_cache_v = Some(v.grow_seq_dim(2, new_cap)?);
         } else {
             let cap = ((needed + kv_chunk_size - 1) / kv_chunk_size) * kv_chunk_size;
-            self.kv_cache_k = Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
-            self.kv_cache_v = Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+            self.kv_cache_k = Some(GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[1, nkv, cap, hd],
+            )?);
+            self.kv_cache_v = Some(GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[1, nkv, cap, hd],
+            )?);
         }
         Ok(())
     }

@@ -26,9 +26,10 @@ impl Phi4LongRope {
 
         let half_dim = rotary_dim / 2;
         let (short_factor, long_factor) = match &config.rope_scaling {
-            Some(RopeScaling::Longrope { short_factor, long_factor }) => {
-                (short_factor.as_slice(), long_factor.as_slice())
-            }
+            Some(RopeScaling::Longrope {
+                short_factor,
+                long_factor,
+            }) => (short_factor.as_slice(), long_factor.as_slice()),
             None => {
                 let ones = vec![1.0_f64; half_dim];
                 let ones_clone = ones.clone();
@@ -77,13 +78,17 @@ fn build_from_factors(
     mscale: f64,
     original_max_position_embeddings: usize,
 ) -> Result<Phi4LongRope, GpuError> {
-    let (cos_short_bytes, sin_short_bytes) = build_tables(max_pos, rotary_dim, theta, short_factor, mscale);
-    let (cos_long_bytes, sin_long_bytes) = build_tables(max_pos, rotary_dim, theta, long_factor, mscale);
+    let (cos_short_bytes, sin_short_bytes) =
+        build_tables(max_pos, rotary_dim, theta, short_factor, mscale);
+    let (cos_long_bytes, sin_long_bytes) =
+        build_tables(max_pos, rotary_dim, theta, long_factor, mscale);
 
     let half_dim = rotary_dim / 2;
     let shape = [max_pos, half_dim];
-    let cos_short = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &cos_short_bytes)?;
-    let sin_short = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &sin_short_bytes)?;
+    let cos_short =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &cos_short_bytes)?;
+    let sin_short =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &sin_short_bytes)?;
     let cos_long = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &cos_long_bytes)?;
     let sin_long = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &shape, &sin_long_bytes)?;
 
@@ -112,7 +117,11 @@ fn build_tables(
     mscale: f64,
 ) -> (Vec<u8>, Vec<u8>) {
     let half_dim = rotary_dim / 2;
-    assert_eq!(factor.len(), half_dim, "factor length must equal rotary_dim/2");
+    assert_eq!(
+        factor.len(),
+        half_dim,
+        "factor length must equal rotary_dim/2"
+    );
 
     let inv_freq: Vec<f64> = (0..half_dim)
         .map(|i| {
@@ -169,7 +178,13 @@ mod tests {
         let config = phi4_mini_test_config();
         let half_dim = config.rotary_dim() / 2;
         let short = vec![1.0_f64; half_dim];
-        let (cos, sin) = build_tables(4096, config.rotary_dim(), config.rope_theta, &short, config.mscale());
+        let (cos, sin) = build_tables(
+            4096,
+            config.rotary_dim(),
+            config.rope_theta,
+            &short,
+            config.mscale(),
+        );
         // At pos=0, cos = 1 * mscale, sin = 0.
         let m = config.mscale();
         let c0 = half::bf16::from_le_bytes([cos[0], cos[1]]).to_f64();
@@ -201,7 +216,10 @@ mod tests {
         let cs = half::bf16::from_le_bytes([cos_short[offs], cos_short[offs + 1]]).to_f64();
         let cl = half::bf16::from_le_bytes([cos_long[offs], cos_long[offs + 1]]).to_f64();
         // cos(small angle) > cos(large angle) for angles in (0, pi/2). Long factor yields smaller angle.
-        assert!(cl >= cs - 1e-3, "cos_long ({cl}) expected >= cos_short ({cs})");
+        assert!(
+            cl >= cs - 1e-3,
+            "cos_long ({cl}) expected >= cos_short ({cs})"
+        );
     }
 
     #[test]

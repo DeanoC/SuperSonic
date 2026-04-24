@@ -42,7 +42,11 @@ pub enum GenEvent {
     /// folds into the next step).
     Token(String),
     /// Terminal event: generation ended with this reason.
-    Done { reason: FinishReason, prompt_tokens: u32, completion_tokens: u32 },
+    Done {
+        reason: FinishReason,
+        prompt_tokens: u32,
+        completion_tokens: u32,
+    },
     /// Terminal error event: generation failed; no more events will arrive.
     Error(String),
 }
@@ -190,12 +194,7 @@ fn run(
 
         let pos = prompt_ids.len() + emitted_ids.len() - 1;
         let mut next_logits = guard.decode_step(next_token, pos)?;
-        next_token = sample(
-            &mut next_logits,
-            params.temperature,
-            params.top_p,
-            &mut rng,
-        );
+        next_token = sample(&mut next_logits, params.temperature, params.top_p, &mut rng);
     };
 
     let _ = tx.send(GenEvent::Done {
@@ -262,7 +261,11 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
     while let Some(ev) = rx.recv().await {
         match ev {
             GenEvent::Token(s) => text.push_str(&s),
-            GenEvent::Done { reason, prompt_tokens: p, completion_tokens: c } => {
+            GenEvent::Done {
+                reason,
+                prompt_tokens: p,
+                completion_tokens: c,
+            } => {
                 finish = Some(reason);
                 prompt_tokens = p;
                 completion_tokens = c;
@@ -271,9 +274,9 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
             GenEvent::Error(msg) => return Err(anyhow!(msg)),
         }
     }
-    let finish = finish.ok_or_else(|| anyhow!(
-        "generation task ended without a terminal event (likely panicked)"
-    ))?;
+    let finish = finish.ok_or_else(|| {
+        anyhow!("generation task ended without a terminal event (likely panicked)")
+    })?;
     Ok(CollectedResult {
         text,
         finish,

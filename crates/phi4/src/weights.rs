@@ -67,9 +67,8 @@ impl Phi4Weights {
         let loader = WeightLoader::from_dir(model_dir)?;
         let prefix = weight_prefix;
 
-        let embed_tokens = Arc::new(
-            loader.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?,
-        );
+        let embed_tokens =
+            Arc::new(loader.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?);
 
         let lm_head = if loader.contains("lm_head.weight") {
             Arc::new(loader.load_to_gpu("lm_head.weight", ordinal)?)
@@ -98,24 +97,17 @@ impl Phi4Weights {
             let qkv_name = format!("{lp}.self_attn.qkv_proj.weight");
             let q_proj_w = loader.load_row_slice_to_gpu(&qkv_name, 0, q_rows, ordinal)?;
             let k_proj_w = loader.load_row_slice_to_gpu(&qkv_name, q_rows, k_rows, ordinal)?;
-            let v_proj_w = loader.load_row_slice_to_gpu(
-                &qkv_name,
-                q_rows + k_rows,
-                v_rows,
-                ordinal,
-            )?;
+            let v_proj_w =
+                loader.load_row_slice_to_gpu(&qkv_name, q_rows + k_rows, v_rows, ordinal)?;
 
             let o_proj_w = loader.load_to_gpu(&format!("{lp}.self_attn.o_proj.weight"), ordinal)?;
 
             // Split fused gate_up_proj → gate / up along dim 0.
             let gate_up_name = format!("{lp}.mlp.gate_up_proj.weight");
-            let gate_proj_w = loader.load_row_slice_to_gpu(&gate_up_name, 0, intermediate, ordinal)?;
-            let up_proj_w = loader.load_row_slice_to_gpu(
-                &gate_up_name,
-                intermediate,
-                intermediate,
-                ordinal,
-            )?;
+            let gate_proj_w =
+                loader.load_row_slice_to_gpu(&gate_up_name, 0, intermediate, ordinal)?;
+            let up_proj_w =
+                loader.load_row_slice_to_gpu(&gate_up_name, intermediate, intermediate, ordinal)?;
             let down_proj_w = loader.load_to_gpu(&format!("{lp}.mlp.down_proj.weight"), ordinal)?;
 
             layers.push(Phi4LayerWeights {
@@ -128,13 +120,20 @@ impl Phi4Weights {
                 gate_proj_w,
                 up_proj_w,
                 down_proj_w,
-                q_proj_int4_scale: None, q_proj_int4_zero: None,
-                k_proj_int4_scale: None, k_proj_int4_zero: None,
-                v_proj_int4_scale: None, v_proj_int4_zero: None,
-                o_proj_int4_scale: None, o_proj_int4_zero: None,
-                gate_proj_int4_scale: None, gate_proj_int4_zero: None,
-                up_proj_int4_scale: None, up_proj_int4_zero: None,
-                down_proj_int4_scale: None, down_proj_int4_zero: None,
+                q_proj_int4_scale: None,
+                q_proj_int4_zero: None,
+                k_proj_int4_scale: None,
+                k_proj_int4_zero: None,
+                v_proj_int4_scale: None,
+                v_proj_int4_zero: None,
+                o_proj_int4_scale: None,
+                o_proj_int4_zero: None,
+                gate_proj_int4_scale: None,
+                gate_proj_int4_zero: None,
+                up_proj_int4_scale: None,
+                up_proj_int4_zero: None,
+                down_proj_int4_scale: None,
+                down_proj_int4_zero: None,
             });
         }
 
@@ -159,22 +158,22 @@ impl Phi4Weights {
     ) -> Result<Self, model_store::Error> {
         let prefix = weight_prefix;
 
-        let load_int4 = |name: &str| -> Result<(Option<GpuBuffer>, Option<GpuBuffer>), model_store::Error> {
-            let scale_name = format!("{name}_int4_scale");
-            let zero_name = format!("{name}_int4_zero");
-            if store.contains(&scale_name) && store.contains(&zero_name) {
-                Ok((
-                    Some(store.load_to_gpu(&scale_name, ordinal)?),
-                    Some(store.load_to_gpu(&zero_name, ordinal)?),
-                ))
-            } else {
-                Ok((None, None))
-            }
-        };
+        let load_int4 =
+            |name: &str| -> Result<(Option<GpuBuffer>, Option<GpuBuffer>), model_store::Error> {
+                let scale_name = format!("{name}_int4_scale");
+                let zero_name = format!("{name}_int4_zero");
+                if store.contains(&scale_name) && store.contains(&zero_name) {
+                    Ok((
+                        Some(store.load_to_gpu(&scale_name, ordinal)?),
+                        Some(store.load_to_gpu(&zero_name, ordinal)?),
+                    ))
+                } else {
+                    Ok((None, None))
+                }
+            };
 
-        let embed_tokens = Arc::new(
-            store.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?,
-        );
+        let embed_tokens =
+            Arc::new(store.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?);
         let lm_head = if store.contains("lm_head.weight") {
             Arc::new(store.load_to_gpu("lm_head.weight", ordinal)?)
         } else {
@@ -241,13 +240,20 @@ impl Phi4Weights {
                 gate_proj_w,
                 up_proj_w,
                 down_proj_w,
-                q_proj_int4_scale: q_i4s, q_proj_int4_zero: q_i4z,
-                k_proj_int4_scale: k_i4s, k_proj_int4_zero: k_i4z,
-                v_proj_int4_scale: v_i4s, v_proj_int4_zero: v_i4z,
-                o_proj_int4_scale: o_i4s, o_proj_int4_zero: o_i4z,
-                gate_proj_int4_scale: gate_i4s, gate_proj_int4_zero: gate_i4z,
-                up_proj_int4_scale: up_i4s, up_proj_int4_zero: up_i4z,
-                down_proj_int4_scale: down_i4s, down_proj_int4_zero: down_i4z,
+                q_proj_int4_scale: q_i4s,
+                q_proj_int4_zero: q_i4z,
+                k_proj_int4_scale: k_i4s,
+                k_proj_int4_zero: k_i4z,
+                v_proj_int4_scale: v_i4s,
+                v_proj_int4_zero: v_i4z,
+                o_proj_int4_scale: o_i4s,
+                o_proj_int4_zero: o_i4z,
+                gate_proj_int4_scale: gate_i4s,
+                gate_proj_int4_zero: gate_i4z,
+                up_proj_int4_scale: up_i4s,
+                up_proj_int4_zero: up_i4z,
+                down_proj_int4_scale: down_i4s,
+                down_proj_int4_zero: down_i4z,
             });
         }
 

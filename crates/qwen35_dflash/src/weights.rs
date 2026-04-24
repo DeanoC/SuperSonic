@@ -107,8 +107,8 @@ impl DFlashWeights {
             let lp = format!("layers.{idx}");
             let input_norm_w =
                 loader.load_to_gpu(&format!("{lp}.input_layernorm.weight"), ordinal)?;
-            let post_attn_norm_w = loader
-                .load_to_gpu(&format!("{lp}.post_attention_layernorm.weight"), ordinal)?;
+            let post_attn_norm_w =
+                loader.load_to_gpu(&format!("{lp}.post_attention_layernorm.weight"), ordinal)?;
 
             let q_proj_w = loader.load_to_gpu(&format!("{lp}.self_attn.q_proj.weight"), ordinal)?;
             let k_proj_w = loader.load_to_gpu(&format!("{lp}.self_attn.k_proj.weight"), ordinal)?;
@@ -118,11 +118,9 @@ impl DFlashWeights {
             let q_norm_w = loader.load_to_gpu(&format!("{lp}.self_attn.q_norm.weight"), ordinal)?;
             let k_norm_w = loader.load_to_gpu(&format!("{lp}.self_attn.k_norm.weight"), ordinal)?;
 
-            let gate_proj_w =
-                loader.load_to_gpu(&format!("{lp}.mlp.gate_proj.weight"), ordinal)?;
+            let gate_proj_w = loader.load_to_gpu(&format!("{lp}.mlp.gate_proj.weight"), ordinal)?;
             let up_proj_w = loader.load_to_gpu(&format!("{lp}.mlp.up_proj.weight"), ordinal)?;
-            let down_proj_w =
-                loader.load_to_gpu(&format!("{lp}.mlp.down_proj.weight"), ordinal)?;
+            let down_proj_w = loader.load_to_gpu(&format!("{lp}.mlp.down_proj.weight"), ordinal)?;
 
             layers.push(DFlashLayerWeights {
                 input_norm_w,

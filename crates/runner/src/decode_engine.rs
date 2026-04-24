@@ -5,19 +5,24 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{GpuBuffer, HostBuffer, ScalarType};
 
-use qwen35::desc_builder::{build_layer_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs, build_batch_seq_descs};
 use qwen35::config::TextConfig;
+use qwen35::desc_builder::{
+    build_batch_seq_descs, build_fp8_scale_descs, build_int4_scale_descs, build_kv_fp8_descs,
+    build_layer_descs,
+};
 use qwen35::rotary::RotaryTables;
 use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
 };
 use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
-use qwen35::weights::Qwen35Weights;
+use qwen35::weights::{LayerKind, Qwen35Weights};
 
 use crate::oracle::OracleOutput;
 use crate::prefill_engine;
+
+const CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS: usize = 0;
 
 /// Decode a byte slice of little-endian `f32` values into a host `Vec<f32>`.
 /// Shared helper used across decode/validate paths.
@@ -60,9 +65,30 @@ fn certified_kv_select_blocks_from_scores(
     rung1_threshold: f32,
     rung1_multiplier: f32,
 ) -> Result<(usize, f32, bool, Vec<f32>)> {
+    let (selected, tail, rung1, probs, _) = certified_kv_select_block_indices_from_scores(
+        block_max,
+        block_sum,
+        tau_cov,
+        k_min,
+        k_max,
+        rung1_threshold,
+        rung1_multiplier,
+    )?;
+    Ok((selected, tail, rung1, probs))
+}
+
+fn certified_kv_select_block_indices_from_scores(
+    block_max: &[f32],
+    block_sum: &[f32],
+    tau_cov: f32,
+    k_min: usize,
+    k_max: usize,
+    rung1_threshold: f32,
+    rung1_multiplier: f32,
+) -> Result<(usize, f32, bool, Vec<f32>, Vec<usize>)> {
     let num_blocks = block_max.len();
     if num_blocks == 0 || block_sum.len() != num_blocks {
-        return Ok((0, 0.0, false, Vec::new()));
+        return Ok((0, 0.0, false, Vec::new(), Vec::new()));
     }
     let mut log_mass = Vec::with_capacity(num_blocks);
     for (&m, &s) in block_max.iter().zip(block_sum.iter()) {
@@ -119,7 +145,162 @@ fn certified_kv_select_blocks_from_scores(
         tail = (1.0 - covered).max(0.0);
         rung1 = true;
     }
-    Ok((selected, tail, rung1, probs))
+    let selected_indices = order.into_iter().take(selected).collect();
+    Ok((selected, tail, rung1, probs, selected_indices))
+}
+
+fn certified_kv_block_log_mass(max_v: f32, sum_v: f32) -> Option<f32> {
+    if max_v.is_finite() && sum_v.is_finite() && sum_v > 0.0 {
+        Some(max_v + sum_v.ln())
+    } else {
+        None
+    }
+}
+
+fn certified_kv_selected_block_fp16_log_masses(
+    query_f32_all: &[f32],
+    promoted_key_host: &[u8],
+    q_head: usize,
+    selected_blocks: &[usize],
+    max_promoted_blocks: usize,
+    block_size: usize,
+    head_dim: usize,
+    q_scale: f32,
+) -> Vec<(usize, f32)> {
+    let query = &query_f32_all[q_head * head_dim..(q_head + 1) * head_dim];
+    let block_key_bytes = block_size * head_dim * ScalarType::BF16.size_in_bytes();
+    let mut out = Vec::with_capacity(selected_blocks.len());
+    for (slot, &block_id) in selected_blocks.iter().enumerate() {
+        let base = (q_head * max_promoted_blocks + slot) * block_key_bytes;
+        let mut scores = Vec::with_capacity(block_size);
+        for token in 0..block_size {
+            let token_base = base + token * head_dim * 2;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                let byte_idx = token_base + d * 2;
+                let k = half::bf16::from_le_bytes([
+                    promoted_key_host[byte_idx],
+                    promoted_key_host[byte_idx + 1],
+                ])
+                .to_f32();
+                dot += query[d] * k;
+            }
+            scores.push(dot * q_scale);
+        }
+        let max_v = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum_v: f32 = scores.iter().map(|s| (*s - max_v).exp()).sum();
+        out.push((block_id, max_v + sum_v.ln()));
+    }
+    out
+}
+
+fn certified_kv_selected_block_fp16_log_masses_from_tier2(
+    query_f32_all: &[f32],
+    tier2_key: &[u8],
+    q_head: usize,
+    kv_head: usize,
+    selected_blocks: &[usize],
+    cap: usize,
+    block_size: usize,
+    head_dim: usize,
+    q_scale: f32,
+) -> Vec<(usize, f32)> {
+    let query = &query_f32_all[q_head * head_dim..(q_head + 1) * head_dim];
+    let mut out = Vec::with_capacity(selected_blocks.len());
+    for &block_id in selected_blocks {
+        let mut scores = Vec::with_capacity(block_size);
+        for token in 0..block_size {
+            let token_base = ((kv_head * cap + block_id * block_size + token) * head_dim) * 2;
+            let mut dot = 0.0f32;
+            for d in 0..head_dim {
+                let byte_idx = token_base + d * 2;
+                let k = half::bf16::from_le_bytes([tier2_key[byte_idx], tier2_key[byte_idx + 1]])
+                    .to_f32();
+                dot += query[d] * k;
+            }
+            scores.push(dot * q_scale);
+        }
+        let max_v = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum_v: f32 = scores.iter().map(|s| (*s - max_v).exp()).sum();
+        out.push((block_id, max_v + sum_v.ln()));
+    }
+    out
+}
+
+fn certified_kv_ranking_boundary_violators(
+    int8_block_max: &[f32],
+    int8_block_sum: &[f32],
+    fp16_selected_log_masses: &[(usize, f32)],
+    selected_blocks: &[usize],
+    ranking_r: usize,
+    eps_guard: f32,
+) -> Vec<usize> {
+    if ranking_r == 0 || selected_blocks.is_empty() {
+        return Vec::new();
+    }
+    let top_r = ranking_r.min(selected_blocks.len());
+    let mut fp16_ranked = fp16_selected_log_masses.to_vec();
+    fp16_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let promoted_boundary = fp16_ranked
+        .get(top_r.saturating_sub(1))
+        .map(|(_, log_mass)| *log_mass)
+        .unwrap_or(f32::NEG_INFINITY);
+    let selected_set: std::collections::HashSet<usize> = selected_blocks.iter().copied().collect();
+    let mut out = Vec::new();
+    for block_id in 0..int8_block_max.len() {
+        if selected_set.contains(&block_id) {
+            continue;
+        }
+        if let Some(int8_log_mass) =
+            certified_kv_block_log_mass(int8_block_max[block_id], int8_block_sum[block_id])
+        {
+            if int8_log_mass + eps_guard > promoted_boundary {
+                out.push(block_id);
+            }
+        }
+    }
+    out.sort_by(|&a, &b| {
+        let la = certified_kv_block_log_mass(int8_block_max[a], int8_block_sum[a])
+            .unwrap_or(f32::NEG_INFINITY);
+        let lb = certified_kv_block_log_mass(int8_block_max[b], int8_block_sum[b])
+            .unwrap_or(f32::NEG_INFINITY);
+        lb.partial_cmp(&la).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+fn certified_kv_ranking_mismatch(
+    int8_block_max: &[f32],
+    int8_block_sum: &[f32],
+    fp16_selected_log_masses: &[(usize, f32)],
+    selected_blocks: &[usize],
+    ranking_r: usize,
+    eps_guard: f32,
+) -> bool {
+    if ranking_r == 0 || selected_blocks.is_empty() {
+        return false;
+    }
+    let top_r = ranking_r.min(selected_blocks.len());
+    let mut fp16_ranked = fp16_selected_log_masses.to_vec();
+    fp16_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let promoted_boundary = fp16_ranked
+        .get(top_r.saturating_sub(1))
+        .map(|(_, log_mass)| *log_mass)
+        .unwrap_or(f32::NEG_INFINITY);
+    let selected_set: std::collections::HashSet<usize> = selected_blocks.iter().copied().collect();
+    for block_id in 0..int8_block_max.len() {
+        if selected_set.contains(&block_id) {
+            continue;
+        }
+        if let Some(int8_log_mass) =
+            certified_kv_block_log_mass(int8_block_max[block_id], int8_block_sum[block_id])
+        {
+            if int8_log_mass + eps_guard > promoted_boundary {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn matmul_proj(
@@ -140,7 +321,17 @@ fn matmul_proj(
 ) -> Result<()> {
     if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
         kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-            ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
+            ordinal,
+            batch,
+            m,
+            n,
+            k,
+            lhs,
+            weight,
+            sc,
+            zr,
+            int4_group_size,
+            out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
     } else if let Some(sc) = int8_scale {
@@ -155,7 +346,15 @@ fn matmul_proj(
             )
             .map_err(|e| anyhow::anyhow!("matmul_fp8: {e}")),
             None => kernel_ffi::prefill_ffi::matmul_rhs_transposed(
-                ordinal, ScalarType::BF16, batch, m, n, k, lhs, weight, out,
+                ordinal,
+                ScalarType::BF16,
+                batch,
+                m,
+                n,
+                k,
+                lhs,
+                weight,
+                out,
             )
             .map_err(|e| anyhow::anyhow!("matmul: {e}")),
         }
@@ -188,15 +387,8 @@ fn residual_add(
     src: &GpuBuffer,
 ) -> Result<()> {
     let lhs: &GpuBuffer = unsafe { &*(dst as *const GpuBuffer) };
-    kernel_ffi::prefill_ffi::element_add(
-        ordinal,
-        ScalarType::BF16,
-        total_elems,
-        lhs,
-        src,
-        dst,
-    )
-    .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
+    kernel_ffi::prefill_ffi::element_add(ordinal, ScalarType::BF16, total_elems, lhs, src, dst)
+        .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
     Ok(())
 }
 
@@ -280,7 +472,11 @@ fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
     } else {
         (1.0 + mantissa as f32 / 8.0) * 2f32.powi(exp as i32 - 7)
     };
-    if sign != 0 { -val } else { val }
+    if sign != 0 {
+        -val
+    } else {
+        val
+    }
 }
 
 fn f32_to_bf16_bytes_host(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
@@ -495,6 +691,18 @@ struct ComponentFullAttentionScratch {
     gated: GpuBuffer,
     proj_out: GpuBuffer,
     certified_score_scratch: Option<GpuBuffer>,
+    certified_block_max: Option<GpuBuffer>,
+    certified_block_sum: Option<GpuBuffer>,
+    certified_promote_index: Option<GpuBuffer>,
+    certified_promoted_key_bf16: Option<GpuBuffer>,
+    certified_value_promote_index: Option<GpuBuffer>,
+    certified_promoted_value_bf16: Option<GpuBuffer>,
+    certified_ranking_fallback_heads: Option<GpuBuffer>,
+    certified_ranking_fallback_kv_slots: Option<GpuBuffer>,
+    certified_ranking_fallback_kv_heads: Option<GpuBuffer>,
+    certified_ranking_fallback_score: Option<GpuBuffer>,
+    certified_tail_key_compact: Option<GpuBuffer>,
+    certified_tail_value_compact: Option<GpuBuffer>,
 }
 
 impl ComponentFullAttentionScratch {
@@ -534,7 +742,9 @@ impl ComponentFullAttentionScratch {
             attn_v_step: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
                 .map_err(|e| anyhow::anyhow!("component full-attn attn_v alloc: {e}"))?,
             attn_out_f32: GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-                .map_err(|e| anyhow::anyhow!("component full-attn attn_out alloc: {e}"))?,
+                .map_err(|e| {
+                anyhow::anyhow!("component full-attn attn_out alloc: {e}")
+            })?,
             attn_out_bf16: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
                 .map_err(|e| anyhow::anyhow!("component full-attn attn_out bf16 alloc: {e}"))?,
             attn_flat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
@@ -544,6 +754,18 @@ impl ComponentFullAttentionScratch {
             proj_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
                 .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
             certified_score_scratch: None,
+            certified_block_max: None,
+            certified_block_sum: None,
+            certified_promote_index: None,
+            certified_promoted_key_bf16: None,
+            certified_value_promote_index: None,
+            certified_promoted_value_bf16: None,
+            certified_ranking_fallback_heads: None,
+            certified_ranking_fallback_kv_slots: None,
+            certified_ranking_fallback_kv_heads: None,
+            certified_ranking_fallback_score: None,
+            certified_tail_key_compact: None,
+            certified_tail_value_compact: None,
         })
     }
 }
@@ -594,38 +816,17 @@ impl DFlashFusedVerifyCache {
             + hidden_dim
             + proj_buf_floats
             + attn_scratch_floats;
-        let workspace = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::F32,
-            &[per_item_floats * block_size],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, hidden_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, hidden_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
-        let logits_buf = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::BF16,
-            &[block_size, 1, vocab_size],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
-        let batch_desc_bytes =
-            num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
-        let batch_desc_device = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::U8,
-            &[batch_desc_bytes],
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
+        let workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[per_item_floats * block_size])
+            .map_err(|e| anyhow::anyhow!("fused verify workspace alloc: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("fused verify hidden_io alloc: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, hidden_dim])
+            .map_err(|e| anyhow::anyhow!("fused verify normed_buf alloc: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, 1, vocab_size])
+            .map_err(|e| anyhow::anyhow!("fused verify logits_buf alloc: {e}"))?;
+        let batch_desc_bytes = num_layers * std::mem::size_of::<kernel_ffi::BatchSeqDesc>();
+        let batch_desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[batch_desc_bytes])
+            .map_err(|e| anyhow::anyhow!("fused verify batch desc alloc: {e}"))?;
         Ok(Self {
             block_size,
             workspace,
@@ -660,6 +861,15 @@ pub struct DecodeStageTimings {
     pub certified_kv_value_quantize_ms: f64,
     pub certified_kv_attend_ms: f64,
     pub certified_kv_cast_ms: f64,
+    pub certified_kv_value_escalation_heads: usize,
+    pub certified_kv_ranking_fallback_heads: usize,
+    pub certified_kv_dense_fallback_layers: usize,
+    pub certified_kv_promoted_key_h2d_bytes: usize,
+    pub certified_kv_promoted_value_h2d_bytes: usize,
+    pub certified_kv_ranking_prefix_cache_hits: usize,
+    pub certified_kv_ranking_prefix_cache_misses: usize,
+    pub certified_kv_ranking_prefix_h2d_bytes: usize,
+    pub certified_kv_ranking_prefix_reuse_bytes: usize,
     pub persistent_full_attn_out_ms: f64,
     pub persistent_linear_proj_ms: f64,
     pub persistent_linear_core_ms: f64,
@@ -687,6 +897,16 @@ impl DecodeStageTimings {
         self.certified_kv_value_quantize_ms += rhs.certified_kv_value_quantize_ms;
         self.certified_kv_attend_ms += rhs.certified_kv_attend_ms;
         self.certified_kv_cast_ms += rhs.certified_kv_cast_ms;
+        self.certified_kv_value_escalation_heads += rhs.certified_kv_value_escalation_heads;
+        self.certified_kv_ranking_fallback_heads += rhs.certified_kv_ranking_fallback_heads;
+        self.certified_kv_dense_fallback_layers += rhs.certified_kv_dense_fallback_layers;
+        self.certified_kv_promoted_key_h2d_bytes += rhs.certified_kv_promoted_key_h2d_bytes;
+        self.certified_kv_promoted_value_h2d_bytes += rhs.certified_kv_promoted_value_h2d_bytes;
+        self.certified_kv_ranking_prefix_cache_hits += rhs.certified_kv_ranking_prefix_cache_hits;
+        self.certified_kv_ranking_prefix_cache_misses +=
+            rhs.certified_kv_ranking_prefix_cache_misses;
+        self.certified_kv_ranking_prefix_h2d_bytes += rhs.certified_kv_ranking_prefix_h2d_bytes;
+        self.certified_kv_ranking_prefix_reuse_bytes += rhs.certified_kv_ranking_prefix_reuse_bytes;
         self.persistent_full_attn_out_ms += rhs.persistent_full_attn_out_ms;
         self.persistent_linear_proj_ms += rhs.persistent_linear_proj_ms;
         self.persistent_linear_core_ms += rhs.persistent_linear_core_ms;
@@ -713,6 +933,58 @@ pub struct DecodeStepOutput {
     pub logits: Option<Vec<f32>>,
     pub sampled_token: u32,
     pub timings: DecodeStageTimings,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CertifiedKvMemoryStats {
+    pub full_attention_layers: usize,
+    pub tier1_compressed_vram_bytes: usize,
+    pub tier2_host_pinned_bytes: usize,
+    pub tail_bf16_vram_bytes: usize,
+    pub ranking_prefix_scratch_vram_bytes: usize,
+    pub dense_bf16_kv_vram_bytes: usize,
+}
+
+impl CertifiedKvMemoryStats {
+    pub fn total_certified_vram_bytes(&self) -> usize {
+        self.tier1_compressed_vram_bytes
+            + self.tail_bf16_vram_bytes
+            + self.ranking_prefix_scratch_vram_bytes
+            + self.dense_bf16_kv_vram_bytes
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CertifiedKvDecodeParams {
+    pub block_size: usize,
+    pub value_group_size: usize,
+    pub bf16_values: bool,
+    pub tau_cov: f32,
+    pub k_min: usize,
+    pub k_max: usize,
+    pub v_tol: f32,
+    pub ranking_r: usize,
+    pub rung1_threshold: f32,
+    pub rung1_multiplier: f32,
+    pub eps_guard: f32,
+}
+
+impl CertifiedKvDecodeParams {
+    fn trace_default(block_size: usize, value_group_size: usize, bf16_values: bool) -> Self {
+        Self {
+            block_size,
+            value_group_size,
+            bf16_values,
+            tau_cov: 0.995,
+            k_min: 2,
+            k_max: 128,
+            v_tol: 0.05,
+            ranking_r: 1,
+            rung1_threshold: 0.005,
+            rung1_multiplier: 2.0,
+            eps_guard: 0.01,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -992,7 +1264,11 @@ fn decode_persistent_4b_timing_slots(
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&sync_bytes[byte_start..byte_end]);
         let v = u64::from_le_bytes(raw);
-        if v >= WRAP_FILTER_CEILING { 0 } else { v }
+        if v >= WRAP_FILTER_CEILING {
+            0
+        } else {
+            v
+        }
     };
 
     let mut full_attn_cycles = 0u64;
@@ -1141,10 +1417,10 @@ mod tests {
 
     #[test]
     fn persistent_4b_timing_ranges_do_not_overlap() {
-        let full_attn_core = PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE
-            ..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
-        let full_attn_out = PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE
-            ..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
+        let full_attn_core =
+            PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE..PERSISTENT_4B_TIMING_FULL_ATTN_CORE_BASE + 8;
+        let full_attn_out =
+            PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE..PERSISTENT_4B_TIMING_FULL_ATTN_OUT_BASE + 8;
         let linear_core =
             PERSISTENT_4B_TIMING_LINEAR_CORE_BASE..PERSISTENT_4B_TIMING_LINEAR_CORE_BASE + 8;
         let linear_out =
@@ -1240,16 +1516,25 @@ impl DecodeEngine {
             let mut key_i8 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 alloc: {e}"))?;
             let mut key_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_scale alloc: {e}"))?;
+                .map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV key_scale alloc: {e}")
+            })?;
             let mut value_i4 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_i4 alloc: {e}"))?;
-            let mut value_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_scale alloc: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {layer_idx} certified KV value_i4 alloc: {e}")
+                })?;
+            let mut value_scale =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
+                    |e| anyhow::anyhow!("layer {layer_idx} certified KV value_scale alloc: {e}"),
+                )?;
             let mut value_zero = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_zero alloc: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {layer_idx} certified KV value_zero alloc: {e}")
+                })?;
             let mut value_error =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_error alloc: {e}"))?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape).map_err(
+                    |e| anyhow::anyhow!("layer {layer_idx} certified KV value_error alloc: {e}"),
+                )?;
 
             let start = Instant::now();
             kernel_ffi::certified_kv::quantize_bf16_cache(
@@ -1269,11 +1554,9 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV quantize: {e}"))?;
             stats.quantize_ms += start.elapsed().as_secs_f64() * 1000.0;
 
-            let errors = decode_f32_le(
-                &value_error
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV value_error D2H: {e}"))?,
-            );
+            let errors = decode_f32_le(&value_error.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV value_error D2H: {e}")
+            })?);
             let layer_max = errors.iter().copied().fold(0.0f32, f32::max);
             stats.max_value_error = stats.max_value_error.max(layer_max);
             stats.layers += 1;
@@ -1301,7 +1584,8 @@ impl DecodeEngine {
             let cache_v_host = cache_v
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV V cache D2H: {e}"))?;
-            let mut query_host = vec![0u8; num_q_heads * head_dim * ScalarType::BF16.size_in_bytes()];
+            let mut query_host =
+                vec![0u8; num_q_heads * head_dim * ScalarType::BF16.size_in_bytes()];
             let max_t = cache_k.shape()[2];
             let elem_bytes = ScalarType::BF16.size_in_bytes();
             for qh in 0..num_q_heads {
@@ -1318,10 +1602,16 @@ impl DecodeEngine {
                 &query_host,
             )
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV score query H2D: {e}"))?;
-            let mut block_max = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_max alloc: {e}"))?;
-            let mut block_sum = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_sum alloc: {e}"))?;
+            let mut block_max =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {layer_idx} certified KV block_max alloc: {e}")
+                    })?;
+            let mut block_sum =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, num_blocks])
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {layer_idx} certified KV block_sum alloc: {e}")
+                    })?;
             let score_start = Instant::now();
             kernel_ffi::certified_kv::score_blocks_int8(
                 self.ordinal,
@@ -1337,16 +1627,12 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV score blocks: {e}"))?;
             stats.score_ms += score_start.elapsed().as_secs_f64() * 1000.0;
 
-            let block_max_host = decode_f32_le(
-                &block_max
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_max D2H: {e}"))?,
-            );
-            let block_sum_host = decode_f32_le(
-                &block_sum
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV block_sum D2H: {e}"))?,
-            );
+            let block_max_host = decode_f32_le(&block_max.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV block_max D2H: {e}")
+            })?);
+            let block_sum_host = decode_f32_le(&block_sum.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV block_sum D2H: {e}")
+            })?);
             for (idx, (&m, &s)) in block_max_host.iter().zip(block_sum_host.iter()).enumerate() {
                 if !m.is_finite() || !s.is_finite() || s < 1.0 || s > block_size as f32 + 0.001 {
                     return Err(anyhow::anyhow!(
@@ -1369,7 +1655,9 @@ impl DecodeEngine {
                     rung1_threshold,
                     rung1_multiplier,
                 )
-                .map_err(|e| anyhow::anyhow!("layer {layer_idx} q_head {qh} certified KV selector: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {layer_idx} q_head {qh} certified KV selector: {e}")
+                })?;
                 stats.selector_heads += 1;
                 stats.selector_selected_blocks += selected;
                 stats.selector_max_tail_mass = stats.selector_max_tail_mass.max(tail);
@@ -1391,11 +1679,13 @@ impl DecodeEngine {
             }
 
             let mut attn_score_scratch =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, aligned])
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend score alloc: {e}"))?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, aligned]).map_err(
+                    |e| anyhow::anyhow!("layer {layer_idx} certified KV attend score alloc: {e}"),
+                )?;
             let mut attn_output =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend output alloc: {e}"))?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim]).map_err(
+                    |e| anyhow::anyhow!("layer {layer_idx} certified KV attend output alloc: {e}"),
+                )?;
             let attend_start = Instant::now();
             kernel_ffi::certified_kv::attend_int8_int4(
                 self.ordinal,
@@ -1414,11 +1704,9 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend: {e}"))?;
             stats.attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
-            let attn_host = decode_f32_le(
-                &attn_output
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV attend output D2H: {e}"))?,
-            );
+            let attn_host = decode_f32_le(&attn_output.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV attend output D2H: {e}")
+            })?);
             for (idx, value) in attn_host.iter().enumerate() {
                 if !value.is_finite() {
                     return Err(anyhow::anyhow!(
@@ -1444,12 +1732,22 @@ impl DecodeEngine {
                 &value_bf16_host,
             )
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value H2D: {e}"))?;
-            let mut bf16_value_score_scratch =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, aligned])
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value score alloc: {e}"))?;
-            let mut bf16_value_output =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output alloc: {e}"))?;
+            let mut bf16_value_score_scratch = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::F32,
+                &[num_q_heads, aligned],
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV BF16-value score alloc: {e}")
+            })?;
+            let mut bf16_value_output = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::F32,
+                &[num_q_heads, head_dim],
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output alloc: {e}")
+            })?;
             let bf16_value_start = Instant::now();
             kernel_ffi::certified_kv::attend_int8_bf16_values(
                 self.ordinal,
@@ -1464,13 +1762,14 @@ impl DecodeEngine {
                 &mut bf16_value_score_scratch,
                 &mut bf16_value_output,
             )
-            .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value attend: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV BF16-value attend: {e}")
+            })?;
             stats.attend_bf16_value_ms += bf16_value_start.elapsed().as_secs_f64() * 1000.0;
-            let bf16_value_host = decode_f32_le(
-                &bf16_value_output
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output D2H: {e}"))?,
-            );
+            let bf16_value_host =
+                decode_f32_le(&bf16_value_output.to_host_bytes().map_err(|e| {
+                    anyhow::anyhow!("layer {layer_idx} certified KV BF16-value output D2H: {e}")
+                })?);
             for (idx, value) in bf16_value_host.iter().enumerate() {
                 if !value.is_finite() {
                     return Err(anyhow::anyhow!(
@@ -1500,7 +1799,10 @@ impl DecodeEngine {
                     }
                     dense_scores[t] = acc * q_scale;
                 }
-                let dense_max = dense_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let dense_max = dense_scores
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let dense_denom: f32 = dense_scores.iter().map(|s| (*s - dense_max).exp()).sum();
                 for d in 0..head_dim {
                     let mut dense_out = 0.0f32;
@@ -1514,8 +1816,9 @@ impl DecodeEngine {
                         dense_out += ((*score - dense_max).exp() / dense_denom) * v;
                     }
                     let attn_idx = qh * head_dim + d;
-                    stats.attend_ref_max_delta =
-                        stats.attend_ref_max_delta.max((attn_host[attn_idx] - dense_out).abs());
+                    stats.attend_ref_max_delta = stats
+                        .attend_ref_max_delta
+                        .max((attn_host[attn_idx] - dense_out).abs());
                     stats.attend_bf16_value_ref_max_delta = stats
                         .attend_bf16_value_ref_max_delta
                         .max((bf16_value_host[attn_idx] - dense_out).abs());
@@ -1527,11 +1830,9 @@ impl DecodeEngine {
             let key_i8_host = key_i8
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_i8 D2H: {e}"))?;
-            let key_scale_host = decode_f32_le(
-                &key_scale
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {layer_idx} certified KV key_scale D2H: {e}"))?,
-            );
+            let key_scale_host = decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {layer_idx} certified KV key_scale D2H: {e}")
+            })?);
             let mut ref_scores = Vec::with_capacity(block_size);
             for t in 0..block_size {
                 let mut acc = 0.0f32;
@@ -1579,7 +1880,9 @@ impl DecodeEngine {
             }
 
             let (prefix_k_host, prefix_v_host, prefix_len) =
-                Self::assemble_full_attention_prefix_cache_bf16_host_static(config, state, layer_idx)?;
+                Self::assemble_full_attention_prefix_cache_bf16_host_static(
+                    config, state, layer_idx,
+                )?;
             if prefix_len == 0 {
                 state.layers[layer_idx].kv_shadow_start = 0;
                 continue;
@@ -1725,7 +2028,11 @@ impl DecodeEngine {
         state: &ModelState,
         layer_idx: usize,
     ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
-        Self::assemble_full_attention_prefix_cache_bf16_host_static(&self.weights.config, state, layer_idx)
+        Self::assemble_full_attention_prefix_cache_bf16_host_static(
+            &self.weights.config,
+            state,
+            layer_idx,
+        )
     }
 
     pub fn full_attention_prefix_cache_bf16_host(
@@ -1798,15 +2105,28 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace k alloc: {e}"))?;
         let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace k_normed alloc: {e}"))?;
+        let mut q_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace q_normed alloc: {e}"))?;
+        let mut k_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace k_normed alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            q_proj_dim,
+            hidden_dim,
+            &normed,
+            &fw.q_proj_w,
+            fw.q_proj_scale.as_ref(),
+            fw.q_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut q_full,
+            fw.q_proj_int4_scale.as_ref(),
+            fw.q_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         if has_attn_gate {
             kernel_ffi::prefill_ffi::split_qgate(
@@ -1831,14 +2151,36 @@ impl DecodeEngine {
         }
 
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.k_proj_w,
+            fw.k_proj_scale.as_ref(),
+            fw.k_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut k_buf,
+            fw.k_proj_int4_scale.as_ref(),
+            fw.k_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.v_proj_w,
+            fw.v_proj_scale.as_ref(),
+            fw.v_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut v_buf,
+            fw.v_proj_int4_scale.as_ref(),
+            fw.v_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
 
         maybe_attn_rms_norm_rows(
@@ -1891,13 +2233,29 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace v D2H: {e}"))?;
 
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace k rope: {e}"))?;
 
@@ -1924,7 +2282,7 @@ impl DecodeEngine {
         idx: usize,
         hidden_bytes: &[u8],
         seqlen_offset: usize,
-        certified_kv: Option<(usize, usize, bool)>,
+        certified_kv: Option<CertifiedKvDecodeParams>,
     ) -> Result<FullAttentionLayerOutputTrace> {
         let config = self.weights.config.clone();
         let fw = self.weights.layers[idx]
@@ -1982,14 +2340,19 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k alloc: {e}"))?;
         let mut v_buf = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, kv_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer v alloc: {e}"))?;
-        let mut q_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_normed alloc: {e}"))?;
-        let mut k_normed = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k_normed alloc: {e}"))?;
-        let mut attn_out_f32 = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out alloc: {e}"))?;
-        let mut attn_out_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out bf16 alloc: {e}"))?;
+        let mut q_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q_normed alloc: {e}"))?;
+        let mut k_normed =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k_normed alloc: {e}"))?;
+        let mut attn_out_f32 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, 1, head_dim])
+                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_out alloc: {e}"))?;
+        let mut attn_out_bf16 =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, 1, head_dim]).map_err(
+                |e| anyhow::anyhow!("layer {idx} trace full layer attn_out bf16 alloc: {e}"),
+            )?;
         let mut gated = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, q_dim])
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gated alloc: {e}"))?;
         let mut proj_out = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, hidden_dim])
@@ -2005,9 +2368,20 @@ impl DecodeEngine {
         let mut value_only_pre_gate = None;
 
         matmul_proj(
-            self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-            &normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut q_full,
-            fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            q_proj_dim,
+            hidden_dim,
+            &normed,
+            &fw.q_proj_w,
+            fw.q_proj_scale.as_ref(),
+            fw.q_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut q_full,
+            fw.q_proj_int4_scale.as_ref(),
+            fw.q_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         if has_attn_gate {
             kernel_ffi::prefill_ffi::split_qgate(
@@ -2031,14 +2405,36 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q copy: {e}"))?;
         }
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut k_buf,
-            fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.k_proj_w,
+            fw.k_proj_scale.as_ref(),
+            fw.k_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut k_buf,
+            fw.k_proj_int4_scale.as_ref(),
+            fw.k_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, kv_dim, hidden_dim,
-            &normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut v_buf,
-            fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            kv_dim,
+            hidden_dim,
+            &normed,
+            &fw.v_proj_w,
+            fw.v_proj_scale.as_ref(),
+            fw.v_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut v_buf,
+            fw.v_proj_int4_scale.as_ref(),
+            fw.v_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         maybe_attn_rms_norm_rows(
             &config,
@@ -2075,13 +2471,29 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k norm copy: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut query_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut query_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer q rope: {e}"))?;
         kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, &mut k_buf,
+            self.ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            seqlen_offset,
+            &mut k_buf,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer k rope: {e}"))?;
 
@@ -2120,7 +2532,10 @@ impl DecodeEngine {
             full_v_bytes[full_dst + prefix_row_bytes..full_dst + kv_row_bytes]
                 .copy_from_slice(&v_step_bytes[step_src..step_src + step_row_bytes]);
         }
-        if let Some((block_size, value_group_size, bf16_values)) = certified_kv {
+        if let Some(certified_kv) = certified_kv {
+            let block_size = certified_kv.block_size;
+            let value_group_size = certified_kv.value_group_size;
+            let bf16_values = certified_kv.bf16_values;
             let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
             let tail_len = kv_len - aligned;
             anyhow::ensure!(
@@ -2141,27 +2556,42 @@ impl DecodeEngine {
                 &full_v_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV V H2D: {e}"))?;
-            let (key_i8_shape, key_scale_shape, value_i4_shape, value_meta_shape, value_error_shape) =
-                kernel_ffi::certified_kv::quantized_shapes(
-                    num_kv_heads,
-                    kv_len,
-                    head_dim,
-                    block_size,
-                    value_group_size,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV shapes: {e}"))?;
+            let (
+                key_i8_shape,
+                key_scale_shape,
+                value_i4_shape,
+                value_meta_shape,
+                value_error_shape,
+            ) = kernel_ffi::certified_kv::quantized_shapes(
+                num_kv_heads,
+                kv_len,
+                head_dim,
+                block_size,
+                value_group_size,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV shapes: {e}"))?;
             let mut key_i8 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape)
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_i8 alloc: {e}"))?;
             let mut key_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape)
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_scale alloc: {e}"))?;
+                .map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV key_scale alloc: {e}")
+            })?;
             let mut value_i4 = GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_i4 alloc: {e}"))?;
-            let mut value_scale = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_scale alloc: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} trace certified KV value_i4 alloc: {e}")
+                })?;
+            let mut value_scale =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV value_scale alloc: {e}"),
+                )?;
             let mut value_zero = GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_zero alloc: {e}"))?;
-            let mut value_error = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_error alloc: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} trace certified KV value_zero alloc: {e}")
+                })?;
+            let mut value_error =
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV value_error alloc: {e}"),
+                )?;
             kernel_ffi::certified_kv::quantize_bf16_cache(
                 self.ordinal,
                 &kv_k_cert,
@@ -2183,24 +2613,19 @@ impl DecodeEngine {
             let key_i8_host = key_i8
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_i8 D2H: {e}"))?;
-            let key_scale_host = decode_f32_le(
-                &key_scale
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV key_scale D2H: {e}"))?,
-            );
+            let key_scale_host = decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV key_scale D2H: {e}")
+            })?);
             let value_i4_host = value_i4
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_i4 D2H: {e}"))?;
-            let value_scale_host = decode_f16_le_host(
-                &value_scale
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_scale D2H: {e}"))?,
-            );
-            let value_zero_host = decode_f16_le_host(
-                &value_zero
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV value_zero D2H: {e}"))?,
-            );
+            let value_scale_host =
+                decode_f16_le_host(&value_scale.to_host_bytes().map_err(|e| {
+                    anyhow::anyhow!("layer {idx} trace certified KV value_scale D2H: {e}")
+                })?);
+            let value_zero_host = decode_f16_le_host(&value_zero.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV value_zero D2H: {e}")
+            })?);
             let host_attention = |quant_keys: bool, quant_values: bool| -> Vec<f32> {
                 let mut out = vec![0.0f32; num_q_heads * head_dim];
                 let q_scale = 1.0 / (head_dim as f32).sqrt();
@@ -2215,8 +2640,10 @@ impl DecodeEngine {
                             let q = q_f32[qh * head_dim + d];
                             let k = if quant_keys && t < aligned {
                                 let block_id = t / block_size;
-                                let qk = key_i8_host[(kvh * aligned + t) * head_dim + d] as i8 as f32;
-                                let scale = key_scale_host[(kvh * num_blocks + block_id) * head_dim + d];
+                                let qk =
+                                    key_i8_host[(kvh * aligned + t) * head_dim + d] as i8 as f32;
+                                let scale =
+                                    key_scale_host[(kvh * num_blocks + block_id) * head_dim + d];
                                 qk * scale
                             } else {
                                 full_k_f32[(kvh * kv_len + t) * head_dim + d]
@@ -2231,7 +2658,8 @@ impl DecodeEngine {
                         let mut acc = 0.0f32;
                         for t in 0..kv_len {
                             let value = if quant_values && t < aligned {
-                                let packed = value_i4_host[(kvh * aligned + t) * (head_dim / 2) + d / 2];
+                                let packed =
+                                    value_i4_host[(kvh * aligned + t) * (head_dim / 2) + d / 2];
                                 let qv_u8 = if (d & 1) == 0 {
                                     packed & 0x0f
                                 } else {
@@ -2261,11 +2689,13 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV query H2D: {e}"))?;
             let mut score_scratch =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV score alloc: {e}"))?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len]).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV score alloc: {e}"),
+                )?;
             let mut cert_attn_out =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV attn alloc: {e}"))?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim]).map_err(
+                    |e| anyhow::anyhow!("layer {idx} trace certified KV attn alloc: {e}"),
+                )?;
             let full_v_cert = GpuBuffer::from_host_bytes(
                 self.ordinal,
                 ScalarType::BF16,
@@ -2296,13 +2726,19 @@ impl DecodeEngine {
             } else {
                 None
             };
-            let mut key_only_score_scratch =
-                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, kv_len]).map_err(
-                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value score alloc: {e}"),
-                )?;
+            let mut key_only_score_scratch = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::F32,
+                &[num_q_heads, kv_len],
+            )
+            .map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV BF16-value score alloc: {e}")
+            })?;
             let mut key_only_attn_out =
                 GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads, head_dim]).map_err(
-                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value attn alloc: {e}"),
+                    |e| {
+                        anyhow::anyhow!("layer {idx} trace certified KV BF16-value attn alloc: {e}")
+                    },
                 )?;
             kernel_ffi::certified_kv::attend_int8_bf16_values(
                 self.ordinal,
@@ -2317,11 +2753,14 @@ impl DecodeEngine {
                 &mut key_only_score_scratch,
                 &mut key_only_attn_out,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value attention: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace certified KV BF16-value attention: {e}")
+            })?;
             let mut key_only_attn_out_bf16 =
-                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim]).map_err(
-                    |e| anyhow::anyhow!("layer {idx} trace certified KV BF16-value cast alloc: {e}"),
-                )?;
+                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_q_heads, head_dim])
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} trace certified KV BF16-value cast alloc: {e}")
+                    })?;
             kernel_ffi::prefill_ffi::cast(
                 self.ordinal,
                 ScalarType::F32,
@@ -2379,7 +2818,9 @@ impl DecodeEngine {
                     &mut score_scratch,
                     &mut cert_attn_out,
                 )
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace certified KV hybrid attention: {e}"))?;
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} trace certified KV hybrid attention: {e}")
+                })?;
             } else {
                 kernel_ffi::certified_kv::attend_int8_int4(
                     self.ordinal,
@@ -2468,7 +2909,12 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_flat H2D: {e}"))?;
         if has_attn_gate {
             kernel_ffi::prefill_ffi::sigmoid_mul(
-                self.ordinal, ScalarType::BF16, q_dim, &attn_flat, &gate_buf, &mut gated,
+                self.ordinal,
+                ScalarType::BF16,
+                q_dim,
+                &attn_flat,
+                &gate_buf,
+                &mut gated,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate apply: {e}"))?;
         } else {
@@ -2481,9 +2927,20 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gate bypass copy: {e}"))?;
         }
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, q_dim,
-            &gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
-            fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            q_dim,
+            &gated,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            fw.o_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut proj_out,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut hidden_out, &proj_out)?;
         Ok(FullAttentionLayerOutputTrace {
@@ -2493,9 +2950,9 @@ impl DecodeEngine {
             gated: gated
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer gated D2H: {e}"))?,
-            attn_hidden: hidden_out
-                .to_host_bytes()
-                .map_err(|e| anyhow::anyhow!("layer {idx} trace full layer attn_hidden D2H: {e}"))?,
+            attn_hidden: hidden_out.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} trace full layer attn_hidden D2H: {e}")
+            })?,
             key_only_pre_gate,
             value_only_pre_gate,
         })
@@ -2548,7 +3005,11 @@ impl DecodeEngine {
             idx,
             hidden_bytes,
             seqlen_offset,
-            Some((block_size, value_group_size, bf16_values)),
+            Some(CertifiedKvDecodeParams::trace_default(
+                block_size,
+                value_group_size,
+                bf16_values,
+            )),
         )
     }
 
@@ -2619,13 +3080,17 @@ impl DecodeEngine {
         let conv = ls
             .conv_state
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state after component trace"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("layer {idx}: missing conv state after component trace")
+            })?
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} component conv D2H: {e}"))?;
         let recurrent = ls
             .recurrent_state
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state after component trace"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!("layer {idx}: missing recurrent state after component trace")
+            })?
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} component recurrent D2H: {e}"))?;
         let hidden = self
@@ -2677,14 +3142,15 @@ impl DecodeEngine {
                 &[1, self.weights.config.hidden_size],
                 &attn_trace.attn_hidden,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden H2D: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("layer {idx} component full-layer attn hidden H2D: {e}")
+            })?;
         } else {
             self.component_decode_linear_attention_layer(idx, false)?;
         }
-        let attn_hidden = self
-            .hidden_io
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer attn hidden D2H: {e}"))?[..row_bytes]
+        let attn_hidden = self.hidden_io.to_host_bytes().map_err(|e| {
+            anyhow::anyhow!("layer {idx} component full-layer attn hidden D2H: {e}")
+        })?[..row_bytes]
             .to_vec();
 
         rms_norm_rows_model(
@@ -2697,19 +3163,18 @@ impl DecodeEngine {
             &mut self.normed_buf,
             &format!("layer {idx} component full-layer post rms_norm"),
         )?;
-        let post_attn_norm = self
-            .normed_buf
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer post norm D2H: {e}"))?[..row_bytes]
-            .to_vec();
+        let post_attn_norm =
+            self.normed_buf.to_host_bytes().map_err(|e| {
+                anyhow::anyhow!("layer {idx} component full-layer post norm D2H: {e}")
+            })?[..row_bytes]
+                .to_vec();
 
         let mlp_trace = self
             .component_decode_mlp_layer(idx, true)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx} component full-layer missing mlp trace"))?;
-        let layer_hidden = self
-            .hidden_io
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("layer {idx} component full-layer final hidden D2H: {e}"))?[..row_bytes]
+        let layer_hidden = self.hidden_io.to_host_bytes().map_err(|e| {
+            anyhow::anyhow!("layer {idx} component full-layer final hidden D2H: {e}")
+        })?[..row_bytes]
             .to_vec();
 
         Ok(ComponentLayerTrace {
@@ -2751,12 +3216,19 @@ impl DecodeEngine {
         seq_pos: usize,
     ) -> Result<(Vec<u8>, Vec<u8>)> {
         let config = self.weights.config.clone();
-        let ls = self.state_for_batch(batch_index)
+        let ls = self
+            .state_for_batch(batch_index)
             .layers
             .get(layer_idx)
             .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?;
-        let cache_k = ls.kv_cache_k.as_ref().ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
-        let cache_v = ls.kv_cache_v.as_ref().ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
+        let cache_k = ls
+            .kv_cache_k
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
+        let cache_v = ls
+            .kv_cache_v
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
         let num_kv_heads = config.num_key_value_heads;
         let head_dim = config.head_dim;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -2805,9 +3277,15 @@ impl DecodeEngine {
         trace_layer: Option<usize>,
         trace_linear_layer: Option<usize>,
         cuda_greedy: bool,
-        certified_kv_decode: Option<(usize, usize, bool)>,
+        certified_kv_decode: Option<CertifiedKvDecodeParams>,
         mut timings: Option<&mut DecodeStageTimings>,
-    ) -> Result<(Option<Vec<f32>>, Option<u32>, Option<Vec<u8>>, Option<ComponentLayerTrace>, Option<ComponentLinearTrace>)> {
+    ) -> Result<(
+        Option<Vec<f32>>,
+        Option<u32>,
+        Option<Vec<u8>>,
+        Option<ComponentLayerTrace>,
+        Option<ComponentLinearTrace>,
+    )> {
         let hidden_dim = self.weights.config.hidden_size;
         let vocab_size = self.weights.config.vocab_size;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
@@ -2860,7 +3338,10 @@ impl DecodeEngine {
                     certified_kv_decode,
                     timings.as_deref_mut(),
                 )?;
-                self.sync_stage_if_requested(collect_timings, &format!("layer {i} full attention"))?;
+                self.sync_stage_if_requested(
+                    collect_timings,
+                    &format!("layer {i} full attention"),
+                )?;
                 let elapsed = full_attn_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some(t) = timings.as_mut() {
                     t.persistent_ms += elapsed;
@@ -2868,13 +3349,15 @@ impl DecodeEngine {
                 }
             } else {
                 let linear_start = Instant::now();
-                if let Some(trace) = self.component_decode_linear_attention_layer(
-                    i,
-                    trace_linear_layer == Some(i),
-                )? {
+                if let Some(trace) =
+                    self.component_decode_linear_attention_layer(i, trace_linear_layer == Some(i))?
+                {
                     traced_linear = Some(trace);
                 }
-                self.sync_stage_if_requested(collect_timings, &format!("layer {i} linear attention"))?;
+                self.sync_stage_if_requested(
+                    collect_timings,
+                    &format!("layer {i} linear attention"),
+                )?;
                 let elapsed = linear_start.elapsed().as_secs_f64() * 1000.0;
                 if let Some(t) = timings.as_mut() {
                     t.persistent_ms += elapsed;
@@ -2903,7 +3386,10 @@ impl DecodeEngine {
                 &mut self.normed_buf,
                 &format!("layer {i} post-attn rms_norm"),
             )?;
-            self.sync_stage_if_requested(collect_timings, &format!("layer {i} post-attn rms_norm"))?;
+            self.sync_stage_if_requested(
+                collect_timings,
+                &format!("layer {i} post-attn rms_norm"),
+            )?;
             if let Some(t) = timings.as_mut() {
                 t.rms_norm_ms += post_attn_norm_start.elapsed().as_secs_f64() * 1000.0;
             }
@@ -2925,13 +3411,14 @@ impl DecodeEngine {
                 t.persistent_mlp_down_ms += mlp_elapsed;
             }
             if trace_layer == Some(i) {
-                let mlp_trace = maybe_mlp
-                    .ok_or_else(|| anyhow::anyhow!("missing mlp trace for layer {i}"))?;
+                let mlp_trace =
+                    maybe_mlp.ok_or_else(|| anyhow::anyhow!("missing mlp trace for layer {i}"))?;
                 traced_layer = Some(ComponentLayerTrace {
                     attn_hidden: trace_attn_hidden
                         .ok_or_else(|| anyhow::anyhow!("missing attn trace for layer {i}"))?,
-                    post_attn_norm: trace_post_attn_norm
-                        .ok_or_else(|| anyhow::anyhow!("missing post-attn norm trace for layer {i}"))?,
+                    post_attn_norm: trace_post_attn_norm.ok_or_else(|| {
+                        anyhow::anyhow!("missing post-attn norm trace for layer {i}")
+                    })?,
                     mlp_swiglu: mlp_trace.swiglu,
                     mlp_out: mlp_trace.down,
                     layer_hidden: self
@@ -2996,7 +3483,13 @@ impl DecodeEngine {
                     .try_into()
                     .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
             );
-            return Ok((None, Some(sampled_token), traced_hidden, traced_layer, traced_linear));
+            return Ok((
+                None,
+                Some(sampled_token),
+                traced_hidden,
+                traced_layer,
+                traced_linear,
+            ));
         }
 
         let lm_head_start = Instant::now();
@@ -3038,9 +3531,21 @@ impl DecodeEngine {
         ))
     }
 
-    fn component_decode_step_4b(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
-        let (logits, _, _, _, _) =
-            self.component_decode_step_4b_impl(token_id, seqlen_offset, None, None, None, false, None, None)?;
+    fn component_decode_step_4b(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<Vec<f32>> {
+        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        )?;
         logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
     }
 
@@ -3060,7 +3565,8 @@ impl DecodeEngine {
             None,
             Some(&mut timings),
         )?;
-        let logits = logits.ok_or_else(|| anyhow::anyhow!("component decode timings missing logits"))?;
+        let logits =
+            logits.ok_or_else(|| anyhow::anyhow!("component decode timings missing logits"))?;
         let sampling_start = Instant::now();
         let _ = Self::greedy_sample(&logits);
         timings.host_sampling_ms += sampling_start.elapsed().as_secs_f64() * 1000.0;
@@ -3077,7 +3583,11 @@ impl DecodeEngine {
             anyhow::bail!("component_decode_step_4b_cuda_fast_greedy requires CUDA backend");
         }
         let mut timings = DecodeStageTimings::default();
-        let timing_slot = if collect_timings { Some(&mut timings) } else { None };
+        let timing_slot = if collect_timings {
+            Some(&mut timings)
+        } else {
+            None
+        };
         let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
@@ -3097,9 +3607,7 @@ impl DecodeEngine {
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
-        block_size: usize,
-        value_group_size: usize,
-        bf16_values: bool,
+        certified_kv_decode: CertifiedKvDecodeParams,
     ) -> Result<Vec<f32>> {
         let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
@@ -3108,7 +3616,7 @@ impl DecodeEngine {
             None,
             None,
             false,
-            Some((block_size, value_group_size, bf16_values)),
+            Some(certified_kv_decode),
             None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
@@ -3118,16 +3626,18 @@ impl DecodeEngine {
         &mut self,
         token_id: u32,
         seqlen_offset: usize,
-        block_size: usize,
-        value_group_size: usize,
-        bf16_values: bool,
+        certified_kv_decode: CertifiedKvDecodeParams,
         collect_timings: bool,
     ) -> Result<(u32, DecodeStageTimings)> {
         if self.hidden_io.backend() != gpu_hal::Backend::Cuda {
             anyhow::bail!("certified KV fast greedy requires CUDA backend");
         }
         let mut timings = DecodeStageTimings::default();
-        let timing_slot = if collect_timings { Some(&mut timings) } else { None };
+        let timing_slot = if collect_timings {
+            Some(&mut timings)
+        } else {
+            None
+        };
         let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
@@ -3135,7 +3645,7 @@ impl DecodeEngine {
             None,
             None,
             true,
-            Some((block_size, value_group_size, bf16_values)),
+            Some(certified_kv_decode),
             timing_slot,
         )?;
         let sampled_token = sampled_token
@@ -3160,7 +3670,8 @@ impl DecodeEngine {
             None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component trace missing logits"))?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing trace for layer {trace_input_layer}"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing trace for layer {trace_input_layer}"))?;
         Ok((logits, trace))
     }
 
@@ -3180,8 +3691,10 @@ impl DecodeEngine {
             None,
             None,
         )?;
-        let logits = logits.ok_or_else(|| anyhow::anyhow!("component layer trace missing logits"))?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
+        let logits =
+            logits.ok_or_else(|| anyhow::anyhow!("component layer trace missing logits"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing stage trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
 
@@ -3201,8 +3714,10 @@ impl DecodeEngine {
             None,
             None,
         )?;
-        let logits = logits.ok_or_else(|| anyhow::anyhow!("component linear trace missing logits"))?;
-        let trace = trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
+        let logits =
+            logits.ok_or_else(|| anyhow::anyhow!("component linear trace missing logits"))?;
+        let trace =
+            trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
         Ok((logits, trace))
     }
 
@@ -3211,7 +3726,7 @@ impl DecodeEngine {
         idx: usize,
         seqlen_offset: usize,
         trace_output: bool,
-        certified_kv_decode: Option<(usize, usize, bool)>,
+        certified_kv_decode: Option<CertifiedKvDecodeParams>,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
         let hidden_dim = self.weights.config.hidden_size;
@@ -3240,8 +3755,8 @@ impl DecodeEngine {
         let kv_len = seqlen_offset + 1;
         let elem_bytes = ScalarType::BF16.size_in_bytes();
         let late_mixed_layers = llama31_int8_late_full_mixed_layers();
-        let use_late_decode_mixed =
-            self.weights.is_int8 && idx + late_mixed_layers >= self.weights.config.num_hidden_layers;
+        let use_late_decode_mixed = self.weights.is_int8
+            && idx + late_mixed_layers >= self.weights.config.num_hidden_layers;
         let use_late_q_mixed =
             use_late_decode_mixed && llama31_int8_late_full_mixed_component_enabled("q");
         let use_late_k_mixed =
@@ -3298,683 +3813,2401 @@ impl DecodeEngine {
 
             let proj_start = Instant::now();
             if use_late_q_mixed {
-            if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_prepared_host(
+                if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
+                    prefill_engine::matmul_int8_mixed_prepared_host(
+                        self.ordinal,
+                        1,
+                        1,
+                        q_proj_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &self.weights,
+                        &format!(
+                            "{}.layers.{idx}.self_attn.q_proj.weight",
+                            self.weights.weight_prefix
+                        ),
+                        &fw.q_proj_w,
+                        sc,
+                        q_full,
+                        mixed_lhs.as_ref(),
+                    )?;
+                } else {
+                    matmul_proj(
+                        self.ordinal,
+                        1,
+                        1,
+                        q_proj_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &fw.q_proj_w,
+                        fw.q_proj_scale.as_ref(),
+                        fw.q_proj_int8_scale.as_ref(),
+                        self.weights.fp8_block_size,
+                        q_full,
+                        fw.q_proj_int4_scale.as_ref(),
+                        fw.q_proj_int4_zero.as_ref(),
+                        self.weights.int4_group_size,
+                    )?;
+                }
+            } else {
+                matmul_proj(
                     self.ordinal,
                     1,
                     1,
                     q_proj_dim,
                     hidden_dim,
                     &self.normed_buf,
-                    &self.weights,
-                    &format!("{}.layers.{idx}.self_attn.q_proj.weight", self.weights.weight_prefix),
                     &fw.q_proj_w,
-                    sc,
+                    fw.q_proj_scale.as_ref(),
+                    fw.q_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
                     q_full,
-                    mixed_lhs.as_ref(),
-                )?;
-            } else {
-                matmul_proj(
-                    self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-                    &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, q_full,
-                    fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                    fw.q_proj_int4_scale.as_ref(),
+                    fw.q_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
                 )?;
             }
-        } else {
-            matmul_proj(
-                self.ordinal, 1, 1, q_proj_dim, hidden_dim,
-                &self.normed_buf, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), self.weights.fp8_block_size, q_full,
-                fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            if has_attn_gate {
+                kernel_ffi::prefill_ffi::split_qgate(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    1,
+                    num_q_heads,
+                    head_dim,
+                    &q_full,
+                    query_buf,
+                    gate_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
+            } else {
+                gpu_hal::copy_d2d(
+                    self.ordinal,
+                    query_buf.as_ptr() as *mut c_void,
+                    q_full.as_ptr(),
+                    q_dim * elem_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
+            }
+
+            if use_late_k_mixed {
+                if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
+                    prefill_engine::matmul_int8_mixed_prepared_host(
+                        self.ordinal,
+                        1,
+                        1,
+                        kv_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &self.weights,
+                        &format!(
+                            "{}.layers.{idx}.self_attn.k_proj.weight",
+                            self.weights.weight_prefix
+                        ),
+                        &fw.k_proj_w,
+                        sc,
+                        k_buf,
+                        mixed_lhs.as_ref(),
+                    )?;
+                } else {
+                    matmul_proj(
+                        self.ordinal,
+                        1,
+                        1,
+                        kv_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &fw.k_proj_w,
+                        fw.k_proj_scale.as_ref(),
+                        fw.k_proj_int8_scale.as_ref(),
+                        self.weights.fp8_block_size,
+                        k_buf,
+                        fw.k_proj_int4_scale.as_ref(),
+                        fw.k_proj_int4_zero.as_ref(),
+                        self.weights.int4_group_size,
+                    )?;
+                }
+            } else {
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    kv_dim,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &fw.k_proj_w,
+                    fw.k_proj_scale.as_ref(),
+                    fw.k_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    k_buf,
+                    fw.k_proj_int4_scale.as_ref(),
+                    fw.k_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+            }
+            if use_late_v_mixed {
+                if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
+                    prefill_engine::matmul_int8_mixed_prepared_host(
+                        self.ordinal,
+                        1,
+                        1,
+                        kv_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &self.weights,
+                        &format!(
+                            "{}.layers.{idx}.self_attn.v_proj.weight",
+                            self.weights.weight_prefix
+                        ),
+                        &fw.v_proj_w,
+                        sc,
+                        v_buf,
+                        mixed_lhs.as_ref(),
+                    )?;
+                } else {
+                    matmul_proj(
+                        self.ordinal,
+                        1,
+                        1,
+                        kv_dim,
+                        hidden_dim,
+                        &self.normed_buf,
+                        &fw.v_proj_w,
+                        fw.v_proj_scale.as_ref(),
+                        fw.v_proj_int8_scale.as_ref(),
+                        self.weights.fp8_block_size,
+                        v_buf,
+                        fw.v_proj_int4_scale.as_ref(),
+                        fw.v_proj_int4_zero.as_ref(),
+                        self.weights.int4_group_size,
+                    )?;
+                }
+            } else {
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    kv_dim,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &fw.v_proj_w,
+                    fw.v_proj_scale.as_ref(),
+                    fw.v_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    v_buf,
+                    fw.v_proj_int4_scale.as_ref(),
+                    fw.v_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+            }
+
+            maybe_attn_rms_norm_rows(
+                config,
+                self.ordinal,
+                num_q_heads,
+                head_dim,
+                &query_buf,
+                fw.q_norm_w.as_ref(),
+                q_normed,
+                &format!("layer {idx} q norm"),
             )?;
-        }
-        if has_attn_gate {
-            kernel_ffi::prefill_ffi::split_qgate(
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                query_buf.as_ptr() as *mut c_void,
+                q_normed.as_ptr(),
+                q_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} q norm copy: {e}"))?;
+
+            maybe_attn_rms_norm_rows(
+                config,
+                self.ordinal,
+                num_kv_heads,
+                head_dim,
+                &k_buf,
+                fw.k_norm_w.as_ref(),
+                k_normed,
+                &format!("layer {idx} k norm"),
+            )?;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                k_buf.as_ptr() as *mut c_void,
+                k_normed.as_ptr(),
+                kv_dim * elem_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
+            self.sync_stage_if_requested(
+                collect_timings,
+                &format!("layer {idx} full attention proj"),
+            )?;
+            if let Some(t) = timings.as_mut() {
+                t.persistent_full_attn_proj_ms += proj_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            if trace_output {
+                q_proj_trace = Some(
+                    query_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} q proj trace D2H: {e}"))?,
+                );
+                gate_proj_trace = Some(
+                    gate_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} gate proj trace D2H: {e}"))?,
+                );
+                k_proj_trace = Some(
+                    k_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} k proj trace D2H: {e}"))?,
+                );
+                v_proj_trace = Some(
+                    v_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} v proj trace D2H: {e}"))?,
+                );
+            }
+
+            kernel_ffi::prefill_ffi::apply_rope_prefill(
                 self.ordinal,
                 ScalarType::BF16,
                 1,
                 num_q_heads,
                 head_dim,
-                &q_full,
+                rotary_dim,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                seqlen_offset,
                 query_buf,
-                gate_buf,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} split qgate: {e}"))?;
-        } else {
-            gpu_hal::copy_d2d(
+            .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
+            kernel_ffi::prefill_ffi::apply_rope_prefill(
                 self.ordinal,
-                query_buf.as_ptr() as *mut c_void,
-                q_full.as_ptr(),
-                q_dim * elem_bytes,
+                ScalarType::BF16,
+                1,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                &self.rotary.cos,
+                &self.rotary.sin,
+                seqlen_offset,
+                k_buf,
             )
-            .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
-        }
-
-        if use_late_k_mixed {
-            if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_prepared_host(
-                    self.ordinal,
-                    1,
-                    1,
-                    kv_dim,
-                    hidden_dim,
-                    &self.normed_buf,
-                    &self.weights,
-                    &format!("{}.layers.{idx}.self_attn.k_proj.weight", self.weights.weight_prefix),
-                    &fw.k_proj_w,
-                    sc,
-                    k_buf,
-                    mixed_lhs.as_ref(),
-                )?;
-            } else {
-                matmul_proj(
-                    self.ordinal, 1, 1, kv_dim, hidden_dim,
-                    &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, k_buf,
-                    fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-                )?;
+            .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
+            if trace_output {
+                q_rope_trace = Some(
+                    query_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} q rope trace D2H: {e}"))?,
+                );
+                k_rope_trace = Some(
+                    k_buf
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} k rope trace D2H: {e}"))?,
+                );
             }
-        } else {
-            matmul_proj(
-                self.ordinal, 1, 1, kv_dim, hidden_dim,
-                &self.normed_buf, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), self.weights.fp8_block_size, k_buf,
-                fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-            )?;
-        }
-        if use_late_v_mixed {
-            if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
-                prefill_engine::matmul_int8_mixed_prepared_host(
-                    self.ordinal,
-                    1,
-                    1,
-                    kv_dim,
-                    hidden_dim,
-                    &self.normed_buf,
-                    &self.weights,
-                    &format!("{}.layers.{idx}.self_attn.v_proj.weight", self.weights.weight_prefix),
-                    &fw.v_proj_w,
-                    sc,
-                    v_buf,
-                    mixed_lhs.as_ref(),
-                )?;
-            } else {
-                matmul_proj(
-                    self.ordinal, 1, 1, kv_dim, hidden_dim,
-                    &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, v_buf,
-                    fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-                )?;
-            }
-        } else {
-            matmul_proj(
-                self.ordinal, 1, 1, kv_dim, hidden_dim,
-                &self.normed_buf, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), self.weights.fp8_block_size, v_buf,
-                fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-            )?;
-        }
 
-        maybe_attn_rms_norm_rows(
-            config,
-            self.ordinal,
-            num_q_heads,
-            head_dim,
-            &query_buf,
-            fw.q_norm_w.as_ref(),
-            q_normed,
-            &format!("layer {idx} q norm"),
-        )?;
-        gpu_hal::copy_d2d(
-            self.ordinal,
-            query_buf.as_ptr() as *mut c_void,
-            q_normed.as_ptr(),
-            q_dim * elem_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q norm copy: {e}"))?;
-
-        maybe_attn_rms_norm_rows(
-            config,
-            self.ordinal,
-            num_kv_heads,
-            head_dim,
-            &k_buf,
-            fw.k_norm_w.as_ref(),
-            k_normed,
-            &format!("layer {idx} k norm"),
-        )?;
-        gpu_hal::copy_d2d(
-            self.ordinal,
-            k_buf.as_ptr() as *mut c_void,
-            k_normed.as_ptr(),
-            kv_dim * elem_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k norm copy: {e}"))?;
-        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention proj"))?;
-        if let Some(t) = timings.as_mut() {
-            t.persistent_full_attn_proj_ms += proj_start.elapsed().as_secs_f64() * 1000.0;
-        }
-        if trace_output {
-            q_proj_trace = Some(
-                query_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} q proj trace D2H: {e}"))?,
-            );
-            gate_proj_trace = Some(
-                gate_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} gate proj trace D2H: {e}"))?,
-            );
-            k_proj_trace = Some(
-                k_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} k proj trace D2H: {e}"))?,
-            );
-            v_proj_trace = Some(
-                v_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} v proj trace D2H: {e}"))?,
-            );
-        }
-
-        kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, query_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
-        kernel_ffi::prefill_ffi::apply_rope_prefill(
-            self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, rotary_dim,
-            &self.rotary.cos, &self.rotary.sin, seqlen_offset, k_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;
-        if trace_output {
-            q_rope_trace = Some(
-                query_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} q rope trace D2H: {e}"))?,
-            );
-            k_rope_trace = Some(
-                k_buf
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} k rope trace D2H: {e}"))?,
-            );
-        }
-
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_q_heads, head_dim, query_buf, attn_q)
+            kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                head_dim,
+                query_buf,
+                attn_q,
+            )
             .map_err(|e| anyhow::anyhow!("layer {idx} q transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, k_buf, attn_k_step)
+            kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_kv_heads,
+                head_dim,
+                k_buf,
+                attn_k_step,
+            )
             .map_err(|e| anyhow::anyhow!("layer {idx} k transpose: {e}"))?;
-        kernel_ffi::prefill_ffi::transpose_shd_hsd(self.ordinal, ScalarType::BF16, 1, num_kv_heads, head_dim, v_buf, attn_v_step)
+            kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_kv_heads,
+                head_dim,
+                v_buf,
+                attn_v_step,
+            )
             .map_err(|e| anyhow::anyhow!("layer {idx} v transpose: {e}"))?;
 
-        let ls = &mut self.state.layers[idx];
-        ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-            .map_err(|e| anyhow::anyhow!("layer {idx} kv alloc: {e}"))?;
-        if let Some(ref mut cache_k) = ls.kv_cache_k {
-            let cap = cache_k.shape()[2];
-            let cap_stride = cap * head_dim * elem_bytes;
-            let src_stride = head_dim * elem_bytes;
-            let dst_offset = seqlen_offset * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
+            let ls = &mut self.state.layers[idx];
+            let use_certified_cuda = certified_kv_decode
+                .map(|cfg| kernel_ffi::certified_kv::aligned_tokens(kv_len, cfg.block_size) > 0)
+                .unwrap_or(false);
+            if !(use_certified_cuda && ls.certified_kv_gpu_tail_only) {
+                ls.ensure_kv_capacity(
+                    seqlen_offset,
                     self.ordinal,
-                    cache_k.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
-                    attn_k_step.offset_ptr(h * src_stride),
-                    src_stride,
+                    config,
+                    self.kv_chunk_size,
+                    self.kv_fp8,
                 )
-                .map_err(|e| anyhow::anyhow!("layer {idx} cache k write h={h}: {e}"))?;
-            }
-        }
-        if let Some(ref mut cache_v) = ls.kv_cache_v {
-            let cap = cache_v.shape()[2];
-            let cap_stride = cap * head_dim * elem_bytes;
-            let src_stride = head_dim * elem_bytes;
-            let dst_offset = seqlen_offset * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                gpu_hal::copy_d2d(
-                    self.ordinal,
-                    cache_v.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
-                    attn_v_step.offset_ptr(h * src_stride),
-                    src_stride,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} cache v write h={h}: {e}"))?;
-            }
-        }
-
-        let cap = ls.kv_cache_k.as_ref().unwrap().shape()[2];
-
-        let core_start = Instant::now();
-        let use_certified_cuda = certified_kv_decode
-            .map(|(block_size, _, _)| {
-                kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size) > 0
-            })
-            .unwrap_or(false);
-        if use_certified_cuda {
-            let (block_size, value_group_size, bf16_values) = certified_kv_decode
-                .expect("certified KV decode config is present when enabled");
-            let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
-            let tail_len = kv_len - aligned;
-            let cap_aligned = kernel_ffi::certified_kv::aligned_tokens(cap, block_size);
-            let key_i8_shape = [num_kv_heads, cap_aligned, head_dim];
-            let key_scale_shape = [num_kv_heads, cap_aligned / block_size, head_dim];
-            let needs_key_alloc = ls
-                .certified_kv_key_i8
-                .as_ref()
-                .map(|buf| buf.shape() != key_i8_shape)
-                .unwrap_or(true)
-                || ls
-                    .certified_kv_key_scale
-                    .as_ref()
-                    .map(|buf| buf.shape() != key_scale_shape)
-                    .unwrap_or(true);
-            if needs_key_alloc {
-                ls.certified_kv_key_i8 =
-                    Some(GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape).map_err(
-                        |e| anyhow::anyhow!("layer {idx} certified KV decode key_i8 alloc: {e}"),
-                    )?);
-                ls.certified_kv_key_scale = Some(
-                    GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape).map_err(
-                        |e| {
-                            anyhow::anyhow!(
-                                "layer {idx} certified KV decode key_scale alloc: {e}"
-                            )
-                        },
-                    )?,
-                );
-                ls.certified_kv_key_tokens = 0;
-            }
-            if ls.certified_kv_key_tokens < aligned {
-                let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-                let key_i8 = ls.certified_kv_key_i8.as_mut().unwrap();
-                let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
-                let start_block = ls.certified_kv_key_tokens / block_size;
-                let block_count = (aligned - ls.certified_kv_key_tokens) / block_size;
-                if timings.is_some() {
-                    gpu_hal::sync(self.ordinal)
-                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV key quantize pre-sync: {e}"))?;
+                .map_err(|e| anyhow::anyhow!("layer {idx} kv alloc: {e}"))?;
+                if let Some(ref mut cache_k) = ls.kv_cache_k {
+                    let cap = cache_k.shape()[2];
+                    let cap_stride = cap * head_dim * elem_bytes;
+                    let src_stride = head_dim * elem_bytes;
+                    let dst_offset = seqlen_offset * head_dim * elem_bytes;
+                    for h in 0..num_kv_heads {
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            cache_k.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
+                            attn_k_step.offset_ptr(h * src_stride),
+                            src_stride,
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} cache k write h={h}: {e}"))?;
+                    }
                 }
-                let key_quantize_start = Instant::now();
-                kernel_ffi::certified_kv::quantize_bf16_keys_range(
-                    self.ordinal,
-                    cache_k_ref,
-                    start_block,
-                    block_count,
-                    block_size,
-                    key_i8,
-                    key_scale,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}"))?;
-                if let Some(t) = timings.as_mut() {
-                    gpu_hal::sync(self.ordinal).map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV key quantize synchronize: {e}")
-                    })?;
-                    t.certified_kv_key_quantize_ms +=
-                        key_quantize_start.elapsed().as_secs_f64() * 1000.0;
-                }
-                ls.certified_kv_key_tokens = aligned;
-            }
-
-            let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-            let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
-            let key_i8 = ls.certified_kv_key_i8.as_ref().unwrap();
-            let key_scale = ls.certified_kv_key_scale.as_ref().unwrap();
-            let tail_key_bf16 = (tail_len > 0).then_some(cache_k_ref);
-            let tail_value_bf16 = (tail_len > 0).then_some(cache_v_ref);
-            let score_shape = [num_q_heads, cap];
-            if scratch
-                .certified_score_scratch
-                .as_ref()
-                .map(|buf| buf.shape() != score_shape)
-                .unwrap_or(true)
-            {
-                scratch.certified_score_scratch = Some(
-                    GpuBuffer::zeros(self.ordinal, ScalarType::F32, &score_shape).map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}")
-                    })?,
-                );
-            }
-            let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
-            if bf16_values {
-                if timings.is_some() {
-                    gpu_hal::sync(self.ordinal)
-                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}"))?;
-                }
-                let attend_start = Instant::now();
-                kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
-                    self.ordinal,
-                    attn_q,
-                    key_i8,
-                    key_scale,
-                    cache_v_ref,
-                    tail_key_bf16,
-                    kv_len,
-                    block_size,
-                    num_q_heads / num_kv_heads,
-                    1.0 / (head_dim as f32).sqrt(),
-                    score_scratch,
-                    attn_out_bf16,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode attention: {e}"))?;
-                if let Some(t) = timings.as_mut() {
-                    gpu_hal::sync(self.ordinal).map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV attention synchronize: {e}")
-                    })?;
-                    t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
+                if let Some(ref mut cache_v) = ls.kv_cache_v {
+                    let cap = cache_v.shape()[2];
+                    let cap_stride = cap * head_dim * elem_bytes;
+                    let src_stride = head_dim * elem_bytes;
+                    let dst_offset = seqlen_offset * head_dim * elem_bytes;
+                    for h in 0..num_kv_heads {
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            cache_v.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
+                            attn_v_step.offset_ptr(h * src_stride),
+                            src_stride,
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} cache v write h={h}: {e}"))?;
+                    }
                 }
             } else {
-                let value_i4_shape = [num_kv_heads, cap_aligned, head_dim / 2];
-                let value_meta_shape = [num_kv_heads, cap_aligned, head_dim / value_group_size];
-                let value_error_shape = [num_kv_heads, cap_aligned / block_size];
-                let needs_value_alloc = ls
-                    .certified_kv_value_i4
+                let tail_slot = seqlen_offset % certified_kv_decode.unwrap().block_size;
+                let src_stride = head_dim * elem_bytes;
+                let dst_offset = tail_slot * head_dim * elem_bytes;
+                let tail_k = ls.certified_kv_tail_k.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("layer {idx} certified tail key buffer missing")
+                })?;
+                let tail_v = ls.certified_kv_tail_v.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("layer {idx} certified tail value buffer missing")
+                })?;
+                let tail_stride = tail_k.shape()[1] * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        tail_k.offset_ptr(h * tail_stride + dst_offset) as *mut c_void,
+                        attn_k_step.offset_ptr(h * src_stride),
+                        src_stride,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified tail k write h={h}: {e}")
+                    })?;
+                    gpu_hal::copy_d2d(
+                        self.ordinal,
+                        tail_v.offset_ptr(h * tail_stride + dst_offset) as *mut c_void,
+                        attn_v_step.offset_ptr(h * src_stride),
+                        src_stride,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified tail v write h={h}: {e}")
+                    })?;
+                }
+            }
+
+            let cap = if use_certified_cuda && ls.certified_kv_gpu_tail_only {
+                ls.certified_kv_host_k
                     .as_ref()
-                    .map(|buf| buf.shape() != value_i4_shape)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("layer {idx} certified host key buffer missing")
+                    })?
+                    .shape()[2]
+            } else {
+                ls.kv_cache_k.as_ref().unwrap().shape()[2]
+            };
+
+            let core_start = Instant::now();
+            if use_certified_cuda {
+                let cfg = certified_kv_decode
+                    .expect("certified KV decode config is present when enabled");
+                let mut certified_attn_already_flat = false;
+                let block_size = cfg.block_size;
+                let value_group_size = cfg.value_group_size;
+                let bf16_values = cfg.bf16_values;
+                let aligned = kernel_ffi::certified_kv::aligned_tokens(kv_len, block_size);
+                let tail_len = kv_len - aligned;
+                let cap_aligned = kernel_ffi::certified_kv::aligned_tokens(cap, block_size);
+                let key_i8_shape = [num_kv_heads, cap_aligned, head_dim];
+                let key_scale_shape = [num_kv_heads, cap_aligned / block_size, head_dim];
+                let needs_key_alloc = ls
+                    .certified_kv_key_i8
+                    .as_ref()
+                    .map(|buf| buf.shape() != key_i8_shape)
                     .unwrap_or(true)
                     || ls
-                        .certified_kv_value_scale
+                        .certified_kv_key_scale
                         .as_ref()
-                        .map(|buf| buf.shape() != value_meta_shape)
-                        .unwrap_or(true)
-                    || ls
-                        .certified_kv_value_zero
-                        .as_ref()
-                        .map(|buf| buf.shape() != value_meta_shape)
-                        .unwrap_or(true)
-                    || ls
-                        .certified_kv_value_error
-                        .as_ref()
-                        .map(|buf| buf.shape() != value_error_shape)
+                        .map(|buf| buf.shape() != key_scale_shape)
                         .unwrap_or(true);
-                if needs_value_alloc {
-                    ls.certified_kv_value_i4 = Some(
-                        GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape).map_err(
+                if needs_key_alloc {
+                    ls.certified_kv_key_i8 = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::U8, &key_i8_shape).map_err(
                             |e| {
+                                anyhow::anyhow!("layer {idx} certified KV decode key_i8 alloc: {e}")
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_key_scale = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &key_scale_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode key_scale alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_key_tokens = 0;
+                }
+                if ls.certified_kv_key_tokens < aligned {
+                    let key_i8 = ls.certified_kv_key_i8.as_mut().unwrap();
+                    let key_scale = ls.certified_kv_key_scale.as_mut().unwrap();
+                    let start_block = ls.certified_kv_key_tokens / block_size;
+                    let block_count = (aligned - ls.certified_kv_key_tokens) / block_size;
+                    if timings.is_some() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV key quantize pre-sync: {e}")
+                        })?;
+                    }
+                    let key_quantize_start = Instant::now();
+                    if !ls.certified_kv_gpu_tail_only {
+                        let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+                        kernel_ffi::certified_kv::quantize_bf16_keys_range(
+                            self.ordinal,
+                            cache_k_ref,
+                            start_block,
+                            block_count,
+                            block_size,
+                            key_i8,
+                            key_scale,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV decode key quantize: {e}")
+                        })?;
+                    } else {
+                        if block_count != 1 {
+                            anyhow::bail!(
+                                "layer {idx} certified tail key quantize expects single completed block, got {block_count}"
+                            );
+                        }
+                        let tail_k = ls.certified_kv_tail_k.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!("layer {idx} certified tail key missing")
+                        })?;
+                        let quant_k = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &[1, num_kv_heads, block_size, head_dim],
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified quant_k alloc: {e}"))?;
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            quant_k.as_ptr() as *mut c_void,
+                            tail_k.as_ptr(),
+                            tail_k.len_bytes(),
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified quant_k copy: {e}"))?;
+                        let mut tmp_key_i8 = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::U8,
+                            &[num_kv_heads, block_size, head_dim],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified tmp key_i8 alloc: {e}")
+                        })?;
+                        let mut tmp_key_scale = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::F32,
+                            &[num_kv_heads, 1, head_dim],
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified tmp key_scale alloc: {e}")
+                        })?;
+                        kernel_ffi::certified_kv::quantize_bf16_keys(
+                            self.ordinal,
+                            &quant_k,
+                            block_size,
+                            block_size,
+                            &mut tmp_key_i8,
+                            &mut tmp_key_scale,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified tail key quantize: {e}")
+                        })?;
+                        let dst_block = start_block;
+                        let dst_key_stride = key_i8.shape()[1] * head_dim;
+                        let src_key_stride = block_size * head_dim;
+                        let key_block_bytes = src_key_stride * ScalarType::U8.size_in_bytes();
+                        let dst_scale_stride = key_scale.shape()[1] * head_dim;
+                        let scale_block_bytes = head_dim * ScalarType::F32.size_in_bytes();
+                        for h in 0..num_kv_heads {
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                key_i8.offset_ptr(
+                                    (h * dst_key_stride + dst_block * block_size * head_dim)
+                                        * ScalarType::U8.size_in_bytes(),
+                                ) as *mut c_void,
+                                tmp_key_i8.offset_ptr(
+                                    h * src_key_stride * ScalarType::U8.size_in_bytes(),
+                                ),
+                                key_block_bytes,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified key_i8 block copy h={h}: {e}"
+                                )
+                            })?;
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                key_scale.offset_ptr(
+                                    (h * dst_scale_stride + dst_block * head_dim)
+                                        * ScalarType::F32.size_in_bytes(),
+                                ) as *mut c_void,
+                                tmp_key_scale
+                                    .offset_ptr(h * head_dim * ScalarType::F32.size_in_bytes()),
+                                scale_block_bytes,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified key_scale block copy h={h}: {e}"
+                                )
+                            })?;
+                        }
+                    }
+                    if let Some(t) = timings.as_mut() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV key quantize synchronize: {e}"
+                            )
+                        })?;
+                        t.certified_kv_key_quantize_ms +=
+                            key_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    ls.certified_kv_key_tokens = aligned;
+                }
+
+                let host_shape = [1, num_kv_heads, cap, head_dim];
+                let needs_host_alloc = ls
+                    .certified_kv_host_k
+                    .as_ref()
+                    .map(|buf| buf.shape() != host_shape)
+                    .unwrap_or(true)
+                    || ls
+                        .certified_kv_host_v
+                        .as_ref()
+                        .map(|buf| buf.shape() != host_shape)
+                        .unwrap_or(true);
+                if needs_host_alloc {
+                    ls.certified_kv_host_k = Some(
+                        HostBuffer::zeros(self.ordinal, ScalarType::BF16, &host_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV Tier-2 host key alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_host_v = Some(
+                        HostBuffer::zeros(self.ordinal, ScalarType::BF16, &host_shape).map_err(
+                            |e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV Tier-2 host value alloc: {e}"
+                                )
+                            },
+                        )?,
+                    );
+                    ls.certified_kv_host_tokens = 0;
+                }
+                if ls.certified_kv_host_tokens < kv_len {
+                    let host_k = ls.certified_kv_host_k.as_mut().unwrap();
+                    let host_v = ls.certified_kv_host_v.as_mut().unwrap();
+                    if !ls.certified_kv_gpu_tail_only {
+                        let start_token = ls.certified_kv_host_tokens;
+                        let token_count = kv_len - start_token;
+                        let byte_count = token_count * head_dim * elem_bytes;
+                        let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+                        let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+                        for h in 0..num_kv_heads {
+                            let offset = (h * cap + start_token) * head_dim * elem_bytes;
+                            gpu_hal::copy_d2h(
+                                self.ordinal,
+                                host_k.offset_mut_ptr(offset),
+                                cache_k_ref.offset_ptr(offset),
+                                byte_count,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV Tier-2 key D2H h={h}: {e}"
+                                )
+                            })?;
+                            gpu_hal::copy_d2h(
+                                self.ordinal,
+                                host_v.offset_mut_ptr(offset),
+                                cache_v_ref.offset_ptr(offset),
+                                byte_count,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV Tier-2 value D2H h={h}: {e}"
+                                )
+                            })?;
+                        }
+                    } else {
+                        let token_offset = kv_len - 1;
+                        let src_stride = head_dim * elem_bytes;
+                        for h in 0..num_kv_heads {
+                            let dst = (h * cap + token_offset) * head_dim * elem_bytes;
+                            gpu_hal::copy_d2h(
+                                self.ordinal,
+                                host_k.offset_mut_ptr(dst),
+                                attn_k_step.offset_ptr(h * src_stride),
+                                src_stride,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified Tier-2 key step D2H h={h}: {e}"
+                                )
+                            })?;
+                            gpu_hal::copy_d2h(
+                                self.ordinal,
+                                host_v.offset_mut_ptr(dst),
+                                attn_v_step.offset_ptr(h * src_stride),
+                                src_stride,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified Tier-2 value step D2H h={h}: {e}"
+                                )
+                            })?;
+                        }
+                    }
+                    ls.certified_kv_host_tokens = kv_len;
+                }
+
+                if !ls.certified_kv_gpu_tail_only {
+                    let value_i4_shape_preoffload = [num_kv_heads, cap_aligned, head_dim / 2];
+                    let value_meta_shape_preoffload =
+                        [num_kv_heads, cap_aligned, head_dim / value_group_size];
+                    let value_error_shape_preoffload = [num_kv_heads, cap_aligned / block_size];
+                    let needs_value_alloc_preoffload = ls
+                        .certified_kv_value_i4
+                        .as_ref()
+                        .map(|buf| buf.shape() != value_i4_shape_preoffload)
+                        .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_scale
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_meta_shape_preoffload)
+                            .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_zero
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_meta_shape_preoffload)
+                            .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_error
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_error_shape_preoffload)
+                            .unwrap_or(true);
+                    if needs_value_alloc_preoffload {
+                        ls.certified_kv_value_i4 = Some(
+                            GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::U8,
+                                &value_i4_shape_preoffload,
+                            )
+                            .map_err(|e| {
                                 anyhow::anyhow!(
                                     "layer {idx} certified KV decode value_i4 alloc: {e}"
                                 )
-                            },
-                        )?,
-                    );
-                    ls.certified_kv_value_scale = Some(
-                        GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
-                            |e| {
+                            })?,
+                        );
+                        ls.certified_kv_value_scale = Some(
+                            GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F16,
+                                &value_meta_shape_preoffload,
+                            )
+                            .map_err(|e| {
                                 anyhow::anyhow!(
                                     "layer {idx} certified KV decode value_scale alloc: {e}"
                                 )
-                            },
-                        )?,
-                    );
-                    ls.certified_kv_value_zero = Some(
-                        GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape).map_err(
-                            |e| {
+                            })?,
+                        );
+                        ls.certified_kv_value_zero = Some(
+                            GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F16,
+                                &value_meta_shape_preoffload,
+                            )
+                            .map_err(|e| {
                                 anyhow::anyhow!(
                                     "layer {idx} certified KV decode value_zero alloc: {e}"
                                 )
-                            },
-                        )?,
-                    );
-                    ls.certified_kv_value_error = Some(
-                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                            })?,
+                        );
+                        ls.certified_kv_value_error = Some(
+                            GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F32,
+                                &value_error_shape_preoffload,
+                            )
                             .map_err(|e| {
                                 anyhow::anyhow!(
                                     "layer {idx} certified KV decode value_error alloc: {e}"
                                 )
                             })?,
-                    );
-                    ls.certified_kv_value_tokens = 0;
+                        );
+                        ls.certified_kv_value_tokens = 0;
+                    }
+                    if ls.certified_kv_value_tokens < aligned {
+                        let start_block = ls.certified_kv_value_tokens / block_size;
+                        let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
+                        if timings.is_some() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value quantize pre-sync: {e}"
+                                )
+                            })?;
+                        }
+                        let value_quantize_start = Instant::now();
+                        kernel_ffi::certified_kv::quantize_bf16_values_range(
+                            self.ordinal,
+                            ls.kv_cache_v.as_ref().unwrap(),
+                            start_block,
+                            block_count,
+                            block_size,
+                            value_group_size,
+                            ls.certified_kv_value_i4.as_mut().unwrap(),
+                            ls.certified_kv_value_scale.as_mut().unwrap(),
+                            ls.certified_kv_value_zero.as_mut().unwrap(),
+                            ls.certified_kv_value_error.as_mut().unwrap(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV decode value quantize: {e}")
+                        })?;
+                        if let Some(t) = timings.as_mut() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value quantize synchronize: {e}"
+                                )
+                            })?;
+                            t.certified_kv_value_quantize_ms +=
+                                value_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        ls.certified_kv_value_tokens = aligned;
+                    }
+
+                    let tail_shape = [num_kv_heads, block_size, head_dim];
+                    let needs_tail_alloc = ls
+                        .certified_kv_tail_k
+                        .as_ref()
+                        .map(|buf| buf.shape() != tail_shape)
+                        .unwrap_or(true)
+                        || ls
+                            .certified_kv_tail_v
+                            .as_ref()
+                            .map(|buf| buf.shape() != tail_shape)
+                            .unwrap_or(true);
+                    if needs_tail_alloc {
+                        ls.certified_kv_tail_k = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &tail_shape).map_err(
+                                |e| anyhow::anyhow!("layer {idx} certified tail k alloc: {e}"),
+                            )?,
+                        );
+                        ls.certified_kv_tail_v = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &tail_shape).map_err(
+                                |e| anyhow::anyhow!("layer {idx} certified tail v alloc: {e}"),
+                            )?,
+                        );
+                    }
+                    if tail_len > 0 {
+                        let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+                        let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+                        let tail_k = ls.certified_kv_tail_k.as_mut().unwrap();
+                        let tail_v = ls.certified_kv_tail_v.as_mut().unwrap();
+                        let src_cap_stride = cap * head_dim * elem_bytes;
+                        let dst_tail_stride = block_size * head_dim * elem_bytes;
+                        let tail_bytes = tail_len * head_dim * elem_bytes;
+                        let src_offset = aligned * head_dim * elem_bytes;
+                        for h in 0..num_kv_heads {
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                tail_k.offset_ptr(h * dst_tail_stride) as *mut c_void,
+                                cache_k_ref.offset_ptr(h * src_cap_stride + src_offset),
+                                tail_bytes,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tail k seed h={h}: {e}")
+                            })?;
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                tail_v.offset_ptr(h * dst_tail_stride) as *mut c_void,
+                                cache_v_ref.offset_ptr(h * src_cap_stride + src_offset),
+                                tail_bytes,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tail v seed h={h}: {e}")
+                            })?;
+                        }
+                    }
+                    ls.kv_cache_k = None;
+                    ls.kv_cache_v = None;
+                    ls.certified_kv_gpu_tail_only = true;
                 }
-                if ls.certified_kv_value_tokens < aligned {
-                    let start_block = ls.certified_kv_value_tokens / block_size;
-                    let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
-                    if timings.is_some() {
-                        gpu_hal::sync(self.ordinal).map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV value quantize pre-sync: {e}")
+
+                let key_i8 = ls.certified_kv_key_i8.as_ref().unwrap();
+                let key_scale = ls.certified_kv_key_scale.as_ref().unwrap();
+                let full_value_gpu_ref = ls.kv_cache_v.as_ref();
+                let tail_key_bf16 = if tail_len > 0 {
+                    ls.certified_kv_tail_k.as_ref()
+                } else {
+                    None
+                };
+                let tail_value_bf16 = if tail_len > 0 {
+                    ls.certified_kv_tail_v.as_ref()
+                } else {
+                    None
+                };
+                let tail_compact_shape = [num_kv_heads, tail_len, head_dim];
+                if tail_len > 0 {
+                    if scratch
+                        .certified_tail_key_compact
+                        .as_ref()
+                        .map(|buf| buf.shape() != tail_compact_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_tail_key_compact = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &tail_compact_shape)
+                                .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV compact tail key alloc: {e}"
+                                )
+                            })?,
+                        );
+                    }
+                    if scratch
+                        .certified_tail_value_compact
+                        .as_ref()
+                        .map(|buf| buf.shape() != tail_compact_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_tail_value_compact = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &tail_compact_shape)
+                                .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV compact tail value alloc: {e}"
+                                )
+                            })?,
+                        );
+                    }
+                    let src_tail_key = tail_key_bf16.ok_or_else(|| {
+                        anyhow::anyhow!("layer {idx} certified KV tail key missing")
+                    })?;
+                    let src_tail_value = tail_value_bf16.ok_or_else(|| {
+                        anyhow::anyhow!("layer {idx} certified KV tail value missing")
+                    })?;
+                    let dst_tail_key = scratch.certified_tail_key_compact.as_mut().unwrap();
+                    let dst_tail_value = scratch.certified_tail_value_compact.as_mut().unwrap();
+                    let src_stride_bytes = src_tail_key.shape()[1] * head_dim * elem_bytes;
+                    let dst_stride_bytes = tail_len * head_dim * elem_bytes;
+                    for h in 0..num_kv_heads {
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            dst_tail_key.offset_ptr(h * dst_stride_bytes) as *mut c_void,
+                            src_tail_key.offset_ptr(h * src_stride_bytes),
+                            dst_stride_bytes,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV compact tail key copy h={h}: {e}"
+                            )
+                        })?;
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            dst_tail_value.offset_ptr(h * dst_stride_bytes) as *mut c_void,
+                            src_tail_value.offset_ptr(h * src_stride_bytes),
+                            dst_stride_bytes,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV compact tail value copy h={h}: {e}"
+                            )
                         })?;
                     }
-                    let value_quantize_start = Instant::now();
-                    kernel_ffi::certified_kv::quantize_bf16_values_range(
+                }
+                let tail_key_kernel_ref = if tail_len > 0 {
+                    scratch.certified_tail_key_compact.as_ref()
+                } else {
+                    None
+                };
+                let tail_value_kernel_ref = if tail_len > 0 {
+                    scratch.certified_tail_value_compact.as_ref()
+                } else {
+                    None
+                };
+                let score_shape = [num_q_heads, cap];
+                if scratch
+                    .certified_score_scratch
+                    .as_ref()
+                    .map(|buf| buf.shape() != score_shape)
+                    .unwrap_or(true)
+                {
+                    scratch.certified_score_scratch = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &score_shape).map_err(
+                            |e| anyhow::anyhow!("layer {idx} certified KV decode score alloc: {e}"),
+                        )?,
+                    );
+                }
+                let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
+                if bf16_values {
+                    let full_value_gpu_ref = full_value_gpu_ref.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "layer {idx} certified BF16-values debug path requires full GPU BF16 values"
+                        )
+                    })?;
+                    if timings.is_some() {
+                        gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}")
+                        })?;
+                    }
+                    let attend_start = Instant::now();
+                    kernel_ffi::certified_kv::attend_int8_bf16_values_strided(
                         self.ordinal,
-                        cache_v_ref,
-                        start_block,
-                        block_count,
+                        attn_q,
+                        key_i8,
+                        key_scale,
+                        full_value_gpu_ref,
+                        tail_key_kernel_ref,
+                        kv_len,
                         block_size,
-                        value_group_size,
-                        ls.certified_kv_value_i4.as_mut().unwrap(),
-                        ls.certified_kv_value_scale.as_mut().unwrap(),
-                        ls.certified_kv_value_zero.as_mut().unwrap(),
-                        ls.certified_kv_value_error.as_mut().unwrap(),
+                        num_q_heads / num_kv_heads,
+                        1.0 / (head_dim as f32).sqrt(),
+                        score_scratch,
+                        attn_out_bf16,
                     )
                     .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV decode value quantize: {e}")
+                        anyhow::anyhow!("layer {idx} certified KV decode attention: {e}")
                     })?;
                     if let Some(t) = timings.as_mut() {
                         gpu_hal::sync(self.ordinal).map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV attention synchronize: {e}")
+                        })?;
+                        t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                } else {
+                    let value_i4_shape = [num_kv_heads, cap_aligned, head_dim / 2];
+                    let value_meta_shape = [num_kv_heads, cap_aligned, head_dim / value_group_size];
+                    let value_error_shape = [num_kv_heads, cap_aligned / block_size];
+                    let needs_value_alloc = ls
+                        .certified_kv_value_i4
+                        .as_ref()
+                        .map(|buf| buf.shape() != value_i4_shape)
+                        .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_scale
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_meta_shape)
+                            .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_zero
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_meta_shape)
+                            .unwrap_or(true)
+                        || ls
+                            .certified_kv_value_error
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_error_shape)
+                            .unwrap_or(true);
+                    if needs_value_alloc {
+                        ls.certified_kv_value_i4 = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::U8, &value_i4_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV decode value_i4 alloc: {e}"
+                                    )
+                                })?,
+                        );
+                        ls.certified_kv_value_scale = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV decode value_scale alloc: {e}"
+                                    )
+                                })?,
+                        );
+                        ls.certified_kv_value_zero = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F16, &value_meta_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV decode value_zero alloc: {e}"
+                                    )
+                                })?,
+                        );
+                        ls.certified_kv_value_error = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &value_error_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV decode value_error alloc: {e}"
+                                    )
+                                })?,
+                        );
+                        ls.certified_kv_value_tokens = 0;
+                    }
+                    if ls.certified_kv_value_tokens < aligned {
+                        let start_block = ls.certified_kv_value_tokens / block_size;
+                        let block_count = (aligned - ls.certified_kv_value_tokens) / block_size;
+                        if timings.is_some() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value quantize pre-sync: {e}"
+                                )
+                            })?;
+                        }
+                        let value_quantize_start = Instant::now();
+                        if !ls.certified_kv_gpu_tail_only {
+                            let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+                            kernel_ffi::certified_kv::quantize_bf16_values_range(
+                                self.ordinal,
+                                cache_v_ref,
+                                start_block,
+                                block_count,
+                                block_size,
+                                value_group_size,
+                                ls.certified_kv_value_i4.as_mut().unwrap(),
+                                ls.certified_kv_value_scale.as_mut().unwrap(),
+                                ls.certified_kv_value_zero.as_mut().unwrap(),
+                                ls.certified_kv_value_error.as_mut().unwrap(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV decode value quantize: {e}"
+                                )
+                            })?;
+                        } else {
+                            if block_count != 1 {
+                                anyhow::bail!(
+                                    "layer {idx} certified tail value quantize expects single completed block, got {block_count}"
+                                );
+                            }
+                            let tail_v = ls.certified_kv_tail_v.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!("layer {idx} certified tail value missing")
+                            })?;
+                            let quant_v = GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::BF16,
+                                &[1, num_kv_heads, block_size, head_dim],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified quant_v alloc: {e}")
+                            })?;
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                quant_v.as_ptr() as *mut c_void,
+                                tail_v.as_ptr(),
+                                tail_v.len_bytes(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified quant_v copy: {e}")
+                            })?;
+                            let groups = head_dim / value_group_size;
+                            let mut tmp_value_i4 = GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::U8,
+                                &[num_kv_heads, block_size, head_dim / 2],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tmp value_i4 alloc: {e}")
+                            })?;
+                            let mut tmp_value_scale = GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F16,
+                                &[num_kv_heads, block_size, groups],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tmp value_scale alloc: {e}")
+                            })?;
+                            let mut tmp_value_zero = GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F16,
+                                &[num_kv_heads, block_size, groups],
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tmp value_zero alloc: {e}")
+                            })?;
+                            let mut tmp_value_error =
+                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_kv_heads, 1])
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified tmp value_error alloc: {e}"
+                                        )
+                                    })?;
+                            kernel_ffi::certified_kv::quantize_bf16_values_range(
+                                self.ordinal,
+                                &quant_v,
+                                0,
+                                1,
+                                block_size,
+                                value_group_size,
+                                &mut tmp_value_i4,
+                                &mut tmp_value_scale,
+                                &mut tmp_value_zero,
+                                &mut tmp_value_error,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified tail value quantize: {e}")
+                            })?;
+                            let dst_block = start_block;
+                            let dst_value = ls.certified_kv_value_i4.as_mut().unwrap();
+                            let dst_scale = ls.certified_kv_value_scale.as_mut().unwrap();
+                            let dst_zero = ls.certified_kv_value_zero.as_mut().unwrap();
+                            let dst_error = ls.certified_kv_value_error.as_mut().unwrap();
+                            let dst_value_stride = dst_value.shape()[1] * (head_dim / 2);
+                            let src_value_stride = block_size * (head_dim / 2);
+                            let value_block_bytes = src_value_stride;
+                            let meta_block_bytes =
+                                block_size * groups * ScalarType::F16.size_in_bytes();
+                            let dst_meta_stride = dst_scale.shape()[1] * groups;
+                            let error_bytes = ScalarType::F32.size_in_bytes();
+                            for h in 0..num_kv_heads {
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    dst_value.offset_ptr(
+                                        (h * dst_value_stride
+                                            + dst_block * block_size * (head_dim / 2))
+                                            * ScalarType::U8.size_in_bytes(),
+                                    ) as *mut c_void,
+                                    tmp_value_i4.offset_ptr(h * src_value_stride),
+                                    value_block_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified value_i4 block copy h={h}: {e}"
+                                    )
+                                })?;
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    dst_scale.offset_ptr(
+                                        (h * dst_meta_stride + dst_block * block_size * groups)
+                                            * ScalarType::F16.size_in_bytes(),
+                                    ) as *mut c_void,
+                                    tmp_value_scale.offset_ptr(
+                                        h * block_size * groups * ScalarType::F16.size_in_bytes(),
+                                    ),
+                                    meta_block_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified value_scale block copy h={h}: {e}"
+                                    )
+                                })?;
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    dst_zero.offset_ptr(
+                                        (h * dst_meta_stride + dst_block * block_size * groups)
+                                            * ScalarType::F16.size_in_bytes(),
+                                    ) as *mut c_void,
+                                    tmp_value_zero.offset_ptr(
+                                        h * block_size * groups * ScalarType::F16.size_in_bytes(),
+                                    ),
+                                    meta_block_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified value_zero block copy h={h}: {e}"
+                                    )
+                                })?;
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    dst_error.offset_ptr(
+                                        (h * dst_error.shape()[1] + dst_block) * error_bytes,
+                                    ) as *mut c_void,
+                                    tmp_value_error.offset_ptr(h * error_bytes),
+                                    error_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified value_error block copy h={h}: {e}"
+                                    )
+                                })?;
+                            }
+                        }
+                        if let Some(t) = timings.as_mut() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value quantize synchronize: {e}"
+                                )
+                            })?;
+                            t.certified_kv_value_quantize_ms +=
+                                value_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        ls.certified_kv_value_tokens = aligned;
+                    }
+                    let num_blocks = aligned / block_size;
+                    let block_score_shape = [num_q_heads, num_blocks];
+                    if scratch
+                        .certified_block_max
+                        .as_ref()
+                        .map(|buf| buf.shape() != block_score_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_block_max = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_max alloc: {e}")
+                                })?,
+                        );
+                    }
+                    if scratch
+                        .certified_block_sum
+                        .as_ref()
+                        .map(|buf| buf.shape() != block_score_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_block_sum = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_sum alloc: {e}")
+                                })?,
+                        );
+                    }
+                    kernel_ffi::certified_kv::score_blocks_int8(
+                        self.ordinal,
+                        attn_q,
+                        key_i8,
+                        key_scale,
+                        block_size,
+                        num_q_heads / num_kv_heads,
+                        1.0 / (head_dim as f32).sqrt(),
+                        scratch.certified_block_max.as_mut().unwrap(),
+                        scratch.certified_block_sum.as_mut().unwrap(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV score blocks: {e}"))?;
+                    let block_max_host = decode_f32_le(
+                        &scratch
+                            .certified_block_max
+                            .as_ref()
+                            .unwrap()
+                            .to_host_bytes()
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV block_max D2H: {e}")
+                            })?,
+                    );
+                    let block_sum_host = decode_f32_le(
+                        &scratch
+                            .certified_block_sum
+                            .as_ref()
+                            .unwrap()
+                            .to_host_bytes()
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV block_sum D2H: {e}")
+                            })?,
+                    );
+                    let value_error_host = decode_f32_le(
+                        &ls.certified_kv_value_error
+                            .as_ref()
+                            .unwrap()
+                            .to_host_bytes()
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV value_error D2H: {e}")
+                            })?,
+                    );
+                    let query_f32_all =
+                        decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
+                        })?);
+                    let gqa_group = num_q_heads / num_kv_heads;
+                    let q_scale = 1.0 / (head_dim as f32).sqrt();
+                    let mut promote_index_host = vec![u32::MAX; num_q_heads * num_blocks];
+                    let mut value_promote_index_host = vec![u32::MAX; num_kv_heads * num_blocks];
+                    let mut selected_by_head = Vec::with_capacity(num_q_heads);
+                    let mut max_promoted_blocks = 1usize;
+                    let mut value_promote_flags = vec![false; num_kv_heads * num_blocks];
+                    let mut value_escalation_heads = 0usize;
+                    let force_dense_layer_fallback = false;
+                    let tier2_key = ls.certified_kv_host_k.as_ref().unwrap().as_bytes();
+                    for qh in 0..num_q_heads {
+                        let score_start = qh * num_blocks;
+                        let score_end = score_start + num_blocks;
+                        let (_, _, _, probs, mut selected_indices) =
+                            certified_kv_select_block_indices_from_scores(
+                                &block_max_host[score_start..score_end],
+                                &block_sum_host[score_start..score_end],
+                                cfg.tau_cov,
+                                cfg.k_min,
+                                cfg.k_max,
+                                cfg.rung1_threshold,
+                                cfg.rung1_multiplier,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} q_head {qh} certified KV selector: {e}"
+                                )
+                            })?;
+                        let kvh = qh / gqa_group;
+                        let mut requires_value_escalation = false;
+                        for (block, prob) in probs.iter().enumerate() {
+                            if prob * value_error_host[kvh * num_blocks + block] > cfg.v_tol {
+                                value_promote_flags[kvh * num_blocks + block] = true;
+                                requires_value_escalation = true;
+                            }
+                        }
+                        if requires_value_escalation {
+                            value_escalation_heads += 1;
+                        }
+                        if cfg.ranking_r > 0 && CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS > 0
+                        {
+                            let mut selected_set: std::collections::HashSet<usize> =
+                                selected_indices.iter().copied().collect();
+                            let mut repaired_blocks = 0usize;
+                            loop {
+                                let fp16_selected_log_masses =
+                                    certified_kv_selected_block_fp16_log_masses_from_tier2(
+                                        &query_f32_all,
+                                        tier2_key,
+                                        qh,
+                                        kvh,
+                                        &selected_indices,
+                                        cap,
+                                        block_size,
+                                        head_dim,
+                                        q_scale,
+                                    );
+                                let violators = certified_kv_ranking_boundary_violators(
+                                    &block_max_host[score_start..score_end],
+                                    &block_sum_host[score_start..score_end],
+                                    &fp16_selected_log_masses,
+                                    &selected_indices,
+                                    cfg.ranking_r,
+                                    cfg.eps_guard,
+                                );
+                                if violators.is_empty()
+                                    || selected_indices.len() >= num_blocks
+                                    || repaired_blocks
+                                        >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
+                                {
+                                    break;
+                                }
+                                for block in violators {
+                                    if repaired_blocks
+                                        >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
+                                    {
+                                        break;
+                                    }
+                                    if selected_set.insert(block) {
+                                        selected_indices.push(block);
+                                        repaired_blocks += 1;
+                                    }
+                                }
+                            }
+                        }
+                        max_promoted_blocks = max_promoted_blocks.max(selected_indices.len());
+                        for (slot, &block) in selected_indices.iter().enumerate() {
+                            promote_index_host[score_start + block] = slot as u32;
+                        }
+                        selected_by_head.push(selected_indices);
+                    }
+                    let mut selected_value_blocks_by_kvh = Vec::with_capacity(num_kv_heads);
+                    let mut max_promoted_value_blocks = 1usize;
+                    for kvh in 0..num_kv_heads {
+                        let mut selected_blocks = Vec::new();
+                        for block in 0..num_blocks {
+                            if value_promote_flags[kvh * num_blocks + block] {
+                                value_promote_index_host[kvh * num_blocks + block] =
+                                    selected_blocks.len() as u32;
+                                selected_blocks.push(block);
+                            }
+                        }
+                        max_promoted_value_blocks =
+                            max_promoted_value_blocks.max(selected_blocks.len());
+                        selected_value_blocks_by_kvh.push(selected_blocks);
+                    }
+                    let promoted_key_shape =
+                        [num_q_heads, max_promoted_blocks, block_size, head_dim];
+                    let promoted_value_shape = [
+                        num_kv_heads,
+                        max_promoted_value_blocks,
+                        block_size,
+                        head_dim,
+                    ];
+                    let block_key_bytes = block_size * head_dim * elem_bytes;
+                    let block_value_bytes = block_size * head_dim * elem_bytes;
+                    let mut promoted_key_host =
+                        vec![0u8; num_q_heads * max_promoted_blocks * block_key_bytes];
+                    let mut promoted_value_host =
+                        vec![0u8; num_kv_heads * max_promoted_value_blocks * block_value_bytes];
+                    let tier2_value = ls.certified_kv_host_v.as_ref().unwrap().as_bytes();
+                    for (qh, selected) in selected_by_head.iter().enumerate() {
+                        let kvh = qh / (num_q_heads / num_kv_heads);
+                        for (slot, &block) in selected.iter().enumerate() {
+                            let src = (kvh * cap + block * block_size) * head_dim * elem_bytes;
+                            let dst = (qh * max_promoted_blocks + slot) * block_key_bytes;
+                            promoted_key_host[dst..dst + block_key_bytes]
+                                .copy_from_slice(&tier2_key[src..src + block_key_bytes]);
+                        }
+                    }
+                    for (kvh, selected) in selected_value_blocks_by_kvh.iter().enumerate() {
+                        for (slot, &block) in selected.iter().enumerate() {
+                            let src = (kvh * cap + block * block_size) * head_dim * elem_bytes;
+                            let dst = (kvh * max_promoted_value_blocks + slot) * block_value_bytes;
+                            promoted_value_host[dst..dst + block_value_bytes]
+                                .copy_from_slice(&tier2_value[src..src + block_value_bytes]);
+                        }
+                    }
+                    let mut ranking_fallback_qheads = Vec::new();
+                    if cfg.ranking_r > 0 {
+                        for qh in 0..num_q_heads {
+                            let score_start = qh * num_blocks;
+                            let score_end = score_start + num_blocks;
+                            let fp16_selected_log_masses =
+                                certified_kv_selected_block_fp16_log_masses(
+                                    &query_f32_all,
+                                    &promoted_key_host,
+                                    qh,
+                                    &selected_by_head[qh],
+                                    max_promoted_blocks,
+                                    block_size,
+                                    head_dim,
+                                    q_scale,
+                                );
+                            if certified_kv_ranking_mismatch(
+                                &block_max_host[score_start..score_end],
+                                &block_sum_host[score_start..score_end],
+                                &fp16_selected_log_masses,
+                                &selected_by_head[qh],
+                                cfg.ranking_r,
+                                cfg.eps_guard,
+                            ) {
+                                ranking_fallback_qheads.push(qh);
+                            }
+                        }
+                    }
+                    let ranking_fallback_heads = ranking_fallback_qheads.len();
+                    let mut ranking_fallback_kv_slots_by_kvh = vec![usize::MAX; num_kv_heads];
+                    let mut ranking_fallback_kv_heads = Vec::new();
+                    let mut ranking_fallback_qhead_kv_slots = Vec::new();
+                    for &qh in &ranking_fallback_qheads {
+                        let kvh = qh / (num_q_heads / num_kv_heads);
+                        let mut slot = ranking_fallback_kv_slots_by_kvh[kvh];
+                        if slot == usize::MAX {
+                            slot = ranking_fallback_kv_heads.len();
+                            ranking_fallback_kv_slots_by_kvh[kvh] = slot;
+                            ranking_fallback_kv_heads.push(kvh);
+                        }
+                        ranking_fallback_qhead_kv_slots.push(slot as u32);
+                    }
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_value_escalation_heads += value_escalation_heads;
+                        t.certified_kv_ranking_fallback_heads += ranking_fallback_heads;
+                        if force_dense_layer_fallback {
+                            t.certified_kv_dense_fallback_layers += 1;
+                        }
+                    }
+                    if force_dense_layer_fallback {
+                        let tier2_key = ls.certified_kv_host_k.as_ref().ok_or_else(|| {
                             anyhow::anyhow!(
-                                "layer {idx} certified KV value quantize synchronize: {e}"
+                                "layer {idx} certified KV dense fallback missing Tier-2 key buffer"
                             )
                         })?;
-                        t.certified_kv_value_quantize_ms +=
-                            value_quantize_start.elapsed().as_secs_f64() * 1000.0;
+                        let tier2_value = ls.certified_kv_host_v.as_ref().ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV dense fallback missing Tier-2 value buffer"
+                            )
+                        })?;
+                        let kv_k_contig = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &[1, num_kv_heads, kv_len, head_dim],
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
+                        let kv_v_contig = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &[1, num_kv_heads, kv_len, head_dim],
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
+                        let contig_stride = kv_len * head_dim * elem_bytes;
+                        let prefix_tokens = aligned.min(kv_len);
+                        let prefix_bytes = prefix_tokens * head_dim * elem_bytes;
+                        let tail_bytes = tail_len * head_dim * elem_bytes;
+                        let tail_offset = aligned * head_dim * elem_bytes;
+                        let tail_k = if tail_len > 0 {
+                            Some(ls.certified_kv_tail_k.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV dense fallback missing tail key buffer"
+                                )
+                            })?)
+                        } else {
+                            None
+                        };
+                        let tail_v = if tail_len > 0 {
+                            Some(ls.certified_kv_tail_v.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV dense fallback missing tail value buffer"
+                                )
+                            })?)
+                        } else {
+                            None
+                        };
+                        let tail_stride = block_size * head_dim * elem_bytes;
+                        for h in 0..num_kv_heads {
+                            let src_bytes = h * cap * head_dim * elem_bytes;
+                            let dst_bytes = h * contig_stride;
+                            if prefix_bytes > 0 {
+                                gpu_hal::copy_h2d(
+                                    self.ordinal,
+                                    kv_k_contig.offset_ptr(dst_bytes) as *mut c_void,
+                                    tier2_key.offset_ptr(src_bytes),
+                                    prefix_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified dense fallback key prefix H2D h={h}: {e}"
+                                    )
+                                })?;
+                                gpu_hal::copy_h2d(
+                                    self.ordinal,
+                                    kv_v_contig.offset_ptr(dst_bytes) as *mut c_void,
+                                    tier2_value.offset_ptr(src_bytes),
+                                    prefix_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified dense fallback value prefix H2D h={h}: {e}"
+                                    )
+                                })?;
+                            }
+                            if tail_bytes > 0 {
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    kv_k_contig.offset_ptr(dst_bytes + tail_offset) as *mut c_void,
+                                    tail_k.unwrap().offset_ptr(h * tail_stride),
+                                    tail_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified dense fallback tail key copy h={h}: {e}"
+                                    )
+                                })?;
+                                gpu_hal::copy_d2d(
+                                    self.ordinal,
+                                    kv_v_contig.offset_ptr(dst_bytes + tail_offset) as *mut c_void,
+                                    tail_v.unwrap().offset_ptr(h * tail_stride),
+                                    tail_bytes,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified dense fallback tail value copy h={h}: {e}"
+                                    )
+                                })?;
+                            }
+                        }
+                        if has_attn_gate {
+                            kernel_ffi::prefill_ffi::full_attention_prefill(
+                                self.ordinal,
+                                ScalarType::BF16,
+                                1,
+                                num_q_heads,
+                                num_kv_heads,
+                                1,
+                                kv_len,
+                                head_dim,
+                                q_scale,
+                                seqlen_offset,
+                                attn_q,
+                                &kv_k_contig,
+                                &kv_v_contig,
+                                attn_out_f32,
+                            )
+                            .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+
+                            kernel_ffi::prefill_ffi::cast(
+                                self.ordinal,
+                                ScalarType::F32,
+                                ScalarType::BF16,
+                                num_q_heads * head_dim,
+                                attn_out_f32,
+                                attn_out_bf16,
+                            )
+                            .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+                        } else {
+                            kernel_ffi::prefill_ffi::full_attention_decode_flat(
+                                self.ordinal,
+                                ScalarType::BF16,
+                                1,
+                                num_q_heads,
+                                num_kv_heads,
+                                kv_len,
+                                head_dim,
+                                q_scale,
+                                attn_q,
+                                &kv_k_contig,
+                                &kv_v_contig,
+                                gated,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} decode attention flat: {e}")
+                            })?;
+                            certified_attn_already_flat = true;
+                        }
+                    } else {
+                        if timings.is_some() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}")
+                            })?;
+                        }
+                        let attend_start = Instant::now();
+                        let promote_shape = [num_q_heads, num_blocks];
+                        if scratch
+                            .certified_promote_index
+                            .as_ref()
+                            .map(|buf| buf.shape() != promote_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_promote_index = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &promote_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV promote index alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        if scratch
+                            .certified_promoted_key_bf16
+                            .as_ref()
+                            .map(|buf| buf.shape() != promoted_key_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_promoted_key_bf16 = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::BF16,
+                                    &promoted_key_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV promoted key alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        let value_promote_shape = [num_kv_heads, num_blocks];
+                        if scratch
+                            .certified_value_promote_index
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_promote_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_value_promote_index = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::U32,
+                                    &value_promote_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promote index alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        if scratch
+                            .certified_promoted_value_bf16
+                            .as_ref()
+                            .map(|buf| buf.shape() != promoted_value_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_promoted_value_bf16 = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::BF16,
+                                    &promoted_value_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV promoted value alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        let promote_index_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                promote_index_host.as_ptr() as *const u8,
+                                promote_index_host.len() * std::mem::size_of::<u32>(),
+                            )
+                        };
+                        let value_promote_index_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                value_promote_index_host.as_ptr() as *const u8,
+                                value_promote_index_host.len() * std::mem::size_of::<u32>(),
+                            )
+                        };
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_promote_index
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            promote_index_bytes.as_ptr() as *const c_void,
+                            promote_index_bytes.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV promote index H2D: {e}")
+                        })?;
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_value_promote_index
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            value_promote_index_bytes.as_ptr() as *const c_void,
+                            value_promote_index_bytes.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV value promote index H2D: {e}")
+                        })?;
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_promoted_key_bf16
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            promoted_key_host.as_ptr() as *const c_void,
+                            promoted_key_host.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV promoted key H2D: {e}")
+                        })?;
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_promoted_key_h2d_bytes += promoted_key_host.len();
+                        }
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_promoted_value_bf16
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            promoted_value_host.as_ptr() as *const c_void,
+                            promoted_value_host.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV promoted value H2D: {e}")
+                        })?;
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_promoted_value_h2d_bytes += promoted_value_host.len();
+                        }
+                        kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                            self.ordinal,
+                            attn_q,
+                            key_i8,
+                            key_scale,
+                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                            scratch.certified_promote_index.as_ref().unwrap(),
+                            scratch.certified_promoted_value_bf16.as_ref().unwrap(),
+                            scratch.certified_value_promote_index.as_ref().unwrap(),
+                            ls.certified_kv_value_i4.as_ref().unwrap(),
+                            ls.certified_kv_value_scale.as_ref().unwrap(),
+                            ls.certified_kv_value_zero.as_ref().unwrap(),
+                            tail_key_kernel_ref,
+                            tail_value_kernel_ref,
+                            kv_len,
+                            block_size,
+                            value_group_size,
+                            num_q_heads / num_kv_heads,
+                            q_scale,
+                            score_scratch,
+                            attn_out_bf16,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV mixed-key INT4 attention: {e}"
+                            )
+                        })?;
+                        if !ranking_fallback_qheads.is_empty() {
+                            let fallback_count = ranking_fallback_qheads.len();
+                            let fallback_kv_count = ranking_fallback_kv_heads.len();
+                            let fallback_heads_shape = [fallback_count];
+                            let fallback_score_shape = [fallback_count, kv_len];
+                            if scratch
+                                .certified_ranking_fallback_heads
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_heads_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_heads = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::U32,
+                                        &fallback_heads_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback heads alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            if scratch
+                                .certified_ranking_fallback_kv_slots
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_heads_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_kv_slots = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::U32,
+                                        &fallback_heads_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback kv slots alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            if scratch
+                                .certified_ranking_fallback_kv_heads
+                                .as_ref()
+                                .map(|buf| buf.shape() != [fallback_kv_count])
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_kv_heads = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::U32,
+                                        &[fallback_kv_count],
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback kv heads alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            if scratch
+                                .certified_ranking_fallback_score
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_score_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_score = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::F32,
+                                        &fallback_score_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback score alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+
+                            let fallback_heads_u32: Vec<u32> = ranking_fallback_qheads
+                                .iter()
+                                .map(|&qh| qh as u32)
+                                .collect();
+                            let fallback_heads_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    fallback_heads_u32.as_ptr() as *const u8,
+                                    fallback_heads_u32.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_ranking_fallback_heads
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                fallback_heads_bytes.as_ptr() as *const c_void,
+                                fallback_heads_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking fallback heads H2D: {e}"
+                                )
+                            })?;
+                            let fallback_kv_slots_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    ranking_fallback_qhead_kv_slots.as_ptr() as *const u8,
+                                    ranking_fallback_qhead_kv_slots.len()
+                                        * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_ranking_fallback_kv_slots
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                fallback_kv_slots_bytes.as_ptr() as *const c_void,
+                                fallback_kv_slots_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking fallback kv slots H2D: {e}"
+                                )
+                            })?;
+                            let fallback_kv_heads_u32: Vec<u32> = ranking_fallback_kv_heads
+                                .iter()
+                                .map(|&kvh| kvh as u32)
+                                .collect();
+                            let fallback_kv_heads_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    fallback_kv_heads_u32.as_ptr() as *const u8,
+                                    fallback_kv_heads_u32.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_ranking_fallback_kv_heads
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                fallback_kv_heads_bytes.as_ptr() as *const c_void,
+                                fallback_kv_heads_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking fallback kv heads H2D: {e}"
+                                )
+                            })?;
+
+                            let tier2_key = ls.certified_kv_host_k.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking fallback missing Tier-2 key buffer"
+                                )
+                            })?;
+                            let tier2_value = ls.certified_kv_host_v.as_ref().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking fallback missing Tier-2 value buffer"
+                                )
+                            })?;
+                            let prefix_tokens = aligned.min(kv_len);
+                            let prefix_bytes = prefix_tokens * head_dim * elem_bytes;
+                            let prefix_shape = [fallback_kv_count, prefix_tokens, head_dim];
+                            let tail_k = if tail_len > 0 {
+                                Some(ls.certified_kv_tail_k.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV ranking fallback missing tail key buffer"
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
+                            let tail_v = if tail_len > 0 {
+                                Some(ls.certified_kv_tail_v.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV ranking fallback missing tail value buffer"
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
+                            let cache_valid = ls.certified_kv_ranking_prefix_tokens
+                                == prefix_tokens
+                                && ls.certified_kv_ranking_prefix_kv_heads
+                                    == ranking_fallback_kv_heads
+                                && ls
+                                    .certified_kv_ranking_prefix_k
+                                    .as_ref()
+                                    .map(|buf| buf.shape() == prefix_shape)
+                                    .unwrap_or(false)
+                                && ls
+                                    .certified_kv_ranking_prefix_v
+                                    .as_ref()
+                                    .map(|buf| buf.shape() == prefix_shape)
+                                    .unwrap_or(false);
+                            let ranking_prefix_bytes = 2 * fallback_kv_count * prefix_bytes;
+                            if let Some(t) = timings.as_mut() {
+                                if cache_valid {
+                                    t.certified_kv_ranking_prefix_cache_hits += fallback_kv_count;
+                                    t.certified_kv_ranking_prefix_reuse_bytes +=
+                                        ranking_prefix_bytes;
+                                } else {
+                                    t.certified_kv_ranking_prefix_cache_misses += fallback_kv_count;
+                                    t.certified_kv_ranking_prefix_h2d_bytes += ranking_prefix_bytes;
+                                }
+                            }
+                            if !cache_valid {
+                                ls.certified_kv_ranking_prefix_k = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::BF16,
+                                        &prefix_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback prefix key alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                                ls.certified_kv_ranking_prefix_v = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::BF16,
+                                        &prefix_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV ranking fallback prefix value alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                                ls.certified_kv_ranking_prefix_tokens = prefix_tokens;
+                                ls.certified_kv_ranking_prefix_kv_heads =
+                                    ranking_fallback_kv_heads.clone();
+                                let fallback_key =
+                                    ls.certified_kv_ranking_prefix_k.as_mut().unwrap();
+                                let fallback_value =
+                                    ls.certified_kv_ranking_prefix_v.as_mut().unwrap();
+                                let fallback_stride = prefix_tokens * head_dim * elem_bytes;
+                                for (slot, &kvh) in ranking_fallback_kv_heads.iter().enumerate() {
+                                    let src_bytes = kvh * cap * head_dim * elem_bytes;
+                                    let dst_bytes = slot * fallback_stride;
+                                    if prefix_bytes == 0 {
+                                        continue;
+                                    }
+                                    gpu_hal::copy_h2d(
+                                        self.ordinal,
+                                        fallback_key.offset_ptr(dst_bytes) as *mut c_void,
+                                        tier2_key.offset_ptr(src_bytes),
+                                        prefix_bytes,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified ranking fallback key H2D kvh={kvh}: {e}"
+                                        )
+                                    })?;
+                                    gpu_hal::copy_h2d(
+                                        self.ordinal,
+                                        fallback_value.offset_ptr(dst_bytes) as *mut c_void,
+                                        tier2_value.offset_ptr(src_bytes),
+                                        prefix_bytes,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified ranking fallback value H2D kvh={kvh}: {e}"
+                                        )
+                                    })?;
+                                }
+                            }
+
+                            kernel_ffi::certified_kv::dense_selected_heads_out_bf16(
+                                self.ordinal,
+                                attn_q,
+                                scratch.certified_ranking_fallback_heads.as_ref().unwrap(),
+                                scratch
+                                    .certified_ranking_fallback_kv_slots
+                                    .as_ref()
+                                    .unwrap(),
+                                scratch
+                                    .certified_ranking_fallback_kv_heads
+                                    .as_ref()
+                                    .unwrap(),
+                                ls.certified_kv_ranking_prefix_k.as_ref().unwrap(),
+                                ls.certified_kv_ranking_prefix_v.as_ref().unwrap(),
+                                tail_k,
+                                tail_v,
+                                kv_len,
+                                scratch.certified_ranking_fallback_score.as_mut().unwrap(),
+                                attn_out_bf16,
+                                q_scale,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV ranking selected-head fallback: {e}"
+                                )
+                            })?;
+                        }
+                        if let Some(t) = timings.as_mut() {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV INT4 attention synchronize: {e}"
+                                )
+                            })?;
+                            t.certified_kv_attend_ms +=
+                                attend_start.elapsed().as_secs_f64() * 1000.0;
+                        }
                     }
-                    ls.certified_kv_value_tokens = aligned;
                 }
-                if timings.is_some() {
-                    gpu_hal::sync(self.ordinal)
-                        .map_err(|e| anyhow::anyhow!("layer {idx} certified KV attention pre-sync: {e}"))?;
-                }
-                let attend_start = Instant::now();
-                kernel_ffi::certified_kv::attend_int8_int4_with_bf16_tail_strided(
-                    self.ordinal,
-                    attn_q,
-                    key_i8,
-                    key_scale,
-                    ls.certified_kv_value_i4.as_ref().unwrap(),
-                    ls.certified_kv_value_scale.as_ref().unwrap(),
-                    ls.certified_kv_value_zero.as_ref().unwrap(),
-                    tail_key_bf16,
-                    tail_value_bf16,
-                    kv_len,
-                    block_size,
-                    value_group_size,
-                    num_q_heads / num_kv_heads,
-                    1.0 / (head_dim as f32).sqrt(),
-                    score_scratch,
-                    attn_out_bf16,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("layer {idx} certified KV decode INT4 attention: {e}")
-                })?;
-                if let Some(t) = timings.as_mut() {
-                    gpu_hal::sync(self.ordinal).map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV INT4 attention synchronize: {e}")
+                if has_attn_gate {
+                    kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        num_q_heads,
+                        1,
+                        head_dim,
+                        attn_out_bf16,
+                        attn_flat,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}")
                     })?;
-                    t.certified_kv_attend_ms += attend_start.elapsed().as_secs_f64() * 1000.0;
-                }
-            }
-            if has_attn_gate {
-                kernel_ffi::prefill_ffi::transpose_shd_hsd(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    num_q_heads,
-                    1,
-                    head_dim,
-                    attn_out_bf16,
-                    attn_flat,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}"))?;
-                if trace_output {
-                    pre_gate_trace = Some(
-                        attn_flat
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
-                    );
-                }
-                kernel_ffi::prefill_ffi::sigmoid_mul(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    q_dim,
-                    attn_flat,
-                    gate_buf,
-                    gated,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
-            } else {
-                kernel_ffi::prefill_ffi::transpose_shd_hsd(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    num_q_heads,
-                    1,
-                    head_dim,
-                    attn_out_bf16,
-                    gated,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}"))?;
-                if trace_output {
-                    pre_gate_trace = Some(
-                        gated
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
-                    );
-                }
-            }
-        } else {
-            let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-            let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
-            if has_attn_gate {
-            let kv_k_contig;
-            let kv_v_contig;
-            let attn_k_ref;
-            let attn_v_ref;
-            if cap == kv_len {
-                attn_k_ref = cache_k_ref;
-                attn_v_ref = cache_v_ref;
-            } else {
-                kv_k_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
-                kv_v_contig = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-                    .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
-                let cap_stride = cap * head_dim * elem_bytes;
-                let contig_stride = kv_len * head_dim * elem_bytes;
-                let copy_bytes = kv_len * head_dim * elem_bytes;
-                for h in 0..num_kv_heads {
-                    gpu_hal::copy_d2d(
+                    if trace_output {
+                        pre_gate_trace =
+                            Some(attn_flat.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}")
+                            })?);
+                    }
+                    kernel_ffi::prefill_ffi::sigmoid_mul(
                         self.ordinal,
-                        kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                        cache_k_ref.offset_ptr(h * cap_stride),
-                        copy_bytes,
+                        ScalarType::BF16,
+                        q_dim,
+                        attn_flat,
+                        gate_buf,
+                        gated,
                     )
-                    .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble k h={h}: {e}"))?;
-                    gpu_hal::copy_d2d(
-                        self.ordinal,
-                        kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                        cache_v_ref.offset_ptr(h * cap_stride),
-                        copy_bytes,
-                    )
-                    .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble v h={h}: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+                } else {
+                    if !certified_attn_already_flat {
+                        kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            num_q_heads,
+                            1,
+                            head_dim,
+                            attn_out_bf16,
+                            gated,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV decode transpose back: {e}")
+                        })?;
+                    }
+                    if trace_output {
+                        pre_gate_trace =
+                            Some(gated.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}")
+                            })?);
+                    }
                 }
-                attn_k_ref = &kv_k_contig;
-                attn_v_ref = &kv_v_contig;
-            }
-            kernel_ffi::prefill_ffi::full_attention_prefill(
-                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-                1, kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(), seqlen_offset,
-                attn_q, attn_k_ref, attn_v_ref, attn_out_f32,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+            } else {
+                let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+                let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
+                if has_attn_gate {
+                    let kv_k_contig;
+                    let kv_v_contig;
+                    let attn_k_ref;
+                    let attn_v_ref;
+                    if cap == kv_len {
+                        attn_k_ref = cache_k_ref;
+                        attn_v_ref = cache_v_ref;
+                    } else {
+                        kv_k_contig = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &[num_kv_heads, kv_len, head_dim],
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_k_contig alloc: {e}"))?;
+                        kv_v_contig = GpuBuffer::zeros(
+                            self.ordinal,
+                            ScalarType::BF16,
+                            &[num_kv_heads, kv_len, head_dim],
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} kv_v_contig alloc: {e}"))?;
+                        let cap_stride = cap * head_dim * elem_bytes;
+                        let contig_stride = kv_len * head_dim * elem_bytes;
+                        let copy_bytes = kv_len * head_dim * elem_bytes;
+                        for h in 0..num_kv_heads {
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                                cache_k_ref.offset_ptr(h * cap_stride),
+                                copy_bytes,
+                            )
+                            .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble k h={h}: {e}"))?;
+                            gpu_hal::copy_d2d(
+                                self.ordinal,
+                                kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
+                                cache_v_ref.offset_ptr(h * cap_stride),
+                                copy_bytes,
+                            )
+                            .map_err(|e| anyhow::anyhow!("layer {idx} kv assemble v h={h}: {e}"))?;
+                        }
+                        attn_k_ref = &kv_k_contig;
+                        attn_v_ref = &kv_v_contig;
+                    }
+                    kernel_ffi::prefill_ffi::full_attention_prefill(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        1,
+                        num_q_heads,
+                        num_kv_heads,
+                        1,
+                        kv_len,
+                        head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                        seqlen_offset,
+                        attn_q,
+                        attn_k_ref,
+                        attn_v_ref,
+                        attn_out_f32,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
-            kernel_ffi::prefill_ffi::cast(
-                self.ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * head_dim, attn_out_f32, attn_out_bf16,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
-            kernel_ffi::prefill_ffi::transpose_shd_hsd(
-                self.ordinal, ScalarType::BF16, num_q_heads, 1, head_dim, attn_out_bf16, attn_flat,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
-            if trace_output {
-                pre_gate_trace = Some(
-                    attn_flat
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
-                );
+                    kernel_ffi::prefill_ffi::cast(
+                        self.ordinal,
+                        ScalarType::F32,
+                        ScalarType::BF16,
+                        num_q_heads * head_dim,
+                        attn_out_f32,
+                        attn_out_bf16,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+                    kernel_ffi::prefill_ffi::transpose_shd_hsd(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        num_q_heads,
+                        1,
+                        head_dim,
+                        attn_out_bf16,
+                        attn_flat,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+                    if trace_output {
+                        pre_gate_trace =
+                            Some(attn_flat.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}")
+                            })?);
+                    }
+                    kernel_ffi::prefill_ffi::sigmoid_mul(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        q_dim,
+                        attn_flat,
+                        gate_buf,
+                        gated,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+                } else if cap == kv_len {
+                    kernel_ffi::prefill_ffi::full_attention_decode_flat(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        1,
+                        num_q_heads,
+                        num_kv_heads,
+                        kv_len,
+                        head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                        attn_q,
+                        cache_k_ref,
+                        cache_v_ref,
+                        gated,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat: {e}"))?;
+                    if trace_output {
+                        pre_gate_trace =
+                            Some(gated.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}")
+                            })?);
+                    }
+                } else {
+                    kernel_ffi::prefill_ffi::full_attention_decode_flat_strided(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        1,
+                        num_q_heads,
+                        num_kv_heads,
+                        kv_len,
+                        cap,
+                        head_dim,
+                        1.0 / (head_dim as f32).sqrt(),
+                        attn_q,
+                        cache_k_ref,
+                        cache_v_ref,
+                        gated,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} decode attention flat strided: {e}")
+                    })?;
+                    if trace_output {
+                        pre_gate_trace =
+                            Some(gated.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}")
+                            })?);
+                    }
+                }
             }
-            kernel_ffi::prefill_ffi::sigmoid_mul(
-                self.ordinal, ScalarType::BF16, q_dim, attn_flat, gate_buf, gated,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
-            } else if cap == kv_len {
-            kernel_ffi::prefill_ffi::full_attention_decode_flat(
-                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-                kv_len, head_dim, 1.0 / (head_dim as f32).sqrt(),
-                attn_q, cache_k_ref, cache_v_ref, gated,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat: {e}"))?;
+            self.sync_stage_if_requested(
+                collect_timings,
+                &format!("layer {idx} full attention core"),
+            )?;
+            if let Some(t) = timings.as_mut() {
+                t.persistent_full_attn_core_ms += core_start.elapsed().as_secs_f64() * 1000.0;
+            }
             if trace_output {
-                pre_gate_trace = Some(
+                gated_trace = Some(
                     gated
                         .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
+                        .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
                 );
             }
-            } else {
-            kernel_ffi::prefill_ffi::full_attention_decode_flat_strided(
-                self.ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-                kv_len, cap, head_dim, 1.0 / (head_dim as f32).sqrt(),
-                attn_q, cache_k_ref, cache_v_ref, gated,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention flat strided: {e}"))?;
-            if trace_output {
-                pre_gate_trace = Some(
-                    gated
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!("layer {idx} pre-gate trace D2H: {e}"))?,
-                );
-            }
-            }
-        }
-        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention core"))?;
-        if let Some(t) = timings.as_mut() {
-            t.persistent_full_attn_core_ms += core_start.elapsed().as_secs_f64() * 1000.0;
-        }
-        if trace_output {
-            gated_trace = Some(
-                gated
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
-            );
-        }
 
-        let out_start = Instant::now();
-        matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, q_dim,
-            gated, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), self.weights.fp8_block_size, proj_out,
-            fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), self.weights.int4_group_size,
-        )?;
-        if trace_output {
-            proj_out_trace = Some(
-                proj_out
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} proj_out trace D2H: {e}"))?,
-            );
-        }
-        residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
-        self.sync_stage_if_requested(collect_timings, &format!("layer {idx} full attention out"))?;
-        if let Some(t) = timings.as_mut() {
-            t.persistent_full_attn_out_ms += out_start.elapsed().as_secs_f64() * 1000.0;
-        }
-        Ok(if trace_output {
-            Some(ComponentFullAttentionTrace {
-                q_proj: q_proj_trace.unwrap_or_default(),
-                gate_proj: gate_proj_trace.unwrap_or_default(),
-                k_proj: k_proj_trace.unwrap_or_default(),
-                v_proj: v_proj_trace.unwrap_or_default(),
-                q_rope: q_rope_trace.unwrap_or_default(),
-                k_rope: k_rope_trace.unwrap_or_default(),
-                pre_gate: pre_gate_trace.unwrap_or_default(),
-                gated: gated_trace.unwrap_or_default(),
-                proj_out: proj_out_trace.unwrap_or_default(),
-                attn_hidden: self
-                    .hidden_io
-                    .to_host_bytes()
-                    .map_err(|e| anyhow::anyhow!("layer {idx} attn hidden trace D2H: {e}"))?,
+            let out_start = Instant::now();
+            matmul_proj(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                q_dim,
+                gated,
+                &fw.o_proj_w,
+                fw.o_proj_scale.as_ref(),
+                fw.o_proj_int8_scale.as_ref(),
+                self.weights.fp8_block_size,
+                proj_out,
+                fw.o_proj_int4_scale.as_ref(),
+                fw.o_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
+            )?;
+            if trace_output {
+                proj_out_trace = Some(
+                    proj_out
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} proj_out trace D2H: {e}"))?,
+                );
+            }
+            residual_add(self.ordinal, hidden_dim, &mut self.hidden_io, &proj_out)?;
+            self.sync_stage_if_requested(
+                collect_timings,
+                &format!("layer {idx} full attention out"),
+            )?;
+            if let Some(t) = timings.as_mut() {
+                t.persistent_full_attn_out_ms += out_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            Ok(if trace_output {
+                Some(ComponentFullAttentionTrace {
+                    q_proj: q_proj_trace.unwrap_or_default(),
+                    gate_proj: gate_proj_trace.unwrap_or_default(),
+                    k_proj: k_proj_trace.unwrap_or_default(),
+                    v_proj: v_proj_trace.unwrap_or_default(),
+                    q_rope: q_rope_trace.unwrap_or_default(),
+                    k_rope: k_rope_trace.unwrap_or_default(),
+                    pre_gate: pre_gate_trace.unwrap_or_default(),
+                    gated: gated_trace.unwrap_or_default(),
+                    proj_out: proj_out_trace.unwrap_or_default(),
+                    attn_hidden: self
+                        .hidden_io
+                        .to_host_bytes()
+                        .map_err(|e| anyhow::anyhow!("layer {idx} attn hidden trace D2H: {e}"))?,
+                })
+            } else {
+                None
             })
-        } else {
-            None
-        })
         })();
         self.component_full_attn_scratch = Some(scratch);
         result
@@ -4010,8 +6243,12 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} b alloc: {e}"))?;
         let a_beta_raw = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, nv * 2])
             .map_err(|e| anyhow::anyhow!("layer {idx} a_beta alloc: {e}"))?;
-        let mut rec_apply = GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[1, val_dim + nv * khd * vhd])
-            .map_err(|e| anyhow::anyhow!("layer {idx} rec_apply alloc: {e}"))?;
+        let mut rec_apply = GpuBuffer::zeros(
+            self.ordinal,
+            ScalarType::F32,
+            &[1, val_dim + nv * khd * vhd],
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} rec_apply alloc: {e}"))?;
         let mut attn_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[nv, vhd])
             .map_err(|e| anyhow::anyhow!("layer {idx} attn_bf16 alloc: {e}"))?;
         let mut norm_w_bf16 = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[vhd])
@@ -4022,34 +6259,84 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} proj_out alloc: {e}"))?;
 
         matmul_proj(
-            self.ordinal, 1, 1, qkv_dim, hidden_dim,
-            &self.normed_buf, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), lw.qkv_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut qkv,
-            lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            qkv_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.qkv_proj_w,
+            lw.qkv_proj_scale.as_ref(),
+            lw.qkv_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut qkv,
+            lw.qkv_proj_int4_scale.as_ref(),
+            lw.qkv_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let qkv_trace = if trace_output {
-            Some(qkv.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} qkv trace D2H: {e}"))?)
+            Some(
+                qkv.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} qkv trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         matmul_proj(
-            self.ordinal, 1, 1, val_dim, hidden_dim,
-            &self.normed_buf, &lw.z_proj_w, lw.z_proj_scale.as_ref(), lw.z_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut z,
-            lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            val_dim,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.z_proj_w,
+            lw.z_proj_scale.as_ref(),
+            lw.z_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut z,
+            lw.z_proj_int4_scale.as_ref(),
+            lw.z_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let z_trace = if trace_output {
-            Some(z.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} z trace D2H: {e}"))?)
+            Some(
+                z.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} z trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         matmul_proj(
-            self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.a_proj_w, lw.a_proj_scale.as_ref(), lw.a_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut a,
-            None, None, self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            nv,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.a_proj_w,
+            lw.a_proj_scale.as_ref(),
+            lw.a_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut a,
+            None,
+            None,
+            self.weights.int4_group_size,
         )?;
         matmul_proj(
-            self.ordinal, 1, 1, nv, hidden_dim,
-            &self.normed_buf, &lw.b_proj_w, lw.b_proj_scale.as_ref(), lw.b_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut b,
-            None, None, self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            nv,
+            hidden_dim,
+            &self.normed_buf,
+            &lw.b_proj_w,
+            lw.b_proj_scale.as_ref(),
+            lw.b_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut b,
+            None,
+            None,
+            self.weights.int4_group_size,
         )?;
 
         let ab_bytes = nv * ScalarType::BF16.size_in_bytes();
@@ -4068,26 +6355,34 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} copy B: {e}"))?;
         let a_trace = if trace_output {
-            Some(a.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} a trace D2H: {e}"))?)
+            Some(
+                a.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} a trace D2H: {e}"))?,
+            )
         } else {
             None
         };
         let b_trace = if trace_output {
-            Some(b.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} b trace D2H: {e}"))?)
+            Some(
+                b.to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} b trace D2H: {e}"))?,
+            )
         } else {
             None
         };
 
         let ls = &mut self.state.layers[idx];
-        let conv_state = ls.conv_state.as_ref().ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
-        let recurrent_state = ls.recurrent_state.as_ref().ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
+        let conv_state = ls
+            .conv_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing conv state"))?;
+        let recurrent_state = ls
+            .recurrent_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {idx}: missing recurrent state"))?;
 
-        let mut conv_pack = GpuBuffer::zeros(
-            self.ordinal,
-            ScalarType::BF16,
-            &[1, qkv_dim + nv],
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} conv_pack alloc: {e}"))?;
+        let mut conv_pack = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[1, qkv_dim + nv])
+            .map_err(|e| anyhow::anyhow!("layer {idx} conv_pack alloc: {e}"))?;
         kernel_ffi::prefill_ffi::linear_stateful_conv_value_decay_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -4264,8 +6559,7 @@ impl DecodeEngine {
             }
             packed_host[out_base + 2 * khd + vhd] = 1.0f32 / (1.0f32 + (-b_bf16[v_head]).exp());
             let softplus = (1.0f32 + (a_bf16[v_head] + dt_bias_bf16[v_head]).exp()).ln();
-            packed_host[out_base + 2 * khd + vhd + 1] =
-                (-softplus * a_log_exp_bf16[v_head]).exp();
+            packed_host[out_base + 2 * khd + vhd + 1] = (-softplus * a_log_exp_bf16[v_head]).exp();
         }
         let packed = GpuBuffer::from_host_bytes(
             self.ordinal,
@@ -4292,8 +6586,9 @@ impl DecodeEngine {
 
         let state_len = config.linear_conv_kernel_dim - 1;
         let state_bytes = ScalarType::BF16.size_in_bytes();
-        let new_conv_state = GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
-            .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
+        let new_conv_state =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[qkv_dim, state_len])
+                .map_err(|e| anyhow::anyhow!("layer {idx} new_conv_state alloc: {e}"))?;
         for c in 0..qkv_dim {
             let channel_base = c * state_len * state_bytes;
             if state_len > 1 {
@@ -4307,7 +6602,8 @@ impl DecodeEngine {
             }
             gpu_hal::copy_d2d(
                 self.ordinal,
-                new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes) as *mut c_void,
+                new_conv_state.offset_ptr(channel_base + (state_len - 1) * state_bytes)
+                    as *mut c_void,
                 qkv.offset_ptr(c * state_bytes),
                 state_bytes,
             )
@@ -4322,11 +6618,20 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} conv state update copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, val_dim, &rec_apply, &mut attn_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            val_dim,
+            &rec_apply,
+            &mut attn_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
         let attn_trace = if trace_output {
-            Some(attn_bf16.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?)
+            Some(
+                attn_bf16
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} attn trace D2H: {e}"))?,
+            )
         } else {
             None
         };
@@ -4348,7 +6653,12 @@ impl DecodeEngine {
         .map_err(|e| anyhow::anyhow!("layer {idx} recurrent update copy: {e}"))?;
 
         kernel_ffi::prefill_ffi::cast(
-            self.ordinal, ScalarType::F32, ScalarType::BF16, vhd, &lw.norm_w, &mut norm_w_bf16,
+            self.ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            vhd,
+            &lw.norm_w,
+            &mut norm_w_bf16,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
         kernel_ffi::prefill_ffi::rms_norm_gated(
@@ -4364,18 +6674,37 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gated norm: {e}"))?;
         let gated_trace = if trace_output {
-            Some(gated.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?)
+            Some(
+                gated
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} gated trace D2H: {e}"))?,
+            )
         } else {
             None
         };
 
         matmul_proj(
-            self.ordinal, 1, 1, hidden_dim, val_dim,
-            &gated, &lw.out_proj_w, lw.out_proj_scale.as_ref(), lw.out_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut proj_out,
-            lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+            self.ordinal,
+            1,
+            1,
+            hidden_dim,
+            val_dim,
+            &gated,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            lw.out_proj_int8_scale.as_ref(),
+            self.weights.fp8_block_size,
+            &mut proj_out,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            self.weights.int4_group_size,
         )?;
         let proj_trace = if trace_output {
-            Some(proj_out.to_host_bytes().map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?)
+            Some(
+                proj_out
+                    .to_host_bytes()
+                    .map_err(|e| anyhow::anyhow!("layer {idx} proj trace D2H: {e}"))?,
+            )
         } else {
             None
         };
@@ -4406,7 +6735,11 @@ impl DecodeEngine {
         })
     }
 
-    fn component_decode_mlp_layer(&mut self, idx: usize, trace_output: bool) -> Result<Option<ComponentMlpTrace>> {
+    fn component_decode_mlp_layer(
+        &mut self,
+        idx: usize,
+        trace_output: bool,
+    ) -> Result<Option<ComponentMlpTrace>> {
         let config = &self.weights.config;
         let hidden_dim = config.hidden_size;
         let intermediate = config.intermediate_size;
@@ -4416,18 +6749,19 @@ impl DecodeEngine {
             .map(Ok)
             .unwrap_or_else(|| ComponentMlpScratch::alloc(config, self.ordinal))?;
         let lw = &self.weights.layers[idx];
-        let gate_up_mixed_lhs = if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
-            prefill_engine::prepare_int8_mixed_lhs(
-                self.ordinal,
-                1,
-                1,
-                hidden_dim,
-                &self.normed_buf,
-                &self.weights,
-            )?
-        } else {
-            None
-        };
+        let gate_up_mixed_lhs =
+            if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
+                prefill_engine::prepare_int8_mixed_lhs(
+                    self.ordinal,
+                    1,
+                    1,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                )?
+            } else {
+                None
+            };
 
         if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
             prefill_engine::matmul_int8_mixed_prepared_host(
@@ -4438,7 +6772,10 @@ impl DecodeEngine {
                 hidden_dim,
                 &self.normed_buf,
                 &self.weights,
-                &format!("{}.layers.{idx}.mlp.gate_proj.weight", self.weights.weight_prefix),
+                &format!(
+                    "{}.layers.{idx}.mlp.gate_proj.weight",
+                    self.weights.weight_prefix
+                ),
                 &lw.gate_proj_w,
                 sc,
                 &mut scratch.gate,
@@ -4446,9 +6783,20 @@ impl DecodeEngine {
             )?;
         } else {
             matmul_proj(
-                self.ordinal, 1, 1, intermediate, hidden_dim,
-                &self.normed_buf, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.gate,
-                lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                lw.gate_proj_scale.as_ref(),
+                lw.gate_proj_int8_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut scratch.gate,
+                lw.gate_proj_int4_scale.as_ref(),
+                lw.gate_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
             )?;
         }
         if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
@@ -4460,7 +6808,10 @@ impl DecodeEngine {
                 hidden_dim,
                 &self.normed_buf,
                 &self.weights,
-                &format!("{}.layers.{idx}.mlp.up_proj.weight", self.weights.weight_prefix),
+                &format!(
+                    "{}.layers.{idx}.mlp.up_proj.weight",
+                    self.weights.weight_prefix
+                ),
                 &lw.up_proj_w,
                 sc,
                 &mut scratch.up,
@@ -4468,9 +6819,20 @@ impl DecodeEngine {
             )?;
         } else {
             matmul_proj(
-                self.ordinal, 1, 1, intermediate, hidden_dim,
-                &self.normed_buf, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.up,
-                lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                self.ordinal,
+                1,
+                1,
+                intermediate,
+                hidden_dim,
+                &self.normed_buf,
+                &lw.up_proj_w,
+                lw.up_proj_scale.as_ref(),
+                lw.up_proj_int8_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut scratch.up,
+                lw.up_proj_int4_scale.as_ref(),
+                lw.up_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
             )?;
         }
         kernel_ffi::prefill_ffi::swiglu_mul(
@@ -4491,30 +6853,48 @@ impl DecodeEngine {
                 intermediate,
                 &scratch.mlp,
                 &self.weights,
-                &format!("{}.layers.{idx}.mlp.down_proj.weight", self.weights.weight_prefix),
+                &format!(
+                    "{}.layers.{idx}.mlp.down_proj.weight",
+                    self.weights.weight_prefix
+                ),
                 &lw.down_proj_w,
                 sc,
                 &mut scratch.down,
             )?;
         } else {
             matmul_proj(
-                self.ordinal, 1, 1, hidden_dim, intermediate,
-                &scratch.mlp, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), self.weights.fp8_block_size, &mut scratch.down,
-                lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), self.weights.int4_group_size,
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                intermediate,
+                &scratch.mlp,
+                &lw.down_proj_w,
+                lw.down_proj_scale.as_ref(),
+                lw.down_proj_int8_scale.as_ref(),
+                self.weights.fp8_block_size,
+                &mut scratch.down,
+                lw.down_proj_int4_scale.as_ref(),
+                lw.down_proj_int4_zero.as_ref(),
+                self.weights.int4_group_size,
             )?;
         }
         let trace = if trace_output {
             Some(ComponentMlpTrace {
-                gate: scratch.gate
+                gate: scratch
+                    .gate
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp gate trace D2H: {e}"))?,
-                up: scratch.up
+                up: scratch
+                    .up
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp up trace D2H: {e}"))?,
-                swiglu: scratch.mlp
+                swiglu: scratch
+                    .mlp
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp swiglu trace D2H: {e}"))?,
-                down: scratch.down
+                down: scratch
+                    .down
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("layer {idx} mlp down trace D2H: {e}"))?,
             })
@@ -4582,7 +6962,9 @@ impl DecodeEngine {
             .prefill_hidden
             .as_ref()
             .context("oracle output missing prefill_hidden (use --emit-state)")?;
-        let hidden_bytes = b64.decode(hidden_b64).context("decode prefill_hidden base64")?;
+        let hidden_bytes = b64
+            .decode(hidden_b64)
+            .context("decode prefill_hidden base64")?;
         let hidden_shape = oracle
             .prefill_hidden_shape
             .as_ref()
@@ -4596,13 +6978,9 @@ impl DecodeEngine {
         } else {
             &hidden_bytes
         };
-        self.hidden_io = GpuBuffer::from_host_bytes(
-            self.ordinal,
-            ScalarType::BF16,
-            hidden_shape,
-            actual_hidden,
-        )
-        .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
+        self.hidden_io =
+            GpuBuffer::from_host_bytes(self.ordinal, ScalarType::BF16, hidden_shape, actual_hidden)
+                .map_err(|e| anyhow::anyhow!("load prefill hidden: {e}"))?;
         Ok(())
     }
 
@@ -4635,7 +7013,6 @@ impl DecodeEngine {
         Ok(())
     }
 
-
     fn apply_oracle_conv_state(&mut self, oracle: &OracleOutput) -> Result<()> {
         let b64 = base64::engine::general_purpose::STANDARD;
         let conv_states = oracle
@@ -4660,7 +7037,9 @@ impl DecodeEngine {
             .as_ref()
             .context("oracle output missing recurrent_states")?;
         for rs in rec_states {
-            let bytes = b64.decode(&rs.data).context("decode recurrent_state base64")?;
+            let bytes = b64
+                .decode(&rs.data)
+                .context("decode recurrent_state base64")?;
             let ls = &mut self.state.layers[rs.layer];
             ls.recurrent_state = Some(
                 GpuBuffer::from_host_bytes(self.ordinal, ScalarType::F32, &rs.shape, &bytes)
@@ -4733,13 +7112,24 @@ impl DecodeEngine {
             batch_size,
         )
         .map_err(|e| anyhow::anyhow!("scratch init: {e}"))?;
-        let hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])
-            .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
-        let normed_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.hidden_size])
-            .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
-        let logits_buf =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[batch_size, 1, config.vocab_size])
-                .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
+        let hidden_io = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.hidden_size],
+        )
+        .map_err(|e| anyhow::anyhow!("hidden_io: {e}"))?;
+        let normed_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.hidden_size],
+        )
+        .map_err(|e| anyhow::anyhow!("normed_buf: {e}"))?;
+        let logits_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[batch_size, 1, config.vocab_size],
+        )
+        .map_err(|e| anyhow::anyhow!("logits_buf: {e}"))?;
         let argmax_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("argmax_buf: {e}"))?;
         let lm_head_block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
@@ -4786,13 +7176,12 @@ impl DecodeEngine {
         } else {
             None
         };
-        let component_full_attn_scratch = if use_4b_kernel
-            && weights.layers.iter().any(|layer| layer.full.is_some())
-        {
-            Some(ComponentFullAttentionScratch::alloc(&weights, ordinal)?)
-        } else {
-            None
-        };
+        let component_full_attn_scratch =
+            if use_4b_kernel && weights.layers.iter().any(|layer| layer.full.is_some()) {
+                Some(ComponentFullAttentionScratch::alloc(&weights, ordinal)?)
+            } else {
+                None
+            };
         let component_mlp_scratch = if use_4b_kernel {
             Some(ComponentMlpScratch::alloc(config, ordinal)?)
         } else {
@@ -4885,6 +7274,63 @@ impl DecodeEngine {
         }
     }
 
+    pub fn certified_kv_memory_stats(&self, batch_index: usize) -> CertifiedKvMemoryStats {
+        let mut stats = CertifiedKvMemoryStats::default();
+        for layer in &self.state_for_batch(batch_index).layers {
+            if !matches!(layer.kind, LayerKind::Full) {
+                continue;
+            }
+            stats.full_attention_layers += 1;
+            for buf in [
+                layer.certified_kv_key_i8.as_ref(),
+                layer.certified_kv_key_scale.as_ref(),
+                layer.certified_kv_value_i4.as_ref(),
+                layer.certified_kv_value_scale.as_ref(),
+                layer.certified_kv_value_zero.as_ref(),
+                layer.certified_kv_value_error.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stats.tier1_compressed_vram_bytes += buf.len_bytes();
+            }
+            for buf in [
+                layer.certified_kv_host_k.as_ref(),
+                layer.certified_kv_host_v.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stats.tier2_host_pinned_bytes += buf.len_bytes();
+            }
+            for buf in [
+                layer.certified_kv_tail_k.as_ref(),
+                layer.certified_kv_tail_v.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stats.tail_bf16_vram_bytes += buf.len_bytes();
+            }
+            for buf in [
+                layer.certified_kv_ranking_prefix_k.as_ref(),
+                layer.certified_kv_ranking_prefix_v.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stats.ranking_prefix_scratch_vram_bytes += buf.len_bytes();
+            }
+            for buf in [layer.kv_cache_k.as_ref(), layer.kv_cache_v.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                stats.dense_bf16_kv_vram_bytes += buf.len_bytes();
+            }
+        }
+        stats
+    }
+
     /// Load prefill state from oracle output into GPU buffers.
     pub fn load_prefill_state(&mut self, oracle: &OracleOutput) -> Result<()> {
         self.apply_oracle_hidden(oracle)?;
@@ -4894,7 +7340,9 @@ impl DecodeEngine {
         // Convert BF16 KV caches to FP8 if requested
         if self.kv_fp8 {
             prefill_engine::convert_kv_caches_to_fp8(
-                &mut self.state, &self.weights.config, self.ordinal,
+                &mut self.state,
+                &self.weights.config,
+                self.ordinal,
             )?;
         }
 
@@ -5072,13 +7520,23 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for full-attention layers
         for (i, ls) in self.state.layers.iter_mut().enumerate() {
             if config.is_full_attention(i) {
-                ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-                    .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
+                ls.ensure_kv_capacity(
+                    seqlen_offset,
+                    self.ordinal,
+                    config,
+                    self.kv_chunk_size,
+                    self.kv_fp8,
+                )
+                .map_err(|e| anyhow::anyhow!("ensure KV capacity layer {i}: {e}"))?;
             }
         }
         self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
+            Self::load_kv_shadow_for_state_static(
+                &self.weights.config,
+                self.ordinal,
+                &mut self.state,
+            )?;
         }
 
         // 3. Build layer descriptors
@@ -5141,8 +7599,7 @@ impl DecodeEngine {
                 self.rotary.rotary_dim,
             )
         };
-        persist_result
-            .map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
+        persist_result.map_err(|e| anyhow::anyhow!("persistent_decode kernel: {e}"))?;
         self.sync_stage_if_requested(sync_for_timing, "persistent_decode")?;
         timings.persistent_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -5192,11 +7649,10 @@ impl DecodeEngine {
                     .to_host_bytes()
                     .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
                 timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let sampled_token = u32::from_le_bytes(
-                    token_bytes[..4]
-                        .try_into()
-                        .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
-                );
+                let sampled_token =
+                    u32::from_le_bytes(token_bytes[..4].try_into().map_err(|_| {
+                        anyhow::anyhow!("argmax D2H returned truncated token buffer")
+                    })?);
 
                 Ok(DecodeStepOutput {
                     logits: None,
@@ -5239,11 +7695,10 @@ impl DecodeEngine {
                         .to_host_bytes()
                         .map_err(|e| anyhow::anyhow!("argmax D2H: {e}"))?;
                     timings.token_d2h_ms = start.elapsed().as_secs_f64() * 1000.0;
-                    let sampled_token = u32::from_le_bytes(
-                        token_bytes[..4]
-                            .try_into()
-                            .map_err(|_| anyhow::anyhow!("argmax D2H returned truncated token buffer"))?,
-                    );
+                    let sampled_token =
+                        u32::from_le_bytes(token_bytes[..4].try_into().map_err(|_| {
+                            anyhow::anyhow!("argmax D2H returned truncated token buffer")
+                        })?);
 
                     return Ok(DecodeStepOutput {
                         logits: None,
@@ -5417,9 +7872,7 @@ impl DecodeEngine {
         let num_layers = config.num_hidden_layers;
         for &li in tap_layers {
             if li >= num_layers {
-                anyhow::bail!(
-                    "tap layer {li} out of range (num_hidden_layers={num_layers})"
-                );
+                anyhow::bail!("tap layer {li} out of range (num_hidden_layers={num_layers})");
             }
         }
 
@@ -5438,12 +7891,9 @@ impl DecodeEngine {
         let (mut tap_workspace, tap_layers_buf) = match self.dflash_tap_cache.take() {
             Some((cached, ws, lb)) if cached.as_slice() == tap_layers => (ws, lb),
             _ => {
-                let workspace = GpuBuffer::zeros(
-                    self.ordinal,
-                    ScalarType::BF16,
-                    &[num_taps, hidden_dim],
-                )
-                .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
+                let workspace =
+                    GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_taps, hidden_dim])
+                        .map_err(|e| anyhow::anyhow!("alloc tap_workspace: {e}"))?;
                 let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
                 let tap_ints_bytes: Vec<u8> =
                     tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -5759,14 +8209,10 @@ impl DecodeEngine {
         // offset for RoPE + KV append + causal read.
         let state_refs: Vec<&ModelState> = (0..b).map(|_| &self.state).collect();
         let seqlen_offsets: Vec<usize> = (0..b).map(|bi| pos_offset + bi).collect();
-        let batch_descs = build_batch_seq_descs(
-            &state_refs,
-            &seqlen_offsets,
-            /* kv_fp8 */ false,
-        )
-        .ok_or_else(|| {
-            anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}")
-        })?;
+        let batch_descs =
+            build_batch_seq_descs(&state_refs, &seqlen_offsets, /* kv_fp8 */ false).ok_or_else(
+                || anyhow::anyhow!("fused verify: build_batch_seq_descs returned None for B={b}"),
+            )?;
         let desc_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(
                 batch_descs.as_ptr() as *const u8,
@@ -5789,9 +8235,7 @@ impl DecodeEngine {
             let dst_offset = bi * row_bytes;
             gpu_hal::copy_d2d(
                 self.ordinal,
-                unsafe {
-                    (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void
-                },
+                unsafe { (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
                 self.weights.embed_tokens.offset_ptr(src_offset),
                 row_bytes,
             )
@@ -5835,8 +8279,8 @@ impl DecodeEngine {
             self.int4_scale_device.as_ref(),
             false, // enable_timing_slots
             false, // enable_attention_trace
-            None, // tap_workspace: verify doesn't capture taps — re-decode does
-            None, // tap_layers: ignored when tap_workspace is None
+            None,  // tap_workspace: verify doesn't capture taps — re-decode does
+            None,  // tap_layers: ignored when tap_workspace is None
         )
         .map_err(|e| anyhow::anyhow!("fused verify persistent_decode_4b: {e}"))?;
 
@@ -5919,7 +8363,8 @@ impl DecodeEngine {
     /// Call after load_prefill_state() or prefill_native() to initialize batch items.
     pub fn replicate_state_to_batch(&mut self) -> Result<()> {
         for b in 0..self.extra_states.len() {
-            self.extra_states[b] = self.state
+            self.extra_states[b] = self
+                .state
                 .clone_gpu()
                 .map_err(|e| anyhow::anyhow!("clone state to batch {}: {e}", b + 1))?;
         }
@@ -5958,15 +8403,15 @@ impl DecodeEngine {
         assert!(self.use_4b_kernel, "batched decode requires 4b kernel");
         let config = &self.weights.config;
         let b = self.batch_size;
-        let use_qwen35_4b_cuda_long_context_component_fallback =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            is_qwen35_4b_shape(config) &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8 &&
-            qwen35_4b_cuda_long_context_component_fallback_enabled() &&
-            seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
+        let use_qwen35_4b_cuda_long_context_component_fallback = self.hidden_io.backend()
+            == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8
+            && qwen35_4b_cuda_long_context_component_fallback_enabled()
+            && seqlen_offset >= QWEN35_4B_CUDA_COMPONENT_FALLBACK_TOKENS;
         if use_qwen35_4b_cuda_long_context_component_fallback {
             let logits = self.component_decode_step_4b(token_ids[0], seqlen_offset)?;
             return Ok((vec![logits], DecodeStageTimings::default()));
@@ -6005,19 +8450,37 @@ impl DecodeEngine {
         // 2. Ensure KV capacity for all batch items
         let seqlen_offsets: Vec<usize> = vec![seqlen_offset; b];
         for bi in 0..b {
-            let st = if bi == 0 { &mut self.state } else { &mut self.extra_states[bi - 1] };
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
             for (i, ls) in st.layers.iter_mut().enumerate() {
                 if config.is_full_attention(i) {
-                    ls.ensure_kv_capacity(seqlen_offset, self.ordinal, config, self.kv_chunk_size, self.kv_fp8)
-                        .map_err(|e| anyhow::anyhow!("ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                    ls.ensure_kv_capacity(
+                        seqlen_offset,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("ensure KV capacity batch {bi} layer {i}: {e}"))?;
                 }
             }
         }
         self.check_attn_scratch_budget()?;
         if self.kv_fp8 && kv_fp8_bf16_sidecar_enabled() {
-            Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.state)?;
+            Self::load_kv_shadow_for_state_static(
+                &self.weights.config,
+                self.ordinal,
+                &mut self.state,
+            )?;
             for bi in 0..self.extra_states.len() {
-                Self::load_kv_shadow_for_state_static(&self.weights.config, self.ordinal, &mut self.extra_states[bi])?;
+                Self::load_kv_shadow_for_state_static(
+                    &self.weights.config,
+                    self.ordinal,
+                    &mut self.extra_states[bi],
+                )?;
             }
         }
 
@@ -6031,7 +8494,8 @@ impl DecodeEngine {
         let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
             .chain(self.extra_states.iter())
             .collect();
-        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8)
+        {
             self.scratch
                 .upload_batch_seq_descs(&batch_descs)
                 .map_err(|e| anyhow::anyhow!("upload batch seq descs: {e}"))?;
@@ -6058,12 +8522,9 @@ impl DecodeEngine {
         let timing_calibration = if enable_timing_slots {
             Some(match self.hidden_io.backend() {
                 gpu_hal::Backend::Cuda => {
-                    let khz = gpu_hal::query_device_info(
-                        gpu_hal::Backend::Cuda,
-                        self.ordinal,
-                    )
-                    .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
-                    .clock_rate_khz;
+                    let khz = gpu_hal::query_device_info(gpu_hal::Backend::Cuda, self.ordinal)
+                        .map_err(|e| anyhow::anyhow!("query CUDA device clock rate: {e}"))?
+                        .clock_rate_khz;
                     PersistentTimingCalibration::ClockRateKhz(khz)
                 }
                 gpu_hal::Backend::Hip => PersistentTimingCalibration::WallClockMs(0.0),
@@ -6075,47 +8536,49 @@ impl DecodeEngine {
         // The CUDA single-stream hero specialization is only validated for the
         // exact Qwen3.5-4B geometry. 2B/9B share the generic persistent path,
         // but routing them through the specialized launch changes numerics.
-        let use_qwen35_4b_cuda_hero =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            is_qwen35_4b_shape(config) &&
-            qwen35_4b_cuda_hero_enabled() &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8;
-        let use_qwen35_4b_cuda_split =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            is_qwen35_4b_shape(config) &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8 &&
-            config.num_hidden_layers > QWEN35_4B_CUDA_SPLIT_LAYER;
+        let use_qwen35_4b_cuda_hero = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+            && qwen35_4b_cuda_hero_enabled()
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8;
+        let use_qwen35_4b_cuda_split = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8
+            && config.num_hidden_layers > QWEN35_4B_CUDA_SPLIT_LAYER;
         let mut persistent_kernel_ms = 0.0;
         if use_qwen35_4b_cuda_split {
             let windows = qwen35_4b_cuda_split_windows(config.num_hidden_layers);
             for (window_start, window_layers) in windows {
                 self.scratch
                     .upload_descs(&descs[window_start..window_start + window_layers])
-                    .map_err(|e| anyhow::anyhow!(
-                        "upload descs for split window [{window_start}, {}): {e}",
-                        window_start + window_layers
-                    ))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "upload descs for split window [{window_start}, {}): {e}",
+                            window_start + window_layers
+                        )
+                    })?;
                 gpu_hal::memset_zeros(
                     self.ordinal,
                     self.scratch.workspace.as_mut_ptr(),
                     self.scratch.workspace.len_bytes(),
                 )
-                .map_err(|e| anyhow::anyhow!(
-                    "clear split decode workspace [{window_start}, {}): {e}",
-                    window_start + window_layers
-                ))?;
-                self.scratch
-                    .reset_sync()
-                    .map_err(|e| anyhow::anyhow!(
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "clear split decode workspace [{window_start}, {}): {e}",
+                        window_start + window_layers
+                    )
+                })?;
+                self.scratch.reset_sync().map_err(|e| {
+                    anyhow::anyhow!(
                         "reset split decode sync [{window_start}, {}): {e}",
                         window_start + window_layers
-                    ))?;
+                    )
+                })?;
 
                 let window_launch_start = Instant::now();
                 let window_result = if use_qwen35_4b_cuda_hero {
@@ -6184,14 +8647,12 @@ impl DecodeEngine {
                 if let Some(PersistentTimingCalibration::ClockRateKhz(clock_rate_khz)) =
                     timing_calibration
                 {
-                    let sync_bytes = self
-                        .scratch
-                        .sync_buf
-                        .to_host_bytes()
-                        .map_err(|e| anyhow::anyhow!(
+                    let sync_bytes = self.scratch.sync_buf.to_host_bytes().map_err(|e| {
+                        anyhow::anyhow!(
                             "split timing slots D2H [{window_start}, {}): {e}",
                             window_start + window_layers
-                        ))?;
+                        )
+                    })?;
                     timings.add_assign(decode_persistent_4b_timing_slots(
                         &sync_bytes,
                         window_layers,
@@ -6300,7 +8761,11 @@ impl DecodeEngine {
         // 6. Update KV filled counts for all batch items
         let filled = seqlen_offset + 1;
         for bi in 0..b {
-            let st = if bi == 0 { &mut self.state } else { &mut self.extra_states[bi - 1] };
+            let st = if bi == 0 {
+                &mut self.state
+            } else {
+                &mut self.extra_states[bi - 1]
+            };
             for (i, ls) in st.layers.iter_mut().enumerate() {
                 if config.is_full_attention(i) {
                     ls.set_kv_filled(filled);
@@ -6416,7 +8881,9 @@ impl DecodeEngine {
                         self.kv_chunk_size,
                         self.kv_fp8,
                     )
-                    .map_err(|e| anyhow::anyhow!("trace ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!("trace ensure KV capacity batch {bi} layer {i}: {e}")
+                    })?;
                 }
             }
         }
@@ -6429,7 +8896,8 @@ impl DecodeEngine {
         let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
             .chain(self.extra_states.iter())
             .collect();
-        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8)
+        {
             self.scratch
                 .upload_batch_seq_descs(&batch_descs)
                 .map_err(|e| anyhow::anyhow!("trace upload batch seq descs: {e}"))?;
@@ -6451,14 +8919,13 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("trace reset batched decode sync: {e}"))?;
 
-        let use_qwen35_4b_cuda_hero =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            is_qwen35_4b_shape(config) &&
-            qwen35_4b_cuda_hero_enabled() &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8;
+        let use_qwen35_4b_cuda_hero = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+            && qwen35_4b_cuda_hero_enabled()
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8;
         let persist_result = if use_qwen35_4b_cuda_hero {
             kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
                 self.ordinal,
@@ -6539,7 +9006,10 @@ impl DecodeEngine {
         anyhow::ensure!(self.batch_size == 1, "debug window requires batch_size=1");
         anyhow::ensure!(self.use_4b_kernel, "debug window requires 4b kernel");
         anyhow::ensure!(self.fp8_scale_device.is_none(), "debug window is BF16-only");
-        anyhow::ensure!(self.int4_scale_device.is_none(), "debug window is BF16-only");
+        anyhow::ensure!(
+            self.int4_scale_device.is_none(),
+            "debug window is BF16-only"
+        );
         anyhow::ensure!(!self.kv_fp8, "debug window does not support kv_fp8");
 
         let config = self.weights.config.clone();
@@ -6574,10 +9044,12 @@ impl DecodeEngine {
         let descs = build_layer_descs(&self.weights, &self.state, seqlen_offset);
         let window_descs = descs
             .get(start_layer..start_layer + num_layers)
-            .ok_or_else(|| anyhow::anyhow!(
-                "debug window desc slice [{start_layer}, {}) missing",
-                start_layer + num_layers
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "debug window desc slice [{start_layer}, {}) missing",
+                    start_layer + num_layers
+                )
+            })?;
         self.scratch
             .upload_descs(window_descs)
             .map_err(|e| anyhow::anyhow!("debug window upload descs: {e}"))?;
@@ -6704,7 +9176,11 @@ impl DecodeEngine {
                         self.kv_chunk_size,
                         self.kv_fp8,
                     )
-                    .map_err(|e| anyhow::anyhow!("linear step-b trace ensure KV capacity batch {bi} layer {i}: {e}"))?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "linear step-b trace ensure KV capacity batch {bi} layer {i}: {e}"
+                        )
+                    })?;
                 }
             }
         }
@@ -6723,7 +9199,8 @@ impl DecodeEngine {
         let state_refs: Vec<&ModelState> = std::iter::once(&self.state)
             .chain(self.extra_states.iter())
             .collect();
-        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8) {
+        if let Some(batch_descs) = build_batch_seq_descs(&state_refs, &seqlen_offsets, self.kv_fp8)
+        {
             self.scratch
                 .upload_batch_seq_descs(&batch_descs)
                 .map_err(|e| anyhow::anyhow!("linear step-b trace upload batch seq descs: {e}"))?;
@@ -6745,14 +9222,13 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("linear step-b trace reset sync: {e}"))?;
 
-        let use_qwen35_4b_cuda_hero =
-            self.hidden_io.backend() == gpu_hal::Backend::Cuda &&
-            is_qwen35_4b_shape(config) &&
-            qwen35_4b_cuda_hero_enabled() &&
-            b == 1 &&
-            self.fp8_scale_device.is_none() &&
-            self.int4_scale_device.is_none() &&
-            !self.kv_fp8;
+        let use_qwen35_4b_cuda_hero = self.hidden_io.backend() == gpu_hal::Backend::Cuda
+            && is_qwen35_4b_shape(config)
+            && qwen35_4b_cuda_hero_enabled()
+            && b == 1
+            && self.fp8_scale_device.is_none()
+            && self.int4_scale_device.is_none()
+            && !self.kv_fp8;
         let persist_result = if use_qwen35_4b_cuda_hero {
             kernel_ffi::persistent_decode_4b_qwen35_sm86_specialized(
                 self.ordinal,
@@ -6843,7 +9319,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = start_floats * ScalarType::F32.size_in_bytes();
         let end = start + total_floats * ScalarType::F32.size_in_bytes();
-        anyhow::ensure!(end <= bytes.len(), "persistent projection slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent projection slice out of bounds"
+        );
         let slice = &bytes[start..end];
         let qkv_end = qkv_dim * 4;
         let z_end = qkv_end + z_dim * 4;
@@ -6886,7 +9365,10 @@ impl DecodeEngine {
         let mlp_out_end = mlp_out_start + hidden * 4;
         let token_out_start = (token_out_base + batch_index * hidden) * 4;
         let token_out_end = token_out_start + hidden * 4;
-        anyhow::ensure!(token_out_end <= bytes.len(), "persistent MLP slice out of bounds");
+        anyhow::ensure!(
+            token_out_end <= bytes.len(),
+            "persistent MLP slice out of bounds"
+        );
         Ok((
             bytes[normed_start..normed_end].to_vec(),
             bytes[gate_start..gate_end].to_vec(),
@@ -6951,7 +9433,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (proj_buf_base + batch_index * self.proj_buf_floats) * 4;
         let end = start + hidden * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn gated slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn gated slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -6965,8 +9450,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -6983,7 +9467,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn saved_gate slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn saved_gate slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -6997,8 +9484,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -7015,7 +9501,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn q slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn q slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -7029,8 +9518,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -7047,7 +9535,10 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
         let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 2) * 4;
         let end = start + q_dim * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn pre_gate slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn pre_gate slice out of bounds"
+        );
         Ok(bytes[start..end].to_vec())
     }
 
@@ -7062,8 +9553,7 @@ impl DecodeEngine {
             batch_index,
             self.batch_size
         );
-        let q_dim =
-            self.weights.config.num_attention_heads * self.weights.config.head_dim;
+        let q_dim = self.weights.config.num_attention_heads * self.weights.config.head_dim;
         let hidden = self.weights.config.hidden_size;
         let intermediate = self.weights.config.intermediate_size;
         let b = self.batch_size;
@@ -7078,9 +9568,7 @@ impl DecodeEngine {
             .workspace
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("persistent workspace D2H: {e}"))?;
-        let score_cols = self
-            .attn_scratch_floats
-            .saturating_sub(q_dim * 3)
+        let score_cols = self.attn_scratch_floats.saturating_sub(q_dim * 3)
             / self.weights.config.num_attention_heads;
         anyhow::ensure!(
             kv_len <= score_cols,
@@ -7088,10 +9576,12 @@ impl DecodeEngine {
             kv_len,
             score_cols,
         );
-        let start =
-            (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
+        let start = (attn_scratch_base + batch_index * self.attn_scratch_floats + q_dim * 3) * 4;
         let end = start + self.weights.config.num_attention_heads * score_cols * 4;
-        anyhow::ensure!(end <= bytes.len(), "persistent full-attn scores slice out of bounds");
+        anyhow::ensure!(
+            end <= bytes.len(),
+            "persistent full-attn scores slice out of bounds"
+        );
         let full = &bytes[start..end];
         let mut out = Vec::with_capacity(self.weights.config.num_attention_heads * kv_len * 4);
         let stride = score_cols * 4;

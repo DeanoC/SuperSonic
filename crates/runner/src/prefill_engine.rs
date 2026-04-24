@@ -17,7 +17,8 @@ use qwen35::weights::Qwen35Weights;
 use kernel_ffi::prefill_ffi;
 
 fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2)
+    bytes
+        .chunks_exact(2)
         .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
         .collect()
 }
@@ -47,7 +48,8 @@ fn encode_u32_le(values: &[usize]) -> Vec<u8> {
 }
 
 fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(4)
+    bytes
+        .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
 }
@@ -62,7 +64,8 @@ fn detect_outlier_cols(lhs_bf16: &[f32], rows: usize, cols: usize, threshold: f3
             }
         }
     }
-    flags.into_iter()
+    flags
+        .into_iter()
         .enumerate()
         .filter_map(|(idx, hit)| hit.then_some(idx))
         .collect()
@@ -160,7 +163,18 @@ pub(crate) fn matmul_int8_mixed_host(
     out: &mut GpuBuffer,
 ) -> Result<()> {
     matmul_int8_mixed_prepared_host(
-        ordinal, batch, m, n, k, lhs, weights, weight_name, weight, int8_scale, out, None,
+        ordinal,
+        batch,
+        m,
+        n,
+        k,
+        lhs,
+        weights,
+        weight_name,
+        weight,
+        int8_scale,
+        out,
+        None,
     )
 }
 
@@ -179,12 +193,16 @@ pub(crate) fn matmul_int8_mixed_prepared_host(
     prepared_lhs: Option<&Int8MixedLhs>,
 ) -> Result<()> {
     let Some(store) = weights.int8_baked_store.as_ref() else {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+        return prefill_ffi::matmul_rhs_transposed_int8(
+            ordinal, batch, m, n, k, lhs, weight, int8_scale, out,
+        )
+        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
     };
     if weights.int8_outlier_threshold <= 0.0 {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+        return prefill_ffi::matmul_rhs_transposed_int8(
+            ordinal, batch, m, n, k, lhs, weight, int8_scale, out,
+        )
+        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
     }
 
     let owned_prepared;
@@ -193,8 +211,10 @@ pub(crate) fn matmul_int8_mixed_prepared_host(
     } else {
         owned_prepared = prepare_int8_mixed_lhs(ordinal, batch, m, k, lhs, weights)?;
         let Some(prepared_lhs) = owned_prepared.as_ref() else {
-            return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-                .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+            return prefill_ffi::matmul_rhs_transposed_int8(
+                ordinal, batch, m, n, k, lhs, weight, int8_scale, out,
+            )
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
         };
         prepared_lhs
     };
@@ -210,8 +230,10 @@ pub(crate) fn matmul_int8_mixed_prepared_host(
         ));
     }
     let Some(lhs_zeroed_gpu) = prepared_lhs.lhs_zeroed_gpu.as_ref() else {
-        return prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, int8_scale, out)
-            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
+        return prefill_ffi::matmul_rhs_transposed_int8(
+            ordinal, batch, m, n, k, lhs, weight, int8_scale, out,
+        )
+        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"));
     };
     let outlier_cols = &prepared_lhs.outlier_cols;
     prefill_ffi::matmul_rhs_transposed_int8(
@@ -328,14 +350,22 @@ fn matmul_proj(
 ) -> Result<()> {
     if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
         prefill_ffi::matmul_rhs_transposed_int4(
-            ordinal, batch, m, n, k, lhs, weight, sc, zr, int4_group_size, out,
+            ordinal,
+            batch,
+            m,
+            n,
+            k,
+            lhs,
+            weight,
+            sc,
+            zr,
+            int4_group_size,
+            out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
     } else if let Some(sc) = int8_scale {
-        prefill_ffi::matmul_rhs_transposed_int8(
-            ordinal, batch, m, n, k, lhs, weight, sc, out,
-        )
-        .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"))
+        prefill_ffi::matmul_rhs_transposed_int8(ordinal, batch, m, n, k, lhs, weight, sc, out)
+            .map_err(|e| anyhow::anyhow!("matmul_int8: {e}"))
     } else {
         match scale {
             Some(s) => prefill_ffi::matmul_rhs_transposed_fp8(
@@ -343,7 +373,15 @@ fn matmul_proj(
             )
             .map_err(|e| anyhow::anyhow!("matmul_fp8: {e}")),
             None => prefill_ffi::matmul_rhs_transposed(
-                ordinal, ScalarType::BF16, batch, m, n, k, lhs, weight, out,
+                ordinal,
+                ScalarType::BF16,
+                batch,
+                m,
+                n,
+                k,
+                lhs,
+                weight,
+                out,
             )
             .map_err(|e| anyhow::anyhow!("matmul: {e}")),
         }
@@ -360,15 +398,8 @@ fn residual_add(
     src: &GpuBuffer,
 ) -> Result<()> {
     let lhs: &GpuBuffer = unsafe { &*(dst as *const GpuBuffer) };
-    prefill_ffi::element_add(
-        ordinal,
-        ScalarType::BF16,
-        total_elems,
-        lhs,
-        src,
-        dst,
-    )
-    .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
+    prefill_ffi::element_add(ordinal, ScalarType::BF16, total_elems, lhs, src, dst)
+        .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
     Ok(())
 }
 
@@ -429,8 +460,13 @@ fn maybe_attn_rms_norm_rows(
         )
         .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     } else {
-        gpu_hal::copy_d2d(ordinal, output.as_mut_ptr(), input.as_ptr(), rows * cols * ScalarType::BF16.size_in_bytes())
-            .map_err(|e| anyhow::anyhow!("{label} copy-through: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            output.as_mut_ptr(),
+            input.as_ptr(),
+            rows * cols * ScalarType::BF16.size_in_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("{label} copy-through: {e}"))?;
     }
     Ok(())
 }
@@ -461,7 +497,9 @@ pub fn compute_logits_for_range(
     ordinal: usize,
 ) -> Result<(Vec<Vec<f32>>, GpuBuffer)> {
     if count == 0 {
-        return Err(anyhow::anyhow!("compute_logits_for_range: count must be > 0"));
+        return Err(anyhow::anyhow!(
+            "compute_logits_for_range: count must be > 0"
+        ));
     }
     let hidden_dim = config.hidden_size;
     let vocab_size = config.vocab_size;
@@ -500,21 +538,29 @@ pub fn compute_logits_for_range(
         .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
     if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
-            ordinal, ScalarType::BF16,
-            1,         // batch
-            count,     // m
+            ordinal,
+            ScalarType::BF16,
+            1,          // batch
+            count,      // m
             vocab_size, // n
             hidden_dim, // k
-            &normed, &*weights.lm_head, &mut logits_buf,
+            &normed,
+            &*weights.lm_head,
+            &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head tiled: {e}"))?;
     } else {
         let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("range matvec counter: {e}"))?;
         kernel_ffi::standalone_matvec(
-            ordinal, ScalarType::BF16,
-            &mut logits_buf, &normed, &*weights.lm_head,
-            hidden_dim, vocab_size, &mut counter,
+            ordinal,
+            ScalarType::BF16,
+            &mut logits_buf,
+            &normed,
+            &*weights.lm_head,
+            hidden_dim,
+            vocab_size,
+            &mut counter,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
     }
@@ -537,7 +583,6 @@ pub fn compute_logits_for_range(
 
     Ok((logits_per_pos, normed))
 }
-
 
 /// Result of a prefill pass.
 pub struct PrefillResult {
@@ -643,12 +688,8 @@ impl PrefillScratch {
                 .map_err(|e| anyhow::anyhow!("prefill mlp_buf: {e}"))?,
             logits_buf: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.vocab_size])
                 .map_err(|e| anyhow::anyhow!("prefill logits: {e}"))?,
-            attn_q: GpuBuffer::zeros(
-                ordinal,
-                ScalarType::BF16,
-                &[num_q_heads, seq_len, head_dim],
-            )
-            .map_err(|e| anyhow::anyhow!("prefill attn_q: {e}"))?,
+            attn_q: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_q_heads, seq_len, head_dim])
+                .map_err(|e| anyhow::anyhow!("prefill attn_q: {e}"))?,
             attn_k: GpuBuffer::zeros(
                 ordinal,
                 ScalarType::BF16,
@@ -667,12 +708,8 @@ impl PrefillScratch {
                 &[num_q_heads, seq_len, head_dim],
             )
             .map_err(|e| anyhow::anyhow!("prefill attn_out_f32: {e}"))?,
-            conv_input: GpuBuffer::zeros(
-                ordinal,
-                ScalarType::BF16,
-                &[qkv_dim, conv_total_len],
-            )
-            .map_err(|e| anyhow::anyhow!("prefill conv_input: {e}"))?,
+            conv_input: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, conv_total_len])
+                .map_err(|e| anyhow::anyhow!("prefill conv_input: {e}"))?,
         })
     }
 }
@@ -693,9 +730,18 @@ pub fn prefill(
     debug_linear_layer: Option<usize>,
 ) -> Result<PrefillResult> {
     prefill_inner(
-        weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
-        prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
-        debug_linear_layer, None,
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        trace_layers,
+        debug_linear_layer,
+        None,
     )
 }
 
@@ -718,9 +764,18 @@ pub fn prefill_with_taps(
     tap_layers: &[usize],
 ) -> Result<PrefillResult> {
     prefill_inner(
-        weights, state, rotary, prompt_ids, ordinal, kv_chunk_size,
-        prefill_chunk_size, kv_fp8, use_4b_kernel, trace_layers,
-        debug_linear_layer, Some(tap_layers),
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        trace_layers,
+        debug_linear_layer,
+        Some(tap_layers),
     )
 }
 
@@ -812,8 +867,7 @@ fn prefill_inner(
     let khd = config.linear_key_head_dim;
     let vhd = config.linear_value_head_dim;
     let kern = config.linear_conv_kernel_dim;
-    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
-        + nv * vhd;
+    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2 + nv * vhd;
 
     // Allocate inter-chunk recurrent states (one per linear layer)
     // These carry the delta recurrent state between chunks.
@@ -894,8 +948,16 @@ fn prefill_inner(
 
             if config.is_full_attention(idx) {
                 prefill_full_attention_layer(
-                    weights, state, rotary, &mut scratch, config, idx,
-                    chunk_len, chunk_start, ordinal, kv_chunk_size,
+                    weights,
+                    state,
+                    rotary,
+                    &mut scratch,
+                    config,
+                    idx,
+                    chunk_len,
+                    chunk_start,
+                    ordinal,
+                    kv_chunk_size,
                     /* commit_kv_filled */ true,
                 )?;
             } else {
@@ -907,8 +969,14 @@ fn prefill_inner(
                 };
                 let trace_linear_debug = debug_linear_layer == Some(idx) && is_last_chunk;
                 prefill_linear_attention_layer(
-                    weights, state, &mut scratch, config, idx,
-                    chunk_len, chunk_start, is_last_chunk,
+                    weights,
+                    state,
+                    &mut scratch,
+                    config,
+                    idx,
+                    chunk_len,
+                    chunk_start,
+                    is_last_chunk,
                     chunk_recurrent[idx].as_mut().unwrap(),
                     chunk_conv_tail[idx].as_mut().unwrap(),
                     ordinal,
@@ -922,7 +990,9 @@ fn prefill_inner(
                     let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
                     let last_token_offset = (chunk_len - 1) * hidden_bytes;
                     let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-                        .map_err(|e| anyhow::anyhow!("trace attn last_hidden alloc layer {idx}: {e}"))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!("trace attn last_hidden alloc layer {idx}: {e}")
+                        })?;
                     gpu_hal::copy_d2d(
                         ordinal,
                         last_hidden.as_ptr() as *mut c_void,
@@ -930,11 +1000,9 @@ fn prefill_inner(
                         hidden_bytes,
                     )
                     .map_err(|e| anyhow::anyhow!("trace attn last_hidden copy layer {idx}: {e}"))?;
-                    trace.push(
-                        last_hidden
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("trace attn last_hidden D2H layer {idx}: {e}"))?,
-                    );
+                    trace.push(last_hidden.to_host_bytes().map_err(|e| {
+                        anyhow::anyhow!("trace attn last_hidden D2H layer {idx}: {e}")
+                    })?);
                 }
             }
 
@@ -955,7 +1023,9 @@ fn prefill_inner(
                     let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
                     let last_token_offset = (chunk_len - 1) * hidden_bytes;
                     let last_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-                        .map_err(|e| anyhow::anyhow!("trace post-attn norm alloc layer {idx}: {e}"))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!("trace post-attn norm alloc layer {idx}: {e}")
+                        })?;
                     gpu_hal::copy_d2d(
                         ordinal,
                         last_normed.as_ptr() as *mut c_void,
@@ -963,11 +1033,9 @@ fn prefill_inner(
                         hidden_bytes,
                     )
                     .map_err(|e| anyhow::anyhow!("trace post-attn norm copy layer {idx}: {e}"))?;
-                    trace.push(
-                        last_normed
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("trace post-attn norm D2H layer {idx}: {e}"))?,
-                    );
+                    trace.push(last_normed.to_host_bytes().map_err(|e| {
+                        anyhow::anyhow!("trace post-attn norm D2H layer {idx}: {e}")
+                    })?);
                 }
             }
 
@@ -989,9 +1057,9 @@ fn prefill_inner(
                     )
                     .map_err(|e| anyhow::anyhow!("trace mlp swiglu copy layer {idx}: {e}"))?;
                     trace.push(
-                        last_swiglu
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("trace mlp swiglu D2H layer {idx}: {e}"))?,
+                        last_swiglu.to_host_bytes().map_err(|e| {
+                            anyhow::anyhow!("trace mlp swiglu D2H layer {idx}: {e}")
+                        })?,
                     );
                 }
                 if let Some(trace) = layer_mlp_out_trace.as_mut() {
@@ -1017,8 +1085,7 @@ fn prefill_inner(
             if is_last_chunk {
                 if let Some(trace) = layer_hidden_trace.as_mut() {
                     let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
-                    let last_token_offset =
-                        (chunk_len - 1) * hidden_bytes;
+                    let last_token_offset = (chunk_len - 1) * hidden_bytes;
                     let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
                         .map_err(|e| anyhow::anyhow!("trace last_hidden alloc layer {idx}: {e}"))?;
                     gpu_hal::copy_d2d(
@@ -1029,9 +1096,9 @@ fn prefill_inner(
                     )
                     .map_err(|e| anyhow::anyhow!("trace last_hidden copy layer {idx}: {e}"))?;
                     trace.push(
-                        last_hidden
-                            .to_host_bytes()
-                            .map_err(|e| anyhow::anyhow!("trace last_hidden D2H layer {idx}: {e}"))?,
+                        last_hidden.to_host_bytes().map_err(|e| {
+                            anyhow::anyhow!("trace last_hidden D2H layer {idx}: {e}")
+                        })?,
                     );
                 }
 
@@ -1044,8 +1111,11 @@ fn prefill_inner(
                         if target_layer == idx {
                             let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
                             let last_token_offset = (chunk_len - 1) * hidden_bytes;
-                            let last_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
-                                .map_err(|e| anyhow::anyhow!("dflash tap alloc layer {idx}: {e}"))?;
+                            let last_hidden =
+                                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("dflash tap alloc layer {idx}: {e}")
+                                    })?;
                             gpu_hal::copy_d2d(
                                 ordinal,
                                 last_hidden.as_ptr() as *mut c_void,
@@ -1060,7 +1130,6 @@ fn prefill_inner(
                     }
                 }
             }
-
         }
 
         chunk_start += chunk_len;
@@ -1078,7 +1147,9 @@ fn prefill_inner(
         use_4b_kernel,
         ordinal,
     )?;
-    let logits = logits_per_pos.pop().expect("count=1 produces exactly one row");
+    let logits = logits_per_pos
+        .pop()
+        .expect("count=1 produces exactly one row");
     let final_norm_trace = Some(
         normed_last
             .to_host_bytes()
@@ -1131,10 +1202,12 @@ pub fn convert_kv_caches_to_fp8(
         let cap = bf16_k.shape()[2];
 
         let elem_bytes = ScalarType::BF16.size_in_bytes();
-        let k_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-            .map_err(|e| anyhow::anyhow!("kv fp8 convert K contig layer {idx}: {e}"))?;
-        let v_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-            .map_err(|e| anyhow::anyhow!("kv fp8 convert V contig layer {idx}: {e}"))?;
+        let k_contig =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                .map_err(|e| anyhow::anyhow!("kv fp8 convert K contig layer {idx}: {e}"))?;
+        let v_contig =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                .map_err(|e| anyhow::anyhow!("kv fp8 convert V contig layer {idx}: {e}"))?;
         let cap_stride = cap * head_dim * elem_bytes;
         let contig_stride = kv_len * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
@@ -1143,21 +1216,31 @@ pub fn convert_kv_caches_to_fp8(
                 k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
                 bf16_k.offset_ptr(h * cap_stride),
                 kv_len * head_dim * elem_bytes,
-            ).map_err(|e| anyhow::anyhow!("kv fp8 convert K assemble h={h}: {e}"))?;
+            )
+            .map_err(|e| anyhow::anyhow!("kv fp8 convert K assemble h={h}: {e}"))?;
             gpu_hal::copy_d2d(
                 ordinal,
                 v_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
                 bf16_v.offset_ptr(h * cap_stride),
                 kv_len * head_dim * elem_bytes,
-            ).map_err(|e| anyhow::anyhow!("kv fp8 convert V assemble h={h}: {e}"))?;
+            )
+            .map_err(|e| anyhow::anyhow!("kv fp8 convert V assemble h={h}: {e}"))?;
         }
 
         // Allocate FP8 cache and scale buffers with same capacity
         let fp8_cap = cap; // keep same capacity for alignment
-        let mut fp8_k = GpuBuffer::zeros(ordinal, ScalarType::U8, &[1, num_kv_heads, fp8_cap, head_dim])
-            .map_err(|e| anyhow::anyhow!("fp8 K alloc layer {idx}: {e}"))?;
-        let mut fp8_v = GpuBuffer::zeros(ordinal, ScalarType::U8, &[1, num_kv_heads, fp8_cap, head_dim])
-            .map_err(|e| anyhow::anyhow!("fp8 V alloc layer {idx}: {e}"))?;
+        let mut fp8_k = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::U8,
+            &[1, num_kv_heads, fp8_cap, head_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("fp8 K alloc layer {idx}: {e}"))?;
+        let mut fp8_v = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::U8,
+            &[1, num_kv_heads, fp8_cap, head_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("fp8 V alloc layer {idx}: {e}"))?;
         let mut scale_k = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, fp8_cap])
             .map_err(|e| anyhow::anyhow!("scale K alloc layer {idx}: {e}"))?;
         let mut scale_v = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, fp8_cap])
@@ -1165,16 +1248,32 @@ pub fn convert_kv_caches_to_fp8(
 
         // Quantize using GPU kernel
         kernel_ffi::prefill_ffi::quantize_kv_to_fp8(
-            ordinal, ScalarType::BF16,
-            &k_contig, &mut fp8_k, &mut scale_k,
-            num_kv_heads, kv_len, head_dim, fp8_cap, 0,
-        ).map_err(|e| anyhow::anyhow!("fp8 K quant layer {idx}: {e}"))?;
+            ordinal,
+            ScalarType::BF16,
+            &k_contig,
+            &mut fp8_k,
+            &mut scale_k,
+            num_kv_heads,
+            kv_len,
+            head_dim,
+            fp8_cap,
+            0,
+        )
+        .map_err(|e| anyhow::anyhow!("fp8 K quant layer {idx}: {e}"))?;
 
         kernel_ffi::prefill_ffi::quantize_kv_to_fp8(
-            ordinal, ScalarType::BF16,
-            &v_contig, &mut fp8_v, &mut scale_v,
-            num_kv_heads, kv_len, head_dim, fp8_cap, 0,
-        ).map_err(|e| anyhow::anyhow!("fp8 V quant layer {idx}: {e}"))?;
+            ordinal,
+            ScalarType::BF16,
+            &v_contig,
+            &mut fp8_v,
+            &mut scale_v,
+            num_kv_heads,
+            kv_len,
+            head_dim,
+            fp8_cap,
+            0,
+        )
+        .map_err(|e| anyhow::anyhow!("fp8 V quant layer {idx}: {e}"))?;
 
         ls.kv_cache_k = Some(fp8_k);
         ls.kv_cache_v = Some(fp8_v);
@@ -1313,9 +1412,20 @@ fn prefill_full_attention_layer(
     let mut q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_proj_dim])
         .map_err(|e| anyhow::anyhow!("q_full alloc: {e}"))?;
     matmul_proj(
-        ordinal, 1, chunk_len, q_proj_dim, hidden_dim,
-        &scratch.normed, &fw.q_proj_w, fw.q_proj_scale.as_ref(), fw.q_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut q_full,
-        fw.q_proj_int4_scale.as_ref(), fw.q_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        q_proj_dim,
+        hidden_dim,
+        &scratch.normed,
+        &fw.q_proj_w,
+        fw.q_proj_scale.as_ref(),
+        fw.q_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut q_full,
+        fw.q_proj_int4_scale.as_ref(),
+        fw.q_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
 
     // 2. Split Q into query and gate when present. Llama-style full attention
@@ -1325,8 +1435,17 @@ fn prefill_full_attention_layer(
     let mut gate_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
         .map_err(|e| anyhow::anyhow!("gate_buf alloc: {e}"))?;
     if has_attn_gate {
-        prefill_ffi::split_qgate(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &q_full, &mut query_buf, &mut gate_buf)
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
+        prefill_ffi::split_qgate(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_q_heads,
+            head_dim,
+            &q_full,
+            &mut query_buf,
+            &mut gate_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
     } else {
         gpu_hal::copy_d2d(
             ordinal,
@@ -1339,15 +1458,30 @@ fn prefill_full_attention_layer(
 
     // 3. K projection
     matmul_proj(
-        ordinal, 1, chunk_len, kv_dim, hidden_dim,
-        &scratch.normed, &fw.k_proj_w, fw.k_proj_scale.as_ref(), fw.k_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-        fw.k_proj_int4_scale.as_ref(), fw.k_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        kv_dim,
+        hidden_dim,
+        &scratch.normed,
+        &fw.k_proj_w,
+        fw.k_proj_scale.as_ref(),
+        fw.k_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut scratch.proj_buf2,
+        fw.k_proj_int4_scale.as_ref(),
+        fw.k_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
 
     // 4. Q normalization
     {
-        let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_q_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
+        let mut q_normed = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[chunk_len * num_q_heads, head_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
         maybe_attn_rms_norm_rows(
             config,
             ordinal,
@@ -1358,14 +1492,23 @@ fn prefill_full_attention_layer(
             &mut q_normed,
             &format!("layer {idx} Q norm"),
         )?;
-        gpu_hal::copy_d2d(ordinal, query_buf.as_ptr() as *mut c_void, q_normed.as_ptr(), chunk_len * q_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            query_buf.as_ptr() as *mut c_void,
+            q_normed.as_ptr(),
+            chunk_len * q_dim * elem_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q norm copy: {e}"))?;
     }
 
     // 5. K normalization
     {
-        let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len * num_kv_heads, head_dim])
-            .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
+        let mut k_normed = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[chunk_len * num_kv_heads, head_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
         maybe_attn_rms_norm_rows(
             config,
             ordinal,
@@ -1376,34 +1519,84 @@ fn prefill_full_attention_layer(
             &mut k_normed,
             &format!("layer {idx} K norm"),
         )?;
-        gpu_hal::copy_d2d(ordinal, scratch.proj_buf2.as_ptr() as *mut c_void, k_normed.as_ptr(), chunk_len * kv_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.proj_buf2.as_ptr() as *mut c_void,
+            k_normed.as_ptr(),
+            chunk_len * kv_dim * elem_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
     }
 
     // 6. RoPE on query and K — use pos_offset = chunk_start for correct position indexing
     prefill_ffi::apply_rope_prefill(
-        ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, rotary_dim,
-        &rotary.cos, &rotary.sin, chunk_start, &mut query_buf,
-    ).map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        num_q_heads,
+        head_dim,
+        rotary_dim,
+        &rotary.cos,
+        &rotary.sin,
+        chunk_start,
+        &mut query_buf,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
     prefill_ffi::apply_rope_prefill(
-        ordinal, ScalarType::BF16, chunk_len, num_kv_heads, head_dim, rotary_dim,
-        &rotary.cos, &rotary.sin, chunk_start, &mut scratch.proj_buf2,
-    ).map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        num_kv_heads,
+        head_dim,
+        rotary_dim,
+        &rotary.cos,
+        &rotary.sin,
+        chunk_start,
+        &mut scratch.proj_buf2,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
 
     // 7. V projection
     let mut v_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, kv_dim])
         .map_err(|e| anyhow::anyhow!("v_buf alloc: {e}"))?;
     matmul_proj(
-        ordinal, 1, chunk_len, kv_dim, hidden_dim,
-        &scratch.normed, &fw.v_proj_w, fw.v_proj_scale.as_ref(), fw.v_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut v_buf,
-        fw.v_proj_int4_scale.as_ref(), fw.v_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        kv_dim,
+        hidden_dim,
+        &scratch.normed,
+        &fw.v_proj_w,
+        fw.v_proj_scale.as_ref(),
+        fw.v_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut v_buf,
+        fw.v_proj_int4_scale.as_ref(),
+        fw.v_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
 
     // 8. Transpose K and V to [H, chunk_len, D] for KV cache write
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, num_kv_heads, head_dim, &scratch.proj_buf2, &mut scratch.attn_k)
-        .map_err(|e| anyhow::anyhow!("layer {idx} K transpose: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, num_kv_heads, head_dim, &v_buf, &mut scratch.attn_v)
-        .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        num_kv_heads,
+        head_dim,
+        &scratch.proj_buf2,
+        &mut scratch.attn_k,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} K transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        num_kv_heads,
+        head_dim,
+        &v_buf,
+        &mut scratch.attn_v,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} V transpose: {e}"))?;
 
     // 9. Write this chunk's K/V to KV cache BEFORE attention (so attention can read from it)
     //    Always use BF16 during prefill (attention kernel expects BF16).
@@ -1449,8 +1642,16 @@ fn prefill_full_attention_layer(
     }
 
     // 10. Transpose Q to [H, chunk_len, D]
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, num_q_heads, head_dim, &query_buf, &mut scratch.attn_q)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        num_q_heads,
+        head_dim,
+        &query_buf,
+        &mut scratch.attn_q,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Q transpose: {e}"))?;
 
     // 11. Causal attention — Q: [q_heads, chunk_len, hd], K/V: [kv_heads, kv_len, hd]
     //     The KV cache has layout [1, nkv, capacity, hd] where capacity >= kv_len.
@@ -1472,10 +1673,12 @@ fn prefill_full_attention_layer(
         attn_v_ref = cache_v_ref;
     } else {
         // Capacity > kv_len — copy each head's kv_len entries into contiguous buffers
-        kv_k_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-            .map_err(|e| anyhow::anyhow!("kv_k_contig alloc: {e}"))?;
-        kv_v_contig = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
-            .map_err(|e| anyhow::anyhow!("kv_v_contig alloc: {e}"))?;
+        kv_k_contig =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                .map_err(|e| anyhow::anyhow!("kv_k_contig alloc: {e}"))?;
+        kv_v_contig =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
+                .map_err(|e| anyhow::anyhow!("kv_v_contig alloc: {e}"))?;
         let cap_stride = cap * head_dim * elem_bytes;
         let contig_stride = kv_len * head_dim * elem_bytes;
         let copy_bytes = kv_len * head_dim * elem_bytes;
@@ -1485,52 +1688,109 @@ fn prefill_full_attention_layer(
                 kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_k_ref.offset_ptr(h * cap_stride),
                 copy_bytes,
-            ).map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
             gpu_hal::copy_d2d(
                 ordinal,
                 kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_v_ref.offset_ptr(h * cap_stride),
                 copy_bytes,
-            ).map_err(|e| anyhow::anyhow!("layer {idx} KV assemble V h={h}: {e}"))?;
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble V h={h}: {e}"))?;
         }
         attn_k_ref = &kv_k_contig;
         attn_v_ref = &kv_v_contig;
     }
 
     prefill_ffi::full_attention_prefill(
-        ordinal, ScalarType::BF16, 1, num_q_heads, num_kv_heads,
-        chunk_len, kv_len, head_dim, scale, chunk_start,
-        &scratch.attn_q, attn_k_ref, attn_v_ref, &mut scratch.attn_out_f32,
-    ).map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+        ordinal,
+        ScalarType::BF16,
+        1,
+        num_q_heads,
+        num_kv_heads,
+        chunk_len,
+        kv_len,
+        head_dim,
+        scale,
+        chunk_start,
+        &scratch.attn_q,
+        attn_k_ref,
+        attn_v_ref,
+        &mut scratch.attn_out_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
 
     // 12. Cast F32 → BF16
-    prefill_ffi::cast(ordinal, ScalarType::F32, ScalarType::BF16, num_q_heads * chunk_len * head_dim, &scratch.attn_out_f32, &mut scratch.attn_q)
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::F32,
+        ScalarType::BF16,
+        num_q_heads * chunk_len * head_dim,
+        &scratch.attn_out_f32,
+        &mut scratch.attn_q,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
 
     // 13. Transpose back [H, chunk_len, D] → [chunk_len, H, D] = [chunk_len, q_dim]
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, num_q_heads, chunk_len, head_dim, &scratch.attn_q, &mut scratch.proj_buf)
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        num_q_heads,
+        chunk_len,
+        head_dim,
+        &scratch.attn_q,
+        &mut scratch.proj_buf,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} attn transpose back: {e}"))?;
 
     // 14. Apply attention gate only for gated-Q attention models (Qwen).
     if has_attn_gate {
         let mut gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_dim])
             .map_err(|e| anyhow::anyhow!("gated alloc: {e}"))?;
-        prefill_ffi::sigmoid_mul(ordinal, ScalarType::BF16, chunk_len * q_dim, &scratch.proj_buf, &gate_buf, &mut gated)
-            .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;
-        gpu_hal::copy_d2d(ordinal, scratch.proj_buf.as_ptr() as *mut c_void, gated.as_ptr(), chunk_len * q_dim * elem_bytes)
-            .map_err(|e| anyhow::anyhow!("gated copy: {e}"))?;
+        prefill_ffi::sigmoid_mul(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len * q_dim,
+            &scratch.proj_buf,
+            &gate_buf,
+            &mut gated,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.proj_buf.as_ptr() as *mut c_void,
+            gated.as_ptr(),
+            chunk_len * q_dim * elem_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("gated copy: {e}"))?;
     }
 
     // 15. O projection
     matmul_proj(
-        ordinal, 1, chunk_len, hidden_dim, q_dim,
-        &scratch.proj_buf, &fw.o_proj_w, fw.o_proj_scale.as_ref(), fw.o_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-        fw.o_proj_int4_scale.as_ref(), fw.o_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        hidden_dim,
+        q_dim,
+        &scratch.proj_buf,
+        &fw.o_proj_w,
+        fw.o_proj_scale.as_ref(),
+        fw.o_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut scratch.proj_buf2,
+        fw.o_proj_int4_scale.as_ref(),
+        fw.o_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
 
     // 16. Residual
-    residual_add(ordinal, chunk_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf2)
-        .map_err(|e| anyhow::anyhow!("layer {idx} attention residual: {e}"))?;
+    residual_add(
+        ordinal,
+        chunk_len * hidden_dim,
+        &mut scratch.hidden,
+        &scratch.proj_buf2,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} attention residual: {e}"))?;
 
     Ok(())
 }
@@ -1561,16 +1821,27 @@ fn prefill_linear_attention_layer(
     let khd = config.linear_key_head_dim;
     let vhd = config.linear_value_head_dim;
     let kern = config.linear_conv_kernel_dim;
-    let key_dim = nk * khd;     // Q and K share this dimension
+    let key_dim = nk * khd; // Q and K share this dimension
     let val_dim = nv * vhd;
     let qkv_dim = key_dim * 2 + val_dim;
     let z_dim = val_dim;
 
     // 1. QKV projection: normed [chunk, hidden] → [chunk, qkv_dim]
     matmul_proj(
-        ordinal, 1, chunk_len, qkv_dim, hidden_dim,
-        &scratch.normed, &lw.qkv_proj_w, lw.qkv_proj_scale.as_ref(), lw.qkv_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
-        lw.qkv_proj_int4_scale.as_ref(), lw.qkv_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        qkv_dim,
+        hidden_dim,
+        &scratch.normed,
+        &lw.qkv_proj_w,
+        lw.qkv_proj_scale.as_ref(),
+        lw.qkv_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut scratch.proj_buf,
+        lw.qkv_proj_int4_scale.as_ref(),
+        lw.qkv_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
     if trace_linear_debug {
         let bytes = scratch
@@ -1598,7 +1869,9 @@ fn prefill_linear_attention_layer(
     if chunk_len >= pad {
         // Enough rows in this chunk to extract directly
         if trace_linear_debug {
-            let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+            let trace = linear_debug_trace
+                .as_mut()
+                .expect("linear debug trace missing");
             let bytes = scratch
                 .proj_buf
                 .to_host_bytes()
@@ -1610,16 +1883,26 @@ fn prefill_linear_attention_layer(
         if is_last_chunk {
             if let Some(ref mut conv_state) = state.layers[idx].conv_state {
                 prefill_ffi::extract_conv_state(
-                    ordinal, ScalarType::BF16, chunk_len, qkv_dim, pad,
-                    &scratch.proj_buf, conv_state,
+                    ordinal,
+                    ScalarType::BF16,
+                    chunk_len,
+                    qkv_dim,
+                    pad,
+                    &scratch.proj_buf,
+                    conv_state,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} extract conv state: {e}"))?;
             }
         }
         if !is_last_chunk {
             prefill_ffi::extract_conv_state(
-                ordinal, ScalarType::BF16, chunk_len, qkv_dim, pad,
-                &scratch.proj_buf, chunk_conv_tail,
+                ordinal,
+                ScalarType::BF16,
+                chunk_len,
+                qkv_dim,
+                pad,
+                &scratch.proj_buf,
+                chunk_conv_tail,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} extract conv tail: {e}"))?;
         }
@@ -1643,7 +1926,8 @@ fn prefill_linear_attention_layer(
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     chunk_conv_tail.offset_ptr(src_off),
                     keep_old * elem_bytes,
-                ).map_err(|e| anyhow::anyhow!("layer {idx} conv tail shift ch={ch}: {e}"))?;
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} conv tail shift ch={ch}: {e}"))?;
             }
             // Append new QKV values
             for t in 0..chunk_len {
@@ -1654,7 +1938,8 @@ fn prefill_linear_attention_layer(
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     scratch.proj_buf.offset_ptr(src_off),
                     elem_bytes,
-                ).map_err(|e| anyhow::anyhow!("layer {idx} conv tail append ch={ch} t={t}: {e}"))?;
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} conv tail append ch={ch} t={t}: {e}"))?;
             }
         }
 
@@ -1662,22 +1947,45 @@ fn prefill_linear_attention_layer(
         let total_bytes = qkv_dim * pad * elem_bytes;
         if is_last_chunk {
             if let Some(ref mut conv_state) = state.layers[idx].conv_state {
-                gpu_hal::copy_d2d(ordinal, conv_state.as_ptr() as *mut c_void, new_tail.as_ptr(), total_bytes)
-                    .map_err(|e| anyhow::anyhow!("layer {idx} conv state final: {e}"))?;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    conv_state.as_ptr() as *mut c_void,
+                    new_tail.as_ptr(),
+                    total_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} conv state final: {e}"))?;
             }
         }
-        gpu_hal::copy_d2d(ordinal, chunk_conv_tail.as_ptr() as *mut c_void, new_tail.as_ptr(), total_bytes)
-            .map_err(|e| anyhow::anyhow!("layer {idx} conv tail update: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            chunk_conv_tail.as_ptr() as *mut c_void,
+            new_tail.as_ptr(),
+            total_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} conv tail update: {e}"))?;
     }
 
     // 2. Z projection: normed [chunk, hidden] → [chunk, z_dim]
     matmul_proj(
-        ordinal, 1, chunk_len, z_dim, hidden_dim,
-        &scratch.normed, &lw.z_proj_w, lw.z_proj_scale.as_ref(), lw.z_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-        lw.z_proj_int4_scale.as_ref(), lw.z_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        z_dim,
+        hidden_dim,
+        &scratch.normed,
+        &lw.z_proj_w,
+        lw.z_proj_scale.as_ref(),
+        lw.z_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut scratch.proj_buf2,
+        lw.z_proj_int4_scale.as_ref(),
+        lw.z_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let bytes = scratch
             .proj_buf2
             .to_host_bytes()
@@ -1691,18 +1999,40 @@ fn prefill_linear_attention_layer(
     let mut b_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, nv])
         .map_err(|e| anyhow::anyhow!("b_buf alloc: {e}"))?;
     matmul_proj(
-        ordinal, 1, chunk_len, nv, hidden_dim,
-        &scratch.normed, &lw.b_proj_w, lw.b_proj_scale.as_ref(), lw.b_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut b_buf,
-        None, None, 0,
+        ordinal,
+        1,
+        chunk_len,
+        nv,
+        hidden_dim,
+        &scratch.normed,
+        &lw.b_proj_w,
+        lw.b_proj_scale.as_ref(),
+        lw.b_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut b_buf,
+        None,
+        None,
+        0,
     )?;
 
     // 4. A projection: normed [chunk, hidden] → [chunk, nv] (kept BF16, too small for INT4)
     let mut a_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, nv])
         .map_err(|e| anyhow::anyhow!("a_buf alloc: {e}"))?;
     matmul_proj(
-        ordinal, 1, chunk_len, nv, hidden_dim,
-        &scratch.normed, &lw.a_proj_w, lw.a_proj_scale.as_ref(), lw.a_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut a_buf,
-        None, None, 0,
+        ordinal,
+        1,
+        chunk_len,
+        nv,
+        hidden_dim,
+        &scratch.normed,
+        &lw.a_proj_w,
+        lw.a_proj_scale.as_ref(),
+        lw.a_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut a_buf,
+        None,
+        None,
+        0,
     )?;
 
     // 5. Transpose QKV [chunk, qkv_dim] → [qkv_dim, pad+chunk] for conv input
@@ -1775,8 +2105,18 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("k_linear alloc: {e}"))?;
     let mut v_linear = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, val_dim])
         .map_err(|e| anyhow::anyhow!("v_linear alloc: {e}"))?;
-    prefill_ffi::split_qkv(ordinal, ScalarType::BF16, chunk_len, key_dim, val_dim, &scratch.proj_buf, &mut q_linear, &mut k_linear, &mut v_linear)
-        .map_err(|e| anyhow::anyhow!("layer {idx} QKV split: {e}"))?;
+    prefill_ffi::split_qkv(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        key_dim,
+        val_dim,
+        &scratch.proj_buf,
+        &mut q_linear,
+        &mut k_linear,
+        &mut v_linear,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} QKV split: {e}"))?;
 
     let mut q_linear_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len, key_dim])
         .map_err(|e| anyhow::anyhow!("q_linear_f32 alloc: {e}"))?;
@@ -1784,28 +2124,72 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("k_linear_f32 alloc: {e}"))?;
     let mut v_linear_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len, val_dim])
         .map_err(|e| anyhow::anyhow!("v_linear_f32 alloc: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, chunk_len * key_dim, &q_linear, &mut q_linear_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q cast: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, chunk_len * key_dim, &k_linear, &mut k_linear_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} K cast: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, chunk_len * val_dim, &v_linear, &mut v_linear_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} V cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        chunk_len * key_dim,
+        &q_linear,
+        &mut q_linear_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Q cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        chunk_len * key_dim,
+        &k_linear,
+        &mut k_linear_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} K cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        chunk_len * val_dim,
+        &v_linear,
+        &mut v_linear_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} V cast: {e}"))?;
 
     let mut q_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len * nk, khd])
         .map_err(|e| anyhow::anyhow!("q_normed alloc: {e}"))?;
-    prefill_ffi::l2norm(ordinal, ScalarType::F32, chunk_len * nk, khd, 1e-6, &q_linear_f32, &mut q_normed)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q l2norm: {e}"))?;
+    prefill_ffi::l2norm(
+        ordinal,
+        ScalarType::F32,
+        chunk_len * nk,
+        khd,
+        1e-6,
+        &q_linear_f32,
+        &mut q_normed,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Q l2norm: {e}"))?;
 
     let q_scale = 1.0 / (khd as f32).sqrt();
     let mut q_scaled = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len, key_dim])
         .map_err(|e| anyhow::anyhow!("q_scaled alloc: {e}"))?;
-    prefill_ffi::mul_scalar(ordinal, ScalarType::F32, chunk_len * key_dim, q_scale, &q_normed, &mut q_scaled)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Q scale: {e}"))?;
+    prefill_ffi::mul_scalar(
+        ordinal,
+        ScalarType::F32,
+        chunk_len * key_dim,
+        q_scale,
+        &q_normed,
+        &mut q_scaled,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Q scale: {e}"))?;
 
     let mut k_normed = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len * nk, khd])
         .map_err(|e| anyhow::anyhow!("k_normed alloc: {e}"))?;
-    prefill_ffi::l2norm(ordinal, ScalarType::F32, chunk_len * nk, khd, 1e-6, &k_linear_f32, &mut k_normed)
-        .map_err(|e| anyhow::anyhow!("layer {idx} K l2norm: {e}"))?;
+    prefill_ffi::l2norm(
+        ordinal,
+        ScalarType::F32,
+        chunk_len * nk,
+        khd,
+        1e-6,
+        &k_linear_f32,
+        &mut k_normed,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} K l2norm: {e}"))?;
 
     // 9. Compute beta and g on GPU
     //    beta[h, t] = sigmoid(B[t, h]) → [nv, chunk_len]
@@ -1818,23 +2202,59 @@ fn prefill_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("dt_bias_f32 alloc: {e}"))?;
     let mut a_log_exp_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv])
         .map_err(|e| anyhow::anyhow!("a_log_exp_f32 alloc: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, chunk_len * nv, &a_buf, &mut a_buf_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} A cast: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, chunk_len * nv, &b_buf, &mut b_buf_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} B cast: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, nv, &lw.dt_bias, &mut dt_bias_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} dt_bias cast: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, nv, &lw.a_log_exp, &mut a_log_exp_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} a_log_exp cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        chunk_len * nv,
+        &a_buf,
+        &mut a_buf_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} A cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        chunk_len * nv,
+        &b_buf,
+        &mut b_buf_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} B cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        nv,
+        &lw.dt_bias,
+        &mut dt_bias_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} dt_bias cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        nv,
+        &lw.a_log_exp,
+        &mut a_log_exp_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} a_log_exp cast: {e}"))?;
     let mut beta_gpu = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, chunk_len])
         .map_err(|e| anyhow::anyhow!("beta alloc: {e}"))?;
     let mut g_gpu = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, chunk_len])
         .map_err(|e| anyhow::anyhow!("g alloc: {e}"))?;
     prefill_ffi::compute_beta_g(
-        ordinal, ScalarType::F32, chunk_len, nv,
-        &b_buf_f32, &a_buf_f32, &dt_bias_f32, &a_log_exp_f32,
-        &mut beta_gpu, &mut g_gpu,
-    ).map_err(|e| anyhow::anyhow!("layer {idx} beta/g: {e}"))?;
+        ordinal,
+        ScalarType::F32,
+        chunk_len,
+        nv,
+        &b_buf_f32,
+        &a_buf_f32,
+        &dt_bias_f32,
+        &a_log_exp_f32,
+        &mut beta_gpu,
+        &mut g_gpu,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} beta/g: {e}"))?;
 
     // 10. Transpose Q [S, nk, khd] → [nk, S, khd] and K, V similarly
     //     If nk != nv, repeat Q and K heads to match nv (like GQA head expansion)
@@ -1843,8 +2263,16 @@ fn prefill_linear_attention_layer(
     let q_trans = if head_repeat == 1 {
         let mut buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nk, chunk_len, khd])
             .map_err(|e| anyhow::anyhow!("q_trans alloc: {e}"))?;
-        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::F32, chunk_len, nk, khd, &q_scaled, &mut buf)
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q linear transpose: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::F32,
+            chunk_len,
+            nk,
+            khd,
+            &q_scaled,
+            &mut buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q linear transpose: {e}"))?;
         buf
     } else {
         let mut expanded_shd = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len, nv, khd])
@@ -1859,7 +2287,7 @@ fn prefill_linear_attention_layer(
             &q_scaled,
             &mut expanded_shd,
         )
-            .map_err(|e| anyhow::anyhow!("layer {idx} Q repeat: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q repeat: {e}"))?;
         let mut expanded = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, chunk_len, khd])
             .map_err(|e| anyhow::anyhow!("q_expanded alloc: {e}"))?;
         prefill_ffi::transpose_shd_hsd(
@@ -1878,8 +2306,16 @@ fn prefill_linear_attention_layer(
     let k_trans = if head_repeat == 1 {
         let mut buf = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nk, chunk_len, khd])
             .map_err(|e| anyhow::anyhow!("k_trans alloc: {e}"))?;
-        prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::F32, chunk_len, nk, khd, &k_normed, &mut buf)
-            .map_err(|e| anyhow::anyhow!("layer {idx} K linear transpose: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::F32,
+            chunk_len,
+            nk,
+            khd,
+            &k_normed,
+            &mut buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K linear transpose: {e}"))?;
         buf
     } else {
         let mut expanded_shd = GpuBuffer::zeros(ordinal, ScalarType::F32, &[chunk_len, nv, khd])
@@ -1894,7 +2330,7 @@ fn prefill_linear_attention_layer(
             &k_normed,
             &mut expanded_shd,
         )
-            .map_err(|e| anyhow::anyhow!("layer {idx} K repeat: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("layer {idx} K repeat: {e}"))?;
         let mut expanded = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, chunk_len, khd])
             .map_err(|e| anyhow::anyhow!("k_expanded alloc: {e}"))?;
         prefill_ffi::transpose_shd_hsd(
@@ -1914,11 +2350,21 @@ fn prefill_linear_attention_layer(
 
     let mut v_trans = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, chunk_len, vhd])
         .map_err(|e| anyhow::anyhow!("v_trans alloc: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::F32, chunk_len, nv, vhd, &v_linear_f32, &mut v_trans)
-        .map_err(|e| anyhow::anyhow!("layer {idx} V linear transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::F32,
+        chunk_len,
+        nv,
+        vhd,
+        &v_linear_f32,
+        &mut v_trans,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} V linear transpose: {e}"))?;
 
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let q_scaled_bytes = q_scaled
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} debug q_scaled D2H: {e}"))?;
@@ -1971,8 +2417,7 @@ fn prefill_linear_attention_layer(
                 packed_equiv[out_base + 2 * khd + i] = v_linear_f32_host[v_base + i];
             }
             packed_equiv[out_base + 2 * khd + vhd] = beta_f32[v_head * chunk_len + last_t];
-            packed_equiv[out_base + 2 * khd + vhd + 1] =
-                g_f32[v_head * chunk_len + last_t].exp();
+            packed_equiv[out_base + 2 * khd + vhd + 1] = g_f32[v_head * chunk_len + last_t].exp();
         }
         trace.packed = packed_equiv
             .into_iter()
@@ -1986,17 +2431,23 @@ fn prefill_linear_attention_layer(
     let out_rows = chunk_len + khd;
     let mut recurrent_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
         .map_err(|e| anyhow::anyhow!("recurrent_f32 alloc: {e}"))?;
-    let mut delta_out =
-        GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, out_rows, vhd])
-            .map_err(|e| anyhow::anyhow!("delta_out alloc: {e}"))?;
+    let mut delta_out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, out_rows, vhd])
+        .map_err(|e| anyhow::anyhow!("delta_out alloc: {e}"))?;
 
-    prefill_ffi::cast(ordinal, ScalarType::BF16, ScalarType::F32, nv * khd * vhd, chunk_recurrent, &mut recurrent_f32)
-        .map_err(|e| anyhow::anyhow!("layer {idx} recurrent init cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::BF16,
+        ScalarType::F32,
+        nv * khd * vhd,
+        chunk_recurrent,
+        &mut recurrent_f32,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} recurrent init cast: {e}"))?;
 
     prefill_ffi::delta_recurrent_prefill(
         ordinal,
         ScalarType::F32,
-        nv,       // batch_heads
+        nv, // batch_heads
         chunk_len,
         khd,
         vhd,
@@ -2015,9 +2466,8 @@ fn prefill_linear_attention_layer(
     let mut state_bytes_debug: Option<Vec<u8>> = None;
     {
         let state_elems = nv * khd * vhd;
-        let state_f32 =
-            GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
-                .map_err(|e| anyhow::anyhow!("state_f32 alloc: {e}"))?;
+        let state_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
+            .map_err(|e| anyhow::anyhow!("state_f32 alloc: {e}"))?;
 
         let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
         let state_bytes_per_head = khd * vhd * elem_bytes_f32;
@@ -2036,8 +2486,15 @@ fn prefill_linear_attention_layer(
         }
 
         // Always update chunk_recurrent (BF16) for the next chunk.
-        prefill_ffi::cast(ordinal, ScalarType::F32, ScalarType::BF16, state_elems, &state_f32, chunk_recurrent)
-            .map_err(|e| anyhow::anyhow!("layer {idx} chunk recurrent update: {e}"))?;
+        prefill_ffi::cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            state_elems,
+            &state_f32,
+            chunk_recurrent,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} chunk recurrent update: {e}"))?;
 
         // On the last chunk, keep the decode-time recurrent state in F32.
         if is_last_chunk {
@@ -2082,10 +2539,19 @@ fn prefill_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("layer {idx} attn output extract h={h}: {e}"))?;
         }
     }
-    prefill_ffi::cast(ordinal, ScalarType::F32, ScalarType::BF16, nv * chunk_len * vhd, &attn_output_f32, &mut attn_output)
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn output cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::F32,
+        ScalarType::BF16,
+        nv * chunk_len * vhd,
+        &attn_output_f32,
+        &mut attn_output,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} attn output cast: {e}"))?;
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let attn_out_bytes = attn_output_f32
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} debug attn_output_f32 D2H: {e}"))?;
@@ -2106,7 +2572,9 @@ fn prefill_linear_attention_layer(
         trace.rec_apply = rec_apply_equiv;
     }
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let bytes = attn_output
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} debug attn D2H: {e}"))?;
@@ -2127,13 +2595,28 @@ fn prefill_linear_attention_layer(
     //     Need Z in [nv, S, vhd] layout
     let mut z_trans = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, chunk_len, vhd])
         .map_err(|e| anyhow::anyhow!("z_trans alloc: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, chunk_len, nv, vhd, &scratch.proj_buf2, &mut z_trans)
-        .map_err(|e| anyhow::anyhow!("layer {idx} Z transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        nv,
+        vhd,
+        &scratch.proj_buf2,
+        &mut z_trans,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} Z transpose: {e}"))?;
 
     let mut norm_w_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[vhd])
         .map_err(|e| anyhow::anyhow!("norm_w_bf16 alloc: {e}"))?;
-    prefill_ffi::cast(ordinal, ScalarType::F32, ScalarType::BF16, vhd, &lw.norm_w, &mut norm_w_bf16)
-        .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
+    prefill_ffi::cast(
+        ordinal,
+        ScalarType::F32,
+        ScalarType::BF16,
+        vhd,
+        &lw.norm_w,
+        &mut norm_w_bf16,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} norm_w cast: {e}"))?;
 
     let mut gated_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv * chunk_len, vhd])
         .map_err(|e| anyhow::anyhow!("gated_out alloc: {e}"))?;
@@ -2152,10 +2635,20 @@ fn prefill_linear_attention_layer(
 
     let mut gated_s_first = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, val_dim])
         .map_err(|e| anyhow::anyhow!("gated_s_first alloc: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(ordinal, ScalarType::BF16, nv, chunk_len, vhd, &gated_out, &mut gated_s_first)
-        .map_err(|e| anyhow::anyhow!("layer {idx} gated transpose: {e}"))?;
+    prefill_ffi::transpose_shd_hsd(
+        ordinal,
+        ScalarType::BF16,
+        nv,
+        chunk_len,
+        vhd,
+        &gated_out,
+        &mut gated_s_first,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} gated transpose: {e}"))?;
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let bytes = gated_s_first
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} debug gated D2H: {e}"))?;
@@ -2166,12 +2659,25 @@ fn prefill_linear_attention_layer(
 
     // 16. O projection: [S, val_dim] × out_proj_w [hidden, val_dim]^T → [S, hidden]
     matmul_proj(
-        ordinal, 1, chunk_len, hidden_dim, val_dim,
-        &gated_s_first, &lw.out_proj_w, lw.out_proj_scale.as_ref(), lw.out_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-        lw.out_proj_int4_scale.as_ref(), lw.out_proj_int4_zero.as_ref(), weights.int4_group_size,
+        ordinal,
+        1,
+        chunk_len,
+        hidden_dim,
+        val_dim,
+        &gated_s_first,
+        &lw.out_proj_w,
+        lw.out_proj_scale.as_ref(),
+        lw.out_proj_int8_scale.as_ref(),
+        weights.fp8_block_size,
+        &mut scratch.proj_buf2,
+        lw.out_proj_int4_scale.as_ref(),
+        lw.out_proj_int4_zero.as_ref(),
+        weights.int4_group_size,
     )?;
     if trace_linear_debug {
-        let trace = linear_debug_trace.as_mut().expect("linear debug trace missing");
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
         let bytes = scratch
             .proj_buf2
             .to_host_bytes()
@@ -2182,8 +2688,13 @@ fn prefill_linear_attention_layer(
     }
 
     // 17. Residual: hidden += O projection output
-    residual_add(ordinal, chunk_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf2)
-        .map_err(|e| anyhow::anyhow!("layer {idx} linear attn residual: {e}"))?;
+    residual_add(
+        ordinal,
+        chunk_len * hidden_dim,
+        &mut scratch.hidden,
+        &scratch.proj_buf2,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} linear attn residual: {e}"))?;
 
     Ok(())
 }
@@ -2210,16 +2721,30 @@ fn prefill_mlp_layer(
             hidden_dim,
             &scratch.normed,
             weights,
-            &format!("{}.layers.{idx}.mlp.gate_proj.weight", weights.weight_prefix),
+            &format!(
+                "{}.layers.{idx}.mlp.gate_proj.weight",
+                weights.weight_prefix
+            ),
             &lw.gate_proj_w,
             sc,
             &mut scratch.proj_buf,
         )?;
     } else {
         matmul_proj(
-            ordinal, 1, seq_len, intermediate, hidden_dim,
-            &scratch.normed, &lw.gate_proj_w, lw.gate_proj_scale.as_ref(), lw.gate_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
-            lw.gate_proj_int4_scale.as_ref(), lw.gate_proj_int4_zero.as_ref(), weights.int4_group_size,
+            ordinal,
+            1,
+            seq_len,
+            intermediate,
+            hidden_dim,
+            &scratch.normed,
+            &lw.gate_proj_w,
+            lw.gate_proj_scale.as_ref(),
+            lw.gate_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf,
+            lw.gate_proj_int4_scale.as_ref(),
+            lw.gate_proj_int4_zero.as_ref(),
+            weights.int4_group_size,
         )?;
     }
 
@@ -2240,9 +2765,20 @@ fn prefill_mlp_layer(
         )?;
     } else {
         matmul_proj(
-            ordinal, 1, seq_len, intermediate, hidden_dim,
-            &scratch.normed, &lw.up_proj_w, lw.up_proj_scale.as_ref(), lw.up_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf2,
-            lw.up_proj_int4_scale.as_ref(), lw.up_proj_int4_zero.as_ref(), weights.int4_group_size,
+            ordinal,
+            1,
+            seq_len,
+            intermediate,
+            hidden_dim,
+            &scratch.normed,
+            &lw.up_proj_w,
+            lw.up_proj_scale.as_ref(),
+            lw.up_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            lw.up_proj_int4_scale.as_ref(),
+            lw.up_proj_int4_zero.as_ref(),
+            weights.int4_group_size,
         )?;
     }
 
@@ -2266,22 +2802,41 @@ fn prefill_mlp_layer(
             intermediate,
             &scratch.mlp_buf,
             weights,
-            &format!("{}.layers.{idx}.mlp.down_proj.weight", weights.weight_prefix),
+            &format!(
+                "{}.layers.{idx}.mlp.down_proj.weight",
+                weights.weight_prefix
+            ),
             &lw.down_proj_w,
             sc,
             &mut scratch.proj_buf,
         )?;
     } else {
         matmul_proj(
-            ordinal, 1, seq_len, hidden_dim, intermediate,
-            &scratch.mlp_buf, &lw.down_proj_w, lw.down_proj_scale.as_ref(), lw.down_proj_int8_scale.as_ref(), weights.fp8_block_size, &mut scratch.proj_buf,
-            lw.down_proj_int4_scale.as_ref(), lw.down_proj_int4_zero.as_ref(), weights.int4_group_size,
+            ordinal,
+            1,
+            seq_len,
+            hidden_dim,
+            intermediate,
+            &scratch.mlp_buf,
+            &lw.down_proj_w,
+            lw.down_proj_scale.as_ref(),
+            lw.down_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf,
+            lw.down_proj_int4_scale.as_ref(),
+            lw.down_proj_int4_zero.as_ref(),
+            weights.int4_group_size,
         )?;
     }
 
     // Residual: hidden += down_proj output
-    residual_add(ordinal, seq_len * hidden_dim, &mut scratch.hidden, &scratch.proj_buf)
-        .map_err(|e| anyhow::anyhow!("layer {idx} MLP residual: {e}"))?;
+    residual_add(
+        ordinal,
+        seq_len * hidden_dim,
+        &mut scratch.hidden,
+        &scratch.proj_buf,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} MLP residual: {e}"))?;
 
     Ok(())
 }

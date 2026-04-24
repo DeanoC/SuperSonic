@@ -222,6 +222,10 @@ fast-greedy/full-logits token regression runs.
 `tests/sm86/bench_llama31_arxiv_v1_smoke.sh` covers generated RULER/NIAH-style
 retrieval smoke QA, and `tests/sm86/bench_llama31_pg19_smoke.sh` covers
 teacher-forced PG-19/perplexity smoke QA for dense INT8 vs certified KV.
+The CUDA certified-KV runtime is still staged: it validates Tier-1 compressed
+KV plus adaptive BF16-key promotion, with BF16 originals retained in
+host-pinned Tier-2 storage and promoted keys paged into compact device scratch.
+Live value escalation and ranking fallback are still pending.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference

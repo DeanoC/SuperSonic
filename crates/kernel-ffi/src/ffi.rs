@@ -170,10 +170,7 @@ unsafe extern "C" {
 // `cudaGetDeviceProperties` on the Rust side).
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn dotcache_hip_device_clock_khz(
-        device_ordinal: c_int,
-        clock_rate_khz_out: *mut u32,
-    ) -> c_int;
+    fn dotcache_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
 
     // Per-model launch preset for the qwen4b persistent decode kernel.
     // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
@@ -1377,10 +1374,7 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
 pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
     #[cfg(supersonic_backend_hip)]
     unsafe {
-        dotcache_qwen35_4b_hip_set_launch_preset(
-            blocks as c_int,
-            if coop { 1 } else { 0 },
-        );
+        dotcache_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
     #[cfg(not(supersonic_backend_hip))]
     {

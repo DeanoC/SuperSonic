@@ -1,3 +1,4 @@
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
 
@@ -203,6 +204,93 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
     })
 }
 
+/// Allocate host memory suitable for fast host-to-device page-in.
+pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
+    let backend = current_backend();
+    if len_bytes == 0 {
+        return Err(GpuError::InvalidArg(
+            "host allocation size must be > 0".into(),
+        ));
+    }
+    match backend {
+        Backend::Cuda => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let mut ptr = std::ptr::null_mut();
+                let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, 0) };
+                if status != 0 {
+                    return Err(cuda_error("cudaHostAlloc", status));
+                }
+                NonNull::new(ptr)
+                    .ok_or_else(|| GpuError::Cuda("cudaHostAlloc returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+        }),
+        Backend::Hip => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_hip)]
+            {
+                let mut ptr = std::ptr::null_mut();
+                let status = unsafe { hipHostMalloc(&mut ptr, len_bytes, 0) };
+                if status != 0 {
+                    return Err(hip_error("hipHostMalloc", status));
+                }
+                NonNull::new(ptr).ok_or_else(|| GpuError::Hip("hipHostMalloc returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+        }),
+        Backend::Metal => {
+            let layout = Layout::from_size_align(len_bytes, 64)
+                .map_err(|e| GpuError::InvalidArg(format!("host allocation layout failed: {e}")))?;
+            let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
+            NonNull::new(ptr).ok_or_else(|| GpuError::Metal("host allocation returned null".into()))
+        }
+    }
+}
+
+/// Free host memory allocated by `alloc_host_pinned`.
+pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_bytes: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    match backend {
+        Backend::Cuda => {
+            let _ = with_device_impl(backend, ordinal, || {
+                #[cfg(supersonic_backend_cuda)]
+                {
+                    let status = unsafe { cudaFreeHost(ptr) };
+                    if status != 0 {
+                        return Err(cuda_error("cudaFreeHost", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            });
+        }
+        Backend::Hip => {
+            let _: Result<()> = with_device_impl(backend, ordinal, || {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipHostFree(ptr) };
+                    if status != 0 {
+                        return Err(hip_error("hipHostFree", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            });
+        }
+        Backend::Metal => {
+            if let Ok(layout) = Layout::from_size_align(len_bytes, 64) {
+                unsafe { dealloc(ptr as *mut u8, layout) };
+            }
+        }
+    }
+}
+
 /// Allocate `len_bytes` of device memory, zeroed.
 pub fn alloc_zeros(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
     let ptr = alloc(ordinal, len_bytes)?;
@@ -257,7 +345,9 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
 pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
     let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
-        return Err(GpuError::InvalidArg("copy_h2d: null pointer or zero len".into()));
+        return Err(GpuError::InvalidArg(
+            "copy_h2d: null pointer or zero len".into(),
+        ));
     }
     with_device_impl(backend, ordinal, || {
         let status = match backend {
@@ -299,7 +389,9 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
     let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
-        return Err(GpuError::InvalidArg("copy_d2h: null pointer or zero len".into()));
+        return Err(GpuError::InvalidArg(
+            "copy_d2h: null pointer or zero len".into(),
+        ));
     }
     with_device_impl(backend, ordinal, || {
         let status = match backend {
@@ -341,7 +433,9 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
     let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
-        return Err(GpuError::InvalidArg("copy_d2d: null pointer or zero len".into()));
+        return Err(GpuError::InvalidArg(
+            "copy_d2d: null pointer or zero len".into(),
+        ));
     }
     with_device_impl(backend, ordinal, || {
         let status = match backend {
@@ -383,7 +477,9 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
 pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> {
     let backend = current_backend();
     if dst.is_null() || len == 0 {
-        return Err(GpuError::InvalidArg("memset_zeros: null pointer or zero len".into()));
+        return Err(GpuError::InvalidArg(
+            "memset_zeros: null pointer or zero len".into(),
+        ));
     }
     with_device_impl(backend, ordinal, || {
         let status = match backend {
@@ -733,7 +829,10 @@ mod tests {
         memset_zeros(ordinal, dst.as_mut_ptr(), dst.len_bytes()).expect("memset zeros");
         sync(ordinal).expect("sync after memset");
         let zeroed = dst.to_host_bytes().expect("download zeroed bytes");
-        assert!(zeroed.iter().all(|&b| b == 0), "destination buffer not zeroed");
+        assert!(
+            zeroed.iter().all(|&b| b == 0),
+            "destination buffer not zeroed"
+        );
     }
 
     #[test]

@@ -131,7 +131,11 @@ fn host_bf16_addmm(
         bail!("host_bf16_addmm k mismatch: {} vs {}", subb_t_shape[1], k);
     }
     if base.len() != rows * out_dim {
-        bail!("host_bf16_addmm base len {} != {}", base.len(), rows * out_dim);
+        bail!(
+            "host_bf16_addmm base len {} != {}",
+            base.len(),
+            rows * out_dim
+        );
     }
     let mut out = base.to_vec();
     for r in 0..rows {
@@ -158,8 +162,7 @@ fn top_delta(label: &str, got: &[f32], expected: &[f32]) {
     }
     eprintln!(
         "[diag] {label} max_abs_delta={worst:.6} idx={worst_idx} got={:.6} expected={:.6}",
-        got[worst_idx],
-        expected[worst_idx],
+        got[worst_idx], expected[worst_idx],
     );
 }
 
@@ -198,9 +201,7 @@ fn main() -> Result<()> {
 
     if let Some(ref oracle_ids) = oracle.prompt_token_ids {
         if oracle_ids != &prompt_ids {
-            bail!(
-                "tokenizer mismatch: rust={prompt_ids:?} oracle={oracle_ids:?}"
-            );
+            bail!("tokenizer mismatch: rust={prompt_ids:?} oracle={oracle_ids:?}");
         }
     }
 
@@ -271,7 +272,10 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("oracle missing traced_mlp_down_subb_t_shape"))?;
 
     if ca_shape.len() < 2 {
-        bail!("expected traced_mlp_down_ca_shape rank >= 2, got {:?}", ca_shape);
+        bail!(
+            "expected traced_mlp_down_ca_shape rank >= 2, got {:?}",
+            ca_shape
+        );
     }
     if ca_dense_shape != ca_shape {
         bail!(
@@ -283,7 +287,11 @@ fn main() -> Result<()> {
     let rows = ca_shape[..ca_shape.len() - 1].iter().product();
     let in_dim = ca_shape[ca_shape.len() - 1];
     if swiglu.len() != rows * in_dim {
-        bail!("swiglu len {} != rows*in_dim {}", swiglu.len(), rows * in_dim);
+        bail!(
+            "swiglu len {} != rows*in_dim {}",
+            swiglu.len(),
+            rows * in_dim
+        );
     }
 
     let bake_dir = bake_dir_int8(&cli.model_dir);
@@ -307,7 +315,11 @@ fn main() -> Result<()> {
         );
     }
     if oracle_down.len() != rows * out_dim {
-        bail!("oracle down len {} != rows*out_dim {}", oracle_down.len(), rows * out_dim);
+        bail!(
+            "oracle down len {} != rows*out_dim {}",
+            oracle_down.len(),
+            rows * out_dim
+        );
     }
 
     let rhs_i8: Vec<i8> = store
@@ -323,7 +335,8 @@ fn main() -> Result<()> {
             .ok_or_else(|| anyhow!("missing raw bytes for {scb_name}"))?,
     )?;
 
-    let ref_from_ca = reference_from_exported_quant(&ca, &sca, &rhs_i8, &scb, rows, out_dim, in_dim)?;
+    let ref_from_ca =
+        reference_from_exported_quant(&ca, &sca, &rhs_i8, &scb, rows, out_dim, in_dim)?;
     let ref_from_ca_dense =
         reference_from_exported_quant(&ca_dense, &sca_dense, &rhs_i8, &scb, rows, out_dim, in_dim)?;
 
@@ -406,10 +419,18 @@ fn main() -> Result<()> {
         );
     }
     if suba.len() != suba_shape[0] * suba_shape[1] {
-        bail!("subA len {} does not match shape {:?}", suba.len(), suba_shape);
+        bail!(
+            "subA len {} does not match shape {:?}",
+            suba.len(),
+            suba_shape
+        );
     }
     if subb_t.len() != subb_t_shape[0] * subb_t_shape[1] {
-        bail!("subB_t len {} does not match shape {:?}", subb_t.len(), subb_t_shape);
+        bail!(
+            "subB_t len {} does not match shape {:?}",
+            subb_t.len(),
+            subb_t_shape
+        );
     }
     if suba_shape[1] > 0 {
         let suba_gpu = GpuBuffer::from_host_bytes(
@@ -476,8 +497,7 @@ fn main() -> Result<()> {
     );
     eprintln!(
         "[diag] row_stats thresholded={:.6} dense={:.6}",
-        sca[0],
-        sca_dense[0],
+        sca[0], sca_dense[0],
     );
     if !outlier_cols.is_empty() {
         let preview: Vec<u32> = outlier_cols.iter().copied().take(8).collect();
@@ -498,12 +518,20 @@ fn main() -> Result<()> {
     top_delta("exported_ca_ref_vs_oracle", &ref_from_ca, &oracle_down);
     top_delta("dense_ca_ref_vs_oracle", &ref_from_ca_dense, &oracle_down);
     if !zeroed_kernel_out.is_empty() {
-        top_delta("zeroed_kernel_vs_thresholded_ref", &zeroed_kernel_out, &ref_from_ca);
+        top_delta(
+            "zeroed_kernel_vs_thresholded_ref",
+            &zeroed_kernel_out,
+            &ref_from_ca,
+        );
         top_delta("zeroed_kernel_vs_oracle", &zeroed_kernel_out, &oracle_down);
     }
     top_delta("kernel_vs_exported_ca_ref", &kernel_out, &ref_from_ca);
     top_delta("kernel_vs_dense_ca_ref", &kernel_out, &ref_from_ca_dense);
-    top_delta("corrected_vs_dense_ca_ref", &corrected_out, &ref_from_ca_dense);
+    top_delta(
+        "corrected_vs_dense_ca_ref",
+        &corrected_out,
+        &ref_from_ca_dense,
+    );
     eprintln!(
         "[diag] summary kernel_vs_oracle={:.6} corrected_vs_oracle={:.6} thresholded_plus_corr_vs_oracle={:.6} host_thresholded_plus_corr_vs_oracle={:.6} ca_ref_vs_oracle={:.6} dense_ca_ref_vs_oracle={:.6} kernel_vs_ca_ref={:.6} kernel_vs_dense_ca_ref={:.6}",
         validate::max_abs_delta(&kernel_out, &oracle_down),

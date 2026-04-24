@@ -54,5 +54,4 @@ fi
 if [[ -n "${EVAL_START_FRAC:-}" ]]; then
   ARGS+=(--eval-start-frac "$EVAL_START_FRAC")
 fi
-
 python3 oracle/pg19_smoke.py "${ARGS[@]}"

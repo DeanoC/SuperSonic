@@ -26,19 +26,18 @@ fn metal_qwen_smoke_runs_end_to_end() {
     let path_value = std::env::join_paths(path_entries).expect("join PATH entries");
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
-    cmd.env("PATH", path_value)
-        .args([
-            "--backend",
-            "auto",
-            "--model",
-            "qwen3.5-0.8b",
-            "--model-dir",
-            model_dir.to_str().expect("model dir must be valid UTF-8"),
-            "--prompt",
-            "Hello",
-            "--max-new-tokens",
-            "1",
-        ]);
+    cmd.env("PATH", path_value).args([
+        "--backend",
+        "auto",
+        "--model",
+        "qwen3.5-0.8b",
+        "--model-dir",
+        model_dir.to_str().expect("model dir must be valid UTF-8"),
+        "--prompt",
+        "Hello",
+        "--max-new-tokens",
+        "1",
+    ]);
 
     if repo_root.join(".venv/bin/python3").exists() {
         cmd.args(["--validate", "--oracle-device", "cpu"]);

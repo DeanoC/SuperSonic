@@ -209,6 +209,14 @@ Notes:
 Llama 3.1 8B arxiv_v1 retrieval smoke QA
 (`./tests/sm86/bench_llama31_arxiv_v1_smoke.sh`, commit `9d00178`):
 
+The current CUDA certified-KV runtime stores completed blocks in Tier-1
+compressed form (INT8 keys + INT4 values) and retains BF16 originals in
+host-pinned Tier-2 storage. The live decode path runs the adaptive selector,
+pages selected key blocks from Tier-2 into a compact device scratch buffer, and
+uses INT4 values for aligned blocks. Value escalation and ranking fallback are
+still not wired in live decode, so the quality contract is not yet the full
+paper ladder.
+
 | Subtask           | Path              | Context | Score | DotCache ref | Decode ms/tok |
 |-------------------|-------------------|--------:|------:|-------------:|--------------:|
 | niah_single       | dense INT8        |    4096 | 1.000 |        1.000 |         397.6 |

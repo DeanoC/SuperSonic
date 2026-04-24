@@ -29,12 +29,12 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::Parser;
-use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
@@ -46,7 +46,9 @@ mod oracle;
 use oracle::OracleOutput;
 
 #[derive(Parser, Debug)]
-#[command(about = "Fully self-contained Gemma 4 E2B forward-pass validator (Rust prefill + Rust decode)")]
+#[command(
+    about = "Fully self-contained Gemma 4 E2B forward-pass validator (Rust prefill + Rust decode)"
+)]
 struct Cli {
     /// Path to a local Gemma 4 checkpoint directory (config.json + safetensors).
     #[arg(long)]
@@ -83,7 +85,12 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -117,8 +124,8 @@ impl UnbakedLoader {
             let mut shards = Vec::with_capacity(shard_files.len());
             for filename in &shard_files {
                 let path = dir.join(filename);
-                let file = File::open(&path)
-                    .with_context(|| format!("open shard {}", path.display()))?;
+                let file =
+                    File::open(&path).with_context(|| format!("open shard {}", path.display()))?;
                 shards.push(unsafe { Mmap::map(&file)? });
             }
             let mut index = std::collections::BTreeMap::new();
@@ -134,15 +141,17 @@ impl UnbakedLoader {
             if !single.exists() {
                 bail!("no safetensors found in {}", dir.display());
             }
-            let file = File::open(&single)
-                .with_context(|| format!("open {}", single.display()))?;
+            let file = File::open(&single).with_context(|| format!("open {}", single.display()))?;
             let mmap = unsafe { Mmap::map(&file)? };
             let st = SafeTensors::deserialize(&mmap)?;
             let mut index = std::collections::BTreeMap::new();
             for name in st.names() {
                 index.insert(name.to_string(), 0);
             }
-            Ok(Self { shards: vec![mmap], index })
+            Ok(Self {
+                shards: vec![mmap],
+                index,
+            })
         }
     }
 
@@ -161,7 +170,12 @@ impl UnbakedLoader {
 
     fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::BF16,
+            &shape,
+            bytes,
+        )?)
     }
 }
 
@@ -214,7 +228,10 @@ fn build_proportional_rope_table(
 ) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let rope_angles = (partial_rotary_factor * (head_dim as f64) / 2.0) as usize;
-    assert!(rope_angles <= half, "rope_angles {rope_angles} > head_dim/2 {half}");
+    assert!(
+        rope_angles <= half,
+        "rope_angles {rope_angles} > head_dim/2 {half}"
+    );
 
     let mut inv_freq = vec![0.0f32; half];
     for j in 0..rope_angles {
@@ -303,8 +320,14 @@ fn compute_per_layer_inputs(
 
     let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
     g4::matvec(
-        0, dtype, &mut proj, &main_embed_gpu, per_layer_model_projection_w,
-        hidden_size, total, counter,
+        0,
+        dtype,
+        &mut proj,
+        &main_embed_gpu,
+        per_layer_model_projection_w,
+        hidden_size,
+        total,
+        counter,
     )?;
 
     let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
@@ -316,8 +339,14 @@ fn compute_per_layer_inputs(
     let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
     let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
     g4::rms_norm_per_row(
-        0, dtype, &mut proj_normed, &proj_reshaped,
-        Some(per_layer_projection_norm_w), eps, num_layers, ple_hidden,
+        0,
+        dtype,
+        &mut proj_normed,
+        &proj_reshaped,
+        Some(per_layer_projection_norm_w),
+        eps,
+        num_layers,
+        ple_hidden,
     )?;
     let proj_normed_host = download_bf16(&proj_normed)?;
 
@@ -379,8 +408,7 @@ fn copy_kv_slots_range(
     for h in 0..num_kv_heads {
         let byte_off = ((h * max_t) + pos_base) * head_dim * elem_bytes;
         let src_ptr = src.offset_ptr(byte_off);
-        let dst_ptr =
-            unsafe { (dst.as_mut_ptr() as *mut u8).add(byte_off) as *mut c_void };
+        let dst_ptr = unsafe { (dst.as_mut_ptr() as *mut u8).add(byte_off) as *mut c_void };
         gpu_hal::copy_d2d(0, dst_ptr, src_ptr, bytes_per_head)
             .map_err(|e| anyhow!("copy_kv_slots_range: {e}"))?;
     }
@@ -424,7 +452,11 @@ fn compare_vectors(got: &[f32], want: &[f32]) -> Result<CompareStats> {
     } else {
         0.0
     };
-    Ok(CompareStats { cos_sim, max_abs, rel_err_norm })
+    Ok(CompareStats {
+        cos_sim,
+        max_abs,
+        rel_err_norm,
+    })
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -635,14 +667,41 @@ fn run_forward_pass(
         let residual = h_running.clone_device()?;
 
         let mut x = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x, &h_running, Some(&w.input_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x,
+            &h_running,
+            Some(&w.input_norm),
+            eps,
+            hidden_size,
+        )?;
 
         let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
         g4::matvec(0, dtype, &mut q, &x, &w.q_proj, hidden_size, q_dim, counter)?;
 
         let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-        g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&w.q_norm), eps, num_q_heads, head_dim)?;
-        g4::rope_decode(0, dtype, &mut q_normed, cos_table, sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
+        g4::rms_norm_per_row(
+            0,
+            dtype,
+            &mut q_normed,
+            &q,
+            Some(&w.q_norm),
+            eps,
+            num_q_heads,
+            head_dim,
+        )?;
+        g4::rope_decode(
+            0,
+            dtype,
+            &mut q_normed,
+            cos_table,
+            sin_table,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            pos,
+        )?;
 
         if !w.shared_kv {
             let k_proj = w.k_proj.as_ref().expect("k_proj on non-shared layer");
@@ -655,25 +714,74 @@ fn run_forward_pass(
             g4::matvec(0, dtype, &mut v, &x, v_proj, hidden_size, kv_dim, counter)?;
 
             let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(k_norm), eps, num_kv_heads, head_dim)?;
+            g4::rms_norm_per_row(
+                0,
+                dtype,
+                &mut k_normed,
+                &k,
+                Some(k_norm),
+                eps,
+                num_kv_heads,
+                head_dim,
+            )?;
             let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
+            g4::rms_norm_per_row(
+                0,
+                dtype,
+                &mut v_normed,
+                &v,
+                None,
+                eps,
+                num_kv_heads,
+                head_dim,
+            )?;
 
-            g4::rope_decode(0, dtype, &mut k_normed, cos_table, sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
+            g4::rope_decode(
+                0,
+                dtype,
+                &mut k_normed,
+                cos_table,
+                sin_table,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                pos,
+            )?;
 
             g4::kv_append(
-                0, dtype, &k_normed, &v_normed,
-                &mut k_caches[layer_idx], &mut v_caches[layer_idx],
-                num_kv_heads, head_dim, pos, max_t,
+                0,
+                dtype,
+                &k_normed,
+                &v_normed,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
+                num_kv_heads,
+                head_dim,
+                pos,
+                max_t,
             )?;
 
             for shared_layer in (layer_idx + 1)..num_layers {
                 let s = &ctx.layers[shared_layer];
                 if s.shared_kv && s.kv_source == layer_idx {
                     let (lo, hi) = k_caches.split_at_mut(shared_layer);
-                    copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                    copy_kv_slot(
+                        &lo[layer_idx],
+                        &mut hi[0],
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        pos,
+                    )?;
                     let (lo, hi) = v_caches.split_at_mut(shared_layer);
-                    copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                    copy_kv_slot(
+                        &lo[layer_idx],
+                        &mut hi[0],
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        pos,
+                    )?;
                 }
             }
         }
@@ -682,9 +790,20 @@ fn run_forward_pass(
         let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
         let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q_heads, max_t])?;
         g4::swa_attn_decode(
-            0, dtype, &q_normed, &k_caches[layer_idx], &v_caches[layer_idx],
-            &mut scores, &mut attn_out,
-            num_q_heads, num_kv_heads, head_dim, kv_len, max_t, sliding_window, 1.0,
+            0,
+            dtype,
+            &q_normed,
+            &k_caches[layer_idx],
+            &v_caches[layer_idx],
+            &mut scores,
+            &mut attn_out,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            kv_len,
+            max_t,
+            sliding_window,
+            1.0,
         )?;
 
         let attn_flat = {
@@ -692,36 +811,103 @@ fn run_forward_pass(
             GpuBuffer::from_host_bytes(0, dtype, &[q_dim], &bytes)?
         };
         let mut o = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::matvec(0, dtype, &mut o, &attn_flat, &w.o_proj, q_dim, hidden_size, counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut o,
+            &attn_flat,
+            &w.o_proj,
+            q_dim,
+            hidden_size,
+            counter,
+        )?;
 
         let mut x2 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x2, &o, Some(&w.post_attn_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x2,
+            &o,
+            Some(&w.post_attn_norm),
+            eps,
+            hidden_size,
+        )?;
         let residual_h = download_bf16(&residual)?;
         let x2_h = download_bf16(&x2)?;
-        let h1_h: Vec<f32> = residual_h.iter().zip(x2_h.iter()).map(|(a, b)| a + b).collect();
+        let h1_h: Vec<f32> = residual_h
+            .iter()
+            .zip(x2_h.iter())
+            .map(|(a, b)| a + b)
+            .collect();
         let h_mid = upload_bf16(&[hidden_size], &h1_h)?;
 
         let residual2 = h_mid.clone_device()?;
 
         let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x3,
+            &h_mid,
+            Some(&w.pre_ff_norm),
+            eps,
+            hidden_size,
+        )?;
 
         let mut gate = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-        g4::matvec(0, dtype, &mut gate, &x3, &w.gate_proj, hidden_size, w.intermediate_size, counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut gate,
+            &x3,
+            &w.gate_proj,
+            hidden_size,
+            w.intermediate_size,
+            counter,
+        )?;
         let mut up_buf = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
-        g4::matvec(0, dtype, &mut up_buf, &x3, &w.up_proj, hidden_size, w.intermediate_size, counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut up_buf,
+            &x3,
+            &w.up_proj,
+            hidden_size,
+            w.intermediate_size,
+            counter,
+        )?;
         let mut y = GpuBuffer::zeros(0, dtype, &[w.intermediate_size])?;
         g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, w.intermediate_size)?;
 
         let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::matvec(0, dtype, &mut m, &y, &w.down_proj, w.intermediate_size, hidden_size, counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut m,
+            &y,
+            &w.down_proj,
+            w.intermediate_size,
+            hidden_size,
+            counter,
+        )?;
 
         let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x4, &m, Some(&w.post_ff_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x4,
+            &m,
+            Some(&w.post_ff_norm),
+            eps,
+            hidden_size,
+        )?;
         let residual2_h = download_bf16(&residual2)?;
         let x4_h = download_bf16(&x4)?;
-        let h_pre_ple: Vec<f32> =
-            residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
+        let h_pre_ple: Vec<f32> = residual2_h
+            .iter()
+            .zip(x4_h.iter())
+            .map(|(a, b)| a + b)
+            .collect();
 
         let bytes_per_layer = ple_hidden * 2;
         let pli_off = layer_idx * bytes_per_layer;
@@ -734,22 +920,44 @@ fn run_forward_pass(
 
         let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
         g4::matvec(
-            0, dtype, &mut gated, &h_in_ple, &w.per_layer_input_gate_w,
-            hidden_size, ple_hidden, counter,
+            0,
+            dtype,
+            &mut gated,
+            &h_in_ple,
+            &w.per_layer_input_gate_w,
+            hidden_size,
+            ple_hidden,
+            counter,
         )?;
         let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
         g4::gelu_tanh_gate_mul(
-            0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
+            0,
+            dtype,
+            &mut gated_act,
+            &gated,
+            &per_layer_input_gpu,
+            ple_hidden,
         )?;
         let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::matvec(
-            0, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
-            ple_hidden, hidden_size, counter,
+            0,
+            dtype,
+            &mut projected,
+            &gated_act,
+            &w.per_layer_projection_w,
+            ple_hidden,
+            hidden_size,
+            counter,
         )?;
         let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::rms_norm(
-            0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
-            eps, hidden_size,
+            0,
+            dtype,
+            &mut normed,
+            &projected,
+            Some(&w.post_per_layer_input_norm_w),
+            eps,
+            hidden_size,
         )?;
         let ple_residual_h = download_bf16(&ple_residual)?;
         let normed_h = download_bf16(&normed)?;
@@ -767,12 +975,26 @@ fn run_forward_pass(
     }
 
     let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    g4::rms_norm(0, dtype, &mut post_norm, &h_running, Some(ctx.final_norm_w), eps, hidden_size)?;
+    g4::rms_norm(
+        0,
+        dtype,
+        &mut post_norm,
+        &h_running,
+        Some(ctx.final_norm_w),
+        eps,
+        hidden_size,
+    )?;
 
     let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[ctx.vocab_size])?;
     g4::matvec(
-        0, dtype, &mut logits_gpu, &post_norm, ctx.lm_head_w,
-        hidden_size, ctx.vocab_size, counter,
+        0,
+        dtype,
+        &mut logits_gpu,
+        &post_norm,
+        ctx.lm_head_w,
+        hidden_size,
+        ctx.vocab_size,
+        counter,
     )?;
     let mut logits_host = download_bf16(&logits_gpu)?;
     let cap = ctx.cap;
@@ -841,15 +1063,29 @@ fn compute_per_layer_inputs_batched(
     let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
     let mut main_embed_batch = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
     g4::embed_gather_scaled(
-        0, dtype, &mut main_embed_batch, token_ids_gpu, ctx.lm_head_w,
-        seq_len, hidden_size, vocab_size, embed_scale,
+        0,
+        dtype,
+        &mut main_embed_batch,
+        token_ids_gpu,
+        ctx.lm_head_w,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        embed_scale,
     )?;
 
     // 2) proj[s, :] = per_layer_model_projection @ main_embed[s, :]  → [S, total]
     let mut proj = GpuBuffer::zeros(0, dtype, &[seq_len, total])?;
     g4::matvec_batched(
-        0, dtype, &mut proj, &main_embed_batch, ctx.per_layer_model_projection_w,
-        seq_len, hidden_size, total, counter,
+        0,
+        dtype,
+        &mut proj,
+        &main_embed_batch,
+        ctx.per_layer_model_projection_w,
+        seq_len,
+        hidden_size,
+        total,
+        counter,
     )?;
 
     // 3) proj *= hidden^-0.5  (BF16-rounded scale — matches HF Python-float * tensor).
@@ -859,8 +1095,14 @@ fn compute_per_layer_inputs_batched(
     // 4) rms_norm over last dim: view [S, total] as [S * num_layers, ple_hidden].
     let mut proj_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
     g4::rms_norm_rows(
-        0, dtype, &mut proj_normed, &proj, Some(ctx.per_layer_projection_norm_w),
-        eps, seq_len * num_layers, ple_hidden,
+        0,
+        dtype,
+        &mut proj_normed,
+        &proj,
+        Some(ctx.per_layer_projection_norm_w),
+        eps,
+        seq_len * num_layers,
+        ple_hidden,
     )?;
 
     // 5) ple_raw[s, l, :] = embed_tokens_per_layer[tok_s, l*ple_hidden..(l+1)*ple_hidden]
@@ -878,8 +1120,13 @@ fn compute_per_layer_inputs_batched(
     let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
     let mut pli = GpuBuffer::zeros(0, dtype, &[seq_len, num_layers, ple_hidden])?;
     g4::add_scaled_residual(
-        0, dtype, &mut pli, &proj_normed, &ple_raw_gpu,
-        combine_scale, seq_len * num_layers * ple_hidden,
+        0,
+        dtype,
+        &mut pli,
+        &proj_normed,
+        &ple_raw_gpu,
+        combine_scale,
+        seq_len * num_layers * ple_hidden,
     )?;
 
     Ok(pli)
@@ -916,15 +1163,21 @@ fn run_prefill(
     for &id in prompt_token_ids {
         id_bytes.extend_from_slice(&id.to_le_bytes());
     }
-    let token_ids_gpu =
-        GpuBuffer::from_host_bytes(0, ScalarType::U32, &[seq_len], &id_bytes)?;
+    let token_ids_gpu = GpuBuffer::from_host_bytes(0, ScalarType::U32, &[seq_len], &id_bytes)?;
 
     // h_running[s, :] = embed_tokens[tok_s] * sqrt(hidden)  (starting layer input).
     let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
     let mut h_running = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
     g4::embed_gather_scaled(
-        0, dtype, &mut h_running, &token_ids_gpu, ctx.lm_head_w,
-        seq_len, hidden_size, vocab_size, embed_scale,
+        0,
+        dtype,
+        &mut h_running,
+        &token_ids_gpu,
+        ctx.lm_head_w,
+        seq_len,
+        hidden_size,
+        vocab_size,
+        embed_scale,
     )?;
 
     // Per-layer inputs for the whole prompt.
@@ -949,23 +1202,50 @@ fn run_prefill(
 
         let mut x = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::rms_norm_rows(
-            0, dtype, &mut x, &h_running, Some(&w.input_norm),
-            eps, seq_len, hidden_size,
+            0,
+            dtype,
+            &mut x,
+            &h_running,
+            Some(&w.input_norm),
+            eps,
+            seq_len,
+            hidden_size,
         )?;
 
         let mut q = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
         g4::matvec_batched(
-            0, dtype, &mut q, &x, &w.q_proj,
-            seq_len, hidden_size, q_dim, counter,
+            0,
+            dtype,
+            &mut q,
+            &x,
+            &w.q_proj,
+            seq_len,
+            hidden_size,
+            q_dim,
+            counter,
         )?;
         let mut q_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
         g4::rms_norm_rows(
-            0, dtype, &mut q_normed, &q, Some(&w.q_norm),
-            eps, seq_len * num_q_heads, head_dim,
+            0,
+            dtype,
+            &mut q_normed,
+            &q,
+            Some(&w.q_norm),
+            eps,
+            seq_len * num_q_heads,
+            head_dim,
         )?;
         g4::rope_prefill(
-            0, dtype, &mut q_normed, cos_table, sin_table,
-            seq_len, num_q_heads, head_dim, rotary_dim, 0,
+            0,
+            dtype,
+            &mut q_normed,
+            cos_table,
+            sin_table,
+            seq_len,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            0,
         )?;
 
         if !w.shared_kv {
@@ -975,35 +1255,77 @@ fn run_prefill(
 
             let mut k = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
             g4::matvec_batched(
-                0, dtype, &mut k, &x, k_proj,
-                seq_len, hidden_size, kv_dim, counter,
+                0,
+                dtype,
+                &mut k,
+                &x,
+                k_proj,
+                seq_len,
+                hidden_size,
+                kv_dim,
+                counter,
             )?;
             let mut v = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
             g4::matvec_batched(
-                0, dtype, &mut v, &x, v_proj,
-                seq_len, hidden_size, kv_dim, counter,
+                0,
+                dtype,
+                &mut v,
+                &x,
+                v_proj,
+                seq_len,
+                hidden_size,
+                kv_dim,
+                counter,
             )?;
 
             let mut k_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
             g4::rms_norm_rows(
-                0, dtype, &mut k_normed, &k, Some(k_norm),
-                eps, seq_len * num_kv_heads, head_dim,
+                0,
+                dtype,
+                &mut k_normed,
+                &k,
+                Some(k_norm),
+                eps,
+                seq_len * num_kv_heads,
+                head_dim,
             )?;
             let mut v_normed = GpuBuffer::zeros(0, dtype, &[seq_len, num_kv_heads, head_dim])?;
             g4::rms_norm_rows(
-                0, dtype, &mut v_normed, &v, None,
-                eps, seq_len * num_kv_heads, head_dim,
+                0,
+                dtype,
+                &mut v_normed,
+                &v,
+                None,
+                eps,
+                seq_len * num_kv_heads,
+                head_dim,
             )?;
 
             g4::rope_prefill(
-                0, dtype, &mut k_normed, cos_table, sin_table,
-                seq_len, num_kv_heads, head_dim, rotary_dim, 0,
+                0,
+                dtype,
+                &mut k_normed,
+                cos_table,
+                sin_table,
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                0,
             )?;
 
             g4::kv_append_prefill(
-                0, dtype, &k_normed, &v_normed,
-                &mut k_caches[layer_idx], &mut v_caches[layer_idx],
-                seq_len, num_kv_heads, head_dim, 0, max_t,
+                0,
+                dtype,
+                &k_normed,
+                &v_normed,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
+                seq_len,
+                num_kv_heads,
+                head_dim,
+                0,
+                max_t,
             )?;
 
             // Replicate to layers that share this one's KV. The shared layers'
@@ -1015,13 +1337,23 @@ fn run_prefill(
                 if s.shared_kv && s.kv_source == layer_idx {
                     let (lo, hi) = k_caches.split_at_mut(shared_layer);
                     copy_kv_slots_range(
-                        &lo[layer_idx], &mut hi[0],
-                        num_kv_heads, max_t, head_dim, 0, seq_len,
+                        &lo[layer_idx],
+                        &mut hi[0],
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        0,
+                        seq_len,
                     )?;
                     let (lo, hi) = v_caches.split_at_mut(shared_layer);
                     copy_kv_slots_range(
-                        &lo[layer_idx], &mut hi[0],
-                        num_kv_heads, max_t, head_dim, 0, seq_len,
+                        &lo[layer_idx],
+                        &mut hi[0],
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        0,
+                        seq_len,
                     )?;
                 }
             }
@@ -1030,98 +1362,199 @@ fn run_prefill(
         let mut attn_out = GpuBuffer::zeros(0, dtype, &[seq_len, num_q_heads, head_dim])?;
         let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[seq_len, num_q_heads, max_t])?;
         g4::attn_prefill(
-            0, dtype, &q_normed, &k_caches[layer_idx], &v_caches[layer_idx],
-            &mut scores, &mut attn_out,
-            seq_len, num_q_heads, num_kv_heads, head_dim, 0, max_t,
-            sliding_window, 1.0,
+            0,
+            dtype,
+            &q_normed,
+            &k_caches[layer_idx],
+            &v_caches[layer_idx],
+            &mut scores,
+            &mut attn_out,
+            seq_len,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            0,
+            max_t,
+            sliding_window,
+            1.0,
         )?;
 
         let mut o = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::matvec_batched(
-            0, dtype, &mut o, &attn_out, &w.o_proj,
-            seq_len, q_dim, hidden_size, counter,
+            0,
+            dtype,
+            &mut o,
+            &attn_out,
+            &w.o_proj,
+            seq_len,
+            q_dim,
+            hidden_size,
+            counter,
         )?;
 
         let mut x2 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::rms_norm_rows(
-            0, dtype, &mut x2, &o, Some(&w.post_attn_norm),
-            eps, seq_len, hidden_size,
+            0,
+            dtype,
+            &mut x2,
+            &o,
+            Some(&w.post_attn_norm),
+            eps,
+            seq_len,
+            hidden_size,
         )?;
         let mut h_mid = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
-        g4::add_residual(
-            0, dtype, &mut h_mid, &residual, &x2, seq_len * hidden_size,
-        )?;
+        g4::add_residual(0, dtype, &mut h_mid, &residual, &x2, seq_len * hidden_size)?;
 
         let residual2 = h_mid.clone_device()?;
 
         let mut x3 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::rms_norm_rows(
-            0, dtype, &mut x3, &h_mid, Some(&w.pre_ff_norm),
-            eps, seq_len, hidden_size,
+            0,
+            dtype,
+            &mut x3,
+            &h_mid,
+            Some(&w.pre_ff_norm),
+            eps,
+            seq_len,
+            hidden_size,
         )?;
 
         let mut gate = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
         g4::matvec_batched(
-            0, dtype, &mut gate, &x3, &w.gate_proj,
-            seq_len, hidden_size, w.intermediate_size, counter,
+            0,
+            dtype,
+            &mut gate,
+            &x3,
+            &w.gate_proj,
+            seq_len,
+            hidden_size,
+            w.intermediate_size,
+            counter,
         )?;
         let mut up_buf = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
         g4::matvec_batched(
-            0, dtype, &mut up_buf, &x3, &w.up_proj,
-            seq_len, hidden_size, w.intermediate_size, counter,
+            0,
+            dtype,
+            &mut up_buf,
+            &x3,
+            &w.up_proj,
+            seq_len,
+            hidden_size,
+            w.intermediate_size,
+            counter,
         )?;
         let mut y = GpuBuffer::zeros(0, dtype, &[seq_len, w.intermediate_size])?;
         g4::gelu_tanh_gate_mul(
-            0, dtype, &mut y, &gate, &up_buf, seq_len * w.intermediate_size,
+            0,
+            dtype,
+            &mut y,
+            &gate,
+            &up_buf,
+            seq_len * w.intermediate_size,
         )?;
 
         let mut m = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::matvec_batched(
-            0, dtype, &mut m, &y, &w.down_proj,
-            seq_len, w.intermediate_size, hidden_size, counter,
+            0,
+            dtype,
+            &mut m,
+            &y,
+            &w.down_proj,
+            seq_len,
+            w.intermediate_size,
+            hidden_size,
+            counter,
         )?;
 
         let mut x4 = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::rms_norm_rows(
-            0, dtype, &mut x4, &m, Some(&w.post_ff_norm),
-            eps, seq_len, hidden_size,
+            0,
+            dtype,
+            &mut x4,
+            &m,
+            Some(&w.post_ff_norm),
+            eps,
+            seq_len,
+            hidden_size,
         )?;
         let mut h_pre_ple = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::add_residual(
-            0, dtype, &mut h_pre_ple, &residual2, &x4, seq_len * hidden_size,
+            0,
+            dtype,
+            &mut h_pre_ple,
+            &residual2,
+            &x4,
+            seq_len * hidden_size,
         )?;
 
         // PLE branch: extract this layer's PLI slice, then apply the
         // gate-project-norm-residual chain across all S tokens.
         let mut pli_slice = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
         g4::gather_layer_slice(
-            0, dtype, &mut pli_slice, &pli,
-            seq_len, num_layers, ple_hidden, layer_idx,
+            0,
+            dtype,
+            &mut pli_slice,
+            &pli,
+            seq_len,
+            num_layers,
+            ple_hidden,
+            layer_idx,
         )?;
 
         let mut gated = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
         g4::matvec_batched(
-            0, dtype, &mut gated, &h_pre_ple, &w.per_layer_input_gate_w,
-            seq_len, hidden_size, ple_hidden, counter,
+            0,
+            dtype,
+            &mut gated,
+            &h_pre_ple,
+            &w.per_layer_input_gate_w,
+            seq_len,
+            hidden_size,
+            ple_hidden,
+            counter,
         )?;
         let mut gated_act = GpuBuffer::zeros(0, dtype, &[seq_len, ple_hidden])?;
         g4::gelu_tanh_gate_mul(
-            0, dtype, &mut gated_act, &gated, &pli_slice, seq_len * ple_hidden,
+            0,
+            dtype,
+            &mut gated_act,
+            &gated,
+            &pli_slice,
+            seq_len * ple_hidden,
         )?;
         let mut projected = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::matvec_batched(
-            0, dtype, &mut projected, &gated_act, &w.per_layer_projection_w,
-            seq_len, ple_hidden, hidden_size, counter,
+            0,
+            dtype,
+            &mut projected,
+            &gated_act,
+            &w.per_layer_projection_w,
+            seq_len,
+            ple_hidden,
+            hidden_size,
+            counter,
         )?;
         let mut normed = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::rms_norm_rows(
-            0, dtype, &mut normed, &projected, Some(&w.post_per_layer_input_norm_w),
-            eps, seq_len, hidden_size,
+            0,
+            dtype,
+            &mut normed,
+            &projected,
+            Some(&w.post_per_layer_input_norm_w),
+            eps,
+            seq_len,
+            hidden_size,
         )?;
         let mut h_new = GpuBuffer::zeros(0, dtype, &[seq_len, hidden_size])?;
         g4::add_scaled_residual(
-            0, dtype, &mut h_new, &h_pre_ple, &normed,
-            w.layer_scalar, seq_len * hidden_size,
+            0,
+            dtype,
+            &mut h_new,
+            &h_pre_ple,
+            &normed,
+            w.layer_scalar,
+            seq_len * hidden_size,
         )?;
         h_running = h_new;
     }
@@ -1137,13 +1570,24 @@ fn run_prefill(
 
     let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
     g4::rms_norm(
-        0, dtype, &mut post_norm, &last_hidden, Some(ctx.final_norm_w),
-        eps, hidden_size,
+        0,
+        dtype,
+        &mut post_norm,
+        &last_hidden,
+        Some(ctx.final_norm_w),
+        eps,
+        hidden_size,
     )?;
     let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
     g4::matvec(
-        0, dtype, &mut logits_gpu, &post_norm, ctx.lm_head_w,
-        hidden_size, vocab_size, counter,
+        0,
+        dtype,
+        &mut logits_gpu,
+        &post_norm,
+        ctx.lm_head_w,
+        hidden_size,
+        vocab_size,
+        counter,
     )?;
     let mut logits_host = download_bf16(&logits_gpu)?;
     let cap = ctx.cap;
@@ -1170,7 +1614,8 @@ fn extract_filled_kv_to_oracle_layout(
     if full.len() != expected {
         bail!(
             "cache len {} != expected {} (layout [{num_kv_heads}, {max_t}, {head_dim}])",
-            full.len(), expected
+            full.len(),
+            expected
         );
     }
     let mut out = vec![0.0f32; num_kv_heads * prompt_tokens * head_dim];
@@ -1178,8 +1623,7 @@ fn extract_filled_kv_to_oracle_layout(
         for t in 0..prompt_tokens {
             let src_off = (h * max_t + t) * head_dim;
             let dst_off = (h * prompt_tokens + t) * head_dim;
-            out[dst_off..dst_off + head_dim]
-                .copy_from_slice(&full[src_off..src_off + head_dim]);
+            out[dst_off..dst_off + head_dim].copy_from_slice(&full[src_off..src_off + head_dim]);
         }
     }
     Ok(out)
@@ -1189,14 +1633,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
 
-    let config: Config = g4_config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let config: Config =
+        g4_config::load_config(&cli.model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
     let tcfg: &TextConfig = &config.text_config;
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
-    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
-        .context("parse oracle JSON")?;
+    let oracle: OracleOutput =
+        serde_json::from_slice(&oracle_bytes).context("parse oracle JSON")?;
     let prompt_token_ids = oracle
         .prompt_token_ids
         .as_ref()
@@ -1226,7 +1670,8 @@ fn main() -> Result<()> {
     if max_new_tokens > oracle.generated_tokens {
         bail!(
             "--max-new-tokens {} exceeds oracle.generated_tokens {}; rerun oracle with more tokens",
-            max_new_tokens, oracle.generated_tokens
+            max_new_tokens,
+            oracle.generated_tokens
         );
     }
     // Phase B runs `max_new_tokens - 1` steps (Phase A covers the first token).
@@ -1267,8 +1712,9 @@ fn main() -> Result<()> {
 
     let lm_head_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.embed_tokens.weight"))?;
     let final_norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
-    let per_layer_model_projection_w =
-        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+    let per_layer_model_projection_w = loader.load_bf16_to_gpu(&format!(
+        "{weight_prefix}.per_layer_model_projection.weight"
+    ))?;
     let per_layer_projection_norm_w =
         loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
 
@@ -1287,9 +1733,13 @@ fn main() -> Result<()> {
     let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
     let full_head_dim = tcfg.head_dim_for(AttnKind::Full);
 
-    let (scos_h, ssin_h) = build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
+    let (scos_h, ssin_h) =
+        build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
     let (fcos_h, fsin_h) = build_proportional_rope_table(
-        full_head_dim, full_rope.rope_theta, full_rope.partial_rotary_factor, max_t,
+        full_head_dim,
+        full_rope.rope_theta,
+        full_rope.partial_rotary_factor,
+        max_t,
     );
     let sliding_cos = upload_bf16(&[max_t, sliding_head_dim], &scos_h)?;
     let sliding_sin = upload_bf16(&[max_t, sliding_head_dim], &ssin_h)?;
@@ -1333,12 +1783,17 @@ fn main() -> Result<()> {
     // positions. Returns the softcapped logits at the last prompt position.
     println!("\n[phase A] batched Rust prefill over {prompt_tokens} prompt tokens");
     let logits = run_prefill(
-        &ctx, prompt_token_ids, &mut k_caches, &mut v_caches, &mut counter,
+        &ctx,
+        prompt_token_ids,
+        &mut k_caches,
+        &mut v_caches,
+        &mut counter,
     )?;
     if oracle.prefill_logits.len() != vocab_size {
         bail!(
             "oracle.prefill_logits len {} != vocab_size {}",
-            oracle.prefill_logits.len(), vocab_size
+            oracle.prefill_logits.len(),
+            vocab_size
         );
     }
     let stats = compare_vectors(&logits, &oracle.prefill_logits)?;
@@ -1383,7 +1838,9 @@ fn main() -> Result<()> {
             if kv.k_shape != expected_shape || kv.v_shape != expected_shape {
                 bail!(
                     "oracle kv_caches[{l}] shape k={:?} v={:?} != expected {:?}",
-                    kv.k_shape, kv.v_shape, expected_shape,
+                    kv.k_shape,
+                    kv.v_shape,
+                    expected_shape,
                 );
             }
             let ok_bytes = B64.decode(&kv.k).context("decode oracle kv.k")?;
@@ -1391,10 +1848,18 @@ fn main() -> Result<()> {
             let ok_f32 = bf16_bytes_to_f32(&ok_bytes);
             let ov_f32 = bf16_bytes_to_f32(&ov_bytes);
             let our_k = extract_filled_kv_to_oracle_layout(
-                &k_caches[l], num_kv_heads, max_t, prompt_tokens, hd,
+                &k_caches[l],
+                num_kv_heads,
+                max_t,
+                prompt_tokens,
+                hd,
             )?;
             let our_v = extract_filled_kv_to_oracle_layout(
-                &v_caches[l], num_kv_heads, max_t, prompt_tokens, hd,
+                &v_caches[l],
+                num_kv_heads,
+                max_t,
+                prompt_tokens,
+                hd,
             )?;
             let ks = compare_vectors(&our_k, &ok_f32)?;
             let vs = compare_vectors(&our_v, &ov_f32)?;
@@ -1416,7 +1881,10 @@ fn main() -> Result<()> {
     }
 
     // ===== PHASE B: Rust decode =====
-    println!("\n[phase B] Rust decode ({} steps)", max_new_tokens.saturating_sub(1));
+    println!(
+        "\n[phase B] Rust decode ({} steps)",
+        max_new_tokens.saturating_sub(1)
+    );
     for step in 0..max_new_tokens.saturating_sub(1) {
         let pos = prompt_tokens + step;
         let input_token_id: u32 = if step == 0 {
@@ -1425,14 +1893,21 @@ fn main() -> Result<()> {
             generated_ids_rust[step]
         };
         let logits_opt = run_forward_pass(
-            &ctx, input_token_id, pos, &mut k_caches, &mut v_caches, &mut counter, true,
+            &ctx,
+            input_token_id,
+            pos,
+            &mut k_caches,
+            &mut v_caches,
+            &mut counter,
+            true,
         )?;
         let logits = logits_opt.expect("decode step must emit logits");
         let want_logits = &oracle.decode_logits[step];
         if want_logits.len() != vocab_size {
             bail!(
                 "oracle.decode_logits[{step}] len {} != vocab_size {}",
-                want_logits.len(), vocab_size
+                want_logits.len(),
+                vocab_size
             );
         }
         let stats = compare_vectors(&logits, want_logits)?;
@@ -1466,7 +1941,10 @@ fn main() -> Result<()> {
         }
     }
 
-    println!("\n[summary] generated_ids_rust                    = {:?}", generated_ids_rust);
+    println!(
+        "\n[summary] generated_ids_rust                    = {:?}",
+        generated_ids_rust
+    );
     println!(
         "[summary] oracle.generated_token_ids[0..{max_new_tokens}] = {:?}",
         &oracle.generated_token_ids[..max_new_tokens]

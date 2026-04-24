@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # E2E validation for the staged certified KV Llama 3.1 CUDA path.
-# The current Rust/CUDA milestone intentionally runs the certified contract
-# through unconditional dense fallback while compressed kernels are being wired.
+# Current Rust/CUDA mode uses Tier-1 compressed KV plus host-pinned Tier-2
+# BF16 originals, paging promoted keys into compact device scratch.
 #
 # Usage:
 #   ./tests/sm86/run_llama31_certified_kv.sh [model_dir]
@@ -65,7 +65,7 @@ echo ""
 
 SUPERSONIC="$REPO_ROOT/target/release/supersonic"
 
-echo "--- Certified KV dense-fallback Rust/CUDA validation ---"
+echo "--- Certified KV Rust/CUDA validation ---"
 cmd=(
     "$SUPERSONIC"
     --backend cuda
@@ -100,8 +100,13 @@ if grep -q 'MISMATCH' "$TMPOUT"; then
     echo "FAIL: validate reported token mismatch"
     exit 1
 fi
-if ! grep -q '"mode":"certified_kv_dense_fallback"' "$TELEMETRY"; then
-    echo "FAIL: telemetry did not record certified_kv_dense_fallback"
+if ! grep -q '"mode":"certified_kv_cuda_mixed_key_int4_value_host_tier2"' "$TELEMETRY"; then
+    echo "FAIL: telemetry did not record certified_kv_cuda_mixed_key_int4_value_host_tier2"
+    cat "$TELEMETRY" || true
+    exit 1
+fi
+if ! grep -q '"paper_tier2_cpu_pinned":true' "$TELEMETRY"; then
+    echo "FAIL: telemetry did not record paper_tier2_cpu_pinned=true"
     cat "$TELEMETRY" || true
     exit 1
 fi

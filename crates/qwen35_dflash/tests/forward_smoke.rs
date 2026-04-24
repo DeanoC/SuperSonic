@@ -32,8 +32,12 @@ use std::time::Instant;
 
 use gpu_hal::{GpuBuffer, ScalarType};
 use qwen35_dflash::{
-    config::load_config, forward::forward, rotary::RotaryTables,
-    state::{DFlashScratch, DFlashState}, weights::DFlashWeights, ForwardParams,
+    config::load_config,
+    forward::forward,
+    rotary::RotaryTables,
+    state::{DFlashScratch, DFlashState},
+    weights::DFlashWeights,
+    ForwardParams,
 };
 
 fn checkpoint_dir() -> PathBuf {
@@ -45,10 +49,14 @@ fn checkpoint_dir() -> PathBuf {
 }
 
 fn random_bf16_bytes(count: usize, seed: u64) -> Vec<u8> {
-    let mut s: u64 = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut s: u64 = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     let mut out = Vec::with_capacity(count * 2);
     for _ in 0..count {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((s >> 33) as u32) as f32 / (u32::MAX as f32);
         let v = (u - 0.5) * 0.1;
         let bf = half::bf16::from_f32(v);
@@ -98,9 +106,8 @@ fn forward_smoke() {
     let dummy = Arc::new(
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1]).expect("alloc dummy placeholder"),
     );
-    let weights =
-        DFlashWeights::load(&dir, &config, ordinal, dummy.clone(), dummy.clone())
-            .expect("load DFlash weights");
+    let weights = DFlashWeights::load(&dir, &config, ordinal, dummy.clone(), dummy.clone())
+        .expect("load DFlash weights");
 
     // Keep the RoPE table modest — smoke only needs a few dozen positions.
     let max_ctx = 256_usize;
@@ -132,9 +139,17 @@ fn forward_smoke() {
     for _ in 0..5 {
         state.reset();
         let _ = forward(
-            &weights, &mut state, &mut scratch, &rotary,
-            &noise_embedding, &target_hidden_raw,
-            ForwardParams { ctx_len, q_len, pos_offset: 0 },
+            &weights,
+            &mut state,
+            &mut scratch,
+            &rotary,
+            &noise_embedding,
+            &target_hidden_raw,
+            ForwardParams {
+                ctx_len,
+                q_len,
+                pos_offset: 0,
+            },
         )
         .expect("warmup forward");
         gpu_hal::sync(ordinal).expect("warmup sync");
@@ -146,9 +161,17 @@ fn forward_smoke() {
     for _ in 0..trials {
         state.reset();
         let _ = forward(
-            &weights, &mut state, &mut scratch, &rotary,
-            &noise_embedding, &target_hidden_raw,
-            ForwardParams { ctx_len, q_len, pos_offset: 0 },
+            &weights,
+            &mut state,
+            &mut scratch,
+            &rotary,
+            &noise_embedding,
+            &target_hidden_raw,
+            ForwardParams {
+                ctx_len,
+                q_len,
+                pos_offset: 0,
+            },
         )
         .expect("timed forward");
     }
@@ -158,9 +181,17 @@ fn forward_smoke() {
     // ---- Round-1 correctness ----
     state.reset();
     let r1 = forward(
-        &weights, &mut state, &mut scratch, &rotary,
-        &noise_embedding, &target_hidden_raw,
-        ForwardParams { ctx_len, q_len, pos_offset: 0 },
+        &weights,
+        &mut state,
+        &mut scratch,
+        &rotary,
+        &noise_embedding,
+        &target_hidden_raw,
+        ForwardParams {
+            ctx_len,
+            q_len,
+            pos_offset: 0,
+        },
     )
     .expect("round-1 forward");
     gpu_hal::sync(ordinal).expect("round-1 sync");
@@ -171,14 +202,20 @@ fn forward_smoke() {
     );
     let r1_bytes = read_final_hidden_to_host(ordinal, r1);
     let (bad, total) = count_non_finite(&r1_bytes);
-    assert_eq!(bad, 0, "round 1 final_hidden has {bad}/{total} non-finite values");
+    assert_eq!(
+        bad, 0,
+        "round 1 final_hidden has {bad}/{total} non-finite values"
+    );
 
     // ---- M3.1 crop-and-round-2 path ----
     // Simulate: accepted 8 draft tokens + 1 bonus = commit 9 positions this round.
     // kv_filled was ctx+q_len=17; crop to ctx+accepted+1 = 1+8+1 = 10.
     let committed = ctx_len + 8 + 1;
     state.crop(committed);
-    assert_eq!(state.kv_filled, committed, "crop must truncate to committed length");
+    assert_eq!(
+        state.kv_filled, committed,
+        "crop must truncate to committed length"
+    );
 
     // Round 2: past_len = committed (10), with a new single-tap ctx and full q_len.
     let ctx_len_r2 = 1;
@@ -200,9 +237,17 @@ fn forward_smoke() {
     .expect("upload round-2 noise_embedding");
 
     let r2 = forward(
-        &weights, &mut state, &mut scratch, &rotary,
-        &noise_embedding_r2, &target_hidden_raw_r2,
-        ForwardParams { ctx_len: ctx_len_r2, q_len, pos_offset: committed },
+        &weights,
+        &mut state,
+        &mut scratch,
+        &rotary,
+        &noise_embedding_r2,
+        &target_hidden_raw_r2,
+        ForwardParams {
+            ctx_len: ctx_len_r2,
+            q_len,
+            pos_offset: committed,
+        },
     )
     .expect("round-2 forward");
     gpu_hal::sync(ordinal).expect("round-2 sync");
@@ -213,12 +258,15 @@ fn forward_smoke() {
     );
     let r2_bytes = read_final_hidden_to_host(ordinal, r2);
     let (bad, total) = count_non_finite(&r2_bytes);
-    assert_eq!(bad, 0, "round 2 final_hidden has {bad}/{total} non-finite values");
+    assert_eq!(
+        bad, 0,
+        "round 2 final_hidden has {bad}/{total} non-finite values"
+    );
 
     // ---- Round 3 with ctx_len > 1 (simulates a longer acceptance streak) ----
     let committed_r2 = committed + 5 + 1; // accepted 5 draft tokens + 1 bonus in round 2
     state.crop(committed_r2);
-    let ctx_len_r3 = 5 + 1;  // taps from the 5 accepted + 1 bonus target steps
+    let ctx_len_r3 = 5 + 1; // taps from the 5 accepted + 1 bonus target steps
     let target_bytes_r3 = random_bf16_bytes(ctx_len_r3 * num_taps_hidden, 0xB1009_u64);
     let target_hidden_raw_r3 = GpuBuffer::from_host_bytes(
         ordinal,
@@ -228,15 +276,26 @@ fn forward_smoke() {
     )
     .expect("upload round-3 target_hidden_raw");
     let r3 = forward(
-        &weights, &mut state, &mut scratch, &rotary,
-        &noise_embedding_r2, &target_hidden_raw_r3,
-        ForwardParams { ctx_len: ctx_len_r3, q_len, pos_offset: committed_r2 },
+        &weights,
+        &mut state,
+        &mut scratch,
+        &rotary,
+        &noise_embedding_r2,
+        &target_hidden_raw_r3,
+        ForwardParams {
+            ctx_len: ctx_len_r3,
+            q_len,
+            pos_offset: committed_r2,
+        },
     )
     .expect("round-3 forward");
     gpu_hal::sync(ordinal).expect("round-3 sync");
     let r3_bytes = read_final_hidden_to_host(ordinal, r3);
     let (bad, total) = count_non_finite(&r3_bytes);
-    assert_eq!(bad, 0, "round 3 final_hidden has {bad}/{total} non-finite values");
+    assert_eq!(
+        bad, 0,
+        "round 3 final_hidden has {bad}/{total} non-finite values"
+    );
 
     println!(
         "forward_smoke: q_len={q_len} ctx_len={ctx_len} past_len=0 → {per_call_ms:.3} ms/call \

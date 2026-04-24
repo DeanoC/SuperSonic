@@ -38,7 +38,8 @@ fn build_lhs(rows: usize, cols: usize, seed: u32) -> Vec<f32> {
     let mut out = Vec::with_capacity(rows * cols);
     for r in 0..rows {
         for c in 0..cols {
-            let x = ((r as u32).wrapping_mul(0x9E37) ^ (c as u32).wrapping_mul(0x85EB) ^ seed) as f32;
+            let x =
+                ((r as u32).wrapping_mul(0x9E37) ^ (c as u32).wrapping_mul(0x85EB) ^ seed) as f32;
             let v = ((x * 1e-5).sin() * 0.75) + ((c as f32) * 1e-4) - ((r as f32) * 2e-4);
             out.push(bf16_round(v));
         }
@@ -73,9 +74,7 @@ fn quantize_lhs_bnb(lhs_bf16: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec
     for r in 0..rows {
         let row = &lhs_bf16[r * cols..(r + 1) * cols];
         let row_f16: Vec<f32> = row.iter().map(|&v| f16_round(v)).collect();
-        let absmax = row_f16
-            .iter()
-            .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+        let absmax = row_f16.iter().fold(0.0f32, |acc, &v| acc.max(v.abs()));
         scales[r] = absmax;
         if absmax == 0.0 {
             continue;
@@ -91,7 +90,14 @@ fn quantize_lhs_bnb(lhs_bf16: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec
     (q, scales)
 }
 
-fn reference_matmul(lhs_bf16: &[f32], rhs_i8_bytes: &[u8], scb: &[f32], rows: usize, out_dim: usize, in_dim: usize) -> Vec<f32> {
+fn reference_matmul(
+    lhs_bf16: &[f32],
+    rhs_i8_bytes: &[u8],
+    scb: &[f32],
+    rows: usize,
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<f32> {
     let (lhs_q, lhs_scales) = quantize_lhs_bnb(lhs_bf16, rows, in_dim);
     let mut out = vec![0f32; rows * out_dim];
     let inv_127_sq = 1.0 / (127.0 * 127.0);
@@ -123,9 +129,20 @@ fn run_shape(dev: usize, shape: &Shape) -> Result<()> {
     let scb = build_scb(shape.out_dim);
     let expected = reference_matmul(&lhs, &rhs, &scb, shape.rows, shape.out_dim, shape.in_dim);
 
-    let lhs_gpu = GpuBuffer::from_host_bytes(dev, ScalarType::BF16, &[shape.rows, shape.in_dim], &f32_to_bf16_bytes(&lhs))?;
-    let rhs_gpu = GpuBuffer::from_host_bytes(dev, ScalarType::U8, &[shape.out_dim, shape.in_dim], &rhs)?;
-    let scb_gpu = GpuBuffer::from_host_bytes(dev, ScalarType::F32, &[shape.out_dim], &f32_to_f32_bytes(&scb))?;
+    let lhs_gpu = GpuBuffer::from_host_bytes(
+        dev,
+        ScalarType::BF16,
+        &[shape.rows, shape.in_dim],
+        &f32_to_bf16_bytes(&lhs),
+    )?;
+    let rhs_gpu =
+        GpuBuffer::from_host_bytes(dev, ScalarType::U8, &[shape.out_dim, shape.in_dim], &rhs)?;
+    let scb_gpu = GpuBuffer::from_host_bytes(
+        dev,
+        ScalarType::F32,
+        &[shape.out_dim],
+        &f32_to_f32_bytes(&scb),
+    )?;
     let mut out_gpu = GpuBuffer::zeros(dev, ScalarType::BF16, &[shape.rows, shape.out_dim])?;
 
     prefill_ffi::matmul_rhs_transposed_int8(
@@ -177,10 +194,30 @@ fn main() -> Result<()> {
     gpu_hal::set_device(dev).map_err(|e| anyhow!("set_device: {e}"))?;
 
     let shapes = [
-        Shape { rows: 1, in_dim: 4096, out_dim: 4096, label: "llama-qproj-step" },
-        Shape { rows: 1, in_dim: 4096, out_dim: 1024, label: "llama-kv-step" },
-        Shape { rows: 3, in_dim: 4096, out_dim: 4096, label: "llama-qproj-prefill" },
-        Shape { rows: 3, in_dim: 4096, out_dim: 14336, label: "llama-mlp-prefill" },
+        Shape {
+            rows: 1,
+            in_dim: 4096,
+            out_dim: 4096,
+            label: "llama-qproj-step",
+        },
+        Shape {
+            rows: 1,
+            in_dim: 4096,
+            out_dim: 1024,
+            label: "llama-kv-step",
+        },
+        Shape {
+            rows: 3,
+            in_dim: 4096,
+            out_dim: 4096,
+            label: "llama-qproj-prefill",
+        },
+        Shape {
+            rows: 3,
+            in_dim: 4096,
+            out_dim: 14336,
+            label: "llama-mlp-prefill",
+        },
     ];
 
     for shape in &shapes {

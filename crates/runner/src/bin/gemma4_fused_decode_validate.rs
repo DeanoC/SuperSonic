@@ -17,12 +17,12 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::Parser;
-use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
@@ -67,7 +67,12 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -101,8 +106,8 @@ impl UnbakedLoader {
             let mut shards = Vec::with_capacity(shard_files.len());
             for filename in &shard_files {
                 let path = dir.join(filename);
-                let file = File::open(&path)
-                    .with_context(|| format!("open shard {}", path.display()))?;
+                let file =
+                    File::open(&path).with_context(|| format!("open shard {}", path.display()))?;
                 shards.push(unsafe { Mmap::map(&file)? });
             }
             let mut index = std::collections::BTreeMap::new();
@@ -118,15 +123,17 @@ impl UnbakedLoader {
             if !single.exists() {
                 bail!("no safetensors found in {}", dir.display());
             }
-            let file = File::open(&single)
-                .with_context(|| format!("open {}", single.display()))?;
+            let file = File::open(&single).with_context(|| format!("open {}", single.display()))?;
             let mmap = unsafe { Mmap::map(&file)? };
             let st = SafeTensors::deserialize(&mmap)?;
             let mut index = std::collections::BTreeMap::new();
             for name in st.names() {
                 index.insert(name.to_string(), 0);
             }
-            Ok(Self { shards: vec![mmap], index })
+            Ok(Self {
+                shards: vec![mmap],
+                index,
+            })
         }
     }
 
@@ -145,7 +152,12 @@ impl UnbakedLoader {
 
     fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::BF16,
+            &shape,
+            bytes,
+        )?)
     }
 }
 
@@ -198,7 +210,10 @@ fn build_proportional_rope_table(
 ) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let rope_angles = (partial_rotary_factor * (head_dim as f64) / 2.0) as usize;
-    assert!(rope_angles <= half, "rope_angles {rope_angles} > head_dim/2 {half}");
+    assert!(
+        rope_angles <= half,
+        "rope_angles {rope_angles} > head_dim/2 {half}"
+    );
 
     let mut inv_freq = vec![0.0f32; half];
     for j in 0..rope_angles {
@@ -303,8 +318,14 @@ fn compute_per_layer_inputs(
 
     let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
     g4::matvec(
-        0, dtype, &mut proj, &main_embed_gpu, per_layer_model_projection_w,
-        hidden_size, total, counter,
+        0,
+        dtype,
+        &mut proj,
+        &main_embed_gpu,
+        per_layer_model_projection_w,
+        hidden_size,
+        total,
+        counter,
     )?;
 
     // HF applies the scale as a Python float against a BF16 tensor, so the
@@ -318,8 +339,14 @@ fn compute_per_layer_inputs(
     let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
     let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
     g4::rms_norm_per_row(
-        0, dtype, &mut proj_normed, &proj_reshaped,
-        Some(per_layer_projection_norm_w), eps, num_layers, ple_hidden,
+        0,
+        dtype,
+        &mut proj_normed,
+        &proj_reshaped,
+        Some(per_layer_projection_norm_w),
+        eps,
+        num_layers,
+        ple_hidden,
     )?;
     let proj_normed_host = download_bf16(&proj_normed)?;
 
@@ -356,9 +383,7 @@ fn seed_kv_cache_from_oracle(
         );
     }
     if positions_to_copy > prompt_tokens {
-        bail!(
-            "positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",
-        );
+        bail!("positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",);
     }
     let bf16_sz = 2;
     let total_bytes = num_kv_heads * max_t * head_dim * bf16_sz;
@@ -439,7 +464,11 @@ fn compare_vectors(got: &[f32], want: &[f32]) -> Result<CompareStats> {
     } else {
         0.0
     };
-    Ok(CompareStats { cos_sim, max_abs, rel_err_norm })
+    Ok(CompareStats {
+        cos_sim,
+        max_abs,
+        rel_err_norm,
+    })
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -563,14 +592,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
 
-    let config: Config = g4_config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let config: Config =
+        g4_config::load_config(&cli.model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
     let tcfg: &TextConfig = &config.text_config;
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
-    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
-        .context("parse oracle JSON")?;
+    let oracle: OracleOutput =
+        serde_json::from_slice(&oracle_bytes).context("parse oracle JSON")?;
     let prompt_token_ids = oracle
         .prompt_token_ids
         .as_ref()
@@ -603,14 +632,16 @@ fn main() -> Result<()> {
     if max_new_tokens > oracle.generated_tokens {
         bail!(
             "--max-new-tokens {} exceeds oracle.generated_tokens {}; rerun oracle with more tokens",
-            max_new_tokens, oracle.generated_tokens
+            max_new_tokens,
+            oracle.generated_tokens
         );
     }
     if let Some(pli) = pli_by_step_oracle {
         if pli.len() < max_new_tokens {
             bail!(
                 "oracle per_layer_inputs_by_step has {} entries, need {}",
-                pli.len(), max_new_tokens
+                pli.len(),
+                max_new_tokens
             );
         }
     }
@@ -632,10 +663,13 @@ fn main() -> Result<()> {
     // (head_dim=512) which strictly dominate sliding layers (head_dim=256).
     let full_head_dim = tcfg.head_dim_for(AttnKind::Full);
     let workspace_elems = g4::fused_attn_block_workspace_elems(
-        hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        full_head_dim,
+        max_t,
     );
-    let mut fused_workspace =
-        GpuBuffer::zeros(0, ScalarType::F32, &[workspace_elems])?;
+    let mut fused_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[workspace_elems])?;
     let mut fused_matvec_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut fused_barrier_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut fused_barrier_flag = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
@@ -646,11 +680,9 @@ fn main() -> Result<()> {
         .map(|l| g4_spec::mlp_intermediate(tcfg, l))
         .max()
         .unwrap_or(tcfg.intermediate_size);
-    let mlp_workspace_elems = g4::fused_mlp_ple_workspace_elems(
-        hidden_size, max_intermediate, ple_hidden,
-    );
-    let mut fused_mlp_workspace =
-        GpuBuffer::zeros(0, ScalarType::F32, &[mlp_workspace_elems])?;
+    let mlp_workspace_elems =
+        g4::fused_mlp_ple_workspace_elems(hidden_size, max_intermediate, ple_hidden);
+    let mut fused_mlp_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[mlp_workspace_elems])?;
     // Per-layer PLI slot (single layer's [ple_hidden] BF16 vector). Populated
     // via D2D copy from the full pli_gpu table each layer.
     let mut pli_slot = GpuBuffer::zeros(0, ScalarType::BF16, &[ple_hidden])?;
@@ -673,8 +705,9 @@ fn main() -> Result<()> {
     let final_norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
 
     // --- Global PLE projection weights for Rust-side `project_per_layer_inputs`. ---
-    let per_layer_model_projection_w =
-        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+    let per_layer_model_projection_w = loader.load_bf16_to_gpu(&format!(
+        "{weight_prefix}.per_layer_model_projection.weight"
+    ))?;
     let per_layer_projection_norm_w =
         loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
 
@@ -702,11 +735,21 @@ fn main() -> Result<()> {
         let v_bytes = B64.decode(&kv.v).context("decode kv.v base64")?;
         let positions_to_copy = prompt_tokens.saturating_sub(1);
         let kc = seed_kv_cache_from_oracle(
-            &k_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+            &k_bytes,
+            &kv.k_shape,
+            num_kv_heads,
+            prompt_tokens,
+            w.head_dim,
+            max_t,
             positions_to_copy,
         )?;
         let vc = seed_kv_cache_from_oracle(
-            &v_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+            &v_bytes,
+            &kv.v_shape,
+            num_kv_heads,
+            prompt_tokens,
+            w.head_dim,
+            max_t,
             positions_to_copy,
         )?;
         k_caches.push(kc);
@@ -721,9 +764,13 @@ fn main() -> Result<()> {
     let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
     let full_head_dim = tcfg.head_dim_for(AttnKind::Full);
 
-    let (scos_h, ssin_h) = build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
+    let (scos_h, ssin_h) =
+        build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
     let (fcos_h, fsin_h) = build_proportional_rope_table(
-        full_head_dim, full_rope.rope_theta, full_rope.partial_rotary_factor, max_t,
+        full_head_dim,
+        full_rope.rope_theta,
+        full_rope.partial_rotary_factor,
+        max_t,
     );
     let sliding_cos = upload_bf16(&[max_t, sliding_head_dim], &scos_h)?;
     let sliding_sin = upload_bf16(&[max_t, sliding_head_dim], &ssin_h)?;
@@ -755,15 +802,20 @@ fn main() -> Result<()> {
         // Compute this step's per_layer_inputs in Rust, mirroring HF's
         // `project_per_layer_inputs`. Shape: [num_layers, ple_hidden] BF16.
         let pli_bytes = compute_per_layer_inputs(
-            &loader, weight_prefix, tcfg, input_token_id,
-            &per_layer_model_projection_w, &per_layer_projection_norm_w,
+            &loader,
+            weight_prefix,
+            tcfg,
+            input_token_id,
+            &per_layer_model_projection_w,
+            &per_layer_projection_norm_w,
             &mut counter,
         )?;
         let expected_pli_bytes = num_layers * ple_hidden * 2;
         if pli_bytes.len() != expected_pli_bytes {
             bail!(
                 "compute_per_layer_inputs returned {} bytes, expected {}",
-                pli_bytes.len(), expected_pli_bytes
+                pli_bytes.len(),
+                expected_pli_bytes
             );
         }
 
@@ -783,9 +835,7 @@ fn main() -> Result<()> {
 
         // Upload the full PLI table once per step; per-layer slices are
         // copied into `pli_slot` inside the loop with a small D2D.
-        let pli_gpu = GpuBuffer::from_host_bytes(
-            0, dtype, &[num_layers, ple_hidden], &pli_bytes,
-        )?;
+        let pli_gpu = GpuBuffer::from_host_bytes(0, dtype, &[num_layers, ple_hidden], &pli_bytes)?;
 
         for layer_idx in 0..num_layers {
             let w = &layers[layer_idx];
@@ -811,8 +861,10 @@ fn main() -> Result<()> {
             let _ = (q_dim, kv_dim, rotary_dim); // still used for workspace sizing logic above
             let mut h_mid = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
             g4::fused_attn_block(
-                0, dtype,
-                &h_running, &mut h_mid,
+                0,
+                dtype,
+                &h_running,
+                &mut h_mid,
                 &w.input_norm,
                 &w.q_proj,
                 w.k_proj.as_ref(),
@@ -821,15 +873,25 @@ fn main() -> Result<()> {
                 w.k_norm.as_ref(),
                 &w.o_proj,
                 &w.post_attn_norm,
-                cos_table, sin_table,
-                &mut k_caches[layer_idx], &mut v_caches[layer_idx],
+                cos_table,
+                sin_table,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
                 &mut fused_workspace,
                 &mut fused_matvec_counter,
-                &mut fused_barrier_counter, &mut fused_barrier_flag,
-                hidden_size, num_q_heads, num_kv_heads, head_dim, head_dim,
-                sliding_window, pos, max_t,
+                &mut fused_barrier_counter,
+                &mut fused_barrier_flag,
+                hidden_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                head_dim,
+                sliding_window,
+                pos,
+                max_t,
                 w.shared_kv,
-                eps, 1.0f32,
+                eps,
+                1.0f32,
             )?;
 
             // After a non-shared layer wrote its K/V at slot `pos`, replicate
@@ -841,9 +903,23 @@ fn main() -> Result<()> {
                     let s = &layers[shared_layer];
                     if s.shared_kv && s.kv_source == layer_idx {
                         let (lo, hi) = k_caches.split_at_mut(shared_layer);
-                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                        copy_kv_slot(
+                            &lo[layer_idx],
+                            &mut hi[0],
+                            num_kv_heads,
+                            max_t,
+                            head_dim,
+                            pos,
+                        )?;
                         let (lo, hi) = v_caches.split_at_mut(shared_layer);
-                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                        copy_kv_slot(
+                            &lo[layer_idx],
+                            &mut hi[0],
+                            num_kv_heads,
+                            max_t,
+                            head_dim,
+                            pos,
+                        )?;
                     }
                 }
             }
@@ -862,40 +938,60 @@ fn main() -> Result<()> {
             // offset. Simpler: copy the slice into a dedicated scratch buffer
             // owned at outer scope and pass that.
             unsafe {
-                gpu_hal::copy_d2d(
-                    0,
-                    pli_slot.as_mut_ptr(),
-                    pli_slice_ptr,
-                    ple_hidden * 2,
-                ).map_err(|e| anyhow!("copy pli slice: {e}"))?;
+                gpu_hal::copy_d2d(0, pli_slot.as_mut_ptr(), pli_slice_ptr, ple_hidden * 2)
+                    .map_err(|e| anyhow!("copy pli slice: {e}"))?;
             }
 
             let mut h_new = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
             g4::fused_mlp_ple(
-                0, dtype,
-                &h_mid, &mut h_new,
+                0,
+                dtype,
+                &h_mid,
+                &mut h_new,
                 &w.pre_ff_norm,
-                &w.gate_proj, &w.up_proj, &w.down_proj, &w.post_ff_norm,
+                &w.gate_proj,
+                &w.up_proj,
+                &w.down_proj,
+                &w.post_ff_norm,
                 &pli_slot,
-                &w.per_layer_input_gate_w, &w.per_layer_projection_w,
+                &w.per_layer_input_gate_w,
+                &w.per_layer_projection_w,
                 &w.post_per_layer_input_norm_w,
                 &mut fused_mlp_workspace,
                 &mut fused_matvec_counter,
-                &mut fused_barrier_counter, &mut fused_barrier_flag,
-                hidden_size, w.intermediate_size, ple_hidden,
-                eps, w.layer_scalar,
+                &mut fused_barrier_counter,
+                &mut fused_barrier_flag,
+                hidden_size,
+                w.intermediate_size,
+                ple_hidden,
+                eps,
+                w.layer_scalar,
             )?;
             h_running = h_new;
         }
 
         // --- Final norm + tied lm_head + softcap ---
         let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut post_norm, &h_running, Some(&final_norm_w), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut post_norm,
+            &h_running,
+            Some(&final_norm_w),
+            eps,
+            hidden_size,
+        )?;
 
         let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
         g4::matvec(
-            0, dtype, &mut logits_gpu, &post_norm, &lm_head_w,
-            hidden_size, vocab_size, &mut counter,
+            0,
+            dtype,
+            &mut logits_gpu,
+            &post_norm,
+            &lm_head_w,
+            hidden_size,
+            vocab_size,
+            &mut counter,
         )?;
         let mut logits_host = download_bf16(&logits_gpu)?;
         for v in logits_host.iter_mut() {
@@ -911,7 +1007,9 @@ fn main() -> Result<()> {
         if want_logits.len() != vocab_size {
             bail!(
                 "oracle {} len {} != vocab_size {}",
-                source_tag, want_logits.len(), vocab_size
+                source_tag,
+                want_logits.len(),
+                vocab_size
             );
         }
         let stats = compare_vectors(&logits_host, want_logits)?;
@@ -932,7 +1030,11 @@ fn main() -> Result<()> {
         println!(
             "  argmax got={got_arg} want={want_arg} expected_gen_id={expected_gen_id} \
              argmax_vs_logits={} argmax_vs_gen_id={} top5_overlap={top5_overlap}/5",
-            if match_oracle_arg { "MATCH" } else { "MISMATCH" },
+            if match_oracle_arg {
+                "MATCH"
+            } else {
+                "MISMATCH"
+            },
             if match_argmax { "MATCH" } else { "MISMATCH" },
         );
         println!("  top5_got={:?} top5_want={:?}", top5_got, top5_want);

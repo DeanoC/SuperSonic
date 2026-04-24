@@ -33,18 +33,10 @@ impl RotaryTables {
             }
         }
 
-        let cos = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[max_pos, half_dim],
-            &cos_data,
-        )?;
-        let sin = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[max_pos, half_dim],
-            &sin_data,
-        )?;
+        let cos =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[max_pos, half_dim], &cos_data)?;
+        let sin =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[max_pos, half_dim], &sin_data)?;
 
         Ok(Self {
             cos,

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Warmed Llama 3.1 8B CUDA benchmark for the staged certified KV path.
-# Current Rust/CUDA mode is the correctness-first dense-fallback baseline.
+# Current Rust/CUDA mode uses Tier-1 compressed KV plus device-BF16 originals
+# plus host-pinned Tier-2 BF16 originals for promoted-key page-in.
 #
 # Usage:
 #   ./tests/sm86/bench_llama31_certified_kv.sh [model_dir]
@@ -170,8 +171,8 @@ prefill_toks_s = (prompt_tokens / prefill_mean) * 1000.0 if prefill_mean else 0.
 decode_toks_s = (generated_tokens / decode_mean) * 1000.0 if decode_mean else 0.0
 
 print("")
-print("--- llama3.1-8b certified-kv dense-fallback lane ---")
-print(f"prompt_tokens={prompt_tokens} generated_tokens={generated_tokens} batch_size=1 mode=certified_kv_dense_fallback")
+print("--- llama3.1-8b certified-kv mixed-key host-tier2 lane ---")
+print(f"prompt_tokens={prompt_tokens} generated_tokens={generated_tokens} batch_size=1 mode=certified_kv_cuda_mixed_key_int4_value_host_tier2")
 print(f"prefill_ms_mean={prefill_mean:.1f} prefill_toks_s={prefill_toks_s:.1f}")
 print(f"decode_ms_mean={decode_mean:.1f} decode_toks_s={decode_toks_s:.1f} ms_per_step_mean={ms_per_step_mean:.1f}")
 print(

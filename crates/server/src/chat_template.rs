@@ -35,10 +35,10 @@ impl ChatTemplate {
         if !path.exists() {
             return Ok(None);
         }
-        let raw = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let cfg: JsonValue = serde_json::from_str(&raw)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let cfg: JsonValue =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
 
         let tpl_src = match cfg.get("chat_template") {
             Some(JsonValue::String(s)) => s.clone(),
@@ -77,11 +77,7 @@ impl ChatTemplate {
 
     /// Render the template against a list of messages. Returns the prompt
     /// text to feed into the tokenizer.
-    pub fn render(
-        &self,
-        messages: &[ChatMessage],
-        add_generation_prompt: bool,
-    ) -> Result<String> {
+    pub fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
         let tpl = self.env.get_template("chat")?;
         let msgs: Vec<Value> = messages
             .iter()
@@ -98,7 +94,8 @@ impl ChatTemplate {
             bos_token => self.bos_token.clone().unwrap_or_default(),
             eos_token => self.eos_token.clone().unwrap_or_default(),
         };
-        tpl.render(ctx).map_err(|e| anyhow!("render chat template: {e}"))
+        tpl.render(ctx)
+            .map_err(|e| anyhow!("render chat template: {e}"))
     }
 }
 

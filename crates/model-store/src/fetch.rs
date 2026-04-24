@@ -238,10 +238,12 @@ pub fn fetch_bake(req: FetchRequest<'_>) -> Result<(), FetchError> {
         });
     }
 
-    let parent = req
-        .target_bake_dir
-        .parent()
-        .ok_or_else(|| FetchError::BadSource(format!("bake dir has no parent: {}", req.target_bake_dir.display())))?;
+    let parent = req.target_bake_dir.parent().ok_or_else(|| {
+        FetchError::BadSource(format!(
+            "bake dir has no parent: {}",
+            req.target_bake_dir.display()
+        ))
+    })?;
     fs::create_dir_all(parent)?;
 
     let cache_dir = parent.join(format!(".bake-cache-{}", req.source.tag));
@@ -252,7 +254,11 @@ pub fn fetch_bake(req: FetchRequest<'_>) -> Result<(), FetchError> {
             .iter()
             .map(|p| (p.name.as_str(), p.sha256.as_str(), p.bytes))
             .collect(),
-        None => vec![(entry.asset.as_str(), entry.sha256.as_str(), entry.compressed_bytes)],
+        None => vec![(
+            entry.asset.as_str(),
+            entry.sha256.as_str(),
+            entry.compressed_bytes,
+        )],
     };
     let total_parts = part_names.len() as u32;
 
@@ -620,7 +626,8 @@ fn extract_tar_zst(
     fs::create_dir_all(&hf_staging)?;
 
     let reader = ConcatReader::open(part_paths)?;
-    let decoder = zstd::stream::Decoder::new(reader).map_err(|e| FetchError::Zstd(e.to_string()))?;
+    let decoder =
+        zstd::stream::Decoder::new(reader).map_err(|e| FetchError::Zstd(e.to_string()))?;
     let mut archive = tar::Archive::new(decoder);
     archive.set_preserve_permissions(false);
     archive.set_overwrite(true);
@@ -629,7 +636,10 @@ fn extract_tar_zst(
     let mut saw_weights = false;
     let mut hf_file_names: Vec<String> = Vec::new();
 
-    for entry in archive.entries().map_err(|e| FetchError::Tar(e.to_string()))? {
+    for entry in archive
+        .entries()
+        .map_err(|e| FetchError::Tar(e.to_string()))?
+    {
         let mut entry = entry.map_err(|e| FetchError::Tar(e.to_string()))?;
         let header = entry.header().clone();
         if !header.entry_type().is_file() {
@@ -645,7 +655,12 @@ fn extract_tar_zst(
         let components: Vec<_> = path.components().collect();
         let name = match path.file_name().and_then(|s| s.to_str()) {
             Some(n) => n.to_string(),
-            None => return Err(FetchError::BadTarEntry(format!("no filename: {}", path.display()))),
+            None => {
+                return Err(FetchError::BadTarEntry(format!(
+                    "no filename: {}",
+                    path.display()
+                )))
+            }
         };
         let dst = match components.len() {
             1 => match name.as_str() {
@@ -750,7 +765,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let partial = tmp.path().join("partial");
 
-        let manifest_bytes = br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+        let manifest_bytes =
+            br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
         let weights_bytes = b"fake weights";
         let cfg_bytes = br#"{"hidden_size":128}"#;
         let tok_bytes = br#"{"model":{"type":"BPE"}}"#;
@@ -771,8 +787,7 @@ mod tests {
             hex(&h.finalize())
         };
 
-        let staging =
-            extract_tar_zst(&[asset_path], &partial, &expected_manifest_sha).unwrap();
+        let staging = extract_tar_zst(&[asset_path], &partial, &expected_manifest_sha).unwrap();
         assert!(staging.bake_staging.join("manifest.json").exists());
         assert!(staging.bake_staging.join("weights.bin").exists());
         assert!(staging.hf_staging.join("config.json").exists());
@@ -785,7 +800,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let partial = tmp.path().join("partial");
 
-        let manifest_bytes = br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
+        let manifest_bytes =
+            br#"{"format_version":1,"converter_version":2,"model_family":"qwen35","tensors":[]}"#;
         let archive = make_tar_zst(&[
             ("manifest.json", manifest_bytes),
             ("weights.bin", b"x"),
@@ -812,8 +828,14 @@ mod tests {
     #[test]
     fn variant_bake_dirs_distinct() {
         let md = Path::new("/tmp/model");
-        assert_ne!(BakeVariant::Bf16.bake_dir(md), BakeVariant::Fp8Native.bake_dir(md));
-        assert_ne!(BakeVariant::Bf16.bake_dir(md), BakeVariant::Int4Gptq.bake_dir(md));
+        assert_ne!(
+            BakeVariant::Bf16.bake_dir(md),
+            BakeVariant::Fp8Native.bake_dir(md)
+        );
+        assert_ne!(
+            BakeVariant::Bf16.bake_dir(md),
+            BakeVariant::Int4Gptq.bake_dir(md)
+        );
         assert_ne!(
             BakeVariant::Fp8Native.bake_dir(md),
             BakeVariant::Int4Gptq.bake_dir(md)
@@ -842,4 +864,3 @@ mod tests {
         assert_eq!(hex(&[0, 0x12, 0xff]), "0012ff");
     }
 }
-

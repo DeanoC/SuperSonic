@@ -2,12 +2,12 @@
 
 use std::sync::Arc;
 
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
-use axum::extract::{Request, State};
 
 use crate::errors::{ApiError, ApiErrorBody, ApiErrorEnvelope};
 use crate::state::ServerState;

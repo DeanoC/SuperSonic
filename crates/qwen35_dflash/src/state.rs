@@ -74,7 +74,11 @@ impl DFlashScratch {
             ordinal,
             block_size: config.block_size,
 
-            fuser_input: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len, num_taps_hidden])?,
+            fuser_input: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[1, ctx_len, num_taps_hidden],
+            )?,
             target_hidden_ctx: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len, hidden])?,
             target_hidden_ctx_norm: GpuBuffer::zeros(
                 ordinal,
@@ -88,7 +92,11 @@ impl DFlashScratch {
             post_attn_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, hidden])?,
 
             q_proj: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, q_out])?,
-            norm_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, hidden])?,
+            norm_concat: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[1, ctx_len + q_len, hidden],
+            )?,
             k_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
             v_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
 
@@ -136,11 +144,7 @@ pub struct DFlashState {
 }
 
 impl DFlashState {
-    pub fn new(
-        ordinal: usize,
-        config: &DFlashConfig,
-        max_ctx: usize,
-    ) -> Result<Self, GpuError> {
+    pub fn new(ordinal: usize, config: &DFlashConfig, max_ctx: usize) -> Result<Self, GpuError> {
         let nkv = config.num_key_value_heads;
         let hd = config.head_dim;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
@@ -150,7 +154,12 @@ impl DFlashState {
                 cache_v: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_ctx, nkv, hd])?,
             });
         }
-        Ok(Self { ordinal, layers, kv_filled: 0, max_ctx })
+        Ok(Self {
+            ordinal,
+            layers,
+            kv_filled: 0,
+            max_ctx,
+        })
     }
 
     /// Roll back the logical fill cursor. Physical memory beyond the cursor

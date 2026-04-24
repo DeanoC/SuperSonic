@@ -1,4 +1,4 @@
-use gpu_hal::{GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{GpuBuffer, GpuError, HostBuffer, ScalarType};
 
 use crate::config::TextConfig;
 use crate::weights::LayerKind;
@@ -38,6 +38,16 @@ pub struct LayerState {
     pub certified_kv_value_zero: Option<GpuBuffer>,
     pub certified_kv_value_error: Option<GpuBuffer>,
     pub certified_kv_value_tokens: usize,
+    pub certified_kv_host_k: Option<HostBuffer>,
+    pub certified_kv_host_v: Option<HostBuffer>,
+    pub certified_kv_host_tokens: usize,
+    pub certified_kv_tail_k: Option<GpuBuffer>,
+    pub certified_kv_tail_v: Option<GpuBuffer>,
+    pub certified_kv_gpu_tail_only: bool,
+    pub certified_kv_ranking_prefix_k: Option<GpuBuffer>,
+    pub certified_kv_ranking_prefix_v: Option<GpuBuffer>,
+    pub certified_kv_ranking_prefix_tokens: usize,
+    pub certified_kv_ranking_prefix_kv_heads: Vec<usize>,
     // Linear attention
     pub conv_state: Option<GpuBuffer>,
     pub recurrent_state: Option<GpuBuffer>,
@@ -81,6 +91,16 @@ impl LayerState {
             certified_kv_value_zero: None,
             certified_kv_value_error: None,
             certified_kv_value_tokens: 0,
+            certified_kv_host_k: None,
+            certified_kv_host_v: None,
+            certified_kv_host_tokens: 0,
+            certified_kv_tail_k: None,
+            certified_kv_tail_v: None,
+            certified_kv_gpu_tail_only: false,
+            certified_kv_ranking_prefix_k: None,
+            certified_kv_ranking_prefix_v: None,
+            certified_kv_ranking_prefix_tokens: 0,
+            certified_kv_ranking_prefix_kv_heads: Vec::new(),
             conv_state: Some(conv_state),
             recurrent_state: Some(recurrent_state),
         })
@@ -105,6 +125,16 @@ impl LayerState {
             certified_kv_value_zero: None,
             certified_kv_value_error: None,
             certified_kv_value_tokens: 0,
+            certified_kv_host_k: None,
+            certified_kv_host_v: None,
+            certified_kv_host_tokens: 0,
+            certified_kv_tail_k: None,
+            certified_kv_tail_v: None,
+            certified_kv_gpu_tail_only: false,
+            certified_kv_ranking_prefix_k: None,
+            certified_kv_ranking_prefix_v: None,
+            certified_kv_ranking_prefix_tokens: 0,
+            certified_kv_ranking_prefix_kv_heads: Vec::new(),
             conv_state: None,
             recurrent_state: None,
         }
@@ -123,7 +153,11 @@ impl LayerState {
         kv_fp8: bool,
     ) -> Result<(), GpuError> {
         let needed = needed + 1; // need room for position `seqlen_offset`
-        let kv_dtype = if kv_fp8 { ScalarType::U8 } else { ScalarType::BF16 };
+        let kv_dtype = if kv_fp8 {
+            ScalarType::U8
+        } else {
+            ScalarType::BF16
+        };
         if let (Some(ref k), Some(ref v)) = (&self.kv_cache_k, &self.kv_cache_v) {
             let current_cap = k.shape()[2]; // [1, nkv, seq, hd]
             if kv_fp8
@@ -132,10 +166,16 @@ impl LayerState {
             {
                 let nkv = config.num_key_value_heads;
                 let hd = config.head_dim;
-                self.kv_shadow_k =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, current_cap, hd])?);
-                self.kv_shadow_v =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, current_cap, hd])?);
+                self.kv_shadow_k = Some(GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[1, nkv, current_cap, hd],
+                )?);
+                self.kv_shadow_v = Some(GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[1, nkv, current_cap, hd],
+                )?);
                 self.kv_shadow_start = self.kv_filled;
             }
             if current_cap >= needed {
@@ -154,7 +194,9 @@ impl LayerState {
                     self.kv_scale_k = Some(new_sk);
                     self.kv_scale_v = Some(new_sv);
                 }
-                if let (Some(ref shadow_k), Some(ref shadow_v)) = (&self.kv_shadow_k, &self.kv_shadow_v) {
+                if let (Some(ref shadow_k), Some(ref shadow_v)) =
+                    (&self.kv_shadow_k, &self.kv_shadow_v)
+                {
                     let new_shadow_k = shadow_k.grow_seq_dim(2, new_cap)?;
                     let new_shadow_v = shadow_v.grow_seq_dim(2, new_cap)?;
                     self.kv_shadow_k = Some(new_shadow_k);
@@ -166,21 +208,23 @@ impl LayerState {
             let cap = ((needed + kv_chunk_size - 1) / kv_chunk_size) * kv_chunk_size;
             let nkv = config.num_key_value_heads;
             let hd = config.head_dim;
-            self.kv_cache_k =
-                Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
-            self.kv_cache_v =
-                Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
+            self.kv_cache_k = Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
+            self.kv_cache_v = Some(GpuBuffer::zeros(ordinal, kv_dtype, &[1, nkv, cap, hd])?);
             if kv_fp8 {
                 // Scale buffers: [nkv, cap] of F32 — one scale per head per position
-                self.kv_scale_k =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
-                self.kv_scale_v =
-                    Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
+                self.kv_scale_k = Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
+                self.kv_scale_v = Some(GpuBuffer::zeros(ordinal, ScalarType::F32, &[nkv, cap])?);
                 if kv_fp8_bf16_sidecar_enabled() {
-                    self.kv_shadow_k =
-                        Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
-                    self.kv_shadow_v =
-                        Some(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, nkv, cap, hd])?);
+                    self.kv_shadow_k = Some(GpuBuffer::zeros(
+                        ordinal,
+                        ScalarType::BF16,
+                        &[1, nkv, cap, hd],
+                    )?);
+                    self.kv_shadow_v = Some(GpuBuffer::zeros(
+                        ordinal,
+                        ScalarType::BF16,
+                        &[1, nkv, cap, hd],
+                    )?);
                     self.kv_shadow_start = self.kv_filled;
                 }
             }
@@ -195,6 +239,22 @@ impl LayerState {
             self.certified_kv_key_tokens = 0;
             self.certified_kv_value_tokens = 0;
         }
+        if filled < self.certified_kv_host_tokens {
+            self.certified_kv_host_tokens = 0;
+        }
+        if filled < self.certified_kv_ranking_prefix_tokens {
+            self.certified_kv_ranking_prefix_k = None;
+            self.certified_kv_ranking_prefix_v = None;
+            self.certified_kv_ranking_prefix_tokens = 0;
+            self.certified_kv_ranking_prefix_kv_heads.clear();
+        }
+        if filled == 0 {
+            self.certified_kv_gpu_tail_only = false;
+            self.certified_kv_ranking_prefix_k = None;
+            self.certified_kv_ranking_prefix_v = None;
+            self.certified_kv_ranking_prefix_tokens = 0;
+            self.certified_kv_ranking_prefix_kv_heads.clear();
+        }
         if self.kv_shadow_k.is_some() && self.kv_shadow_v.is_some() {
             self.kv_shadow_start = kv_fp8_bf16_sidecar_window_tokens()
                 .map(|window| filled.saturating_sub(window))
@@ -204,10 +264,7 @@ impl LayerState {
 
     /// Get KV cache capacity (allocated seq dim).
     pub fn kv_capacity(&self) -> usize {
-        self.kv_cache_k
-            .as_ref()
-            .map(|k| k.shape()[2])
-            .unwrap_or(0)
+        self.kv_cache_k.as_ref().map(|k| k.shape()[2]).unwrap_or(0)
     }
 }
 
@@ -217,6 +274,12 @@ impl LayerState {
         let clone_opt = |opt: &Option<GpuBuffer>| -> Result<Option<GpuBuffer>, GpuError> {
             match opt {
                 Some(buf) => Ok(Some(buf.clone_device()?)),
+                None => Ok(None),
+            }
+        };
+        let clone_host_opt = |opt: &Option<HostBuffer>| -> Result<Option<HostBuffer>, GpuError> {
+            match opt {
+                Some(buf) => Ok(Some(buf.clone_host()?)),
                 None => Ok(None),
             }
         };
@@ -238,6 +301,16 @@ impl LayerState {
             certified_kv_value_zero: clone_opt(&self.certified_kv_value_zero)?,
             certified_kv_value_error: clone_opt(&self.certified_kv_value_error)?,
             certified_kv_value_tokens: self.certified_kv_value_tokens,
+            certified_kv_host_k: clone_host_opt(&self.certified_kv_host_k)?,
+            certified_kv_host_v: clone_host_opt(&self.certified_kv_host_v)?,
+            certified_kv_host_tokens: self.certified_kv_host_tokens,
+            certified_kv_tail_k: clone_opt(&self.certified_kv_tail_k)?,
+            certified_kv_tail_v: clone_opt(&self.certified_kv_tail_v)?,
+            certified_kv_gpu_tail_only: self.certified_kv_gpu_tail_only,
+            certified_kv_ranking_prefix_k: clone_opt(&self.certified_kv_ranking_prefix_k)?,
+            certified_kv_ranking_prefix_v: clone_opt(&self.certified_kv_ranking_prefix_v)?,
+            certified_kv_ranking_prefix_tokens: self.certified_kv_ranking_prefix_tokens,
+            certified_kv_ranking_prefix_kv_heads: self.certified_kv_ranking_prefix_kv_heads.clone(),
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })
@@ -495,7 +568,12 @@ mod tests {
 
         // Read back and assert bit-exact equality with bytes-A.
         for (i, ls) in state.layers.iter().enumerate() {
-            match (ls.kind, &ls.conv_state, &ls.recurrent_state, &expected_per_layer[i]) {
+            match (
+                ls.kind,
+                &ls.conv_state,
+                &ls.recurrent_state,
+                &expected_per_layer[i],
+            ) {
                 (LayerKind::Linear, Some(conv), Some(rec), Some((conv_a, rec_a))) => {
                     let conv_rb = conv.to_host_bytes().expect("d2h conv restored");
                     let rec_rb = rec.to_host_bytes().expect("d2h rec restored");
@@ -509,20 +587,23 @@ mod tests {
                     );
                 }
                 (LayerKind::Full, None, None, None) => {}
-                _ => panic!(
-                    "layer {i}: kind/state/snapshot-slot inconsistency after restore"
-                ),
+                _ => panic!("layer {i}: kind/state/snapshot-slot inconsistency after restore"),
             }
         }
 
         // Sanity: a second snapshot + restore round-trip on the restored state
         // is a no-op.
         let snap2 = state.snapshot_linear().expect("snapshot_linear 2nd");
-        state.restore_linear(&snap2, ordinal).expect("restore_linear 2nd");
+        state
+            .restore_linear(&snap2, ordinal)
+            .expect("restore_linear 2nd");
         for (i, ls) in state.layers.iter().enumerate() {
-            if let (LayerKind::Linear, Some(conv), Some(rec), Some((conv_a, rec_a))) =
-                (ls.kind, &ls.conv_state, &ls.recurrent_state, &expected_per_layer[i])
-            {
+            if let (LayerKind::Linear, Some(conv), Some(rec), Some((conv_a, rec_a))) = (
+                ls.kind,
+                &ls.conv_state,
+                &ls.recurrent_state,
+                &expected_per_layer[i],
+            ) {
                 let conv_rb = conv.to_host_bytes().expect("d2h conv 2nd");
                 let rec_rb = rec.to_host_bytes().expect("d2h rec 2nd");
                 assert_eq!(&conv_rb, conv_a, "layer {i}: conv drift on 2nd roundtrip");

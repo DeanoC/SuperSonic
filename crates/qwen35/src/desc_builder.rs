@@ -1,4 +1,6 @@
-use kernel_ffi::{DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, BatchSeqDesc, MAX_BATCH_SIZE};
+use kernel_ffi::{
+    BatchSeqDesc, DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, MAX_BATCH_SIZE,
+};
 
 use crate::state::ModelState;
 use crate::weights::{LayerKind, Qwen35Weights};
@@ -69,8 +71,16 @@ pub fn build_layer_descs(
                 d.attn_head_dim = config.head_dim as i32;
                 d.attn_num_heads = config.num_attention_heads as i32;
                 d.attn_num_kv_heads = config.num_key_value_heads as i32;
-                d.q_norm_w = fa.q_norm_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null());
-                d.k_norm_w = fa.k_norm_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null());
+                d.q_norm_w = fa
+                    .q_norm_w
+                    .as_ref()
+                    .map(|w| w.as_ptr())
+                    .unwrap_or(std::ptr::null());
+                d.k_norm_w = fa
+                    .k_norm_w
+                    .as_ref()
+                    .map(|w| w.as_ptr())
+                    .unwrap_or(std::ptr::null());
                 d.q_norm_eps = if fa.q_norm_w.is_some() {
                     config.rms_norm_eps as f32
                 } else {
@@ -116,9 +126,7 @@ pub fn build_fp8_scale_descs(weights: &Qwen35Weights) -> Option<Vec<FP8ScaleDesc
     }
 
     let scale_ptr = |opt: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
-        opt.as_ref()
-            .map(|b| b.as_ptr())
-            .unwrap_or(std::ptr::null())
+        opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
     };
 
     let mut descs = Vec::with_capacity(weights.layers.len());
@@ -162,9 +170,7 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
     }
 
     let ptr = |opt: &Option<gpu_hal::GpuBuffer>| -> *const std::ffi::c_void {
-        opt.as_ref()
-            .map(|b| b.as_ptr())
-            .unwrap_or(std::ptr::null())
+        opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
     };
 
     let mut descs = Vec::with_capacity(weights.layers.len());
@@ -222,7 +228,12 @@ pub fn build_batch_seq_descs(
     if batch_size <= 1 {
         return None;
     }
-    assert!(batch_size <= MAX_BATCH_SIZE, "batch_size {} exceeds MAX_BATCH_SIZE {}", batch_size, MAX_BATCH_SIZE);
+    assert!(
+        batch_size <= MAX_BATCH_SIZE,
+        "batch_size {} exceeds MAX_BATCH_SIZE {}",
+        batch_size,
+        MAX_BATCH_SIZE
+    );
     assert_eq!(states.len(), seqlen_offsets.len());
 
     let num_layers = states[0].layers.len();

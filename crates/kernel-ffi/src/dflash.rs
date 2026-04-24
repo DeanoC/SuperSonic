@@ -98,7 +98,11 @@ pub fn bidir_attention(
         }
     };
     if status != 0 {
-        return Err(backend_error(backend, "dflash_draft bidir attention", status));
+        return Err(backend_error(
+            backend,
+            "dflash_draft bidir attention",
+            status,
+        ));
     }
     Ok(())
 }

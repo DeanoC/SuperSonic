@@ -42,7 +42,8 @@ impl Phi4Config {
     }
 
     pub fn mscale(&self) -> f64 {
-        let scale = self.max_position_embeddings as f64 / self.original_max_position_embeddings as f64;
+        let scale =
+            self.max_position_embeddings as f64 / self.original_max_position_embeddings as f64;
         if scale <= 1.0 {
             1.0
         } else {
@@ -66,7 +67,9 @@ impl Phi4Config {
 
 fn extract_token_ids(value: &Option<serde_json::Value>) -> Vec<u32> {
     match value {
-        Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| vec![v as u32]).unwrap_or_default(),
+        Some(serde_json::Value::Number(n)) => {
+            n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
+        }
         Some(serde_json::Value::Array(arr)) => arr
             .iter()
             .filter_map(|v| v.as_u64().map(|n| n as u32))
@@ -77,8 +80,10 @@ fn extract_token_ids(value: &Option<serde_json::Value>) -> Vec<u32> {
 
 pub fn load_config(model_dir: &std::path::Path) -> Result<Phi4Config, String> {
     let config_path = model_dir.join("config.json");
-    let text = std::fs::read_to_string(&config_path).map_err(|e| format!("read config.json: {e}"))?;
-    let config: Phi4Config = serde_json::from_str(&text).map_err(|e| format!("parse config.json: {e}"))?;
+    let text =
+        std::fs::read_to_string(&config_path).map_err(|e| format!("read config.json: {e}"))?;
+    let config: Phi4Config =
+        serde_json::from_str(&text).map_err(|e| format!("parse config.json: {e}"))?;
     validate(&config)?;
     Ok(config)
 }
@@ -101,7 +106,11 @@ fn validate(config: &Phi4Config) -> Result<(), String> {
         return Err(format!("rotary_dim {rot_dim} must be even"));
     }
     let expected_factor_len = rot_dim / 2;
-    if let Some(RopeScaling::Longrope { short_factor, long_factor }) = &config.rope_scaling {
+    if let Some(RopeScaling::Longrope {
+        short_factor,
+        long_factor,
+    }) = &config.rope_scaling
+    {
         if short_factor.len() != expected_factor_len {
             return Err(format!(
                 "short_factor length {} != rotary_dim/2 {}",

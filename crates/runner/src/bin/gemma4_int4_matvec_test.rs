@@ -161,23 +161,36 @@ fn test_single(dev: usize, shape: &Shape) -> Result<()> {
     let zero_bytes = f32_to_bf16_bytes(&zeros);
     let x_bytes = f32_to_bf16_bytes(&x_f32);
 
-    let w_packed = GpuBuffer::from_host_bytes(
-        dev, ScalarType::U8, &[out_dim, in_dim / 2], &packed_bytes,
-    )?;
+    let w_packed =
+        GpuBuffer::from_host_bytes(dev, ScalarType::U8, &[out_dim, in_dim / 2], &packed_bytes)?;
     let w_scale = GpuBuffer::from_host_bytes(
-        dev, ScalarType::BF16, &[out_dim / gs, in_dim / gs], &scale_bytes,
+        dev,
+        ScalarType::BF16,
+        &[out_dim / gs, in_dim / gs],
+        &scale_bytes,
     )?;
     let w_zero = GpuBuffer::from_host_bytes(
-        dev, ScalarType::BF16, &[out_dim / gs, in_dim / gs], &zero_bytes,
+        dev,
+        ScalarType::BF16,
+        &[out_dim / gs, in_dim / gs],
+        &zero_bytes,
     )?;
     let x = GpuBuffer::from_host_bytes(dev, ScalarType::BF16, &[in_dim], &x_bytes)?;
     let mut out_buf = GpuBuffer::zeros(dev, ScalarType::BF16, &[out_dim])?;
     let mut counter = GpuBuffer::zeros(dev, ScalarType::U32, &[1])?;
 
     g4::matvec_int4(
-        dev, ScalarType::BF16,
-        &mut out_buf, &x, &w_packed, &w_scale, &w_zero,
-        in_dim, out_dim, gs, &mut counter,
+        dev,
+        ScalarType::BF16,
+        &mut out_buf,
+        &x,
+        &w_packed,
+        &w_scale,
+        &w_zero,
+        in_dim,
+        out_dim,
+        gs,
+        &mut counter,
     )?;
 
     let got = bf16_bytes_to_f32(&out_buf.to_host_bytes()?);
@@ -240,23 +253,37 @@ fn test_batched(dev: usize, shape: &Shape, seq_len: usize) -> Result<()> {
     let zero_bytes = f32_to_bf16_bytes(&zeros);
     let x_bytes = f32_to_bf16_bytes(&x_flat);
 
-    let w_packed = GpuBuffer::from_host_bytes(
-        dev, ScalarType::U8, &[out_dim, in_dim / 2], &packed_bytes,
-    )?;
+    let w_packed =
+        GpuBuffer::from_host_bytes(dev, ScalarType::U8, &[out_dim, in_dim / 2], &packed_bytes)?;
     let w_scale = GpuBuffer::from_host_bytes(
-        dev, ScalarType::BF16, &[out_dim / gs, in_dim / gs], &scale_bytes,
+        dev,
+        ScalarType::BF16,
+        &[out_dim / gs, in_dim / gs],
+        &scale_bytes,
     )?;
     let w_zero = GpuBuffer::from_host_bytes(
-        dev, ScalarType::BF16, &[out_dim / gs, in_dim / gs], &zero_bytes,
+        dev,
+        ScalarType::BF16,
+        &[out_dim / gs, in_dim / gs],
+        &zero_bytes,
     )?;
     let x = GpuBuffer::from_host_bytes(dev, ScalarType::BF16, &[seq_len, in_dim], &x_bytes)?;
     let mut out_buf = GpuBuffer::zeros(dev, ScalarType::BF16, &[seq_len, out_dim])?;
     let mut counter = GpuBuffer::zeros(dev, ScalarType::U32, &[1])?;
 
     g4::matvec_batched_int4(
-        dev, ScalarType::BF16,
-        &mut out_buf, &x, &w_packed, &w_scale, &w_zero,
-        seq_len, in_dim, out_dim, gs, &mut counter,
+        dev,
+        ScalarType::BF16,
+        &mut out_buf,
+        &x,
+        &w_packed,
+        &w_scale,
+        &w_zero,
+        seq_len,
+        in_dim,
+        out_dim,
+        gs,
+        &mut counter,
     )?;
 
     let got = bf16_bytes_to_f32(&out_buf.to_host_bytes()?);
@@ -290,22 +317,70 @@ fn main() -> Result<()> {
     gpu_hal::set_device(dev).map_err(|e| anyhow!("set_device: {e}"))?;
 
     let shapes = [
-        Shape { in_dim: 1536, out_dim: 2048, label: "E2B-SWA-q_proj" },
-        Shape { in_dim: 1536, out_dim: 512, label: "E2B-FULL-k/v_proj" },
-        Shape { in_dim: 1536, out_dim: 12288, label: "E2B-wide-gate/up" },
-        Shape { in_dim: 12288, out_dim: 1536, label: "E2B-wide-down" },
-        Shape { in_dim: 2560, out_dim: 4096, label: "E4B-FULL-q_proj" },
+        Shape {
+            in_dim: 1536,
+            out_dim: 2048,
+            label: "E2B-SWA-q_proj",
+        },
+        Shape {
+            in_dim: 1536,
+            out_dim: 512,
+            label: "E2B-FULL-k/v_proj",
+        },
+        Shape {
+            in_dim: 1536,
+            out_dim: 12288,
+            label: "E2B-wide-gate/up",
+        },
+        Shape {
+            in_dim: 12288,
+            out_dim: 1536,
+            label: "E2B-wide-down",
+        },
+        Shape {
+            in_dim: 2560,
+            out_dim: 4096,
+            label: "E4B-FULL-q_proj",
+        },
         // E4B-specific shapes (added 2026-04-19 during INT4 drift investigation).
         // in_dim=2560 is critical: it's not a multiple of 2048 (block_stride),
         // so it exercises the multi-round non-aligned path which earlier E2B
         // tests never hit (E2B has in_dim=1536 which fits in one round).
-        Shape { in_dim: 2560, out_dim: 2048, label: "E4B-SWA-q_proj" },
-        Shape { in_dim: 2560, out_dim: 1024, label: "E4B-FULL-k/v_proj" },
-        Shape { in_dim: 2560, out_dim: 512, label: "E4B-SWA-k/v_proj" },
-        Shape { in_dim: 2560, out_dim: 10240, label: "E4B-gate/up" },
-        Shape { in_dim: 10240, out_dim: 2560, label: "E4B-down" },
-        Shape { in_dim: 4096, out_dim: 2560, label: "E4B-FULL-o_proj" },
-        Shape { in_dim: 2048, out_dim: 2560, label: "E4B-SWA-o_proj" },
+        Shape {
+            in_dim: 2560,
+            out_dim: 2048,
+            label: "E4B-SWA-q_proj",
+        },
+        Shape {
+            in_dim: 2560,
+            out_dim: 1024,
+            label: "E4B-FULL-k/v_proj",
+        },
+        Shape {
+            in_dim: 2560,
+            out_dim: 512,
+            label: "E4B-SWA-k/v_proj",
+        },
+        Shape {
+            in_dim: 2560,
+            out_dim: 10240,
+            label: "E4B-gate/up",
+        },
+        Shape {
+            in_dim: 10240,
+            out_dim: 2560,
+            label: "E4B-down",
+        },
+        Shape {
+            in_dim: 4096,
+            out_dim: 2560,
+            label: "E4B-FULL-o_proj",
+        },
+        Shape {
+            in_dim: 2048,
+            out_dim: 2560,
+            label: "E4B-SWA-o_proj",
+        },
     ];
 
     for shape in &shapes {
@@ -315,7 +390,10 @@ fn main() -> Result<()> {
         test_batched(dev, shape, 3)?;
     }
 
-    eprintln!("[PASS] all {} single + {} batched INT4 matvec tests",
-              shapes.len(), shapes.len());
+    eprintln!(
+        "[PASS] all {} single + {} batched INT4 matvec tests",
+        shapes.len(),
+        shapes.len()
+    );
     Ok(())
 }

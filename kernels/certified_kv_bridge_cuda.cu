@@ -33,6 +33,30 @@ __device__ __forceinline__ int clamp_i32(int value, int lo, int hi) {
     return value < lo ? lo : (value > hi ? hi : value);
 }
 
+__device__ __forceinline__ float block_reduce_max_256(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch[threadIdx.x] = fmaxf(scratch[threadIdx.x], scratch[threadIdx.x + stride]);
+        }
+        __syncthreads();
+    }
+    return scratch[0];
+}
+
+__device__ __forceinline__ float block_reduce_sum_256(float value, float* scratch) {
+    scratch[threadIdx.x] = value;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            scratch[threadIdx.x] += scratch[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    return scratch[0];
+}
+
 __device__ void atomic_max_nonnegative_float(float* address, float value) {
     int* address_as_i = reinterpret_cast<int*>(address);
     int old = *address_as_i;
@@ -562,21 +586,23 @@ __global__ void certified_kv_attend_int8_int4_bf16_tail_kernel(
     }
     __syncthreads();
 
-    __shared__ float max_score;
-    __shared__ float denom;
-    if (threadIdx.x == 0) {
-        float m = -INFINITY;
-        for (int tok = 0; tok < total_tokens; ++tok) {
-            m = fmaxf(m, score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok]);
-        }
-        float s = 0.0f;
-        for (int tok = 0; tok < total_tokens; ++tok) {
-            s += expf(score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - m);
-        }
-        max_score = m;
-        denom = s;
+    __shared__ float reduce_scratch[256];
+    float local_max = -INFINITY;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_max = fmaxf(
+            local_max,
+            score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok]
+        );
     }
-    __syncthreads();
+    const float max_score = block_reduce_max_256(local_max, reduce_scratch);
+
+    float local_denom = 0.0f;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_denom += expf(
+            score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - max_score
+        );
+    }
+    const float denom = block_reduce_sum_256(local_denom, reduce_scratch);
 
     for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
         const size_t score_idx = static_cast<size_t>(qh) * score_stride_tokens + tok;
@@ -618,6 +644,278 @@ __global__ void certified_kv_attend_int8_int4_bf16_tail_kernel(
         } else {
             output_f32[out_idx] = acc;
         }
+    }
+}
+
+__global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
+    const __nv_bfloat16* query,
+    const uint8_t* key_int8,
+    const float* key_scale,
+    const __nv_bfloat16* promoted_key_bf16,
+    const uint32_t* promote_index,
+    const __nv_bfloat16* promoted_value_bf16,
+    const uint32_t* value_promote_index,
+    const uint8_t* value_int4,
+    const __half* value_scale,
+    const __half* value_zero,
+    const __nv_bfloat16* tail_key,
+    const __nv_bfloat16* tail_value,
+    float* score_scratch,
+    __nv_bfloat16* output_bf16,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int tail_len,
+    int key_stride_tokens,
+    int key_scale_stride_blocks,
+    int max_promoted_blocks,
+    int max_promoted_value_blocks,
+    int value_stride_tokens,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
+    int tail_value_start_tokens,
+    int tail_value_stride_tokens,
+    int score_stride_tokens,
+    int head_dim,
+    int value_group_size,
+    int gqa_group,
+    float q_scale
+) {
+    const int qh = blockIdx.x;
+    if (qh >= q_heads) return;
+    const int kvh = qh / gqa_group;
+    if (kvh >= kv_heads) return;
+    const int aligned_tokens = num_blocks * block_size;
+    const int total_tokens = aligned_tokens + tail_len;
+
+    for (int tok = threadIdx.x; tok < aligned_tokens; tok += blockDim.x) {
+        const int block_id = tok / block_size;
+        const uint32_t promoted_slot =
+            promote_index[static_cast<size_t>(qh) * num_blocks + block_id];
+        const bool promote = promoted_slot != 0xffffffffu;
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+            float k;
+            if (promote) {
+                const int token_in_block = tok - block_id * block_size;
+                k = bf16_to_float(
+                    promoted_key_bf16[
+                        ((static_cast<size_t>(qh) * max_promoted_blocks + promoted_slot) *
+                             block_size +
+                         token_in_block) *
+                            head_dim +
+                        d
+                    ]
+                );
+            } else {
+                const int8_t kq = static_cast<int8_t>(
+                    key_int8[(static_cast<size_t>(kvh) * key_stride_tokens + tok) * head_dim + d]
+                );
+                const float ks =
+                    key_scale[
+                        (static_cast<size_t>(kvh) * key_scale_stride_blocks + block_id) * head_dim + d
+                    ];
+                k = static_cast<float>(kq) * ks;
+            }
+            acc += q * k;
+        }
+        score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] = acc * q_scale;
+    }
+    for (int tail_tok = threadIdx.x; tail_tok < tail_len; tail_tok += blockDim.x) {
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+            const float k = bf16_to_float(
+                tail_key[
+                    (static_cast<size_t>(kvh) * tail_key_stride_tokens +
+                     tail_key_start_tokens + tail_tok) * head_dim + d
+                ]
+            );
+            acc += q * k;
+        }
+        score_scratch[static_cast<size_t>(qh) * score_stride_tokens + aligned_tokens + tail_tok] =
+            acc * q_scale;
+    }
+    __syncthreads();
+
+    __shared__ float max_score;
+    __shared__ float denom;
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            m = fmaxf(m, score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok]);
+        }
+        float s = 0.0f;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            s += expf(score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - m);
+        }
+        max_score = m;
+        denom = s;
+    }
+    __syncthreads();
+
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        const size_t score_idx = static_cast<size_t>(qh) * score_stride_tokens + tok;
+        score_scratch[score_idx] = expf(score_scratch[score_idx] - max_score) / denom;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            const float w = score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
+        float v;
+        if (tok < aligned_tokens) {
+            const int block_id = tok / block_size;
+            const uint32_t promoted_value_slot =
+                value_promote_index[static_cast<size_t>(kvh) * num_blocks + block_id];
+            if (promoted_value_slot != 0xffffffffu) {
+                const int token_in_block = tok - block_id * block_size;
+                v = bf16_to_float(
+                    promoted_value_bf16[
+                        ((static_cast<size_t>(kvh) * max_promoted_value_blocks +
+                          promoted_value_slot) *
+                             block_size +
+                         token_in_block) *
+                            head_dim +
+                        d
+                    ]
+                );
+            } else {
+                v = certified_kv_dequant_int4_value(
+                    value_int4,
+                    value_scale,
+                    value_zero,
+                    kvh,
+                    tok,
+                    d,
+                    value_stride_tokens,
+                    head_dim,
+                    value_group_size
+                );
+            }
+        } else {
+            const int tail_tok = tok - aligned_tokens;
+            v = bf16_to_float(
+                    tail_value[
+                        (static_cast<size_t>(kvh) * tail_value_stride_tokens +
+                         tail_value_start_tokens + tail_tok) * head_dim + d
+                    ]
+                );
+            }
+            acc += w * v;
+        }
+        output_bf16[static_cast<size_t>(qh) * head_dim + d] = __float2bfloat16(acc);
+    }
+}
+
+__global__ void certified_kv_dense_selected_heads_kernel(
+    const __nv_bfloat16* query,
+    const uint32_t* fallback_heads,
+    const uint32_t* fallback_kv_slots,
+    const uint32_t* fallback_kv_heads,
+    const __nv_bfloat16* fallback_key,
+    const __nv_bfloat16* fallback_value,
+    const __nv_bfloat16* tail_key,
+    const __nv_bfloat16* tail_value,
+    float* score_scratch,
+    __nv_bfloat16* output_bf16,
+    int q_heads,
+    int fallback_count,
+    int fallback_kv_count,
+    int prefix_tokens,
+    int tail_len,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
+    int tail_value_start_tokens,
+    int tail_value_stride_tokens,
+    int score_stride_tokens,
+    int head_dim,
+    float q_scale
+) {
+    const int fallback_idx = blockIdx.x;
+    if (fallback_idx >= fallback_count) return;
+    const int qh = static_cast<int>(fallback_heads[fallback_idx]);
+    if (qh < 0 || qh >= q_heads) return;
+    const int kv_slot = static_cast<int>(fallback_kv_slots[fallback_idx]);
+    if (kv_slot < 0 || kv_slot >= fallback_kv_count) return;
+    const int kvh = static_cast<int>(fallback_kv_heads[kv_slot]);
+    const int total_tokens = prefix_tokens + tail_len;
+
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        float acc = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+            float k;
+            if (tok < prefix_tokens) {
+                k = bf16_to_float(
+                    fallback_key[(static_cast<size_t>(kv_slot) * prefix_tokens + tok) * head_dim + d]
+                );
+            } else {
+                const int tail_tok = tok - prefix_tokens;
+                k = bf16_to_float(
+                    tail_key[
+                        (static_cast<size_t>(kvh) * tail_key_stride_tokens +
+                         tail_key_start_tokens + tail_tok) * head_dim + d
+                    ]
+                );
+            }
+            acc += q * k;
+        }
+        score_scratch[static_cast<size_t>(fallback_idx) * score_stride_tokens + tok] =
+            acc * q_scale;
+    }
+    __syncthreads();
+
+    __shared__ float reduce_scratch[256];
+    float local_max = -INFINITY;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_max = fmaxf(
+            local_max,
+            score_scratch[static_cast<size_t>(fallback_idx) * score_stride_tokens + tok]
+        );
+    }
+    const float max_score = block_reduce_max_256(local_max, reduce_scratch);
+
+    float local_denom = 0.0f;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_denom += expf(
+            score_scratch[static_cast<size_t>(fallback_idx) * score_stride_tokens + tok] -
+            max_score
+        );
+    }
+    const float denom = block_reduce_sum_256(local_denom, reduce_scratch);
+
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        const size_t score_idx = static_cast<size_t>(fallback_idx) * score_stride_tokens + tok;
+        score_scratch[score_idx] = expf(score_scratch[score_idx] - max_score) / denom;
+    }
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float acc = 0.0f;
+        for (int tok = 0; tok < total_tokens; ++tok) {
+            const float w =
+                score_scratch[static_cast<size_t>(fallback_idx) * score_stride_tokens + tok];
+            float v;
+            if (tok < prefix_tokens) {
+                v = bf16_to_float(
+                    fallback_value[(static_cast<size_t>(kv_slot) * prefix_tokens + tok) * head_dim + d]
+                );
+            } else {
+                const int tail_tok = tok - prefix_tokens;
+                v = bf16_to_float(
+                    tail_value[
+                        (static_cast<size_t>(kvh) * tail_value_stride_tokens +
+                         tail_value_start_tokens + tail_tok) * head_dim + d
+                    ]
+                );
+            }
+            acc += w * v;
+        }
+        output_bf16[static_cast<size_t>(qh) * head_dim + d] = __float2bfloat16(acc);
     }
 }
 
@@ -1445,6 +1743,182 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_
         q_scale
     );
     if (cudaGetLastError() != cudaSuccess) return 75;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
+    size_t device_ordinal,
+    const void* query_bf16,
+    const void* key_int8,
+    const void* key_scale,
+    const void* promoted_key_bf16,
+    const void* promote_index,
+    const void* promoted_value_bf16,
+    const void* value_promote_index,
+    const void* value_int4,
+    const void* value_scale,
+    const void* value_zero,
+    const void* tail_key_bf16,
+    const void* tail_value_bf16,
+    void* score_scratch,
+    void* output_bf16,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int tail_len,
+    int key_stride_tokens,
+    int key_scale_stride_blocks,
+    int max_promoted_blocks,
+    int max_promoted_value_blocks,
+    int value_stride_tokens,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
+    int tail_value_start_tokens,
+    int tail_value_stride_tokens,
+    int score_stride_tokens,
+    int head_dim,
+    int value_group_size,
+    int gqa_group,
+    float q_scale
+) {
+    if (query_bf16 == nullptr || key_int8 == nullptr || key_scale == nullptr ||
+        promoted_key_bf16 == nullptr || promote_index == nullptr ||
+        promoted_value_bf16 == nullptr || value_promote_index == nullptr ||
+        value_int4 == nullptr || value_scale == nullptr || value_zero == nullptr ||
+        score_scratch == nullptr || output_bf16 == nullptr) {
+        return 81;
+    }
+    if (tail_len > 0 && (tail_key_bf16 == nullptr || tail_value_bf16 == nullptr)) {
+        return 82;
+    }
+    if (q_heads <= 0 || kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
+        tail_len < 0 || key_stride_tokens <= 0 || key_scale_stride_blocks <= 0 ||
+        max_promoted_blocks <= 0 || max_promoted_value_blocks <= 0 ||
+        value_stride_tokens <= 0 ||
+        tail_key_start_tokens < 0 || tail_value_start_tokens < 0 ||
+        score_stride_tokens <= 0 || head_dim <= 0 || value_group_size <= 0 || gqa_group <= 0) {
+        return 83;
+    }
+    const int aligned_tokens = num_blocks * block_size;
+    const int total_tokens = aligned_tokens + tail_len;
+    if (head_dim % 2 != 0 || head_dim % value_group_size != 0 ||
+        block_size > 256 || q_heads != kv_heads * gqa_group ||
+        key_stride_tokens < aligned_tokens || key_scale_stride_blocks < num_blocks ||
+        value_stride_tokens < aligned_tokens ||
+        score_stride_tokens < total_tokens ||
+        (tail_len > 0 && tail_key_stride_tokens < tail_key_start_tokens + tail_len) ||
+        (tail_len > 0 && tail_value_stride_tokens < tail_value_start_tokens + tail_len)) {
+        return 84;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    certified_kv_attend_mixed_key_int4_bf16_tail_kernel<<<q_heads, 256>>>(
+        static_cast<const __nv_bfloat16*>(query_bf16),
+        static_cast<const uint8_t*>(key_int8),
+        static_cast<const float*>(key_scale),
+        static_cast<const __nv_bfloat16*>(promoted_key_bf16),
+        static_cast<const uint32_t*>(promote_index),
+        static_cast<const __nv_bfloat16*>(promoted_value_bf16),
+        static_cast<const uint32_t*>(value_promote_index),
+        static_cast<const uint8_t*>(value_int4),
+        static_cast<const __half*>(value_scale),
+        static_cast<const __half*>(value_zero),
+        static_cast<const __nv_bfloat16*>(tail_key_bf16),
+        static_cast<const __nv_bfloat16*>(tail_value_bf16),
+        static_cast<float*>(score_scratch),
+        static_cast<__nv_bfloat16*>(output_bf16),
+        q_heads,
+        kv_heads,
+        num_blocks,
+        block_size,
+        tail_len,
+        key_stride_tokens,
+        key_scale_stride_blocks,
+        max_promoted_blocks,
+        max_promoted_value_blocks,
+        value_stride_tokens,
+        tail_key_start_tokens,
+        tail_key_stride_tokens,
+        tail_value_start_tokens,
+        tail_value_stride_tokens,
+        score_stride_tokens,
+        head_dim,
+        value_group_size,
+        gqa_group,
+        q_scale
+    );
+    if (cudaGetLastError() != cudaSuccess) return 85;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
+    size_t device_ordinal,
+    const void* query_bf16,
+    const void* fallback_heads,
+    const void* fallback_kv_slots,
+    const void* fallback_kv_heads,
+    const void* fallback_key_bf16,
+    const void* fallback_value_bf16,
+    const void* tail_key_bf16,
+    const void* tail_value_bf16,
+    void* score_scratch,
+    void* output_bf16,
+    int q_heads,
+    int fallback_count,
+    int fallback_kv_count,
+    int prefix_tokens,
+    int tail_len,
+    int tail_key_start_tokens,
+    int tail_key_stride_tokens,
+    int tail_value_start_tokens,
+    int tail_value_stride_tokens,
+    int score_stride_tokens,
+    int head_dim,
+    float q_scale
+) {
+    if (query_bf16 == nullptr || fallback_heads == nullptr ||
+        fallback_kv_slots == nullptr || fallback_kv_heads == nullptr ||
+        fallback_key_bf16 == nullptr || fallback_value_bf16 == nullptr ||
+        score_scratch == nullptr || output_bf16 == nullptr) {
+        return 91;
+    }
+    if (tail_len > 0 && (tail_key_bf16 == nullptr || tail_value_bf16 == nullptr)) {
+        return 94;
+    }
+    const int total_tokens = prefix_tokens + tail_len;
+    if (q_heads <= 0 || fallback_count <= 0 || fallback_kv_count <= 0 || prefix_tokens < 0 ||
+        tail_len < 0 || total_tokens <= 0 || score_stride_tokens < total_tokens ||
+        head_dim <= 0 || tail_key_start_tokens < 0 || tail_value_start_tokens < 0 ||
+        (tail_len > 0 && tail_key_stride_tokens < tail_key_start_tokens + tail_len) ||
+        (tail_len > 0 && tail_value_stride_tokens < tail_value_start_tokens + tail_len)) {
+        return 92;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    certified_kv_dense_selected_heads_kernel<<<fallback_count, 256>>>(
+        static_cast<const __nv_bfloat16*>(query_bf16),
+        static_cast<const uint32_t*>(fallback_heads),
+        static_cast<const uint32_t*>(fallback_kv_slots),
+        static_cast<const uint32_t*>(fallback_kv_heads),
+        static_cast<const __nv_bfloat16*>(fallback_key_bf16),
+        static_cast<const __nv_bfloat16*>(fallback_value_bf16),
+        static_cast<const __nv_bfloat16*>(tail_key_bf16),
+        static_cast<const __nv_bfloat16*>(tail_value_bf16),
+        static_cast<float*>(score_scratch),
+        static_cast<__nv_bfloat16*>(output_bf16),
+        q_heads,
+        fallback_count,
+        fallback_kv_count,
+        prefix_tokens,
+        tail_len,
+        tail_key_start_tokens,
+        tail_key_stride_tokens,
+        tail_value_start_tokens,
+        tail_value_stride_tokens,
+        score_stride_tokens,
+        head_dim,
+        q_scale
+    );
+    if (cudaGetLastError() != cudaSuccess) return 93;
     return 0;
 }
 

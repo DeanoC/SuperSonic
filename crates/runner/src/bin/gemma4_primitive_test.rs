@@ -33,7 +33,12 @@ fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -51,13 +56,15 @@ fn nearly_eq(a: f32, b: f32, rtol: f32, atol: f32) -> bool {
 
 fn assert_vec(label: &str, got: &[f32], want: &[f32], rtol: f32, atol: f32) -> Result<()> {
     if got.len() != want.len() {
-        bail!("{label}: length mismatch got={} want={}", got.len(), want.len());
+        bail!(
+            "{label}: length mismatch got={} want={}",
+            got.len(),
+            want.len()
+        );
     }
     for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
         if !nearly_eq(g, w, rtol, atol) {
-            bail!(
-                "{label}: element [{i}] got={g:.6} want={w:.6} (rtol={rtol} atol={atol})"
-            );
+            bail!("{label}: element [{i}] got={g:.6} want={w:.6} (rtol={rtol} atol={atol})");
         }
     }
     Ok(())
@@ -97,7 +104,9 @@ fn test_rms_norm_no_weight() -> Result<()> {
     let x: Vec<f32> = vec![1.0, 2.0, -3.0, -4.0];
     let eps = 1e-6_f32;
     let n = x.len();
-    let inv_rms = ((x.iter().map(|v| v * v).sum::<f32>() / n as f32) + eps).sqrt().recip();
+    let inv_rms = ((x.iter().map(|v| v * v).sum::<f32>() / n as f32) + eps)
+        .sqrt()
+        .recip();
     let want: Vec<f32> = x.iter().map(|&xv| xv * inv_rms).collect();
 
     let xs = upload_bf16(&[n], &x)?;
@@ -128,7 +137,16 @@ fn test_matvec() -> Result<()> {
     let ws = upload_bf16(&[out_dim, in_dim], &w)?;
     let mut out = GpuBuffer::zeros(0, ScalarType::BF16, &[out_dim])?;
     let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
-    gemma4::matvec(0, ScalarType::BF16, &mut out, &xs, &ws, in_dim, out_dim, &mut counter)?;
+    gemma4::matvec(
+        0,
+        ScalarType::BF16,
+        &mut out,
+        &xs,
+        &ws,
+        in_dim,
+        out_dim,
+        &mut counter,
+    )?;
     let got = download_bf16(&out)?;
     assert_vec("matvec", &got, &want, 2e-2, 5e-3)
 }
@@ -222,8 +240,15 @@ fn test_rope_decode() -> Result<()> {
     let mut x_b = upload_bf16(&[num_heads, head_dim], &x_host)?;
 
     gemma4::rope_decode(
-        0, ScalarType::BF16, &mut x_b, &cos_b, &sin_b,
-        num_heads, head_dim, rotary_dim, position,
+        0,
+        ScalarType::BF16,
+        &mut x_b,
+        &cos_b,
+        &sin_b,
+        num_heads,
+        head_dim,
+        rotary_dim,
+        position,
     )?;
 
     let got = download_bf16(&x_b)?;
@@ -255,8 +280,16 @@ fn test_kv_append() -> Result<()> {
     let mut v_cache = GpuBuffer::zeros(0, ScalarType::BF16, &[num_kv, max_t, head_dim])?;
 
     gemma4::kv_append(
-        0, ScalarType::BF16, &k_in_b, &v_in_b, &mut k_cache, &mut v_cache,
-        num_kv, head_dim, pos, max_t,
+        0,
+        ScalarType::BF16,
+        &k_in_b,
+        &v_in_b,
+        &mut k_cache,
+        &mut v_cache,
+        num_kv,
+        head_dim,
+        pos,
+        max_t,
     )?;
 
     let k_host = download_bf16(&k_cache)?;
@@ -266,18 +299,28 @@ fn test_kv_append() -> Result<()> {
         for t in 0..max_t {
             for d in 0..head_dim {
                 let off = (h * max_t + t) * head_dim + d;
-                let expected_k = if t == pos { k_in[h * head_dim + d] } else { 0.0 };
-                let expected_v = if t == pos { v_in[h * head_dim + d] } else { 0.0 };
+                let expected_k = if t == pos {
+                    k_in[h * head_dim + d]
+                } else {
+                    0.0
+                };
+                let expected_v = if t == pos {
+                    v_in[h * head_dim + d]
+                } else {
+                    0.0
+                };
                 if !nearly_eq(k_host[off], expected_k, 2e-2, 5e-3) {
                     bail!(
                         "kv_append K mismatch at h={h} t={t} d={d}: got {} want {}",
-                        k_host[off], expected_k
+                        k_host[off],
+                        expected_k
                     );
                 }
                 if !nearly_eq(v_host[off], expected_v, 2e-2, 5e-3) {
                     bail!(
                         "kv_append V mismatch at h={h} t={t} d={d}: got {} want {}",
-                        v_host[off], expected_v
+                        v_host[off],
+                        expected_v
                     );
                 }
             }
@@ -302,16 +345,13 @@ fn test_swa_attn_uniform() -> Result<()> {
 
     let q: Vec<f32> = vec![0.0; num_q * hd];
     let k: Vec<f32> = vec![
-        1.0, 2.0, 3.0, 4.0,  // t=0
-        5.0, 6.0, 7.0, 8.0,  // t=1
-        0.0, 0.0, 0.0, 0.0,  // t=2 (unused)
-        0.0, 0.0, 0.0, 0.0,  // t=3
+        1.0, 2.0, 3.0, 4.0, // t=0
+        5.0, 6.0, 7.0, 8.0, // t=1
+        0.0, 0.0, 0.0, 0.0, // t=2 (unused)
+        0.0, 0.0, 0.0, 0.0, // t=3
     ];
     let v: Vec<f32> = vec![
-        2.0, 4.0, 6.0, 8.0,
-        10.0, 12.0, 14.0, 16.0,
-        0.0, 0.0, 0.0, 0.0,
-        0.0, 0.0, 0.0, 0.0,
+        2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
     ];
     let want: Vec<f32> = vec![6.0, 8.0, 10.0, 12.0]; // avg of V[0] and V[1]
 
@@ -322,8 +362,20 @@ fn test_swa_attn_uniform() -> Result<()> {
     let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q, max_t])?;
 
     gemma4::swa_attn_decode(
-        0, ScalarType::BF16, &q_b, &k_b, &v_b, &mut scores, &mut out,
-        num_q, num_kv, hd, kv_len, max_t, 0 /* no window */, 1.0,
+        0,
+        ScalarType::BF16,
+        &q_b,
+        &k_b,
+        &v_b,
+        &mut scores,
+        &mut out,
+        num_q,
+        num_kv,
+        hd,
+        kv_len,
+        max_t,
+        0, /* no window */
+        1.0,
     )?;
 
     let got = download_bf16(&out)?;
@@ -342,17 +394,10 @@ fn test_swa_attn_window_masks_oldest() -> Result<()> {
 
     let q: Vec<f32> = vec![0.0; hd];
     let k: Vec<f32> = vec![
-        100.0, 100.0,  // t=0 — would dominate if not masked
-        1.0, 1.0,
-        2.0, 2.0,
-        0.0, 0.0,
+        100.0, 100.0, // t=0 — would dominate if not masked
+        1.0, 1.0, 2.0, 2.0, 0.0, 0.0,
     ];
-    let v: Vec<f32> = vec![
-        10.0, 20.0,
-        3.0, 5.0,
-        5.0, 9.0,
-        0.0, 0.0,
-    ];
+    let v: Vec<f32> = vec![10.0, 20.0, 3.0, 5.0, 5.0, 9.0, 0.0, 0.0];
     // Expected: avg(V[1], V[2]) = (4.0, 7.0)
     let want: Vec<f32> = vec![4.0, 7.0];
 
@@ -363,8 +408,20 @@ fn test_swa_attn_window_masks_oldest() -> Result<()> {
     let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q, max_t])?;
 
     gemma4::swa_attn_decode(
-        0, ScalarType::BF16, &q_b, &k_b, &v_b, &mut scores, &mut out,
-        num_q, num_kv, hd, kv_len, max_t, 2 /* window=2 */, 1.0,
+        0,
+        ScalarType::BF16,
+        &q_b,
+        &k_b,
+        &v_b,
+        &mut scores,
+        &mut out,
+        num_q,
+        num_kv,
+        hd,
+        kv_len,
+        max_t,
+        2, /* window=2 */
+        1.0,
     )?;
 
     let got = download_bf16(&out)?;
@@ -396,8 +453,20 @@ fn test_swa_attn_gqa() -> Result<()> {
     let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q, max_t])?;
 
     gemma4::swa_attn_decode(
-        0, ScalarType::BF16, &q_b, &k_b, &v_b, &mut scores, &mut out,
-        num_q, num_kv, hd, kv_len, max_t, 0, 1.0,
+        0,
+        ScalarType::BF16,
+        &q_b,
+        &k_b,
+        &v_b,
+        &mut scores,
+        &mut out,
+        num_q,
+        num_kv,
+        hd,
+        kv_len,
+        max_t,
+        0,
+        1.0,
     )?;
 
     let got = download_bf16(&out)?;
@@ -416,7 +485,10 @@ fn main() -> Result<()> {
         ("rope_decode", test_rope_decode),
         ("kv_append", test_kv_append),
         ("swa_attn_uniform", test_swa_attn_uniform),
-        ("swa_attn_window_masks_oldest", test_swa_attn_window_masks_oldest),
+        (
+            "swa_attn_window_masks_oldest",
+            test_swa_attn_window_masks_oldest,
+        ),
         ("swa_attn_gqa", test_swa_attn_gqa),
     ];
 
