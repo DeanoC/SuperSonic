@@ -1092,52 +1092,116 @@ __global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
     }
     __syncthreads();
 
-    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+    if (head_dim <= 128) {
+        __shared__ float value_partial[256];
+        const int d = threadIdx.x % head_dim;
+        const int lane = threadIdx.x / head_dim;
+        const int lanes_per_dim = blockDim.x / head_dim;
         float acc = 0.0f;
-        for (int tok = 0; tok < total_tokens; ++tok) {
-            const float w = score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
-        float v;
-        if (tok < aligned_tokens) {
-            const int block_id = tok / block_size;
-            const uint32_t promoted_value_slot =
-                value_promote_index[static_cast<size_t>(kvh) * num_blocks + block_id];
-            if (promoted_value_slot != 0xffffffffu) {
-                const int token_in_block = tok - block_id * block_size;
-                v = bf16_to_float(
-                    promoted_value_bf16[
-                        ((static_cast<size_t>(kvh) * max_promoted_value_blocks +
-                          promoted_value_slot) *
-                             block_size +
-                         token_in_block) *
-                            head_dim +
-                        d
-                    ]
-                );
-            } else {
-                v = certified_kv_dequant_int4_value(
-                    value_int4,
-                    value_scale,
-                    value_zero,
-                    kvh,
-                    tok,
-                    d,
-                    value_stride_tokens,
-                    head_dim,
-                    value_group_size
-                );
+        if (lane < lanes_per_dim) {
+            for (int tok = lane; tok < total_tokens; tok += lanes_per_dim) {
+                const float w =
+                    score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
+                float v;
+                if (tok < aligned_tokens) {
+                    const int block_id = tok / block_size;
+                    const uint32_t promoted_value_slot =
+                        value_promote_index[static_cast<size_t>(kvh) * num_blocks + block_id];
+                    if (promoted_value_slot != 0xffffffffu) {
+                        const int token_in_block = tok - block_id * block_size;
+                        v = bf16_to_float(
+                            promoted_value_bf16[
+                                ((static_cast<size_t>(kvh) * max_promoted_value_blocks +
+                                  promoted_value_slot) *
+                                     block_size +
+                                 token_in_block) *
+                                    head_dim +
+                                d
+                            ]
+                        );
+                    } else {
+                        v = certified_kv_dequant_int4_value(
+                            value_int4,
+                            value_scale,
+                            value_zero,
+                            kvh,
+                            tok,
+                            d,
+                            value_stride_tokens,
+                            head_dim,
+                            value_group_size
+                        );
+                    }
+                } else {
+                    const int tail_tok = tok - aligned_tokens;
+                    v = bf16_to_float(
+                        tail_value[
+                            (static_cast<size_t>(kvh) * tail_value_stride_tokens +
+                             tail_value_start_tokens + tail_tok) * head_dim + d
+                        ]
+                    );
+                }
+                acc += w * v;
             }
-        } else {
-            const int tail_tok = tok - aligned_tokens;
-            v = bf16_to_float(
-                    tail_value[
-                        (static_cast<size_t>(kvh) * tail_value_stride_tokens +
-                         tail_value_start_tokens + tail_tok) * head_dim + d
-                    ]
-                );
-            }
-            acc += w * v;
         }
-        output_bf16[static_cast<size_t>(qh) * head_dim + d] = __float2bfloat16(acc);
+        value_partial[threadIdx.x] = acc;
+        __syncthreads();
+        if (lane == 0) {
+            float sum = 0.0f;
+            for (int l = 0; l < lanes_per_dim; ++l) {
+                sum += value_partial[l * head_dim + d];
+            }
+            output_bf16[static_cast<size_t>(qh) * head_dim + d] = __float2bfloat16(sum);
+        }
+    } else {
+        for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+            float acc = 0.0f;
+            for (int tok = 0; tok < total_tokens; ++tok) {
+                const float w =
+                    score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
+                float v;
+                if (tok < aligned_tokens) {
+                    const int block_id = tok / block_size;
+                    const uint32_t promoted_value_slot =
+                        value_promote_index[static_cast<size_t>(kvh) * num_blocks + block_id];
+                    if (promoted_value_slot != 0xffffffffu) {
+                        const int token_in_block = tok - block_id * block_size;
+                        v = bf16_to_float(
+                            promoted_value_bf16[
+                                ((static_cast<size_t>(kvh) * max_promoted_value_blocks +
+                                  promoted_value_slot) *
+                                     block_size +
+                                 token_in_block) *
+                                    head_dim +
+                                d
+                            ]
+                        );
+                    } else {
+                        v = certified_kv_dequant_int4_value(
+                            value_int4,
+                            value_scale,
+                            value_zero,
+                            kvh,
+                            tok,
+                            d,
+                            value_stride_tokens,
+                            head_dim,
+                            value_group_size
+                        );
+                    }
+                } else {
+                    const int tail_tok = tok - aligned_tokens;
+                    v = bf16_to_float(
+                        tail_value[
+                            (static_cast<size_t>(kvh) * tail_value_stride_tokens +
+                             tail_value_start_tokens + tail_tok) * head_dim + d
+                        ]
+                    );
+                }
+                acc += w * v;
+            }
+            output_bf16[static_cast<size_t>(qh) * head_dim + d] = __float2bfloat16(acc);
+        }
     }
 }
 
