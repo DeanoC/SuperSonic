@@ -38,6 +38,7 @@ impl Default for BackendArg {
 #[serde(rename_all = "snake_case")]
 pub enum BughuntMode {
     Gate,
+    DecodeGate,
     Localize,
     Dump,
     Bench,
@@ -47,6 +48,7 @@ impl BughuntMode {
     fn as_str(self) -> &'static str {
         match self {
             Self::Gate => "gate",
+            Self::DecodeGate => "decode_gate",
             Self::Localize => "localize",
             Self::Dump => "dump",
             Self::Bench => "bench",
@@ -263,6 +265,45 @@ pub struct GateRunSection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DecodeStepGateReport {
+    pub step: usize,
+    pub oracle_token: u32,
+    pub replay_token: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_token: Option<u32>,
+    pub replay_logit_reference: String,
+    pub replay_logit_max_abs: f32,
+    pub replay_logit_mean_abs: f32,
+    pub token_match_replay: bool,
+    pub token_match_component: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodeGatePromptReport {
+    pub name: String,
+    pub notes: Option<String>,
+    pub pass: bool,
+    pub prompt_len: usize,
+    pub decode_tokens: usize,
+    pub oracle_tokens: Vec<u32>,
+    pub replay_tokens: Vec<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_tokens: Option<Vec<u32>>,
+    pub max_replay_logit_abs: f32,
+    pub mean_replay_logit_abs: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_mismatch_step: Option<usize>,
+    pub steps: Vec<DecodeStepGateReport>,
+    pub timings: Vec<PhaseTimingReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodeGateRunSection {
+    pub pass: bool,
+    pub prompt_results: Vec<DecodeGatePromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct LocalizeRunSection {
     pub pass: bool,
     pub gate_prompt: PromptGateReport,
@@ -389,6 +430,8 @@ pub struct BughuntReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gate: Option<GateRunSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub decode_gate: Option<DecodeGateRunSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub localize: Option<LocalizeRunSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dump: Option<DumpRunSection>,
@@ -402,6 +445,18 @@ impl BughuntReport {
             "gate" => {
                 if self
                     .gate
+                    .as_ref()
+                    .map(|section| section.pass)
+                    .unwrap_or(false)
+                {
+                    0
+                } else {
+                    1
+                }
+            }
+            "decode_gate" => {
+                if self
+                    .decode_gate
                     .as_ref()
                     .map(|section| section.pass)
                     .unwrap_or(false)
@@ -494,6 +549,24 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 mode: args.mode.as_str().to_string(),
                 metadata,
                 gate: Some(reports),
+                decode_gate: None,
+                localize: None,
+                dump: None,
+                bench: None,
+            }
+        }
+        BughuntMode::DecodeGate => {
+            let section = run_decode_gate_mode(
+                &runtime,
+                &manifest,
+                args.prompt.as_deref(),
+                args.bench_decode_tokens,
+            )?;
+            BughuntReport {
+                mode: args.mode.as_str().to_string(),
+                metadata,
+                gate: None,
+                decode_gate: Some(section),
                 localize: None,
                 dump: None,
                 bench: None,
@@ -505,6 +578,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 mode: args.mode.as_str().to_string(),
                 metadata,
                 gate: None,
+                decode_gate: None,
                 localize: Some(section),
                 dump: None,
                 bench: None,
@@ -523,6 +597,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 mode: args.mode.as_str().to_string(),
                 metadata,
                 gate: None,
+                decode_gate: None,
                 localize: None,
                 dump: Some(section),
                 bench: None,
@@ -542,6 +617,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 mode: args.mode.as_str().to_string(),
                 metadata,
                 gate: None,
+                decode_gate: None,
                 localize: None,
                 dump: None,
                 bench: Some(section),
@@ -569,6 +645,9 @@ fn validate_args(args: &BughuntArgs) -> Result<()> {
     }
     if matches!(args.mode, BughuntMode::Bench) && args.bench_iterations == 0 {
         bail!("--iters must be greater than zero in bench mode");
+    }
+    if matches!(args.mode, BughuntMode::DecodeGate) && args.bench_decode_tokens == 0 {
+        bail!("--decode-tokens must be greater than zero in decode-gate mode");
     }
     Ok(())
 }
@@ -899,6 +978,174 @@ fn run_gate_mode(
     Ok(GateRunSection {
         pass,
         prompt_results,
+    })
+}
+
+fn run_decode_gate_mode(
+    runtime: &QwenBughuntRuntime,
+    manifest: &PromptManifest,
+    selected_prompt: Option<&str>,
+    decode_tokens: usize,
+) -> Result<DecodeGateRunSection> {
+    let prompts = select_prompts(manifest, selected_prompt)?;
+    let mut prompt_results = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        eprintln!(
+            "[bughunt] decode_gate prompt={} decode_tokens={} start",
+            prompt.name, decode_tokens
+        );
+        let report = analyze_decode_gate_prompt(runtime, prompt, decode_tokens)?;
+        eprintln!(
+            "[bughunt] decode_gate prompt={} done pass={} first_mismatch={} max_replay_logit_abs={:.4}",
+            prompt.name,
+            report.pass,
+            report
+                .first_mismatch_step
+                .map(|step| step.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            report.max_replay_logit_abs
+        );
+        prompt_results.push(report);
+    }
+    let pass = prompt_results.iter().all(|report| report.pass);
+    Ok(DecodeGateRunSection {
+        pass,
+        prompt_results,
+    })
+}
+
+fn analyze_decode_gate_prompt(
+    runtime: &QwenBughuntRuntime,
+    prompt: &PromptManifestEntry,
+    decode_tokens: usize,
+) -> Result<DecodeGatePromptReport> {
+    let prompt_start = Instant::now();
+    let mut timings = Vec::new();
+
+    eprintln!("[bughunt] decode_gate prompt={} oracle", prompt.name);
+    let phase_start = Instant::now();
+    let oracle_output = oracle::run_oracle(
+        &runtime.oracle_script,
+        runtime.model_variant.hf_model_id(),
+        &prompt.prompt_ids,
+        decode_tokens,
+        "bf16",
+        &runtime.oracle_device,
+        false,
+        false,
+        None,
+        None,
+    )?;
+    timings.push(phase_timing("oracle", phase_start));
+
+    if oracle_output.generated_token_ids.len() < decode_tokens {
+        bail!(
+            "oracle returned {} generated tokens, expected {}",
+            oracle_output.generated_token_ids.len(),
+            decode_tokens
+        );
+    }
+    if decode_tokens > 1 && oracle_output.decode_logits.len() + 1 < decode_tokens {
+        bail!(
+            "oracle returned {} decode logit rows, expected at least {}",
+            oracle_output.decode_logits.len(),
+            decode_tokens - 1
+        );
+    }
+
+    eprintln!("[bughunt] decode_gate prompt={} replay_forced", prompt.name);
+    let phase_start = Instant::now();
+    let mut replay_tokens = Vec::with_capacity(decode_tokens);
+    let mut steps = Vec::with_capacity(decode_tokens);
+    for step in 0..decode_tokens {
+        let mut forced_history = prompt.prompt_ids.clone();
+        forced_history.extend_from_slice(&oracle_output.generated_token_ids[..step]);
+        let native_prefill = run_native_prefill(runtime, &forced_history)
+            .with_context(|| format!("decode_gate replay forced step {step}"))?;
+        gpu_hal::sync(runtime.ordinal)
+            .with_context(|| format!("decode_gate replay forced sync step {step}"))?;
+        let replay_token = DecodeEngine::greedy_sample(&native_prefill.logits);
+        replay_tokens.push(replay_token);
+        let (reference, reference_name) = if step == 0 {
+            (&oracle_output.prefill_logits, "oracle_prefill_logits")
+        } else {
+            (
+                oracle_output.decode_logits.get(step - 1).ok_or_else(|| {
+                    anyhow::anyhow!("missing oracle decode logits for step {step}")
+                })?,
+                "oracle_decode_logits",
+            )
+        };
+        let replay_logit_max_abs = validate::max_abs_delta(&native_prefill.logits, reference);
+        let replay_logit_mean_abs = mean_abs_delta(&native_prefill.logits, reference);
+        let oracle_token = oracle_output.generated_token_ids[step];
+        steps.push(DecodeStepGateReport {
+            step,
+            oracle_token,
+            replay_token,
+            component_token: None,
+            replay_logit_reference: reference_name.to_string(),
+            replay_logit_max_abs,
+            replay_logit_mean_abs,
+            token_match_replay: replay_token == oracle_token,
+            token_match_component: runtime.backend != Backend::Metal,
+        });
+    }
+    timings.push(phase_timing("replay_forced", phase_start));
+
+    let component_tokens = if runtime.backend == Backend::Metal {
+        eprintln!("[bughunt] decode_gate prompt={} component", prompt.name);
+        let phase_start = Instant::now();
+        let tokens =
+            run_component_decode_token_sequence(runtime, &prompt.prompt_ids, decode_tokens)
+                .with_context(|| format!("decode_gate component prompt {}", prompt.name))?;
+        for (step, token) in tokens.iter().copied().enumerate() {
+            if let Some(step_report) = steps.get_mut(step) {
+                step_report.component_token = Some(token);
+                step_report.token_match_component =
+                    token == oracle_output.generated_token_ids[step];
+            }
+        }
+        timings.push(phase_timing("component", phase_start));
+        Some(tokens)
+    } else {
+        None
+    };
+
+    let max_replay_logit_abs = steps
+        .iter()
+        .map(|step| step.replay_logit_max_abs)
+        .fold(0.0_f32, f32::max);
+    let mean_replay_logit_abs = if steps.is_empty() {
+        0.0
+    } else {
+        steps
+            .iter()
+            .map(|step| step.replay_logit_mean_abs)
+            .sum::<f32>()
+            / steps.len() as f32
+    };
+    let first_mismatch_step = steps
+        .iter()
+        .find(|step| !step.token_match_replay || !step.token_match_component)
+        .map(|step| step.step);
+    let pass = first_mismatch_step.is_none();
+    timings.push(phase_timing("total", prompt_start));
+
+    Ok(DecodeGatePromptReport {
+        name: prompt.name.clone(),
+        notes: prompt.notes.clone(),
+        pass,
+        prompt_len: prompt.prompt_ids.len(),
+        decode_tokens,
+        oracle_tokens: oracle_output.generated_token_ids[..decode_tokens].to_vec(),
+        replay_tokens,
+        component_tokens,
+        max_replay_logit_abs,
+        mean_replay_logit_abs,
+        first_mismatch_step,
+        steps,
+        timings,
     })
 }
 
@@ -1311,6 +1558,31 @@ fn run_component_decode_once(
         .rebuild_prefill_state_greedy_token(prompt_ids)
         .context("bench component decode initial prefill")?;
     run_component_decode_steps(engine, token, prompt_ids.len(), decode_tokens)
+}
+
+fn run_component_decode_token_sequence(
+    runtime: &QwenBughuntRuntime,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<Vec<u32>> {
+    let mut engine = runtime
+        .new_component_decode_engine(prompt_ids.len() + decode_tokens)
+        .context("decode gate component decode engine")?;
+    let mut token = engine
+        .rebuild_prefill_state_greedy_token(prompt_ids)
+        .context("decode gate component initial prefill")?;
+    gpu_hal::sync(runtime.ordinal).context("decode gate component initial sync")?;
+
+    let mut tokens = Vec::with_capacity(decode_tokens);
+    tokens.push(token);
+    for step in 1..decode_tokens {
+        let (next, _) = engine
+            .decode_step_metal_component_greedy(token, prompt_ids.len() + step - 1)
+            .with_context(|| format!("decode gate component step {step}"))?;
+        token = next;
+        tokens.push(token);
+    }
+    Ok(tokens)
 }
 
 fn run_component_decode_steps(
@@ -3168,6 +3440,52 @@ fn print_report_summary(report: &BughuntReport) {
                 }
             }
         }
+        "decode_gate" => {
+            if let Some(decode_gate) = report.decode_gate.as_ref() {
+                println!(
+                    "mode=decode_gate backend={} prompts={} pass={}",
+                    report.metadata.backend,
+                    decode_gate.prompt_results.len(),
+                    decode_gate.pass
+                );
+                for prompt in &decode_gate.prompt_results {
+                    println!(
+                        "{} prompt={} tokens={} first_mismatch={} max_replay_logit_abs={:.4} oracle_tokens={:?} replay_tokens={:?} component_tokens={}",
+                        if prompt.pass { "PASS" } else { "FAIL" },
+                        prompt.name,
+                        prompt.decode_tokens,
+                        prompt
+                            .first_mismatch_step
+                            .map(|step| step.to_string())
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        prompt.max_replay_logit_abs,
+                        prompt.oracle_tokens,
+                        prompt.replay_tokens,
+                        prompt
+                            .component_tokens
+                            .as_ref()
+                            .map(|tokens| format!("{tokens:?}"))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    );
+                    if let Some(step) = prompt
+                        .steps
+                        .iter()
+                        .find(|step| !step.token_match_replay || !step.token_match_component)
+                    {
+                        println!(
+                            "first_bad_step={} oracle={} replay={} component={} replay_logit_max_abs={:.4}",
+                            step.step,
+                            step.oracle_token,
+                            step.replay_token,
+                            step.component_token
+                                .map(|token| token.to_string())
+                                .unwrap_or_else(|| "n/a".to_string()),
+                            step.replay_logit_max_abs,
+                        );
+                    }
+                }
+            }
+        }
         "localize" => {
             if let Some(localize) = report.localize.as_ref() {
                 println!(
@@ -3655,6 +3973,7 @@ mod tests {
                 commit_ish: Some("abc123".to_string()),
             },
             gate: None,
+            decode_gate: None,
             localize: Some(LocalizeRunSection {
                 pass: false,
                 gate_prompt: PromptGateReport {
@@ -3724,6 +4043,7 @@ mod tests {
                 commit_ish: Some("abc123".to_string()),
             },
             gate: None,
+            decode_gate: None,
             localize: None,
             dump: None,
             bench: Some(BenchRunSection {
@@ -3811,6 +4131,65 @@ mod tests {
         );
         assert_eq!(prompt["prefill_hal_profile"]["alloc_calls"], 1);
         assert_eq!(prompt["prefill_hal_profile"]["d2h_bytes"], 2048);
+    }
+
+    #[test]
+    fn decode_gate_report_serialization_includes_token_comparisons() {
+        let report = BughuntReport {
+            mode: "decode_gate".to_string(),
+            metadata: RunMetadata {
+                mode: "decode_gate".to_string(),
+                model: "qwen3.5-0.8b".to_string(),
+                backend: "metal".to_string(),
+                device: 0,
+                arch: "apple-m4".to_string(),
+                model_dir: "/tmp/model".to_string(),
+                oracle_device: "cpu".to_string(),
+                commit_ish: Some("abc123".to_string()),
+            },
+            gate: None,
+            decode_gate: Some(DecodeGateRunSection {
+                pass: false,
+                prompt_results: vec![DecodeGatePromptReport {
+                    name: "code_prompt".to_string(),
+                    notes: Some("code".to_string()),
+                    pass: false,
+                    prompt_len: 31,
+                    decode_tokens: 2,
+                    oracle_tokens: vec![271, 16],
+                    replay_tokens: vec![271, 17],
+                    component_tokens: Some(vec![271, 16]),
+                    max_replay_logit_abs: 0.2,
+                    mean_replay_logit_abs: 0.05,
+                    first_mismatch_step: Some(1),
+                    steps: vec![DecodeStepGateReport {
+                        step: 1,
+                        oracle_token: 16,
+                        replay_token: 17,
+                        component_token: Some(16),
+                        replay_logit_reference: "oracle_decode_logits".to_string(),
+                        replay_logit_max_abs: 0.2,
+                        replay_logit_mean_abs: 0.05,
+                        token_match_replay: false,
+                        token_match_component: true,
+                    }],
+                    timings: vec![PhaseTimingReport {
+                        phase: "oracle".to_string(),
+                        elapsed_ms: 10.0,
+                    }],
+                }],
+            }),
+            localize: None,
+            dump: None,
+            bench: None,
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        let prompt = &value["decode_gate"]["prompt_results"][0];
+        assert_eq!(value["mode"], "decode_gate");
+        assert_eq!(prompt["first_mismatch_step"], 1);
+        assert_eq!(prompt["oracle_tokens"][1], 16);
+        assert_eq!(prompt["replay_tokens"][1], 17);
+        assert_eq!(prompt["component_tokens"][1], 16);
     }
 
     #[test]
