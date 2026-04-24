@@ -1068,21 +1068,23 @@ __global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
     }
     __syncthreads();
 
-    __shared__ float max_score;
-    __shared__ float denom;
-    if (threadIdx.x == 0) {
-        float m = -INFINITY;
-        for (int tok = 0; tok < total_tokens; ++tok) {
-            m = fmaxf(m, score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok]);
-        }
-        float s = 0.0f;
-        for (int tok = 0; tok < total_tokens; ++tok) {
-            s += expf(score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - m);
-        }
-        max_score = m;
-        denom = s;
+    __shared__ float reduce_scratch[256];
+    float local_max = -INFINITY;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_max = fmaxf(
+            local_max,
+            score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok]
+        );
     }
-    __syncthreads();
+    const float max_score = block_reduce_max_256(local_max, reduce_scratch);
+
+    float local_denom = 0.0f;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        local_denom += expf(
+            score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok] - max_score
+        );
+    }
+    const float denom = block_reduce_sum_256(local_denom, reduce_scratch);
 
     for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
         const size_t score_idx = static_cast<size_t>(qh) * score_stride_tokens + tok;
