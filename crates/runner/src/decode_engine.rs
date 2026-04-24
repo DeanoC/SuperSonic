@@ -847,6 +847,7 @@ struct ComponentFullAttentionScratch {
     certified_value_promote_index: Option<GpuBuffer>,
     certified_promoted_value_bf16: Option<GpuBuffer>,
     certified_score_consistency_flags: Option<GpuBuffer>,
+    certified_selected_fp16_log_masses: Option<GpuBuffer>,
     certified_ranking_fallback_heads: Option<GpuBuffer>,
     certified_ranking_fallback_kv_slots: Option<GpuBuffer>,
     certified_ranking_fallback_kv_heads: Option<GpuBuffer>,
@@ -911,6 +912,7 @@ impl ComponentFullAttentionScratch {
             certified_value_promote_index: None,
             certified_promoted_value_bf16: None,
             certified_score_consistency_flags: None,
+            certified_selected_fp16_log_masses: None,
             certified_ranking_fallback_heads: None,
             certified_ranking_fallback_kv_slots: None,
             certified_ranking_fallback_kv_heads: None,
@@ -5853,24 +5855,67 @@ impl DecodeEngine {
                     if score_consistency_violations > 0 {
                         force_dense_layer_fallback = true;
                     }
+                    let selected_log_mass_shape = [num_q_heads, max_promoted_blocks];
+                    if scratch
+                        .certified_selected_fp16_log_masses
+                        .as_ref()
+                        .map(|buf| buf.shape() != selected_log_mass_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_selected_fp16_log_masses = Some(
+                            GpuBuffer::zeros(
+                                self.ordinal,
+                                ScalarType::F32,
+                                &selected_log_mass_shape,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV selected FP16 log-mass alloc: {e}"
+                                )
+                            })?,
+                        );
+                    }
+                    kernel_ffi::certified_kv::selected_fp16_log_masses(
+                        self.ordinal,
+                        attn_q,
+                        scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                        scratch.certified_promote_index.as_ref().unwrap(),
+                        scratch.certified_selected_fp16_log_masses.as_mut().unwrap(),
+                        block_size,
+                        max_promoted_blocks,
+                        q_scale,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV selected FP16 log-masses: {e}")
+                    })?;
+                    let selected_fp16_log_mass_host = decode_f32_le(
+                        &scratch
+                            .certified_selected_fp16_log_masses
+                            .as_ref()
+                            .unwrap()
+                            .to_host_bytes()
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV selected FP16 log-masses D2H: {e}"
+                                )
+                            })?,
+                    );
                     let mut ranking_fallback_qheads = Vec::new();
                     if cfg.ranking_r > 0 {
                         for qh in 0..num_q_heads {
                             let score_start = qh * num_blocks;
                             let score_end = score_start + num_blocks;
-                            let kvh = qh / gqa_group;
-                            let fp16_selected_log_masses =
-                                certified_kv_selected_block_fp16_log_masses_from_tier2(
-                                    &query_f32_all,
-                                    tier2_key,
-                                    qh,
-                                    kvh,
-                                    &selected_by_head[qh],
-                                    cap,
-                                    block_size,
-                                    head_dim,
-                                    q_scale,
-                                );
+                            let fp16_selected_log_masses: Vec<(usize, f32)> = selected_by_head[qh]
+                                .iter()
+                                .enumerate()
+                                .map(|(slot, &block)| {
+                                    (
+                                        block,
+                                        selected_fp16_log_mass_host
+                                            [qh * max_promoted_blocks + slot],
+                                    )
+                                })
+                                .collect();
                             if certified_kv_ranking_mismatch(
                                 &block_max_host[score_start..score_end],
                                 &block_sum_host[score_start..score_end],

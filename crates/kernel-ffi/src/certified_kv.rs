@@ -138,6 +138,20 @@ unsafe extern "C" {
         gqa_group: c_int,
     ) -> c_int;
 
+    fn dotcache_llama31_certified_kv_selected_fp16_log_masses(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        promoted_key_bf16: *const c_void,
+        promote_index: *const c_void,
+        out_log_masses: *mut c_void,
+        q_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        max_promoted_blocks: c_int,
+        head_dim: c_int,
+        q_scale: f32,
+    ) -> c_int;
+
     fn dotcache_llama31_certified_kv_attend_int8_int4(
         device_ordinal: usize,
         query_bf16: *const c_void,
@@ -1359,6 +1373,100 @@ pub fn gather_promoted_bf16_from_tier2(
             max_promoted_blocks,
             max_promoted_value_blocks,
             gqa_group,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn selected_fp16_log_masses(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    promoted_key_bf16: &GpuBuffer,
+    promote_index: &GpuBuffer,
+    out_log_masses: &mut GpuBuffer,
+    block_size: usize,
+    max_promoted_blocks: usize,
+    q_scale: f32,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV selected FP16 log-masses is currently CUDA-only".into(),
+        ));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d && !query_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV selected FP16 log-masses expects query [qh,hd] or [qh,1,hd], got {:?}",
+            query_shape
+        )));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || promoted_key_bf16.dtype() != ScalarType::BF16
+        || promote_index.dtype() != ScalarType::U32
+        || out_log_masses.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV selected FP16 log-masses dtype mismatch".into(),
+        ));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
+    let num_blocks = promote_index.shape().get(1).copied().unwrap_or(0);
+    if block_size == 0
+        || max_promoted_blocks == 0
+        || promote_index.shape() != [q_heads, num_blocks]
+        || promoted_key_bf16.shape() != [q_heads, max_promoted_blocks, block_size, head_dim]
+        || out_log_masses.shape() != [q_heads, max_promoted_blocks]
+        || max_promoted_blocks > num_blocks
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV selected FP16 log-masses shape mismatch: query={:?} promoted={:?} index={:?} out={:?} block={block_size} max={max_promoted_blocks}",
+            query_bf16.shape(),
+            promoted_key_bf16.shape(),
+            promote_index.shape(),
+            out_log_masses.shape()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_selected_fp16_log_masses(
+            ordinal,
+            query_bf16.as_ptr(),
+            promoted_key_bf16.as_ptr(),
+            promote_index.as_ptr(),
+            out_log_masses.as_mut_ptr(),
+            q_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            max_promoted_blocks as c_int,
+            head_dim as c_int,
+            q_scale,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA selected FP16 log-masses failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            query_bf16,
+            promoted_key_bf16,
+            promote_index,
+            out_log_masses,
+            block_size,
+            max_promoted_blocks,
+            q_scale,
         );
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }

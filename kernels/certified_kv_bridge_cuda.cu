@@ -573,6 +573,71 @@ __global__ void certified_kv_gather_promoted_values_kernel(
     }
 }
 
+__global__ void certified_kv_selected_fp16_log_mass_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const __nv_bfloat16* __restrict__ promoted_key,
+    const uint32_t* __restrict__ promote_index,
+    float* __restrict__ out_log_mass,
+    int q_heads,
+    int num_blocks,
+    int block_size,
+    int max_promoted_blocks,
+    int head_dim,
+    float q_scale
+) {
+    const int linear = blockIdx.x;
+    const int qh = linear / max_promoted_blocks;
+    const int slot = linear - qh * max_promoted_blocks;
+    if (qh >= q_heads || slot >= max_promoted_blocks) {
+        return;
+    }
+    extern __shared__ float scores[];
+    if (threadIdx.x < block_size) {
+        scores[threadIdx.x] = -INFINITY;
+    }
+    __syncthreads();
+
+    uint32_t block_id = 0xffffffffu;
+    for (int b = slot; b < num_blocks; b += max_promoted_blocks) {
+        const uint32_t candidate = promote_index[static_cast<size_t>(qh) * num_blocks + b];
+        if (candidate == static_cast<uint32_t>(slot)) {
+            block_id = static_cast<uint32_t>(b);
+            break;
+        }
+    }
+    if (block_id == 0xffffffffu) {
+        if (threadIdx.x == 0) {
+            out_log_mass[static_cast<size_t>(qh) * max_promoted_blocks + slot] = -INFINITY;
+        }
+        return;
+    }
+
+    const int token = threadIdx.x;
+    if (token < block_size) {
+        const __nv_bfloat16* q = query + static_cast<size_t>(qh) * head_dim;
+        const __nv_bfloat16* k =
+            promoted_key
+            + ((static_cast<size_t>(qh) * max_promoted_blocks + slot) * block_size + token) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += __bfloat162float(q[d]) * __bfloat162float(k[d]);
+        }
+        scores[token] = dot * q_scale;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = -INFINITY;
+        for (int t = 0; t < block_size; ++t) {
+            m = fmaxf(m, scores[t]);
+        }
+        float s = 0.0f;
+        for (int t = 0; t < block_size; ++t) {
+            s += expf(scores[t] - m);
+        }
+        out_log_mass[static_cast<size_t>(qh) * max_promoted_blocks + slot] = m + logf(s);
+    }
+}
+
 __device__ __forceinline__ float certified_kv_dequant_int4_value(
     const uint8_t* value_int4,
     const __half* value_scale,
@@ -1646,6 +1711,47 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
         head_dim
     );
     if (cudaGetLastError() != cudaSuccess) return 26;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_selected_fp16_log_masses(
+    size_t device_ordinal,
+    const void* query_bf16,
+    const void* promoted_key_bf16,
+    const void* promote_index,
+    void* out_log_masses,
+    int q_heads,
+    int num_blocks,
+    int block_size,
+    int max_promoted_blocks,
+    int head_dim,
+    float q_scale
+) {
+    if (query_bf16 == nullptr || promoted_key_bf16 == nullptr ||
+        promote_index == nullptr || out_log_masses == nullptr) {
+        return 28;
+    }
+    if (q_heads <= 0 || num_blocks <= 0 || block_size <= 0 ||
+        max_promoted_blocks <= 0 || head_dim <= 0) {
+        return 29;
+    }
+    if (block_size > 256 || max_promoted_blocks > num_blocks) {
+        return 30;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    certified_kv_selected_fp16_log_mass_kernel<<<q_heads * max_promoted_blocks, block_size, block_size * sizeof(float)>>>(
+        static_cast<const __nv_bfloat16*>(query_bf16),
+        static_cast<const __nv_bfloat16*>(promoted_key_bf16),
+        static_cast<const uint32_t*>(promote_index),
+        static_cast<float*>(out_log_masses),
+        q_heads,
+        num_blocks,
+        block_size,
+        max_promoted_blocks,
+        head_dim,
+        q_scale
+    );
+    if (cudaGetLastError() != cudaSuccess) return 31;
     return 0;
 }
 
