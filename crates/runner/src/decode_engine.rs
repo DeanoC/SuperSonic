@@ -169,6 +169,10 @@ fn metal_fused_mlp_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_MLP").is_some()
 }
 
+fn metal_fused_mlp_gate_up_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP").is_none()
+}
+
 fn metal_fused_full_projection_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
 }
@@ -3632,7 +3636,19 @@ impl DecodeEngine {
             && lw.gate_proj_w.dtype() == ScalarType::BF16
             && lw.up_proj_w.dtype() == ScalarType::BF16
             && lw.down_proj_w.dtype() == ScalarType::BF16;
-        if use_fused_mlp {
+        let use_fused_mlp_gate_up = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && (metal_fused_mlp_gate_up_enabled() || use_fused_mlp)
+            && lw.gate_proj_scale.is_none()
+            && lw.gate_proj_int4_scale.is_none()
+            && lw.gate_proj_int4_zero.is_none()
+            && lw.up_proj_scale.is_none()
+            && lw.up_proj_int4_scale.is_none()
+            && lw.up_proj_int4_zero.is_none()
+            && self.normed_buf.dtype() == ScalarType::BF16
+            && lw.gate_proj_w.dtype() == ScalarType::BF16
+            && lw.up_proj_w.dtype() == ScalarType::BF16;
+        if use_fused_mlp_gate_up {
             kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_bf16(
                 hidden_dim,
                 intermediate,
@@ -3674,6 +3690,17 @@ impl DecodeEngine {
                 lw.up_proj_int4_zero.as_ref(),
                 self.weights.int4_group_size,
             )?;
+            kernel_ffi::prefill_ffi::swiglu_mul(
+                self.ordinal,
+                ScalarType::BF16,
+                intermediate,
+                gate,
+                up,
+                mlp,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
+        }
+        if use_fused_mlp_gate_up && !use_fused_mlp {
             kernel_ffi::prefill_ffi::swiglu_mul(
                 self.ordinal,
                 ScalarType::BF16,
