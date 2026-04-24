@@ -32,15 +32,26 @@ pub struct LayerState {
     // scales for the contiguous prefix covered by complete blocks.
     pub certified_kv_key_i8: Option<GpuBuffer>,
     pub certified_kv_key_scale: Option<GpuBuffer>,
+    pub certified_kv_key_zero: Option<GpuBuffer>,
     pub certified_kv_key_tokens: usize,
     pub certified_kv_value_i4: Option<GpuBuffer>,
     pub certified_kv_value_scale: Option<GpuBuffer>,
     pub certified_kv_value_zero: Option<GpuBuffer>,
     pub certified_kv_value_error: Option<GpuBuffer>,
+    pub certified_kv_value_norm: Option<GpuBuffer>,
     pub certified_kv_value_tokens: usize,
     pub certified_kv_host_k: Option<HostBuffer>,
     pub certified_kv_host_v: Option<HostBuffer>,
     pub certified_kv_host_tokens: usize,
+    pub certified_kv_host_meta_blocks: usize,
+    pub certified_kv_host_meta_key_stride_tokens: usize,
+    pub certified_kv_host_meta_key_scale_stride_blocks: usize,
+    pub certified_kv_host_meta_value_error_stride_blocks: usize,
+    pub certified_kv_host_key_i8_cache: Vec<u8>,
+    pub certified_kv_host_key_scale_cache: Vec<f32>,
+    pub certified_kv_host_key_zero_cache: Vec<f32>,
+    pub certified_kv_host_value_error_cache: Vec<f32>,
+    pub certified_kv_host_value_norm_cache: Vec<f32>,
     pub certified_kv_tail_k: Option<GpuBuffer>,
     pub certified_kv_tail_v: Option<GpuBuffer>,
     pub certified_kv_gpu_tail_only: bool,
@@ -85,15 +96,26 @@ impl LayerState {
             kv_shadow_start: usize::MAX,
             certified_kv_key_i8: None,
             certified_kv_key_scale: None,
+            certified_kv_key_zero: None,
             certified_kv_key_tokens: 0,
             certified_kv_value_i4: None,
             certified_kv_value_scale: None,
             certified_kv_value_zero: None,
             certified_kv_value_error: None,
+            certified_kv_value_norm: None,
             certified_kv_value_tokens: 0,
             certified_kv_host_k: None,
             certified_kv_host_v: None,
             certified_kv_host_tokens: 0,
+            certified_kv_host_meta_blocks: 0,
+            certified_kv_host_meta_key_stride_tokens: 0,
+            certified_kv_host_meta_key_scale_stride_blocks: 0,
+            certified_kv_host_meta_value_error_stride_blocks: 0,
+            certified_kv_host_key_i8_cache: Vec::new(),
+            certified_kv_host_key_scale_cache: Vec::new(),
+            certified_kv_host_key_zero_cache: Vec::new(),
+            certified_kv_host_value_error_cache: Vec::new(),
+            certified_kv_host_value_norm_cache: Vec::new(),
             certified_kv_tail_k: None,
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
@@ -119,15 +141,26 @@ impl LayerState {
             kv_shadow_start: usize::MAX,
             certified_kv_key_i8: None,
             certified_kv_key_scale: None,
+            certified_kv_key_zero: None,
             certified_kv_key_tokens: 0,
             certified_kv_value_i4: None,
             certified_kv_value_scale: None,
             certified_kv_value_zero: None,
             certified_kv_value_error: None,
+            certified_kv_value_norm: None,
             certified_kv_value_tokens: 0,
             certified_kv_host_k: None,
             certified_kv_host_v: None,
             certified_kv_host_tokens: 0,
+            certified_kv_host_meta_blocks: 0,
+            certified_kv_host_meta_key_stride_tokens: 0,
+            certified_kv_host_meta_key_scale_stride_blocks: 0,
+            certified_kv_host_meta_value_error_stride_blocks: 0,
+            certified_kv_host_key_i8_cache: Vec::new(),
+            certified_kv_host_key_scale_cache: Vec::new(),
+            certified_kv_host_key_zero_cache: Vec::new(),
+            certified_kv_host_value_error_cache: Vec::new(),
+            certified_kv_host_value_norm_cache: Vec::new(),
             certified_kv_tail_k: None,
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
@@ -238,9 +271,29 @@ impl LayerState {
         if filled < self.certified_kv_key_tokens || filled < self.certified_kv_value_tokens {
             self.certified_kv_key_tokens = 0;
             self.certified_kv_value_tokens = 0;
+            self.certified_kv_host_meta_blocks = 0;
+            self.certified_kv_host_meta_key_stride_tokens = 0;
+            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
+            self.certified_kv_host_meta_value_error_stride_blocks = 0;
+            self.certified_kv_host_key_i8_cache.clear();
+            self.certified_kv_host_key_scale_cache.clear();
+            self.certified_kv_host_key_zero_cache.clear();
+            self.certified_kv_host_value_error_cache.clear();
+            self.certified_kv_host_value_norm_cache.clear();
         }
         if filled < self.certified_kv_host_tokens {
             self.certified_kv_host_tokens = 0;
+        }
+        if filled < self.certified_kv_host_meta_blocks {
+            self.certified_kv_host_meta_blocks = 0;
+            self.certified_kv_host_meta_key_stride_tokens = 0;
+            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
+            self.certified_kv_host_meta_value_error_stride_blocks = 0;
+            self.certified_kv_host_key_i8_cache.clear();
+            self.certified_kv_host_key_scale_cache.clear();
+            self.certified_kv_host_key_zero_cache.clear();
+            self.certified_kv_host_value_error_cache.clear();
+            self.certified_kv_host_value_norm_cache.clear();
         }
         if filled < self.certified_kv_ranking_prefix_tokens {
             self.certified_kv_ranking_prefix_k = None;
@@ -250,6 +303,15 @@ impl LayerState {
         }
         if filled == 0 {
             self.certified_kv_gpu_tail_only = false;
+            self.certified_kv_host_meta_blocks = 0;
+            self.certified_kv_host_meta_key_stride_tokens = 0;
+            self.certified_kv_host_meta_key_scale_stride_blocks = 0;
+            self.certified_kv_host_meta_value_error_stride_blocks = 0;
+            self.certified_kv_host_key_i8_cache.clear();
+            self.certified_kv_host_key_scale_cache.clear();
+            self.certified_kv_host_key_zero_cache.clear();
+            self.certified_kv_host_value_error_cache.clear();
+            self.certified_kv_host_value_norm_cache.clear();
             self.certified_kv_ranking_prefix_k = None;
             self.certified_kv_ranking_prefix_v = None;
             self.certified_kv_ranking_prefix_tokens = 0;
@@ -295,15 +357,28 @@ impl LayerState {
             kv_shadow_start: self.kv_shadow_start,
             certified_kv_key_i8: clone_opt(&self.certified_kv_key_i8)?,
             certified_kv_key_scale: clone_opt(&self.certified_kv_key_scale)?,
+            certified_kv_key_zero: clone_opt(&self.certified_kv_key_zero)?,
             certified_kv_key_tokens: self.certified_kv_key_tokens,
             certified_kv_value_i4: clone_opt(&self.certified_kv_value_i4)?,
             certified_kv_value_scale: clone_opt(&self.certified_kv_value_scale)?,
             certified_kv_value_zero: clone_opt(&self.certified_kv_value_zero)?,
             certified_kv_value_error: clone_opt(&self.certified_kv_value_error)?,
+            certified_kv_value_norm: clone_opt(&self.certified_kv_value_norm)?,
             certified_kv_value_tokens: self.certified_kv_value_tokens,
             certified_kv_host_k: clone_host_opt(&self.certified_kv_host_k)?,
             certified_kv_host_v: clone_host_opt(&self.certified_kv_host_v)?,
             certified_kv_host_tokens: self.certified_kv_host_tokens,
+            certified_kv_host_meta_blocks: self.certified_kv_host_meta_blocks,
+            certified_kv_host_meta_key_stride_tokens: self.certified_kv_host_meta_key_stride_tokens,
+            certified_kv_host_meta_key_scale_stride_blocks: self
+                .certified_kv_host_meta_key_scale_stride_blocks,
+            certified_kv_host_meta_value_error_stride_blocks: self
+                .certified_kv_host_meta_value_error_stride_blocks,
+            certified_kv_host_key_i8_cache: self.certified_kv_host_key_i8_cache.clone(),
+            certified_kv_host_key_scale_cache: self.certified_kv_host_key_scale_cache.clone(),
+            certified_kv_host_key_zero_cache: self.certified_kv_host_key_zero_cache.clone(),
+            certified_kv_host_value_error_cache: self.certified_kv_host_value_error_cache.clone(),
+            certified_kv_host_value_norm_cache: self.certified_kv_host_value_norm_cache.clone(),
             certified_kv_tail_k: clone_opt(&self.certified_kv_tail_k)?,
             certified_kv_tail_v: clone_opt(&self.certified_kv_tail_v)?,
             certified_kv_gpu_tail_only: self.certified_kv_gpu_tail_only,

@@ -16,6 +16,9 @@ pub(crate) struct CertifiedKvConfig {
     pub ranking_r: usize,
     pub rung1_threshold: f32,
     pub rung1_multiplier: f32,
+    pub delta_guard_factor: f32,
+    pub score_exploration_rate: f32,
+    pub require_certified_tail_bound: bool,
     pub eps_guard: f32,
     pub telemetry_path: Option<PathBuf>,
 }
@@ -33,6 +36,9 @@ impl CertifiedKvConfig {
             ranking_r: cli.certified_kv_ranking_r,
             rung1_threshold: cli.certified_kv_rung1_threshold,
             rung1_multiplier: cli.certified_kv_rung1_multiplier,
+            delta_guard_factor: cli.certified_kv_delta_guard_factor,
+            score_exploration_rate: cli.certified_kv_score_exploration_rate,
+            require_certified_tail_bound: !cli.certified_kv_allow_uncertified_tail,
             eps_guard: cli.certified_kv_eps_guard,
             telemetry_path: cli.certified_kv_telemetry.clone(),
         };
@@ -71,6 +77,12 @@ impl CertifiedKvConfig {
         if self.rung1_multiplier < 1.0 {
             bail!("--certified-kv-rung1-multiplier must be >= 1");
         }
+        if self.delta_guard_factor < 0.0 {
+            bail!("--certified-kv-delta-guard-factor must be >= 0");
+        }
+        if !(0.0..=1.0).contains(&self.score_exploration_rate) {
+            bail!("--certified-kv-score-exploration-rate must be in [0, 1]");
+        }
         if self.eps_guard < 0.0 {
             bail!("--certified-kv-eps-guard must be >= 0");
         }
@@ -79,7 +91,7 @@ impl CertifiedKvConfig {
 
     pub(crate) fn summary(&self) -> String {
         format!(
-            "block={} value_group={} value_mode={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} eps_guard={:.6} telemetry={}",
+            "block={} value_group={} value_mode={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} delta_guard_factor={:.3} score_exploration_rate={:.3} require_certified_tail_bound={} eps_guard={:.6} telemetry={}",
             self.block_size,
             self.value_group_size,
             if self.bf16_values { "bf16" } else { "int4" },
@@ -90,6 +102,9 @@ impl CertifiedKvConfig {
             self.ranking_r,
             self.rung1_threshold,
             self.rung1_multiplier,
+            self.delta_guard_factor,
+            self.score_exploration_rate,
+            self.require_certified_tail_bound,
             self.eps_guard,
             self.telemetry_path
                 .as_ref()

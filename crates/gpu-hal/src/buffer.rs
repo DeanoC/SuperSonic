@@ -85,8 +85,18 @@ impl HostBuffer {
         self.ptr.as_ptr()
     }
 
+    pub fn device_ptr(&self) -> Result<*const c_void> {
+        ops::host_pinned_device_ptr(self.backend, self.device_ordinal, self.ptr.as_ptr())
+            .map(|ptr| ptr.as_ptr() as *const c_void)
+    }
+
     pub fn as_mut_ptr(&mut self) -> *mut c_void {
         self.ptr.as_ptr()
+    }
+
+    pub fn device_mut_ptr(&mut self) -> Result<*mut c_void> {
+        ops::host_pinned_device_ptr(self.backend, self.device_ordinal, self.ptr.as_ptr())
+            .map(|ptr| ptr.as_ptr())
     }
 
     pub fn offset_ptr(&self, byte_offset: usize) -> *const c_void {

@@ -357,7 +357,8 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
             #[cfg(supersonic_backend_cuda)]
             {
                 let mut ptr = std::ptr::null_mut();
-                let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, 0) };
+                const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
+                let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, CUDA_HOST_ALLOC_MAPPED) };
                 if status != 0 {
                     return Err(cuda_error("cudaHostAlloc", status));
                 }
@@ -386,6 +387,37 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
             let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
             NonNull::new(ptr).ok_or_else(|| GpuError::Metal("host allocation returned null".into()))
         }
+    }
+}
+
+/// Return the device-visible pointer for mapped pinned host memory.
+pub fn host_pinned_device_ptr(
+    backend: Backend,
+    ordinal: usize,
+    ptr: *mut c_void,
+) -> Result<NonNull<c_void>> {
+    if ptr.is_null() {
+        return Err(GpuError::InvalidArg(
+            "host_pinned_device_ptr: null host pointer".into(),
+        ));
+    }
+    match backend {
+        Backend::Cuda => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let mut device_ptr = std::ptr::null_mut();
+                let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
+                if status != 0 {
+                    return Err(cuda_error("cudaHostGetDevicePointer", status));
+                }
+                NonNull::new(device_ptr)
+                    .ok_or_else(|| GpuError::Cuda("cudaHostGetDevicePointer returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+        }),
+        Backend::Hip | Backend::Metal => NonNull::new(ptr)
+            .ok_or_else(|| GpuError::InvalidArg("host_pinned_device_ptr returned null".into())),
     }
 }
 

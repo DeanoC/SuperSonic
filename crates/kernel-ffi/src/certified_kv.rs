@@ -18,10 +18,12 @@ unsafe extern "C" {
         value_bf16: *const c_void,
         key_int8: *mut c_void,
         key_scale: *mut c_void,
+        key_zero: *mut c_void,
         value_int4: *mut c_void,
         value_scale: *mut c_void,
         value_zero: *mut c_void,
         value_error: *mut c_void,
+        value_norm: *mut c_void,
         num_kv_heads: c_int,
         seq_len: c_int,
         max_t: c_int,
@@ -35,6 +37,7 @@ unsafe extern "C" {
         key_bf16: *const c_void,
         key_int8: *mut c_void,
         key_scale: *mut c_void,
+        key_zero: *mut c_void,
         num_kv_heads: c_int,
         seq_len: c_int,
         max_t: c_int,
@@ -46,6 +49,7 @@ unsafe extern "C" {
         key_bf16: *const c_void,
         key_int8: *mut c_void,
         key_scale: *mut c_void,
+        key_zero: *mut c_void,
         num_kv_heads: c_int,
         max_t: c_int,
         key_stride_tokens: c_int,
@@ -62,6 +66,7 @@ unsafe extern "C" {
         value_scale: *mut c_void,
         value_zero: *mut c_void,
         value_error: *mut c_void,
+        value_norm: *mut c_void,
         num_kv_heads: c_int,
         max_t: c_int,
         value_stride_tokens: c_int,
@@ -78,15 +83,59 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         block_max: *mut c_void,
         block_sum: *mut c_void,
         q_heads: c_int,
         kv_heads: c_int,
         num_blocks: c_int,
         block_size: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
         head_dim: c_int,
         gqa_group: c_int,
         q_scale: f32,
+    ) -> c_int;
+
+    fn dotcache_llama31_certified_kv_score_consistency(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_int8: *const c_void,
+        key_scale: *const c_void,
+        key_zero: *const c_void,
+        promoted_key_bf16: *const c_void,
+        promote_index: *const c_void,
+        violation_flags: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        key_stride_tokens: c_int,
+        key_scale_stride_blocks: c_int,
+        max_promoted_blocks: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+        eps_guard: f32,
+    ) -> c_int;
+
+    fn dotcache_llama31_certified_kv_gather_promoted_bf16(
+        device_ordinal: usize,
+        tier2_key_bf16: *const c_void,
+        tier2_value_bf16: *const c_void,
+        promote_index: *const c_void,
+        value_promote_index: *const c_void,
+        promoted_key_bf16: *mut c_void,
+        promoted_value_bf16: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        cap_tokens: c_int,
+        max_promoted_blocks: c_int,
+        max_promoted_value_blocks: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
     ) -> c_int;
 
     fn dotcache_llama31_certified_kv_attend_int8_int4(
@@ -94,6 +143,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_int4: *const c_void,
         value_scale: *const c_void,
         value_zero: *const c_void,
@@ -114,6 +164,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_int4: *const c_void,
         value_scale: *const c_void,
         value_zero: *const c_void,
@@ -136,6 +187,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_int4: *const c_void,
         value_scale: *const c_void,
         value_zero: *const c_void,
@@ -166,6 +218,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_int4: *const c_void,
         value_scale: *const c_void,
         value_zero: *const c_void,
@@ -196,6 +249,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         promoted_key_bf16: *const c_void,
         promote_index: *const c_void,
         promoted_value_bf16: *const c_void,
@@ -258,6 +312,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_bf16: *const c_void,
         tail_key_bf16: *const c_void,
         score_scratch: *mut c_void,
@@ -282,6 +337,7 @@ unsafe extern "C" {
         query_bf16: *const c_void,
         key_int8: *const c_void,
         key_scale: *const c_void,
+        key_zero: *const c_void,
         value_bf16: *const c_void,
         tail_key_bf16: *const c_void,
         score_scratch: *mut c_void,
@@ -354,10 +410,12 @@ pub fn quantize_bf16_cache(
     value_group_size: usize,
     key_int8: &mut GpuBuffer,
     key_scale: &mut GpuBuffer,
+    key_zero: &mut GpuBuffer,
     value_int4: &mut GpuBuffer,
     value_scale: &mut GpuBuffer,
     value_zero: &mut GpuBuffer,
     value_error: &mut GpuBuffer,
+    value_norm: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if key_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -416,6 +474,14 @@ pub fn quantize_bf16_cache(
             key_scale.shape()
         )));
     }
+    if key_zero.dtype() != ScalarType::F32 || key_zero.shape() != key_scale_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key_zero expects F32 {:?}, got {:?} {:?}",
+            key_scale_shape,
+            key_zero.dtype(),
+            key_zero.shape()
+        )));
+    }
     if value_int4.dtype() != ScalarType::U8 || value_int4.shape() != value_i4_shape {
         return Err(GpuError::InvalidArg(format!(
             "certified KV value_int4 expects U8 {:?}, got {:?} {:?}",
@@ -448,6 +514,14 @@ pub fn quantize_bf16_cache(
             value_error.shape()
         )));
     }
+    if value_norm.dtype() != ScalarType::F32 || value_norm.shape() != value_error_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value_norm expects F32 {:?}, got {:?} {:?}",
+            value_error_shape,
+            value_norm.dtype(),
+            value_norm.shape()
+        )));
+    }
 
     let backend = key_bf16.backend();
     match backend {
@@ -461,10 +535,12 @@ pub fn quantize_bf16_cache(
                         value_bf16.as_ptr(),
                         key_int8.as_mut_ptr(),
                         key_scale.as_mut_ptr(),
+                        key_zero.as_mut_ptr(),
                         value_int4.as_mut_ptr(),
                         value_scale.as_mut_ptr(),
                         value_zero.as_mut_ptr(),
                         value_error.as_mut_ptr(),
+                        value_norm.as_mut_ptr(),
                         num_kv_heads as c_int,
                         seq_len as c_int,
                         max_t as c_int,
@@ -499,6 +575,7 @@ pub fn quantize_bf16_keys(
     block_size: usize,
     key_int8: &mut GpuBuffer,
     key_scale: &mut GpuBuffer,
+    key_zero: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if key_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -549,6 +626,14 @@ pub fn quantize_bf16_keys(
             key_scale.shape()
         )));
     }
+    if key_zero.dtype() != ScalarType::F32 || key_zero.shape() != key_scale_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key_zero expects F32 {:?}, got {:?} {:?}",
+            key_scale_shape,
+            key_zero.dtype(),
+            key_zero.shape()
+        )));
+    }
 
     match key_bf16.backend() {
         Backend::Cuda => {
@@ -559,6 +644,7 @@ pub fn quantize_bf16_keys(
                     key_bf16.as_ptr(),
                     key_int8.as_mut_ptr(),
                     key_scale.as_mut_ptr(),
+                    key_zero.as_mut_ptr(),
                     num_kv_heads as c_int,
                     seq_len as c_int,
                     max_t as c_int,
@@ -592,6 +678,7 @@ pub fn quantize_bf16_keys_range(
     block_size: usize,
     key_int8: &mut GpuBuffer,
     key_scale: &mut GpuBuffer,
+    key_zero: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if key_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -643,6 +730,14 @@ pub fn quantize_bf16_keys_range(
             key_scale.shape()
         )));
     }
+    if key_zero.dtype() != ScalarType::F32 || key_zero.shape() != scale_shape {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key range quantization key_zero expects F32 {:?}, got {:?} {:?}",
+            scale_shape,
+            key_zero.dtype(),
+            key_zero.shape()
+        )));
+    }
     let end_block = start_block.checked_add(block_count).ok_or_else(|| {
         GpuError::InvalidArg("certified KV key range quantization block range overflow".into())
     })?;
@@ -666,6 +761,7 @@ pub fn quantize_bf16_keys_range(
                     key_bf16.as_ptr(),
                     key_int8.as_mut_ptr(),
                     key_scale.as_mut_ptr(),
+                    key_zero.as_mut_ptr(),
                     num_kv_heads as c_int,
                     max_t as c_int,
                     key_stride_tokens as c_int,
@@ -705,6 +801,7 @@ pub fn quantize_bf16_values_range(
     value_scale: &mut GpuBuffer,
     value_zero: &mut GpuBuffer,
     value_error: &mut GpuBuffer,
+    value_norm: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if value_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -776,6 +873,14 @@ pub fn quantize_bf16_values_range(
             value_error.shape()
         )));
     }
+    if value_norm.dtype() != ScalarType::F32 || value_norm.shape() != value_error.shape() {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value range quantization value_norm expects F32 {:?}, got {:?} {:?}",
+            value_error.shape(),
+            value_norm.dtype(),
+            value_norm.shape()
+        )));
+    }
     let value_stride_tokens = value_shape[1];
     if scale_shape[1] != value_stride_tokens {
         return Err(GpuError::InvalidArg(format!(
@@ -807,6 +912,7 @@ pub fn quantize_bf16_values_range(
                     value_scale.as_mut_ptr(),
                     value_zero.as_mut_ptr(),
                     value_error.as_mut_ptr(),
+                    value_norm.as_mut_ptr(),
                     num_kv_heads as c_int,
                     max_t as c_int,
                     value_stride_tokens as c_int,
@@ -841,6 +947,7 @@ pub fn score_blocks_int8(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     block_size: usize,
     gqa_group: usize,
     q_scale: f32,
@@ -858,11 +965,15 @@ pub fn score_blocks_int8(
             query_bf16.dtype()
         )));
     }
-    if key_int8.dtype() != ScalarType::U8 || key_scale.dtype() != ScalarType::F32 {
+    if key_int8.dtype() != ScalarType::U8
+        || key_scale.dtype() != ScalarType::F32
+        || key_zero.dtype() != ScalarType::F32
+    {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV INT8 scoring expects U8/F32 key buffers, got {:?}/{:?}",
+            "certified KV INT8 scoring expects U8/F32/F32 key buffers, got {:?}/{:?}/{:?}",
             key_int8.dtype(),
-            key_scale.dtype()
+            key_scale.dtype(),
+            key_zero.dtype()
         )));
     }
     if block_max.dtype() != ScalarType::F32 || block_sum.dtype() != ScalarType::F32 {
@@ -878,10 +989,11 @@ pub fn score_blocks_int8(
     if (!query_is_2d && !query_is_3d) || key_int8.shape().len() != 3 || key_scale.shape().len() != 3
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV INT8 scoring expects query [qh,hd] or [qh,1,hd], key_int8 [kvh,t,hd], key_scale [kvh,b,hd], got {:?}/{:?}/{:?}",
+            "certified KV INT8 scoring expects query [qh,hd] or [qh,1,hd], key_int8 [kvh,t,hd], key_scale/key_zero [kvh,b,hd], got {:?}/{:?}/{:?}/{:?}",
             query_bf16.shape(),
             key_int8.shape(),
-            key_scale.shape()
+            key_scale.shape(),
+            key_zero.shape()
         )));
     }
     if block_size == 0 || block_size > 256 {
@@ -947,6 +1059,13 @@ pub fn score_blocks_int8(
             key_scale.shape()
         )));
     }
+    if key_zero.shape() != key_scale.shape() {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV INT8 scoring key_zero expects same shape as key_scale {:?}, got {:?}",
+            key_scale.shape(),
+            key_zero.shape()
+        )));
+    }
 
     let backend = query_bf16.backend();
     match backend {
@@ -959,12 +1078,15 @@ pub fn score_blocks_int8(
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
                         key_scale.as_ptr(),
+                        key_zero.as_ptr(),
                         block_max.as_mut_ptr(),
                         block_sum.as_mut_ptr(),
                         q_heads as c_int,
                         kv_heads as c_int,
                         num_blocks as c_int,
                         block_size as c_int,
+                        stride_tokens as c_int,
+                        stride_blocks as c_int,
                         head_dim as c_int,
                         gqa_group as c_int,
                         q_scale,
@@ -989,11 +1111,265 @@ pub fn score_blocks_int8(
     }
 }
 
+pub fn score_consistency(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    key_int8: &GpuBuffer,
+    key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
+    promoted_key_bf16: &GpuBuffer,
+    promote_index: &GpuBuffer,
+    violation_flags: &mut GpuBuffer,
+    block_size: usize,
+    max_promoted_blocks: usize,
+    gqa_group: usize,
+    q_scale: f32,
+    eps_guard: f32,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV score consistency is currently CUDA-only".into(),
+        ));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d && !query_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV score consistency expects query [qh,hd] or [qh,1,hd], got {:?}",
+            query_bf16.shape()
+        )));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || key_int8.dtype() != ScalarType::U8
+        || key_scale.dtype() != ScalarType::F32
+        || key_zero.dtype() != ScalarType::F32
+        || promoted_key_bf16.dtype() != ScalarType::BF16
+        || promote_index.dtype() != ScalarType::U32
+        || violation_flags.dtype() != ScalarType::U32
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV score consistency dtype mismatch".into(),
+        ));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
+    let kv_heads = key_int8.shape()[0];
+    let key_stride_tokens = key_int8.shape()[1];
+    let key_scale_stride_blocks = key_scale.shape()[1];
+    let num_blocks = promote_index.shape()[1];
+    if block_size == 0
+        || max_promoted_blocks == 0
+        || gqa_group == 0
+        || q_heads != kv_heads * gqa_group
+        || key_int8.shape().len() != 3
+        || key_int8.shape()[2] != head_dim
+        || key_scale.shape().len() != 3
+        || key_scale.shape()[0] != kv_heads
+        || key_scale.shape()[2] != head_dim
+        || key_zero.shape() != key_scale.shape()
+        || promote_index.shape().len() != 2
+        || promote_index.shape()[0] != q_heads
+        || promoted_key_bf16.shape().len() != 4
+        || promoted_key_bf16.shape()[0] != q_heads
+        || promoted_key_bf16.shape()[1] < max_promoted_blocks
+        || promoted_key_bf16.shape()[2] != block_size
+        || promoted_key_bf16.shape()[3] != head_dim
+        || violation_flags.elem_count() < q_heads
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV score consistency shape mismatch: query={:?} key={:?} scale={:?} promoted={:?} index={:?} flags={:?}",
+            query_bf16.shape(),
+            key_int8.shape(),
+            key_scale.shape(),
+            promoted_key_bf16.shape(),
+            promote_index.shape(),
+            violation_flags.shape()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_score_consistency(
+            ordinal,
+            query_bf16.as_ptr(),
+            key_int8.as_ptr(),
+            key_scale.as_ptr(),
+            key_zero.as_ptr(),
+            promoted_key_bf16.as_ptr(),
+            promote_index.as_ptr(),
+            violation_flags.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            key_stride_tokens as c_int,
+            key_scale_stride_blocks as c_int,
+            max_promoted_blocks as c_int,
+            head_dim as c_int,
+            gqa_group as c_int,
+            q_scale,
+            eps_guard,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA score consistency failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            query_bf16,
+            key_int8,
+            key_scale,
+            key_zero,
+            promoted_key_bf16,
+            promote_index,
+            violation_flags,
+            block_size,
+            max_promoted_blocks,
+            gqa_group,
+            q_scale,
+            eps_guard,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gather_promoted_bf16_from_tier2(
+    ordinal: usize,
+    tier2_key_bf16_device_ptr: *const c_void,
+    tier2_value_bf16_device_ptr: *const c_void,
+    promote_index: &GpuBuffer,
+    value_promote_index: &GpuBuffer,
+    promoted_key_bf16: &mut GpuBuffer,
+    promoted_value_bf16: &mut GpuBuffer,
+    block_size: usize,
+    cap_tokens: usize,
+    max_promoted_blocks: usize,
+    max_promoted_value_blocks: usize,
+    gqa_group: usize,
+) -> Result<(), GpuError> {
+    if promote_index.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 gather is currently CUDA-only".into(),
+        ));
+    }
+    if tier2_key_bf16_device_ptr.is_null() || tier2_value_bf16_device_ptr.is_null() {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 gather received null Tier-2 device pointer".into(),
+        ));
+    }
+    if promote_index.dtype() != ScalarType::U32
+        || value_promote_index.dtype() != ScalarType::U32
+        || promoted_key_bf16.dtype() != ScalarType::BF16
+        || promoted_value_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 gather dtype mismatch".into(),
+        ));
+    }
+    let promote_shape = promote_index.shape();
+    let value_promote_shape = value_promote_index.shape();
+    let promoted_key_shape = promoted_key_bf16.shape();
+    let promoted_value_shape = promoted_value_bf16.shape();
+    if promote_shape.len() != 2
+        || value_promote_shape.len() != 2
+        || promoted_key_shape.len() != 4
+        || promoted_value_shape.len() != 4
+        || block_size == 0
+        || cap_tokens == 0
+        || max_promoted_blocks == 0
+        || max_promoted_value_blocks == 0
+        || gqa_group == 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV promoted BF16 gather invalid shapes: index={:?} value_index={:?} key={:?} value={:?}",
+            promote_shape, value_promote_shape, promoted_key_shape, promoted_value_shape
+        )));
+    }
+    let q_heads = promote_shape[0];
+    let num_blocks = promote_shape[1];
+    let kv_heads = value_promote_shape[0];
+    let head_dim = promoted_key_shape[3];
+    if value_promote_shape[1] != num_blocks
+        || q_heads != kv_heads * gqa_group
+        || promoted_key_shape[0] != q_heads
+        || promoted_key_shape[1] < max_promoted_blocks
+        || promoted_key_shape[2] != block_size
+        || promoted_value_shape[0] != kv_heads
+        || promoted_value_shape[1] < max_promoted_value_blocks
+        || promoted_value_shape[2] != block_size
+        || promoted_value_shape[3] != head_dim
+        || cap_tokens < num_blocks * block_size
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV promoted BF16 gather shape mismatch: index={:?} value_index={:?} key={:?} value={:?} cap={cap_tokens} block={block_size} max_key={max_promoted_blocks} max_value={max_promoted_value_blocks} gqa={gqa_group}",
+            promote_shape, value_promote_shape, promoted_key_shape, promoted_value_shape
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_gather_promoted_bf16(
+            ordinal,
+            tier2_key_bf16_device_ptr,
+            tier2_value_bf16_device_ptr,
+            promote_index.as_ptr(),
+            value_promote_index.as_ptr(),
+            promoted_key_bf16.as_mut_ptr(),
+            promoted_value_bf16.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            cap_tokens as c_int,
+            max_promoted_blocks as c_int,
+            max_promoted_value_blocks as c_int,
+            head_dim as c_int,
+            gqa_group as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA promoted BF16 gather failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            tier2_key_bf16_device_ptr,
+            tier2_value_bf16_device_ptr,
+            promote_index,
+            value_promote_index,
+            promoted_key_bf16,
+            promoted_value_bf16,
+            block_size,
+            cap_tokens,
+            max_promoted_blocks,
+            max_promoted_value_blocks,
+            gqa_group,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
 pub fn attend_int8_int4(
     ordinal: usize,
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     value_int4: &GpuBuffer,
     value_scale: &GpuBuffer,
     value_zero: &GpuBuffer,
@@ -1095,6 +1471,7 @@ pub fn attend_int8_int4(
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
                         key_scale.as_ptr(),
+                        key_zero.as_ptr(),
                         value_int4.as_ptr(),
                         value_scale.as_ptr(),
                         value_zero.as_ptr(),
@@ -1134,6 +1511,7 @@ pub fn attend_int8_int4_with_bf16_tail(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     value_int4: &GpuBuffer,
     value_scale: &GpuBuffer,
     value_zero: &GpuBuffer,
@@ -1207,6 +1585,7 @@ pub fn attend_int8_int4_with_bf16_tail(
             query_bf16,
             key_int8,
             key_scale,
+            key_zero,
             value_int4,
             value_scale,
             value_zero,
@@ -1271,6 +1650,7 @@ pub fn attend_int8_int4_with_bf16_tail(
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
                         key_scale.as_ptr(),
+                        key_zero.as_ptr(),
                         value_int4.as_ptr(),
                         value_scale.as_ptr(),
                         value_zero.as_ptr(),
@@ -1313,6 +1693,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     value_int4: &GpuBuffer,
     value_scale: &GpuBuffer,
     value_zero: &GpuBuffer,
@@ -1487,6 +1868,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
                         key_scale.as_ptr(),
+                        key_zero.as_ptr(),
                         value_int4.as_ptr(),
                         value_scale.as_ptr(),
                         value_zero.as_ptr(),
@@ -1518,6 +1900,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
                         key_scale.as_ptr(),
+                        key_zero.as_ptr(),
                         value_int4.as_ptr(),
                         value_scale.as_ptr(),
                         value_zero.as_ptr(),
@@ -1568,6 +1951,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     promoted_key_bf16: &GpuBuffer,
     promote_index: &GpuBuffer,
     promoted_value_bf16: &GpuBuffer,
@@ -1593,6 +1977,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
     if query_bf16.dtype() != ScalarType::BF16
         || key_int8.dtype() != ScalarType::U8
         || key_scale.dtype() != ScalarType::F32
+        || key_zero.dtype() != ScalarType::F32
         || promoted_key_bf16.dtype() != ScalarType::BF16
         || promote_index.dtype() != ScalarType::U32
         || promoted_value_bf16.dtype() != ScalarType::BF16
@@ -1604,10 +1989,11 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         || output_bf16.dtype() != ScalarType::BF16
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV mixed-key dtypes must be BF16/U8/F32/BF16/U32/BF16/U32/U8/F16/F16/F32/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            "certified KV mixed-key dtypes must be BF16/U8/F32/F32/BF16/U32/BF16/U32/U8/F16/F16/F32/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
             query_bf16.dtype(),
             key_int8.dtype(),
             key_scale.dtype(),
+            key_zero.dtype(),
             promoted_key_bf16.dtype(),
             promote_index.dtype(),
             promoted_value_bf16.dtype(),
@@ -1625,6 +2011,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
     if (!query_is_2d && !query_is_3d)
         || key_int8.shape().len() != 3
         || key_scale.shape().len() != 3
+        || key_zero.shape().len() != 3
         || value_int4.shape().len() != 3
     {
         return Err(GpuError::InvalidArg(format!(
@@ -1659,12 +2046,14 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
     }
     let key_stride_tokens = key_int8.shape()[1];
     let num_blocks = active_aligned_tokens / block_size;
-    let key_scale_stride_blocks =
-        if key_scale.shape()[0] == kv_heads && key_scale.shape()[2] == head_dim {
-            key_scale.shape()[1]
-        } else {
-            0
-        };
+    let key_scale_stride_blocks = if key_scale.shape()[0] == kv_heads
+        && key_scale.shape()[2] == head_dim
+        && key_zero.shape() == key_scale.shape()
+    {
+        key_scale.shape()[1]
+    } else {
+        0
+    };
     let promoted_key_shape = promoted_key_bf16.shape();
     let max_promoted_blocks = if promoted_key_shape.len() == 4
         && promoted_key_shape[0] == q_heads
@@ -1776,6 +2165,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
             query_bf16.as_ptr(),
             key_int8.as_ptr(),
             key_scale.as_ptr(),
+            key_zero.as_ptr(),
             promoted_key_bf16.as_ptr(),
             promote_index.as_ptr(),
             promoted_value_bf16.as_ptr(),
@@ -1826,6 +2216,7 @@ pub fn attend_int8_bf16_values(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     value_bf16: &GpuBuffer,
     tail_key_bf16: Option<&GpuBuffer>,
     block_size: usize,
@@ -1845,6 +2236,7 @@ pub fn attend_int8_bf16_values(
         query_bf16,
         key_int8,
         key_scale,
+        key_zero,
         value_bf16,
         tail_key_bf16,
         value_bf16.shape()[1],
@@ -2050,6 +2442,7 @@ pub fn attend_int8_bf16_values_strided(
     query_bf16: &GpuBuffer,
     key_int8: &GpuBuffer,
     key_scale: &GpuBuffer,
+    key_zero: &GpuBuffer,
     value_bf16: &GpuBuffer,
     tail_key_bf16: Option<&GpuBuffer>,
     total_tokens: usize,
@@ -2227,6 +2620,7 @@ pub fn attend_int8_bf16_values_strided(
                             query_bf16.as_ptr(),
                             key_int8.as_ptr(),
                             key_scale.as_ptr(),
+                            key_zero.as_ptr(),
                             value_bf16.as_ptr(),
                             tail_key_ptr,
                             score_scratch.as_mut_ptr(),
@@ -2252,6 +2646,7 @@ pub fn attend_int8_bf16_values_strided(
                             query_bf16.as_ptr(),
                             key_int8.as_ptr(),
                             key_scale.as_ptr(),
+                            key_zero.as_ptr(),
                             value_bf16.as_ptr(),
                             tail_key_ptr,
                             score_scratch.as_mut_ptr(),
@@ -2385,6 +2780,8 @@ mod tests {
         let mut key_i8 = GpuBuffer::zeros(ordinal, ScalarType::U8, &key_i8_shape).expect("key_i8");
         let mut key_scale =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &key_scale_shape).expect("key_scale");
+        let mut key_zero =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &key_scale_shape).expect("key_zero");
         let mut value_i4 =
             GpuBuffer::zeros(ordinal, ScalarType::U8, &value_i4_shape).expect("value_i4");
         let mut value_scale =
@@ -2393,6 +2790,8 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::F16, &value_meta_shape).expect("value_zero");
         let mut value_error =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &value_error_shape).expect("value_error");
+        let mut value_norm =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &value_error_shape).expect("value_norm");
 
         quantize_bf16_cache(
             ordinal,
@@ -2403,19 +2802,24 @@ mod tests {
             value_group_size,
             &mut key_i8,
             &mut key_scale,
+            &mut key_zero,
             &mut value_i4,
             &mut value_scale,
             &mut value_zero,
             &mut value_error,
+            &mut value_norm,
         )
         .expect("quantize");
 
         let key_scales = f32s(&key_scale.to_host_bytes().expect("download key_scale"));
-        assert!((key_scales[0] - (2.0 / 127.0)).abs() < 1.0e-6);
-        assert!((key_scales[4] - (4.0 / 127.0)).abs() < 1.0e-6);
+        assert!((key_scales[0] - (1.0 / 255.0)).abs() < 1.0e-6);
+        assert!((key_scales[4] - (5.0 / 255.0)).abs() < 1.0e-6);
+        let key_zeros = f32s(&key_zero.to_host_bytes().expect("download key_zero"));
+        assert!((key_zeros[0] - (1.0 + 128.0 / 255.0)).abs() < 1.0e-6);
+        assert!((key_zeros[4] - (-4.0 + 128.0 * 5.0 / 255.0)).abs() < 1.0e-6);
         let key_q = key_i8.to_host_bytes().expect("download key_i8");
-        assert_eq!(key_q[0] as i8, 64);
-        assert_eq!(key_q[1] as i8, -127);
+        assert_eq!(key_q[0] as i8, -128);
+        assert_eq!(key_q[1] as i8, -128);
 
         let value_q = value_i4.to_host_bytes().expect("download value_i4");
         assert_eq!(value_q[0], 0xf0);
@@ -2435,6 +2839,8 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::U8, &key_i8_shape).expect("key_only_i8");
         let mut key_only_scale =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &key_scale_shape).expect("key_only_scale");
+        let mut key_only_zero =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &key_scale_shape).expect("key_only_zero");
         quantize_bf16_keys(
             ordinal,
             &key,
@@ -2442,6 +2848,7 @@ mod tests {
             block_size,
             &mut key_only_i8,
             &mut key_only_scale,
+            &mut key_only_zero,
         )
         .expect("quantize keys");
         assert_eq!(
@@ -2454,6 +2861,12 @@ mod tests {
                 .expect("download key_only_scale"),
             key_scale.to_host_bytes().expect("download key_scale again")
         );
+        assert_eq!(
+            key_only_zero
+                .to_host_bytes()
+                .expect("download key_only_zero"),
+            key_zero.to_host_bytes().expect("download key_zero again")
+        );
 
         let mut key_range_i8 =
             GpuBuffer::zeros(ordinal, ScalarType::U8, &[num_kv_heads, 6, head_dim])
@@ -2461,6 +2874,9 @@ mod tests {
         let mut key_range_scale =
             GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, 3, head_dim])
                 .expect("key_range_scale");
+        let mut key_range_zero =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, 3, head_dim])
+                .expect("key_range_zero");
         quantize_bf16_keys_range(
             ordinal,
             &key,
@@ -2469,6 +2885,7 @@ mod tests {
             block_size,
             &mut key_range_i8,
             &mut key_range_scale,
+            &mut key_range_zero,
         )
         .expect("quantize key range 0");
         quantize_bf16_keys_range(
@@ -2479,6 +2896,7 @@ mod tests {
             block_size,
             &mut key_range_i8,
             &mut key_range_scale,
+            &mut key_range_zero,
         )
         .expect("quantize key range 1");
         let key_range_q = key_range_i8.to_host_bytes().expect("download key_range_i8");
@@ -2494,6 +2912,15 @@ mod tests {
             &key_scale
                 .to_host_bytes()
                 .expect("download key_scale range cmp")[..]
+        );
+        let key_range_zeros = key_range_zero
+            .to_host_bytes()
+            .expect("download key_range_zero");
+        assert_eq!(
+            &key_range_zeros[..num_kv_heads * (seq_len / block_size) * head_dim * 4],
+            &key_zero
+                .to_host_bytes()
+                .expect("download key_zero range cmp")[..]
         );
     }
 
@@ -2531,6 +2958,7 @@ mod tests {
             &f32_bytes(&[0.1, 0.2, 0.05, 0.25]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let mut block_max = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 1]).expect("block_max");
         let mut block_sum = GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 1]).expect("block_sum");
 
@@ -2539,6 +2967,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             2,
             2,
             1.0,
@@ -2602,6 +3031,7 @@ mod tests {
             &f32_bytes(&[0.1, 0.2, 0.05, 0.25]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let value_i4 = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::U8,
@@ -2632,6 +3062,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &value_i4,
             &value_scale,
             &value_zero,
@@ -2681,6 +3112,7 @@ mod tests {
             &f32_bytes(&[1.0, 1.0, 1.0, 1.0]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let value_i4 =
             GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 2, 2], &[0, 0, 0, 0])
                 .expect("upload value_i4");
@@ -2721,6 +3153,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &value_i4,
             &value_scale,
             &value_zero,
@@ -2769,6 +3202,7 @@ mod tests {
             &f32_bytes(&[1.0, 1.0, 1.0, 1.0, 99.0, 99.0, 99.0, 99.0]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 2, 4]).expect("key_zero");
         let value_i4 = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::U8,
@@ -2818,6 +3252,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &value_i4,
             &value_scale,
             &value_zero,
@@ -2850,6 +3285,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &value_i4,
             &value_scale,
             &value_zero,
@@ -2898,6 +3334,7 @@ mod tests {
             &f32_bytes(&[1.0, 1.0, 1.0, 1.0]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let values = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -2923,6 +3360,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &values,
             Some(&tail_key),
             2,
@@ -2967,6 +3405,7 @@ mod tests {
             &f32_bytes(&[1.0, 1.0, 1.0, 1.0]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let values = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -2993,6 +3432,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &values,
             Some(&tail_key),
             3,
@@ -3021,6 +3461,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &values,
             Some(&tail_key),
             3,
@@ -3065,6 +3506,7 @@ mod tests {
             &f32_bytes(&[1.0, 1.0, 1.0, 1.0]),
         )
         .expect("upload key_scale");
+        let key_zero = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 4]).expect("key_zero");
         let values = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -3094,6 +3536,7 @@ mod tests {
             &query,
             &key_i8,
             &key_scale,
+            &key_zero,
             &values,
             Some(&tail_key),
             3,

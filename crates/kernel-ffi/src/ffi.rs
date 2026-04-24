@@ -189,6 +189,15 @@ unsafe extern "C" {
         out_index: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_cuda_target_nll_bf16(
+        device_ordinal: usize,
+        rows: usize,
+        vocab_size: usize,
+        logits: *const c_void,
+        targets: *const c_void,
+        out_nll: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_cuda_lm_head_argmax_bf16(
         device_ordinal: usize,
         hidden_dim: usize,
@@ -761,6 +770,62 @@ pub fn cuda_lm_head_argmax_bf16(
             hidden_dim,
             vocab_size,
         );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn cuda_target_nll_bf16(
+    ordinal: usize,
+    logits: &GpuBuffer,
+    targets: &GpuBuffer,
+    out_nll: &mut GpuBuffer,
+    rows: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Cuda
+        || targets.backend() != Backend::Cuda
+        || out_nll.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_target_nll_bf16 requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if targets.dtype() != ScalarType::U32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires U32 targets".into(),
+        ));
+    }
+    if out_nll.dtype() != ScalarType::F32 || out_nll.elem_count() < rows {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires F32 out_nll with at least rows elements".into(),
+        ));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_target_nll_bf16(
+            ordinal,
+            rows,
+            vocab_size,
+            logits.as_ptr(),
+            targets.as_ptr(),
+            out_nll.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_target_nll_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, logits, targets, out_nll, rows, vocab_size);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
 }

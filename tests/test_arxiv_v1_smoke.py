@@ -9,6 +9,7 @@ from oracle.arxiv_v1_smoke import (
     evaluate_quality_gates,
     load_reference,
     make_niah_single,
+    parse_stage_line,
     parse_supersonic_generation,
     score_string_match_all,
     stable_seed,
@@ -47,6 +48,13 @@ class ArxivV1SmokeTests(unittest.TestCase):
             parse_supersonic_generation(output, "needle: 12345\nQuestion:"),
             " answer is 67890",
         )
+
+    def test_stage_parser_reads_key_value_pairs(self):
+        parsed = parse_stage_line(
+            "[stage] tokens=3 total_ms=12.5 cert_attend=4.0 host_sampling=0.2\n"
+        )
+        self.assertEqual(parsed["tokens"], 3.0)
+        self.assertEqual(parsed["cert_attend"], 4.0)
 
     def test_reference_loader_reads_normalized_ruler_smoke_summary(self):
         with tempfile.TemporaryDirectory() as td:

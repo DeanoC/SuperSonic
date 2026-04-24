@@ -409,6 +409,69 @@ __global__ void pfx_argmax_blocks_kernel(
     }
 }
 
+__global__ void pfx_target_nll_bf16_kernel(
+    const hip_bfloat16* __restrict__ logits,
+    const uint32_t* __restrict__ targets,
+    size_t rows,
+    size_t vocab_size,
+    float* __restrict__ out_nll
+) {
+    __shared__ float shared_vals[256];
+    __shared__ float shared_target[256];
+
+    const unsigned int tid = threadIdx.x;
+    const size_t row = blockIdx.x;
+    if (row >= rows) {
+        return;
+    }
+
+    const hip_bfloat16* row_logits = logits + row * vocab_size;
+    const uint32_t target = targets[row];
+
+    float max_val = -1.0e30f;
+    float target_val = 0.0f;
+    for (size_t idx = tid; idx < vocab_size; idx += blockDim.x) {
+        const float val = __bfloat162float(row_logits[idx]);
+        max_val = fmaxf(max_val, val);
+        if (idx == static_cast<size_t>(target)) {
+            target_val = val;
+        }
+    }
+
+    shared_vals[tid] = max_val;
+    shared_target[tid] = target_val;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared_vals[tid] = fmaxf(shared_vals[tid], shared_vals[tid + offset]);
+            shared_target[tid] += shared_target[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    const float row_max = shared_vals[0];
+    const float row_target = shared_target[0];
+    float sum_exp = 0.0f;
+    for (size_t idx = tid; idx < vocab_size; idx += blockDim.x) {
+        sum_exp += expf(__bfloat162float(row_logits[idx]) - row_max);
+    }
+
+    shared_vals[tid] = sum_exp;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            shared_vals[tid] += shared_vals[tid + offset];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_nll[row] = row_max + logf(shared_vals[0]) - row_target;
+    }
+}
+
 int argmax_bf16_device(int device_ordinal, size_t n, const void* logits, void* out_index) {
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
@@ -418,6 +481,27 @@ int argmax_bf16_device(int device_ordinal, size_t n, const void* logits, void* o
         static_cast<uint32_t*>(out_index));
     if (cudaGetLastError() != cudaSuccess) return 401;
     if (cudaDeviceSynchronize() != cudaSuccess) return 402;
+    return 0;
+}
+
+int target_nll_bf16_device(
+    int device_ordinal,
+    size_t rows,
+    size_t vocab_size,
+    const void* logits,
+    const void* targets,
+    void* out_nll
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    pfx_target_nll_bf16_kernel<<<static_cast<unsigned int>(rows), block>>>(
+        static_cast<const hip_bfloat16*>(logits),
+        static_cast<const uint32_t*>(targets),
+        rows,
+        vocab_size,
+        static_cast<float*>(out_nll));
+    if (cudaGetLastError() != cudaSuccess) return 421;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 422;
     return 0;
 }
 
@@ -627,6 +711,23 @@ extern "C" int dotcache_qwen35_cuda_argmax_bf16(
     void* out_index
 ) {
     return argmax_bf16_device(static_cast<int>(device_ordinal), n, logits, out_index);
+}
+
+extern "C" int dotcache_qwen35_cuda_target_nll_bf16(
+    size_t device_ordinal,
+    size_t rows,
+    size_t vocab_size,
+    const void* logits,
+    const void* targets,
+    void* out_nll
+) {
+    return target_nll_bf16_device(
+        static_cast<int>(device_ordinal),
+        rows,
+        vocab_size,
+        logits,
+        targets,
+        out_nll);
 }
 
 extern "C" int dotcache_qwen35_cuda_lm_head_argmax_bf16(

@@ -356,6 +356,10 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     teacher_forced_dense_prefix_len: Option<usize>,
 
+    /// Debug-only: force the legacy one-token-prefill + decode-step teacher-forced scorer.
+    #[arg(long, hide = true)]
+    teacher_forced_decode_step: bool,
+
     /// Run PyTorch oracle and compare logits
     #[arg(long)]
     validate: bool,
@@ -464,6 +468,18 @@ pub(crate) struct Cli {
     /// Certified KV Rung 1 K expansion multiplier.
     #[arg(long, default_value = "2.0", hide = true)]
     certified_kv_rung1_multiplier: f32,
+
+    /// Certified KV guard exponent applied to tail-mass certificates.
+    #[arg(long, default_value = "3.0", hide = true)]
+    certified_kv_delta_guard_factor: f32,
+
+    /// Fraction of tail blocks to score-check opportunistically.
+    #[arg(long, default_value = "0.01", hide = true)]
+    certified_kv_score_exploration_rate: f32,
+
+    /// Debug-only: allow certified KV to continue when the tail certificate misses threshold.
+    #[arg(long, hide = true)]
+    certified_kv_allow_uncertified_tail: bool,
 
     /// Certified KV score-consistency guard epsilon.
     #[arg(long, default_value = "0.0001", hide = true)]

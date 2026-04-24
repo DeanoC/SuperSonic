@@ -10,6 +10,7 @@ from oracle.pg19_smoke import (
     evaluate_gates,
     load_reference,
     parse_contexts,
+    parse_stage_line,
     parse_teacher_forced_json,
     resolve_eval_start_frac,
 )
@@ -27,6 +28,11 @@ class Pg19SmokeTests(unittest.TestCase):
         parsed = parse_teacher_forced_json(output)
         self.assertEqual(parsed["perplexity"], 6.25)
         self.assertEqual(parsed["scored_tokens"], 10)
+
+    def test_stage_parser_reads_key_value_pairs(self):
+        parsed = parse_stage_line("[stage] tokens=4 total_ms=20.5 cert_key_q=1.0\n")
+        self.assertEqual(parsed["tokens"], 4.0)
+        self.assertEqual(parsed["cert_key_q"], 1.0)
 
     def test_reference_loader_reads_normalized_pg19(self):
         with tempfile.TemporaryDirectory() as td:

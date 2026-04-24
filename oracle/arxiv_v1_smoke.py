@@ -22,6 +22,7 @@ import re
 import string
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -460,37 +461,47 @@ def run_supersonic(
     timeout_s: int,
     emit_stage_timings: bool = False,
 ) -> tuple[str, dict[str, Any]]:
-    cmd = [
-        str(binary),
-        "--backend",
-        "cuda",
-        "--model",
-        "llama3.1-8b",
-        "--model-dir",
-        str(model_dir),
-        "--prompt",
-        prompt,
-        "--max-new-tokens",
-        str(max_new_tokens),
-        "--int8",
-        "--emit-generated-json",
-    ]
-    if config == "certified":
-        cmd.append("--certified-kv")
-    if emit_stage_timings:
-        cmd.append("--emit-stage-timings")
-    env = os.environ.copy()
-    env.setdefault("SUPERSONIC_BACKENDS", "cuda")
-    start = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
-    elapsed = time.perf_counter() - start
-    output = proc.stdout + proc.stderr
-    if proc.returncode != 0:
-        raise RuntimeError(f"SuperSonic failed with exit code {proc.returncode}\n{output}")
-    generated = parse_supersonic_generation(output, prompt)
-    result = parse_result_line(output)
-    result["wall_seconds"] = elapsed
-    return generated, result
+    with tempfile.NamedTemporaryFile(prefix="certified-kv-arxiv-", suffix=".jsonl") as telemetry:
+        cmd = [
+            str(binary),
+            "--backend",
+            "cuda",
+            "--model",
+            "llama3.1-8b",
+            "--model-dir",
+            str(model_dir),
+            "--prompt",
+            prompt,
+            "--max-new-tokens",
+            str(max_new_tokens),
+            "--int8",
+            "--emit-generated-json",
+        ]
+        if config == "certified":
+            cmd.extend(["--certified-kv", "--certified-kv-telemetry", telemetry.name])
+        if emit_stage_timings:
+            cmd.append("--emit-stage-timings")
+        env = os.environ.copy()
+        env.setdefault("SUPERSONIC_BACKENDS", "cuda")
+        start = time.perf_counter()
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
+        elapsed = time.perf_counter() - start
+        output = proc.stdout + proc.stderr
+        if proc.returncode != 0:
+            raise RuntimeError(f"SuperSonic failed with exit code {proc.returncode}\n{output}")
+        generated = parse_supersonic_generation(output, prompt)
+        result = parse_result_line(output)
+        result["stage"] = parse_stage_line(output)
+        result["wall_seconds"] = elapsed
+        if config == "certified":
+            telemetry.seek(0)
+            lines = [
+                json.loads(line)
+                for line in telemetry.read().decode().splitlines()
+                if line.strip()
+            ]
+            result["certified_kv_telemetry"] = lines[-1] if lines else {}
+        return generated, result
 
 
 def parse_result_line(output: str) -> dict[str, Any]:
@@ -507,6 +518,23 @@ def parse_result_line(output: str) -> dict[str, Any]:
         "decode_ms": float(match.group(3)),
         "ms_per_step": float(match.group(4)),
     }
+
+
+def parse_stage_line(output: str) -> dict[str, Any]:
+    match = re.search(r"^\[stage\] (.+)$", output, flags=re.MULTILINE)
+    if not match:
+        return {}
+    out: dict[str, Any] = {}
+    for part in match.group(1).split():
+        if "=" not in part:
+            continue
+        key, raw = part.split("=", 1)
+        try:
+            value: Any = float(raw)
+        except ValueError:
+            value = raw
+        out[key] = value
+    return out
 
 
 def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
@@ -533,16 +561,25 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 rng = random.Random(stable_seed(args.seed, subtask, ctx, sample_idx))
                 prompt, refs = builder(rng, ctx, tokenizer)
                 for cfg in configs:
-                    generated, timing = run_supersonic(
-                        args.binary,
-                        args.model_dir,
-                        prompt,
-                        max_new,
-                        cfg,
-                        args.timeout,
-                        emit_stage_timings=args.emit_stage_timings,
-                    )
-                    score = score_string_match_all(generated, refs)
+                    error = None
+                    generated = ""
+                    timing: dict[str, Any] = {}
+                    score: float | None = None
+                    try:
+                        generated, timing = run_supersonic(
+                            args.binary,
+                            args.model_dir,
+                            prompt,
+                            max_new,
+                            cfg,
+                            args.timeout,
+                            emit_stage_timings=args.emit_stage_timings,
+                        )
+                        score = score_string_match_all(generated, refs)
+                    except Exception as exc:
+                        if not args.continue_on_error:
+                            raise
+                        error = str(exc)
                     ref = references[cfg][ctx]
                     ref_key = f"{subtask}_{ctx // 1024}K"
                     ref_score = ref.subtask_values.get(ref_key) if ref else None
@@ -554,6 +591,7 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
                         "sample_idx": sample_idx,
                         "references": refs,
                         "score": score,
+                        "error": error,
                         "generated": generated[:400],
                         "timing": timing,
                         "reference_score": ref_score,
@@ -561,9 +599,10 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     all_results.append(row)
                     ref_part = "" if ref_score is None else f" ref={ref_score:.3f}"
+                    score_part = "ERROR" if score is None else f"{score:.3f}"
                     print(
                         f"{cfg:<9} ctx={ctx:<5} {subtask:<16} "
-                        f"sample={sample_idx:<2} score={score:.3f}{ref_part} "
+                        f"sample={sample_idx:<2} score={score_part}{ref_part} "
                         f"ms_step={timing.get('ms_per_step', 0.0):.2f}"
                     )
 
@@ -581,12 +620,21 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
                 "reference_source": row["reference_source"],
             },
         )
-        bucket["scores"].append(row["score"])
+        if row["score"] is not None:
+            bucket["scores"].append(row["score"])
 
     for bucket in summary.values():
         scores = bucket.pop("scores")
         bucket["mean_score"] = sum(scores) / len(scores) if scores else 0.0
         bucket["n"] = len(scores)
+        bucket["errors"] = sum(
+            1
+            for row in all_results
+            if row["config"] == bucket["config"]
+            and row["subtask"] == bucket["subtask"]
+            and row["context_length"] == bucket["context_length"]
+            and row.get("error")
+        )
         ref = bucket.get("reference_score")
         bucket["delta_vs_reference"] = (
             bucket["mean_score"] - float(ref) if ref is not None else None
@@ -604,6 +652,7 @@ def run_ruler_smoke(args: argparse.Namespace) -> dict[str, Any]:
         "reference_dir": str(args.reference_dir),
         "summary": summary,
         "results": all_results,
+        "run_errors": [row for row in all_results if row.get("error")],
     }
     return payload
 
@@ -629,6 +678,8 @@ def evaluate_quality_gates(payload: dict[str, Any], args: argparse.Namespace) ->
         dense_scores: dict[tuple[int, str, int], float] = {}
         cert_scores: dict[tuple[int, str, int], float] = {}
         for row in payload.get("results", []):
+            if row.get("score") is None:
+                continue
             sample_key = (row["context_length"], row["subtask"], row["sample_idx"])
             if row["config"] == "dense":
                 dense_scores[sample_key] = float(row["score"])
@@ -683,6 +734,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fail-below-reference", action="store_true")
     parser.add_argument("--reference-tolerance", type=float, default=0.0)
     parser.add_argument("--fail-on-critical", action="store_true")
+    parser.add_argument("--continue-on-error", action="store_true")
     parser.add_argument("--output", type=Path, default=Path("target/arxiv_v1_smoke.json"))
     args = parser.parse_args(argv)
     unknown = [name for name in args.subtasks if name not in SUBTASK_BUILDERS]

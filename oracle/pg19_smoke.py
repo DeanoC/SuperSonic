@@ -15,6 +15,7 @@ import math
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,23 @@ def parse_teacher_forced_json(output: str) -> dict[str, Any]:
     if not match:
         raise RuntimeError("SuperSonic output missing [teacher_forced_json]")
     return json.loads(match.group(1))
+
+
+def parse_stage_line(output: str) -> dict[str, Any]:
+    match = re.search(r"^\[stage\] (.+)$", output, flags=re.MULTILINE)
+    if not match:
+        return {}
+    out: dict[str, Any] = {}
+    for part in match.group(1).split():
+        if "=" not in part:
+            continue
+        key, raw = part.split("=", 1)
+        try:
+            value: Any = float(raw)
+        except ValueError:
+            value = raw
+        out[key] = value
+    return out
 
 
 def load_reference(
@@ -140,39 +158,52 @@ def run_supersonic(
     config: str,
     timeout: int,
     dense_prefix_len: int | None = None,
+    emit_stage_timings: bool = False,
 ) -> dict[str, Any]:
-    cmd = [
-        str(binary),
-        "--backend",
-        "cuda",
-        "--model",
-        "llama3.1-8b",
-        "--model-dir",
-        str(model_dir),
-        "--prompt",
-        prompt,
-        "--prompt-no-special-tokens",
-        "--context-size",
-        str(context),
-        "--max-new-tokens",
-        "0",
-        "--int8",
-        "--teacher-forced",
-    ]
-    if config == "certified":
-        cmd.append("--certified-kv")
-        if dense_prefix_len is not None and dense_prefix_len > 0:
-            cmd.extend(["--teacher-forced-dense-prefix-len", str(dense_prefix_len)])
-    proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
-    combined = proc.stdout + proc.stderr
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"SuperSonic failed for config={config} context={context} rc={proc.returncode}\n{combined[-4000:]}"
-        )
-    result = parse_teacher_forced_json(combined)
-    result["stdout_tail"] = proc.stdout[-1000:]
-    result["stderr_tail"] = proc.stderr[-1000:]
-    return result
+    with tempfile.NamedTemporaryFile(prefix="certified-kv-pg19-", suffix=".jsonl") as telemetry:
+        cmd = [
+            str(binary),
+            "--backend",
+            "cuda",
+            "--model",
+            "llama3.1-8b",
+            "--model-dir",
+            str(model_dir),
+            "--prompt",
+            prompt,
+            "--prompt-no-special-tokens",
+            "--context-size",
+            str(context),
+            "--max-new-tokens",
+            "0",
+            "--int8",
+            "--teacher-forced",
+        ]
+        if config == "certified":
+            cmd.extend(["--certified-kv", "--certified-kv-telemetry", telemetry.name])
+            if dense_prefix_len is not None and dense_prefix_len > 0:
+                cmd.extend(["--teacher-forced-dense-prefix-len", str(dense_prefix_len)])
+        if emit_stage_timings:
+            cmd.append("--emit-stage-timings")
+        proc = subprocess.run(cmd, text=True, capture_output=True, timeout=timeout, check=False)
+        combined = proc.stdout + proc.stderr
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"SuperSonic failed for config={config} context={context} rc={proc.returncode}\n{combined[-4000:]}"
+            )
+        result = parse_teacher_forced_json(combined)
+        result["stage"] = parse_stage_line(combined)
+        if config == "certified":
+            telemetry.seek(0)
+            lines = [
+                json.loads(line)
+                for line in telemetry.read().decode().splitlines()
+                if line.strip()
+            ]
+            result["certified_kv_telemetry"] = lines[-1] if lines else {}
+        result["stdout_tail"] = proc.stdout[-1000:]
+        result["stderr_tail"] = proc.stderr[-1000:]
+        return result
 
 
 def aggregate(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -233,6 +264,7 @@ def main() -> int:
     parser.add_argument("--source-text", type=Path, default=None)
     parser.add_argument("--output", type=Path, default=Path("target/pg19_smoke.json"))
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--emit-stage-timings", action="store_true")
     parser.add_argument(
         "--reference-dir",
         type=Path,
@@ -282,6 +314,7 @@ def main() -> int:
                     config,
                     args.timeout,
                     dense_prefix_len=dense_prefix_len,
+                    emit_stage_timings=args.emit_stage_timings,
                 )
                 result.update({"chunk_idx": idx, "context_length": ctx, "config": config})
                 per_chunk.append(result)

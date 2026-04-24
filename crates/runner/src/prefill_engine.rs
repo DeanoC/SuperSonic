@@ -584,6 +584,110 @@ pub fn compute_logits_for_range(
     Ok((logits_per_pos, normed))
 }
 
+fn compute_target_nll_for_range(
+    hidden: &GpuBuffer,
+    weights: &Qwen35Weights,
+    config: &TextConfig,
+    start: usize,
+    targets: &[u32],
+    ordinal: usize,
+) -> Result<Vec<f32>> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let hidden_dim = config.hidden_size;
+    let vocab_size = config.vocab_size;
+    let count = targets.len();
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+
+    for &target in targets {
+        if target as usize >= vocab_size {
+            return Err(anyhow::anyhow!(
+                "target token {target} outside vocab size {vocab_size}"
+            ));
+        }
+    }
+
+    let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("target NLL slice alloc: {e}"))?;
+    let src_offset = start * hidden_dim * elem_bytes;
+    gpu_hal::copy_d2d(
+        ordinal,
+        slice.as_ptr() as *mut c_void,
+        hidden.offset_ptr(src_offset),
+        count * hidden_dim * elem_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("target NLL slice copy: {e}"))?;
+
+    let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("target NLL normed alloc: {e}"))?;
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        count,
+        hidden_dim,
+        &slice,
+        &weights.norm_weight,
+        &mut normed,
+        "target NLL final norm",
+    )?;
+
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
+        .map_err(|e| anyhow::anyhow!("target NLL logits alloc: {e}"))?;
+    kernel_ffi::matmul_rhs_transposed_4b(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        count,
+        vocab_size,
+        hidden_dim,
+        &normed,
+        &*weights.lm_head,
+        &mut logits_buf,
+    )
+    .map_err(|e| anyhow::anyhow!("target NLL lm_head tiled: {e}"))?;
+
+    let mut target_bytes = Vec::with_capacity(count * 4);
+    for &target in targets {
+        target_bytes.extend_from_slice(&target.to_le_bytes());
+    }
+    let targets_gpu = GpuBuffer::zeros(ordinal, ScalarType::U32, &[count])
+        .map_err(|e| anyhow::anyhow!("target NLL target alloc: {e}"))?;
+    copy_h2d(
+        ordinal,
+        targets_gpu.as_ptr() as *mut c_void,
+        target_bytes.as_ptr() as *const c_void,
+        target_bytes.len(),
+    )
+    .map_err(|e| anyhow::anyhow!("target NLL target H2D: {e}"))?;
+
+    let mut nll_gpu = GpuBuffer::zeros(ordinal, ScalarType::F32, &[count])
+        .map_err(|e| anyhow::anyhow!("target NLL output alloc: {e}"))?;
+    kernel_ffi::cuda_target_nll_bf16(
+        ordinal,
+        &logits_buf,
+        &targets_gpu,
+        &mut nll_gpu,
+        count,
+        vocab_size,
+    )
+    .map_err(|e| anyhow::anyhow!("target NLL kernel: {e}"))?;
+
+    let nll_bytes = nll_gpu
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("target NLL D2H: {e}"))?;
+    Ok(nll_bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect())
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefillTargetNll {
+    pub total_nll: f64,
+    pub scored_tokens: usize,
+}
+
 /// Result of a prefill pass.
 pub struct PrefillResult {
     /// Logits for the last token position [vocab_size] as F32 on CPU.
@@ -607,6 +711,8 @@ pub struct PrefillResult {
     pub tap_hiddens: Option<Vec<Vec<u8>>>,
     /// Optional last-token debug trace for one selected linear-attention layer.
     pub linear_debug_trace: Option<LinearLayerDebugTrace>,
+    /// Optional GPU-computed next-token NLL summary for a requested hidden range.
+    pub target_nll: Option<PrefillTargetNll>,
 }
 
 pub struct LinearLayerDebugTrace {
@@ -742,6 +848,7 @@ pub fn prefill(
         trace_layers,
         debug_linear_layer,
         None,
+        None,
     )
 }
 
@@ -776,6 +883,36 @@ pub fn prefill_with_taps(
         trace_layers,
         debug_linear_layer,
         Some(tap_layers),
+        None,
+    )
+}
+
+pub fn prefill_with_target_nll(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    score_hidden_start: usize,
+    score_targets: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+) -> Result<PrefillResult> {
+    prefill_inner(
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        0,
+        kv_fp8,
+        use_4b_kernel,
+        false,
+        None,
+        None,
+        Some((score_hidden_start, score_targets)),
     )
 }
 
@@ -792,6 +929,7 @@ fn prefill_inner(
     trace_layers: bool,
     debug_linear_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
+    target_nll: Option<(usize, &[u32])>,
 ) -> Result<PrefillResult> {
     let config = &weights.config;
     let seq_len = prompt_ids.len();
@@ -1138,6 +1276,31 @@ fn prefill_inner(
     // Extract logits for the last token of the final chunk. Refactored out
     // into `compute_logits_for_range` so the DFlash verify path can request
     // count=B and walk the block argmax in one shot (M3; see docs/dflash.md §6).
+    let target_nll = if let Some((score_hidden_start, score_targets)) = target_nll {
+        let score_end = score_hidden_start
+            .checked_add(score_targets.len())
+            .ok_or_else(|| anyhow::anyhow!("target NLL range overflow"))?;
+        if score_end > last_chunk_len {
+            return Err(anyhow::anyhow!(
+                "target NLL range [{score_hidden_start}, {score_end}) is outside unchunked hidden buffer of {last_chunk_len} rows"
+            ));
+        }
+        let nll = compute_target_nll_for_range(
+            &scratch.hidden,
+            weights,
+            config,
+            score_hidden_start,
+            score_targets,
+            ordinal,
+        )?;
+        Some(PrefillTargetNll {
+            total_nll: nll.iter().map(|&x| x as f64).sum(),
+            scored_tokens: nll.len(),
+        })
+    } else {
+        None
+    };
+
     let (mut logits_per_pos, normed_last) = compute_logits_for_range(
         &scratch.hidden,
         weights,
@@ -1173,6 +1336,7 @@ fn prefill_inner(
         layer_hidden_trace,
         tap_hiddens,
         linear_debug_trace,
+        target_nll,
     })
 }
 

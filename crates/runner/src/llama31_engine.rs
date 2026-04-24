@@ -32,6 +32,9 @@ fn certified_kv_decode_params(
         ranking_r: cfg.ranking_r,
         rung1_threshold: cfg.rung1_threshold,
         rung1_multiplier: cfg.rung1_multiplier,
+        delta_guard_factor: cfg.delta_guard_factor,
+        score_exploration_rate: cfg.score_exploration_rate,
+        require_certified_tail_bound: cfg.require_certified_tail_bound,
         eps_guard: cfg.eps_guard,
     }
 }
@@ -499,17 +502,47 @@ fn run_llama31_teacher_forced(
 
     let score_start = Instant::now();
     let prefill_start = Instant::now();
-    let mut logits = engine.prefill_native(&prompt_ids[..1])?;
-    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
-
+    let use_gpu_prefill_scoring =
+        !cli.teacher_forced_decode_step && (certified_kv_cfg.is_none() || dense_prefix_len > 1);
+    let mut logits;
     let mut total_nll = 0.0f64;
     let mut scored_tokens = 0usize;
     let mut skipped_boundary_tokens = 0usize;
+    let mut decode_loop_start = 1usize;
+
+    if use_gpu_prefill_scoring && certified_kv_cfg.is_none() {
+        let targets = &prompt_ids[1..];
+        let prefill = engine.prefill_native_with_target_nll(prompt_ids, 0, targets)?;
+        let scored = prefill
+            .target_nll
+            .as_ref()
+            .ok_or_else(|| anyhow!("scored prefill did not return target NLL"))?;
+        total_nll += scored.total_nll;
+        scored_tokens += scored.scored_tokens;
+        logits = prefill.logits;
+        decode_loop_start = prompt_ids.len();
+    } else if use_gpu_prefill_scoring && dense_prefix_len > 1 {
+        let prefix = &prompt_ids[..dense_prefix_len];
+        let targets = &prompt_ids[1..dense_prefix_len];
+        let prefill = engine.prefill_native_with_target_nll(prefix, 0, targets)?;
+        let scored = prefill
+            .target_nll
+            .as_ref()
+            .ok_or_else(|| anyhow!("scored prefix prefill did not return target NLL"))?;
+        total_nll += scored.total_nll;
+        scored_tokens += scored.scored_tokens;
+        logits = prefill.logits;
+        decode_loop_start = dense_prefix_len;
+    } else {
+        logits = engine.prefill_native(&prompt_ids[..1])?;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
     let mut decode_steps = 0usize;
     let mut certified_decode_steps = 0usize;
     let mut stage_totals = DecodeStageTimings::default();
 
-    for target_idx in 1..prompt_ids.len() {
+    for target_idx in decode_loop_start..prompt_ids.len() {
         let score_token =
             dense_prefix_len == 0 || target_idx < dense_prefix_len || target_idx > dense_prefix_len;
         if score_token {
@@ -572,6 +605,7 @@ fn run_llama31_teacher_forced(
             "backend": "cuda",
             "model": model_variant.to_string(),
             "mode": if certified_kv_cfg.is_some() { "certified_kv" } else { "dense" },
+            "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll" } else { "decode_step_logits" },
             "prompt_tokens": prompt_ids.len(),
             "scored_tokens": scored_tokens,
             "skipped_boundary_tokens": skipped_boundary_tokens,
@@ -589,6 +623,70 @@ fn run_llama31_teacher_forced(
     );
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, decode_steps);
+    }
+    if let Some(cfg) = certified_kv_cfg {
+        if let Some(path) = cfg.telemetry_path.as_ref() {
+            let memory_stats = engine.certified_kv_memory_stats(0);
+            let payload = serde_json::json!({
+                "backend": "cuda",
+                "model": model_variant.to_string(),
+                "mode": "certified_kv_teacher_forced",
+                "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll_prefix_plus_decode_suffix" } else { "decode_step_logits" },
+                "implementation_stage": "cuda_tier1_mapped_cpu_tier2_gpu_gather",
+                "tier1_storage": if cfg.bf16_values {
+                    "int8_keys_bf16_values"
+                } else {
+                    "int8_keys_int4_values"
+                },
+                "tier2_storage": "cpu_pinned_bf16_original_kv",
+                "paper_tier2_cpu_pinned": true,
+                "prompt_tokens": prompt_ids.len(),
+                "scored_tokens": scored_tokens,
+                "decode_steps": decode_steps,
+                "certified_decode_steps": certified_decode_steps,
+                "perplexity": perplexity,
+                "bits_per_token": bits_per_token,
+                "prefill_ms": prefill_ms,
+                "total_ms": total_ms,
+                "ms_per_token": ms_per_token,
+                "memory_full_attention_layers": memory_stats.full_attention_layers,
+                "memory_tier1_compressed_vram_bytes": memory_stats.tier1_compressed_vram_bytes,
+                "memory_tier2_host_pinned_bytes": memory_stats.tier2_host_pinned_bytes,
+                "memory_tail_bf16_vram_bytes": memory_stats.tail_bf16_vram_bytes,
+                "memory_ranking_prefix_scratch_vram_bytes": memory_stats.ranking_prefix_scratch_vram_bytes,
+                "memory_dense_bf16_kv_vram_bytes": memory_stats.dense_bf16_kv_vram_bytes,
+                "memory_total_certified_vram_bytes": memory_stats.total_certified_vram_bytes(),
+                "block_size": cfg.block_size,
+                "value_group_size": cfg.value_group_size,
+                "value_mode": if cfg.bf16_values { "bf16" } else { "int4" },
+                "tau_cov": cfg.tau_cov,
+                "k_min": cfg.k_min,
+                "k_max": cfg.k_max,
+                "v_tol": cfg.v_tol,
+                "ranking_r": cfg.ranking_r,
+                "rung1_threshold": cfg.rung1_threshold,
+                "rung1_multiplier": cfg.rung1_multiplier,
+                "delta_guard_factor": cfg.delta_guard_factor,
+                "score_exploration_rate": cfg.score_exploration_rate,
+                "require_certified_tail_bound": cfg.require_certified_tail_bound,
+                "eps_guard": cfg.eps_guard,
+            });
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("create certified KV telemetry dir {}", parent.display())
+                    })?;
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open certified KV telemetry {}", path.display()))?;
+            use std::io::Write as _;
+            writeln!(file, "{payload}")
+                .with_context(|| format!("write certified KV telemetry {}", path.display()))?;
+        }
     }
     Ok(())
 }
@@ -813,6 +911,7 @@ pub fn run_llama31(
         false,
         1,
     )?;
+    engine.set_decode_context_limit(context_tokens);
     if let Some(cfg) = &certified_kv_cfg {
         eprintln!("[certified-kv] {}", cfg.summary());
         if cfg.bf16_values {
@@ -1395,7 +1494,7 @@ pub fn run_llama31(
                 "backend": "cuda",
                 "model": model_variant.to_string(),
                 "mode": live_mode,
-                "implementation_stage": "cuda_tier1_cpu_tier2_promoted_key_pagein",
+                "implementation_stage": "cuda_tier1_mapped_cpu_tier2_gpu_gather",
                 "tier1_storage": if cfg.bf16_values {
                     "int8_keys_bf16_values"
                 } else {
@@ -1418,6 +1517,14 @@ pub fn run_llama31(
                 "ranking_prefix_cache_hit_rate": ranking_prefix_cache_hit_rate,
                 "ranking_prefix_h2d_bytes": stage_totals.certified_kv_ranking_prefix_h2d_bytes,
                 "ranking_prefix_reuse_bytes": stage_totals.certified_kv_ranking_prefix_reuse_bytes,
+                "certificate_e_key_max": stage_totals.certified_kv_e_key_max,
+                "certificate_e_val_max": stage_totals.certified_kv_e_val_max,
+                "certificate_bound_total_max": stage_totals.certified_kv_bound_total_max,
+                "certificate_delta_tail_max": stage_totals.certified_kv_delta_tail_max,
+                "certificate_vmax_max": stage_totals.certified_kv_vmax_max,
+                "certificate_true_tail_bound_max": stage_totals.certified_kv_true_tail_bound_max,
+                "certificate_uncertified_tail_heads": stage_totals.certified_kv_uncertified_tail_heads,
+                "score_consistency_violations": stage_totals.certified_kv_score_consistency_violations,
                 "memory_full_attention_layers": memory_stats.full_attention_layers,
                 "memory_tier1_compressed_vram_bytes": memory_stats.tier1_compressed_vram_bytes,
                 "memory_tier2_host_pinned_bytes": memory_stats.tier2_host_pinned_bytes,
@@ -1439,6 +1546,9 @@ pub fn run_llama31(
                 "ranking_r": cfg.ranking_r,
                 "rung1_threshold": cfg.rung1_threshold,
                 "rung1_multiplier": cfg.rung1_multiplier,
+                "delta_guard_factor": cfg.delta_guard_factor,
+                "score_exploration_rate": cfg.score_exploration_rate,
+                "require_certified_tail_bound": cfg.require_certified_tail_bound,
                 "eps_guard": cfg.eps_guard,
                 "rung4_forced_dense_steps": stage_totals.certified_kv_dense_fallback_layers,
                 "shadow_layers": certified_kv_shadow_stats.map(|s| s.layers),
