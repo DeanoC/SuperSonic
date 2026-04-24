@@ -176,6 +176,18 @@ unsafe extern "C" {
         value_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_full_attention_decode_bf16_f32(
+        q_heads: usize,
+        kv_heads: usize,
+        kv_len: usize,
+        kv_stride: usize,
+        head_dim: usize,
+        scale: f32,
+        query_ptr: *const c_void,
+        key_ptr: *const c_void,
+        value_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_rms_norm_rows_bf16(
         n_rows: usize,
         n_cols: usize,
@@ -1326,6 +1338,69 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native full_attention_prefill_bf16_f32 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_attention_decode_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query.dtype() != ScalarType::BF16
+        || key.dtype() != ScalarType::BF16
+        || value.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_decode expects BF16 query/key/value, got {:?}/{:?}/{:?}",
+            query.dtype(),
+            key.dtype(),
+            value.dtype()
+        )));
+    }
+    if out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_decode expects F32 output, got {:?}",
+            out.dtype()
+        )));
+    }
+    if kv_stride < kv_len {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_decode requires kv_stride >= kv_len, got {kv_stride} < {kv_len}"
+        )));
+    }
+    if head_dim > 256 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_decode supports head_dim <= 256, got {head_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_full_attention_decode_bf16_f32(
+            q_heads,
+            kv_heads,
+            kv_len,
+            kv_stride,
+            head_dim,
+            scale,
+            query.as_ptr(),
+            key.as_ptr(),
+            value.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native full_attention_decode_bf16_f32 failed with status {status}"
         )));
     }
     Ok(())
@@ -3311,6 +3386,25 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native full_attention_prefill_strided_bf16_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_attention_decode_bf16_f32(
+    _q_heads: usize,
+    _kv_heads: usize,
+    _kv_len: usize,
+    _kv_stride: usize,
+    _head_dim: usize,
+    _scale: f32,
+    _query: &GpuBuffer,
+    _key: &GpuBuffer,
+    _value: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native full_attention_decode_bf16_f32 is not compiled".into(),
     ))
 }
 

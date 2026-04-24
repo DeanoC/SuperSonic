@@ -87,6 +87,15 @@ struct FullAttentionParams {
     float scale;
 };
 
+struct FullAttentionDecodeParams {
+    uint32_t q_heads;
+    uint32_t kv_heads;
+    uint32_t kv_len;
+    uint32_t kv_stride;
+    uint32_t head_dim;
+    float scale;
+};
+
 struct EmbeddingLookupParams {
     uint32_t token_count;
     uint32_t vocab_size;
@@ -1787,6 +1796,179 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create full-attention pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> full_attention_decode_pipeline_bf16_f32(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:501
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"FATTNDECODE(
+#include <metal_stdlib>
+using namespace metal;
+
+struct FullAttentionDecodeParams {
+    uint q_heads;
+    uint kv_heads;
+    uint kv_len;
+    uint kv_stride;
+    uint head_dim;
+    float scale;
+};
+
+inline void reduce_sum_256(threadgroup float* scratch, uint tid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 128) { scratch[tid] += scratch[tid + 128]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 64) { scratch[tid] += scratch[tid + 64]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) { scratch[tid] += scratch[tid + 32]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 16) { scratch[tid] += scratch[tid + 16]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 8) { scratch[tid] += scratch[tid + 8]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 4) { scratch[tid] += scratch[tid + 4]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 2) { scratch[tid] += scratch[tid + 2]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 1) { scratch[tid] += scratch[tid + 1]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+kernel void supersonic_full_attention_decode_bf16_f32(
+    device const bfloat* query [[buffer(0)]],
+    device const bfloat* key [[buffer(1)]],
+    device const bfloat* value [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant FullAttentionDecodeParams& params [[buffer(4)]],
+    uint q_head [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    threadgroup float scratch[256];
+    threadgroup float max_score;
+    threadgroup float denom;
+    threadgroup float weight;
+
+    if (q_head >= params.q_heads) {
+        return;
+    }
+
+    uint num_kv_groups = params.q_heads / params.kv_heads;
+    uint kv_head = q_head / num_kv_groups;
+    uint query_base = q_head * params.head_dim;
+
+    if (tid == 0) {
+        max_score = -INFINITY;
+        denom = 0.0f;
+        weight = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint kv_pos = 0; kv_pos < params.kv_len; ++kv_pos) {
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
+        scratch[tid] = tid < params.head_dim
+            ? float(query[query_base + tid]) * float(key[key_base + tid])
+            : 0.0f;
+        reduce_sum_256(scratch, tid);
+        if (tid == 0) {
+            max_score = max(max_score, scratch[0] * params.scale);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint kv_pos = 0; kv_pos < params.kv_len; ++kv_pos) {
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
+        scratch[tid] = tid < params.head_dim
+            ? float(query[query_base + tid]) * float(key[key_base + tid])
+            : 0.0f;
+        reduce_sum_256(scratch, tid);
+        if (tid == 0) {
+            denom += exp((scratch[0] * params.scale) - max_score);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float numer = 0.0f;
+    for (uint kv_pos = 0; kv_pos < params.kv_len; ++kv_pos) {
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
+        scratch[tid] = tid < params.head_dim
+            ? float(query[query_base + tid]) * float(key[key_base + tid])
+            : 0.0f;
+        reduce_sum_256(scratch, tid);
+        if (tid == 0) {
+            weight = exp((scratch[0] * params.scale) - max_score);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < params.head_dim) {
+            uint value_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
+            numer += weight * float(value[value_base + tid]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < params.head_dim) {
+        out[q_head * params.head_dim + tid] = numer / denom;
+    }
+}
+)FATTNDECODE";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:502
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile full-attention decode library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_full_attention_decode_bf16_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:503
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load full-attention decode function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:504
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create full-attention decode pipeline"
                                                                              }];
                         }
                     }
@@ -8589,6 +8771,77 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             MTLSize threads_per_grid = MTLSizeMake(head_dim, q_len, q_heads);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 27, 28, 29, 30);
+    }
+}
+
+extern "C" int supersonic_metal_full_attention_decode_bf16_f32(
+    size_t q_heads,
+    size_t kv_heads,
+    size_t kv_len,
+    size_t kv_stride,
+    size_t head_dim,
+    float scale,
+    const void* query_ptr,
+    const void* key_ptr,
+    const void* value_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (q_heads == 0 || kv_heads == 0 || kv_len == 0 || kv_stride < kv_len || head_dim == 0 ||
+            head_dim > 256 || query_ptr == nullptr || key_ptr == nullptr || value_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 511;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            full_attention_decode_pipeline_bf16_f32(&pipeline_error);
+        if (pipeline == nil) {
+            return 512;
+        }
+
+        id<MTLBuffer> query = nil;
+        id<MTLBuffer> key = nil;
+        id<MTLBuffer> value = nil;
+        id<MTLBuffer> out = nil;
+        size_t query_offset = 0;
+        size_t key_offset = 0;
+        size_t value_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(query_ptr, &query, &query_offset) != 0) {
+            return 513;
+        }
+        if (lookup_buffer(key_ptr, &key, &key_offset) != 0) {
+            return 514;
+        }
+        if (lookup_buffer(value_ptr, &value, &value_offset) != 0) {
+            return 515;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 516;
+        }
+
+        FullAttentionDecodeParams params = {
+            static_cast<uint32_t>(q_heads),
+            static_cast<uint32_t>(kv_heads),
+            static_cast<uint32_t>(kv_len),
+            static_cast<uint32_t>(kv_stride),
+            static_cast<uint32_t>(head_dim),
+            scale,
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:query offset:query_offset atIndex:0];
+            [encoder setBuffer:key offset:key_offset atIndex:1];
+            [encoder setBuffer:value offset:value_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+
+            MTLSize groups = MTLSizeMake(q_heads, 1, 1);
+            MTLSize threads = MTLSizeMake(256, 1, 1);
+            [encoder dispatchThreadgroups:groups threadsPerThreadgroup:threads];
+        }, 517, 518, 519, 520);
     }
 }
 

@@ -45,6 +45,10 @@ fn metal_matmul_lm_head_argmax_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_MATMUL_LM_HEAD_ARGMAX").is_some()
 }
 
+fn metal_full_attention_decode_kernel_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FULL_ATTENTION_DECODE_KERNEL").is_some()
+}
+
 fn copy_d2d_ordered(
     ordinal: usize,
     dst: *mut c_void,
@@ -2558,7 +2562,23 @@ impl DecodeEngine {
             kv_stride = kv_len;
         }
 
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && metal_full_attention_decode_kernel_enabled()
+        {
+            kernel_ffi::prefill_ffi::metal_full_attention_decode_bf16_f32(
+                num_q_heads,
+                num_kv_heads,
+                kv_len,
+                kv_stride,
+                head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+                attn_q,
+                attn_k_ref,
+                attn_v_ref,
+                attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention: {e}"))?;
+        } else if self.hidden_io.backend() == gpu_hal::Backend::Metal {
             kernel_ffi::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
                 num_q_heads,
                 num_kv_heads,
