@@ -194,9 +194,11 @@ pub struct PromptGateReport {
     pub notes: Option<String>,
     pub pass: bool,
     pub thresholds: PromptThresholds,
+    pub prefill_logit_reference: String,
     pub prefill_logit_max_abs: f32,
     pub prefill_logit_mean_abs: f32,
     pub prefill_logit_mse: f32,
+    pub raw_oracle_prefill_logit_max_abs: f32,
     pub gpu_reference_logit_max_abs: f32,
     pub native_vs_gpu_reference_logit_max_abs: f32,
     pub worst_checked_position: usize,
@@ -1639,14 +1641,29 @@ fn analyze_gate_prompt(
     let worst_position = choose_worst_position(&checked_positions)
         .ok_or_else(|| anyhow::anyhow!("prompt '{}' produced no checked positions", prompt.name))?;
 
+    let oracle_final_hidden = trace
+        .decoder_layer_outputs
+        .last()
+        .and_then(|value| flatten_token_bsd(value, None))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt '{}' oracle trace missing final hidden for last prompt position",
+                prompt.name
+            )
+        })?;
+    let oracle_aligned_prefill_logits =
+        compute_qwen_logits_from_hidden_row(runtime, &oracle_final_hidden)?;
+
     let prefill_logit_max_abs =
-        validate::max_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        validate::max_abs_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
     let prefill_logit_mean_abs =
-        mean_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        mean_abs_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
     let prefill_logit_mse =
-        mean_square_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        mean_square_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
+    let raw_oracle_prefill_logit_max_abs =
+        validate::max_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
     let gpu_reference_logit_max_abs =
-        validate::max_abs_delta(&gpu_reference_logits, &oracle_output.prefill_logits);
+        validate::max_abs_delta(&gpu_reference_logits, &oracle_aligned_prefill_logits);
     let native_vs_gpu_reference_logit_max_abs =
         validate::max_abs_delta(&native_prefill.logits, &gpu_reference_logits);
 
@@ -1663,9 +1680,11 @@ fn analyze_gate_prompt(
             notes: prompt.notes.clone(),
             pass,
             thresholds: prompt.thresholds.clone(),
+            prefill_logit_reference: "oracle_final_hidden_recomputed".to_string(),
             prefill_logit_max_abs,
             prefill_logit_mean_abs,
             prefill_logit_mse,
+            raw_oracle_prefill_logit_max_abs,
             gpu_reference_logit_max_abs,
             native_vs_gpu_reference_logit_max_abs,
             worst_checked_position: worst_position.position,
@@ -3647,9 +3666,11 @@ mod tests {
                         layer_hidden_max_abs: 0.1,
                         restart_tail_logit_max_abs: 0.1,
                     },
+                    prefill_logit_reference: "oracle_final_hidden_recomputed".to_string(),
                     prefill_logit_max_abs: 0.2,
                     prefill_logit_mean_abs: 0.02,
                     prefill_logit_mse: 0.01,
+                    raw_oracle_prefill_logit_max_abs: 0.25,
                     gpu_reference_logit_max_abs: 0.19,
                     native_vs_gpu_reference_logit_max_abs: 0.03,
                     worst_checked_position: 15,
