@@ -542,6 +542,47 @@ __global__ void certified_kv_gather_promoted_keys_kernel(
     }
 }
 
+__global__ void certified_kv_gather_promoted_keys_gqa_union_kernel(
+    const __nv_bfloat16* __restrict__ tier2_key_bf16,
+    const uint32_t* __restrict__ promote_index,
+    __nv_bfloat16* __restrict__ promoted_key_bf16,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int cap_tokens,
+    int max_promoted_blocks,
+    int head_dim,
+    int gqa_group
+) {
+    const int linear = blockIdx.x;
+    const int kvh = linear / num_blocks;
+    const int block = linear - kvh * num_blocks;
+    if (kvh >= kv_heads || block >= num_blocks) {
+        return;
+    }
+    const int elems_per_block = block_size * head_dim;
+    const size_t src_base =
+        (static_cast<size_t>(kvh) * cap_tokens + static_cast<size_t>(block) * block_size) * head_dim;
+    const int first_qh = kvh * gqa_group;
+    for (int idx = threadIdx.x; idx < elems_per_block; idx += blockDim.x) {
+        const __nv_bfloat16 value = tier2_key_bf16[src_base + idx];
+        for (int local_qh = 0; local_qh < gqa_group; ++local_qh) {
+            const int qh = first_qh + local_qh;
+            if (qh >= q_heads) {
+                continue;
+            }
+            const uint32_t slot = promote_index[static_cast<size_t>(qh) * num_blocks + block];
+            if (slot == 0xffffffffu || static_cast<int>(slot) >= max_promoted_blocks) {
+                continue;
+            }
+            const size_t dst_base =
+                (static_cast<size_t>(qh) * max_promoted_blocks + slot) * elems_per_block;
+            promoted_key_bf16[dst_base + idx] = value;
+        }
+    }
+}
+
 __global__ void certified_kv_gather_promoted_values_kernel(
     const __nv_bfloat16* __restrict__ tier2_value_bf16,
     const uint32_t* __restrict__ value_promote_index,
@@ -1685,7 +1726,7 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     }
     ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
     constexpr int threads = 256;
-    certified_kv_gather_promoted_keys_kernel<<<q_heads * num_blocks, threads>>>(
+    certified_kv_gather_promoted_keys_gqa_union_kernel<<<kv_heads * num_blocks, threads>>>(
         static_cast<const __nv_bfloat16*>(tier2_key_bf16),
         static_cast<const uint32_t*>(promote_index),
         static_cast<__nv_bfloat16*>(promoted_key_bf16),
