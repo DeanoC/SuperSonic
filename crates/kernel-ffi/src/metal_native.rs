@@ -111,6 +111,12 @@ unsafe extern "C" {
         up_weight_ptr: *const c_void,
         mlp_out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_full_attention_gate_bf16(
+        total_elems: usize,
+        attn_f32_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen_mlp_down_residual_bf16(
         hidden_dim: usize,
         intermediate_dim: usize,
@@ -1892,6 +1898,46 @@ pub(crate) fn sigmoid_mul(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn full_attention_gate_bf16(
+    total_elems: usize,
+    attn_f32: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_gate_bf16 supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if attn_f32.dtype() != ScalarType::F32
+        || gate.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_gate_bf16 expects F32/BF16/BF16 buffers, got {:?}/{:?}/{:?}",
+            attn_f32.dtype(),
+            gate.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_full_attention_gate_bf16(
+            total_elems,
+            attn_f32.as_ptr(),
+            gate.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native full_attention_gate_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn swiglu_mul(
     dtype: ScalarType,
     total_elems: usize,
@@ -3610,6 +3656,18 @@ pub(crate) fn sigmoid_mul(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn full_attention_gate_bf16(
+    _total_elems: usize,
+    _attn_f32: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native full_attention_gate_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn swiglu_mul(
     _dtype: ScalarType,
     _total_elems: usize,
@@ -5111,6 +5169,46 @@ mod tests {
             assert!(
                 delta <= 1e-6,
                 "f32 idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_full_attention_gate_matches_reference() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let attn_vals = [1.125f32, -2.75, 0.03125, 8.5, -0.5];
+        let gate_vals = [0.0f32, 1.0, -1.0, 3.0, -3.0];
+        let attn =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, &[5], &f32_bytes(&attn_vals))
+                .expect("upload f32 attn");
+        let gate =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[5], &bf16_bytes(&gate_vals))
+                .expect("upload bf16 gate");
+        let mut attn_bf16 =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[5]).expect("allocate cast out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[5]).expect("allocate ref out");
+        let mut out_native =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[5]).expect("allocate native out");
+
+        crate::metal_host::cast(ScalarType::F32, ScalarType::BF16, 5, &attn, &mut attn_bf16)
+            .expect("host cast attention");
+        crate::metal_host::sigmoid_mul(ScalarType::BF16, 5, &attn_bf16, &gate, &mut out_ref)
+            .expect("host gate attention");
+        full_attention_gate_bf16(5, &attn, &gate, &mut out_native)
+            .expect("native full attention gate");
+
+        for (idx, (a, e)) in read_bf16(&out_native)
+            .iter()
+            .zip(read_bf16(&out_ref).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.02,
+                "bf16 idx {idx}: expected {e}, got {a}, delta {delta}"
             );
         }
     }

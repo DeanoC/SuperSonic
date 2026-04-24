@@ -189,6 +189,10 @@ fn metal_fused_full_qk_prep_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_QK_PREP").is_some()
 }
 
+fn metal_fused_full_attention_gate_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_ATTENTION_GATE").is_some()
+}
+
 fn metal_fused_linear_out_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
 }
@@ -2618,25 +2622,37 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
         }
 
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::F32,
-            ScalarType::BF16,
-            num_q_heads * head_dim,
-            attn_out_f32,
-            attn_flat,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && metal_fused_full_attention_gate_enabled()
+        {
+            kernel_ffi::prefill_ffi::metal_full_attention_gate_bf16(
+                q_dim,
+                attn_out_f32,
+                gate_buf,
+                gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused full gate: {e}"))?;
+        } else {
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                attn_out_f32,
+                attn_flat,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
 
-        kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal,
-            ScalarType::BF16,
-            q_dim,
-            attn_flat,
-            gate_buf,
-            gated,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+            kernel_ffi::prefill_ffi::sigmoid_mul(
+                self.ordinal,
+                ScalarType::BF16,
+                q_dim,
+                attn_flat,
+                gate_buf,
+                gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+        }
 
         matmul_proj(
             self.ordinal,

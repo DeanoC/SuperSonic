@@ -3530,6 +3530,95 @@ kernel void supersonic_sigmoid_mul_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> full_attention_gate_pipeline(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:204
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"FGATE(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ElementwiseParams {
+    uint total_elems;
+};
+
+kernel void supersonic_full_attention_gate_bf16(
+    device const float* attn [[buffer(0)]],
+    device const bfloat* gate [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant ElementwiseParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    bfloat attn_bf = bfloat(attn[gid]);
+    float gv = float(gate[gid]);
+    float sig = 1.0f / (1.0f + exp(-gv));
+    out[gid] = bfloat(float(attn_bf) * sig);
+}
+)FGATE";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:205
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile full-attention gate library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_full_attention_gate_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:206
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load full-attention gate function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:207
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create full-attention gate pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> swiglu_mul_pipeline(NSString* function_name, NSError** error_out) {
     static std::mutex mutex;
     static bool attempted_bf16 = false;
@@ -5846,6 +5935,61 @@ extern "C" int supersonic_metal_sigmoid_mul_f32(
         out_ptr,
         @"supersonic_sigmoid_mul_f32"
     );
+}
+
+extern "C" int supersonic_metal_full_attention_gate_bf16(
+    size_t total_elems,
+    const void* attn_f32_ptr,
+    const void* gate_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (total_elems == 0) {
+            return 0;
+        }
+        if (total_elems > UINT32_MAX || attn_f32_ptr == nullptr || gate_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 208;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = full_attention_gate_pipeline(&pipeline_error);
+        if (pipeline == nil) {
+            return 209;
+        }
+
+        id<MTLBuffer> attn = nil;
+        id<MTLBuffer> gate = nil;
+        id<MTLBuffer> out = nil;
+        size_t attn_offset = 0;
+        size_t gate_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(attn_f32_ptr, &attn, &attn_offset) != 0) {
+            return 210;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 211;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 212;
+        }
+
+        ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:attn offset:attn_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 213, 214, 215, 216);
+    }
 }
 
 static int supersonic_metal_swiglu_mul_impl(

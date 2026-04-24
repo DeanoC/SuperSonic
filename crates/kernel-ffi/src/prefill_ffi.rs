@@ -435,6 +435,17 @@ pub fn metal_qwen_mlp_gate_up_swiglu_bf16(
     })
 }
 
+pub fn metal_full_attention_gate_bf16(
+    total_elems: usize,
+    attn_f32: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("full_attention_gate", "native", || {
+        metal_native::full_attention_gate_bf16(total_elems, attn_f32, gate, out)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn metal_qwen_mlp_down_residual_bf16(
     hidden_dim: usize,
