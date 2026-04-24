@@ -2499,9 +2499,11 @@ impl DecodeEngine {
         let cap = cache_k_ref.shape()[2];
         let attn_k_ref;
         let attn_v_ref;
-        if cap == kv_len {
+        let kv_stride;
+        if cap == kv_len || self.hidden_io.backend() == gpu_hal::Backend::Metal {
             attn_k_ref = cache_k_ref;
             attn_v_ref = cache_v_ref;
+            kv_stride = cap;
         } else {
             if *kv_contig_capacity < cap {
                 *kv_k_contig = Some(
@@ -2543,25 +2545,44 @@ impl DecodeEngine {
             }
             attn_k_ref = &kv_k_contig;
             attn_v_ref = &kv_v_contig;
+            kv_stride = kv_len;
         }
 
-        kernel_ffi::prefill_ffi::full_attention_prefill(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            num_q_heads,
-            num_kv_heads,
-            1,
-            kv_len,
-            head_dim,
-            1.0 / (head_dim as f32).sqrt(),
-            seqlen_offset,
-            attn_q,
-            attn_k_ref,
-            attn_v_ref,
-            attn_out_f32,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            kernel_ffi::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
+                num_q_heads,
+                num_kv_heads,
+                1,
+                kv_len,
+                kv_stride,
+                head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+                seqlen_offset,
+                attn_q,
+                attn_k_ref,
+                attn_v_ref,
+                attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} strided attention: {e}"))?;
+        } else {
+            kernel_ffi::prefill_ffi::full_attention_prefill(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                num_q_heads,
+                num_kv_heads,
+                1,
+                kv_len,
+                head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+                seqlen_offset,
+                attn_q,
+                attn_k_ref,
+                attn_v_ref,
+                attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
+        }
 
         kernel_ffi::prefill_ffi::cast(
             self.ordinal,

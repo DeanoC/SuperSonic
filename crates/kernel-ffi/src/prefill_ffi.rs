@@ -1239,6 +1239,44 @@ pub fn full_attention_prefill(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn metal_full_attention_prefill_strided_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_strided_bf16_f32 requires a Metal output buffer".into(),
+        ));
+    }
+    metal_profile_time("full_attention_prefill_strided", "native", || {
+        metal_native::full_attention_prefill_strided_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            kv_stride,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key,
+            value,
+            out,
+        )
+    })
+}
+
 /// Decode-only full attention for q_len=1. Writes BF16/FP16 flat [batch, q_heads * head_dim].
 pub fn full_attention_decode_flat(
     ordinal: usize,

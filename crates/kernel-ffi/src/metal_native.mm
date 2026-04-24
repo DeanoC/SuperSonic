@@ -81,6 +81,7 @@ struct FullAttentionParams {
     uint32_t kv_heads;
     uint32_t q_len;
     uint32_t kv_len;
+    uint32_t kv_stride;
     uint32_t head_dim;
     uint32_t seqlen_offset;
     float scale;
@@ -1644,6 +1645,7 @@ struct FullAttentionParams {
     uint kv_heads;
     uint q_len;
     uint kv_len;
+    uint kv_stride;
     uint head_dim;
     uint seqlen_offset;
     float scale;
@@ -1671,7 +1673,7 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
 
     float max_score = -INFINITY;
     for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
-        uint key_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         float dot = 0.0f;
         for (uint kk = 0; kk < params.head_dim; ++kk) {
             dot += float(query[query_base + kk]) * float(key[key_base + kk]);
@@ -1683,14 +1685,14 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
     float denom = 0.0f;
     float numer = 0.0f;
     for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
-        uint key_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint key_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         float dot = 0.0f;
         for (uint kk = 0; kk < params.head_dim; ++kk) {
             dot += float(query[query_base + kk]) * float(key[key_base + kk]);
         }
         float weight = exp((dot * params.scale) - max_score);
         denom += weight;
-        uint value_base = (kv_head * params.kv_len + kv_pos) * params.head_dim;
+        uint value_base = (kv_head * params.kv_stride + kv_pos) * params.head_dim;
         numer += weight * float(value[value_base + d]);
     }
 
@@ -8372,6 +8374,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
     size_t kv_heads,
     size_t q_len,
     size_t kv_len,
+    size_t kv_stride,
     size_t head_dim,
     float scale,
     size_t seqlen_offset,
@@ -8381,7 +8384,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
     void* out_ptr
 ) {
     @autoreleasepool {
-        if (q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 || head_dim == 0 ||
+        if (q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 || kv_stride < kv_len || head_dim == 0 ||
             query_ptr == nullptr || key_ptr == nullptr || value_ptr == nullptr || out_ptr == nullptr) {
             return 21;
         }
@@ -8418,6 +8421,7 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             static_cast<uint32_t>(kv_heads),
             static_cast<uint32_t>(q_len),
             static_cast<uint32_t>(kv_len),
+            static_cast<uint32_t>(kv_stride),
             static_cast<uint32_t>(head_dim),
             static_cast<uint32_t>(seqlen_offset),
             scale,

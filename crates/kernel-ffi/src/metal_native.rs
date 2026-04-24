@@ -155,6 +155,7 @@ unsafe extern "C" {
         kv_heads: usize,
         q_len: usize,
         kv_len: usize,
+        kv_stride: usize,
         head_dim: usize,
         scale: f32,
         seqlen_offset: usize,
@@ -1179,6 +1180,38 @@ pub(crate) fn full_attention_prefill_bf16_f32(
     value: &GpuBuffer,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    full_attention_prefill_strided_bf16_f32(
+        q_heads,
+        kv_heads,
+        q_len,
+        kv_len,
+        kv_len,
+        head_dim,
+        scale,
+        seqlen_offset,
+        query,
+        key,
+        value,
+        out,
+    )
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_attention_prefill_strided_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
     if query.dtype() != ScalarType::BF16
         || key.dtype() != ScalarType::BF16
         || value.dtype() != ScalarType::BF16
@@ -1196,12 +1229,18 @@ pub(crate) fn full_attention_prefill_bf16_f32(
             out.dtype()
         )));
     }
+    if kv_stride < kv_len {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_prefill requires kv_stride >= kv_len, got {kv_stride} < {kv_len}"
+        )));
+    }
     let status = unsafe {
         supersonic_metal_full_attention_prefill_bf16_f32(
             q_heads,
             kv_heads,
             q_len,
             kv_len,
+            kv_stride,
             head_dim,
             scale,
             seqlen_offset,
@@ -3163,6 +3202,27 @@ pub(crate) fn full_attention_prefill_bf16_f32(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_attention_prefill_strided_bf16_f32(
+    _q_heads: usize,
+    _kv_heads: usize,
+    _q_len: usize,
+    _kv_len: usize,
+    _kv_stride: usize,
+    _head_dim: usize,
+    _scale: f32,
+    _seqlen_offset: usize,
+    _query: &GpuBuffer,
+    _key: &GpuBuffer,
+    _value: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native full_attention_prefill_strided_bf16_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn rms_norm_rows_bf16(
     _n_rows: usize,
     _n_cols: usize,
@@ -4298,6 +4358,93 @@ mod tests {
             let delta = (a - e).abs();
             assert!(
                 delta <= 1e-4,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_full_attention_strided_matches_contiguous() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 2],
+            &bf16_bytes(&[0.5, 1.0]),
+        )
+        .expect("upload query");
+        let key_contig = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 1.0]),
+        )
+        .expect("upload contiguous key");
+        let value_contig = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2, 2],
+            &bf16_bytes(&[10.0, 1.0, 1.0, 20.0]),
+        )
+        .expect("upload contiguous value");
+        let key_strided = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 4, 2],
+            &bf16_bytes(&[1.0, 0.0, 0.0, 1.0, 99.0, 99.0, 77.0, 77.0]),
+        )
+        .expect("upload strided key");
+        let value_strided = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 4, 2],
+            &bf16_bytes(&[10.0, 1.0, 1.0, 20.0, 99.0, 99.0, 77.0, 77.0]),
+        )
+        .expect("upload strided value");
+        let mut out_contig =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 2]).expect("allocate contig out");
+        let mut out_strided =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, 1, 2]).expect("allocate strided out");
+
+        full_attention_prefill_bf16_f32(
+            1,
+            1,
+            1,
+            2,
+            2,
+            1.0,
+            1,
+            &query,
+            &key_contig,
+            &value_contig,
+            &mut out_contig,
+        )
+        .expect("run contiguous attention");
+        full_attention_prefill_strided_bf16_f32(
+            1,
+            1,
+            1,
+            2,
+            4,
+            2,
+            1.0,
+            1,
+            &query,
+            &key_strided,
+            &value_strided,
+            &mut out_strided,
+        )
+        .expect("run strided attention");
+
+        for (idx, (a, e)) in read_f32(&out_strided)
+            .iter()
+            .zip(read_f32(&out_contig).iter())
+            .enumerate()
+        {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 1e-5,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
             );
         }
