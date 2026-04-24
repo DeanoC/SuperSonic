@@ -45,6 +45,10 @@ fn metal_matmul_lm_head_argmax_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_MATMUL_LM_HEAD_ARGMAX").is_some()
 }
 
+fn metal_full_attention_decode_kernel_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FULL_ATTENTION_DECODE_KERNEL").is_some()
+}
+
 fn copy_d2d_ordered(
     ordinal: usize,
     dst: *mut c_void,
@@ -173,6 +177,10 @@ fn metal_fused_mlp_gate_up_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP").is_none()
 }
 
+fn metal_fused_mlp_gate_up_swiglu_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP_SWIGLU").is_none()
+}
+
 fn metal_fused_full_projection_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
 }
@@ -181,8 +189,16 @@ fn metal_fused_full_qk_prep_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_QK_PREP").is_some()
 }
 
+fn metal_fused_full_attention_gate_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_ATTENTION_GATE").is_some()
+}
+
 fn metal_fused_linear_out_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
+}
+
+fn metal_fused_linear_out_bf16_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT_BF16").is_some()
 }
 
 fn metal_fused_linear_decode_apply_inplace_disabled() -> bool {
@@ -2060,9 +2076,11 @@ impl DecodeEngine {
                 kernel_ffi::metal_argmax_bf16_into(&self.logits_buf, &mut self.argmax_buf, vocab_size)
                     .map_err(|e| anyhow::anyhow!("lm_head matmul argmax reduce: {e}"))?;
             } else {
-                kernel_ffi::metal_lm_head_argmax_bf16_into(
+                kernel_ffi::metal_lm_head_argmax_bf16_with_partials_into(
                     &self.normed_buf,
                     &*self.weights.lm_head,
+                    &mut self.lm_head_block_best_vals,
+                    &mut self.lm_head_block_best_idxs,
                     &mut self.argmax_buf,
                     hidden_dim,
                     vocab_size,
@@ -2552,7 +2570,23 @@ impl DecodeEngine {
             kv_stride = kv_len;
         }
 
-        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && metal_full_attention_decode_kernel_enabled()
+        {
+            kernel_ffi::prefill_ffi::metal_full_attention_decode_bf16_f32(
+                num_q_heads,
+                num_kv_heads,
+                kv_len,
+                kv_stride,
+                head_dim,
+                1.0 / (head_dim as f32).sqrt(),
+                attn_q,
+                attn_k_ref,
+                attn_v_ref,
+                attn_out_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} decode attention: {e}"))?;
+        } else if self.hidden_io.backend() == gpu_hal::Backend::Metal {
             kernel_ffi::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
                 num_q_heads,
                 num_kv_heads,
@@ -2588,25 +2622,37 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("layer {idx} attention: {e}"))?;
         }
 
-        kernel_ffi::prefill_ffi::cast(
-            self.ordinal,
-            ScalarType::F32,
-            ScalarType::BF16,
-            num_q_heads * head_dim,
-            attn_out_f32,
-            attn_flat,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && metal_fused_full_attention_gate_enabled()
+        {
+            kernel_ffi::prefill_ffi::metal_full_attention_gate_bf16(
+                q_dim,
+                attn_out_f32,
+                gate_buf,
+                gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused full gate: {e}"))?;
+        } else {
+            kernel_ffi::prefill_ffi::cast(
+                self.ordinal,
+                ScalarType::F32,
+                ScalarType::BF16,
+                num_q_heads * head_dim,
+                attn_out_f32,
+                attn_flat,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} attn cast: {e}"))?;
 
-        kernel_ffi::prefill_ffi::sigmoid_mul(
-            self.ordinal,
-            ScalarType::BF16,
-            q_dim,
-            attn_flat,
-            gate_buf,
-            gated,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+            kernel_ffi::prefill_ffi::sigmoid_mul(
+                self.ordinal,
+                ScalarType::BF16,
+                q_dim,
+                attn_flat,
+                gate_buf,
+                gated,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} gate apply: {e}"))?;
+        }
 
         matmul_proj(
             self.ordinal,
@@ -3433,7 +3479,35 @@ impl DecodeEngine {
             && lw.out_proj_scale.is_none()
             && lw.out_proj_int4_scale.is_none()
             && lw.out_proj_int4_zero.is_none();
-        let (attn_trace, gated_trace, proj_trace) = if use_fused_linear_out {
+        let use_fused_linear_out_bf16 = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && used_fused_linear_decode_apply_inplace
+            && metal_fused_linear_out_bf16_enabled()
+            && norm_w_bf16_ref.dtype() == ScalarType::BF16
+            && z.dtype() == ScalarType::BF16
+            && attn_bf16.dtype() == ScalarType::BF16
+            && lw.out_proj_w.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16
+            && lw.out_proj_scale.is_none()
+            && lw.out_proj_int4_scale.is_none()
+            && lw.out_proj_int4_zero.is_none();
+        let (attn_trace, gated_trace, proj_trace) = if use_fused_linear_out_bf16 {
+            let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
+            kernel_ffi::prefill_ffi::metal_qwen_linear_out_residual_bf16_bf16(
+                hidden_dim,
+                nv,
+                vhd,
+                config.rms_norm_eps as f32,
+                &attn_bf16,
+                &z,
+                norm_w_bf16_ref,
+                &lw.out_proj_w,
+                residual,
+                &mut self.hidden_io,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused BF16 linear out/residual: {e}"))?;
+            (None, None, None)
+        } else if use_fused_linear_out {
             let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
             kernel_ffi::prefill_ffi::metal_qwen_linear_out_residual_f32_bf16(
                 hidden_dim,
@@ -3649,7 +3723,20 @@ impl DecodeEngine {
             && self.normed_buf.dtype() == ScalarType::BF16
             && lw.gate_proj_w.dtype() == ScalarType::BF16
             && lw.up_proj_w.dtype() == ScalarType::BF16;
-        if use_fused_mlp_gate_up {
+        let use_fused_mlp_gate_up_swiglu = use_fused_mlp_gate_up
+            && !use_fused_mlp
+            && metal_fused_mlp_gate_up_swiglu_enabled();
+        if use_fused_mlp_gate_up_swiglu {
+            kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_swiglu_bf16(
+                hidden_dim,
+                intermediate,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                &lw.up_proj_w,
+                mlp,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused mlp gate/up/swiglu: {e}"))?;
+        } else if use_fused_mlp_gate_up {
             kernel_ffi::prefill_ffi::metal_qwen_mlp_gate_up_bf16(
                 hidden_dim,
                 intermediate,
@@ -3701,7 +3788,7 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
         }
-        if use_fused_mlp_gate_up && !use_fused_mlp {
+        if use_fused_mlp_gate_up && !use_fused_mlp && !use_fused_mlp_gate_up_swiglu {
             kernel_ffi::prefill_ffi::swiglu_mul(
                 self.ordinal,
                 ScalarType::BF16,
