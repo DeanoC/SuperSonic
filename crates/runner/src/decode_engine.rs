@@ -185,6 +185,10 @@ fn metal_fused_linear_out_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
 }
 
+fn metal_fused_linear_out_bf16_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT_BF16").is_some()
+}
+
 fn metal_fused_linear_decode_apply_inplace_disabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_DECODE_APPLY_INPLACE").is_some()
 }
@@ -3433,7 +3437,35 @@ impl DecodeEngine {
             && lw.out_proj_scale.is_none()
             && lw.out_proj_int4_scale.is_none()
             && lw.out_proj_int4_zero.is_none();
-        let (attn_trace, gated_trace, proj_trace) = if use_fused_linear_out {
+        let use_fused_linear_out_bf16 = self.hidden_io.backend() == gpu_hal::Backend::Metal
+            && !trace_output
+            && used_fused_linear_decode_apply_inplace
+            && metal_fused_linear_out_bf16_enabled()
+            && norm_w_bf16_ref.dtype() == ScalarType::BF16
+            && z.dtype() == ScalarType::BF16
+            && attn_bf16.dtype() == ScalarType::BF16
+            && lw.out_proj_w.dtype() == ScalarType::BF16
+            && self.hidden_io.dtype() == ScalarType::BF16
+            && lw.out_proj_scale.is_none()
+            && lw.out_proj_int4_scale.is_none()
+            && lw.out_proj_int4_zero.is_none();
+        let (attn_trace, gated_trace, proj_trace) = if use_fused_linear_out_bf16 {
+            let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
+            kernel_ffi::prefill_ffi::metal_qwen_linear_out_residual_bf16_bf16(
+                hidden_dim,
+                nv,
+                vhd,
+                config.rms_norm_eps as f32,
+                &attn_bf16,
+                &z,
+                norm_w_bf16_ref,
+                &lw.out_proj_w,
+                residual,
+                &mut self.hidden_io,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} fused BF16 linear out/residual: {e}"))?;
+            (None, None, None)
+        } else if use_fused_linear_out {
             let residual: &GpuBuffer = unsafe { &*(&self.hidden_io as *const GpuBuffer) };
             kernel_ffi::prefill_ffi::metal_qwen_linear_out_residual_f32_bf16(
                 hidden_dim,

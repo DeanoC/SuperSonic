@@ -458,6 +458,26 @@ pub fn metal_qwen_linear_out_residual_f32_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_out_residual_bf16_bf16(
+    hidden_dim: usize,
+    num_rows: usize,
+    row_dim: usize,
+    eps: f32,
+    attn: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_proj: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_out_residual_bf16", "native", || {
+        metal_native::qwen_linear_out_residual_bf16_bf16(
+            hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn metal_rms_norm_rope_rows_bf16(
     n_rows: usize,
     n_cols: usize,

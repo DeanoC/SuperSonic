@@ -124,6 +124,18 @@ unsafe extern "C" {
         residual_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_qwen_linear_out_residual_bf16_bf16(
+        hidden_dim: usize,
+        num_rows: usize,
+        row_dim: usize,
+        eps: f32,
+        attn_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        weight_ptr: *const c_void,
+        out_proj_ptr: *const c_void,
+        residual_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen_full_projections_bf16(
         hidden_dim: usize,
         q_proj_dim: usize,
@@ -1106,6 +1118,67 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native qwen_linear_out_residual_f32_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_out_residual_bf16_bf16(
+    hidden_dim: usize,
+    num_rows: usize,
+    row_dim: usize,
+    eps: f32,
+    attn: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_proj: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let dtypes = [
+        attn.dtype(),
+        gate.dtype(),
+        weight.dtype(),
+        out_proj.dtype(),
+        residual.dtype(),
+        out.dtype(),
+    ];
+    if dtypes != [
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+        ScalarType::BF16,
+    ] {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_out_residual_bf16_bf16 expects BF16 buffers, got {dtypes:?}"
+        )));
+    }
+    if hidden_dim == 0 || num_rows == 0 || row_dim == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen_linear_out_residual_bf16_bf16 invalid shape: hidden_dim={hidden_dim} num_rows={num_rows} row_dim={row_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen_linear_out_residual_bf16_bf16(
+            hidden_dim,
+            num_rows,
+            row_dim,
+            eps,
+            attn.as_ptr(),
+            gate.as_ptr(),
+            weight.as_ptr(),
+            out_proj.as_ptr(),
+            residual.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native qwen_linear_out_residual_bf16_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -3136,6 +3209,25 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native qwen_linear_out_residual_f32_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qwen_linear_out_residual_bf16_bf16(
+    _hidden_dim: usize,
+    _num_rows: usize,
+    _row_dim: usize,
+    _eps: f32,
+    _attn: &GpuBuffer,
+    _gate: &GpuBuffer,
+    _weight: &GpuBuffer,
+    _out_proj: &GpuBuffer,
+    _residual: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native qwen_linear_out_residual_bf16_bf16 is not compiled".into(),
     ))
 }
 

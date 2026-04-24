@@ -1032,23 +1032,38 @@ kernel void supersonic_qwen_mlp_down_residual_bf16(
     return pipeline;
 }
 
-id<MTLComputePipelineState> qwen_linear_out_residual_pipeline_f32_bf16(NSError** error_out) {
+id<MTLComputePipelineState> qwen_linear_out_residual_pipeline(NSString* function_name, NSError** error_out) {
     static std::mutex mutex;
-    static bool attempted = false;
-    static __strong id<MTLComputePipelineState> pipeline = nil;
-    static __strong NSError* build_error = nil;
+    static __strong NSMutableDictionary<NSString*, id<MTLComputePipelineState>>* pipelines = nil;
+    static __strong NSMutableDictionary<NSString*, NSError*>* errors = nil;
 
     std::lock_guard<std::mutex> lock(mutex);
-    if (!attempted) {
-        attempted = true;
-        @autoreleasepool {
-            id<MTLDevice> device = metal_device();
-            if (device == nil) {
-                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
-                                                   code:385
-                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
-            } else {
-                static const char* kSource = R"QWENLINEAROUT(
+    if (pipelines == nil) {
+        pipelines = [[NSMutableDictionary alloc] init];
+        errors = [[NSMutableDictionary alloc] init];
+    }
+    id<MTLComputePipelineState> cached = pipelines[function_name];
+    if (cached != nil) {
+        return cached;
+    }
+    NSError* cached_error = errors[function_name];
+    if (cached_error != nil) {
+        if (error_out != nullptr) {
+            *error_out = cached_error;
+        }
+        return nil;
+    }
+
+    NSError* build_error = nil;
+    id<MTLComputePipelineState> pipeline = nil;
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil) {
+            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                               code:385
+                                           userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+        } else {
+            static const char* kSource = R"QWENLINEAROUT(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -1092,54 +1107,93 @@ kernel void supersonic_qwen_linear_out_residual_f32_bf16(
     }
     out[gid] = bfloat(float(bfloat(acc)) + float(residual[gid]));
 }
+
+kernel void supersonic_qwen_linear_out_residual_bf16_bf16(
+    device const bfloat* attn [[buffer(0)]],
+    device const bfloat* gate [[buffer(1)]],
+    device const bfloat* norm_weight [[buffer(2)]],
+    device const bfloat* out_proj [[buffer(3)]],
+    device const bfloat* residual [[buffer(4)]],
+    device bfloat* out [[buffer(5)]],
+    constant QwenLinearOutParams& params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.hidden_dim) {
+        return;
+    }
+    float acc = 0.0f;
+    for (uint row = 0; row < params.num_rows; ++row) {
+        uint row_base = row * params.row_dim;
+        float mean_sq = 0.0f;
+        for (uint col = 0; col < params.row_dim; ++col) {
+            float value = float(attn[row_base + col]);
+            mean_sq = fma(value, value, mean_sq);
+        }
+        float inv_rms = rsqrt((mean_sq / float(params.row_dim)) + params.eps);
+        for (uint col = 0; col < params.row_dim; ++col) {
+            uint idx = row_base + col;
+            float gate_v = float(gate[idx]);
+            float sig = 1.0f / (1.0f + exp(-gate_v));
+            bfloat gated =
+                bfloat(float(attn[idx]) * inv_rms * float(norm_weight[col]) * (gate_v * sig));
+            acc += float(gated) * float(out_proj[gid * (params.num_rows * params.row_dim) + idx]);
+        }
+    }
+    out[gid] = bfloat(float(bfloat(acc)) + float(residual[gid]));
+}
 )QWENLINEAROUT";
 
-                NSString* source = [NSString stringWithUTF8String:kSource];
-                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-                configure_precise_math(options);
-                NSError* library_error = nil;
-                id<MTLLibrary> library = [device newLibraryWithSource:source
-                                                              options:options
-                                                                error:&library_error];
-                if (library == nil || library_error != nil) {
-                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
-                                                                       code:386
-                                                                   userInfo:@{
-                                                                       NSLocalizedDescriptionKey :
-                                                                           @"Failed to compile Qwen linear out library"
-                                                                   }];
+            NSString* source = [NSString stringWithUTF8String:kSource];
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            configure_precise_math(options);
+            NSError* library_error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                          options:options
+                                                            error:&library_error];
+            if (library == nil || library_error != nil) {
+                build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                   code:386
+                                                               userInfo:@{
+                                                                   NSLocalizedDescriptionKey :
+                                                                       @"Failed to compile Qwen linear out library"
+                                                               }];
+            } else {
+                id<MTLFunction> function = [library newFunctionWithName:function_name];
+                if (function == nil) {
+                    build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                       code:387
+                                                   userInfo:@{
+                                                       NSLocalizedDescriptionKey :
+                                                           @"Failed to load Qwen linear out function"
+                                                   }];
                 } else {
-                    id<MTLFunction> function =
-                        [library newFunctionWithName:@"supersonic_qwen_linear_out_residual_f32_bf16"];
-                    if (function == nil) {
-                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
-                                                           code:387
-                                                       userInfo:@{
-                                                           NSLocalizedDescriptionKey :
-                                                               @"Failed to load Qwen linear out function"
-                                                       }];
-                    } else {
-                        NSError* pipeline_error = nil;
-                        pipeline = [device newComputePipelineStateWithFunction:function
-                                                                         error:&pipeline_error];
-                        if (pipeline == nil || pipeline_error != nil) {
-                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
-                                                                                 code:388
-                                                                             userInfo:@{
-                                                                                 NSLocalizedDescriptionKey :
-                                                                                     @"Failed to create Qwen linear out pipeline"
-                                                                             }];
-                        }
+                    NSError* pipeline_error = nil;
+                    pipeline = [device newComputePipelineStateWithFunction:function
+                                                                     error:&pipeline_error];
+                    if (pipeline == nil || pipeline_error != nil) {
+                        build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                             code:388
+                                                                         userInfo:@{
+                                                                             NSLocalizedDescriptionKey :
+                                                                                 @"Failed to create Qwen linear out pipeline"
+                                                                         }];
                     }
                 }
             }
         }
     }
 
-    if (pipeline == nil && error_out != nullptr) {
+    if (pipeline != nil) {
+        pipelines[function_name] = pipeline;
+        return pipeline;
+    }
+    if (build_error != nil) {
+        errors[function_name] = build_error;
+    }
+    if (error_out != nullptr) {
         *error_out = build_error;
     }
-    return pipeline;
+    return nil;
 }
 
 id<MTLComputePipelineState> qwen_full_projection_pipeline_bf16(NSError** error_out) {
@@ -7847,7 +7901,10 @@ extern "C" int supersonic_metal_qwen_linear_out_residual_f32_bf16(
 
         NSError* pipeline_error = nil;
         id<MTLComputePipelineState> pipeline =
-            qwen_linear_out_residual_pipeline_f32_bf16(&pipeline_error);
+            qwen_linear_out_residual_pipeline(
+                @"supersonic_qwen_linear_out_residual_f32_bf16",
+                &pipeline_error
+            );
         if (pipeline == nil) {
             return 400;
         }
@@ -7911,6 +7968,97 @@ extern "C" int supersonic_metal_qwen_linear_out_residual_f32_bf16(
             MTLSize threads_per_grid = MTLSizeMake(hidden_dim, 1, 1);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 407, 408, 409, 410);
+    }
+}
+
+extern "C" int supersonic_metal_qwen_linear_out_residual_bf16_bf16(
+    size_t hidden_dim,
+    size_t num_rows,
+    size_t row_dim,
+    float eps,
+    const void* attn_ptr,
+    const void* gate_ptr,
+    const void* weight_ptr,
+    const void* out_proj_ptr,
+    const void* residual_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (hidden_dim == 0 || num_rows == 0 || row_dim == 0 || attn_ptr == nullptr ||
+            gate_ptr == nullptr || weight_ptr == nullptr || out_proj_ptr == nullptr ||
+            residual_ptr == nullptr || out_ptr == nullptr) {
+            return 411;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline =
+            qwen_linear_out_residual_pipeline(
+                @"supersonic_qwen_linear_out_residual_bf16_bf16",
+                &pipeline_error
+            );
+        if (pipeline == nil) {
+            return 412;
+        }
+
+        id<MTLBuffer> attn = nil;
+        id<MTLBuffer> gate = nil;
+        id<MTLBuffer> weight = nil;
+        id<MTLBuffer> out_proj = nil;
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> out = nil;
+        size_t attn_offset = 0;
+        size_t gate_offset = 0;
+        size_t weight_offset = 0;
+        size_t out_proj_offset = 0;
+        size_t residual_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(attn_ptr, &attn, &attn_offset) != 0) {
+            return 413;
+        }
+        if (lookup_buffer(gate_ptr, &gate, &gate_offset) != 0) {
+            return 414;
+        }
+        if (lookup_buffer(weight_ptr, &weight, &weight_offset) != 0) {
+            return 415;
+        }
+        if (lookup_buffer(out_proj_ptr, &out_proj, &out_proj_offset) != 0) {
+            return 416;
+        }
+        if (lookup_buffer(residual_ptr, &residual, &residual_offset) != 0) {
+            return 417;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 418;
+        }
+
+        struct QwenLinearOutParams {
+            uint32_t hidden_dim;
+            uint32_t num_rows;
+            uint32_t row_dim;
+            float eps;
+        } params = {
+            static_cast<uint32_t>(hidden_dim),
+            static_cast<uint32_t>(num_rows),
+            static_cast<uint32_t>(row_dim),
+            eps,
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:attn offset:attn_offset atIndex:0];
+            [encoder setBuffer:gate offset:gate_offset atIndex:1];
+            [encoder setBuffer:weight offset:weight_offset atIndex:2];
+            [encoder setBuffer:out_proj offset:out_proj_offset atIndex:3];
+            [encoder setBuffer:residual offset:residual_offset atIndex:4];
+            [encoder setBuffer:out offset:out_offset atIndex:5];
+            [encoder setBytes:&params length:sizeof(params) atIndex:6];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(hidden_dim, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 419, 420, 421, 422);
     }
 }
 
