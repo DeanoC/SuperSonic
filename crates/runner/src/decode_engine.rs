@@ -3424,6 +3424,7 @@ impl DecodeEngine {
         let use_fused_linear_out = self.hidden_io.backend() == gpu_hal::Backend::Metal
             && !trace_output
             && metal_fused_linear_out_enabled()
+            && !used_fused_linear_decode_apply_inplace
             && norm_w_bf16_ref.dtype() == ScalarType::BF16
             && z.dtype() == ScalarType::BF16
             && rec_apply.dtype() == ScalarType::F32

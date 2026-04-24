@@ -2020,16 +2020,17 @@ kernel void supersonic_rms_norm_rope_rows_bf16(
     float inv_rms = rsqrt((scratch[0] / float(params.n_cols)) + params.eps);
     uint table_base = params.pos_offset * params.half_rot;
     for (uint col = tid; col < params.half_rot; col += params.block_size) {
-        float x0 = float(input[row_base + col]) * inv_rms * float(weight[col]);
+        float x0 = float(input[row_base + col]) * inv_rms * (float(weight[col]) + 1.0f);
         float x1 = float(input[row_base + col + params.half_rot]) * inv_rms *
-                   float(weight[col + params.half_rot]);
+                   (float(weight[col + params.half_rot]) + 1.0f);
         float c = float(cos_table[table_base + col]);
         float s = float(sin_table[table_base + col]);
         out[row_base + col] = bfloat(x0 * c - x1 * s);
         out[row_base + col + params.half_rot] = bfloat(x1 * c + x0 * s);
     }
     for (uint col = params.rotary_dim + tid; col < params.n_cols; col += params.block_size) {
-        out[row_base + col] = bfloat(float(input[row_base + col]) * inv_rms * float(weight[col]));
+        out[row_base + col] =
+            bfloat(float(input[row_base + col]) * inv_rms * (float(weight[col]) + 1.0f));
     }
 }
 )RMSROPE";
