@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
@@ -13,7 +14,7 @@ use qwen35::weights::Qwen35Weights;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::decode_engine::decode_f32_le;
+use crate::decode_engine::{decode_f32_le, DecodeEngine};
 use crate::oracle;
 use crate::prefill_engine;
 use crate::registry::{self, FamilyParams, GpuArch, ModelVariant};
@@ -39,6 +40,7 @@ pub enum BughuntMode {
     Gate,
     Localize,
     Dump,
+    Bench,
 }
 
 impl BughuntMode {
@@ -47,6 +49,7 @@ impl BughuntMode {
             Self::Gate => "gate",
             Self::Localize => "localize",
             Self::Dump => "dump",
+            Self::Bench => "bench",
         }
     }
 }
@@ -90,6 +93,10 @@ pub struct BughuntArgs {
     pub position: Option<usize>,
     pub layer: Option<usize>,
     pub layer_kind: Option<BughuntLayerKind>,
+    pub bench_iterations: usize,
+    pub bench_warmup: usize,
+    pub bench_decode_tokens: usize,
+    pub bench_profile_ops: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -176,14 +183,22 @@ pub struct PositionSweepReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct PhaseTimingReport {
+    pub phase: String,
+    pub elapsed_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PromptGateReport {
     pub name: String,
     pub notes: Option<String>,
     pub pass: bool,
     pub thresholds: PromptThresholds,
+    pub prefill_logit_reference: String,
     pub prefill_logit_max_abs: f32,
     pub prefill_logit_mean_abs: f32,
     pub prefill_logit_mse: f32,
+    pub raw_oracle_prefill_logit_max_abs: f32,
     pub gpu_reference_logit_max_abs: f32,
     pub native_vs_gpu_reference_logit_max_abs: f32,
     pub worst_checked_position: usize,
@@ -191,6 +206,7 @@ pub struct PromptGateReport {
     pub worst_layer_kind: String,
     pub worst_layer_delta: f32,
     pub checked_positions: Vec<PositionSweepReport>,
+    pub timings: Vec<PhaseTimingReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -261,6 +277,112 @@ pub struct DumpRunSection {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BenchPromptReport {
+    pub name: String,
+    pub notes: Option<String>,
+    pub prompt_len: usize,
+    pub warmup_iterations: usize,
+    pub iterations: usize,
+    pub decode_tokens: usize,
+    pub native_prefill_ms: Vec<f64>,
+    pub min_native_prefill_ms: f64,
+    pub max_native_prefill_ms: f64,
+    pub mean_native_prefill_ms: f64,
+    pub greedy_prefill_ms: Vec<f64>,
+    pub min_greedy_prefill_ms: f64,
+    pub max_greedy_prefill_ms: f64,
+    pub mean_greedy_prefill_ms: f64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub replay_decode_ms: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_replay_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_replay_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_replay_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_replay_decode_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_ms: Option<Vec<f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_component_decode_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_component_decode_ms_per_token: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub greedy_prefill_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_decode_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_profile: Option<MetalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefill_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub greedy_prefill_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_decode_hal_profile: Option<HalProfileReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_decode_hal_profile: Option<HalProfileReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetalProfileReport {
+    pub total_calls: u64,
+    pub native_calls: u64,
+    pub host_calls: u64,
+    pub total_ms: f64,
+    pub native_ms: f64,
+    pub host_ms: f64,
+    pub entries: Vec<MetalProfileOpReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MetalProfileOpReport {
+    pub op: String,
+    pub path: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HalProfileReport {
+    pub total_calls: u64,
+    pub total_ms: f64,
+    pub alloc_calls: u64,
+    pub alloc_bytes: u64,
+    pub free_calls: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub d2d_bytes: u64,
+    pub memset_bytes: u64,
+    pub sync_calls: u64,
+    pub entries: Vec<HalProfileOpReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HalProfileOpReport {
+    pub op: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub mean_ms: f64,
+    pub max_ms: f64,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchRunSection {
+    pub pass: bool,
+    pub prompt_results: Vec<BenchPromptReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct BughuntReport {
     pub mode: String,
     pub metadata: RunMetadata,
@@ -270,6 +392,8 @@ pub struct BughuntReport {
     pub localize: Option<LocalizeRunSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dump: Option<DumpRunSection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bench: Option<BenchRunSection>,
 }
 
 impl BughuntReport {
@@ -311,6 +435,18 @@ impl BughuntReport {
                     1
                 }
             }
+            "bench" => {
+                if self
+                    .bench
+                    .as_ref()
+                    .map(|section| section.pass)
+                    .unwrap_or(false)
+                {
+                    0
+                } else {
+                    1
+                }
+            }
             _ => 1,
         }
     }
@@ -333,6 +469,9 @@ struct QwenBughuntRuntime {
     kv_chunk_size: usize,
     prefill_chunk_size: usize,
     use_4b_kernel: bool,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
+    weight_prefix: String,
     oracle_script: PathBuf,
     qwen35_trace_script: PathBuf,
     commit_ish: Option<String>,
@@ -357,6 +496,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: Some(reports),
                 localize: None,
                 dump: None,
+                bench: None,
             }
         }
         BughuntMode::Localize => {
@@ -367,6 +507,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: None,
                 localize: Some(section),
                 dump: None,
+                bench: None,
             }
         }
         BughuntMode::Dump => {
@@ -384,6 +525,26 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
                 gate: None,
                 localize: None,
                 dump: Some(section),
+                bench: None,
+            }
+        }
+        BughuntMode::Bench => {
+            let section = run_bench_mode(
+                &runtime,
+                &manifest,
+                args.prompt.as_deref(),
+                args.bench_iterations,
+                args.bench_warmup,
+                args.bench_decode_tokens,
+                args.bench_profile_ops,
+            )?;
+            BughuntReport {
+                mode: args.mode.as_str().to_string(),
+                metadata,
+                gate: None,
+                localize: None,
+                dump: None,
+                bench: Some(section),
             }
         }
     };
@@ -405,6 +566,9 @@ fn validate_args(args: &BughuntArgs) -> Result<()> {
     }
     if matches!(args.mode, BughuntMode::Dump) && args.prompt.is_none() {
         bail!("--prompt is required in dump mode");
+    }
+    if matches!(args.mode, BughuntMode::Bench) && args.bench_iterations == 0 {
+        bail!("--iters must be greater than zero in bench mode");
     }
     Ok(())
 }
@@ -462,6 +626,9 @@ impl QwenBughuntRuntime {
             kv_chunk_size: params.kv_chunk_size,
             prefill_chunk_size: 0,
             use_4b_kernel: params.use_4b_kernel,
+            proj_buf_floats: params.proj_buf_floats,
+            attn_scratch_floats: params.attn_scratch_floats,
+            weight_prefix: params.weight_prefix.to_string(),
             oracle_script: repo_root.join("oracle/run_oracle.py"),
             qwen35_trace_script: repo_root.join("oracle/qwen35_oracle.py"),
             commit_ish: git_commit_ish(&repo_root),
@@ -479,6 +646,33 @@ impl QwenBughuntRuntime {
             oracle_device: self.oracle_device.clone(),
             commit_ish: self.commit_ish.clone(),
         }
+    }
+
+    fn new_component_decode_engine(&self, context_tokens: usize) -> Result<DecodeEngine> {
+        let attn_scratch_floats = qwen35::scratch::required_attn_scratch_floats(
+            self.weights.config.num_attention_heads,
+            self.weights.config.head_dim,
+            context_tokens,
+            self.kv_chunk_size,
+        )
+        .max(self.attn_scratch_floats);
+        let weights = load_qwen35_weights(
+            &self.model_dir,
+            &self.weights.config,
+            self.ordinal,
+            &self.weight_prefix,
+        )?;
+        DecodeEngine::new(
+            weights,
+            self.ordinal,
+            self.proj_buf_floats,
+            attn_scratch_floats,
+            self.kv_chunk_size,
+            self.use_4b_kernel,
+            self.prefill_chunk_size,
+            false,
+            1,
+        )
     }
 }
 
@@ -706,6 +900,433 @@ fn run_gate_mode(
         pass,
         prompt_results,
     })
+}
+
+fn run_bench_mode(
+    runtime: &QwenBughuntRuntime,
+    manifest: &PromptManifest,
+    selected_prompt: Option<&str>,
+    iterations: usize,
+    warmup_iterations: usize,
+    decode_tokens: usize,
+    profile_ops: bool,
+) -> Result<BenchRunSection> {
+    let prompts = select_prompts(manifest, selected_prompt)?;
+    let mut prompt_results = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        eprintln!(
+            "[bughunt] bench prompt={} warmup={} iters={} decode_tokens={} profile_ops={} start",
+            prompt.name, warmup_iterations, iterations, decode_tokens, profile_ops
+        );
+        let mut greedy_prefill_state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+            .map_err(|e| anyhow::anyhow!("bench greedy prefill state init: {e}"))?;
+        for warmup in 0..warmup_iterations {
+            let _ = run_native_prefill(runtime, &prompt.prompt_ids)
+                .with_context(|| format!("bench warmup {warmup} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench warmup sync prompt {}", prompt.name))?;
+            let _ = run_native_prefill_greedy_token_with_state(
+                runtime,
+                &mut greedy_prefill_state,
+                &prompt.prompt_ids,
+            )
+            .with_context(|| format!("bench greedy warmup {warmup} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench greedy warmup sync prompt {}", prompt.name))?;
+            if decode_tokens > 0 {
+                let _ = run_replay_decode_once(runtime, &prompt.prompt_ids, decode_tokens)
+                    .with_context(|| {
+                        format!("bench replay decode warmup {warmup} prompt {}", prompt.name)
+                    })?;
+            }
+        }
+
+        let mut native_prefill_ms = Vec::with_capacity(iterations);
+        for iter in 0..iterations {
+            let start = Instant::now();
+            let _ = run_native_prefill(runtime, &prompt.prompt_ids)
+                .with_context(|| format!("bench iter {iter} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench iter sync prompt {}", prompt.name))?;
+            native_prefill_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        let (min_native_prefill_ms, max_native_prefill_ms, mean_native_prefill_ms) =
+            bench_stats(&native_prefill_ms);
+        let mut greedy_prefill_ms = Vec::with_capacity(iterations);
+        for iter in 0..iterations {
+            let start = Instant::now();
+            let _ = run_native_prefill_greedy_token_with_state(
+                runtime,
+                &mut greedy_prefill_state,
+                &prompt.prompt_ids,
+            )
+            .with_context(|| format!("bench greedy iter {iter} prompt {}", prompt.name))?;
+            gpu_hal::sync(runtime.ordinal)
+                .with_context(|| format!("bench greedy iter sync prompt {}", prompt.name))?;
+            greedy_prefill_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        let (min_greedy_prefill_ms, max_greedy_prefill_ms, mean_greedy_prefill_ms) =
+            bench_stats(&greedy_prefill_ms);
+        let prefill_profiles = if profile_ops {
+            collect_profiles(|| {
+                let _ = run_native_prefill(runtime, &prompt.prompt_ids)
+                    .with_context(|| format!("bench profile prefill prompt {}", prompt.name))?;
+                gpu_hal::sync(runtime.ordinal)
+                    .with_context(|| format!("bench profile prefill sync prompt {}", prompt.name))
+            })?
+        } else {
+            ProfileReports::default()
+        };
+        let greedy_prefill_profiles = if profile_ops {
+            collect_profiles(|| {
+                let _ = run_native_prefill_greedy_token_with_state(
+                    runtime,
+                    &mut greedy_prefill_state,
+                    &prompt.prompt_ids,
+                )
+                .with_context(|| format!("bench profile greedy prefill prompt {}", prompt.name))?;
+                gpu_hal::sync(runtime.ordinal).with_context(|| {
+                    format!("bench profile greedy prefill sync prompt {}", prompt.name)
+                })
+            })?
+        } else {
+            ProfileReports::default()
+        };
+
+        let mut component_engine = if decode_tokens > 0 && runtime.backend == Backend::Metal {
+            Some(
+                runtime
+                    .new_component_decode_engine(prompt.prompt_ids.len() + decode_tokens)
+                    .with_context(|| {
+                        format!("bench component decode engine prompt {}", prompt.name)
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut replay_decode_ms = Vec::with_capacity(iterations);
+        if decode_tokens > 0 {
+            for iter in 0..iterations {
+                let elapsed_ms = run_replay_decode_once(runtime, &prompt.prompt_ids, decode_tokens)
+                    .with_context(|| {
+                        format!("bench replay decode iter {iter} prompt {}", prompt.name)
+                    })?;
+                replay_decode_ms.push(elapsed_ms);
+            }
+        }
+        let (min_replay_decode_ms, max_replay_decode_ms, mean_replay_decode_ms) =
+            optional_bench_stats(&replay_decode_ms);
+        let mean_replay_decode_ms_per_token = mean_replay_decode_ms
+            .filter(|_| decode_tokens > 0)
+            .map(|value| value / decode_tokens as f64);
+        let replay_decode_profiles = if profile_ops && decode_tokens > 0 {
+            collect_replay_decode_profile(runtime, &prompt.prompt_ids, decode_tokens)?
+        } else {
+            ProfileReports::default()
+        };
+        let mut component_decode_ms = Vec::with_capacity(iterations);
+        if let Some(engine) = component_engine.as_mut() {
+            for warmup in 0..warmup_iterations {
+                let _ = run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
+                    .with_context(|| {
+                        format!(
+                            "bench component decode warmup {warmup} prompt {}",
+                            prompt.name
+                        )
+                    })?;
+            }
+            for iter in 0..iterations {
+                let elapsed_ms =
+                    run_component_decode_once(engine, &prompt.prompt_ids, decode_tokens)
+                        .with_context(|| {
+                            format!("bench component decode iter {iter} prompt {}", prompt.name)
+                        })?;
+                component_decode_ms.push(elapsed_ms);
+            }
+        }
+        let (min_component_decode_ms, max_component_decode_ms, mean_component_decode_ms) =
+            optional_bench_stats(&component_decode_ms);
+        let mean_component_decode_ms_per_token = mean_component_decode_ms
+            .filter(|_| decode_tokens > 0)
+            .map(|value| value / decode_tokens as f64);
+        let component_decode_profiles = if profile_ops && decode_tokens > 0 {
+            if let Some(engine) = component_engine.as_mut() {
+                collect_component_decode_profile(
+                    runtime.ordinal,
+                    engine,
+                    &prompt.prompt_ids,
+                    decode_tokens,
+                )?
+            } else {
+                ProfileReports::default()
+            }
+        } else {
+            ProfileReports::default()
+        };
+        eprintln!(
+            "[bughunt] bench prompt={} done mean_native_prefill_ms={:.1} min={:.1} max={:.1} mean_greedy_prefill_ms={:.1} mean_replay_decode_ms_per_token={} mean_component_decode_ms_per_token={}",
+            prompt.name,
+            mean_native_prefill_ms,
+            min_native_prefill_ms,
+            max_native_prefill_ms,
+            mean_greedy_prefill_ms,
+            mean_replay_decode_ms_per_token
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            mean_component_decode_ms_per_token
+                .map(|value| format!("{value:.1}"))
+                .unwrap_or_else(|| "n/a".to_string())
+        );
+        prompt_results.push(BenchPromptReport {
+            name: prompt.name.clone(),
+            notes: prompt.notes.clone(),
+            prompt_len: prompt.prompt_ids.len(),
+            warmup_iterations,
+            iterations,
+            decode_tokens,
+            native_prefill_ms,
+            min_native_prefill_ms,
+            max_native_prefill_ms,
+            mean_native_prefill_ms,
+            greedy_prefill_ms,
+            min_greedy_prefill_ms,
+            max_greedy_prefill_ms,
+            mean_greedy_prefill_ms,
+            replay_decode_ms,
+            min_replay_decode_ms,
+            max_replay_decode_ms,
+            mean_replay_decode_ms,
+            mean_replay_decode_ms_per_token,
+            component_decode_ms: (!component_decode_ms.is_empty()).then_some(component_decode_ms),
+            min_component_decode_ms,
+            max_component_decode_ms,
+            mean_component_decode_ms,
+            mean_component_decode_ms_per_token,
+            prefill_profile: prefill_profiles.metal,
+            greedy_prefill_profile: greedy_prefill_profiles.metal,
+            replay_decode_profile: replay_decode_profiles.metal,
+            component_decode_profile: component_decode_profiles.metal,
+            prefill_hal_profile: prefill_profiles.hal,
+            greedy_prefill_hal_profile: greedy_prefill_profiles.hal,
+            replay_decode_hal_profile: replay_decode_profiles.hal,
+            component_decode_hal_profile: component_decode_profiles.hal,
+        });
+    }
+    Ok(BenchRunSection {
+        pass: true,
+        prompt_results,
+    })
+}
+
+fn bench_stats(values: &[f64]) -> (f64, f64, f64) {
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (min, max, mean)
+}
+
+fn optional_bench_stats(values: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if values.is_empty() {
+        return (None, None, None);
+    }
+    let (min, max, mean) = bench_stats(values);
+    (Some(min), Some(max), Some(mean))
+}
+
+#[derive(Debug, Default)]
+struct ProfileReports {
+    metal: Option<MetalProfileReport>,
+    hal: Option<HalProfileReport>,
+}
+
+fn collect_profiles<F>(f: F) -> Result<ProfileReports>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let _guard = ProfileGuard::new();
+    kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
+    f()?;
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
+}
+
+fn collect_replay_decode_profile(
+    runtime: &QwenBughuntRuntime,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<ProfileReports> {
+    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+        .map_err(|e| anyhow::anyhow!("bench profile replay state init: {e}"))?;
+    let mut history = prompt_ids.to_vec();
+    let mut token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
+        .context("bench profile replay decode initial prefill")?;
+    gpu_hal::sync(runtime.ordinal).context("bench profile replay decode initial sync")?;
+
+    let _guard = ProfileGuard::new();
+    kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
+    for step in 0..decode_tokens {
+        history.push(token);
+        token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
+            .with_context(|| format!("bench profile replay decode step {step}"))?;
+        gpu_hal::sync(runtime.ordinal)
+            .with_context(|| format!("bench profile replay decode sync step {step}"))?;
+    }
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
+}
+
+fn collect_component_decode_profile(
+    ordinal: usize,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<ProfileReports> {
+    let token = engine
+        .rebuild_prefill_state_greedy_token(prompt_ids)
+        .context("bench profile component decode initial prefill")?;
+    gpu_hal::sync(ordinal).context("bench profile component decode initial sync")?;
+
+    let _guard = ProfileGuard::new();
+    kernel_ffi::prefill_ffi::metal_profile_reset();
+    gpu_hal::hal_profile_reset();
+    run_component_decode_steps(engine, token, prompt_ids.len(), decode_tokens)
+        .context("bench profile component decode steps")?;
+    Ok(ProfileReports {
+        metal: Some(metal_profile_report(
+            kernel_ffi::prefill_ffi::metal_profile_snapshot(),
+        )),
+        hal: Some(hal_profile_report(gpu_hal::hal_profile_snapshot())),
+    })
+}
+
+fn metal_profile_report(
+    snapshot: kernel_ffi::prefill_ffi::MetalProfileSnapshot,
+) -> MetalProfileReport {
+    MetalProfileReport {
+        total_calls: snapshot.total_calls,
+        native_calls: snapshot.native_calls,
+        host_calls: snapshot.host_calls,
+        total_ms: snapshot.total_ms,
+        native_ms: snapshot.native_ms,
+        host_ms: snapshot.host_ms,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|entry| MetalProfileOpReport {
+                mean_ms: entry.mean_ms(),
+                op: entry.op,
+                path: entry.path,
+                calls: entry.calls,
+                total_ms: entry.total_ms,
+                max_ms: entry.max_ms,
+            })
+            .collect(),
+    }
+}
+
+fn hal_profile_report(snapshot: gpu_hal::HalProfileSnapshot) -> HalProfileReport {
+    HalProfileReport {
+        total_calls: snapshot.total_calls,
+        total_ms: snapshot.total_ms,
+        alloc_calls: snapshot.alloc_calls,
+        alloc_bytes: snapshot.alloc_bytes,
+        free_calls: snapshot.free_calls,
+        h2d_bytes: snapshot.h2d_bytes,
+        d2h_bytes: snapshot.d2h_bytes,
+        d2d_bytes: snapshot.d2d_bytes,
+        memset_bytes: snapshot.memset_bytes,
+        sync_calls: snapshot.sync_calls,
+        entries: snapshot
+            .entries
+            .into_iter()
+            .map(|entry| HalProfileOpReport {
+                mean_ms: entry.mean_ms(),
+                op: entry.op,
+                calls: entry.calls,
+                total_ms: entry.total_ms,
+                max_ms: entry.max_ms,
+                total_bytes: entry.total_bytes,
+            })
+            .collect(),
+    }
+}
+
+struct ProfileGuard;
+
+impl ProfileGuard {
+    fn new() -> Self {
+        kernel_ffi::prefill_ffi::metal_profile_set_enabled(true);
+        gpu_hal::hal_profile_set_enabled(true);
+        Self
+    }
+}
+
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        kernel_ffi::prefill_ffi::metal_profile_set_enabled(false);
+        gpu_hal::hal_profile_set_enabled(false);
+    }
+}
+
+fn run_replay_decode_once(
+    runtime: &QwenBughuntRuntime,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<f64> {
+    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+        .map_err(|e| anyhow::anyhow!("bench replay state init: {e}"))?;
+    let mut history = prompt_ids.to_vec();
+    let mut token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
+        .context("bench replay decode initial prefill")?;
+    gpu_hal::sync(runtime.ordinal).context("bench replay decode initial sync")?;
+
+    let start = Instant::now();
+    for step in 0..decode_tokens {
+        history.push(token);
+        token = run_native_prefill_greedy_token_with_state(runtime, &mut state, &history)
+            .with_context(|| format!("bench replay decode step {step}"))?;
+        gpu_hal::sync(runtime.ordinal)
+            .with_context(|| format!("bench replay decode sync step {step}"))?;
+    }
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
+}
+
+fn run_component_decode_once(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    decode_tokens: usize,
+) -> Result<f64> {
+    let token = engine
+        .rebuild_prefill_state_greedy_token(prompt_ids)
+        .context("bench component decode initial prefill")?;
+    run_component_decode_steps(engine, token, prompt_ids.len(), decode_tokens)
+}
+
+fn run_component_decode_steps(
+    engine: &mut DecodeEngine,
+    mut token: u32,
+    initial_seqlen: usize,
+    decode_tokens: usize,
+) -> Result<f64> {
+    let start = Instant::now();
+    for step in 0..decode_tokens {
+        let (next, _) = engine
+            .decode_step_metal_component_greedy(token, initial_seqlen + step)
+            .with_context(|| format!("bench component decode step {step}"))?;
+        token = next;
+    }
+    Ok(start.elapsed().as_secs_f64() * 1000.0)
 }
 
 fn run_localize_mode(
@@ -967,7 +1588,11 @@ fn analyze_gate_prompt(
     runtime: &QwenBughuntRuntime,
     prompt: &PromptManifestEntry,
 ) -> Result<PromptGateAnalysis> {
+    let prompt_start = Instant::now();
+    let mut timings = Vec::new();
+
     eprintln!("[bughunt] gate prompt={} oracle_compact", prompt.name);
+    let phase_start = Instant::now();
     let oracle_output = oracle::run_oracle(
         &runtime.oracle_script,
         runtime.model_variant.hf_model_id(),
@@ -976,14 +1601,24 @@ fn analyze_gate_prompt(
         "bf16",
         &runtime.oracle_device,
         false,
+        false,
         None,
         None,
     )?;
+    timings.push(phase_timing("oracle_compact", phase_start));
+
     eprintln!("[bughunt] gate prompt={} oracle_trace", prompt.name);
+    let phase_start = Instant::now();
     let trace = run_trace_oracle(runtime, &prompt.prompt_ids, None, None, None)?;
+    timings.push(phase_timing("oracle_trace", phase_start));
+
     eprintln!("[bughunt] gate prompt={} native_prefill", prompt.name);
+    let phase_start = Instant::now();
     let native_prefill = run_native_prefill(runtime, &prompt.prompt_ids)?;
+    timings.push(phase_timing("native_prefill", phase_start));
+
     eprintln!("[bughunt] gate prompt={} gpu_reference", prompt.name);
+    let phase_start = Instant::now();
     let gpu_reference_logits = prefill_engine::gpu_reference_replay_step(
         &runtime.weights,
         &runtime.rotary,
@@ -993,23 +1628,42 @@ fn analyze_gate_prompt(
         runtime.prefill_chunk_size,
         runtime.use_4b_kernel,
     )?;
+    timings.push(phase_timing("gpu_reference", phase_start));
+
     eprintln!(
         "[bughunt] gate prompt={} position_sweep count={}",
         prompt.name,
         prompt.positions.len()
     );
+    let phase_start = Instant::now();
     let checked_positions = sweep_prompt_positions(runtime, prompt, &trace)?;
+    timings.push(phase_timing("position_sweep", phase_start));
     let worst_position = choose_worst_position(&checked_positions)
         .ok_or_else(|| anyhow::anyhow!("prompt '{}' produced no checked positions", prompt.name))?;
 
+    let oracle_final_hidden = trace
+        .decoder_layer_outputs
+        .last()
+        .and_then(|value| flatten_token_bsd(value, None))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "prompt '{}' oracle trace missing final hidden for last prompt position",
+                prompt.name
+            )
+        })?;
+    let oracle_aligned_prefill_logits =
+        compute_qwen_logits_from_hidden_row(runtime, &oracle_final_hidden)?;
+
     let prefill_logit_max_abs =
-        validate::max_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        validate::max_abs_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
     let prefill_logit_mean_abs =
-        mean_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        mean_abs_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
     let prefill_logit_mse =
-        mean_square_delta(&native_prefill.logits, &oracle_output.prefill_logits);
+        mean_square_delta(&native_prefill.logits, &oracle_aligned_prefill_logits);
+    let raw_oracle_prefill_logit_max_abs =
+        validate::max_abs_delta(&native_prefill.logits, &oracle_output.prefill_logits);
     let gpu_reference_logit_max_abs =
-        validate::max_abs_delta(&gpu_reference_logits, &oracle_output.prefill_logits);
+        validate::max_abs_delta(&gpu_reference_logits, &oracle_aligned_prefill_logits);
     let native_vs_gpu_reference_logit_max_abs =
         validate::max_abs_delta(&native_prefill.logits, &gpu_reference_logits);
 
@@ -1018,6 +1672,7 @@ fn analyze_gate_prompt(
         worst_position.worst_layer_delta,
         &prompt.thresholds,
     );
+    timings.push(phase_timing("total", prompt_start));
 
     Ok(PromptGateAnalysis {
         report: PromptGateReport {
@@ -1025,9 +1680,11 @@ fn analyze_gate_prompt(
             notes: prompt.notes.clone(),
             pass,
             thresholds: prompt.thresholds.clone(),
+            prefill_logit_reference: "oracle_final_hidden_recomputed".to_string(),
             prefill_logit_max_abs,
             prefill_logit_mean_abs,
             prefill_logit_mse,
+            raw_oracle_prefill_logit_max_abs,
             gpu_reference_logit_max_abs,
             native_vs_gpu_reference_logit_max_abs,
             worst_checked_position: worst_position.position,
@@ -1035,8 +1692,16 @@ fn analyze_gate_prompt(
             worst_layer_kind: worst_position.worst_layer_kind.clone(),
             worst_layer_delta: worst_position.worst_layer_delta,
             checked_positions,
+            timings,
         },
     })
+}
+
+fn phase_timing(phase: &str, start: Instant) -> PhaseTimingReport {
+    PhaseTimingReport {
+        phase: phase.to_string(),
+        elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
+    }
 }
 
 fn gate_pass(
@@ -1143,6 +1808,7 @@ fn run_restart_layer_sweep(
         0,
         "bf16",
         &runtime.oracle_device,
+        false,
         false,
         None,
         None,
@@ -2349,6 +3015,25 @@ fn run_native_prefill(
     )
 }
 
+fn run_native_prefill_greedy_token_with_state(
+    runtime: &QwenBughuntRuntime,
+    state: &mut ModelState,
+    prompt_ids: &[u32],
+) -> Result<u32> {
+    state.reset_for_prefill_reuse();
+    prefill_engine::prefill_greedy_token(
+        &runtime.weights,
+        state,
+        &runtime.rotary,
+        prompt_ids,
+        runtime.ordinal,
+        runtime.kv_chunk_size,
+        runtime.prefill_chunk_size,
+        false,
+        runtime.use_4b_kernel,
+    )
+}
+
 fn run_native_prefill_with_trace(
     runtime: &QwenBughuntRuntime,
     prompt_ids: &[u32],
@@ -2455,8 +3140,20 @@ fn print_report_summary(report: &BughuntReport) {
                     gate.pass
                 );
                 for prompt in &gate.prompt_results {
+                    let native_ms = prompt
+                        .timings
+                        .iter()
+                        .find(|timing| timing.phase == "native_prefill")
+                        .map(|timing| timing.elapsed_ms)
+                        .unwrap_or(0.0);
+                    let total_ms = prompt
+                        .timings
+                        .iter()
+                        .find(|timing| timing.phase == "total")
+                        .map(|timing| timing.elapsed_ms)
+                        .unwrap_or(0.0);
                     println!(
-                        "{} prompt={} prefill_max_abs={:.4} gpu_ref_max_abs={:.4} worst_position={} worst_layer={}({}) worst_layer_delta={:.4}",
+                        "{} prompt={} prefill_max_abs={:.4} gpu_ref_max_abs={:.4} worst_position={} worst_layer={}({}) worst_layer_delta={:.4} native_prefill_ms={:.1} total_ms={:.1}",
                         if prompt.pass { "PASS" } else { "FAIL" },
                         prompt.name,
                         prompt.prefill_logit_max_abs,
@@ -2465,6 +3162,8 @@ fn print_report_summary(report: &BughuntReport) {
                         prompt.worst_layer,
                         prompt.worst_layer_kind,
                         prompt.worst_layer_delta,
+                        native_ms,
+                        total_ms,
                     );
                 }
             }
@@ -2529,8 +3228,128 @@ fn print_report_summary(report: &BughuntReport) {
                 }
             }
         }
+        "bench" => {
+            if let Some(bench) = report.bench.as_ref() {
+                println!(
+                    "mode=bench backend={} prompts={} pass={}",
+                    report.metadata.backend,
+                    bench.prompt_results.len(),
+                    bench.pass
+                );
+                for prompt in &bench.prompt_results {
+                    println!(
+                        "BENCH prompt={} tokens={} iters={} warmup={} native_prefill_ms_mean={:.1} min={:.1} max={:.1} greedy_prefill_ms_mean={:.1} min={:.1} max={:.1} decode_tokens={} replay_decode_ms_per_token_mean={} component_decode_ms_per_token_mean={}",
+                        prompt.name,
+                        prompt.prompt_len,
+                        prompt.iterations,
+                        prompt.warmup_iterations,
+                        prompt.mean_native_prefill_ms,
+                        prompt.min_native_prefill_ms,
+                        prompt.max_native_prefill_ms,
+                        prompt.mean_greedy_prefill_ms,
+                        prompt.min_greedy_prefill_ms,
+                        prompt.max_greedy_prefill_ms,
+                        prompt.decode_tokens,
+                        prompt
+                            .mean_replay_decode_ms_per_token
+                            .map(|value| format!("{value:.1}"))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                        prompt
+                            .mean_component_decode_ms_per_token
+                            .map(|value| format!("{value:.1}"))
+                            .unwrap_or_else(|| "n/a".to_string()),
+                    );
+                    if let Some(profile) = prompt.prefill_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "prefill", profile);
+                    }
+                    if let Some(profile) = prompt.greedy_prefill_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "greedy_prefill", profile);
+                    }
+                    if let Some(profile) = prompt.replay_decode_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "replay_decode", profile);
+                    }
+                    if let Some(profile) = prompt.component_decode_profile.as_ref() {
+                        print_profile_summary(&prompt.name, "component_decode", profile);
+                    }
+                    if let Some(profile) = prompt.prefill_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "prefill", profile);
+                    }
+                    if let Some(profile) = prompt.greedy_prefill_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "greedy_prefill", profile);
+                    }
+                    if let Some(profile) = prompt.replay_decode_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "replay_decode", profile);
+                    }
+                    if let Some(profile) = prompt.component_decode_hal_profile.as_ref() {
+                        print_hal_profile_summary(&prompt.name, "component_decode", profile);
+                    }
+                }
+            }
+        }
         _ => {}
     }
+}
+
+fn print_profile_summary(prompt_name: &str, phase: &str, profile: &MetalProfileReport) {
+    println!(
+        "PROFILE prompt={} phase={} total_calls={} native_calls={} host_calls={} total_ms={:.1} native_ms={:.1} host_ms={:.1}",
+        prompt_name,
+        phase,
+        profile.total_calls,
+        profile.native_calls,
+        profile.host_calls,
+        profile.total_ms,
+        profile.native_ms,
+        profile.host_ms,
+    );
+    for entry in profile.entries.iter().take(8) {
+        println!(
+            "PROFILE_OP prompt={} phase={} op={} path={} calls={} total_ms={:.1} mean_ms={:.3} max_ms={:.3}",
+            prompt_name,
+            phase,
+            entry.op,
+            entry.path,
+            entry.calls,
+            entry.total_ms,
+            entry.mean_ms,
+            entry.max_ms,
+        );
+    }
+}
+
+fn print_hal_profile_summary(prompt_name: &str, phase: &str, profile: &HalProfileReport) {
+    println!(
+        "HAL_PROFILE prompt={} phase={} total_calls={} total_ms={:.1} alloc_calls={} alloc_mb={:.1} free_calls={} h2d_mb={:.1} d2h_mb={:.1} d2d_mb={:.1} memset_mb={:.1} sync_calls={}",
+        prompt_name,
+        phase,
+        profile.total_calls,
+        profile.total_ms,
+        profile.alloc_calls,
+        bytes_to_mb(profile.alloc_bytes),
+        profile.free_calls,
+        bytes_to_mb(profile.h2d_bytes),
+        bytes_to_mb(profile.d2h_bytes),
+        bytes_to_mb(profile.d2d_bytes),
+        bytes_to_mb(profile.memset_bytes),
+        profile.sync_calls,
+    );
+    for entry in profile.entries.iter().take(8) {
+        println!(
+            "HAL_OP prompt={} phase={} op={} calls={} total_ms={:.1} mean_ms={:.3} max_ms={:.3} total_mb={:.1}",
+            prompt_name,
+            phase,
+            entry.op,
+            entry.calls,
+            entry.total_ms,
+            entry.mean_ms,
+            entry.max_ms,
+            bytes_to_mb(entry.total_bytes),
+        );
+    }
+}
+
+fn bytes_to_mb(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 fn write_report_json(path: &Path, report: &BughuntReport) -> Result<()> {
@@ -2847,9 +3666,11 @@ mod tests {
                         layer_hidden_max_abs: 0.1,
                         restart_tail_logit_max_abs: 0.1,
                     },
+                    prefill_logit_reference: "oracle_final_hidden_recomputed".to_string(),
                     prefill_logit_max_abs: 0.2,
                     prefill_logit_mean_abs: 0.02,
                     prefill_logit_mse: 0.01,
+                    raw_oracle_prefill_logit_max_abs: 0.25,
                     gpu_reference_logit_max_abs: 0.19,
                     native_vs_gpu_reference_logit_max_abs: 0.03,
                     worst_checked_position: 15,
@@ -2857,6 +3678,10 @@ mod tests {
                     worst_layer_kind: "linear".to_string(),
                     worst_layer_delta: 0.12,
                     checked_positions: Vec::new(),
+                    timings: vec![PhaseTimingReport {
+                        phase: "native_prefill".to_string(),
+                        elapsed_ms: 12.5,
+                    }],
                 },
                 localization: LocalizationSummary {
                     prompt_name: "code_prompt".to_string(),
@@ -2874,6 +3699,7 @@ mod tests {
                 },
             }),
             dump: None,
+            bench: None,
         };
         let value = serde_json::to_value(&report).unwrap();
         assert_eq!(value["mode"], "localize");
@@ -2881,6 +3707,159 @@ mod tests {
             value["localize"]["localization"]["first_suspicious_restart_layer"],
             18
         );
+    }
+
+    #[test]
+    fn bench_report_serialization_includes_decode_and_profile_fields() {
+        let report = BughuntReport {
+            mode: "bench".to_string(),
+            metadata: RunMetadata {
+                mode: "bench".to_string(),
+                model: "qwen3.5-0.8b".to_string(),
+                backend: "metal".to_string(),
+                device: 0,
+                arch: "apple-m4".to_string(),
+                model_dir: "/tmp/model".to_string(),
+                oracle_device: "cpu".to_string(),
+                commit_ish: Some("abc123".to_string()),
+            },
+            gate: None,
+            localize: None,
+            dump: None,
+            bench: Some(BenchRunSection {
+                pass: true,
+                prompt_results: vec![BenchPromptReport {
+                    name: "hello_world".to_string(),
+                    notes: Some("smoke".to_string()),
+                    prompt_len: 2,
+                    warmup_iterations: 0,
+                    iterations: 1,
+                    decode_tokens: 1,
+                    native_prefill_ms: vec![3.0],
+                    min_native_prefill_ms: 3.0,
+                    max_native_prefill_ms: 3.0,
+                    mean_native_prefill_ms: 3.0,
+                    greedy_prefill_ms: vec![1.0],
+                    min_greedy_prefill_ms: 1.0,
+                    max_greedy_prefill_ms: 1.0,
+                    mean_greedy_prefill_ms: 1.0,
+                    replay_decode_ms: vec![4.0],
+                    min_replay_decode_ms: Some(4.0),
+                    max_replay_decode_ms: Some(4.0),
+                    mean_replay_decode_ms: Some(4.0),
+                    mean_replay_decode_ms_per_token: Some(4.0),
+                    component_decode_ms: Some(vec![2.0]),
+                    min_component_decode_ms: Some(2.0),
+                    max_component_decode_ms: Some(2.0),
+                    mean_component_decode_ms: Some(2.0),
+                    mean_component_decode_ms_per_token: Some(2.0),
+                    prefill_profile: Some(MetalProfileReport {
+                        total_calls: 2,
+                        native_calls: 1,
+                        host_calls: 1,
+                        total_ms: 1.5,
+                        native_ms: 1.0,
+                        host_ms: 0.5,
+                        entries: vec![MetalProfileOpReport {
+                            op: "matmul_rhs_transposed".to_string(),
+                            path: "native".to_string(),
+                            calls: 1,
+                            total_ms: 1.0,
+                            mean_ms: 1.0,
+                            max_ms: 1.0,
+                        }],
+                    }),
+                    greedy_prefill_profile: None,
+                    replay_decode_profile: None,
+                    component_decode_profile: None,
+                    prefill_hal_profile: Some(HalProfileReport {
+                        total_calls: 3,
+                        total_ms: 2.0,
+                        alloc_calls: 1,
+                        alloc_bytes: 1024,
+                        free_calls: 1,
+                        h2d_bytes: 0,
+                        d2h_bytes: 2048,
+                        d2d_bytes: 0,
+                        memset_bytes: 1024,
+                        sync_calls: 1,
+                        entries: vec![HalProfileOpReport {
+                            op: "alloc".to_string(),
+                            calls: 1,
+                            total_ms: 1.0,
+                            mean_ms: 1.0,
+                            max_ms: 1.0,
+                            total_bytes: 1024,
+                        }],
+                    }),
+                    greedy_prefill_hal_profile: None,
+                    replay_decode_hal_profile: None,
+                    component_decode_hal_profile: None,
+                }],
+            }),
+        };
+        let value = serde_json::to_value(&report).unwrap();
+        let prompt = &value["bench"]["prompt_results"][0];
+        assert_eq!(prompt["decode_tokens"], 1);
+        assert_eq!(prompt["mean_greedy_prefill_ms"], 1.0);
+        assert_eq!(prompt["mean_replay_decode_ms_per_token"], 4.0);
+        assert_eq!(prompt["mean_component_decode_ms_per_token"], 2.0);
+        assert_eq!(prompt["prefill_profile"]["native_calls"], 1);
+        assert_eq!(
+            prompt["prefill_profile"]["entries"][0]["op"],
+            "matmul_rhs_transposed"
+        );
+        assert_eq!(prompt["prefill_hal_profile"]["alloc_calls"], 1);
+        assert_eq!(prompt["prefill_hal_profile"]["d2h_bytes"], 2048);
+    }
+
+    #[test]
+    fn metal_profile_report_preserves_dispatch_summary() {
+        let report = metal_profile_report(kernel_ffi::prefill_ffi::MetalProfileSnapshot {
+            total_calls: 3,
+            native_calls: 2,
+            host_calls: 1,
+            total_ms: 4.0,
+            native_ms: 3.0,
+            host_ms: 1.0,
+            entries: vec![kernel_ffi::prefill_ffi::MetalProfileEntry {
+                op: "cast".to_string(),
+                path: "native".to_string(),
+                calls: 2,
+                total_ms: 3.0,
+                max_ms: 2.0,
+            }],
+        });
+        assert_eq!(report.total_calls, 3);
+        assert_eq!(report.native_calls, 2);
+        assert_eq!(report.host_calls, 1);
+        assert_eq!(report.entries[0].mean_ms, 1.5);
+    }
+
+    #[test]
+    fn hal_profile_report_preserves_memory_summary() {
+        let report = hal_profile_report(gpu_hal::HalProfileSnapshot {
+            total_calls: 2,
+            total_ms: 5.0,
+            alloc_calls: 1,
+            alloc_bytes: 4096,
+            free_calls: 1,
+            h2d_bytes: 128,
+            d2h_bytes: 256,
+            d2d_bytes: 512,
+            memset_bytes: 1024,
+            sync_calls: 1,
+            entries: vec![gpu_hal::HalProfileEntry {
+                op: "alloc".to_string(),
+                calls: 1,
+                total_ms: 4.0,
+                max_ms: 4.0,
+                total_bytes: 4096,
+            }],
+        });
+        assert_eq!(report.alloc_calls, 1);
+        assert_eq!(report.alloc_bytes, 4096);
+        assert_eq!(report.entries[0].mean_ms, 4.0);
     }
 
     #[test]

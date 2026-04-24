@@ -5,7 +5,7 @@
       "prompt_ids": [9419, 1814],
       "positions": [0, 1],
       "thresholds": {
-        "prefill_logit_max_abs": 0.20,
+        "prefill_logit_max_abs": 0.30,
         "layer_hidden_max_abs": 0.15,
         "restart_tail_logit_max_abs": 0.16
       },

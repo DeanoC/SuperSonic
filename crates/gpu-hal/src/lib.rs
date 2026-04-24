@@ -16,7 +16,8 @@ pub use backend::{
 pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::GpuError;
 pub use ops::{
-    alloc, alloc_zeros, copy_d2d, copy_d2h, copy_h2d, memset_zeros, query_device_info, set_device,
-    sync, GpuEvent,
+    alloc, alloc_zeros, copy_d2d, copy_d2h, copy_h2d, hal_profile_reset, hal_profile_set_enabled,
+    hal_profile_snapshot, memset_zeros, query_device_info, set_device, sync, GpuEvent,
+    HalProfileEntry, HalProfileSnapshot,
 };
 pub use scalar_type::ScalarType;

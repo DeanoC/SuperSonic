@@ -130,7 +130,7 @@ pub fn run_phi4(
         let oracle = oracle_mod::run_phi4_oracle(
             &oracle_script,
             &cli.model_dir,
-            &cli.prompt,
+            cli.prompt.as_str(),
             cli.max_new_tokens,
             &cli.oracle_dtype,
             &oracle_device,

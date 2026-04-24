@@ -1,6 +1,10 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use crate::backend::{current_backend, Backend, DeviceInfo};
 #[cfg(supersonic_backend_cuda)]
@@ -12,6 +16,137 @@ use crate::hip_sys::*;
 use crate::metal_sys::*;
 use crate::scalar_type::ScalarType;
 
+static HAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static HAL_PROFILE: OnceLock<Mutex<HalProfileAccumulator>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct HalProfileEntry {
+    pub op: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub max_ms: f64,
+    pub total_bytes: u64,
+}
+
+impl HalProfileEntry {
+    pub fn mean_ms(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.total_ms / self.calls as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HalProfileSnapshot {
+    pub total_calls: u64,
+    pub total_ms: f64,
+    pub alloc_calls: u64,
+    pub alloc_bytes: u64,
+    pub free_calls: u64,
+    pub h2d_bytes: u64,
+    pub d2h_bytes: u64,
+    pub d2d_bytes: u64,
+    pub memset_bytes: u64,
+    pub sync_calls: u64,
+    pub entries: Vec<HalProfileEntry>,
+}
+
+#[derive(Debug, Default)]
+struct HalProfileAccumulator {
+    entries: BTreeMap<String, HalProfileEntry>,
+}
+
+pub fn hal_profile_set_enabled(enabled: bool) {
+    HAL_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn hal_profile_enabled() -> bool {
+    HAL_PROFILE_ENABLED.load(Ordering::Relaxed)
+        || std::env::var_os("SUPERSONIC_HAL_PROFILE").is_some()
+}
+
+pub fn hal_profile_reset() {
+    if let Some(profile) = HAL_PROFILE.get() {
+        profile
+            .lock()
+            .expect("HAL profile mutex poisoned")
+            .entries
+            .clear();
+    }
+}
+
+pub fn hal_profile_snapshot() -> HalProfileSnapshot {
+    let mut snapshot = HalProfileSnapshot::default();
+    let Some(profile) = HAL_PROFILE.get() else {
+        return snapshot;
+    };
+    let mut entries: Vec<_> = profile
+        .lock()
+        .expect("HAL profile mutex poisoned")
+        .entries
+        .values()
+        .cloned()
+        .collect();
+    entries.sort_by(|lhs, rhs| {
+        rhs.total_ms
+            .partial_cmp(&lhs.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.op.cmp(&rhs.op))
+    });
+    for entry in &entries {
+        snapshot.total_calls += entry.calls;
+        snapshot.total_ms += entry.total_ms;
+        match entry.op.as_str() {
+            "alloc" => {
+                snapshot.alloc_calls += entry.calls;
+                snapshot.alloc_bytes += entry.total_bytes;
+            }
+            "free" => {
+                snapshot.free_calls += entry.calls;
+            }
+            "copy_h2d" => snapshot.h2d_bytes += entry.total_bytes,
+            "copy_d2h" => snapshot.d2h_bytes += entry.total_bytes,
+            "copy_d2d" => snapshot.d2d_bytes += entry.total_bytes,
+            "memset_zeros" => snapshot.memset_bytes += entry.total_bytes,
+            "sync" => snapshot.sync_calls += entry.calls,
+            _ => {}
+        }
+    }
+    snapshot.entries = entries;
+    snapshot
+}
+
+fn hal_profile_time<T, F>(op: &'static str, bytes: usize, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !hal_profile_enabled() {
+        return f();
+    }
+    let start = Instant::now();
+    let result = f();
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("HAL profile mutex poisoned");
+    let entry = profile
+        .entries
+        .entry(op.to_string())
+        .or_insert_with(|| HalProfileEntry {
+            op: op.to_string(),
+            calls: 0,
+            total_ms: 0.0,
+            max_ms: 0.0,
+            total_bytes: 0,
+        });
+    entry.calls += 1;
+    entry.total_ms += elapsed_ms;
+    entry.max_ms = entry.max_ms.max(elapsed_ms);
+    entry.total_bytes += bytes as u64;
+    result
+}
+
 fn with_device_impl<T>(
     backend: Backend,
     ordinal: usize,
@@ -19,6 +154,7 @@ fn with_device_impl<T>(
 ) -> Result<T> {
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
+    #[allow(unused_mut)]
     let mut prev = 0;
     match backend {
         Backend::Hip => {
@@ -84,6 +220,7 @@ fn with_device_impl<T>(
     };
     let result = f();
     if let Some(prev) = restore {
+        let _ = prev;
         let status = match backend {
             Backend::Hip => {
                 #[cfg(supersonic_backend_hip)]
@@ -118,6 +255,7 @@ pub fn set_device(ordinal: usize) -> Result<()> {
     let backend = current_backend();
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
+    let _ = ordinal_i32;
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -157,49 +295,51 @@ pub fn set_device(ordinal: usize) -> Result<()> {
 
 /// Allocate `len_bytes` of device memory, returning a non-null pointer.
 pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
-    let backend = current_backend();
     if len_bytes == 0 {
         return Err(GpuError::InvalidArg("allocation size must be > 0".into()));
     }
-    with_device_impl(backend, ordinal, || {
-        let mut ptr = std::ptr::null_mut();
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipMalloc(&mut ptr, len_bytes)
+    hal_profile_time("alloc", len_bytes, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let mut ptr = std::ptr::null_mut();
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipMalloc(&mut ptr, len_bytes)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaMalloc(&mut ptr, len_bytes)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaMalloc(&mut ptr, len_bytes)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                #[cfg(supersonic_backend_metal)]
-                unsafe {
-                    supersonic_metal_alloc(len_bytes, &mut ptr)
+                Backend::Metal => {
+                    #[cfg(supersonic_backend_metal)]
+                    unsafe {
+                        supersonic_metal_alloc(len_bytes, &mut ptr)
+                    }
+                    #[cfg(not(supersonic_backend_metal))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_metal))]
-                1
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipMalloc", status),
+                    Backend::Cuda => cuda_error("cudaMalloc", status),
+                    Backend::Metal => metal_error("metalAlloc", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipMalloc", status),
-                Backend::Cuda => cuda_error("cudaMalloc", status),
-                Backend::Metal => metal_error("metalAlloc", status),
-            });
-        }
-        NonNull::new(ptr).ok_or_else(|| match backend {
-            Backend::Hip => GpuError::Hip("hipMalloc returned null".into()),
-            Backend::Cuda => GpuError::Cuda("cudaMalloc returned null".into()),
-            Backend::Metal => GpuError::Metal("metalAlloc returned null".into()),
+            NonNull::new(ptr).ok_or_else(|| match backend {
+                Backend::Hip => GpuError::Hip("hipMalloc returned null".into()),
+                Backend::Cuda => GpuError::Cuda("cudaMalloc returned null".into()),
+                Backend::Metal => GpuError::Metal("metalAlloc returned null".into()),
+            })
         })
     })
 }
@@ -303,251 +443,263 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
     if ptr.is_null() {
         return;
     }
-    let _ = with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipFree(ptr)
+    hal_profile_time("free", 0, || {
+        let _ = with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipFree(ptr)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaFree(ptr)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaFree(ptr)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                #[cfg(supersonic_backend_metal)]
-                unsafe {
-                    supersonic_metal_free(ptr)
+                Backend::Metal => {
+                    #[cfg(supersonic_backend_metal)]
+                    unsafe {
+                        supersonic_metal_free(ptr)
+                    }
+                    #[cfg(not(supersonic_backend_metal))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_metal))]
-                1
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipFree", status),
+                    Backend::Cuda => cuda_error("cudaFree", status),
+                    Backend::Metal => metal_error("metalFree", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipFree", status),
-                Backend::Cuda => cuda_error("cudaFree", status),
-                Backend::Metal => metal_error("metalFree", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        });
     });
 }
 
 /// Copy from host memory to device memory.
 pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
-    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg(
             "copy_h2d: null pointer or zero len".into(),
         ));
     }
-    with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE)
+    hal_profile_time("copy_h2d", len, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipMemcpy(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_HOST_TO_DEVICE)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_HOST_TO_DEVICE)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                Backend::Metal => {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                    }
+                    0
                 }
-                0
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipMemcpy(H2D)", status),
+                    Backend::Cuda => cuda_error("cudaMemcpy(H2D)", status),
+                    Backend::Metal => metal_error("metalMemcpy(H2D)", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipMemcpy(H2D)", status),
-                Backend::Cuda => cuda_error("cudaMemcpy(H2D)", status),
-                Backend::Metal => metal_error("metalMemcpy(H2D)", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
 /// Copy from device memory to host memory.
 pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
-    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg(
             "copy_d2h: null pointer or zero len".into(),
         ));
     }
-    with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST)
+    hal_profile_time("copy_d2h", len, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_HOST)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_HOST)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_HOST)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                Backend::Metal => {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, len);
+                    }
+                    0
                 }
-                0
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipMemcpy(D2H)", status),
+                    Backend::Cuda => cuda_error("cudaMemcpy(D2H)", status),
+                    Backend::Metal => metal_error("metalMemcpy(D2H)", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipMemcpy(D2H)", status),
-                Backend::Cuda => cuda_error("cudaMemcpy(D2H)", status),
-                Backend::Metal => metal_error("metalMemcpy(D2H)", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
 /// Copy from device memory to device memory.
 pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize) -> Result<()> {
-    let backend = current_backend();
     if dst.is_null() || src.is_null() || len == 0 {
         return Err(GpuError::InvalidArg(
             "copy_d2d: null pointer or zero len".into(),
         ));
     }
-    with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE)
+    hal_profile_time("copy_d2d", len, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipMemcpy(dst, src, len, HIP_MEMCPY_DEVICE_TO_DEVICE)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_DEVICE)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaMemcpy(dst, src, len, CUDA_MEMCPY_DEVICE_TO_DEVICE)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                unsafe {
-                    std::ptr::copy(src as *const u8, dst as *mut u8, len);
+                Backend::Metal => {
+                    unsafe {
+                        std::ptr::copy(src as *const u8, dst as *mut u8, len);
+                    }
+                    0
                 }
-                0
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipMemcpy(D2D)", status),
+                    Backend::Cuda => cuda_error("cudaMemcpy(D2D)", status),
+                    Backend::Metal => metal_error("metalMemcpy(D2D)", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipMemcpy(D2D)", status),
-                Backend::Cuda => cuda_error("cudaMemcpy(D2D)", status),
-                Backend::Metal => metal_error("metalMemcpy(D2D)", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
 /// Set device memory to zero.
 pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> {
-    let backend = current_backend();
     if dst.is_null() || len == 0 {
         return Err(GpuError::InvalidArg(
             "memset_zeros: null pointer or zero len".into(),
         ));
     }
-    with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipMemset(dst, 0, len)
+    hal_profile_time("memset_zeros", len, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipMemset(dst, 0, len)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaMemset(dst, 0, len)
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaMemset(dst, 0, len)
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
-            }
-            Backend::Metal => {
-                unsafe {
-                    std::ptr::write_bytes(dst as *mut u8, 0, len);
+                Backend::Metal => {
+                    unsafe {
+                        std::ptr::write_bytes(dst as *mut u8, 0, len);
+                    }
+                    0
                 }
-                0
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipMemset", status),
+                    Backend::Cuda => cuda_error("cudaMemset", status),
+                    Backend::Metal => metal_error("metalMemset", status),
+                });
             }
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipMemset", status),
-                Backend::Cuda => cuda_error("cudaMemset", status),
-                Backend::Metal => metal_error("metalMemset", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
 /// Synchronize the device (block until all pending work completes).
 pub fn sync(ordinal: usize) -> Result<()> {
-    let backend = current_backend();
-    with_device_impl(backend, ordinal, || {
-        let status = match backend {
-            Backend::Hip => {
-                #[cfg(supersonic_backend_hip)]
-                unsafe {
-                    hipDeviceSynchronize()
+    hal_profile_time("sync", 0, || {
+        let backend = current_backend();
+        with_device_impl(backend, ordinal, || {
+            let status = match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipDeviceSynchronize()
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_hip))]
-                1
-            }
-            Backend::Cuda => {
-                #[cfg(supersonic_backend_cuda)]
-                unsafe {
-                    cudaDeviceSynchronize()
+                Backend::Cuda => {
+                    #[cfg(supersonic_backend_cuda)]
+                    unsafe {
+                        cudaDeviceSynchronize()
+                    }
+                    #[cfg(not(supersonic_backend_cuda))]
+                    1
                 }
-                #[cfg(not(supersonic_backend_cuda))]
-                1
+                Backend::Metal => 0,
+            };
+            if status != 0 {
+                return Err(match backend {
+                    Backend::Hip => hip_error("hipDeviceSynchronize", status),
+                    Backend::Cuda => cuda_error("cudaDeviceSynchronize", status),
+                    Backend::Metal => metal_error("metalDeviceSynchronize", status),
+                });
             }
-            Backend::Metal => 0,
-        };
-        if status != 0 {
-            return Err(match backend {
-                Backend::Hip => hip_error("hipDeviceSynchronize", status),
-                Backend::Cuda => cuda_error("cudaDeviceSynchronize", status),
-                Backend::Metal => metal_error("metalDeviceSynchronize", status),
-            });
-        }
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -564,6 +716,7 @@ pub struct GpuEvent {
 impl GpuEvent {
     pub fn new(ordinal: usize) -> Result<Self> {
         let backend = current_backend();
+        #[allow(unused_mut)]
         let mut raw: *mut c_void = std::ptr::null_mut();
         with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
@@ -698,6 +851,7 @@ impl Drop for GpuEvent {
 pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo> {
     let ordinal_i32 = c_int::try_from(ordinal)
         .map_err(|_| GpuError::InvalidArg(format!("device ordinal {ordinal} overflows c_int")))?;
+    let _ = ordinal_i32;
     match backend {
         Backend::Hip => Err(GpuError::InvalidArg(
             "HIP device query is provided by the HIP kernel bridge, not gpu-hal".into(),

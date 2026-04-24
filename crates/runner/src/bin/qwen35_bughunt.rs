@@ -42,10 +42,32 @@ struct Cli {
 
     #[arg(long, default_value_t = 0)]
     ordinal: usize,
+
+    #[arg(long, default_value_t = 3)]
+    iters: usize,
+
+    #[arg(long, default_value_t = 1)]
+    warmup: usize,
+
+    #[arg(long, default_value_t = 0)]
+    decode_tokens: usize,
+
+    #[arg(long)]
+    profile_ops: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.backend == BackendArg::Metal
+        && !matches!(cli.mode, BughuntMode::Bench)
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_F32_FINAL_NORM").is_none()
+    {
+        // The bug-hunt gate is a prefill-state parity harness. Keep its final
+        // logit comparison on the F32 reference projection path so a known
+        // low-precision Metal lm-head path cannot mask or fabricate oracle
+        // failures.
+        std::env::set_var("SUPERSONIC_METAL_FORCE_F32_FINAL_NORM", "1");
+    }
     let report = runner::bughunt::run(BughuntArgs {
         mode: cli.mode,
         model_dir: cli.model_dir,
@@ -58,6 +80,10 @@ fn main() -> Result<()> {
         position: cli.position,
         layer: cli.layer,
         layer_kind: cli.layer_kind,
+        bench_iterations: cli.iters,
+        bench_warmup: cli.warmup,
+        bench_decode_tokens: cli.decode_tokens,
+        bench_profile_ops: cli.profile_ops,
     })?;
 
     let exit_code = report.exit_code();
