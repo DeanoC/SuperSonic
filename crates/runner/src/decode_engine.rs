@@ -7072,6 +7072,7 @@ impl DecodeEngine {
                                 score_scratch,
                                 scratch.certified_softmax_stats.as_mut().unwrap(),
                                 attn_out_bf16,
+                                None,
                             )
                             .map_err(|e| {
                                 anyhow::anyhow!(
@@ -7106,6 +7107,7 @@ impl DecodeEngine {
                                 q_scale,
                                 score_scratch,
                                 attn_out_bf16,
+                                None,
                             )
                             .map_err(|e| {
                                 anyhow::anyhow!(
@@ -7501,6 +7503,7 @@ impl DecodeEngine {
                                     score_scratch,
                                     scratch.certified_softmax_stats.as_mut().unwrap(),
                                     attn_out_bf16,
+                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
                                 )
                                 .map_err(|e| {
                                     anyhow::anyhow!(
@@ -7530,6 +7533,7 @@ impl DecodeEngine {
                                     q_scale,
                                     score_scratch,
                                     attn_out_bf16,
+                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
                                 )
                                 .map_err(|e| {
                                     anyhow::anyhow!(

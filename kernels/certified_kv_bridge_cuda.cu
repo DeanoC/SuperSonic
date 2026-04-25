@@ -29,6 +29,10 @@ __device__ __forceinline__ float bf16_to_float(__nv_bfloat16 value) {
     return static_cast<float>(value);
 }
 
+__device__ __forceinline__ bool certified_kv_should_run(const uint32_t* run_flag) {
+    return run_flag == nullptr || run_flag[0] != 0;
+}
+
 __device__ __forceinline__ int clamp_i32(int value, int lo, int hi) {
     return value < lo ? lo : (value > hi ? hi : value);
 }
@@ -1492,8 +1496,10 @@ __global__ void certified_kv_attend_mixed_key_int4_bf16_tail_kernel(
     int head_dim,
     int value_group_size,
     int gqa_group,
-    float q_scale
+    float q_scale,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int qh = blockIdx.x;
     if (qh >= q_heads) return;
     const int kvh = qh / gqa_group;
@@ -1717,8 +1723,10 @@ __global__ void certified_kv_mixed_key_score_kernel(
     int score_stride_tokens,
     int head_dim,
     int gqa_group,
-    float q_scale
+    float q_scale,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int total_chunks = num_blocks + (tail_len > 0 ? 1 : 0);
     const int qh = blockIdx.x / total_chunks;
     const int chunk = blockIdx.x - qh * total_chunks;
@@ -1807,8 +1815,10 @@ __global__ void certified_kv_mixed_value_by_dim_kernel(
     int score_stride_tokens,
     int head_dim,
     int value_group_size,
-    int gqa_group
+    int gqa_group,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int linear = blockIdx.x;
     const int qh = linear / head_dim;
     const int d = linear - qh * head_dim;
@@ -1884,8 +1894,10 @@ __global__ void certified_kv_all_promoted_score_kernel(
     int score_stride_tokens,
     int head_dim,
     int gqa_group,
-    float q_scale
+    float q_scale,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int total_chunks = num_blocks + (tail_len > 0 ? 1 : 0);
     const int qh = blockIdx.x / total_chunks;
     const int chunk = blockIdx.x - qh * total_chunks;
@@ -1930,8 +1942,10 @@ __global__ void certified_kv_softmax_stats_kernel(
     float* softmax_stats,
     int q_heads,
     int total_tokens,
-    int score_stride_tokens
+    int score_stride_tokens,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int qh = blockIdx.x;
     if (qh >= q_heads) return;
     __shared__ float reduce_scratch[256];
@@ -1961,8 +1975,10 @@ __global__ void certified_kv_softmax_normalize_kernel(
     const float* softmax_stats,
     int q_heads,
     int total_tokens,
-    int score_stride_tokens
+    int score_stride_tokens,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int qh = blockIdx.x;
     if (qh >= q_heads) return;
     const float max_score = softmax_stats[static_cast<size_t>(qh) * 2];
@@ -1977,8 +1993,10 @@ __global__ void certified_kv_softmax_normalize_inplace_kernel(
     float* score_scratch,
     int q_heads,
     int total_tokens,
-    int score_stride_tokens
+    int score_stride_tokens,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int qh = blockIdx.x;
     if (qh >= q_heads) return;
     __shared__ float reduce_scratch[256];
@@ -2136,8 +2154,10 @@ __global__ void certified_kv_all_promoted_value_kernel(
     int score_stride_tokens,
     int head_dim,
     int value_group_size,
-    int gqa_group
+    int gqa_group,
+    const uint32_t* run_flag
 ) {
+    if (!certified_kv_should_run(run_flag)) return;
     const int qh = blockIdx.x;
     if (qh >= q_heads) return;
     const int kvh = qh / gqa_group;
@@ -3710,7 +3730,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
     int head_dim,
     int value_group_size,
     int gqa_group,
-    float q_scale
+    float q_scale,
+    const void* run_flag
 ) {
     if (query_bf16 == nullptr || key_int8 == nullptr || key_scale == nullptr ||
         promoted_key_bf16 == nullptr || promote_index == nullptr ||
@@ -3769,7 +3790,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
             score_stride_tokens,
             head_dim,
             gqa_group,
-            q_scale
+            q_scale,
+            static_cast<const uint32_t*>(run_flag)
         );
         if (cudaGetLastError() != cudaSuccess) return 85;
 
@@ -3777,7 +3799,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
             static_cast<float*>(score_scratch),
             q_heads,
             total_tokens,
-            score_stride_tokens
+            score_stride_tokens,
+            static_cast<const uint32_t*>(run_flag)
         );
         if (cudaGetLastError() != cudaSuccess) return 86;
         certified_kv_mixed_value_by_dim_kernel<<<q_heads * head_dim, 256>>>(
@@ -3801,7 +3824,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
             score_stride_tokens,
             head_dim,
             value_group_size,
-            gqa_group
+            gqa_group,
+            static_cast<const uint32_t*>(run_flag)
         );
         if (cudaGetLastError() != cudaSuccess) return 87;
         return 0;
@@ -3841,7 +3865,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
         head_dim,
         value_group_size,
         gqa_group,
-        q_scale
+        q_scale,
+        static_cast<const uint32_t*>(run_flag)
     );
     if (cudaGetLastError() != cudaSuccess) return 85;
     return 0;
@@ -3876,7 +3901,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
     int head_dim,
     int value_group_size,
     int gqa_group,
-    float q_scale
+    float q_scale,
+    const void* run_flag
 ) {
     if (query_bf16 == nullptr || promoted_key_bf16 == nullptr ||
         promoted_value_bf16 == nullptr || value_promote_index == nullptr ||
@@ -3919,7 +3945,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
         score_stride_tokens,
         head_dim,
         gqa_group,
-        q_scale
+        q_scale,
+        static_cast<const uint32_t*>(run_flag)
     );
     if (cudaGetLastError() != cudaSuccess) return 95;
     certified_kv_softmax_stats_kernel<<<q_heads, 256>>>(
@@ -3927,7 +3954,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
         static_cast<float*>(softmax_stats),
         q_heads,
         total_tokens,
-        score_stride_tokens
+        score_stride_tokens,
+        static_cast<const uint32_t*>(run_flag)
     );
     if (cudaGetLastError() != cudaSuccess) return 96;
     certified_kv_softmax_normalize_kernel<<<q_heads, 256>>>(
@@ -3935,7 +3963,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
         static_cast<const float*>(softmax_stats),
         q_heads,
         total_tokens,
-        score_stride_tokens
+        score_stride_tokens,
+        static_cast<const uint32_t*>(run_flag)
     );
     if (cudaGetLastError() != cudaSuccess) return 97;
     certified_kv_all_promoted_value_kernel<<<q_heads, 256>>>(
@@ -3959,7 +3988,8 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
         score_stride_tokens,
         head_dim,
         value_group_size,
-        gqa_group
+        gqa_group,
+        static_cast<const uint32_t*>(run_flag)
     );
     if (cudaGetLastError() != cudaSuccess) return 98;
     return 0;
@@ -4019,7 +4049,8 @@ extern "C" int dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
         score_stride_tokens,
         head_dim,
         gqa_group,
-        q_scale
+        q_scale,
+        nullptr
     );
     if (cudaGetLastError() != cudaSuccess) return 115;
     certified_kv_softmax_stats_kernel<<<q_heads, 256>>>(
@@ -4027,7 +4058,8 @@ extern "C" int dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
         static_cast<float*>(softmax_stats),
         q_heads,
         total_tokens,
-        score_stride_tokens
+        score_stride_tokens,
+        nullptr
     );
     if (cudaGetLastError() != cudaSuccess) return 116;
     certified_kv_softmax_normalize_kernel<<<q_heads, 256>>>(
@@ -4035,7 +4067,8 @@ extern "C" int dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
         static_cast<const float*>(softmax_stats),
         q_heads,
         total_tokens,
-        score_stride_tokens
+        score_stride_tokens,
+        nullptr
     );
     if (cudaGetLastError() != cudaSuccess) return 117;
     return 0;
@@ -4109,7 +4142,8 @@ extern "C" int dotcache_llama31_certified_kv_apply_all_promoted_values_from_prob
         score_stride_tokens,
         head_dim,
         value_group_size,
-        gqa_group
+        gqa_group,
+        nullptr
     );
     if (cudaGetLastError() != cudaSuccess) return 122;
     return 0;

@@ -646,6 +646,7 @@ fn run_once(
             q_scale,
             score_scratch,
             output_bf16,
+            None,
         )
         .context("mixed-key INT4 attend")
     })?;

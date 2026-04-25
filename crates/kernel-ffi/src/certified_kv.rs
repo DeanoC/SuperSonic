@@ -364,6 +364,7 @@ unsafe extern "C" {
         value_group_size: c_int,
         gqa_group: c_int,
         q_scale: f32,
+        run_flag: *const c_void,
     ) -> c_int;
     fn dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
         device_ordinal: usize,
@@ -395,6 +396,7 @@ unsafe extern "C" {
         value_group_size: c_int,
         gqa_group: c_int,
         q_scale: f32,
+        run_flag: *const c_void,
     ) -> c_int;
     fn dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
         device_ordinal: usize,
@@ -2437,6 +2439,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
     q_scale: f32,
     score_scratch: &mut GpuBuffer,
     output_bf16: &mut GpuBuffer,
+    run_flag: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     if query_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -2456,9 +2459,12 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
         || value_zero.dtype() != ScalarType::F16
         || score_scratch.dtype() != ScalarType::F32
         || output_bf16.dtype() != ScalarType::BF16
+        || run_flag
+            .map(|flag| flag.dtype() != ScalarType::U32 || flag.shape().is_empty())
+            .unwrap_or(false)
     {
         return Err(GpuError::InvalidArg(format!(
-            "certified KV mixed-key dtypes must be BF16/U8/F32/F32/BF16/U32/BF16/U32/U8/F16/F16/F32/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            "certified KV mixed-key dtypes must be BF16/U8/F32/F32/BF16/U32/BF16/U32/U8/F16/F16/F32/BF16 plus optional U32 flag, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
             query_bf16.dtype(),
             key_int8.dtype(),
             key_scale.dtype(),
@@ -2668,6 +2674,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
             value_group_size as c_int,
             gqa_group as c_int,
             q_scale,
+            run_flag.map_or(std::ptr::null(), GpuBuffer::as_ptr),
         );
         if status != 0 {
             return Err(certified_kv_error(
@@ -2703,6 +2710,7 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
     score_scratch: &mut GpuBuffer,
     softmax_stats: &mut GpuBuffer,
     output_bf16: &mut GpuBuffer,
+    run_flag: Option<&GpuBuffer>,
 ) -> Result<(), GpuError> {
     if query_bf16.backend() != Backend::Cuda {
         return Err(GpuError::InvalidArg(
@@ -2719,6 +2727,9 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
         || score_scratch.dtype() != ScalarType::F32
         || softmax_stats.dtype() != ScalarType::F32
         || output_bf16.dtype() != ScalarType::BF16
+        || run_flag
+            .map(|flag| flag.dtype() != ScalarType::U32 || flag.shape().is_empty())
+            .unwrap_or(false)
     {
         return Err(GpuError::InvalidArg(
             "certified KV all-promoted attention dtype mismatch".into(),
@@ -2882,6 +2893,7 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
             value_group_size as c_int,
             gqa_group as c_int,
             q_scale,
+            run_flag.map_or(std::ptr::null(), GpuBuffer::as_ptr),
         );
         if status != 0 {
             return Err(certified_kv_error(
