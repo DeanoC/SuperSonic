@@ -874,6 +874,7 @@ struct ComponentFullAttentionScratch {
     gated: GpuBuffer,
     proj_out: GpuBuffer,
     certified_score_scratch: Option<GpuBuffer>,
+    certified_softmax_stats: Option<GpuBuffer>,
     certified_block_max: Option<GpuBuffer>,
     certified_block_sum: Option<GpuBuffer>,
     certified_promote_index: Option<GpuBuffer>,
@@ -939,6 +940,7 @@ impl ComponentFullAttentionScratch {
             proj_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, config.hidden_size])
                 .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
             certified_score_scratch: None,
+            certified_softmax_stats: None,
             certified_block_max: None,
             certified_block_sum: None,
             certified_promote_index: None,
@@ -5116,6 +5118,20 @@ impl DecodeEngine {
                         )?,
                     );
                 }
+                let softmax_stats_shape = [num_q_heads, 2];
+                if scratch
+                    .certified_softmax_stats
+                    .as_ref()
+                    .map(|buf| buf.shape() != softmax_stats_shape)
+                    .unwrap_or(true)
+                {
+                    scratch.certified_softmax_stats = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &softmax_stats_shape)
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV softmax stats alloc: {e}")
+                            })?,
+                    );
+                }
                 let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
                 if bf16_values {
                     let full_value_gpu_ref = full_value_gpu_ref.ok_or_else(|| {
@@ -6252,34 +6268,62 @@ impl DecodeEngine {
                             })?;
                         }
                         let attend_start = Instant::now();
-                        kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
-                            self.ordinal,
-                            attn_q,
-                            key_i8,
-                            key_scale,
-                            key_zero,
-                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                            scratch.certified_promote_index.as_ref().unwrap(),
-                            scratch.certified_promoted_value_bf16.as_ref().unwrap(),
-                            scratch.certified_value_promote_index.as_ref().unwrap(),
-                            ls.certified_kv_value_i4.as_ref().unwrap(),
-                            ls.certified_kv_value_scale.as_ref().unwrap(),
-                            ls.certified_kv_value_zero.as_ref().unwrap(),
-                            tail_key_kernel_ref,
-                            tail_value_kernel_ref,
-                            kv_len,
-                            block_size,
-                            value_group_size,
-                            num_q_heads / num_kv_heads,
-                            q_scale,
-                            score_scratch,
-                            attn_out_bf16,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "layer {idx} certified KV mixed-key INT4 attention: {e}"
+                        if key_budget_covers_all_blocks && ranking_fallback_qheads.is_empty() {
+                            kernel_ffi::certified_kv::attend_all_promoted_int4_with_bf16_tail(
+                                self.ordinal,
+                                attn_q,
+                                scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                                scratch.certified_promoted_value_bf16.as_ref().unwrap(),
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                ls.certified_kv_value_i4.as_ref().unwrap(),
+                                ls.certified_kv_value_scale.as_ref().unwrap(),
+                                ls.certified_kv_value_zero.as_ref().unwrap(),
+                                tail_key_kernel_ref,
+                                tail_value_kernel_ref,
+                                kv_len,
+                                block_size,
+                                value_group_size,
+                                num_q_heads / num_kv_heads,
+                                q_scale,
+                                score_scratch,
+                                scratch.certified_softmax_stats.as_mut().unwrap(),
+                                attn_out_bf16,
                             )
-                        })?;
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV all-promoted INT4 attention: {e}"
+                                )
+                            })?;
+                        } else {
+                            kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                                self.ordinal,
+                                attn_q,
+                                key_i8,
+                                key_scale,
+                                key_zero,
+                                scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                scratch.certified_promoted_value_bf16.as_ref().unwrap(),
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                ls.certified_kv_value_i4.as_ref().unwrap(),
+                                ls.certified_kv_value_scale.as_ref().unwrap(),
+                                ls.certified_kv_value_zero.as_ref().unwrap(),
+                                tail_key_kernel_ref,
+                                tail_value_kernel_ref,
+                                kv_len,
+                                block_size,
+                                value_group_size,
+                                num_q_heads / num_kv_heads,
+                                q_scale,
+                                score_scratch,
+                                attn_out_bf16,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV mixed-key INT4 attention: {e}"
+                                )
+                            })?;
+                        }
                         if !ranking_fallback_qheads.is_empty() {
                             let fallback_count = ranking_fallback_qheads.len();
                             let fallback_kv_count = ranking_fallback_kv_heads.len();
