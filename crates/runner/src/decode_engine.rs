@@ -5625,10 +5625,15 @@ impl DecodeEngine {
                     let key_scale_stride_blocks = key_scale.shape()[1];
                     let value_error_stride_blocks =
                         ls.certified_kv_value_error.as_ref().unwrap().shape()[1];
-                    // The all-promoted shortcut is only exact when the configured top-K
-                    // budget covers the whole cache before scoring. Rung 1 is conditional
-                    // on the certified tail bound, so it cannot be used to skip Phase 1.
-                    let key_budget_covers_all_blocks = cfg.k_max >= num_blocks;
+                    // If the configured key budget, including the Rung-1 expansion cap,
+                    // can cover the whole cache, conservatively promote every block.
+                    // This is paper-exact: the INT8 tail is empty, so E_key=0 and the
+                    // ranking check is vacuous. It uses the BF16 scratch/cache path but
+                    // does not make Tier-2 BF16 KV resident outside fallback scratch.
+                    let expanded_key_budget = cfg
+                        .k_max
+                        .saturating_mul(cfg.rung1_multiplier.ceil().max(1.0) as usize);
+                    let key_budget_covers_all_blocks = expanded_key_budget >= num_blocks;
                     let use_device_selector =
                         !key_budget_covers_all_blocks && cfg.ranking_r <= 1 && num_blocks <= 2048;
                     let mut block_max_host = Vec::new();
