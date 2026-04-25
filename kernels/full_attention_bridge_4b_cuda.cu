@@ -4762,6 +4762,53 @@ extern "C" int dotcache_qwen35_4b_hip_standalone_matvec(
     }
 }
 
+extern "C" int dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+    size_t device_ordinal,
+    size_t in_dim,
+    size_t out_dim,
+    const void* input,
+    const void* weight,
+    void* output) {
+    if (input == nullptr || weight == nullptr || output == nullptr || in_dim == 0 || out_dim == 0) {
+        return 236;
+    }
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    cublasHandle_t handle = g_cublas_handle_cache.get(static_cast<int>(device_ordinal));
+    if (handle == nullptr) {
+        return 237;
+    }
+    if (cublasSetStream(handle, 0) != CUBLAS_STATUS_SUCCESS) {
+        return 238;
+    }
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        static_cast<int>(out_dim),
+        1,
+        static_cast<int>(in_dim),
+        &alpha,
+        weight,
+        CUDA_R_16BF,
+        static_cast<int>(in_dim),
+        input,
+        CUDA_R_16BF,
+        static_cast<int>(in_dim),
+        &beta,
+        output,
+        CUDA_R_16BF,
+        static_cast<int>(out_dim),
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        return 239;
+    }
+    return 0;
+}
+
 template <typename T, bool SINGLE_STREAM_BF16_SPECIALIZED = false>
 int persistent_decode_device(
     int device_ordinal,

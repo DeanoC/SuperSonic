@@ -216,6 +216,15 @@ unsafe extern "C" {
         block_best_idxs: *mut c_void,
         out_index: *mut c_void,
     ) -> c_int;
+
+    fn dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+        device_ordinal: usize,
+        in_dim: usize,
+        out_dim: usize,
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
+    ) -> c_int;
 }
 
 fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
@@ -1129,6 +1138,72 @@ pub fn standalone_matvec_4b(
         ));
     }
     Ok(())
+}
+
+pub fn cuda_lm_head_bf16_gemm_4b(
+    ordinal: usize,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Cuda
+        || input.backend() != Backend::Cuda
+        || weight.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_bf16_gemm_4b requires CUDA buffers".into(),
+        ));
+    }
+    if output.dtype() != ScalarType::BF16
+        || input.dtype() != ScalarType::BF16
+        || weight.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b requires BF16 output/input/weight, got {:?}/{:?}/{:?}",
+            output.dtype(),
+            input.dtype(),
+            weight.dtype()
+        )));
+    }
+    if input.elem_count() < in_dim || output.elem_count() < out_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b buffer too small: input elems={} output elems={} in_dim={in_dim} out_dim={out_dim}",
+            input.elem_count(),
+            output.elem_count()
+        )));
+    }
+    if weight.elem_count() < in_dim * out_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b weight elems={} smaller than {out_dim}x{in_dim}",
+            weight.elem_count()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+            ordinal,
+            in_dim,
+            out_dim,
+            input.as_ptr(),
+            weight.as_ptr(),
+            output.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(backend_error(
+                Backend::Cuda,
+                "cuda_lm_head_bf16_gemm_4b",
+                status,
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, output, input, weight, in_dim, out_dim);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
 }
 
 /// 4B RMSNorm over multiple contiguous rows.

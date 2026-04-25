@@ -3726,17 +3726,31 @@ impl DecodeEngine {
         }
 
         let lm_head_start = Instant::now();
-        kernel_ffi::standalone_matvec_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            &mut self.logits_buf,
-            &self.normed_buf,
-            &*self.weights.lm_head,
-            hidden_dim,
-            vocab_size,
-            &mut self.matvec_counter,
-        )
-        .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+        if self.logits_buf.backend() == gpu_hal::Backend::Cuda
+            && std::env::var_os("SUPERSONIC_LLAMA31_DISABLE_CUBLAS_LM_HEAD").is_none()
+        {
+            kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                self.ordinal,
+                &mut self.logits_buf,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                hidden_dim,
+                vocab_size,
+            )
+            .map_err(|e| anyhow::anyhow!("cuBLAS lm_head matvec 4b: {e}"))?;
+        } else {
+            kernel_ffi::standalone_matvec_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                &mut self.logits_buf,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                hidden_dim,
+                vocab_size,
+                &mut self.matvec_counter,
+            )
+            .map_err(|e| anyhow::anyhow!("lm_head matvec: {e}"))?;
+        }
         self.sync_stage_if_requested(collect_timings, "lm_head matvec 4b")?;
         if let Some(t) = timings.as_mut() {
             t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
