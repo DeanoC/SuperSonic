@@ -8893,91 +8893,131 @@ impl DecodeEngine {
             .map(Ok)
             .unwrap_or_else(|| ComponentMlpScratch::alloc(config, self.ordinal))?;
         let lw = &self.weights.layers[idx];
-        let gate_up_mixed_lhs =
-            if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
-                prefill_engine::prepare_int8_mixed_lhs(
+        let use_cublas_mlp = self.normed_buf.backend() == gpu_hal::Backend::Cuda
+            && std::env::var_os("SUPERSONIC_LLAMA31_DISABLE_CUBLAS_MLP").is_none()
+            && lw.gate_proj_scale.is_none()
+            && lw.gate_proj_int8_scale.is_none()
+            && lw.gate_proj_int4_scale.is_none()
+            && lw.up_proj_scale.is_none()
+            && lw.up_proj_int8_scale.is_none()
+            && lw.up_proj_int4_scale.is_none()
+            && lw.down_proj_scale.is_none()
+            && lw.down_proj_int8_scale.is_none()
+            && lw.down_proj_int4_scale.is_none();
+        let gate_up_mixed_lhs = if !use_cublas_mlp
+            && (lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some())
+        {
+            prefill_engine::prepare_int8_mixed_lhs(
+                self.ordinal,
+                1,
+                1,
+                hidden_dim,
+                &self.normed_buf,
+                &self.weights,
+            )?
+        } else {
+            None
+        };
+
+        if use_cublas_mlp {
+            kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                self.ordinal,
+                &mut scratch.gate,
+                &self.normed_buf,
+                &lw.gate_proj_w,
+                hidden_dim,
+                intermediate,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS MLP gate_proj: {e}"))?;
+            kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                self.ordinal,
+                &mut scratch.up,
+                &self.normed_buf,
+                &lw.up_proj_w,
+                hidden_dim,
+                intermediate,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS MLP up_proj: {e}"))?;
+        } else {
+            if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
+                prefill_engine::matmul_int8_mixed_prepared_host(
                     self.ordinal,
                     1,
                     1,
+                    intermediate,
                     hidden_dim,
                     &self.normed_buf,
                     &self.weights,
-                )?
+                    &format!(
+                        "{}.layers.{idx}.mlp.gate_proj.weight",
+                        self.weights.weight_prefix
+                    ),
+                    &lw.gate_proj_w,
+                    sc,
+                    &mut scratch.gate,
+                    gate_up_mixed_lhs.as_ref(),
+                )?;
             } else {
-                None
-            };
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    intermediate,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &lw.gate_proj_w,
+                    lw.gate_proj_scale.as_ref(),
+                    lw.gate_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    &mut scratch.gate,
+                    lw.gate_proj_int4_scale.as_ref(),
+                    lw.gate_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+            }
 
-        if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
-            prefill_engine::matmul_int8_mixed_prepared_host(
-                self.ordinal,
-                1,
-                1,
-                intermediate,
-                hidden_dim,
-                &self.normed_buf,
-                &self.weights,
-                &format!(
-                    "{}.layers.{idx}.mlp.gate_proj.weight",
-                    self.weights.weight_prefix
-                ),
-                &lw.gate_proj_w,
-                sc,
-                &mut scratch.gate,
-                gate_up_mixed_lhs.as_ref(),
-            )?;
-        } else {
-            matmul_proj(
-                self.ordinal,
-                1,
-                1,
-                intermediate,
-                hidden_dim,
-                &self.normed_buf,
-                &lw.gate_proj_w,
-                lw.gate_proj_scale.as_ref(),
-                lw.gate_proj_int8_scale.as_ref(),
-                self.weights.fp8_block_size,
-                &mut scratch.gate,
-                lw.gate_proj_int4_scale.as_ref(),
-                lw.gate_proj_int4_zero.as_ref(),
-                self.weights.int4_group_size,
-            )?;
-        }
-        if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
-            prefill_engine::matmul_int8_mixed_prepared_host(
-                self.ordinal,
-                1,
-                1,
-                intermediate,
-                hidden_dim,
-                &self.normed_buf,
-                &self.weights,
-                &format!(
-                    "{}.layers.{idx}.mlp.up_proj.weight",
-                    self.weights.weight_prefix
-                ),
-                &lw.up_proj_w,
-                sc,
-                &mut scratch.up,
-                gate_up_mixed_lhs.as_ref(),
-            )?;
-        } else {
-            matmul_proj(
-                self.ordinal,
-                1,
-                1,
-                intermediate,
-                hidden_dim,
-                &self.normed_buf,
-                &lw.up_proj_w,
-                lw.up_proj_scale.as_ref(),
-                lw.up_proj_int8_scale.as_ref(),
-                self.weights.fp8_block_size,
-                &mut scratch.up,
-                lw.up_proj_int4_scale.as_ref(),
-                lw.up_proj_int4_zero.as_ref(),
-                self.weights.int4_group_size,
-            )?;
+            if lw.gate_proj_int8_scale.is_some() || lw.up_proj_int8_scale.is_some() {
+                let _ = gate_up_mixed_lhs.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("layer {idx} missing prepared INT8 mixed lhs")
+                })?;
+            }
+
+            if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
+                prefill_engine::matmul_int8_mixed_prepared_host(
+                    self.ordinal,
+                    1,
+                    1,
+                    intermediate,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &self.weights,
+                    &format!(
+                        "{}.layers.{idx}.mlp.up_proj.weight",
+                        self.weights.weight_prefix
+                    ),
+                    &lw.up_proj_w,
+                    sc,
+                    &mut scratch.up,
+                    gate_up_mixed_lhs.as_ref(),
+                )?;
+            } else {
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    intermediate,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &lw.up_proj_w,
+                    lw.up_proj_scale.as_ref(),
+                    lw.up_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    &mut scratch.up,
+                    lw.up_proj_int4_scale.as_ref(),
+                    lw.up_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+            }
         }
         kernel_ffi::prefill_ffi::swiglu_mul(
             self.ordinal,
@@ -8988,7 +9028,17 @@ impl DecodeEngine {
             &mut scratch.mlp,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} swiglu: {e}"))?;
-        if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
+        if use_cublas_mlp {
+            kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                self.ordinal,
+                &mut scratch.down,
+                &scratch.mlp,
+                &lw.down_proj_w,
+                intermediate,
+                hidden_dim,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS MLP down_proj: {e}"))?;
+        } else if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
             prefill_engine::matmul_int8_mixed_host(
                 self.ordinal,
                 1,
