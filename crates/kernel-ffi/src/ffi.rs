@@ -198,6 +198,14 @@ unsafe extern "C" {
         out_nll: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+        device_ordinal: usize,
+        vocab_size: usize,
+        logits: *const c_void,
+        target: u32,
+        out_sum: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_cuda_lm_head_argmax_bf16(
         device_ordinal: usize,
         hidden_dim: usize,
@@ -826,6 +834,57 @@ pub fn cuda_target_nll_bf16(
     #[cfg(not(supersonic_backend_cuda))]
     {
         let _ = (ordinal, logits, targets, out_nll, rows, vocab_size);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn cuda_accumulate_target_nll_bf16(
+    ordinal: usize,
+    logits: &GpuBuffer,
+    target: u32,
+    out_sum: &mut GpuBuffer,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Cuda || out_sum.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "cuda_accumulate_target_nll_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_accumulate_target_nll_bf16 requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if out_sum.dtype() != ScalarType::F32 || out_sum.elem_count() < 1 {
+        return Err(GpuError::InvalidArg(
+            "cuda_accumulate_target_nll_bf16 requires F32[1] output sum".into(),
+        ));
+    }
+    if target as usize >= vocab_size {
+        return Err(GpuError::InvalidArg(format!(
+            "target token {target} outside vocab size {vocab_size}"
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+            ordinal,
+            vocab_size,
+            logits.as_ptr(),
+            target,
+            out_sum.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_accumulate_target_nll_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, logits, target, out_sum, vocab_size);
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
 }

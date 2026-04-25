@@ -457,6 +457,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "0.05", hide = true)]
     certified_kv_v_tol: f32,
 
+    /// Promoted BF16 value blocks cached per layer/KV head (0 disables cache).
+    #[arg(long, default_value = "128", hide = true)]
+    certified_kv_value_cache_blocks: usize,
+
     /// Certified KV ranking-consistency depth.
     #[arg(long, default_value = "1", hide = true)]
     certified_kv_ranking_r: usize,

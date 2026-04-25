@@ -159,6 +159,7 @@ def run_supersonic(
     timeout: int,
     dense_prefix_len: int | None = None,
     emit_stage_timings: bool = False,
+    certified_extra_args: list[str] | None = None,
 ) -> dict[str, Any]:
     with tempfile.NamedTemporaryFile(prefix="certified-kv-pg19-", suffix=".jsonl") as telemetry:
         cmd = [
@@ -181,6 +182,8 @@ def run_supersonic(
         ]
         if config == "certified":
             cmd.extend(["--certified-kv", "--certified-kv-telemetry", telemetry.name])
+            if certified_extra_args:
+                cmd.extend(certified_extra_args)
             if dense_prefix_len is not None and dense_prefix_len > 0:
                 cmd.extend(["--teacher-forced-dense-prefix-len", str(dense_prefix_len)])
         if emit_stage_timings:
@@ -266,6 +269,12 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--emit-stage-timings", action="store_true")
     parser.add_argument(
+        "--certified-extra-arg",
+        action="append",
+        default=[],
+        help="Additional argument forwarded only to certified SuperSonic runs; repeat for values.",
+    )
+    parser.add_argument(
         "--reference-dir",
         type=Path,
         default=Path("/workspace/DotCache/benchmarks/results/arxiv_v1_20260420"),
@@ -315,6 +324,7 @@ def main() -> int:
                     args.timeout,
                     dense_prefix_len=dense_prefix_len,
                     emit_stage_timings=args.emit_stage_timings,
+                    certified_extra_args=args.certified_extra_arg,
                 )
                 result.update({"chunk_idx": idx, "context_length": ctx, "config": config})
                 per_chunk.append(result)

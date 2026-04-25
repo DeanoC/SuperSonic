@@ -29,6 +29,7 @@ fn certified_kv_decode_params(
         k_min: cfg.k_min,
         k_max: cfg.k_max,
         v_tol: cfg.v_tol,
+        value_cache_blocks: cfg.value_cache_blocks,
         ranking_r: cfg.ranking_r,
         rung1_threshold: cfg.rung1_threshold,
         rung1_multiplier: cfg.rung1_multiplier,
@@ -547,48 +548,107 @@ fn run_llama31_teacher_forced(
     let mut decode_steps = 0usize;
     let mut certified_decode_steps = 0usize;
     let mut stage_totals = DecodeStageTimings::default();
+    let use_decode_target_nll =
+        *model_variant == ModelVariant::Llama3_1_8B && !cli.teacher_forced_decode_step;
 
-    for target_idx in decode_loop_start..prompt_ids.len() {
-        let score_token =
-            dense_prefix_len == 0 || target_idx < dense_prefix_len || target_idx > dense_prefix_len;
-        if score_token {
-            total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
-            scored_tokens += 1;
-        } else {
-            skipped_boundary_tokens += 1;
+    let should_score = |target_idx: usize| {
+        dense_prefix_len == 0 || target_idx < dense_prefix_len || target_idx > dense_prefix_len
+    };
+
+    if use_decode_target_nll {
+        engine.reset_target_nll_accum()?;
+        if decode_loop_start < prompt_ids.len() {
+            if should_score(decode_loop_start) {
+                total_nll += target_nll_from_logits(&logits, prompt_ids[decode_loop_start])?;
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
         }
-        if target_idx + 1 < prompt_ids.len() {
-            let input_token = prompt_ids[target_idx];
-            let pos = target_idx;
+        for input_idx in decode_loop_start..prompt_ids.len().saturating_sub(1) {
+            let input_token = prompt_ids[input_idx];
+            let pos = input_idx;
+            let target_idx = input_idx + 1;
+            let target_token = prompt_ids[target_idx];
             let use_certified_decode =
                 certified_kv_cfg.is_some() && (dense_prefix_len == 0 || pos >= dense_prefix_len);
-            logits = if use_certified_decode {
-                let cfg = certified_kv_cfg.expect("checked above");
+            let certified_params =
+                use_certified_decode.then(|| certified_kv_decode_params(certified_kv_cfg.unwrap()));
+            if use_certified_decode {
                 certified_decode_steps += 1;
-                if cli.emit_stage_timings {
-                    let (next_logits, timings) = engine
-                        .component_decode_step_4b_certified_kv_with_timings(
+            }
+            let timings = if should_score(target_idx) {
+                engine.component_decode_step_4b_accumulate_target_nll(
+                    input_token,
+                    pos,
+                    target_token,
+                    certified_params,
+                    cli.emit_stage_timings,
+                )?
+            } else {
+                let (_nll, timings) = engine.component_decode_step_4b_target_nll(
+                    input_token,
+                    pos,
+                    target_token,
+                    certified_params,
+                    cli.emit_stage_timings,
+                )?;
+                timings
+            };
+            if cli.emit_stage_timings {
+                stage_totals.add_assign(timings);
+            }
+            if should_score(target_idx) {
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
+            decode_steps += 1;
+        }
+        total_nll += engine.read_target_nll_accum()? as f64;
+    } else {
+        for target_idx in decode_loop_start..prompt_ids.len() {
+            let score_token = should_score(target_idx);
+            if score_token {
+                total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
+            if target_idx + 1 < prompt_ids.len() {
+                let input_token = prompt_ids[target_idx];
+                let pos = target_idx;
+                let use_certified_decode = certified_kv_cfg.is_some()
+                    && (dense_prefix_len == 0 || pos >= dense_prefix_len);
+                logits = if use_certified_decode {
+                    let cfg = certified_kv_cfg.expect("checked above");
+                    certified_decode_steps += 1;
+                    if cli.emit_stage_timings {
+                        let (next_logits, timings) = engine
+                            .component_decode_step_4b_certified_kv_with_timings(
+                                input_token,
+                                pos,
+                                certified_kv_decode_params(cfg),
+                            )?;
+                        stage_totals.add_assign(timings);
+                        next_logits
+                    } else {
+                        engine.component_decode_step_4b_certified_kv(
                             input_token,
                             pos,
                             certified_kv_decode_params(cfg),
-                        )?;
+                        )?
+                    }
+                } else if cli.emit_stage_timings {
+                    let (next_logits, timings) =
+                        engine.decode_step_with_timings(input_token, pos)?;
                     stage_totals.add_assign(timings);
                     next_logits
                 } else {
-                    engine.component_decode_step_4b_certified_kv(
-                        input_token,
-                        pos,
-                        certified_kv_decode_params(cfg),
-                    )?
-                }
-            } else if cli.emit_stage_timings {
-                let (next_logits, timings) = engine.decode_step_with_timings(input_token, pos)?;
-                stage_totals.add_assign(timings);
-                next_logits
-            } else {
-                engine.decode_step(input_token, pos)?
-            };
-            decode_steps += 1;
+                    engine.decode_step(input_token, pos)?
+                };
+                decode_steps += 1;
+            }
         }
     }
     if scored_tokens == 0 {
@@ -666,6 +726,48 @@ fn run_llama31_teacher_forced(
                 "prefill_ms": prefill_ms,
                 "total_ms": total_ms,
                 "ms_per_token": ms_per_token,
+                "stage_total_ms": stage_totals.total_ms(),
+                "stage_persistent_ms": stage_totals.persistent_ms,
+                "stage_persistent_full_attn_ms": stage_totals.persistent_full_attn_ms,
+                "stage_persistent_full_attn_proj_ms": stage_totals.persistent_full_attn_proj_ms,
+                "stage_persistent_full_attn_core_ms": stage_totals.persistent_full_attn_core_ms,
+                "stage_persistent_full_attn_out_ms": stage_totals.persistent_full_attn_out_ms,
+                "stage_persistent_linear_core_ms": stage_totals.persistent_linear_core_ms,
+                "stage_persistent_mlp_down_ms": stage_totals.persistent_mlp_down_ms,
+                "stage_rms_norm_ms": stage_totals.rms_norm_ms,
+                "stage_lm_head_ms": stage_totals.lm_head_ms,
+                "stage_logits_d2h_ms": stage_totals.logits_d2h_ms,
+                "stage_host_sampling_ms": stage_totals.host_sampling_ms,
+                "certified_kv_key_quantize_ms": stage_totals.certified_kv_key_quantize_ms,
+                "certified_kv_value_quantize_ms": stage_totals.certified_kv_value_quantize_ms,
+                "certified_kv_score_ms": stage_totals.certified_kv_score_ms,
+                "certified_kv_selector_ms": stage_totals.certified_kv_selector_ms,
+                "certified_kv_gather_ms": stage_totals.certified_kv_gather_ms,
+                "certified_kv_score_consistency_ms": stage_totals.certified_kv_score_consistency_ms,
+                "certified_kv_rank_log_ms": stage_totals.certified_kv_rank_log_ms,
+                "certified_kv_ranking_cpu_ms": stage_totals.certified_kv_ranking_cpu_ms,
+                "certified_kv_attend_ms": stage_totals.certified_kv_attend_ms,
+                "certified_kv_cast_ms": stage_totals.certified_kv_cast_ms,
+                "certified_kv_value_escalation_heads": stage_totals.certified_kv_value_escalation_heads,
+                "certified_kv_ranking_fallback_heads": stage_totals.certified_kv_ranking_fallback_heads,
+                "certified_kv_dense_fallback_layers": stage_totals.certified_kv_dense_fallback_layers,
+                "certified_kv_promoted_key_h2d_bytes": stage_totals.certified_kv_promoted_key_h2d_bytes,
+                "certified_kv_promoted_value_h2d_bytes": stage_totals.certified_kv_promoted_value_h2d_bytes,
+                "certified_kv_promoted_value_cache_hits": stage_totals.certified_kv_promoted_value_cache_hits,
+                "certified_kv_promoted_value_cache_misses": stage_totals.certified_kv_promoted_value_cache_misses,
+                "certified_kv_promoted_value_cache_overflows": stage_totals.certified_kv_promoted_value_cache_overflows,
+                "certified_kv_ranking_prefix_cache_hits": stage_totals.certified_kv_ranking_prefix_cache_hits,
+                "certified_kv_ranking_prefix_cache_misses": stage_totals.certified_kv_ranking_prefix_cache_misses,
+                "certified_kv_ranking_prefix_h2d_bytes": stage_totals.certified_kv_ranking_prefix_h2d_bytes,
+                "certified_kv_ranking_prefix_reuse_bytes": stage_totals.certified_kv_ranking_prefix_reuse_bytes,
+                "certified_kv_e_key_max": stage_totals.certified_kv_e_key_max,
+                "certified_kv_e_val_max": stage_totals.certified_kv_e_val_max,
+                "certified_kv_bound_total_max": stage_totals.certified_kv_bound_total_max,
+                "certified_kv_delta_tail_max": stage_totals.certified_kv_delta_tail_max,
+                "certified_kv_vmax_max": stage_totals.certified_kv_vmax_max,
+                "certified_kv_true_tail_bound_max": stage_totals.certified_kv_true_tail_bound_max,
+                "certified_kv_uncertified_tail_heads": stage_totals.certified_kv_uncertified_tail_heads,
+                "certified_kv_score_consistency_violations": stage_totals.certified_kv_score_consistency_violations,
                 "memory_full_attention_layers": memory_stats.full_attention_layers,
                 "memory_tier1_compressed_vram_bytes": memory_stats.tier1_compressed_vram_bytes,
                 "memory_tier2_host_pinned_bytes": memory_stats.tier2_host_pinned_bytes,
@@ -680,6 +782,7 @@ fn run_llama31_teacher_forced(
                 "k_min": cfg.k_min,
                 "k_max": cfg.k_max,
                 "v_tol": cfg.v_tol,
+                "value_cache_blocks": cfg.value_cache_blocks,
                 "ranking_r": cfg.ranking_r,
                 "rung1_threshold": cfg.rung1_threshold,
                 "rung1_multiplier": cfg.rung1_multiplier,
@@ -1529,6 +1632,9 @@ pub fn run_llama31(
                 "dense_fallback_layers": stage_totals.certified_kv_dense_fallback_layers,
                 "promoted_key_h2d_bytes": stage_totals.certified_kv_promoted_key_h2d_bytes,
                 "promoted_value_h2d_bytes": stage_totals.certified_kv_promoted_value_h2d_bytes,
+                "promoted_value_cache_hits": stage_totals.certified_kv_promoted_value_cache_hits,
+                "promoted_value_cache_misses": stage_totals.certified_kv_promoted_value_cache_misses,
+                "promoted_value_cache_overflows": stage_totals.certified_kv_promoted_value_cache_overflows,
                 "ranking_prefix_cache_hits": stage_totals.certified_kv_ranking_prefix_cache_hits,
                 "ranking_prefix_cache_misses": stage_totals.certified_kv_ranking_prefix_cache_misses,
                 "ranking_prefix_cache_hit_rate": ranking_prefix_cache_hit_rate,
@@ -1560,6 +1666,7 @@ pub fn run_llama31(
                 "k_min": cfg.k_min,
                 "k_max": cfg.k_max,
                 "v_tol": cfg.v_tol,
+                "value_cache_blocks": cfg.value_cache_blocks,
                 "ranking_r": cfg.ranking_r,
                 "rung1_threshold": cfg.rung1_threshold,
                 "rung1_multiplier": cfg.rung1_multiplier,

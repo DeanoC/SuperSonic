@@ -96,12 +96,21 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_key_scale_norms(
+        device_ordinal: usize,
+        key_scale: *const c_void,
+        key_scale_norm: *mut c_void,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        key_scale_stride_blocks: c_int,
+        head_dim: c_int,
+    ) -> c_int;
 
     fn dotcache_llama31_certified_kv_score_consistency(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
-        key_scale: *const c_void,
+        key_scale_norm: *const c_void,
         key_zero: *const c_void,
         promoted_key_bf16: *const c_void,
         promote_index: *const c_void,
@@ -111,7 +120,7 @@ unsafe extern "C" {
         num_blocks: c_int,
         block_size: c_int,
         key_stride_tokens: c_int,
-        key_scale_stride_blocks: c_int,
+        key_scale_norm_stride_blocks: c_int,
         max_promoted_blocks: c_int,
         head_dim: c_int,
         gqa_group: c_int,
@@ -163,6 +172,53 @@ unsafe extern "C" {
         max_promoted_blocks: c_int,
         head_dim: c_int,
         q_scale: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_select_blocks(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        key_scale: *const c_void,
+        block_max: *const c_void,
+        block_sum: *const c_void,
+        value_norm: *const c_void,
+        promote_index: *mut c_void,
+        value_promote_index: *mut c_void,
+        selected_blocks: *mut c_void,
+        selected_counts: *mut c_void,
+        fallback_flags: *mut c_void,
+        delta_blocks: *mut c_void,
+        e_key_by_head: *mut c_void,
+        delta_tail_by_head: *mut c_void,
+        vmax_by_head: *mut c_void,
+        true_tail_by_head: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        key_scale_stride_blocks: c_int,
+        value_norm_stride_blocks: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
+        k_min: c_int,
+        k_max: c_int,
+        max_promoted_blocks: c_int,
+        q_scale: f32,
+        tau_cov: f32,
+        rung1_threshold: f32,
+        rung1_multiplier: f32,
+        delta_guard_factor: f32,
+        score_exploration_rate: f32,
+        require_certified_tail_bound: c_int,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_ranking_flags(
+        device_ordinal: usize,
+        block_max: *const c_void,
+        block_sum: *const c_void,
+        delta_blocks: *const c_void,
+        selected_fp16_log_masses: *const c_void,
+        promote_index: *const c_void,
+        fallback_flags: *mut c_void,
+        q_heads: c_int,
+        num_blocks: c_int,
+        max_promoted_blocks: c_int,
     ) -> c_int;
 
     fn dotcache_llama31_certified_kv_attend_int8_int4(
@@ -340,6 +396,83 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        promoted_key_bf16: *const c_void,
+        tail_key_bf16: *const c_void,
+        score_scratch: *mut c_void,
+        softmax_stats: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        tail_len: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
+        score_stride_tokens: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
+        q_scale: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_apply_all_promoted_values_from_probs(
+        device_ordinal: usize,
+        score_scratch: *const c_void,
+        promoted_value_bf16: *const c_void,
+        value_promote_index: *const c_void,
+        value_int4: *const c_void,
+        value_scale: *const c_void,
+        value_zero: *const c_void,
+        tail_value_bf16: *const c_void,
+        output_bf16: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        tail_len: c_int,
+        max_promoted_value_blocks: c_int,
+        value_stride_tokens: c_int,
+        tail_value_start_tokens: c_int,
+        tail_value_stride_tokens: c_int,
+        score_stride_tokens: c_int,
+        head_dim: c_int,
+        value_group_size: c_int,
+        gqa_group: c_int,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_block_masses_from_probs(
+        device_ordinal: usize,
+        score_scratch: *const c_void,
+        block_mass: *mut c_void,
+        q_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        score_stride_tokens: c_int,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_value_promotions_from_block_masses(
+        device_ordinal: usize,
+        block_mass: *const c_void,
+        value_error: *const c_void,
+        ranking_fallback_head_flags: *const c_void,
+        value_promote_index: *mut c_void,
+        kv_counters: *mut c_void,
+        any_promoted: *mut c_void,
+        head_promoted_flags: *mut c_void,
+        e_val_by_head: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        value_error_stride_blocks: c_int,
+        gqa_group: c_int,
+        v_tol: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_init_all_promoted_indices(
+        device_ordinal: usize,
+        promote_index: *mut c_void,
+        value_promote_index: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        num_blocks: c_int,
+    ) -> c_int;
     fn dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
@@ -363,6 +496,30 @@ unsafe extern "C" {
         tail_value_stride_tokens: c_int,
         score_stride_tokens: c_int,
         head_dim: c_int,
+        q_scale: f32,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
+        device_ordinal: usize,
+        query_bf16: *const c_void,
+        fallback_flags: *const c_void,
+        fallback_key_bf16: *const c_void,
+        fallback_value_bf16: *const c_void,
+        tail_key_bf16: *const c_void,
+        tail_value_bf16: *const c_void,
+        score_scratch: *mut c_void,
+        output_bf16: *mut c_void,
+        q_heads: c_int,
+        kv_heads: c_int,
+        prefix_tokens: c_int,
+        prefix_stride_tokens: c_int,
+        tail_len: c_int,
+        tail_key_start_tokens: c_int,
+        tail_key_stride_tokens: c_int,
+        tail_value_start_tokens: c_int,
+        tail_value_stride_tokens: c_int,
+        score_stride_tokens: c_int,
+        head_dim: c_int,
+        gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
 
@@ -1167,6 +1324,71 @@ pub fn score_blocks_int8(
         Backend::Hip | Backend::Metal => Err(GpuError::InvalidArg(
             "certified KV INT8 scoring is currently CUDA-only".into(),
         )),
+    }
+}
+
+pub fn key_scale_norms(
+    ordinal: usize,
+    key_scale: &GpuBuffer,
+    key_scale_norm: &mut GpuBuffer,
+    num_blocks: usize,
+) -> Result<(), GpuError> {
+    if key_scale.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV key-scale norm prepass is currently CUDA-only".into(),
+        ));
+    }
+    if key_scale.dtype() != ScalarType::F32 || key_scale_norm.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key-scale norm dtypes must be F32/F32, got {:?}/{:?}",
+            key_scale.dtype(),
+            key_scale_norm.dtype()
+        )));
+    }
+    if key_scale.shape().len() != 3 || key_scale_norm.shape().len() != 2 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key-scale norm shapes must be [kv,b,hd]/[kv,b], got {:?}/{:?}",
+            key_scale.shape(),
+            key_scale_norm.shape()
+        )));
+    }
+    let kv_heads = key_scale.shape()[0];
+    let stride_blocks = key_scale.shape()[1];
+    let head_dim = key_scale.shape()[2];
+    if num_blocks == 0
+        || stride_blocks < num_blocks
+        || key_scale_norm.shape()[0] != kv_heads
+        || key_scale_norm.shape()[1] < num_blocks
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV key-scale norm dimension mismatch: scale={:?} norm={:?} num_blocks={num_blocks}",
+            key_scale.shape(),
+            key_scale_norm.shape()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_key_scale_norms(
+            ordinal,
+            key_scale.as_ptr(),
+            key_scale_norm.as_mut_ptr(),
+            kv_heads as c_int,
+            num_blocks as c_int,
+            stride_blocks as c_int,
+            head_dim as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA key-scale norm prepass failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, key_scale, key_scale_norm, num_blocks);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
 }
 
@@ -2695,6 +2917,344 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn score_all_promoted_bf16_keys(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    promoted_key_bf16: &GpuBuffer,
+    tail_key_bf16: Option<&GpuBuffer>,
+    total_tokens: usize,
+    block_size: usize,
+    gqa_group: usize,
+    q_scale: f32,
+    score_scratch: &mut GpuBuffer,
+    softmax_stats: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV all-promoted score is currently CUDA-only".into(),
+        ));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || promoted_key_bf16.dtype() != ScalarType::BF16
+        || score_scratch.dtype() != ScalarType::F32
+        || softmax_stats.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV all-promoted score dtype mismatch".into(),
+        ));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d && !query_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted score query expects [qh,hd] or [qh,1,hd], got {:?}",
+            query_shape
+        )));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
+    let key_shape = promoted_key_bf16.shape();
+    if key_shape.len() != 4 || key_shape[2] != block_size || key_shape[3] != head_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted score key shape mismatch: {:?}",
+            key_shape
+        )));
+    }
+    let kv_heads = key_shape[0];
+    let num_blocks = key_shape[1];
+    let active_aligned_tokens = num_blocks * block_size;
+    if block_size == 0
+        || block_size > 256
+        || head_dim == 0
+        || head_dim > 128
+        || gqa_group == 0
+        || q_heads != kv_heads * gqa_group
+        || total_tokens < active_aligned_tokens
+        || score_scratch.shape().len() != 2
+        || score_scratch.shape()[0] != q_heads
+        || score_scratch.shape()[1] < total_tokens
+        || softmax_stats.shape() != [q_heads, 2]
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted score shape mismatch query={:?} key={:?} score={:?} stats={:?}",
+            query_bf16.shape(),
+            promoted_key_bf16.shape(),
+            score_scratch.shape(),
+            softmax_stats.shape()
+        )));
+    }
+    let tail_len = total_tokens - active_aligned_tokens;
+    let (tail_key_start, tail_key_stride) = if tail_len == 0 {
+        (0, 0)
+    } else {
+        let tail = tail_key_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "certified KV all-promoted score needs tail key for tail_len={tail_len}"
+            ))
+        })?;
+        let shape = tail.shape();
+        let compact_3d = shape == [kv_heads, tail_len, head_dim];
+        let strided_3d = shape.len() == 3 && shape[0] == kv_heads && shape[2] == head_dim;
+        let strided_4d =
+            shape.len() == 4 && shape[0] == 1 && shape[1] == kv_heads && shape[3] == head_dim;
+        if tail.dtype() != ScalarType::BF16 || (!compact_3d && !strided_3d && !strided_4d) {
+            return Err(GpuError::InvalidArg(format!(
+                "certified KV all-promoted score tail key expects BF16 compact or strided tail, got {:?} {:?}",
+                tail.dtype(),
+                tail.shape()
+            )));
+        }
+        if compact_3d {
+            (0, tail_len)
+        } else {
+            let stride = if shape.len() == 3 { shape[1] } else { shape[2] };
+            if stride < total_tokens {
+                return Err(GpuError::InvalidArg(format!(
+                    "certified KV all-promoted score tail stride={stride} must cover total_tokens={total_tokens}"
+                )));
+            }
+            (active_aligned_tokens, stride)
+        }
+    };
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
+            ordinal,
+            query_bf16.as_ptr(),
+            promoted_key_bf16.as_ptr(),
+            tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+            score_scratch.as_mut_ptr(),
+            softmax_stats.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            tail_len as c_int,
+            tail_key_start as c_int,
+            tail_key_stride as c_int,
+            score_scratch.shape()[1] as c_int,
+            head_dim as c_int,
+            gqa_group as c_int,
+            q_scale,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA all-promoted score failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            query_bf16,
+            promoted_key_bf16,
+            tail_key_bf16,
+            total_tokens,
+            block_size,
+            gqa_group,
+            q_scale,
+            score_scratch,
+            softmax_stats,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn apply_all_promoted_values_from_probs(
+    ordinal: usize,
+    score_scratch: &GpuBuffer,
+    promoted_value_bf16: &GpuBuffer,
+    value_promote_index: &GpuBuffer,
+    value_int4: &GpuBuffer,
+    value_scale: &GpuBuffer,
+    value_zero: &GpuBuffer,
+    tail_value_bf16: Option<&GpuBuffer>,
+    total_tokens: usize,
+    block_size: usize,
+    value_group_size: usize,
+    gqa_group: usize,
+    output_bf16: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if score_scratch.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV all-promoted value apply is currently CUDA-only".into(),
+        ));
+    }
+    if score_scratch.dtype() != ScalarType::F32
+        || promoted_value_bf16.dtype() != ScalarType::BF16
+        || value_promote_index.dtype() != ScalarType::U32
+        || value_int4.dtype() != ScalarType::U8
+        || value_scale.dtype() != ScalarType::F16
+        || value_zero.dtype() != ScalarType::F16
+        || output_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV all-promoted value apply dtype mismatch".into(),
+        ));
+    }
+    let score_shape = score_scratch.shape();
+    if score_shape.len() != 2 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted value score shape mismatch: {:?}",
+            score_shape
+        )));
+    }
+    let q_heads = score_shape[0];
+    let value_index_shape = value_promote_index.shape();
+    if value_index_shape.len() != 2 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted value index shape mismatch: {:?}",
+            value_index_shape
+        )));
+    }
+    let kv_heads = value_index_shape[0];
+    let num_blocks = value_index_shape[1];
+    let promoted_value_shape = promoted_value_bf16.shape();
+    let head_dim = promoted_value_shape.get(3).copied().unwrap_or(0);
+    let max_promoted_value_blocks = promoted_value_shape.get(1).copied().unwrap_or(0);
+    let active_aligned_tokens = num_blocks * block_size;
+    let value_groups = if value_group_size > 0 {
+        head_dim / value_group_size
+    } else {
+        0
+    };
+    let value_stride_tokens = if value_int4.shape().len() == 3 && value_int4.shape()[0] == kv_heads
+    {
+        value_int4.shape()[1]
+    } else {
+        0
+    };
+    let output_shape = output_bf16.shape();
+    let output_is_2d = output_shape == [q_heads, head_dim];
+    let output_is_3d = output_shape == [q_heads, 1, head_dim];
+    if block_size == 0
+        || block_size > 256
+        || head_dim == 0
+        || head_dim > 128
+        || value_group_size == 0
+        || head_dim % value_group_size != 0
+        || gqa_group == 0
+        || q_heads != kv_heads * gqa_group
+        || total_tokens < active_aligned_tokens
+        || score_shape[1] < total_tokens
+        || promoted_value_shape != [kv_heads, max_promoted_value_blocks, block_size, head_dim]
+        || max_promoted_value_blocks == 0
+        || value_int4.shape() != [kv_heads, value_stride_tokens, head_dim / 2]
+        || value_scale.shape() != [kv_heads, value_stride_tokens, value_groups]
+        || value_zero.shape() != [kv_heads, value_stride_tokens, value_groups]
+        || value_stride_tokens < active_aligned_tokens
+        || (!output_is_2d && !output_is_3d)
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted value shape mismatch score={:?} promoted_value={:?} index={:?} value={:?} scale={:?} output={:?}",
+            score_scratch.shape(),
+            promoted_value_bf16.shape(),
+            value_promote_index.shape(),
+            value_int4.shape(),
+            value_scale.shape(),
+            output_bf16.shape()
+        )));
+    }
+    let tail_len = total_tokens - active_aligned_tokens;
+    let (tail_value_start, tail_value_stride) = if tail_len == 0 {
+        (0, 0)
+    } else {
+        let tail = tail_value_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "certified KV all-promoted value apply needs tail value for tail_len={tail_len}"
+            ))
+        })?;
+        let shape = tail.shape();
+        let compact_3d = shape == [kv_heads, tail_len, head_dim];
+        let strided_3d = shape.len() == 3 && shape[0] == kv_heads && shape[2] == head_dim;
+        let strided_4d =
+            shape.len() == 4 && shape[0] == 1 && shape[1] == kv_heads && shape[3] == head_dim;
+        if tail.dtype() != ScalarType::BF16 || (!compact_3d && !strided_3d && !strided_4d) {
+            return Err(GpuError::InvalidArg(format!(
+                "certified KV all-promoted value tail expects BF16 compact or strided tail, got {:?} {:?}",
+                tail.dtype(),
+                tail.shape()
+            )));
+        }
+        if compact_3d {
+            (0, tail_len)
+        } else {
+            let stride = if shape.len() == 3 { shape[1] } else { shape[2] };
+            if stride < total_tokens {
+                return Err(GpuError::InvalidArg(format!(
+                    "certified KV all-promoted value tail stride={stride} must cover total_tokens={total_tokens}"
+                )));
+            }
+            (active_aligned_tokens, stride)
+        }
+    };
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_apply_all_promoted_values_from_probs(
+            ordinal,
+            score_scratch.as_ptr(),
+            promoted_value_bf16.as_ptr(),
+            value_promote_index.as_ptr(),
+            value_int4.as_ptr(),
+            value_scale.as_ptr(),
+            value_zero.as_ptr(),
+            tail_value_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr),
+            output_bf16.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            tail_len as c_int,
+            max_promoted_value_blocks as c_int,
+            value_stride_tokens as c_int,
+            tail_value_start as c_int,
+            tail_value_stride as c_int,
+            score_scratch.shape()[1] as c_int,
+            head_dim as c_int,
+            value_group_size as c_int,
+            gqa_group as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA all-promoted value apply failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            score_scratch,
+            promoted_value_bf16,
+            value_promote_index,
+            value_int4,
+            value_scale,
+            value_zero,
+            tail_value_bf16,
+            total_tokens,
+            block_size,
+            value_group_size,
+            gqa_group,
+            output_bf16,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
 pub fn attend_int8_bf16_values(
     ordinal: usize,
     query_bf16: &GpuBuffer,
@@ -2730,6 +3290,526 @@ pub fn attend_int8_bf16_values(
         score_scratch,
         output_f32,
     )
+}
+
+pub fn block_masses_from_token_probs(
+    ordinal: usize,
+    score_scratch: &GpuBuffer,
+    block_mass: &mut GpuBuffer,
+    block_size: usize,
+) -> Result<(), GpuError> {
+    if score_scratch.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV block mass reduction is currently CUDA-only".into(),
+        ));
+    }
+    if score_scratch.dtype() != ScalarType::F32 || block_mass.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV block mass reduction expects F32/F32, got {:?}/{:?}",
+            score_scratch.dtype(),
+            block_mass.dtype()
+        )));
+    }
+    if score_scratch.shape().len() != 2 || block_mass.shape().len() != 2 || block_size == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV block mass reduction expects score [qh,t], mass [qh,b], block_size>0; got {:?}/{:?}/{block_size}",
+            score_scratch.shape(),
+            block_mass.shape()
+        )));
+    }
+    let q_heads = score_scratch.shape()[0];
+    let num_blocks = block_mass.shape()[1];
+    if block_mass.shape()[0] != q_heads || score_scratch.shape()[1] < num_blocks * block_size {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV block mass reduction shape mismatch score={:?} mass={:?} block_size={block_size}",
+            score_scratch.shape(),
+            block_mass.shape()
+        )));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_block_masses_from_probs(
+            ordinal,
+            score_scratch.as_ptr(),
+            block_mass.as_mut_ptr(),
+            q_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            score_scratch.shape()[1] as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA block mass reduction failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, score_scratch, block_mass, block_size);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn select_blocks_device(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    key_scale_norm: &GpuBuffer,
+    block_max: &GpuBuffer,
+    block_sum: &GpuBuffer,
+    value_norm: &GpuBuffer,
+    promote_index: &mut GpuBuffer,
+    value_promote_index: &mut GpuBuffer,
+    selected_blocks: &mut GpuBuffer,
+    selected_counts: &mut GpuBuffer,
+    fallback_flags: &mut GpuBuffer,
+    delta_blocks: &mut GpuBuffer,
+    e_key_by_head: &mut GpuBuffer,
+    delta_tail_by_head: &mut GpuBuffer,
+    vmax_by_head: &mut GpuBuffer,
+    true_tail_by_head: &mut GpuBuffer,
+    gqa_group: usize,
+    k_min: usize,
+    k_max: usize,
+    max_promoted_blocks: usize,
+    q_scale: f32,
+    tau_cov: f32,
+    rung1_threshold: f32,
+    rung1_multiplier: f32,
+    delta_guard_factor: f32,
+    score_exploration_rate: f32,
+    require_certified_tail_bound: bool,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV device selector is currently CUDA-only".into(),
+        ));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d && !query_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV device selector expects query [qh,hd] or [qh,1,hd], got {:?}",
+            query_shape
+        )));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
+    let kv_heads = key_scale_norm.shape().first().copied().unwrap_or(0);
+    let num_blocks = block_max.shape().get(1).copied().unwrap_or(0);
+    if query_bf16.dtype() != ScalarType::BF16
+        || key_scale_norm.dtype() != ScalarType::F32
+        || block_max.dtype() != ScalarType::F32
+        || block_sum.dtype() != ScalarType::F32
+        || value_norm.dtype() != ScalarType::F32
+        || promote_index.dtype() != ScalarType::U32
+        || value_promote_index.dtype() != ScalarType::U32
+        || selected_blocks.dtype() != ScalarType::U32
+        || selected_counts.dtype() != ScalarType::U32
+        || fallback_flags.dtype() != ScalarType::U32
+        || delta_blocks.dtype() != ScalarType::F32
+        || e_key_by_head.dtype() != ScalarType::F32
+        || delta_tail_by_head.dtype() != ScalarType::F32
+        || vmax_by_head.dtype() != ScalarType::F32
+        || true_tail_by_head.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV device selector dtype mismatch".into(),
+        ));
+    }
+    if gqa_group == 0
+        || q_heads != kv_heads * gqa_group
+        || key_scale_norm.shape().len() != 2
+        || key_scale_norm.shape()[1] < num_blocks
+        || block_max.shape() != [q_heads, num_blocks]
+        || block_sum.shape() != [q_heads, num_blocks]
+        || value_norm.shape().len() != 2
+        || value_norm.shape()[0] != kv_heads
+        || value_norm.shape()[1] < num_blocks
+        || promote_index.shape() != [q_heads, num_blocks]
+        || value_promote_index.shape() != [kv_heads, num_blocks]
+        || selected_blocks.shape() != [q_heads, max_promoted_blocks]
+        || selected_counts.shape() != [q_heads]
+        || fallback_flags.shape() != [q_heads]
+        || delta_blocks.shape() != [q_heads, num_blocks]
+        || e_key_by_head.shape() != [q_heads]
+        || delta_tail_by_head.shape() != [q_heads]
+        || vmax_by_head.shape() != [q_heads]
+        || true_tail_by_head.shape() != [q_heads]
+        || max_promoted_blocks == 0
+        || max_promoted_blocks > num_blocks
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV device selector shape mismatch: query={:?} key_scale_norm={:?} max={:?} sum={:?} norm={:?} promote={:?} value_promote={:?} selected={:?} counts={:?} flags={:?} delta={:?}",
+            query_bf16.shape(),
+            key_scale_norm.shape(),
+            block_max.shape(),
+            block_sum.shape(),
+            value_norm.shape(),
+            promote_index.shape(),
+            value_promote_index.shape(),
+            selected_blocks.shape(),
+            selected_counts.shape(),
+            fallback_flags.shape(),
+            delta_blocks.shape()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_select_blocks(
+            ordinal,
+            query_bf16.as_ptr(),
+            key_scale_norm.as_ptr(),
+            block_max.as_ptr(),
+            block_sum.as_ptr(),
+            value_norm.as_ptr(),
+            promote_index.as_mut_ptr(),
+            value_promote_index.as_mut_ptr(),
+            selected_blocks.as_mut_ptr(),
+            selected_counts.as_mut_ptr(),
+            fallback_flags.as_mut_ptr(),
+            delta_blocks.as_mut_ptr(),
+            e_key_by_head.as_mut_ptr(),
+            delta_tail_by_head.as_mut_ptr(),
+            vmax_by_head.as_mut_ptr(),
+            true_tail_by_head.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            key_scale_norm.shape()[1] as c_int,
+            value_norm.shape()[1] as c_int,
+            head_dim as c_int,
+            gqa_group as c_int,
+            k_min as c_int,
+            k_max as c_int,
+            max_promoted_blocks as c_int,
+            q_scale,
+            tau_cov,
+            rung1_threshold,
+            rung1_multiplier,
+            delta_guard_factor,
+            score_exploration_rate,
+            i32::from(require_certified_tail_bound) as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA device selector failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            query_bf16,
+            key_scale_norm,
+            block_max,
+            block_sum,
+            value_norm,
+            promote_index,
+            value_promote_index,
+            selected_blocks,
+            selected_counts,
+            fallback_flags,
+            delta_blocks,
+            e_key_by_head,
+            delta_tail_by_head,
+            vmax_by_head,
+            true_tail_by_head,
+            gqa_group,
+            k_min,
+            k_max,
+            max_promoted_blocks,
+            q_scale,
+            tau_cov,
+            rung1_threshold,
+            rung1_multiplier,
+            delta_guard_factor,
+            score_exploration_rate,
+            require_certified_tail_bound,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn ranking_flags_device(
+    ordinal: usize,
+    block_max: &GpuBuffer,
+    block_sum: &GpuBuffer,
+    delta_blocks: &GpuBuffer,
+    selected_fp16_log_masses: &GpuBuffer,
+    promote_index: &GpuBuffer,
+    fallback_flags: &mut GpuBuffer,
+    max_promoted_blocks: usize,
+) -> Result<(), GpuError> {
+    if block_max.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV device ranking check is currently CUDA-only".into(),
+        ));
+    }
+    let q_heads = block_max.shape().first().copied().unwrap_or(0);
+    let num_blocks = block_max.shape().get(1).copied().unwrap_or(0);
+    if block_max.dtype() != ScalarType::F32
+        || block_sum.dtype() != ScalarType::F32
+        || delta_blocks.dtype() != ScalarType::F32
+        || selected_fp16_log_masses.dtype() != ScalarType::F32
+        || promote_index.dtype() != ScalarType::U32
+        || fallback_flags.dtype() != ScalarType::U32
+        || block_max.shape() != [q_heads, num_blocks]
+        || block_sum.shape() != [q_heads, num_blocks]
+        || delta_blocks.shape() != [q_heads, num_blocks]
+        || selected_fp16_log_masses.shape() != [q_heads, max_promoted_blocks]
+        || promote_index.shape() != [q_heads, num_blocks]
+        || fallback_flags.shape() != [q_heads]
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV device ranking shape/dtype mismatch: max={:?} sum={:?} delta={:?} fp16={:?} promote={:?} flags={:?}",
+            block_max.shape(),
+            block_sum.shape(),
+            delta_blocks.shape(),
+            selected_fp16_log_masses.shape(),
+            promote_index.shape(),
+            fallback_flags.shape()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_ranking_flags(
+            ordinal,
+            block_max.as_ptr(),
+            block_sum.as_ptr(),
+            delta_blocks.as_ptr(),
+            selected_fp16_log_masses.as_ptr(),
+            promote_index.as_ptr(),
+            fallback_flags.as_mut_ptr(),
+            q_heads as c_int,
+            num_blocks as c_int,
+            max_promoted_blocks as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA ranking flags failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            block_max,
+            block_sum,
+            delta_blocks,
+            selected_fp16_log_masses,
+            promote_index,
+            fallback_flags,
+            max_promoted_blocks,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn value_promotions_from_block_masses(
+    ordinal: usize,
+    block_mass: &GpuBuffer,
+    value_error: &GpuBuffer,
+    ranking_fallback_head_flags: Option<&GpuBuffer>,
+    value_promote_index: &mut GpuBuffer,
+    kv_counters: &mut GpuBuffer,
+    any_promoted: &mut GpuBuffer,
+    head_promoted_flags: &mut GpuBuffer,
+    e_val_by_head: &mut GpuBuffer,
+    gqa_group: usize,
+    v_tol: f32,
+) -> Result<(), GpuError> {
+    if block_mass.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV value-promotion evaluation is currently CUDA-only".into(),
+        ));
+    }
+    if block_mass.dtype() != ScalarType::F32
+        || value_error.dtype() != ScalarType::F32
+        || value_promote_index.dtype() != ScalarType::U32
+        || kv_counters.dtype() != ScalarType::U32
+        || any_promoted.dtype() != ScalarType::U32
+        || head_promoted_flags.dtype() != ScalarType::U32
+        || e_val_by_head.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value-promotion dtypes must be F32/F32/U32/U32/U32/U32/F32, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            block_mass.dtype(),
+            value_error.dtype(),
+            value_promote_index.dtype(),
+            kv_counters.dtype(),
+            any_promoted.dtype(),
+            head_promoted_flags.dtype(),
+            e_val_by_head.dtype()
+        )));
+    }
+    if block_mass.shape().len() != 2
+        || value_error.shape().len() != 2
+        || value_promote_index.shape().len() != 2
+        || kv_counters.shape().len() != 1
+        || any_promoted.elem_count() != 1
+        || head_promoted_flags.shape().len() != 1
+        || e_val_by_head.shape().len() != 1
+        || gqa_group == 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value-promotion shape mismatch: mass={:?} err={:?} index={:?} counters={:?} any={:?} heads={:?} e_val={:?} gqa={gqa_group}",
+            block_mass.shape(),
+            value_error.shape(),
+            value_promote_index.shape(),
+            kv_counters.shape(),
+            any_promoted.shape(),
+            head_promoted_flags.shape(),
+            e_val_by_head.shape()
+        )));
+    }
+    let q_heads = block_mass.shape()[0];
+    let num_blocks = block_mass.shape()[1];
+    let kv_heads = value_error.shape()[0];
+    if q_heads != kv_heads * gqa_group
+        || value_error.shape()[1] < num_blocks
+        || value_promote_index.shape() != [kv_heads, num_blocks]
+        || kv_counters.shape()[0] != kv_heads
+        || head_promoted_flags.shape()[0] != q_heads
+        || e_val_by_head.shape()[0] != q_heads
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV value-promotion dimensions mismatch: q_heads={q_heads} kv_heads={kv_heads} num_blocks={num_blocks} gqa={gqa_group} err={:?} index={:?}",
+            value_error.shape(),
+            value_promote_index.shape()
+        )));
+    }
+    if let Some(flags) = ranking_fallback_head_flags {
+        if flags.dtype() != ScalarType::U32 || flags.elem_count() < q_heads {
+            return Err(GpuError::InvalidArg(format!(
+                "certified KV value-promotion fallback flags must be U32[{q_heads}], got {:?}[{}]",
+                flags.dtype(),
+                flags.elem_count()
+            )));
+        }
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_value_promotions_from_block_masses(
+            ordinal,
+            block_mass.as_ptr(),
+            value_error.as_ptr(),
+            ranking_fallback_head_flags
+                .map(|buf| buf.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            value_promote_index.as_mut_ptr(),
+            kv_counters.as_mut_ptr(),
+            any_promoted.as_mut_ptr(),
+            head_promoted_flags.as_mut_ptr(),
+            e_val_by_head.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+            value_error.shape()[1] as c_int,
+            gqa_group as c_int,
+            v_tol,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA value-promotion evaluation failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            block_mass,
+            value_error,
+            ranking_fallback_head_flags,
+            value_promote_index,
+            kv_counters,
+            any_promoted,
+            head_promoted_flags,
+            e_val_by_head,
+            gqa_group,
+            v_tol,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn init_all_promoted_indices(
+    ordinal: usize,
+    promote_index: &mut GpuBuffer,
+    value_promote_index: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if promote_index.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV all-promoted index init is currently CUDA-only".into(),
+        ));
+    }
+    if promote_index.dtype() != ScalarType::U32 || value_promote_index.dtype() != ScalarType::U32 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted index dtypes must be U32/U32, got {:?}/{:?}",
+            promote_index.dtype(),
+            value_promote_index.dtype()
+        )));
+    }
+    if promote_index.shape().len() != 2 || value_promote_index.shape().len() != 2 {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted index shapes must be 2D, got {:?}/{:?}",
+            promote_index.shape(),
+            value_promote_index.shape()
+        )));
+    }
+    let q_heads = promote_index.shape()[0];
+    let num_blocks = promote_index.shape()[1];
+    let kv_heads = value_promote_index.shape()[0];
+    if value_promote_index.shape()[1] != num_blocks {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV all-promoted index block mismatch: promote={:?} value={:?}",
+            promote_index.shape(),
+            value_promote_index.shape()
+        )));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_init_all_promoted_indices(
+            ordinal,
+            promote_index.as_mut_ptr(),
+            value_promote_index.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            num_blocks as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA all-promoted index init failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, promote_index, value_promote_index);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
 }
 
 pub fn dense_selected_heads_out_bf16(
@@ -2917,6 +3997,178 @@ pub fn dense_selected_heads_out_bf16(
         return Err(GpuError::InvalidArg(
             "certified KV selected-head fallback requires CUDA support".into(),
         ));
+    }
+    Ok(())
+}
+
+pub fn dense_flagged_heads_out_bf16(
+    ordinal: usize,
+    query_bf16: &GpuBuffer,
+    fallback_flags: &GpuBuffer,
+    fallback_key_bf16: &GpuBuffer,
+    fallback_value_bf16: &GpuBuffer,
+    prefix_tokens: usize,
+    tail_key_bf16: Option<&GpuBuffer>,
+    tail_value_bf16: Option<&GpuBuffer>,
+    total_tokens: usize,
+    score_scratch: &mut GpuBuffer,
+    output_bf16: &mut GpuBuffer,
+    q_scale: f32,
+) -> Result<(), GpuError> {
+    if query_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV flagged dense fallback is currently CUDA-only".into(),
+        ));
+    }
+    if query_bf16.dtype() != ScalarType::BF16
+        || fallback_flags.dtype() != ScalarType::U32
+        || fallback_key_bf16.dtype() != ScalarType::BF16
+        || fallback_value_bf16.dtype() != ScalarType::BF16
+        || score_scratch.dtype() != ScalarType::F32
+        || output_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV flagged fallback dtype mismatch".into(),
+        ));
+    }
+    let query_shape = query_bf16.shape();
+    let query_is_2d = query_shape.len() == 2;
+    let query_is_3d = query_shape.len() == 3 && query_shape[1] == 1;
+    if !query_is_2d && !query_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV flagged fallback expects query [qh,hd] or [qh,1,hd], got {:?}",
+            query_shape
+        )));
+    }
+    let q_heads = query_shape[0];
+    let head_dim = if query_is_2d {
+        query_shape[1]
+    } else {
+        query_shape[2]
+    };
+    let prefix_shape = fallback_key_bf16.shape();
+    if prefix_shape.len() != 3
+        || fallback_value_bf16.shape() != prefix_shape
+        || fallback_flags.shape() != [q_heads]
+        || prefix_shape[2] != head_dim
+        || prefix_shape[1] < prefix_tokens
+        || total_tokens < prefix_tokens
+        || score_scratch.shape().len() != 2
+        || score_scratch.shape()[0] != q_heads
+        || score_scratch.shape()[1] < total_tokens
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV flagged fallback shape mismatch query={:?} flags={:?} key={:?} value={:?} score={:?} prefix_tokens={prefix_tokens} total_tokens={total_tokens}",
+            query_shape,
+            fallback_flags.shape(),
+            fallback_key_bf16.shape(),
+            fallback_value_bf16.shape(),
+            score_scratch.shape()
+        )));
+    }
+    let tail_len = total_tokens - prefix_tokens;
+    if tail_len > 0 {
+        let tail_k = tail_key_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(
+                "certified KV flagged fallback requires tail key when tail_len > 0".into(),
+            )
+        })?;
+        let tail_v = tail_value_bf16.ok_or_else(|| {
+            GpuError::InvalidArg(
+                "certified KV flagged fallback requires tail value when tail_len > 0".into(),
+            )
+        })?;
+        if tail_k.dtype() != ScalarType::BF16
+            || tail_v.dtype() != ScalarType::BF16
+            || tail_k.shape().len() != 3
+            || tail_v.shape().len() != 3
+            || tail_k.shape()[0] != prefix_shape[0]
+            || tail_v.shape()[0] != prefix_shape[0]
+            || tail_k.shape()[2] != head_dim
+            || tail_v.shape()[2] != head_dim
+            || tail_k.shape()[1] < tail_len
+            || tail_v.shape()[1] < tail_len
+        {
+            return Err(GpuError::InvalidArg(format!(
+                "certified KV flagged fallback tail shape mismatch tail_k={:?} tail_v={:?} tail_len={tail_len} head_dim={head_dim}",
+                tail_k.shape(),
+                tail_v.shape()
+            )));
+        }
+    }
+    let output_shape = output_bf16.shape();
+    let output_is_2d = output_shape == [q_heads, head_dim];
+    let output_is_3d = output_shape == [q_heads, 1, head_dim];
+    if !output_is_2d && !output_is_3d {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV flagged fallback output shape mismatch {:?}",
+            output_shape
+        )));
+    }
+    let kv_heads = prefix_shape[0];
+    if kv_heads == 0 || total_tokens == 0 || q_heads % kv_heads != 0 {
+        return Ok(());
+    }
+    let tail_key_ptr = tail_key_bf16
+        .map(|buf| buf.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let tail_value_ptr = tail_value_bf16
+        .map(|buf| buf.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let tail_key_stride = tail_key_bf16.map(|buf| buf.shape()[1]).unwrap_or(0);
+    let tail_value_stride = tail_value_bf16.map(|buf| buf.shape()[1]).unwrap_or(0);
+    let gqa_group = q_heads / kv_heads;
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
+            ordinal,
+            query_bf16.as_ptr(),
+            fallback_flags.as_ptr(),
+            fallback_key_bf16.as_ptr(),
+            fallback_value_bf16.as_ptr(),
+            tail_key_ptr,
+            tail_value_ptr,
+            score_scratch.as_mut_ptr(),
+            output_bf16.as_mut_ptr(),
+            q_heads as c_int,
+            kv_heads as c_int,
+            prefix_tokens as c_int,
+            prefix_shape[1] as c_int,
+            tail_len as c_int,
+            0,
+            tail_key_stride as c_int,
+            0,
+            tail_value_stride as c_int,
+            score_scratch.shape()[1] as c_int,
+            head_dim as c_int,
+            gqa_group as c_int,
+            q_scale,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA flagged fallback failed: {status}"),
+            ));
+        }
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            query_bf16,
+            fallback_flags,
+            fallback_key_bf16,
+            fallback_value_bf16,
+            prefix_tokens,
+            tail_key_bf16,
+            tail_value_bf16,
+            total_tokens,
+            score_scratch,
+            output_bf16,
+            q_scale,
+        );
+        return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
     }
     Ok(())
 }
@@ -3479,6 +4731,211 @@ mod tests {
                 "unexpected block sum got={got} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn cuda_score_consistency_clears_stale_flags() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let query = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 2],
+            &bf16_bytes(&[0.5, -1.0]),
+        )
+        .expect("upload query");
+        let key_i8 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, 2, 2],
+            &[1i8 as u8, 2i8 as u8, 3i8 as u8, 4i8 as u8],
+        )
+        .expect("upload key_i8");
+        let key_scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 2],
+            &f32_bytes(&[1.0, 1.0]),
+        )
+        .expect("upload key_scale");
+        let key_zero = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[1, 1, 2],
+            &f32_bytes(&[0.0, 0.0]),
+        )
+        .expect("upload key_zero");
+        let promoted_key = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 2, 2],
+            &bf16_bytes(&[1.0, 2.0, 3.0, 4.0]),
+        )
+        .expect("upload promoted key");
+        let promote_index =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[1, 1], &0u32.to_le_bytes())
+                .expect("upload promote index");
+        let mut flags =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[1], &1u32.to_le_bytes())
+                .expect("upload stale flags");
+
+        score_consistency(
+            ordinal,
+            &query,
+            &key_i8,
+            &key_scale,
+            &key_zero,
+            &promoted_key,
+            &promote_index,
+            &mut flags,
+            2,
+            1,
+            1,
+            1.0,
+            0.0,
+        )
+        .expect("score consistency");
+
+        let flag = u32::from_le_bytes(
+            flags.to_host_bytes().expect("download flags")[0..4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(flag, 0, "score consistency did not clear stale flag");
+    }
+
+    #[test]
+    fn cuda_block_masses_reduce_normalized_token_probs() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let score_scratch = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 8],
+            &f32_bytes(&[
+                0.10, 0.20, 0.05, 0.15, 0.25, 0.05, 0.10, 0.10, 0.30, 0.10, 0.20, 0.05, 0.05, 0.15,
+                0.10, 0.05,
+            ]),
+        )
+        .expect("upload probs");
+        let mut block_mass =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("block mass");
+
+        block_masses_from_token_probs(ordinal, &score_scratch, &mut block_mass, 4)
+            .expect("reduce block mass");
+
+        let masses = f32s(&block_mass.to_host_bytes().expect("download block mass"));
+        let expected = [0.50_f32, 0.50_f32, 0.65_f32, 0.35_f32];
+        for (got, expected) in masses.iter().zip(expected) {
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "unexpected block mass got={got} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn cuda_value_promotions_from_final_block_masses() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let block_mass = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[4, 3],
+            &f32_bytes(&[
+                0.80, 0.15, 0.05, 0.10, 0.20, 0.70, 0.30, 0.30, 0.40, 0.25, 0.25, 0.50,
+            ]),
+        )
+        .expect("upload block masses");
+        let value_error = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::F32,
+            &[2, 3],
+            &f32_bytes(&[0.01, 0.60, 0.01, 0.30, 0.01, 0.30]),
+        )
+        .expect("upload value errors");
+        let fallback_flags = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U32,
+            &[4],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        )
+        .expect("upload fallback flags");
+        let mut value_index =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[2, 3]).expect("value index");
+        let mut counters = GpuBuffer::zeros(ordinal, ScalarType::U32, &[2]).expect("counters");
+        let mut any = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("any");
+        let mut head_flags = GpuBuffer::zeros(ordinal, ScalarType::U32, &[4]).expect("head flags");
+        let mut e_val = GpuBuffer::zeros(ordinal, ScalarType::F32, &[4]).expect("e val");
+
+        value_promotions_from_block_masses(
+            ordinal,
+            &block_mass,
+            &value_error,
+            Some(&fallback_flags),
+            &mut value_index,
+            &mut counters,
+            &mut any,
+            &mut head_flags,
+            &mut e_val,
+            2,
+            0.05,
+        )
+        .expect("evaluate promotions");
+
+        let any_host = u32::from_le_bytes(
+            any.to_host_bytes().expect("download any")[0..4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(any_host, 1);
+        let heads: Vec<u32> = head_flags
+            .to_host_bytes()
+            .expect("download head flags")
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(heads, vec![1, 1, 1, 1]);
+        let vals = f32s(&e_val.to_host_bytes().expect("download e_val"));
+        assert!(
+            (vals[0] - 0.0085).abs() < 1e-6,
+            "unexpected e_val {:?}",
+            vals
+        );
+        assert!(
+            (vals[1] - 0.0080).abs() < 1e-6,
+            "unexpected e_val {:?}",
+            vals
+        );
+    }
+
+    #[test]
+    fn cuda_init_all_promoted_indices() {
+        set_backend(Backend::Cuda);
+        let ordinal = 0usize;
+        let mut promote_index =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[4, 3]).expect("promote index");
+        let mut value_promote_index =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[2, 3]).expect("value promote index");
+
+        init_all_promoted_indices(ordinal, &mut promote_index, &mut value_promote_index)
+            .expect("init all-promoted indices");
+
+        let promote: Vec<u32> = promote_index
+            .to_host_bytes()
+            .expect("download promote index")
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(promote, vec![0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2]);
+
+        let value: Vec<u32> = value_promote_index
+            .to_host_bytes()
+            .expect("download value promote index")
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(value, vec![u32::MAX; 6]);
     }
 
     #[test]

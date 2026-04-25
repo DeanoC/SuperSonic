@@ -33,6 +33,13 @@ pub fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn decode_u32_le(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 fn decode_bf16_le_host(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
@@ -56,27 +63,21 @@ fn logsumexp(values: &[f32]) -> f32 {
     max_v + sum.ln()
 }
 
-fn certified_kv_score_delta_blocks(
+fn certified_kv_score_delta_from_channel_max(
     query_f32_all: &[f32],
-    key_scale_host: &[f32],
+    key_scale_channel_max_host: &[f32],
     q_head: usize,
     kv_head: usize,
-    num_blocks: usize,
-    key_scale_stride_blocks: usize,
     head_dim: usize,
     q_scale: f32,
-) -> Vec<f32> {
+) -> f32 {
     let query = &query_f32_all[q_head * head_dim..(q_head + 1) * head_dim];
-    let mut out = Vec::with_capacity(num_blocks);
-    for block in 0..num_blocks {
-        let mut weighted_scale_sum = 0.0f32;
-        let scale_base = (kv_head * key_scale_stride_blocks + block) * head_dim;
-        for dim in 0..head_dim {
-            weighted_scale_sum += query[dim].abs() * key_scale_host[scale_base + dim];
-        }
-        out.push(0.5 * q_scale * weighted_scale_sum);
+    let scale_base = kv_head * head_dim;
+    let mut weighted_scale_sum = 0.0f32;
+    for dim in 0..head_dim {
+        weighted_scale_sum += query[dim].abs() * key_scale_channel_max_host[scale_base + dim];
     }
-    out
+    0.5 * q_scale * weighted_scale_sum
 }
 
 fn certified_kv_vmax_for_head(
@@ -84,13 +85,12 @@ fn certified_kv_vmax_for_head(
     kv_head: usize,
     num_blocks: usize,
     value_error_stride_blocks: usize,
-    selected_blocks: &[usize],
+    selected_flags: &[bool],
 ) -> f32 {
-    let selected: std::collections::HashSet<usize> = selected_blocks.iter().copied().collect();
     let base = kv_head * value_error_stride_blocks;
     let mut vmax = 0.0f32;
     for block in 0..num_blocks {
-        if selected.contains(&block) {
+        if selected_flags[block] {
             continue;
         }
         vmax = vmax.max(value_norm_host[base + block]);
@@ -100,55 +100,6 @@ fn certified_kv_vmax_for_head(
 
 fn certified_kv_key_error_bound(vmax: f32, true_tail_bound: f32, delta_tail: f32) -> f32 {
     2.0 * vmax * true_tail_bound * ((2.0 * delta_tail).exp() - 1.0)
-}
-
-fn certified_kv_score_consistency_violates(
-    query_f32_all: &[f32],
-    tier2_key: &[u8],
-    key_int8: &[u8],
-    key_scale_host: &[f32],
-    key_zero_host: &[f32],
-    q_head: usize,
-    kv_head: usize,
-    selected_blocks: &[usize],
-    delta_blocks: &[f32],
-    cap: usize,
-    num_blocks: usize,
-    key_stride_tokens: usize,
-    key_scale_stride_blocks: usize,
-    block_size: usize,
-    head_dim: usize,
-    q_scale: f32,
-    eps_guard: f32,
-) -> bool {
-    let query = &query_f32_all[q_head * head_dim..(q_head + 1) * head_dim];
-    for &block_id in selected_blocks {
-        let scale_base = (kv_head * key_scale_stride_blocks + block_id) * head_dim;
-        for token in 0..block_size {
-            let token_idx = block_id * block_size + token;
-            if token_idx >= cap {
-                continue;
-            }
-            let mut fp16_dot = 0.0f32;
-            let mut int8_dot = 0.0f32;
-            let token_base = (kv_head * key_stride_tokens + token_idx) * head_dim;
-            for dim in 0..head_dim {
-                let key_byte = (token_base + dim) * 2;
-                let fp16_k =
-                    half::bf16::from_le_bytes([tier2_key[key_byte], tier2_key[key_byte + 1]])
-                        .to_f32();
-                let code = key_int8[token_base + dim] as i8 as f32;
-                let int8_k =
-                    code * key_scale_host[scale_base + dim] + key_zero_host[scale_base + dim];
-                fp16_dot += query[dim] * fp16_k;
-                int8_dot += query[dim] * int8_k;
-            }
-            if (fp16_dot - int8_dot).abs() * q_scale > delta_blocks[block_id] + eps_guard {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn certified_kv_select_blocks_from_scores(
@@ -174,40 +125,6 @@ fn certified_kv_select_blocks_from_scores(
         delta_guard_factor,
     )?;
     Ok((selected, tail, rung1, probs))
-}
-
-fn certified_kv_probs_from_scores(block_max: &[f32], block_sum: &[f32]) -> Result<Vec<f32>> {
-    let num_blocks = block_max.len();
-    if num_blocks == 0 || block_sum.len() != num_blocks {
-        return Ok(Vec::new());
-    }
-    let mut log_mass = Vec::with_capacity(num_blocks);
-    for (&m, &s) in block_max.iter().zip(block_sum.iter()) {
-        if !m.is_finite() || !s.is_finite() || s <= 0.0 {
-            return Err(anyhow::anyhow!(
-                "certified KV probability pass received invalid block score max={} sum={}",
-                m,
-                s
-            ));
-        }
-        log_mass.push(m + s.ln());
-    }
-    let global = logsumexp(&log_mass);
-    if !global.is_finite() {
-        return Err(anyhow::anyhow!(
-            "certified KV probability pass global logsumexp is not finite"
-        ));
-    }
-    let mut probs: Vec<f32> = log_mass.iter().map(|m| (*m - global).exp()).collect();
-    for p in &mut probs {
-        if !p.is_finite() || *p < 0.0 {
-            return Err(anyhow::anyhow!(
-                "certified KV probability pass produced invalid probability {}",
-                *p
-            ));
-        }
-    }
-    Ok(probs)
 }
 
 fn certified_kv_select_block_indices_from_scores(
@@ -314,43 +231,6 @@ fn certified_kv_block_log_mass(max_v: f32, sum_v: f32) -> Option<f32> {
     }
 }
 
-fn certified_kv_selected_block_fp16_log_masses(
-    query_f32_all: &[f32],
-    promoted_key_host: &[u8],
-    q_head: usize,
-    selected_blocks: &[usize],
-    max_promoted_blocks: usize,
-    block_size: usize,
-    head_dim: usize,
-    q_scale: f32,
-) -> Vec<(usize, f32)> {
-    let query = &query_f32_all[q_head * head_dim..(q_head + 1) * head_dim];
-    let block_key_bytes = block_size * head_dim * ScalarType::BF16.size_in_bytes();
-    let mut out = Vec::with_capacity(selected_blocks.len());
-    for (slot, &block_id) in selected_blocks.iter().enumerate() {
-        let base = (q_head * max_promoted_blocks + slot) * block_key_bytes;
-        let mut scores = Vec::with_capacity(block_size);
-        for token in 0..block_size {
-            let token_base = base + token * head_dim * 2;
-            let mut dot = 0.0f32;
-            for d in 0..head_dim {
-                let byte_idx = token_base + d * 2;
-                let k = half::bf16::from_le_bytes([
-                    promoted_key_host[byte_idx],
-                    promoted_key_host[byte_idx + 1],
-                ])
-                .to_f32();
-                dot += query[d] * k;
-            }
-            scores.push(dot * q_scale);
-        }
-        let max_v = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum_v: f32 = scores.iter().map(|s| (*s - max_v).exp()).sum();
-        out.push((block_id, max_v + sum_v.ln()));
-    }
-    out
-}
-
 fn certified_kv_selected_block_fp16_log_masses_from_tier2(
     query_f32_all: &[f32],
     tier2_key: &[u8],
@@ -402,10 +282,13 @@ fn certified_kv_ranking_boundary_violators(
         .get(top_r.saturating_sub(1))
         .map(|(_, log_mass)| *log_mass)
         .unwrap_or(f32::NEG_INFINITY);
-    let selected_set: std::collections::HashSet<usize> = selected_blocks.iter().copied().collect();
+    let mut selected_flags = vec![false; int8_block_max.len()];
+    for &block in selected_blocks {
+        selected_flags[block] = true;
+    }
     let mut out = Vec::new();
     for block_id in 0..int8_block_max.len() {
-        if selected_set.contains(&block_id) {
+        if selected_flags[block_id] {
             continue;
         }
         if let Some(int8_log_mass) =
@@ -438,6 +321,45 @@ fn certified_kv_ranking_mismatch(
         return false;
     }
     let top_r = ranking_r.min(selected_blocks.len());
+    let mut selected_flags = vec![false; int8_block_max.len()];
+    for &block in selected_blocks {
+        selected_flags[block] = true;
+    }
+    if top_r == 1 {
+        let fp16_best = fp16_selected_log_masses
+            .iter()
+            .copied()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let int8_best = selected_blocks
+            .iter()
+            .filter_map(|&block_id| {
+                certified_kv_block_log_mass(int8_block_max[block_id], int8_block_sum[block_id])
+                    .map(|log_mass| (block_id, log_mass))
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        let Some((fp16_block, promoted_boundary)) = fp16_best else {
+            return true;
+        };
+        let Some((int8_block, _)) = int8_best else {
+            return true;
+        };
+        if fp16_block != int8_block {
+            return true;
+        }
+        for block_id in 0..int8_block_max.len() {
+            if selected_flags[block_id] {
+                continue;
+            }
+            if let Some(int8_log_mass) =
+                certified_kv_block_log_mass(int8_block_max[block_id], int8_block_sum[block_id])
+            {
+                if int8_log_mass + delta_blocks[block_id] > promoted_boundary {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
     let mut fp16_ranked = fp16_selected_log_masses.to_vec();
     fp16_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut int8_selected = Vec::with_capacity(selected_blocks.len());
@@ -466,9 +388,8 @@ fn certified_kv_ranking_mismatch(
         .get(top_r.saturating_sub(1))
         .map(|(_, log_mass)| *log_mass)
         .unwrap_or(f32::NEG_INFINITY);
-    let selected_set: std::collections::HashSet<usize> = selected_blocks.iter().copied().collect();
     for block_id in 0..int8_block_max.len() {
-        if selected_set.contains(&block_id) {
+        if selected_flags[block_id] {
             continue;
         }
         if let Some(int8_log_mass) =
@@ -788,6 +709,9 @@ pub struct DecodeEngine {
     argmax_buf: GpuBuffer,
     lm_head_block_best_vals: GpuBuffer,
     lm_head_block_best_idxs: GpuBuffer,
+    target_nll_token: GpuBuffer,
+    target_nll_value: GpuBuffer,
+    target_nll_accum: GpuBuffer,
     matvec_counter: GpuBuffer,
     ordinal: usize,
     kv_chunk_size: usize,
@@ -875,8 +799,22 @@ struct ComponentFullAttentionScratch {
     proj_out: GpuBuffer,
     certified_score_scratch: Option<GpuBuffer>,
     certified_softmax_stats: Option<GpuBuffer>,
+    certified_final_block_mass: Option<GpuBuffer>,
+    certified_value_promotion_counters: Option<GpuBuffer>,
+    certified_value_promotion_any: Option<GpuBuffer>,
+    certified_value_promotion_head_flags: Option<GpuBuffer>,
+    certified_value_e_val_by_head: Option<GpuBuffer>,
+    certified_ranking_fallback_head_flags: Option<GpuBuffer>,
     certified_block_max: Option<GpuBuffer>,
     certified_block_sum: Option<GpuBuffer>,
+    certified_key_scale_norm: Option<GpuBuffer>,
+    certified_delta_blocks: Option<GpuBuffer>,
+    certified_selected_blocks: Option<GpuBuffer>,
+    certified_selected_counts: Option<GpuBuffer>,
+    certified_selector_e_key: Option<GpuBuffer>,
+    certified_selector_delta_tail: Option<GpuBuffer>,
+    certified_selector_vmax: Option<GpuBuffer>,
+    certified_selector_true_tail: Option<GpuBuffer>,
     certified_promote_index: Option<GpuBuffer>,
     certified_promoted_key_bf16: Option<GpuBuffer>,
     certified_value_promote_index: Option<GpuBuffer>,
@@ -941,8 +879,22 @@ impl ComponentFullAttentionScratch {
                 .map_err(|e| anyhow::anyhow!("component full-attn proj_out alloc: {e}"))?,
             certified_score_scratch: None,
             certified_softmax_stats: None,
+            certified_final_block_mass: None,
+            certified_value_promotion_counters: None,
+            certified_value_promotion_any: None,
+            certified_value_promotion_head_flags: None,
+            certified_value_e_val_by_head: None,
+            certified_ranking_fallback_head_flags: None,
             certified_block_max: None,
             certified_block_sum: None,
+            certified_key_scale_norm: None,
+            certified_delta_blocks: None,
+            certified_selected_blocks: None,
+            certified_selected_counts: None,
+            certified_selector_e_key: None,
+            certified_selector_delta_tail: None,
+            certified_selector_vmax: None,
+            certified_selector_true_tail: None,
             certified_promote_index: None,
             certified_promoted_key_bf16: None,
             certified_value_promote_index: None,
@@ -1061,6 +1013,9 @@ pub struct DecodeStageTimings {
     pub certified_kv_dense_fallback_layers: usize,
     pub certified_kv_promoted_key_h2d_bytes: usize,
     pub certified_kv_promoted_value_h2d_bytes: usize,
+    pub certified_kv_promoted_value_cache_hits: usize,
+    pub certified_kv_promoted_value_cache_misses: usize,
+    pub certified_kv_promoted_value_cache_overflows: usize,
     pub certified_kv_ranking_prefix_cache_hits: usize,
     pub certified_kv_ranking_prefix_cache_misses: usize,
     pub certified_kv_ranking_prefix_h2d_bytes: usize,
@@ -1111,6 +1066,11 @@ impl DecodeStageTimings {
         self.certified_kv_dense_fallback_layers += rhs.certified_kv_dense_fallback_layers;
         self.certified_kv_promoted_key_h2d_bytes += rhs.certified_kv_promoted_key_h2d_bytes;
         self.certified_kv_promoted_value_h2d_bytes += rhs.certified_kv_promoted_value_h2d_bytes;
+        self.certified_kv_promoted_value_cache_hits += rhs.certified_kv_promoted_value_cache_hits;
+        self.certified_kv_promoted_value_cache_misses +=
+            rhs.certified_kv_promoted_value_cache_misses;
+        self.certified_kv_promoted_value_cache_overflows +=
+            rhs.certified_kv_promoted_value_cache_overflows;
         self.certified_kv_ranking_prefix_cache_hits += rhs.certified_kv_ranking_prefix_cache_hits;
         self.certified_kv_ranking_prefix_cache_misses +=
             rhs.certified_kv_ranking_prefix_cache_misses;
@@ -1187,6 +1147,7 @@ pub struct CertifiedKvDecodeParams {
     pub k_min: usize,
     pub k_max: usize,
     pub v_tol: f32,
+    pub value_cache_blocks: usize,
     pub ranking_r: usize,
     pub rung1_threshold: f32,
     pub rung1_multiplier: f32,
@@ -1206,6 +1167,7 @@ impl CertifiedKvDecodeParams {
             k_min: 2,
             k_max: 128,
             v_tol: 0.05,
+            value_cache_blocks: 128,
             ranking_r: 1,
             rung1_threshold: 0.005,
             rung1_multiplier: 2.0,
@@ -3545,10 +3507,13 @@ impl DecodeEngine {
         trace_linear_layer: Option<usize>,
         cuda_greedy: bool,
         certified_kv_decode: Option<CertifiedKvDecodeParams>,
+        target_nll_token: Option<u32>,
+        accumulate_target_nll: bool,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<(
         Option<Vec<f32>>,
         Option<u32>,
+        Option<f32>,
         Option<Vec<u8>>,
         Option<ComponentLayerTrace>,
         Option<ComponentLinearTrace>,
@@ -3753,6 +3718,7 @@ impl DecodeEngine {
             return Ok((
                 None,
                 Some(sampled_token),
+                None,
                 traced_hidden,
                 traced_layer,
                 traced_linear,
@@ -3776,6 +3742,71 @@ impl DecodeEngine {
             t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
         }
 
+        if let Some(target) = target_nll_token {
+            if target as usize >= vocab_size {
+                anyhow::bail!("target token {target} outside vocab size {vocab_size}");
+            }
+            let nll_start = Instant::now();
+            if accumulate_target_nll {
+                kernel_ffi::cuda_accumulate_target_nll_bf16(
+                    self.ordinal,
+                    &self.logits_buf,
+                    target,
+                    &mut self.target_nll_accum,
+                    vocab_size,
+                )
+                .map_err(|e| anyhow::anyhow!("target NLL accumulate kernel: {e}"))?;
+                if let Some(t) = timings.as_mut() {
+                    t.logits_d2h_ms += nll_start.elapsed().as_secs_f64() * 1000.0;
+                }
+                return Ok((
+                    None,
+                    None,
+                    Some(0.0),
+                    traced_hidden,
+                    traced_layer,
+                    traced_linear,
+                ));
+            }
+            let target_bytes = target.to_le_bytes();
+            gpu_hal::copy_h2d(
+                self.ordinal,
+                self.target_nll_token.as_mut_ptr(),
+                target_bytes.as_ptr() as *const c_void,
+                target_bytes.len(),
+            )
+            .map_err(|e| anyhow::anyhow!("target NLL target H2D: {e}"))?;
+            kernel_ffi::cuda_target_nll_bf16(
+                self.ordinal,
+                &self.logits_buf,
+                &self.target_nll_token,
+                &mut self.target_nll_value,
+                1,
+                vocab_size,
+            )
+            .map_err(|e| anyhow::anyhow!("target NLL kernel: {e}"))?;
+            let nll_bytes = self
+                .target_nll_value
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("target NLL D2H: {e}"))?;
+            if let Some(t) = timings.as_mut() {
+                t.logits_d2h_ms += nll_start.elapsed().as_secs_f64() * 1000.0;
+            }
+            let nll = f32::from_le_bytes(
+                nll_bytes[..4]
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("target NLL D2H returned truncated buffer"))?,
+            );
+            return Ok((
+                None,
+                None,
+                Some(nll),
+                traced_hidden,
+                traced_layer,
+                traced_linear,
+            ));
+        }
+
         let logits_d2h_start = Instant::now();
         let logits_bytes = self
             .logits_buf
@@ -3792,6 +3823,7 @@ impl DecodeEngine {
                     .collect(),
             ),
             None,
+            None,
             traced_hidden,
             traced_layer,
             traced_linear,
@@ -3803,7 +3835,7 @@ impl DecodeEngine {
         token_id: u32,
         seqlen_offset: usize,
     ) -> Result<Vec<f32>> {
-        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3811,6 +3843,8 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
+            false,
             None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
@@ -3822,7 +3856,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
         let mut timings = DecodeStageTimings::default();
-        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3830,6 +3864,8 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
+            false,
             Some(&mut timings),
         )?;
         let logits =
@@ -3855,7 +3891,7 @@ impl DecodeEngine {
         } else {
             None
         };
-        let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
+        let (_, sampled_token, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3863,6 +3899,8 @@ impl DecodeEngine {
             None,
             true,
             None,
+            None,
+            false,
             timing_slot,
         )?;
         let sampled_token = sampled_token
@@ -3876,7 +3914,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
         certified_kv_decode: CertifiedKvDecodeParams,
     ) -> Result<Vec<f32>> {
-        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3884,6 +3922,8 @@ impl DecodeEngine {
             None,
             false,
             Some(certified_kv_decode),
+            None,
+            false,
             None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
@@ -3896,7 +3936,7 @@ impl DecodeEngine {
         certified_kv_decode: CertifiedKvDecodeParams,
     ) -> Result<(Vec<f32>, DecodeStageTimings)> {
         let mut timings = DecodeStageTimings::default();
-        let (logits, _, _, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3904,10 +3944,91 @@ impl DecodeEngine {
             None,
             false,
             Some(certified_kv_decode),
+            None,
+            false,
             Some(&mut timings),
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))?;
         Ok((logits, timings))
+    }
+
+    pub fn component_decode_step_4b_target_nll(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        target_token: u32,
+        certified_kv_decode: Option<CertifiedKvDecodeParams>,
+        collect_timings: bool,
+    ) -> Result<(f32, DecodeStageTimings)> {
+        let mut timings = DecodeStageTimings::default();
+        let timing_slot = if collect_timings {
+            Some(&mut timings)
+        } else {
+            None
+        };
+        let (_, _, nll, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            certified_kv_decode,
+            Some(target_token),
+            false,
+            timing_slot,
+        )?;
+        let nll = nll.ok_or_else(|| anyhow::anyhow!("component target NLL missing output"))?;
+        Ok((nll, timings))
+    }
+
+    pub fn reset_target_nll_accum(&mut self) -> Result<()> {
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            self.target_nll_accum.as_mut_ptr(),
+            self.target_nll_accum.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("target NLL accumulator reset: {e}"))
+    }
+
+    pub fn read_target_nll_accum(&self) -> Result<f32> {
+        let bytes = self
+            .target_nll_accum
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("target NLL accumulator D2H: {e}"))?;
+        Ok(f32::from_le_bytes(bytes[..4].try_into().map_err(|_| {
+            anyhow::anyhow!("target NLL accumulator D2H truncated")
+        })?))
+    }
+
+    pub fn component_decode_step_4b_accumulate_target_nll(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        target_token: u32,
+        certified_kv_decode: Option<CertifiedKvDecodeParams>,
+        collect_timings: bool,
+    ) -> Result<DecodeStageTimings> {
+        let mut timings = DecodeStageTimings::default();
+        let timing_slot = if collect_timings {
+            Some(&mut timings)
+        } else {
+            None
+        };
+        let (_, _, nll, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            certified_kv_decode,
+            Some(target_token),
+            true,
+            timing_slot,
+        )?;
+        nll.ok_or_else(|| anyhow::anyhow!("component accumulated target NLL missing marker"))?;
+        Ok(timings)
     }
 
     pub fn component_decode_step_4b_certified_kv_cuda_fast_greedy(
@@ -3926,7 +4047,7 @@ impl DecodeEngine {
         } else {
             None
         };
-        let (_, sampled_token, _, _, _) = self.component_decode_step_4b_impl(
+        let (_, sampled_token, _, _, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3934,6 +4055,8 @@ impl DecodeEngine {
             None,
             true,
             Some(certified_kv_decode),
+            None,
+            false,
             timing_slot,
         )?;
         let sampled_token = sampled_token
@@ -3947,7 +4070,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_input_layer: usize,
     ) -> Result<(Vec<f32>, Vec<u8>)> {
-        let (logits, _, trace, _, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, trace, _, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             Some(trace_input_layer),
@@ -3955,6 +4078,8 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
+            false,
             None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component trace missing logits"))?;
@@ -3969,7 +4094,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLayerTrace)> {
-        let (logits, _, _, trace, _) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, trace, _) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -3977,6 +4102,8 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
+            false,
             None,
         )?;
         let logits =
@@ -3992,7 +4119,7 @@ impl DecodeEngine {
         seqlen_offset: usize,
         trace_layer: usize,
     ) -> Result<(Vec<f32>, ComponentLinearTrace)> {
-        let (logits, _, _, _, trace) = self.component_decode_step_4b_impl(
+        let (logits, _, _, _, _, trace) = self.component_decode_step_4b_impl(
             token_id,
             seqlen_offset,
             None,
@@ -4000,6 +4127,8 @@ impl DecodeEngine {
             Some(trace_layer),
             false,
             None,
+            None,
+            false,
             None,
         )?;
         let logits =
@@ -5132,6 +5261,23 @@ impl DecodeEngine {
                             })?,
                     );
                 }
+                let final_block_mass_shape = [num_q_heads, aligned / block_size];
+                if aligned > 0
+                    && scratch
+                        .certified_final_block_mass
+                        .as_ref()
+                        .map(|buf| buf.shape() != final_block_mass_shape)
+                        .unwrap_or(true)
+                {
+                    scratch.certified_final_block_mass = Some(
+                        GpuBuffer::zeros(self.ordinal, ScalarType::F32, &final_block_mass_shape)
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV final block mass alloc: {e}"
+                                )
+                            })?,
+                    );
+                }
                 let score_scratch = scratch.certified_score_scratch.as_mut().unwrap();
                 if bf16_values {
                     let full_value_gpu_ref = full_value_gpu_ref.ok_or_else(|| {
@@ -5454,312 +5600,621 @@ impl DecodeEngine {
                         ls.certified_kv_value_tokens = aligned;
                     }
                     let num_blocks = aligned / block_size;
-                    let block_score_shape = [num_q_heads, num_blocks];
-                    if scratch
-                        .certified_block_max
-                        .as_ref()
-                        .map(|buf| buf.shape() != block_score_shape)
-                        .unwrap_or(true)
-                    {
-                        scratch.certified_block_max = Some(
-                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV block_max alloc: {e}")
-                                })?,
-                        );
-                    }
-                    if scratch
-                        .certified_block_sum
-                        .as_ref()
-                        .map(|buf| buf.shape() != block_score_shape)
-                        .unwrap_or(true)
-                    {
-                        scratch.certified_block_sum = Some(
-                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
-                                .map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV block_sum alloc: {e}")
-                                })?,
-                        );
-                    }
-                    let cert_score_start = Instant::now();
-                    kernel_ffi::certified_kv::score_blocks_int8(
-                        self.ordinal,
-                        attn_q,
-                        key_i8,
-                        key_scale,
-                        key_zero,
-                        block_size,
-                        num_q_heads / num_kv_heads,
-                        1.0 / (head_dim as f32).sqrt(),
-                        scratch.certified_block_max.as_mut().unwrap(),
-                        scratch.certified_block_sum.as_mut().unwrap(),
-                    )
-                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV score blocks: {e}"))?;
-                    let block_max_host = decode_f32_le(
-                        &scratch
-                            .certified_block_max
-                            .as_ref()
-                            .unwrap()
-                            .to_host_bytes()
-                            .map_err(|e| {
-                                anyhow::anyhow!("layer {idx} certified KV block_max D2H: {e}")
-                            })?,
-                    );
-                    let block_sum_host = decode_f32_le(
-                        &scratch
-                            .certified_block_sum
-                            .as_ref()
-                            .unwrap()
-                            .to_host_bytes()
-                            .map_err(|e| {
-                                anyhow::anyhow!("layer {idx} certified KV block_sum D2H: {e}")
-                            })?,
-                    );
-                    let query_f32_all =
-                        decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
-                        })?);
-                    if let Some(t) = timings.as_mut() {
-                        t.certified_kv_score_ms +=
-                            cert_score_start.elapsed().as_secs_f64() * 1000.0;
-                    }
                     let gqa_group = num_q_heads / num_kv_heads;
                     let q_scale = 1.0 / (head_dim as f32).sqrt();
                     let key_stride_tokens = key_i8.shape()[1];
                     let key_scale_stride_blocks = key_scale.shape()[1];
                     let value_error_stride_blocks =
                         ls.certified_kv_value_error.as_ref().unwrap().shape()[1];
-                    let need_meta_refresh = ls.certified_kv_host_meta_blocks != num_blocks
-                        || ls.certified_kv_host_meta_key_stride_tokens != key_stride_tokens
-                        || ls.certified_kv_host_meta_key_scale_stride_blocks
-                            != key_scale_stride_blocks
-                        || ls.certified_kv_host_meta_value_error_stride_blocks
-                            != value_error_stride_blocks;
-                    if need_meta_refresh {
-                        ls.certified_kv_host_value_error_cache = decode_f32_le(
-                            &ls.certified_kv_value_error
-                                .as_ref()
-                                .unwrap()
-                                .to_host_bytes()
-                                .map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV value_error D2H: {e}")
-                                })?,
-                        );
-                        ls.certified_kv_host_value_norm_cache = decode_f32_le(
-                            &ls.certified_kv_value_norm
-                                .as_ref()
-                                .unwrap()
-                                .to_host_bytes()
-                                .map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV value_norm D2H: {e}")
-                                })?,
-                        );
-                        ls.certified_kv_host_key_scale_cache =
-                            decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
-                                anyhow::anyhow!("layer {idx} certified KV key_scale D2H: {e}")
-                            })?);
-                        ls.certified_kv_host_meta_blocks = num_blocks;
-                        ls.certified_kv_host_meta_key_stride_tokens = key_stride_tokens;
-                        ls.certified_kv_host_meta_key_scale_stride_blocks = key_scale_stride_blocks;
-                        ls.certified_kv_host_meta_value_error_stride_blocks =
-                            value_error_stride_blocks;
+                    // The all-promoted shortcut is only exact when the configured top-K
+                    // budget covers the whole cache before scoring. Rung 1 is conditional
+                    // on the certified tail bound, so it cannot be used to skip Phase 1.
+                    let key_budget_covers_all_blocks = cfg.k_max >= num_blocks;
+                    let use_device_selector =
+                        !key_budget_covers_all_blocks && cfg.ranking_r <= 1 && num_blocks <= 2048;
+                    let mut block_max_host = Vec::new();
+                    let mut block_sum_host = Vec::new();
+                    let mut query_f32_all = Vec::new();
+                    if !key_budget_covers_all_blocks {
+                        let block_score_shape = [num_q_heads, num_blocks];
+                        if scratch
+                            .certified_block_max
+                            .as_ref()
+                            .map(|buf| buf.shape() != block_score_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_block_max = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV block_max alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        if scratch
+                            .certified_block_sum
+                            .as_ref()
+                            .map(|buf| buf.shape() != block_score_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_block_sum = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV block_sum alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        let cert_score_start = Instant::now();
+                        kernel_ffi::certified_kv::score_blocks_int8(
+                            self.ordinal,
+                            attn_q,
+                            key_i8,
+                            key_scale,
+                            key_zero,
+                            block_size,
+                            gqa_group,
+                            q_scale,
+                            scratch.certified_block_max.as_mut().unwrap(),
+                            scratch.certified_block_sum.as_mut().unwrap(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV score blocks: {e}")
+                        })?;
+                        if !use_device_selector {
+                            block_max_host = decode_f32_le(
+                                &scratch
+                                    .certified_block_max
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV block_max D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            block_sum_host = decode_f32_le(
+                                &scratch
+                                    .certified_block_sum
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV block_sum D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            query_f32_all =
+                                decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
+                                })?);
+                        }
+                        if let Some(t) = timings.as_mut() {
+                            t.certified_kv_score_ms +=
+                                cert_score_start.elapsed().as_secs_f64() * 1000.0;
+                        }
+                        let need_meta_refresh = !use_device_selector
+                            && (ls.certified_kv_host_meta_blocks != num_blocks
+                                || ls.certified_kv_host_meta_key_stride_tokens
+                                    != key_stride_tokens
+                                || ls.certified_kv_host_meta_key_scale_stride_blocks
+                                    != key_scale_stride_blocks
+                                || ls.certified_kv_host_meta_value_error_stride_blocks
+                                    != value_error_stride_blocks);
+                        if need_meta_refresh {
+                            ls.certified_kv_host_value_error_cache = decode_f32_le(
+                                &ls.certified_kv_value_error
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV value_error D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            ls.certified_kv_host_value_norm_cache = decode_f32_le(
+                                &ls.certified_kv_value_norm
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV value_norm D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            ls.certified_kv_host_key_scale_cache =
+                                decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV key_scale D2H: {e}")
+                                })?);
+                            ls.certified_kv_host_key_scale_channel_max_cache =
+                                vec![0.0; num_kv_heads * head_dim];
+                            for kvh in 0..num_kv_heads {
+                                for block in 0..num_blocks {
+                                    let scale_base =
+                                        (kvh * key_scale_stride_blocks + block) * head_dim;
+                                    let max_base = kvh * head_dim;
+                                    for dim in 0..head_dim {
+                                        let scale =
+                                            ls.certified_kv_host_key_scale_cache[scale_base + dim];
+                                        let max_slot = &mut ls
+                                            .certified_kv_host_key_scale_channel_max_cache
+                                            [max_base + dim];
+                                        *max_slot = (*max_slot).max(scale);
+                                    }
+                                }
+                            }
+                            ls.certified_kv_host_meta_blocks = num_blocks;
+                            ls.certified_kv_host_meta_key_stride_tokens = key_stride_tokens;
+                            ls.certified_kv_host_meta_key_scale_stride_blocks =
+                                key_scale_stride_blocks;
+                            ls.certified_kv_host_meta_value_error_stride_blocks =
+                                value_error_stride_blocks;
+                        }
                     }
-                    let value_error_host = &ls.certified_kv_host_value_error_cache;
-                    let value_norm_host = &ls.certified_kv_host_value_norm_cache;
-                    let key_scale_host = &ls.certified_kv_host_key_scale_cache;
-                    let mut promote_index_host = vec![u32::MAX; num_q_heads * num_blocks];
-                    let mut value_promote_index_host = vec![u32::MAX; num_kv_heads * num_blocks];
+                    let mut promote_index_host = if key_budget_covers_all_blocks {
+                        Vec::new()
+                    } else {
+                        vec![u32::MAX; num_q_heads * num_blocks]
+                    };
+                    let mut value_promote_index_host = if key_budget_covers_all_blocks {
+                        Vec::new()
+                    } else {
+                        vec![u32::MAX; num_kv_heads * num_blocks]
+                    };
                     let mut selected_by_head = Vec::with_capacity(num_q_heads);
                     let mut max_promoted_blocks = 1usize;
                     let mut value_promote_flags = vec![false; num_kv_heads * num_blocks];
-                    let mut value_escalation_heads = 0usize;
-                    let mut force_dense_layer_fallback = false;
+                    // Recoverable certificate failures are handled by the Rung-3
+                    // per-head dense path. Keep Rung-4 available for future
+                    // unrecoverable layer-wide failures without making common
+                    // tail-bound misses recompute every query head.
+                    let force_dense_layer_fallback = false;
+                    let mut dense_fallback_qhead_flags = vec![false; num_q_heads];
                     let tier2_key = ls.certified_kv_host_k.as_ref().unwrap().as_bytes();
                     let mut delta_blocks_by_head = Vec::with_capacity(num_q_heads);
-                    let mut probs_by_head = Vec::with_capacity(num_q_heads);
                     let mut e_key_by_head = Vec::with_capacity(num_q_heads);
-                    let key_budget_covers_all_blocks = cfg.k_max >= num_blocks
-                        || ((cfg.k_max as f32) * cfg.rung1_multiplier).ceil() as usize
-                            >= num_blocks;
+                    let mut delta_tail_by_head = Vec::with_capacity(num_q_heads);
+                    let mut vmax_by_head = Vec::with_capacity(num_q_heads);
+                    let mut true_tail_bound_by_head = Vec::with_capacity(num_q_heads);
+                    let collect_cert_host_telemetry =
+                        std::env::var_os("SUPERSONIC_CERTIFIED_HOST_TELEMETRY").is_some();
                     let cert_selector_start = Instant::now();
-                    for qh in 0..num_q_heads {
-                        let score_start = qh * num_blocks;
-                        let score_end = score_start + num_blocks;
-                        let kvh = qh / gqa_group;
-                        if key_budget_covers_all_blocks {
-                            let probs = certified_kv_probs_from_scores(
-                                &block_max_host[score_start..score_end],
-                                &block_sum_host[score_start..score_end],
+                    if use_device_selector {
+                        let max_device_promoted_blocks = cfg
+                            .k_max
+                            .max(cfg.k_min)
+                            .min(num_blocks)
+                            .saturating_mul(cfg.rung1_multiplier.ceil().max(1.0) as usize)
+                            .clamp(1, num_blocks);
+                        max_promoted_blocks = max_device_promoted_blocks;
+                        let promote_shape = [num_q_heads, num_blocks];
+                        let value_promote_shape = [num_kv_heads, num_blocks];
+                        let selected_shape = [num_q_heads, max_device_promoted_blocks];
+                        let head_shape = [num_q_heads];
+                        if scratch
+                            .certified_promote_index
+                            .as_ref()
+                            .map(|buf| buf.shape() != promote_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_promote_index = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &promote_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV promote index alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        if scratch
+                            .certified_value_promote_index
+                            .as_ref()
+                            .map(|buf| buf.shape() != value_promote_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_value_promote_index = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::U32,
+                                    &value_promote_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promote index alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        if scratch
+                            .certified_selected_blocks
+                            .as_ref()
+                            .map(|buf| buf.shape() != selected_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_selected_blocks = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &selected_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV selected block alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        if scratch
+                            .certified_selected_counts
+                            .as_ref()
+                            .map(|buf| buf.shape() != head_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_selected_counts = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &head_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV selected count alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        if scratch
+                            .certified_ranking_fallback_head_flags
+                            .as_ref()
+                            .map(|buf| buf.shape() != head_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_ranking_fallback_head_flags = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &head_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV fallback flag alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        let score_shape = [num_q_heads, num_blocks];
+                        if scratch
+                            .certified_delta_blocks
+                            .as_ref()
+                            .map(|buf| buf.shape() != score_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_delta_blocks = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &score_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV delta block alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        let scale_norm_shape = [num_kv_heads, num_blocks];
+                        if scratch
+                            .certified_key_scale_norm
+                            .as_ref()
+                            .map(|buf| buf.shape() != scale_norm_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_key_scale_norm = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &scale_norm_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV key-scale norm alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                        }
+                        let refresh_key_scale_norm =
+                            ls.certified_kv_device_meta_key_scale_norm_blocks != num_blocks
+                                || ls.certified_kv_device_meta_key_scale_stride_blocks
+                                    != key_scale_stride_blocks;
+                        if refresh_key_scale_norm {
+                            kernel_ffi::certified_kv::key_scale_norms(
+                                self.ordinal,
+                                key_scale,
+                                scratch.certified_key_scale_norm.as_mut().unwrap(),
+                                num_blocks,
                             )
                             .map_err(|e| {
                                 anyhow::anyhow!(
-                                    "layer {idx} q_head {qh} certified KV probability pass: {e}"
+                                    "layer {idx} certified KV key-scale norm prepass: {e}"
                                 )
                             })?;
-                            let mut requires_value_escalation = false;
+                            ls.certified_kv_device_meta_key_scale_norm_blocks = num_blocks;
+                            ls.certified_kv_device_meta_key_scale_stride_blocks =
+                                key_scale_stride_blocks;
+                        }
+                        for (slot, name) in [
+                            (&mut scratch.certified_selector_e_key, "e-key"),
+                            (&mut scratch.certified_selector_delta_tail, "delta-tail"),
+                            (&mut scratch.certified_selector_vmax, "vmax"),
+                            (&mut scratch.certified_selector_true_tail, "true-tail"),
+                        ] {
+                            if slot
+                                .as_ref()
+                                .map(|buf| buf.shape() != head_shape)
+                                .unwrap_or(true)
+                            {
+                                *slot = Some(
+                                    GpuBuffer::zeros(self.ordinal, ScalarType::F32, &head_shape)
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "layer {idx} certified KV selector {name} alloc: {e}"
+                                            )
+                                        })?,
+                                );
+                            }
+                        }
+                        kernel_ffi::certified_kv::select_blocks_device(
+                            self.ordinal,
+                            attn_q,
+                            scratch.certified_key_scale_norm.as_ref().unwrap(),
+                            scratch.certified_block_max.as_ref().unwrap(),
+                            scratch.certified_block_sum.as_ref().unwrap(),
+                            ls.certified_kv_value_norm.as_ref().unwrap(),
+                            scratch.certified_promote_index.as_mut().unwrap(),
+                            scratch.certified_value_promote_index.as_mut().unwrap(),
+                            scratch.certified_selected_blocks.as_mut().unwrap(),
+                            scratch.certified_selected_counts.as_mut().unwrap(),
+                            scratch
+                                .certified_ranking_fallback_head_flags
+                                .as_mut()
+                                .unwrap(),
+                            scratch.certified_delta_blocks.as_mut().unwrap(),
+                            scratch.certified_selector_e_key.as_mut().unwrap(),
+                            scratch.certified_selector_delta_tail.as_mut().unwrap(),
+                            scratch.certified_selector_vmax.as_mut().unwrap(),
+                            scratch.certified_selector_true_tail.as_mut().unwrap(),
+                            gqa_group,
+                            cfg.k_min,
+                            cfg.k_max,
+                            max_device_promoted_blocks,
+                            q_scale,
+                            cfg.tau_cov,
+                            cfg.rung1_threshold,
+                            cfg.rung1_multiplier,
+                            cfg.delta_guard_factor,
+                            cfg.score_exploration_rate,
+                            cfg.require_certified_tail_bound,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV device selector: {e}")
+                        })?;
+                        selected_by_head.resize_with(num_q_heads, Vec::new);
+                        if collect_cert_host_telemetry {
+                            dense_fallback_qhead_flags = decode_u32_le(
+                                &scratch
+                                    .certified_ranking_fallback_head_flags
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV fallback flags D2H: {e}"
+                                        )
+                                    })?,
+                            )
+                            .into_iter()
+                            .map(|flag| flag != 0)
+                            .collect();
+                            if let Some(t) = timings.as_mut() {
+                                t.certified_kv_uncertified_tail_heads += dense_fallback_qhead_flags
+                                    .iter()
+                                    .filter(|&&flag| flag)
+                                    .count();
+                            }
+                            e_key_by_head = decode_f32_le(
+                                &scratch
+                                    .certified_selector_e_key
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("layer {idx} certified KV e-key D2H: {e}")
+                                    })?,
+                            );
+                            delta_tail_by_head = decode_f32_le(
+                                &scratch
+                                    .certified_selector_delta_tail
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV delta-tail D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            vmax_by_head = decode_f32_le(
+                                &scratch
+                                    .certified_selector_vmax
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!("layer {idx} certified KV vmax D2H: {e}")
+                                    })?,
+                            );
+                            true_tail_bound_by_head = decode_f32_le(
+                                &scratch
+                                    .certified_selector_true_tail
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV true-tail D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                        } else {
+                            e_key_by_head.resize(num_q_heads, 0.0);
+                            delta_tail_by_head.resize(num_q_heads, 0.0);
+                            vmax_by_head.resize(num_q_heads, 0.0);
+                            true_tail_bound_by_head.resize(num_q_heads, 0.0);
+                        }
+                    } else {
+                        for qh in 0..num_q_heads {
+                            let score_start = qh * num_blocks;
+                            let score_end = score_start + num_blocks;
+                            let kvh = qh / gqa_group;
+                            if key_budget_covers_all_blocks {
+                                let selected_indices: Vec<usize> = (0..num_blocks).collect();
+                                e_key_by_head.push(0.0);
+                                delta_tail_by_head.push(0.0);
+                                vmax_by_head.push(0.0);
+                                true_tail_bound_by_head.push(0.0);
+                                delta_blocks_by_head.push(vec![0.0; num_blocks]);
+                                max_promoted_blocks = max_promoted_blocks.max(num_blocks);
+                                selected_by_head.push(selected_indices);
+                                continue;
+                            }
+                            let value_error_host = &ls.certified_kv_host_value_error_cache;
+                            let value_norm_host = &ls.certified_kv_host_value_norm_cache;
+                            let key_scale_channel_max_host =
+                                &ls.certified_kv_host_key_scale_channel_max_cache;
+                            let delta_global = certified_kv_score_delta_from_channel_max(
+                                &query_f32_all,
+                                key_scale_channel_max_host,
+                                qh,
+                                kvh,
+                                head_dim,
+                                q_scale,
+                            );
+                            let delta_blocks = vec![delta_global; num_blocks];
+                            let (_, _selector_true_tail_bound, _, probs, mut selected_indices) =
+                                certified_kv_select_block_indices_from_scores(
+                                    &block_max_host[score_start..score_end],
+                                    &block_sum_host[score_start..score_end],
+                                    Some(&delta_blocks),
+                                    cfg.tau_cov,
+                                    cfg.k_min,
+                                    cfg.k_max,
+                                    cfg.rung1_threshold,
+                                    cfg.rung1_multiplier,
+                                    cfg.delta_guard_factor,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} q_head {qh} certified KV selector: {e}"
+                                    )
+                                })?;
                             for (block, prob) in probs.iter().enumerate() {
                                 let value_contribution = prob
                                     * value_error_host[kvh * value_error_stride_blocks + block];
                                 if value_contribution > cfg.v_tol {
                                     value_promote_flags[kvh * num_blocks + block] = true;
-                                    requires_value_escalation = true;
                                 }
                             }
-                            if requires_value_escalation {
-                                value_escalation_heads += 1;
-                            }
-                            let selected_indices: Vec<usize> = (0..num_blocks).collect();
-                            for block in 0..num_blocks {
-                                promote_index_host[score_start + block] = block as u32;
-                            }
-                            probs_by_head.push(probs);
-                            e_key_by_head.push(0.0);
-                            delta_blocks_by_head.push(vec![0.0; num_blocks]);
-                            max_promoted_blocks = max_promoted_blocks.max(num_blocks);
-                            selected_by_head.push(selected_indices);
-                            if let Some(t) = timings.as_mut() {
-                                t.certified_kv_true_tail_bound_max =
-                                    t.certified_kv_true_tail_bound_max.max(0.0);
-                            }
-                            continue;
-                        }
-                        let delta_blocks = certified_kv_score_delta_blocks(
-                            &query_f32_all,
-                            &key_scale_host,
-                            qh,
-                            kvh,
-                            num_blocks,
-                            key_scale_stride_blocks,
-                            head_dim,
-                            q_scale,
-                        );
-                        let (_, true_tail_bound, _, probs, mut selected_indices) =
-                            certified_kv_select_block_indices_from_scores(
-                                &block_max_host[score_start..score_end],
-                                &block_sum_host[score_start..score_end],
-                                Some(&delta_blocks),
-                                cfg.tau_cov,
-                                cfg.k_min,
-                                cfg.k_max,
-                                cfg.rung1_threshold,
-                                cfg.rung1_multiplier,
-                                cfg.delta_guard_factor,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} q_head {qh} certified KV selector: {e}"
-                                )
-                            })?;
-                        if cfg.require_certified_tail_bound && true_tail_bound > cfg.rung1_threshold
-                        {
-                            force_dense_layer_fallback = true;
-                            if let Some(t) = timings.as_mut() {
-                                t.certified_kv_uncertified_tail_heads += 1;
-                            }
-                        }
-                        let mut requires_value_escalation = false;
-                        for (block, prob) in probs.iter().enumerate() {
-                            let value_contribution =
-                                prob * value_error_host[kvh * value_error_stride_blocks + block];
-                            if value_contribution > cfg.v_tol {
-                                value_promote_flags[kvh * num_blocks + block] = true;
-                                requires_value_escalation = true;
-                            }
-                        }
-                        if requires_value_escalation {
-                            value_escalation_heads += 1;
-                        }
-                        let selected_set: std::collections::HashSet<usize> =
-                            selected_indices.iter().copied().collect();
-                        let delta_tail = (0..num_blocks)
-                            .filter(|block| !selected_set.contains(block))
-                            .map(|block| delta_blocks[block])
-                            .fold(0.0f32, f32::max);
-                        let vmax = certified_kv_vmax_for_head(
-                            &value_norm_host,
-                            kvh,
-                            num_blocks,
-                            value_error_stride_blocks,
-                            &selected_indices,
-                        );
-                        let e_key = certified_kv_key_error_bound(vmax, true_tail_bound, delta_tail);
-                        if let Some(t) = timings.as_mut() {
-                            t.certified_kv_e_key_max = t.certified_kv_e_key_max.max(e_key);
-                            t.certified_kv_delta_tail_max =
-                                t.certified_kv_delta_tail_max.max(delta_tail);
-                            t.certified_kv_vmax_max = t.certified_kv_vmax_max.max(vmax);
-                            t.certified_kv_true_tail_bound_max =
-                                t.certified_kv_true_tail_bound_max.max(true_tail_bound);
-                        }
-                        if cfg.ranking_r > 0 && CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS > 0
-                        {
-                            let mut selected_set: std::collections::HashSet<usize> =
-                                selected_indices.iter().copied().collect();
-                            let mut repaired_blocks = 0usize;
-                            loop {
-                                let fp16_selected_log_masses =
-                                    certified_kv_selected_block_fp16_log_masses_from_tier2(
-                                        &query_f32_all,
-                                        tier2_key,
-                                        qh,
-                                        kvh,
+                            if cfg.ranking_r > 0
+                                && CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS > 0
+                            {
+                                let mut selected_set: std::collections::HashSet<usize> =
+                                    selected_indices.iter().copied().collect();
+                                let mut repaired_blocks = 0usize;
+                                loop {
+                                    let fp16_selected_log_masses =
+                                        certified_kv_selected_block_fp16_log_masses_from_tier2(
+                                            &query_f32_all,
+                                            tier2_key,
+                                            qh,
+                                            kvh,
+                                            &selected_indices,
+                                            cap,
+                                            block_size,
+                                            head_dim,
+                                            q_scale,
+                                        );
+                                    let violators = certified_kv_ranking_boundary_violators(
+                                        &block_max_host[score_start..score_end],
+                                        &block_sum_host[score_start..score_end],
+                                        &delta_blocks,
+                                        &fp16_selected_log_masses,
                                         &selected_indices,
-                                        cap,
-                                        block_size,
-                                        head_dim,
-                                        q_scale,
+                                        cfg.ranking_r,
                                     );
-                                let violators = certified_kv_ranking_boundary_violators(
-                                    &block_max_host[score_start..score_end],
-                                    &block_sum_host[score_start..score_end],
-                                    &delta_blocks,
-                                    &fp16_selected_log_masses,
-                                    &selected_indices,
-                                    cfg.ranking_r,
-                                );
-                                if violators.is_empty()
-                                    || selected_indices.len() >= num_blocks
-                                    || repaired_blocks
-                                        >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
-                                {
-                                    break;
-                                }
-                                for block in violators {
-                                    if repaired_blocks
-                                        >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
+                                    if violators.is_empty()
+                                        || selected_indices.len() >= num_blocks
+                                        || repaired_blocks
+                                            >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
                                     {
                                         break;
                                     }
-                                    if selected_set.insert(block) {
-                                        selected_indices.push(block);
-                                        repaired_blocks += 1;
+                                    for block in violators {
+                                        if repaired_blocks
+                                            >= CERTIFIED_KV_MAX_RANKING_BOUNDARY_REPAIR_BLOCKS
+                                        {
+                                            break;
+                                        }
+                                        if selected_set.insert(block) {
+                                            selected_indices.push(block);
+                                            repaired_blocks += 1;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if cfg.score_exploration_rate > 0.0 && selected_indices.len() < num_blocks {
-                            let period =
-                                (1.0 / cfg.score_exploration_rate).ceil().max(1.0) as usize;
-                            let mut selected_set: std::collections::HashSet<usize> =
-                                selected_indices.iter().copied().collect();
-                            for block in 0..num_blocks {
-                                if selected_set.contains(&block) {
-                                    continue;
-                                }
-                                if ((block.wrapping_mul(1_103_515_245) ^ qh) % period) == 0 {
-                                    selected_set.insert(block);
-                                    selected_indices.push(block);
+                            let mut selected_flags = vec![false; num_blocks];
+                            for &block in &selected_indices {
+                                selected_flags[block] = true;
+                            }
+                            if cfg.score_exploration_rate > 0.0
+                                && selected_indices.len() < num_blocks
+                            {
+                                let period =
+                                    (1.0 / cfg.score_exploration_rate).ceil().max(1.0) as usize;
+                                for block in 0..num_blocks {
+                                    if selected_flags[block] {
+                                        continue;
+                                    }
+                                    if ((block.wrapping_mul(1_103_515_245) ^ qh) % period) == 0 {
+                                        selected_flags[block] = true;
+                                        selected_indices.push(block);
+                                    }
                                 }
                             }
+                            let tail_mass = (0..num_blocks)
+                                .filter(|&block| !selected_flags[block])
+                                .map(|block| probs[block])
+                                .sum::<f32>()
+                                .max(0.0);
+                            let delta_tail = (0..num_blocks)
+                                .filter(|&block| !selected_flags[block])
+                                .map(|block| delta_blocks[block])
+                                .fold(0.0f32, f32::max);
+                            let true_tail_bound =
+                                (cfg.delta_guard_factor * delta_tail).exp() * tail_mass;
+                            if cfg.require_certified_tail_bound
+                                && true_tail_bound > cfg.rung1_threshold
+                            {
+                                dense_fallback_qhead_flags[qh] = true;
+                                if let Some(t) = timings.as_mut() {
+                                    t.certified_kv_uncertified_tail_heads += 1;
+                                }
+                            }
+                            let vmax = certified_kv_vmax_for_head(
+                                &value_norm_host,
+                                kvh,
+                                num_blocks,
+                                value_error_stride_blocks,
+                                &selected_flags,
+                            );
+                            let e_key =
+                                certified_kv_key_error_bound(vmax, true_tail_bound, delta_tail);
+                            e_key_by_head.push(e_key);
+                            delta_tail_by_head.push(delta_tail);
+                            vmax_by_head.push(vmax);
+                            true_tail_bound_by_head.push(true_tail_bound);
+                            delta_blocks_by_head.push(delta_blocks);
+                            max_promoted_blocks = max_promoted_blocks.max(selected_indices.len());
+                            for (slot, &block) in selected_indices.iter().enumerate() {
+                                promote_index_host[score_start + block] = slot as u32;
+                            }
+                            selected_by_head.push(selected_indices);
                         }
-                        probs_by_head.push(probs);
-                        e_key_by_head.push(e_key);
-                        delta_blocks_by_head.push(delta_blocks);
-                        max_promoted_blocks = max_promoted_blocks.max(selected_indices.len());
-                        for (slot, &block) in selected_indices.iter().enumerate() {
-                            promote_index_host[score_start + block] = slot as u32;
-                        }
-                        selected_by_head.push(selected_indices);
                     }
                     let mut selected_value_blocks_by_kvh = Vec::with_capacity(num_kv_heads);
                     let mut max_promoted_value_blocks = 1usize;
@@ -5776,23 +6231,104 @@ impl DecodeEngine {
                             max_promoted_value_blocks.max(selected_blocks.len());
                         selected_value_blocks_by_kvh.push(selected_blocks);
                     }
-                    if let Some(t) = timings.as_mut() {
-                        for qh in 0..num_q_heads {
-                            let kvh = qh / gqa_group;
-                            let mut e_val = 0.0f32;
-                            for (block, prob) in probs_by_head[qh].iter().enumerate() {
-                                if !value_promote_flags[kvh * num_blocks + block] {
-                                    e_val += prob
-                                        * value_error_host[kvh * value_error_stride_blocks + block];
-                                }
-                            }
-                            t.certified_kv_e_val_max = t.certified_kv_e_val_max.max(e_val);
-                            t.certified_kv_bound_total_max = t
-                                .certified_kv_bound_total_max
-                                .max(e_key_by_head[qh] + e_val);
+                    let has_value_promotions = selected_value_blocks_by_kvh
+                        .iter()
+                        .any(|blocks| !blocks.is_empty());
+                    let value_cache_capacity = cfg.value_cache_blocks.max(1);
+                    let initial_value_cache_fits_step = selected_value_blocks_by_kvh
+                        .iter()
+                        .all(|blocks| blocks.len() <= value_cache_capacity);
+                    let use_initial_value_cache = !key_budget_covers_all_blocks
+                        && cfg.value_cache_blocks > 0
+                        && has_value_promotions
+                        && initial_value_cache_fits_step;
+                    let mut value_gather_index_host = value_promote_index_host.clone();
+                    let mut value_cache_hits = 0usize;
+                    let mut value_cache_misses = 0usize;
+                    let mut value_cache_overflows = 0usize;
+                    let value_block_bytes = block_size * head_dim * elem_bytes;
+                    let selected_value_block_count = selected_value_blocks_by_kvh
+                        .iter()
+                        .map(Vec::len)
+                        .sum::<usize>();
+                    if use_initial_value_cache {
+                        let tag_len = num_kv_heads * value_cache_capacity;
+                        let cache_shape =
+                            [num_kv_heads, value_cache_capacity, block_size, head_dim];
+                        let reset_cache = ls
+                            .certified_kv_promoted_value_cache
+                            .as_ref()
+                            .map(|buf| buf.shape() != cache_shape)
+                            .unwrap_or(true)
+                            || ls.certified_kv_promoted_value_cache_capacity
+                                != value_cache_capacity
+                            || ls.certified_kv_promoted_value_cache_tags.len() != tag_len;
+                        if reset_cache {
+                            ls.certified_kv_promoted_value_cache = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &cache_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV promoted value cache alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                            ls.certified_kv_promoted_value_cache_capacity = value_cache_capacity;
+                            ls.certified_kv_promoted_value_cache_tags = vec![usize::MAX; tag_len];
+                            ls.certified_kv_promoted_value_cache_lru = vec![0; tag_len];
+                            ls.certified_kv_promoted_value_cache_tick = 0;
                         }
+                        value_promote_index_host.fill(u32::MAX);
+                        value_gather_index_host.fill(u32::MAX);
+                        for kvh in 0..num_kv_heads {
+                            for &block in &selected_value_blocks_by_kvh[kvh] {
+                                let base = kvh * value_cache_capacity;
+                                ls.certified_kv_promoted_value_cache_tick =
+                                    ls.certified_kv_promoted_value_cache_tick.wrapping_add(1);
+                                let tick = ls.certified_kv_promoted_value_cache_tick;
+                                let mut slot = (0..value_cache_capacity).find(|&s| {
+                                    ls.certified_kv_promoted_value_cache_tags[base + s] == block
+                                });
+                                if let Some(s) = slot {
+                                    value_cache_hits += 1;
+                                    ls.certified_kv_promoted_value_cache_lru[base + s] = tick;
+                                } else {
+                                    value_cache_misses += 1;
+                                    slot = (0..value_cache_capacity).find(|&s| {
+                                        ls.certified_kv_promoted_value_cache_tags[base + s]
+                                            == usize::MAX
+                                    });
+                                    let s = if let Some(s) = slot {
+                                        s
+                                    } else {
+                                        value_cache_overflows += 1;
+                                        (0..value_cache_capacity)
+                                            .min_by_key(|&s| {
+                                                ls.certified_kv_promoted_value_cache_lru[base + s]
+                                            })
+                                            .unwrap_or(0)
+                                    };
+                                    ls.certified_kv_promoted_value_cache_tags[base + s] = block;
+                                    ls.certified_kv_promoted_value_cache_lru[base + s] = tick;
+                                    value_gather_index_host[kvh * num_blocks + block] = s as u32;
+                                    slot = Some(s);
+                                }
+                                value_promote_index_host[kvh * num_blocks + block] =
+                                    slot.unwrap() as u32;
+                            }
+                        }
+                        max_promoted_value_blocks = value_cache_capacity;
+                    }
+                    if let Some(t) = timings.as_mut() {
                         t.certified_kv_selector_ms +=
                             cert_selector_start.elapsed().as_secs_f64() * 1000.0;
+                        t.certified_kv_promoted_value_cache_hits += value_cache_hits;
+                        t.certified_kv_promoted_value_cache_misses += value_cache_misses;
+                        t.certified_kv_promoted_value_cache_overflows += value_cache_overflows;
+                        t.certified_kv_promoted_value_h2d_bytes += if use_initial_value_cache {
+                            value_cache_misses * value_block_bytes
+                        } else {
+                            selected_value_block_count * value_block_bytes
+                        };
                     }
                     let promoted_key_shape = if key_budget_covers_all_blocks {
                         [num_kv_heads, num_blocks, block_size, head_dim]
@@ -5837,6 +6373,65 @@ impl DecodeEngine {
                             })?,
                         );
                     }
+                    if scratch
+                        .certified_value_promotion_counters
+                        .as_ref()
+                        .map(|buf| buf.shape() != [num_kv_heads])
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_value_promotion_counters = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[num_kv_heads])
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promotion counters alloc: {e}"
+                                    )
+                                })?,
+                        );
+                    }
+                    if scratch
+                        .certified_value_promotion_any
+                        .as_ref()
+                        .map(|buf| buf.shape() != [1])
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_value_promotion_any = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[1]).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value promotion flag alloc: {e}"
+                                )
+                            })?,
+                        );
+                    }
+                    if scratch
+                        .certified_value_promotion_head_flags
+                        .as_ref()
+                        .map(|buf| buf.shape() != [num_q_heads])
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_value_promotion_head_flags = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[num_q_heads])
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promotion head flags alloc: {e}"
+                                    )
+                                })?,
+                        );
+                    }
+                    if scratch
+                        .certified_value_e_val_by_head
+                        .as_ref()
+                        .map(|buf| buf.shape() != [num_q_heads])
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_value_e_val_by_head = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &[num_q_heads])
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV e_val-by-head alloc: {e}"
+                                    )
+                                })?,
+                        );
+                    }
                     if key_budget_covers_all_blocks {
                         if ls
                             .certified_kv_promoted_key_cache
@@ -5871,60 +6466,85 @@ impl DecodeEngine {
                             })?,
                         );
                     }
-                    if scratch
-                        .certified_promoted_value_bf16
-                        .as_ref()
-                        .map(|buf| buf.shape() != promoted_value_shape)
-                        .unwrap_or(true)
-                    {
-                        scratch.certified_promoted_value_bf16 = Some(
-                            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &promoted_value_shape)
+                    if !use_initial_value_cache {
+                        if scratch
+                            .certified_promoted_value_bf16
+                            .as_ref()
+                            .map(|buf| buf.shape() != promoted_value_shape)
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_promoted_value_bf16 = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::BF16,
+                                    &promoted_value_shape,
+                                )
                                 .map_err(|e| {
                                     anyhow::anyhow!(
                                         "layer {idx} certified KV promoted value alloc: {e}"
                                     )
                                 })?,
-                        );
+                            );
+                        }
                     }
-                    let promote_index_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            promote_index_host.as_ptr() as *const u8,
-                            promote_index_host.len() * std::mem::size_of::<u32>(),
-                        )
-                    };
-                    let value_promote_index_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            value_promote_index_host.as_ptr() as *const u8,
-                            value_promote_index_host.len() * std::mem::size_of::<u32>(),
-                        )
-                    };
                     let cert_gather_start = Instant::now();
-                    gpu_hal::copy_h2d(
-                        self.ordinal,
-                        scratch
-                            .certified_promote_index
-                            .as_mut()
-                            .unwrap()
-                            .as_mut_ptr(),
-                        promote_index_bytes.as_ptr() as *const c_void,
-                        promote_index_bytes.len(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV promote index H2D: {e}")
-                    })?;
-                    gpu_hal::copy_h2d(
-                        self.ordinal,
-                        scratch
-                            .certified_value_promote_index
-                            .as_mut()
-                            .unwrap()
-                            .as_mut_ptr(),
-                        value_promote_index_bytes.as_ptr() as *const c_void,
-                        value_promote_index_bytes.len(),
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV value promote index H2D: {e}")
-                    })?;
+                    if key_budget_covers_all_blocks {
+                        let promote_index_buf = scratch.certified_promote_index.as_mut().unwrap();
+                        let value_promote_index_buf =
+                            scratch.certified_value_promote_index.as_mut().unwrap();
+                        kernel_ffi::certified_kv::init_all_promoted_indices(
+                            self.ordinal,
+                            promote_index_buf,
+                            value_promote_index_buf,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV all-promoted index init: {e}")
+                        })?;
+                    } else if !use_device_selector {
+                        let promote_index_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                promote_index_host.as_ptr() as *const u8,
+                                promote_index_host.len() * std::mem::size_of::<u32>(),
+                            )
+                        };
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_promote_index
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            promote_index_bytes.as_ptr() as *const c_void,
+                            promote_index_bytes.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV promote index H2D: {e}")
+                        })?;
+                        let value_promote_upload = if use_initial_value_cache {
+                            &value_gather_index_host
+                        } else {
+                            &value_promote_index_host
+                        };
+                        let value_promote_index_bytes = unsafe {
+                            std::slice::from_raw_parts(
+                                value_promote_upload.as_ptr() as *const u8,
+                                value_promote_upload.len() * std::mem::size_of::<u32>(),
+                            )
+                        };
+                        gpu_hal::copy_h2d(
+                            self.ordinal,
+                            scratch
+                                .certified_value_promote_index
+                                .as_mut()
+                                .unwrap()
+                                .as_mut_ptr(),
+                            value_promote_index_bytes.as_ptr() as *const c_void,
+                            value_promote_index_bytes.len(),
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("layer {idx} certified KV value promote index H2D: {e}")
+                        })?;
+                    }
                     let promoted_key_cache_valid = key_budget_covers_all_blocks
                         && ls.certified_kv_promoted_key_cache_tokens >= aligned;
                     let tier2_value_device_ptr = ls
@@ -5935,9 +6555,6 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV Tier-2 value map: {e}")
                         })?;
-                    let has_value_promotions = selected_value_blocks_by_kvh
-                        .iter()
-                        .any(|blocks| !blocks.is_empty());
                     if key_budget_covers_all_blocks && promoted_key_cache_valid {
                         if has_value_promotions {
                             kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
@@ -5985,6 +6602,47 @@ impl DecodeEngine {
                                 )
                             })?;
                             ls.certified_kv_promoted_key_cache_tokens = aligned;
+                        } else if use_initial_value_cache {
+                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
+                                self.ordinal,
+                                tier2_key_device_ptr,
+                                tier2_value_device_ptr,
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                scratch.certified_promoted_key_bf16.as_mut().unwrap(),
+                                ls.certified_kv_promoted_value_cache.as_mut().unwrap(),
+                                block_size,
+                                cap,
+                                max_promoted_blocks,
+                                max_promoted_value_blocks,
+                                gqa_group,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV promoted BF16 gather through value cache: {e}"
+                                )
+                            })?;
+                            let value_promote_index_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    value_promote_index_host.as_ptr() as *const u8,
+                                    value_promote_index_host.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_value_promote_index
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                value_promote_index_bytes.as_ptr() as *const c_void,
+                                value_promote_index_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV cached value promote index H2D: {e}"
+                                )
+                            })?;
                         } else {
                             kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
                                 self.ordinal,
@@ -6035,6 +6693,14 @@ impl DecodeEngine {
                             );
                         }
                         let cert_score_consistency_start = Instant::now();
+                        let score_consistency_flags_ref = if use_device_selector {
+                            scratch
+                                .certified_ranking_fallback_head_flags
+                                .as_mut()
+                                .unwrap()
+                        } else {
+                            scratch.certified_score_consistency_flags.as_mut().unwrap()
+                        };
                         kernel_ffi::certified_kv::score_consistency(
                             self.ordinal,
                             attn_q,
@@ -6043,7 +6709,7 @@ impl DecodeEngine {
                             key_zero,
                             scratch.certified_promoted_key_bf16.as_ref().unwrap(),
                             scratch.certified_promote_index.as_ref().unwrap(),
-                            scratch.certified_score_consistency_flags.as_mut().unwrap(),
+                            score_consistency_flags_ref,
                             block_size,
                             max_promoted_blocks,
                             gqa_group,
@@ -6053,31 +6719,33 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV score consistency: {e}")
                         })?;
-                        let score_consistency_flags = scratch
-                            .certified_score_consistency_flags
-                            .as_ref()
-                            .unwrap()
-                            .to_host_bytes()
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} certified KV score-consistency flags D2H: {e}"
-                                )
-                            })?;
-                        score_consistency_violations = score_consistency_flags
-                            .chunks_exact(std::mem::size_of::<u32>())
-                            .filter(|chunk| {
-                                u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
-                            })
-                            .count();
+                        if !use_device_selector {
+                            let score_consistency_flags = scratch
+                                .certified_score_consistency_flags
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV score-consistency flags D2H: {e}"
+                                    )
+                                })?;
+                            for (qh, chunk) in score_consistency_flags
+                                .chunks_exact(std::mem::size_of::<u32>())
+                                .enumerate()
+                            {
+                                if u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
+                                {
+                                    score_consistency_violations += 1;
+                                    dense_fallback_qhead_flags[qh] = true;
+                                }
+                            }
+                        }
                         if let Some(t) = timings.as_mut() {
                             t.certified_kv_score_consistency_ms +=
                                 cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
                         }
                     }
-                    if score_consistency_violations > 0 {
-                        force_dense_layer_fallback = true;
-                    }
-                    let mut ranking_fallback_qheads = Vec::new();
                     if cfg.ranking_r > 0 && !key_budget_covers_all_blocks {
                         let selected_log_mass_shape = [num_q_heads, max_promoted_blocks];
                         if scratch
@@ -6115,54 +6783,101 @@ impl DecodeEngine {
                                 "layer {idx} certified KV selected FP16 log-masses: {e}"
                             )
                         })?;
-                        let selected_fp16_log_mass_host = decode_f32_le(
-                            &scratch
-                                .certified_selected_fp16_log_masses
-                                .as_ref()
-                                .unwrap()
-                                .to_host_bytes()
-                                .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "layer {idx} certified KV selected FP16 log-masses D2H: {e}"
-                                    )
-                                })?,
-                        );
+                        if use_device_selector {
+                            kernel_ffi::certified_kv::ranking_flags_device(
+                                self.ordinal,
+                                scratch.certified_block_max.as_ref().unwrap(),
+                                scratch.certified_block_sum.as_ref().unwrap(),
+                                scratch.certified_delta_blocks.as_ref().unwrap(),
+                                scratch.certified_selected_fp16_log_masses.as_ref().unwrap(),
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                scratch
+                                    .certified_ranking_fallback_head_flags
+                                    .as_mut()
+                                    .unwrap(),
+                                max_promoted_blocks,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV device ranking check: {e}"
+                                )
+                            })?;
+                            if collect_cert_host_telemetry {
+                                let device_fallback_flags = decode_u32_le(
+                                    &scratch
+                                        .certified_ranking_fallback_head_flags
+                                        .as_ref()
+                                        .unwrap()
+                                        .to_host_bytes()
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "layer {idx} certified KV fallback flags D2H: {e}"
+                                            )
+                                        })?,
+                                );
+                                for (qh, flag) in device_fallback_flags.into_iter().enumerate() {
+                                    if flag != 0 {
+                                        dense_fallback_qhead_flags[qh] = true;
+                                    }
+                                }
+                            }
+                        } else {
+                            let selected_fp16_log_mass_host = decode_f32_le(
+                                &scratch
+                                    .certified_selected_fp16_log_masses
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV selected FP16 log-masses D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            let cert_ranking_cpu_start = Instant::now();
+                            for qh in 0..num_q_heads {
+                                let score_start = qh * num_blocks;
+                                let score_end = score_start + num_blocks;
+                                let fp16_selected_log_masses: Vec<(usize, f32)> = selected_by_head
+                                    [qh]
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(slot, &block)| {
+                                        (
+                                            block,
+                                            selected_fp16_log_mass_host
+                                                [qh * max_promoted_blocks + slot],
+                                        )
+                                    })
+                                    .collect();
+                                if certified_kv_ranking_mismatch(
+                                    &block_max_host[score_start..score_end],
+                                    &block_sum_host[score_start..score_end],
+                                    &delta_blocks_by_head[qh],
+                                    &fp16_selected_log_masses,
+                                    &selected_by_head[qh],
+                                    cfg.ranking_r,
+                                ) {
+                                    dense_fallback_qhead_flags[qh] = true;
+                                }
+                            }
+                            if let Some(t) = timings.as_mut() {
+                                t.certified_kv_ranking_cpu_ms +=
+                                    cert_ranking_cpu_start.elapsed().as_secs_f64() * 1000.0;
+                            }
+                        }
                         if let Some(t) = timings.as_mut() {
                             t.certified_kv_rank_log_ms +=
                                 cert_rank_log_start.elapsed().as_secs_f64() * 1000.0;
                         }
-                        let cert_ranking_cpu_start = Instant::now();
-                        for qh in 0..num_q_heads {
-                            let score_start = qh * num_blocks;
-                            let score_end = score_start + num_blocks;
-                            let fp16_selected_log_masses: Vec<(usize, f32)> = selected_by_head[qh]
-                                .iter()
-                                .enumerate()
-                                .map(|(slot, &block)| {
-                                    (
-                                        block,
-                                        selected_fp16_log_mass_host
-                                            [qh * max_promoted_blocks + slot],
-                                    )
-                                })
-                                .collect();
-                            if certified_kv_ranking_mismatch(
-                                &block_max_host[score_start..score_end],
-                                &block_sum_host[score_start..score_end],
-                                &delta_blocks_by_head[qh],
-                                &fp16_selected_log_masses,
-                                &selected_by_head[qh],
-                                cfg.ranking_r,
-                            ) {
-                                ranking_fallback_qheads.push(qh);
-                            }
-                        }
-                        if let Some(t) = timings.as_mut() {
-                            t.certified_kv_ranking_cpu_ms +=
-                                cert_ranking_cpu_start.elapsed().as_secs_f64() * 1000.0;
-                        }
                     }
+                    let ranking_fallback_qheads: Vec<usize> = dense_fallback_qhead_flags
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(qh, &fallback)| fallback.then_some(qh))
+                        .collect();
                     let ranking_fallback_heads = ranking_fallback_qheads.len();
+                    let ranking_fallback_qhead_flags = dense_fallback_qhead_flags;
                     let mut ranking_fallback_kv_slots_by_kvh = vec![usize::MAX; num_kv_heads];
                     let mut ranking_fallback_kv_heads = Vec::new();
                     let mut ranking_fallback_qhead_kv_slots = Vec::new();
@@ -6177,7 +6892,6 @@ impl DecodeEngine {
                         ranking_fallback_qhead_kv_slots.push(slot as u32);
                     }
                     if let Some(t) = timings.as_mut() {
-                        t.certified_kv_value_escalation_heads += value_escalation_heads;
                         t.certified_kv_ranking_fallback_heads += ranking_fallback_heads;
                         t.certified_kv_score_consistency_violations += score_consistency_violations;
                         if force_dense_layer_fallback {
@@ -6365,6 +7079,11 @@ impl DecodeEngine {
                                 )
                             })?;
                         } else {
+                            let promoted_value_ref = if use_initial_value_cache {
+                                ls.certified_kv_promoted_value_cache.as_ref().unwrap()
+                            } else {
+                                scratch.certified_promoted_value_bf16.as_ref().unwrap()
+                            };
                             kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
                                 self.ordinal,
                                 attn_q,
@@ -6373,7 +7092,7 @@ impl DecodeEngine {
                                 key_zero,
                                 scratch.certified_promoted_key_bf16.as_ref().unwrap(),
                                 scratch.certified_promote_index.as_ref().unwrap(),
-                                scratch.certified_promoted_value_bf16.as_ref().unwrap(),
+                                promoted_value_ref,
                                 scratch.certified_value_promote_index.as_ref().unwrap(),
                                 ls.certified_kv_value_i4.as_ref().unwrap(),
                                 ls.certified_kv_value_scale.as_ref().unwrap(),
@@ -6394,7 +7113,696 @@ impl DecodeEngine {
                                 )
                             })?;
                         }
-                        if !ranking_fallback_qheads.is_empty() {
+                        kernel_ffi::certified_kv::block_masses_from_token_probs(
+                            self.ordinal,
+                            score_scratch,
+                            scratch.certified_final_block_mass.as_mut().unwrap(),
+                            block_size,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV final block mass reduction: {e}"
+                            )
+                        })?;
+                        let ranking_fallback_head_flags_ref = if use_device_selector {
+                            scratch.certified_ranking_fallback_head_flags.as_ref()
+                        } else if ranking_fallback_qheads.is_empty() {
+                            None
+                        } else {
+                            let fallback_flag_shape = [num_q_heads];
+                            if scratch
+                                .certified_ranking_fallback_head_flags
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_flag_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_head_flags = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::U32,
+                                        &fallback_flag_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV fallback head flags alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            let fallback_flags_u32: Vec<u32> = ranking_fallback_qhead_flags
+                                .iter()
+                                .map(|&flag| if flag { 1 } else { 0 })
+                                .collect();
+                            let fallback_flags_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    fallback_flags_u32.as_ptr() as *const u8,
+                                    fallback_flags_u32.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_ranking_fallback_head_flags
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                fallback_flags_bytes.as_ptr() as *const c_void,
+                                fallback_flags_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV fallback head flags H2D: {e}"
+                                )
+                            })?;
+                            scratch.certified_ranking_fallback_head_flags.as_ref()
+                        };
+                        kernel_ffi::certified_kv::value_promotions_from_block_masses(
+                            self.ordinal,
+                            scratch.certified_final_block_mass.as_ref().unwrap(),
+                            ls.certified_kv_value_error.as_ref().unwrap(),
+                            ranking_fallback_head_flags_ref,
+                            scratch.certified_value_promote_index.as_mut().unwrap(),
+                            scratch.certified_value_promotion_counters.as_mut().unwrap(),
+                            scratch.certified_value_promotion_any.as_mut().unwrap(),
+                            scratch
+                                .certified_value_promotion_head_flags
+                                .as_mut()
+                                .unwrap(),
+                            scratch.certified_value_e_val_by_head.as_mut().unwrap(),
+                            gqa_group,
+                            cfg.v_tol,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV final value-promotion evaluation: {e}"
+                            )
+                        })?;
+                        let added_value_promotions = if use_device_selector {
+                            true
+                        } else {
+                            scratch
+                                .certified_value_promotion_any
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promotion flag D2H: {e}"
+                                    )
+                                })?
+                                .chunks_exact(std::mem::size_of::<u32>())
+                                .next()
+                                .map(|chunk| {
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        != 0
+                                })
+                                .unwrap_or(false)
+                        };
+                        if added_value_promotions {
+                            let final_promoted_by_kvh: Vec<Vec<usize>>;
+                            if use_device_selector {
+                                final_promoted_by_kvh = Vec::new();
+                            } else {
+                                let final_value_index_bytes = scratch
+                                    .certified_value_promote_index
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV final value index D2H: {e}"
+                                        )
+                                    })?;
+                                let final_value_index_host: Vec<u32> = final_value_index_bytes
+                                    .chunks_exact(std::mem::size_of::<u32>())
+                                    .map(|chunk| {
+                                        u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                    })
+                                    .collect();
+                                final_promoted_by_kvh = (0..num_kv_heads)
+                                    .map(|kvh| {
+                                        (0..num_blocks)
+                                            .filter(|&block| {
+                                                final_value_index_host[kvh * num_blocks + block]
+                                                    != u32::MAX
+                                            })
+                                            .collect()
+                                    })
+                                    .collect();
+                            }
+                            let final_value_cache_fits_step = !use_device_selector
+                                && final_promoted_by_kvh
+                                    .iter()
+                                    .all(|blocks| blocks.len() <= value_cache_capacity);
+                            let use_final_value_cache = !use_device_selector
+                                && !key_budget_covers_all_blocks
+                                && cfg.value_cache_blocks > 0
+                                && final_value_cache_fits_step;
+                            let final_promoted_value_ref: &GpuBuffer;
+                            if use_final_value_cache {
+                                let tag_len = num_kv_heads * value_cache_capacity;
+                                let cache_shape =
+                                    [num_kv_heads, value_cache_capacity, block_size, head_dim];
+                                let reset_cache = ls
+                                    .certified_kv_promoted_value_cache
+                                    .as_ref()
+                                    .map(|buf| buf.shape() != cache_shape)
+                                    .unwrap_or(true)
+                                    || ls.certified_kv_promoted_value_cache_capacity
+                                        != value_cache_capacity
+                                    || ls.certified_kv_promoted_value_cache_tags.len() != tag_len;
+                                if reset_cache {
+                                    ls.certified_kv_promoted_value_cache = Some(
+                                        GpuBuffer::zeros(
+                                            self.ordinal,
+                                            ScalarType::BF16,
+                                            &cache_shape,
+                                        )
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "layer {idx} certified KV promoted value cache alloc: {e}"
+                                            )
+                                        })?,
+                                    );
+                                    ls.certified_kv_promoted_value_cache_capacity =
+                                        value_cache_capacity;
+                                    ls.certified_kv_promoted_value_cache_tags =
+                                        vec![usize::MAX; tag_len];
+                                    ls.certified_kv_promoted_value_cache_lru = vec![0; tag_len];
+                                    ls.certified_kv_promoted_value_cache_tick = 0;
+                                }
+
+                                let mut final_value_promote_index_host =
+                                    vec![u32::MAX; num_kv_heads * num_blocks];
+                                let mut final_value_gather_index_host =
+                                    vec![u32::MAX; num_kv_heads * num_blocks];
+                                let mut final_cache_hits = 0usize;
+                                let mut final_cache_misses = 0usize;
+                                let mut final_cache_overflows = 0usize;
+                                for kvh in 0..num_kv_heads {
+                                    for &block in &final_promoted_by_kvh[kvh] {
+                                        let base = kvh * value_cache_capacity;
+                                        ls.certified_kv_promoted_value_cache_tick = ls
+                                            .certified_kv_promoted_value_cache_tick
+                                            .wrapping_add(1);
+                                        let tick = ls.certified_kv_promoted_value_cache_tick;
+                                        let mut slot = (0..value_cache_capacity).find(|&s| {
+                                            ls.certified_kv_promoted_value_cache_tags[base + s]
+                                                == block
+                                        });
+                                        if let Some(s) = slot {
+                                            final_cache_hits += 1;
+                                            ls.certified_kv_promoted_value_cache_lru[base + s] =
+                                                tick;
+                                        } else {
+                                            final_cache_misses += 1;
+                                            slot = (0..value_cache_capacity).find(|&s| {
+                                                ls.certified_kv_promoted_value_cache_tags[base + s]
+                                                    == usize::MAX
+                                            });
+                                            let s = if let Some(s) = slot {
+                                                s
+                                            } else {
+                                                final_cache_overflows += 1;
+                                                (0..value_cache_capacity)
+                                                    .min_by_key(|&s| {
+                                                        ls.certified_kv_promoted_value_cache_lru
+                                                            [base + s]
+                                                    })
+                                                    .unwrap_or(0)
+                                            };
+                                            ls.certified_kv_promoted_value_cache_tags[base + s] =
+                                                block;
+                                            ls.certified_kv_promoted_value_cache_lru[base + s] =
+                                                tick;
+                                            final_value_gather_index_host
+                                                [kvh * num_blocks + block] = s as u32;
+                                            slot = Some(s);
+                                        }
+                                        final_value_promote_index_host[kvh * num_blocks + block] =
+                                            slot.unwrap() as u32;
+                                    }
+                                }
+                                let final_gather_index_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        final_value_gather_index_host.as_ptr() as *const u8,
+                                        final_value_gather_index_host.len()
+                                            * std::mem::size_of::<u32>(),
+                                    )
+                                };
+                                gpu_hal::copy_h2d(
+                                    self.ordinal,
+                                    scratch
+                                        .certified_value_promote_index
+                                        .as_mut()
+                                        .unwrap()
+                                        .as_mut_ptr(),
+                                    final_gather_index_bytes.as_ptr() as *const c_void,
+                                    final_gather_index_bytes.len(),
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV final value cache gather index H2D: {e}"
+                                    )
+                                })?;
+                                kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
+                                    self.ordinal,
+                                    tier2_value_device_ptr,
+                                    scratch.certified_value_promote_index.as_ref().unwrap(),
+                                    ls.certified_kv_promoted_value_cache.as_mut().unwrap(),
+                                    block_size,
+                                    cap,
+                                    value_cache_capacity,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV exact promoted BF16 value cache gather: {e}"
+                                    )
+                                })?;
+                                let final_promote_index_bytes = unsafe {
+                                    std::slice::from_raw_parts(
+                                        final_value_promote_index_host.as_ptr() as *const u8,
+                                        final_value_promote_index_host.len()
+                                            * std::mem::size_of::<u32>(),
+                                    )
+                                };
+                                gpu_hal::copy_h2d(
+                                    self.ordinal,
+                                    scratch
+                                        .certified_value_promote_index
+                                        .as_mut()
+                                        .unwrap()
+                                        .as_mut_ptr(),
+                                    final_promote_index_bytes.as_ptr() as *const c_void,
+                                    final_promote_index_bytes.len(),
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV final cached value promote index H2D: {e}"
+                                    )
+                                })?;
+                                if let Some(t) = timings.as_mut() {
+                                    t.certified_kv_promoted_value_cache_hits += final_cache_hits;
+                                    t.certified_kv_promoted_value_cache_misses +=
+                                        final_cache_misses;
+                                    t.certified_kv_promoted_value_cache_overflows +=
+                                        final_cache_overflows;
+                                    t.certified_kv_promoted_value_h2d_bytes +=
+                                        final_cache_misses * value_block_bytes;
+                                }
+                                final_promoted_value_ref =
+                                    ls.certified_kv_promoted_value_cache.as_ref().unwrap();
+                            } else {
+                                max_promoted_value_blocks = num_blocks;
+                                let promoted_value_shape = [
+                                    num_kv_heads,
+                                    max_promoted_value_blocks,
+                                    block_size,
+                                    head_dim,
+                                ];
+                                if scratch
+                                    .certified_promoted_value_bf16
+                                    .as_ref()
+                                    .map(|buf| buf.shape() != promoted_value_shape)
+                                    .unwrap_or(true)
+                                {
+                                    scratch.certified_promoted_value_bf16 = Some(
+                                        GpuBuffer::zeros(
+                                            self.ordinal,
+                                            ScalarType::BF16,
+                                            &promoted_value_shape,
+                                        )
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "layer {idx} certified KV promoted value realloc: {e}"
+                                            )
+                                        })?,
+                                    );
+                                }
+                                kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
+                                    self.ordinal,
+                                    tier2_value_device_ptr,
+                                    scratch.certified_value_promote_index.as_ref().unwrap(),
+                                    scratch.certified_promoted_value_bf16.as_mut().unwrap(),
+                                    block_size,
+                                    cap,
+                                    max_promoted_value_blocks,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV exact promoted BF16 value gather: {e}"
+                                    )
+                                })?;
+                                if collect_cert_host_telemetry {
+                                    if let Some(t) = timings.as_mut() {
+                                        let final_value_counter_bytes = scratch
+                                        .certified_value_promotion_counters
+                                        .as_ref()
+                                        .unwrap()
+                                        .to_host_bytes()
+                                        .map_err(|e| {
+                                            anyhow::anyhow!(
+                                                "layer {idx} certified KV final value counters D2H: {e}"
+                                            )
+                                        })?;
+                                        let final_value_blocks = final_value_counter_bytes
+                                            .chunks_exact(std::mem::size_of::<u32>())
+                                            .map(|chunk| {
+                                                u32::from_le_bytes([
+                                                    chunk[0], chunk[1], chunk[2], chunk[3],
+                                                ])
+                                                    as usize
+                                            })
+                                            .sum::<usize>();
+                                        t.certified_kv_promoted_value_h2d_bytes +=
+                                            final_value_blocks * value_block_bytes;
+                                    }
+                                }
+                                final_promoted_value_ref =
+                                    scratch.certified_promoted_value_bf16.as_ref().unwrap();
+                            }
+                            if key_budget_covers_all_blocks && ranking_fallback_qheads.is_empty() {
+                                kernel_ffi::certified_kv::attend_all_promoted_int4_with_bf16_tail(
+                                    self.ordinal,
+                                    attn_q,
+                                    ls.certified_kv_promoted_key_cache.as_ref().unwrap(),
+                                    final_promoted_value_ref,
+                                    scratch.certified_value_promote_index.as_ref().unwrap(),
+                                    ls.certified_kv_value_i4.as_ref().unwrap(),
+                                    ls.certified_kv_value_scale.as_ref().unwrap(),
+                                    ls.certified_kv_value_zero.as_ref().unwrap(),
+                                    tail_key_kernel_ref,
+                                    tail_value_kernel_ref,
+                                    kv_len,
+                                    block_size,
+                                    value_group_size,
+                                    num_q_heads / num_kv_heads,
+                                    q_scale,
+                                    score_scratch,
+                                    scratch.certified_softmax_stats.as_mut().unwrap(),
+                                    attn_out_bf16,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV exact all-promoted INT4 attention: {e}"
+                                    )
+                                })?;
+                            } else {
+                                kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                                    self.ordinal,
+                                    attn_q,
+                                    key_i8,
+                                    key_scale,
+                                    key_zero,
+                                    scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                                    scratch.certified_promote_index.as_ref().unwrap(),
+                                    final_promoted_value_ref,
+                                    scratch.certified_value_promote_index.as_ref().unwrap(),
+                                    ls.certified_kv_value_i4.as_ref().unwrap(),
+                                    ls.certified_kv_value_scale.as_ref().unwrap(),
+                                    ls.certified_kv_value_zero.as_ref().unwrap(),
+                                    tail_key_kernel_ref,
+                                    tail_value_kernel_ref,
+                                    kv_len,
+                                    block_size,
+                                    value_group_size,
+                                    num_q_heads / num_kv_heads,
+                                    q_scale,
+                                    score_scratch,
+                                    attn_out_bf16,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV exact mixed-key INT4 attention: {e}"
+                                    )
+                                })?;
+                            }
+                            kernel_ffi::certified_kv::block_masses_from_token_probs(
+                                self.ordinal,
+                                score_scratch,
+                                scratch.certified_final_block_mass.as_mut().unwrap(),
+                                block_size,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV exact final block mass reduction: {e}"
+                                )
+                            })?;
+                            kernel_ffi::certified_kv::value_promotions_from_block_masses(
+                                self.ordinal,
+                                scratch.certified_final_block_mass.as_ref().unwrap(),
+                                ls.certified_kv_value_error.as_ref().unwrap(),
+                                ranking_fallback_head_flags_ref,
+                                scratch.certified_value_promote_index.as_mut().unwrap(),
+                                scratch.certified_value_promotion_counters.as_mut().unwrap(),
+                                scratch.certified_value_promotion_any.as_mut().unwrap(),
+                                scratch
+                                    .certified_value_promotion_head_flags
+                                    .as_mut()
+                                    .unwrap(),
+                                scratch.certified_value_e_val_by_head.as_mut().unwrap(),
+                                gqa_group,
+                                cfg.v_tol,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV exact final value-promotion evaluation: {e}"
+                                )
+                            })?;
+                        }
+                        if collect_cert_host_telemetry {
+                            let final_value_head_flags = scratch
+                                .certified_value_promotion_head_flags
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV value promotion head flags D2H: {e}"
+                                    )
+                                })?;
+                            let final_value_escalation_heads = final_value_head_flags
+                                .chunks_exact(std::mem::size_of::<u32>())
+                                .filter(|chunk| {
+                                    u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
+                                        != 0
+                                })
+                                .count();
+                            let e_val_by_head = decode_f32_le(
+                                &scratch
+                                    .certified_value_e_val_by_head
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV e_val-by-head D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            if let Some(t) = timings.as_mut() {
+                                t.certified_kv_value_escalation_heads +=
+                                    final_value_escalation_heads;
+                                for qh in 0..num_q_heads {
+                                    let mut e_val = e_val_by_head[qh];
+                                    let e_key = if ranking_fallback_qhead_flags[qh] {
+                                        0.0
+                                    } else {
+                                        e_key_by_head[qh]
+                                    };
+                                    if ranking_fallback_qhead_flags[qh] {
+                                        e_val = 0.0;
+                                    }
+                                    t.certified_kv_e_key_max = t.certified_kv_e_key_max.max(e_key);
+                                    t.certified_kv_delta_tail_max = t
+                                        .certified_kv_delta_tail_max
+                                        .max(if ranking_fallback_qhead_flags[qh] {
+                                            0.0
+                                        } else {
+                                            delta_tail_by_head[qh]
+                                        });
+                                    t.certified_kv_vmax_max = t.certified_kv_vmax_max.max(
+                                        if ranking_fallback_qhead_flags[qh] {
+                                            0.0
+                                        } else {
+                                            vmax_by_head[qh]
+                                        },
+                                    );
+                                    t.certified_kv_true_tail_bound_max = t
+                                        .certified_kv_true_tail_bound_max
+                                        .max(if ranking_fallback_qhead_flags[qh] {
+                                            0.0
+                                        } else {
+                                            true_tail_bound_by_head[qh]
+                                        });
+                                    t.certified_kv_e_val_max = t.certified_kv_e_val_max.max(e_val);
+                                    t.certified_kv_bound_total_max =
+                                        t.certified_kv_bound_total_max.max(e_key + e_val);
+                                }
+                            }
+                        }
+                        if use_device_selector && cfg.ranking_r > 0 && !key_budget_covers_all_blocks
+                        {
+                            let prefix_tokens = aligned.min(kv_len);
+                            let prefix_shape = [num_kv_heads, cap, head_dim];
+                            let reset_prefix_cache = ls
+                                .certified_kv_ranking_prefix_k
+                                .as_ref()
+                                .map(|buf| buf.shape() != prefix_shape)
+                                .unwrap_or(true)
+                                || ls
+                                    .certified_kv_ranking_prefix_v
+                                    .as_ref()
+                                    .map(|buf| buf.shape() != prefix_shape)
+                                    .unwrap_or(true)
+                                || ls.certified_kv_ranking_prefix_tokens > prefix_tokens;
+                            if reset_prefix_cache {
+                                ls.certified_kv_ranking_prefix_k = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::BF16,
+                                        &prefix_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV full fallback prefix key alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                                ls.certified_kv_ranking_prefix_v = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::BF16,
+                                        &prefix_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV full fallback prefix value alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                                ls.certified_kv_ranking_prefix_tokens = 0;
+                                ls.certified_kv_ranking_prefix_kv_heads.clear();
+                            }
+                            if ls.certified_kv_ranking_prefix_tokens < prefix_tokens {
+                                let old_tokens = ls.certified_kv_ranking_prefix_tokens;
+                                let new_tokens = prefix_tokens - old_tokens;
+                                let token_offset_bytes = old_tokens * head_dim * elem_bytes;
+                                let copy_bytes = new_tokens * head_dim * elem_bytes;
+                                let dst_stride_bytes = cap * head_dim * elem_bytes;
+                                let tier2_key = ls.certified_kv_host_k.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV flagged fallback missing Tier-2 key buffer"
+                                    )
+                                })?;
+                                let tier2_value = ls.certified_kv_host_v.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV flagged fallback missing Tier-2 value buffer"
+                                    )
+                                })?;
+                                let fallback_key =
+                                    ls.certified_kv_ranking_prefix_k.as_mut().unwrap();
+                                let fallback_value =
+                                    ls.certified_kv_ranking_prefix_v.as_mut().unwrap();
+                                for kvh in 0..num_kv_heads {
+                                    let src_bytes = kvh * dst_stride_bytes + token_offset_bytes;
+                                    let dst_bytes = kvh * dst_stride_bytes + token_offset_bytes;
+                                    gpu_hal::copy_h2d(
+                                        self.ordinal,
+                                        fallback_key.offset_ptr(dst_bytes) as *mut c_void,
+                                        tier2_key.offset_ptr(src_bytes),
+                                        copy_bytes,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified flagged fallback key H2D kvh={kvh}: {e}"
+                                        )
+                                    })?;
+                                    gpu_hal::copy_h2d(
+                                        self.ordinal,
+                                        fallback_value.offset_ptr(dst_bytes) as *mut c_void,
+                                        tier2_value.offset_ptr(src_bytes),
+                                        copy_bytes,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified flagged fallback value H2D kvh={kvh}: {e}"
+                                        )
+                                    })?;
+                                }
+                                ls.certified_kv_ranking_prefix_tokens = prefix_tokens;
+                                if let Some(t) = timings.as_mut() {
+                                    t.certified_kv_ranking_prefix_cache_misses += num_kv_heads;
+                                    t.certified_kv_ranking_prefix_h2d_bytes +=
+                                        2 * num_kv_heads * copy_bytes;
+                                }
+                            } else if let Some(t) = timings.as_mut() {
+                                t.certified_kv_ranking_prefix_cache_hits += num_kv_heads;
+                                t.certified_kv_ranking_prefix_reuse_bytes +=
+                                    2 * num_kv_heads * prefix_tokens * head_dim * elem_bytes;
+                            }
+                            let tail_k = if tail_len > 0 {
+                                Some(ls.certified_kv_tail_k.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV flagged fallback missing tail key buffer"
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
+                            let tail_v = if tail_len > 0 {
+                                Some(ls.certified_kv_tail_v.as_ref().ok_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV flagged fallback missing tail value buffer"
+                                    )
+                                })?)
+                            } else {
+                                None
+                            };
+
+                            let fallback_score_shape = [num_q_heads, kv_len];
+                            if scratch
+                                .certified_ranking_fallback_score
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_score_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_score = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::F32,
+                                        &fallback_score_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV flagged fallback score alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            kernel_ffi::certified_kv::dense_flagged_heads_out_bf16(
+                                self.ordinal,
+                                attn_q,
+                                scratch
+                                    .certified_ranking_fallback_head_flags
+                                    .as_ref()
+                                    .unwrap(),
+                                ls.certified_kv_ranking_prefix_k.as_ref().unwrap(),
+                                ls.certified_kv_ranking_prefix_v.as_ref().unwrap(),
+                                prefix_tokens,
+                                tail_k,
+                                tail_v,
+                                kv_len,
+                                scratch.certified_ranking_fallback_score.as_mut().unwrap(),
+                                attn_out_bf16,
+                                q_scale,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV flagged-head fallback: {e}"
+                                )
+                            })?;
+                        } else if !ranking_fallback_qheads.is_empty() {
                             let fallback_count = ranking_fallback_qheads.len();
                             let fallback_kv_count = ranking_fallback_kv_heads.len();
                             let fallback_heads_shape = [fallback_count];
@@ -7898,6 +9306,12 @@ impl DecodeEngine {
             .map_err(|e| anyhow::anyhow!("lm_head_block_best_vals: {e}"))?;
         let lm_head_block_best_idxs = GpuBuffer::zeros(ordinal, ScalarType::U32, &[512])
             .map_err(|e| anyhow::anyhow!("lm_head_block_best_idxs: {e}"))?;
+        let target_nll_token = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("target_nll_token: {e}"))?;
+        let target_nll_value = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1])
+            .map_err(|e| anyhow::anyhow!("target_nll_value: {e}"))?;
+        let target_nll_accum = GpuBuffer::zeros(ordinal, ScalarType::F32, &[1])
+            .map_err(|e| anyhow::anyhow!("target_nll_accum: {e}"))?;
         let matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .map_err(|e| anyhow::anyhow!("matvec_counter: {e}"))?;
 
@@ -7962,6 +9376,9 @@ impl DecodeEngine {
             argmax_buf,
             lm_head_block_best_vals,
             lm_head_block_best_idxs,
+            target_nll_token,
+            target_nll_value,
+            target_nll_accum,
             matvec_counter,
             ordinal,
             kv_chunk_size,

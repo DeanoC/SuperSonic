@@ -9,6 +9,8 @@ set -euo pipefail
 #   CONFIG=both                  dense, certified, or both
 #   OUTPUT=target/pg19_smoke.json
 #   TIMEOUT=900                  per SuperSonic scorer invocation
+#   EMIT_STAGE_TIMINGS=0         include per-stage GPU/runtime timing telemetry
+#   CERTIFIED_EXTRA_ARGS=""      extra args forwarded only to certified scorer
 #   MAX_CERTIFIED_DELTA=0.10     fail if certified ppl exceeds dense by this much
 #   FAIL_ABOVE_REFERENCE=0       compare to DotCache arxiv_v1 reference when present
 #   REFERENCE_TOLERANCE=0.05     additive ppl tolerance vs DotCache reference
@@ -53,5 +55,14 @@ if [[ "${REFERENCE_SMOKE:-0}" == "1" ]]; then
 fi
 if [[ -n "${EVAL_START_FRAC:-}" ]]; then
   ARGS+=(--eval-start-frac "$EVAL_START_FRAC")
+fi
+if [[ "${EMIT_STAGE_TIMINGS:-0}" == "1" ]]; then
+  ARGS+=(--emit-stage-timings)
+fi
+if [[ -n "${CERTIFIED_EXTRA_ARGS:-}" ]]; then
+  read -r -a EXTRA_ARGS <<< "${CERTIFIED_EXTRA_ARGS}"
+  for arg in "${EXTRA_ARGS[@]}"; do
+    ARGS+=("--certified-extra-arg=$arg")
+  done
 fi
 python3 oracle/pg19_smoke.py "${ARGS[@]}"
