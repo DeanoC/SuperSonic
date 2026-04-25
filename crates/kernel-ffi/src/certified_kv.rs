@@ -12,6 +12,32 @@ fn certified_kv_error(backend: Backend, msg: String) -> GpuError {
 
 #[cfg(supersonic_backend_cuda)]
 unsafe extern "C" {
+    fn dotcache_llama31_certified_kv_copy_step_bf16(
+        device_ordinal: usize,
+        src_key_bf16: *const c_void,
+        src_value_bf16: *const c_void,
+        dst_key_bf16: *mut c_void,
+        dst_value_bf16: *mut c_void,
+        kv_heads: c_int,
+        dst_stride_tokens: c_int,
+        dst_token: c_int,
+        head_dim: c_int,
+    ) -> c_int;
+    fn dotcache_llama31_certified_kv_copy_token_range_bf16(
+        device_ordinal: usize,
+        src_key_bf16: *const c_void,
+        src_value_bf16: *const c_void,
+        dst_key_bf16: *mut c_void,
+        dst_value_bf16: *mut c_void,
+        kv_heads: c_int,
+        src_stride_tokens: c_int,
+        src_start_token: c_int,
+        dst_stride_tokens: c_int,
+        dst_start_token: c_int,
+        token_count: c_int,
+        head_dim: c_int,
+    ) -> c_int;
+
     fn dotcache_llama31_certified_kv_quantize_bf16(
         device_ordinal: usize,
         key_bf16: *const c_void,
@@ -582,6 +608,185 @@ pub fn aligned_tokens(seq_len: usize, block_size: usize) -> usize {
         0
     } else {
         (seq_len / block_size) * block_size
+    }
+}
+
+pub fn copy_step_bf16(
+    ordinal: usize,
+    src_key_bf16: &GpuBuffer,
+    src_value_bf16: &GpuBuffer,
+    dst_key_bf16: &mut GpuBuffer,
+    dst_value_bf16: &mut GpuBuffer,
+    dst_token: usize,
+) -> Result<(), GpuError> {
+    if src_key_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV BF16 step copy is currently CUDA-only".into(),
+        ));
+    }
+    if src_key_bf16.dtype() != ScalarType::BF16
+        || src_value_bf16.dtype() != ScalarType::BF16
+        || dst_key_bf16.dtype() != ScalarType::BF16
+        || dst_value_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 step copy expects BF16 buffers, got src {:?}/{:?} dst {:?}/{:?}",
+            src_key_bf16.dtype(),
+            src_value_bf16.dtype(),
+            dst_key_bf16.dtype(),
+            dst_value_bf16.dtype()
+        )));
+    }
+    if src_key_bf16.shape().len() != 3
+        || src_key_bf16.shape()[1] != 1
+        || src_value_bf16.shape() != src_key_bf16.shape()
+        || dst_value_bf16.shape() != dst_key_bf16.shape()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 step copy expects src [kvh,1,hd] and matching dst [kvh,t,hd] or [1,kvh,t,hd], got src {:?}/{:?} dst {:?}/{:?}",
+            src_key_bf16.shape(),
+            src_value_bf16.shape(),
+            dst_key_bf16.shape(),
+            dst_value_bf16.shape()
+        )));
+    }
+    let kv_heads = src_key_bf16.shape()[0];
+    let head_dim = src_key_bf16.shape()[2];
+    let dst_shape = dst_key_bf16.shape();
+    let (dst_kv_heads, dst_stride_tokens, dst_head_dim) = match dst_shape {
+        [kvh, stride, hd] => (*kvh, *stride, *hd),
+        [1, kvh, stride, hd] => (*kvh, *stride, *hd),
+        _ => (0, 0, 0),
+    };
+    if dst_kv_heads != kv_heads || dst_head_dim != head_dim || dst_token >= dst_stride_tokens {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 step copy dst shape {:?} incompatible with src {:?} dst_token={dst_token}",
+            dst_key_bf16.shape(),
+            src_key_bf16.shape()
+        )));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_copy_step_bf16(
+            ordinal,
+            src_key_bf16.as_ptr(),
+            src_value_bf16.as_ptr(),
+            dst_key_bf16.as_mut_ptr(),
+            dst_value_bf16.as_mut_ptr(),
+            kv_heads as c_int,
+            dst_stride_tokens as c_int,
+            dst_token as c_int,
+            head_dim as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA BF16 step copy failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn copy_token_range_bf16(
+    ordinal: usize,
+    src_key_bf16: &GpuBuffer,
+    src_value_bf16: &GpuBuffer,
+    dst_key_bf16: &mut GpuBuffer,
+    dst_value_bf16: &mut GpuBuffer,
+    src_start_token: usize,
+    dst_start_token: usize,
+    token_count: usize,
+) -> Result<(), GpuError> {
+    if token_count == 0 {
+        return Ok(());
+    }
+    if src_key_bf16.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV BF16 range copy is currently CUDA-only".into(),
+        ));
+    }
+    if src_key_bf16.dtype() != ScalarType::BF16
+        || src_value_bf16.dtype() != ScalarType::BF16
+        || dst_key_bf16.dtype() != ScalarType::BF16
+        || dst_value_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 range copy expects BF16 buffers, got src {:?}/{:?} dst {:?}/{:?}",
+            src_key_bf16.dtype(),
+            src_value_bf16.dtype(),
+            dst_key_bf16.dtype(),
+            dst_value_bf16.dtype()
+        )));
+    }
+    if src_value_bf16.shape() != src_key_bf16.shape()
+        || dst_value_bf16.shape() != dst_key_bf16.shape()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 range copy expects matching src/dst [kvh,t,hd] or [1,kvh,t,hd], got src {:?}/{:?} dst {:?}/{:?}",
+            src_key_bf16.shape(),
+            src_value_bf16.shape(),
+            dst_key_bf16.shape(),
+            dst_value_bf16.shape()
+        )));
+    }
+    let src_shape = src_key_bf16.shape();
+    let dst_shape = dst_key_bf16.shape();
+    let (kv_heads, src_stride_tokens, head_dim) = match src_shape {
+        [kvh, stride, hd] => (*kvh, *stride, *hd),
+        [1, kvh, stride, hd] => (*kvh, *stride, *hd),
+        _ => (0, 0, 0),
+    };
+    let (dst_kv_heads, dst_stride_tokens, dst_head_dim) = match dst_shape {
+        [kvh, stride, hd] => (*kvh, *stride, *hd),
+        [1, kvh, stride, hd] => (*kvh, *stride, *hd),
+        _ => (0, 0, 0),
+    };
+    if kv_heads == 0
+        || dst_kv_heads != kv_heads
+        || dst_head_dim != head_dim
+        || src_start_token + token_count > src_stride_tokens
+        || dst_start_token + token_count > dst_stride_tokens
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV BF16 range copy incompatible shapes src {:?} dst {:?} src_start={src_start_token} dst_start={dst_start_token} count={token_count}",
+            src_key_bf16.shape(),
+            dst_key_bf16.shape()
+        )));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_copy_token_range_bf16(
+            ordinal,
+            src_key_bf16.as_ptr(),
+            src_value_bf16.as_ptr(),
+            dst_key_bf16.as_mut_ptr(),
+            dst_value_bf16.as_mut_ptr(),
+            kv_heads as c_int,
+            src_stride_tokens as c_int,
+            src_start_token as c_int,
+            dst_stride_tokens as c_int,
+            dst_start_token as c_int,
+            token_count as c_int,
+            head_dim as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA BF16 range copy failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
 }
 

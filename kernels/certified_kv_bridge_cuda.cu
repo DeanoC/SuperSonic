@@ -29,6 +29,54 @@ __device__ __forceinline__ float bf16_to_float(__nv_bfloat16 value) {
     return static_cast<float>(value);
 }
 
+__global__ void certified_kv_copy_step_bf16_kernel(
+    const __nv_bfloat16* src_key,
+    const __nv_bfloat16* src_value,
+    __nv_bfloat16* dst_key,
+    __nv_bfloat16* dst_value,
+    int kv_heads,
+    int dst_stride_tokens,
+    int dst_token,
+    int head_dim
+) {
+    const int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = kv_heads * head_dim;
+    if (linear >= total) return;
+    const int d = linear % head_dim;
+    const int kvh = linear / head_dim;
+    const size_t src_idx = (static_cast<size_t>(kvh) * head_dim) + d;
+    const size_t dst_idx = (static_cast<size_t>(kvh) * dst_stride_tokens + dst_token) * head_dim + d;
+    dst_key[dst_idx] = src_key[src_idx];
+    dst_value[dst_idx] = src_value[src_idx];
+}
+
+__global__ void certified_kv_copy_token_range_bf16_kernel(
+    const __nv_bfloat16* src_key,
+    const __nv_bfloat16* src_value,
+    __nv_bfloat16* dst_key,
+    __nv_bfloat16* dst_value,
+    int kv_heads,
+    int src_stride_tokens,
+    int src_start_token,
+    int dst_stride_tokens,
+    int dst_start_token,
+    int token_count,
+    int head_dim
+) {
+    const int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = kv_heads * token_count * head_dim;
+    if (linear >= total) return;
+    const int d = linear % head_dim;
+    const int tok = (linear / head_dim) % token_count;
+    const int kvh = linear / (token_count * head_dim);
+    const size_t src_idx =
+        (static_cast<size_t>(kvh) * src_stride_tokens + src_start_token + tok) * head_dim + d;
+    const size_t dst_idx =
+        (static_cast<size_t>(kvh) * dst_stride_tokens + dst_start_token + tok) * head_dim + d;
+    dst_key[dst_idx] = src_key[src_idx];
+    dst_value[dst_idx] = src_value[src_idx];
+}
+
 __device__ __forceinline__ bool certified_kv_should_run(const uint32_t* run_flag) {
     return run_flag == nullptr || run_flag[0] != 0;
 }
@@ -2548,6 +2596,88 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
 }
 
 } // namespace
+
+extern "C" int dotcache_llama31_certified_kv_copy_step_bf16(
+    size_t device_ordinal,
+    const void* src_key_bf16,
+    const void* src_value_bf16,
+    void* dst_key_bf16,
+    void* dst_value_bf16,
+    int kv_heads,
+    int dst_stride_tokens,
+    int dst_token,
+    int head_dim
+) {
+    if (src_key_bf16 == nullptr || src_value_bf16 == nullptr ||
+        dst_key_bf16 == nullptr || dst_value_bf16 == nullptr) {
+        return 127;
+    }
+    if (kv_heads <= 0 || dst_stride_tokens <= 0 || dst_token < 0 ||
+        dst_token >= dst_stride_tokens || head_dim <= 0) {
+        return 128;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    const int total = kv_heads * head_dim;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    certified_kv_copy_step_bf16_kernel<<<blocks, threads>>>(
+        static_cast<const __nv_bfloat16*>(src_key_bf16),
+        static_cast<const __nv_bfloat16*>(src_value_bf16),
+        static_cast<__nv_bfloat16*>(dst_key_bf16),
+        static_cast<__nv_bfloat16*>(dst_value_bf16),
+        kv_heads,
+        dst_stride_tokens,
+        dst_token,
+        head_dim
+    );
+    if (cudaGetLastError() != cudaSuccess) return 129;
+    return 0;
+}
+
+extern "C" int dotcache_llama31_certified_kv_copy_token_range_bf16(
+    size_t device_ordinal,
+    const void* src_key_bf16,
+    const void* src_value_bf16,
+    void* dst_key_bf16,
+    void* dst_value_bf16,
+    int kv_heads,
+    int src_stride_tokens,
+    int src_start_token,
+    int dst_stride_tokens,
+    int dst_start_token,
+    int token_count,
+    int head_dim
+) {
+    if (src_key_bf16 == nullptr || src_value_bf16 == nullptr ||
+        dst_key_bf16 == nullptr || dst_value_bf16 == nullptr) {
+        return 130;
+    }
+    if (kv_heads <= 0 || src_stride_tokens <= 0 || dst_stride_tokens <= 0 ||
+        src_start_token < 0 || dst_start_token < 0 || token_count <= 0 || head_dim <= 0 ||
+        src_start_token + token_count > src_stride_tokens ||
+        dst_start_token + token_count > dst_stride_tokens) {
+        return 131;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    const int total = kv_heads * token_count * head_dim;
+    const int threads = 256;
+    const int blocks = (total + threads - 1) / threads;
+    certified_kv_copy_token_range_bf16_kernel<<<blocks, threads>>>(
+        static_cast<const __nv_bfloat16*>(src_key_bf16),
+        static_cast<const __nv_bfloat16*>(src_value_bf16),
+        static_cast<__nv_bfloat16*>(dst_key_bf16),
+        static_cast<__nv_bfloat16*>(dst_value_bf16),
+        kv_heads,
+        src_stride_tokens,
+        src_start_token,
+        dst_stride_tokens,
+        dst_start_token,
+        token_count,
+        head_dim
+    );
+    if (cudaGetLastError() != cudaSuccess) return 132;
+    return 0;
+}
 
 extern "C" int dotcache_llama31_certified_kv_quantize_bf16(
     size_t device_ordinal,

@@ -4573,67 +4573,36 @@ impl DecodeEngine {
                     self.kv_fp8,
                 )
                 .map_err(|e| anyhow::anyhow!("layer {idx} kv alloc: {e}"))?;
-                if let Some(ref mut cache_k) = ls.kv_cache_k {
-                    let cap = cache_k.shape()[2];
-                    let cap_stride = cap * head_dim * elem_bytes;
-                    let src_stride = head_dim * elem_bytes;
-                    let dst_offset = seqlen_offset * head_dim * elem_bytes;
-                    for h in 0..num_kv_heads {
-                        gpu_hal::copy_d2d(
-                            self.ordinal,
-                            cache_k.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
-                            attn_k_step.offset_ptr(h * src_stride),
-                            src_stride,
-                        )
-                        .map_err(|e| anyhow::anyhow!("layer {idx} cache k write h={h}: {e}"))?;
-                    }
-                }
-                if let Some(ref mut cache_v) = ls.kv_cache_v {
-                    let cap = cache_v.shape()[2];
-                    let cap_stride = cap * head_dim * elem_bytes;
-                    let src_stride = head_dim * elem_bytes;
-                    let dst_offset = seqlen_offset * head_dim * elem_bytes;
-                    for h in 0..num_kv_heads {
-                        gpu_hal::copy_d2d(
-                            self.ordinal,
-                            cache_v.offset_ptr(h * cap_stride + dst_offset) as *mut c_void,
-                            attn_v_step.offset_ptr(h * src_stride),
-                            src_stride,
-                        )
-                        .map_err(|e| anyhow::anyhow!("layer {idx} cache v write h={h}: {e}"))?;
-                    }
+                if let (Some(cache_k), Some(cache_v)) =
+                    (ls.kv_cache_k.as_mut(), ls.kv_cache_v.as_mut())
+                {
+                    kernel_ffi::certified_kv::copy_step_bf16(
+                        self.ordinal,
+                        attn_k_step,
+                        attn_v_step,
+                        cache_k,
+                        cache_v,
+                        seqlen_offset,
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} cache KV step write: {e}"))?;
                 }
             } else {
                 let tail_slot = seqlen_offset % certified_kv_decode.unwrap().block_size;
-                let src_stride = head_dim * elem_bytes;
-                let dst_offset = tail_slot * head_dim * elem_bytes;
                 let tail_k = ls.certified_kv_tail_k.as_mut().ok_or_else(|| {
                     anyhow::anyhow!("layer {idx} certified tail key buffer missing")
                 })?;
                 let tail_v = ls.certified_kv_tail_v.as_mut().ok_or_else(|| {
                     anyhow::anyhow!("layer {idx} certified tail value buffer missing")
                 })?;
-                let tail_stride = tail_k.shape()[1] * head_dim * elem_bytes;
-                for h in 0..num_kv_heads {
-                    gpu_hal::copy_d2d(
-                        self.ordinal,
-                        tail_k.offset_ptr(h * tail_stride + dst_offset) as *mut c_void,
-                        attn_k_step.offset_ptr(h * src_stride),
-                        src_stride,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified tail k write h={h}: {e}")
-                    })?;
-                    gpu_hal::copy_d2d(
-                        self.ordinal,
-                        tail_v.offset_ptr(h * tail_stride + dst_offset) as *mut c_void,
-                        attn_v_step.offset_ptr(h * src_stride),
-                        src_stride,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified tail v write h={h}: {e}")
-                    })?;
-                }
+                kernel_ffi::certified_kv::copy_step_bf16(
+                    self.ordinal,
+                    attn_k_step,
+                    attn_v_step,
+                    tail_k,
+                    tail_v,
+                    tail_slot,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} certified tail KV step write: {e}"))?;
             }
 
             let cap = if use_certified_cuda && ls.certified_kv_gpu_tail_only {
@@ -5113,30 +5082,17 @@ impl DecodeEngine {
                         let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
                         let tail_k = ls.certified_kv_tail_k.as_mut().unwrap();
                         let tail_v = ls.certified_kv_tail_v.as_mut().unwrap();
-                        let src_cap_stride = cap * head_dim * elem_bytes;
-                        let dst_tail_stride = block_size * head_dim * elem_bytes;
-                        let tail_bytes = tail_len * head_dim * elem_bytes;
-                        let src_offset = aligned * head_dim * elem_bytes;
-                        for h in 0..num_kv_heads {
-                            gpu_hal::copy_d2d(
-                                self.ordinal,
-                                tail_k.offset_ptr(h * dst_tail_stride) as *mut c_void,
-                                cache_k_ref.offset_ptr(h * src_cap_stride + src_offset),
-                                tail_bytes,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("layer {idx} certified tail k seed h={h}: {e}")
-                            })?;
-                            gpu_hal::copy_d2d(
-                                self.ordinal,
-                                tail_v.offset_ptr(h * dst_tail_stride) as *mut c_void,
-                                cache_v_ref.offset_ptr(h * src_cap_stride + src_offset),
-                                tail_bytes,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!("layer {idx} certified tail v seed h={h}: {e}")
-                            })?;
-                        }
+                        kernel_ffi::certified_kv::copy_token_range_bf16(
+                            self.ordinal,
+                            cache_k_ref,
+                            cache_v_ref,
+                            tail_k,
+                            tail_v,
+                            aligned,
+                            0,
+                            tail_len,
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {idx} certified tail KV seed: {e}"))?;
                     }
                     ls.kv_cache_k = None;
                     ls.kv_cache_v = None;
