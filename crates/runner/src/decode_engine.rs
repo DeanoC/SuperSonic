@@ -4229,7 +4229,26 @@ impl DecodeEngine {
             let attn_flat = &mut scratch.attn_flat;
             let gated = &mut scratch.gated;
             let proj_out = &mut scratch.proj_out;
-            let mixed_lhs = if use_late_q_mixed || use_late_k_mixed || use_late_v_mixed {
+            let use_cublas_full_proj = self.normed_buf.backend() == gpu_hal::Backend::Cuda
+                && std::env::var_os("SUPERSONIC_LLAMA31_DISABLE_CUBLAS_FULL_ATTN_PROJ").is_none()
+                && !use_late_q_mixed
+                && !use_late_k_mixed
+                && !use_late_v_mixed
+                && fw.q_proj_scale.is_none()
+                && fw.q_proj_int8_scale.is_none()
+                && fw.q_proj_int4_scale.is_none()
+                && fw.k_proj_scale.is_none()
+                && fw.k_proj_int8_scale.is_none()
+                && fw.k_proj_int4_scale.is_none()
+                && fw.v_proj_scale.is_none()
+                && fw.v_proj_int8_scale.is_none()
+                && fw.v_proj_int4_scale.is_none()
+                && fw.o_proj_scale.is_none()
+                && fw.o_proj_int8_scale.is_none()
+                && fw.o_proj_int4_scale.is_none();
+            let mixed_lhs = if !use_cublas_full_proj
+                && (use_late_q_mixed || use_late_k_mixed || use_late_v_mixed)
+            {
                 prefill_engine::prepare_int8_mixed_lhs(
                     self.ordinal,
                     1,
@@ -4243,7 +4262,17 @@ impl DecodeEngine {
             };
 
             let proj_start = Instant::now();
-            if use_late_q_mixed {
+            if use_cublas_full_proj {
+                kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                    self.ordinal,
+                    q_full,
+                    &self.normed_buf,
+                    &fw.q_proj_w,
+                    hidden_dim,
+                    q_proj_dim,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS q_proj: {e}"))?;
+            } else if use_late_q_mixed {
                 if let Some(sc) = fw.q_proj_int8_scale.as_ref() {
                     prefill_engine::matmul_int8_mixed_prepared_host(
                         self.ordinal,
@@ -4320,7 +4349,17 @@ impl DecodeEngine {
                 .map_err(|e| anyhow::anyhow!("layer {idx} q copy: {e}"))?;
             }
 
-            if use_late_k_mixed {
+            if use_cublas_full_proj {
+                kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                    self.ordinal,
+                    k_buf,
+                    &self.normed_buf,
+                    &fw.k_proj_w,
+                    hidden_dim,
+                    kv_dim,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS k_proj: {e}"))?;
+            } else if use_late_k_mixed {
                 if let Some(sc) = fw.k_proj_int8_scale.as_ref() {
                     prefill_engine::matmul_int8_mixed_prepared_host(
                         self.ordinal,
@@ -4375,7 +4414,17 @@ impl DecodeEngine {
                     self.weights.int4_group_size,
                 )?;
             }
-            if use_late_v_mixed {
+            if use_cublas_full_proj {
+                kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                    self.ordinal,
+                    v_buf,
+                    &self.normed_buf,
+                    &fw.v_proj_w,
+                    hidden_dim,
+                    kv_dim,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS v_proj: {e}"))?;
+            } else if use_late_v_mixed {
                 if let Some(sc) = fw.v_proj_int8_scale.as_ref() {
                     prefill_engine::matmul_int8_mixed_prepared_host(
                         self.ordinal,
@@ -8302,22 +8351,34 @@ impl DecodeEngine {
             }
 
             let out_start = Instant::now();
-            matmul_proj(
-                self.ordinal,
-                1,
-                1,
-                hidden_dim,
-                q_dim,
-                gated,
-                &fw.o_proj_w,
-                fw.o_proj_scale.as_ref(),
-                fw.o_proj_int8_scale.as_ref(),
-                self.weights.fp8_block_size,
-                proj_out,
-                fw.o_proj_int4_scale.as_ref(),
-                fw.o_proj_int4_zero.as_ref(),
-                self.weights.int4_group_size,
-            )?;
+            if use_cublas_full_proj {
+                kernel_ffi::cuda_lm_head_bf16_gemm_4b(
+                    self.ordinal,
+                    proj_out,
+                    gated,
+                    &fw.o_proj_w,
+                    q_dim,
+                    hidden_dim,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} cuBLAS o_proj: {e}"))?;
+            } else {
+                matmul_proj(
+                    self.ordinal,
+                    1,
+                    1,
+                    hidden_dim,
+                    q_dim,
+                    gated,
+                    &fw.o_proj_w,
+                    fw.o_proj_scale.as_ref(),
+                    fw.o_proj_int8_scale.as_ref(),
+                    self.weights.fp8_block_size,
+                    proj_out,
+                    fw.o_proj_int4_scale.as_ref(),
+                    fw.o_proj_int4_zero.as_ref(),
+                    self.weights.int4_group_size,
+                )?;
+            }
             if trace_output {
                 proj_out_trace = Some(
                     proj_out
