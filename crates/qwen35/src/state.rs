@@ -55,6 +55,8 @@ pub struct LayerState {
     pub certified_kv_tail_k: Option<GpuBuffer>,
     pub certified_kv_tail_v: Option<GpuBuffer>,
     pub certified_kv_gpu_tail_only: bool,
+    pub certified_kv_promoted_key_cache: Option<GpuBuffer>,
+    pub certified_kv_promoted_key_cache_tokens: usize,
     pub certified_kv_ranking_prefix_k: Option<GpuBuffer>,
     pub certified_kv_ranking_prefix_v: Option<GpuBuffer>,
     pub certified_kv_ranking_prefix_tokens: usize,
@@ -119,6 +121,8 @@ impl LayerState {
             certified_kv_tail_k: None,
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
+            certified_kv_promoted_key_cache: None,
+            certified_kv_promoted_key_cache_tokens: 0,
             certified_kv_ranking_prefix_k: None,
             certified_kv_ranking_prefix_v: None,
             certified_kv_ranking_prefix_tokens: 0,
@@ -164,6 +168,8 @@ impl LayerState {
             certified_kv_tail_k: None,
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
+            certified_kv_promoted_key_cache: None,
+            certified_kv_promoted_key_cache_tokens: 0,
             certified_kv_ranking_prefix_k: None,
             certified_kv_ranking_prefix_v: None,
             certified_kv_ranking_prefix_tokens: 0,
@@ -284,6 +290,10 @@ impl LayerState {
         if filled < self.certified_kv_host_tokens {
             self.certified_kv_host_tokens = 0;
         }
+        if filled < self.certified_kv_promoted_key_cache_tokens {
+            self.certified_kv_promoted_key_cache = None;
+            self.certified_kv_promoted_key_cache_tokens = 0;
+        }
         if filled < self.certified_kv_host_meta_blocks {
             self.certified_kv_host_meta_blocks = 0;
             self.certified_kv_host_meta_key_stride_tokens = 0;
@@ -312,6 +322,8 @@ impl LayerState {
             self.certified_kv_host_key_zero_cache.clear();
             self.certified_kv_host_value_error_cache.clear();
             self.certified_kv_host_value_norm_cache.clear();
+            self.certified_kv_promoted_key_cache = None;
+            self.certified_kv_promoted_key_cache_tokens = 0;
             self.certified_kv_ranking_prefix_k = None;
             self.certified_kv_ranking_prefix_v = None;
             self.certified_kv_ranking_prefix_tokens = 0;
@@ -382,6 +394,8 @@ impl LayerState {
             certified_kv_tail_k: clone_opt(&self.certified_kv_tail_k)?,
             certified_kv_tail_v: clone_opt(&self.certified_kv_tail_v)?,
             certified_kv_gpu_tail_only: self.certified_kv_gpu_tail_only,
+            certified_kv_promoted_key_cache: clone_opt(&self.certified_kv_promoted_key_cache)?,
+            certified_kv_promoted_key_cache_tokens: self.certified_kv_promoted_key_cache_tokens,
             certified_kv_ranking_prefix_k: clone_opt(&self.certified_kv_ranking_prefix_k)?,
             certified_kv_ranking_prefix_v: clone_opt(&self.certified_kv_ranking_prefix_v)?,
             certified_kv_ranking_prefix_tokens: self.certified_kv_ranking_prefix_tokens,

@@ -2060,6 +2060,44 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     return 0;
 }
 
+extern "C" int dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+    size_t device_ordinal,
+    const void* tier2_value_bf16,
+    const void* value_promote_index,
+    void* promoted_value_bf16,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int cap_tokens,
+    int max_promoted_value_blocks,
+    int head_dim
+) {
+    if (tier2_value_bf16 == nullptr || value_promote_index == nullptr ||
+        promoted_value_bf16 == nullptr) {
+        return 27;
+    }
+    if (kv_heads <= 0 || num_blocks <= 0 || block_size <= 0 || cap_tokens <= 0 ||
+        max_promoted_value_blocks <= 0 || head_dim <= 0 ||
+        cap_tokens < num_blocks * block_size) {
+        return 28;
+    }
+    ScopedCudaDevice scoped(static_cast<int>(device_ordinal));
+    constexpr int threads = 256;
+    certified_kv_gather_promoted_values_kernel<<<kv_heads * num_blocks, threads>>>(
+        static_cast<const __nv_bfloat16*>(tier2_value_bf16),
+        static_cast<const uint32_t*>(value_promote_index),
+        static_cast<__nv_bfloat16*>(promoted_value_bf16),
+        kv_heads,
+        num_blocks,
+        block_size,
+        cap_tokens,
+        max_promoted_value_blocks,
+        head_dim
+    );
+    if (cudaGetLastError() != cudaSuccess) return 29;
+    return 0;
+}
+
 extern "C" int dotcache_llama31_certified_kv_selected_fp16_log_masses(
     size_t device_ordinal,
     const void* query_bf16,

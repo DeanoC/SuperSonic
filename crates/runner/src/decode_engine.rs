@@ -5837,7 +5837,28 @@ impl DecodeEngine {
                             })?,
                         );
                     }
-                    if scratch
+                    if key_budget_covers_all_blocks {
+                        if ls
+                            .certified_kv_promoted_key_cache
+                            .as_ref()
+                            .map(|buf| buf.shape() != promoted_key_shape)
+                            .unwrap_or(true)
+                        {
+                            ls.certified_kv_promoted_key_cache = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::BF16,
+                                    &promoted_key_shape,
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV promoted key cache alloc: {e}"
+                                    )
+                                })?,
+                            );
+                            ls.certified_kv_promoted_key_cache_tokens = 0;
+                        }
+                    } else if scratch
                         .certified_promoted_key_bf16
                         .as_ref()
                         .map(|buf| buf.shape() != promoted_key_shape)
@@ -5904,14 +5925,8 @@ impl DecodeEngine {
                     .map_err(|e| {
                         anyhow::anyhow!("layer {idx} certified KV value promote index H2D: {e}")
                     })?;
-                    let tier2_key_device_ptr = ls
-                        .certified_kv_host_k
-                        .as_ref()
-                        .unwrap()
-                        .device_ptr()
-                        .map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV Tier-2 key map: {e}")
-                        })?;
+                    let promoted_key_cache_valid = key_budget_covers_all_blocks
+                        && ls.certified_kv_promoted_key_cache_tokens >= aligned;
                     let tier2_value_device_ptr = ls
                         .certified_kv_host_v
                         .as_ref()
@@ -5920,23 +5935,78 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV Tier-2 value map: {e}")
                         })?;
-                    kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
-                        self.ordinal,
-                        tier2_key_device_ptr,
-                        tier2_value_device_ptr,
-                        scratch.certified_promote_index.as_ref().unwrap(),
-                        scratch.certified_value_promote_index.as_ref().unwrap(),
-                        scratch.certified_promoted_key_bf16.as_mut().unwrap(),
-                        scratch.certified_promoted_value_bf16.as_mut().unwrap(),
-                        block_size,
-                        cap,
-                        max_promoted_blocks,
-                        max_promoted_value_blocks,
-                        gqa_group,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("layer {idx} certified KV promoted BF16 gather: {e}")
-                    })?;
+                    let has_value_promotions = selected_value_blocks_by_kvh
+                        .iter()
+                        .any(|blocks| !blocks.is_empty());
+                    if key_budget_covers_all_blocks && promoted_key_cache_valid {
+                        if has_value_promotions {
+                            kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
+                                self.ordinal,
+                                tier2_value_device_ptr,
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                scratch.certified_promoted_value_bf16.as_mut().unwrap(),
+                                block_size,
+                                cap,
+                                max_promoted_value_blocks,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV promoted BF16 value gather: {e}"
+                                )
+                            })?;
+                        }
+                    } else {
+                        let tier2_key_device_ptr = ls
+                            .certified_kv_host_k
+                            .as_ref()
+                            .unwrap()
+                            .device_ptr()
+                            .map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV Tier-2 key map: {e}")
+                            })?;
+                        if key_budget_covers_all_blocks {
+                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
+                                self.ordinal,
+                                tier2_key_device_ptr,
+                                tier2_value_device_ptr,
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                ls.certified_kv_promoted_key_cache.as_mut().unwrap(),
+                                scratch.certified_promoted_value_bf16.as_mut().unwrap(),
+                                block_size,
+                                cap,
+                                max_promoted_blocks,
+                                max_promoted_value_blocks,
+                                gqa_group,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV promoted BF16 gather: {e}"
+                                )
+                            })?;
+                            ls.certified_kv_promoted_key_cache_tokens = aligned;
+                        } else {
+                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
+                                self.ordinal,
+                                tier2_key_device_ptr,
+                                tier2_value_device_ptr,
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                scratch.certified_promoted_key_bf16.as_mut().unwrap(),
+                                scratch.certified_promoted_value_bf16.as_mut().unwrap(),
+                                block_size,
+                                cap,
+                                max_promoted_blocks,
+                                max_promoted_value_blocks,
+                                gqa_group,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV promoted BF16 gather: {e}"
+                                )
+                            })?;
+                        }
+                    }
                     if timings.is_some() {
                         gpu_hal::sync(self.ordinal).map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV gather synchronize: {e}")
@@ -6272,7 +6342,7 @@ impl DecodeEngine {
                             kernel_ffi::certified_kv::attend_all_promoted_int4_with_bf16_tail(
                                 self.ordinal,
                                 attn_q,
-                                scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                                ls.certified_kv_promoted_key_cache.as_ref().unwrap(),
                                 scratch.certified_promoted_value_bf16.as_ref().unwrap(),
                                 scratch.certified_value_promote_index.as_ref().unwrap(),
                                 ls.certified_kv_value_i4.as_ref().unwrap(),

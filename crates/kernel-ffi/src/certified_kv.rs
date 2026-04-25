@@ -138,6 +138,18 @@ unsafe extern "C" {
         head_dim: c_int,
         gqa_group: c_int,
     ) -> c_int;
+    fn dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+        device_ordinal: usize,
+        tier2_value_bf16: *const c_void,
+        value_promote_index: *const c_void,
+        promoted_value_bf16: *mut c_void,
+        kv_heads: c_int,
+        num_blocks: c_int,
+        block_size: c_int,
+        cap_tokens: c_int,
+        max_promoted_value_blocks: c_int,
+        head_dim: c_int,
+    ) -> c_int;
 
     fn dotcache_llama31_certified_kv_selected_fp16_log_masses(
         device_ordinal: usize,
@@ -1410,6 +1422,96 @@ pub fn gather_promoted_bf16_from_tier2(
             max_promoted_blocks,
             max_promoted_value_blocks,
             gqa_group,
+        );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gather_promoted_values_bf16_from_tier2(
+    ordinal: usize,
+    tier2_value_bf16_device_ptr: *const c_void,
+    value_promote_index: &GpuBuffer,
+    promoted_value_bf16: &mut GpuBuffer,
+    block_size: usize,
+    cap_tokens: usize,
+    max_promoted_value_blocks: usize,
+) -> Result<(), GpuError> {
+    if value_promote_index.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 value gather is currently CUDA-only".into(),
+        ));
+    }
+    if tier2_value_bf16_device_ptr.is_null() {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 value gather received null Tier-2 device pointer".into(),
+        ));
+    }
+    if value_promote_index.dtype() != ScalarType::U32
+        || promoted_value_bf16.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(
+            "certified KV promoted BF16 value gather dtype mismatch".into(),
+        ));
+    }
+    let value_promote_shape = value_promote_index.shape();
+    let promoted_value_shape = promoted_value_bf16.shape();
+    if value_promote_shape.len() != 2
+        || promoted_value_shape.len() != 4
+        || block_size == 0
+        || cap_tokens == 0
+        || max_promoted_value_blocks == 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV promoted BF16 value gather invalid shapes: value_index={:?} value={:?}",
+            value_promote_shape, promoted_value_shape
+        )));
+    }
+    let kv_heads = value_promote_shape[0];
+    let num_blocks = value_promote_shape[1];
+    let head_dim = promoted_value_shape[3];
+    if promoted_value_shape[0] != kv_heads
+        || promoted_value_shape[1] < max_promoted_value_blocks
+        || promoted_value_shape[2] != block_size
+        || cap_tokens < num_blocks * block_size
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "certified KV promoted BF16 value gather shape mismatch: value_index={:?} value={:?} cap={cap_tokens} block={block_size} max_value={max_promoted_value_blocks}",
+            value_promote_shape, promoted_value_shape
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+            ordinal,
+            tier2_value_bf16_device_ptr,
+            value_promote_index.as_ptr(),
+            promoted_value_bf16.as_mut_ptr(),
+            kv_heads as c_int,
+            num_blocks as c_int,
+            block_size as c_int,
+            cap_tokens as c_int,
+            max_promoted_value_blocks as c_int,
+            head_dim as c_int,
+        );
+        if status != 0 {
+            return Err(certified_kv_error(
+                Backend::Cuda,
+                format!("certified KV CUDA promoted BF16 value gather failed: {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            tier2_value_bf16_device_ptr,
+            value_promote_index,
+            promoted_value_bf16,
+            block_size,
+            cap_tokens,
+            max_promoted_value_blocks,
         );
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
