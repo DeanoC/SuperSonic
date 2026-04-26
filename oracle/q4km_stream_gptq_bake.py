@@ -43,6 +43,8 @@ def log(msg: str) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stream a GGUF -> Q4KM-GPTQ SuperSonic bake")
     p.add_argument("--model-dir", required=True, type=Path)
+    p.add_argument("--activation-model-dir", type=Path, default=None,
+                   help="Optional HF/Transformers model directory used only for activation collection")
     p.add_argument("--gguf-file", required=True, type=Path)
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument("--model", default="qwen3.6-27b")
@@ -224,7 +226,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if args.offload_folder:
         kwargs["offload_folder"] = str(args.offload_folder)
 
-    model = AutoModelForCausalLM.from_pretrained(str(args.model_dir), **kwargs)
+    model_dir = args.activation_model_dir or args.model_dir
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), **kwargs)
     if not args.device_map:
         model = model.to(device)
     model.eval()
