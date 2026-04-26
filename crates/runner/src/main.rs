@@ -97,6 +97,7 @@ impl BackendChoice {
             "auto" => Some(Self::Auto),
             "hip" => Some(Self::Explicit(Backend::Hip)),
             "cuda" => Some(Self::Explicit(Backend::Cuda)),
+            "metal" => Some(Self::Explicit(Backend::Metal)),
             _ => None,
         }
     }
@@ -127,6 +128,11 @@ fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
                 && kernel_ffi::query_gpu_info(ordinal).is_ok()
             {
                 return Ok(Backend::Hip);
+            }
+            if gpu_hal::is_backend_compiled(Backend::Metal)
+                && gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok()
+            {
+                return Ok(Backend::Metal);
             }
             anyhow::bail!(
                 "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
@@ -772,7 +778,7 @@ fn main() -> Result<()> {
     let ordinal = cli.device;
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown backend '{}'. Expected one of: auto, hip, cuda",
+            "Unknown backend '{}'. Expected one of: auto, hip, cuda, metal",
             cli.backend
         )
     })?;
@@ -1073,6 +1079,9 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
+    if prompt_ids.is_empty() {
+        anyhow::bail!("empty prompt after tokenization");
+    }
 
     // 4. VRAM check (needs config + prompt length for KV cache estimation)
     let context_tokens = cli
@@ -1303,7 +1312,11 @@ fn main() -> Result<()> {
             None,
         )?;
         engine.load_prefill_state(&output)?;
-        let first = output.generated_token_ids[0];
+        let first = output.generated_token_ids.first().copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "oracle prefill produced no generated tokens; --oracle-prefill requires --max-new-tokens > 0"
+            )
+        })?;
         eprintln!(
             "[prefill] oracle prefill done in {:.0}ms",
             prefill_start.elapsed().as_millis()
