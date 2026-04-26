@@ -102,7 +102,13 @@ fn main() -> Result<()> {
     if args.iters == 0 {
         bail!("--iters must be > 0");
     }
-    if args.q_heads != args.kv_heads * (args.q_heads / args.kv_heads) {
+    if args.q_heads == 0 {
+        bail!("--q-heads must be > 0");
+    }
+    if args.kv_heads == 0 {
+        bail!("--kv-heads must be > 0");
+    }
+    if args.q_heads % args.kv_heads != 0 {
         bail!("q_heads must be an integer multiple of kv_heads");
     }
     let contexts = parse_contexts(&args.contexts)?;
@@ -656,6 +662,7 @@ fn run_once(
             score_scratch,
             block_mass,
             args.block_size,
+            None,
         )
         .context("block masses")
     })?;
@@ -672,6 +679,7 @@ fn run_once(
             e_val_by_head,
             gqa_group,
             args.v_tol,
+            None,
         )
         .context("value promotions")
     })?;
@@ -684,6 +692,7 @@ fn run_once(
             args.block_size,
             context_tokens,
             max_promoted_value_blocks,
+            None,
         )
         .context("promoted value gather")
     })?;

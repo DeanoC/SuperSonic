@@ -1050,6 +1050,16 @@ fn main() -> Result<()> {
                 );
             }
         }
+    } else if backend == Backend::Metal {
+        if cli.int4 {
+            anyhow::bail!("Metal does not support --int4 on Qwen3.5 yet");
+        }
+        if cli.fp8_runtime {
+            anyhow::bail!("Metal does not support --fp8-runtime on Qwen3.5 yet");
+        }
+        if cli.kv_fp8 {
+            anyhow::bail!("Metal does not support --kv-fp8 on Qwen3.5 yet");
+        }
     }
 
     // If --model-dir is pristine (no config.json), fetch a bake first so the
