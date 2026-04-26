@@ -1138,7 +1138,7 @@ pub fn rms_norm_4b(
 /// F32-cached input vector; anything larger overruns LDS and faults the same
 /// way the 2B attn_scratch crash did (c.f. 338b939). Keep in sync with the
 /// `shared_input[...]` declaration in every `full_attention*.hip`/`.cuh`.
-pub const STANDALONE_MATVEC_MAX_IN_DIM: usize = 4096;
+pub const STANDALONE_MATVEC_MAX_IN_DIM: usize = 8192;
 
 /// 4B variant of standalone matvec (same logic, separate compilation).
 pub fn standalone_matvec_4b(

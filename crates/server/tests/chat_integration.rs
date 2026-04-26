@@ -40,6 +40,7 @@ fn load_test_config() -> Option<LoaderConfig> {
     let model = std::env::var("SUPERSONIC_TEST_MODEL").ok()?;
     let dir = std::env::var("SUPERSONIC_TEST_MODEL_DIR").ok()?;
     let int4 = std::env::var("SUPERSONIC_TEST_INT4").is_ok();
+    let q4km = std::env::var("SUPERSONIC_TEST_Q4KM").is_ok();
     let fp8 = std::env::var("SUPERSONIC_TEST_FP8_RUNTIME").is_ok();
     let kv_fp8 = std::env::var("SUPERSONIC_TEST_KV_FP8").is_ok();
     let max_ctx = std::env::var("SUPERSONIC_TEST_MAX_CONTEXT")
@@ -53,6 +54,7 @@ fn load_test_config() -> Option<LoaderConfig> {
         device: 0,
         max_context: max_ctx,
         int4,
+        q4km,
         fp8_runtime: fp8,
         kv_fp8,
         api_key: None,

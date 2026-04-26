@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn command_exists(name: &str) -> bool {
@@ -10,10 +12,81 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn detect_cuda_root() -> Option<PathBuf> {
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(value) = env::var(var) {
+            let path = PathBuf::from(value);
+            if path.join("bin/nvcc").exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    let Ok(output) = Command::new("sh")
+        .arg("-lc")
+        .arg("command -v nvcc")
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+
+    let nvcc = fs::canonicalize(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+    .ok()?;
+    nvcc.parent()
+        .and_then(|bin| bin.parent())
+        .map(Path::to_path_buf)
+}
+
+fn detect_cuda_lib_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(root) = detect_cuda_root() {
+        candidates.extend([
+            root.join("lib64"),
+            root.join("targets/x86_64-linux/lib"),
+            root.join("lib"),
+        ]);
+    }
+    candidates.extend([
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/usr/local/lib"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/lib"),
+    ]);
+    for candidate in candidates {
+        if has_libcudart(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn has_libcudart(dir: &Path) -> bool {
+    if dir.join("libcudart.so").exists() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libcudart.so.")
+        })
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/metal_bridge.mm");
     println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_cuda)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_metal)");
@@ -63,6 +136,13 @@ fn main() {
         println!("cargo:rustc-cfg=supersonic_backend_hip");
     }
     if enable_cuda {
+        if let Some(cuda_lib_dir) = detect_cuda_lib_dir() {
+            println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
+        } else {
+            println!(
+                "cargo:warning=could not locate libcudart under CUDA_HOME/CUDA_PATH or common system library paths; falling back to linker search path"
+            );
+        }
         println!("cargo:rustc-cfg=supersonic_backend_cuda");
     }
     if enable_metal {

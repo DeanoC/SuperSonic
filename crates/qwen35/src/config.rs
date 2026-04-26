@@ -193,3 +193,67 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Config, String> {
         serde_json::from_str(&text).map_err(|e| format!("parse config.json: {e}"))?;
     Ok(config.normalized())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_qwen36_27b_text_config_geometry() {
+        let layer_types = (0..64)
+            .map(|idx| {
+                if (idx + 1) % 4 == 0 {
+                    "\"full_attention\""
+                } else {
+                    "\"linear_attention\""
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            r#"{{
+                "text_config": {{
+                    "vocab_size": 248320,
+                    "hidden_size": 5120,
+                    "intermediate_size": 17408,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 24,
+                    "num_key_value_heads": 4,
+                    "hidden_act": "silu",
+                    "max_position_embeddings": 262144,
+                    "rms_norm_eps": 1e-06,
+                    "tie_word_embeddings": false,
+                    "eos_token_id": 248044,
+                    "head_dim": 256,
+                    "linear_conv_kernel_dim": 4,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 48,
+                    "layer_types": [{layer_types}],
+                    "rope_parameters": {{
+                        "partial_rotary_factor": 0.25,
+                        "rope_theta": 10000000,
+                        "rope_type": "default",
+                        "mrope_interleaved": true,
+                        "mrope_section": [11, 11, 10]
+                    }}
+                }},
+                "vision_config": {{"hidden_size": 1152}}
+            }}"#
+        );
+
+        let config: Config = serde_json::from_str(&json).unwrap();
+        let text = config.normalized().text_config;
+        assert_eq!(text.num_hidden_layers, 64);
+        assert_eq!(text.num_full_attention_layers(), 16);
+        assert_eq!(text.hidden_size, 5120);
+        assert_eq!(text.intermediate_size, 17408);
+        assert_eq!(text.num_attention_heads, 24);
+        assert_eq!(text.num_key_value_heads, 4);
+        assert_eq!(text.linear_value_dim(), 6144);
+        assert_eq!(text.rotary_dim(), 64);
+        assert_eq!(text.rope_theta(), 10_000_000.0);
+        assert_eq!(text.kv_bytes_per_token(2), 65_536);
+    }
+}

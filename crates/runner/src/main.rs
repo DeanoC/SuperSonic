@@ -400,6 +400,15 @@ pub(crate) struct Cli {
     #[arg(long)]
     int4: bool,
 
+    /// Use a GGUF-like Q4KM bake in SuperSonic's native low-bit runtime layout.
+    /// Runtime executes the translated bake, not GGML blocks directly.
+    #[arg(long)]
+    q4km: bool,
+
+    /// Optional GGUF source file to translate into a native q4km bake.
+    #[arg(long)]
+    gguf_file: Option<PathBuf>,
+
     /// Load an INT8 bake produced from BitsAndBytes `load_in_8bit=True`.
     /// Currently only supported for `llama3.1-8b` on CUDA.
     #[arg(long)]
@@ -734,13 +743,70 @@ fn try_download_bake(
 /// Pick the variant the CLI flags imply, using the same INT4 > FP8 > BF16
 /// priority order as the rest of the runner.
 fn cli_variant(cli: &Cli) -> model_store::fetch::BakeVariant {
-    if cli.int4 {
+    if cli.q4km {
+        model_store::fetch::BakeVariant::Q4Km
+    } else if cli.int4 {
         model_store::fetch::BakeVariant::Int4Gptq
     } else if cli.fp8_runtime {
         model_store::fetch::BakeVariant::Fp8Native
     } else {
         model_store::fetch::BakeVariant::Bf16
     }
+}
+
+fn variant_version_ok(
+    variant: model_store::fetch::BakeVariant,
+    bake_dir: &std::path::Path,
+) -> bool {
+    if variant == model_store::fetch::BakeVariant::Q4Km
+        && bake_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-q4km-gptq"))
+    {
+        model_store::version_ok_q4km_gptq(bake_dir)
+    } else {
+        model_store::version_ok(bake_dir)
+    }
+}
+
+fn repo_root() -> Result<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve repository root from CARGO_MANIFEST_DIR"))
+}
+
+fn run_q4km_baker(cli: &Cli, bake_dir: &std::path::Path) -> Result<()> {
+    let gguf_file = cli
+        .gguf_file
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--q4km local bake requires --gguf-file"))?;
+    let script = repo_root()?.join("oracle/bake_q4km.py");
+    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
+    eprintln!(
+        "[bake] translating GGUF {} into native q4km bake at {}",
+        gguf_file.display(),
+        bake_dir.display()
+    );
+    let status = std::process::Command::new(&python)
+        .arg(&script)
+        .arg("--model-dir")
+        .arg(&cli.model_dir)
+        .arg("--model")
+        .arg(&cli.model)
+        .arg("--gguf-file")
+        .arg(gguf_file)
+        .arg("--out-dir")
+        .arg(bake_dir)
+        .status()
+        .map_err(|e| anyhow::anyhow!("launch q4km baker {script:?}: {e}"))?;
+    if !status.success() {
+        anyhow::bail!("q4km baker failed with status {status}");
+    }
+    Ok(())
 }
 
 /// When `--model-dir` has no `config.json`, we can't load the tokenizer or
@@ -882,6 +948,23 @@ fn main() -> Result<()> {
         )
     })?;
 
+    if cli.q4km && (cli.int4 || cli.int8 || cli.fp8_runtime) {
+        anyhow::bail!("--q4km is mutually exclusive with --int4, --int8, and --fp8-runtime");
+    }
+    if cli.q4km
+        && !matches!(
+            model_variant.family(),
+            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+        )
+    {
+        anyhow::bail!("--q4km is currently supported only for Qwen models");
+    }
+    if cli.gguf_file.is_some() && !cli.q4km {
+        anyhow::bail!("--gguf-file requires --q4km");
+    }
+    if cli.no_bake && cli.q4km {
+        anyhow::bail!("--q4km requires a baked package; omit --no-bake");
+    }
     if cli.int8 && (cli.int4 || cli.fp8_runtime) {
         anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
     }
@@ -904,6 +987,14 @@ fn main() -> Result<()> {
         let _ = certified_kv::CertifiedKvConfig::from_cli(&cli)?;
     } else if cli.certified_kv_shadow_validate {
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
+    }
+    if model_variant.family() == ModelFamily::Qwen36Moe {
+        anyhow::bail!(
+            "qwen3.6-35b-a3b is recognized, but the MoE runtime is not implemented yet. \
+             Build a q4km bake with `python oracle/bake_q4km.py --model qwen3.6-35b-a3b --model-dir {}` first; \
+             runtime support needs the separate Qwen MoE engine/kernels.",
+            cli.model_dir.display(),
+        );
     }
 
     // 2. Detect GPU
@@ -994,6 +1085,7 @@ fn main() -> Result<()> {
         ModelFamily::Llama31 => {
             return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
         }
+        ModelFamily::Qwen36Moe => unreachable!("qwen3.6 MoE is rejected before registry lookup"),
         ModelFamily::Qwen35 => {}
     }
 
@@ -1122,8 +1214,8 @@ fn main() -> Result<()> {
         if cli.int4 {
             anyhow::bail!("CUDA v1 does not support --int4 yet");
         }
-        if cli.fp8_runtime {
-            anyhow::bail!("CUDA v1 does not support --fp8-runtime yet");
+        if cli.fp8_runtime && model_variant != ModelVariant::Qwen3_6_27B {
+            anyhow::bail!("CUDA --fp8-runtime currently supports only qwen3.6-27b on sm86");
         }
         if cli.kv_fp8 {
             if model_variant != ModelVariant::Qwen3_5_4B || gpu_arch != GpuArch::Sm86 {
@@ -1145,6 +1237,9 @@ fn main() -> Result<()> {
         ) {
             anyhow::bail!("Metal only supports --model qwen3.5-0.8b or qwen3.5-2b");
         }
+        if cli.int4 || cli.q4km {
+            anyhow::bail!("Metal does not support low-bit Qwen weights on Qwen3.5 yet");
+        }
         if cli.fp8_runtime {
             anyhow::bail!("Metal does not support --fp8-runtime on Qwen3.5 yet");
         }
@@ -1155,7 +1250,9 @@ fn main() -> Result<()> {
             anyhow::bail!("Metal only supports --batch-size 1");
         }
         if cli.force_kernel_decode || cli.force_component_decode {
-            anyhow::bail!("Metal does not support --force-kernel-decode or --force-component-decode");
+            anyhow::bail!(
+                "Metal does not support --force-kernel-decode or --force-component-decode"
+            );
         }
     }
 
@@ -1200,8 +1297,13 @@ fn main() -> Result<()> {
         gpu_hal::ScalarType::BF16.size_in_bytes()
     };
     let kv_per_token = text_config.kv_bytes_per_token(kv_dtype_bytes);
-    // FP8 runtime dequant halves weight VRAM; INT4 quarters it.
-    let effective_fixed = if cli.int4 {
+    // FP8 runtime dequant halves weight VRAM; low-bit paths quarter most
+    // matmul weights but keep embeddings/lm_head and scratch in higher
+    // precision. Q4KM is measured from real 27B GGUF bakes at ~0.30x fixed;
+    // GPTQ INT4 keeps the older conservative 0.37x estimate.
+    let effective_fixed = if cli.q4km {
+        (entry.vram.fixed_bytes as f64 * 0.30) as u64
+    } else if cli.int4 {
         // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1
         // INT4 weights = weights / 4 + ~5% scale/zero overhead
         // total ≈ fixed * 0.9 * 0.3 + fixed * 0.1 = fixed * 0.37
@@ -1249,22 +1351,25 @@ fn main() -> Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
     } else {
-        let variant = if cli.int4 {
+        let variant = if cli.q4km {
+            model_store::fetch::BakeVariant::Q4Km
+        } else if cli.int4 {
             model_store::fetch::BakeVariant::Int4Gptq
         } else if cli.fp8_runtime {
             model_store::fetch::BakeVariant::Fp8Native
         } else {
             model_store::fetch::BakeVariant::Bf16
         };
-        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let mut bake_dir = variant.bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
 
-        if cli.download_bake || !model_store::version_ok(&bake_dir) {
+        if cli.download_bake || !variant_version_ok(variant, &bake_dir) {
             let local_bake_ok = matches!(
                 variant,
                 model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
-            );
+            ) || (variant == model_store::fetch::BakeVariant::Q4Km
+                && cli.gguf_file.is_some());
             let canonical_model = model_variant.to_string();
             match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
                 Ok(true) => {
@@ -1272,50 +1377,82 @@ fn main() -> Result<()> {
                 }
                 Ok(false) => {
                     if !local_bake_ok {
-                        anyhow::bail!(
-                            "no {variant} bake at {} and --no-download set.\n\
-                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
-                            bake_dir.display(),
-                            cli.model_dir.display(),
-                        );
+                        if cli.q4km {
+                            anyhow::bail!(
+                                "no {variant} bake at {} and --no-download set.\n\
+                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
+                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
+                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
+                                bake_dir.display(),
+                                cli.model_dir.display(),
+                                bake_dir.display(),
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "no {variant} bake at {} and --no-download set.\n\
+                                 Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
+                                bake_dir.display(),
+                                cli.model_dir.display(),
+                            );
+                        }
                     }
                 }
                 Err(e) => {
                     if local_bake_ok {
                         eprintln!("[fetch] {e}; falling back to local bake");
                     } else {
-                        anyhow::bail!(
-                            "could not obtain {variant} bake: {e}\n\n\
-                             INT4 baking requires a GPTQ calibration pass in Python. \
-                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}\n\
-                             then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
-                            cli.model_dir.display(),
-                            cli.model,
-                            cli.model_dir.display(),
-                        );
+                        if cli.q4km {
+                            anyhow::bail!(
+                                "could not obtain {variant} bake: {e}\n\n\
+                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
+                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
+                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
+                                cli.model_dir.display(),
+                                bake_dir.display(),
+                            );
+                        } else {
+                            anyhow::bail!(
+                                "could not obtain {variant} bake: {e}\n\n\
+                                 INT4 baking requires a GPTQ calibration pass in Python. \
+                                 Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}\n\
+                                 then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
+                                cli.model_dir.display(),
+                                cli.model,
+                                cli.model_dir.display(),
+                            );
+                        }
                     }
                 }
             }
-            if !model_store::version_ok(&bake_dir) && local_bake_ok {
-                let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
-                eprintln!("[bake] no baked package found — baking weights{mode_str} (one-time)...");
+            if !variant_version_ok(variant, &bake_dir) && local_bake_ok {
                 let bake_start = Instant::now();
-                let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
-                    .map(|i| text_config.is_full_attention(i))
-                    .collect();
-                model_store::bake_qwen35(
-                    &cli.model_dir,
-                    params.weight_prefix,
-                    text_config.num_hidden_layers,
-                    &layer_is_full,
-                    cli.fp8_runtime,
-                    &|msg| eprintln!("{msg}"),
-                )
-                .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+                if cli.q4km {
+                    bake_dir = model_store::bake_dir_q4km_minmax(&cli.model_dir);
+                    if !model_store::version_ok(&bake_dir) {
+                        run_q4km_baker(&cli, &bake_dir)?;
+                    }
+                } else {
+                    let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
+                    eprintln!(
+                        "[bake] no baked package found — baking weights{mode_str} (one-time)..."
+                    );
+                    let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
+                        .map(|i| text_config.is_full_attention(i))
+                        .collect();
+                    model_store::bake_qwen35(
+                        &cli.model_dir,
+                        params.weight_prefix,
+                        text_config.num_hidden_layers,
+                        &layer_is_full,
+                        cli.fp8_runtime,
+                        &|msg| eprintln!("{msg}"),
+                    )
+                    .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
+                }
                 eprintln!("[bake] done in {:.1}s", bake_start.elapsed().as_secs_f64());
             }
         }
-        if model_store::version_ok(&bake_dir) {
+        if variant_version_ok(variant, &bake_dir) {
             eprintln!("[weights] found baked package at {}", bake_dir.display());
         }
         let store = model_store::BakedStore::open(&bake_dir)

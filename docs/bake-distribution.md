@@ -32,10 +32,12 @@ One release per `FORMAT_VERSION`; tag `bakes-v{FORMAT_VERSION}` on
 - One `{model}-{variant}-fmt{N}-cvt{M}.tar.zst` (or
   `…tar.zst.partNN` when >1800 MiB) per bake.
 
-Models: `qwen3.5-{0.8b,2b,4b,9b}`, `gemma4-{e2b,e4b}`.
-Variants: `bf16`, `fp8-native`, `int4-gptq`.
+Models: `qwen3.5-{0.8b,2b,4b,9b}`, `qwen3.6-27b`,
+`qwen3.6-35b-a3b`, `gemma4-{e2b,e4b}`.
+Variants: `bf16`, `fp8-native`, `int4-gptq`, `q4km`, `q4km-gptq`.
 
 Example: `gemma4-e4b-int4-gptq-fmt1-cvt2.tar.zst`.
+Example: `qwen3.6-27b-q4km-gptq-fmt1-cvt2.tar.zst`.
 
 Tarballs contain `manifest.json` + `weights.bin` at the root plus the small
 HuggingFace metadata files under an `hf/` prefix:

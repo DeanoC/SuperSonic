@@ -42,6 +42,7 @@ pub struct LoaderConfig {
     pub device: usize,
     pub max_context: usize,
     pub int4: bool,
+    pub q4km: bool,
     pub fp8_runtime: bool,
     pub kv_fp8: bool,
     pub api_key: Option<String>,
@@ -51,6 +52,9 @@ pub struct LoaderConfig {
 }
 
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
+    if cfg.q4km && (cfg.int4 || cfg.fp8_runtime) {
+        bail!("--q4km is mutually exclusive with --int4 and --fp8-runtime");
+    }
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
     gpu_hal::set_backend(backend);
@@ -62,6 +66,14 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             registry::supported_models_list().join(", ")
         )
     })?;
+    if cfg.q4km
+        && !matches!(
+            variant.family(),
+            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+        )
+    {
+        bail!("--q4km is currently supported only for Qwen models");
+    }
 
     if backend == Backend::Metal {
         if variant != ModelVariant::Qwen3_5_0_8B {
@@ -136,12 +148,13 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     let max_context = cfg.max_context.max(8);
     let (session, eos_ids) = match variant.family() {
         ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
+        ModelFamily::Qwen36Moe => bail!("qwen3.6-35b-a3b MoE runtime is not implemented yet"),
         ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
         ModelFamily::Phi4 => {
             bail!("Phi-4 engine is under development — not yet exposed via supersonic-serve");
         }
         ModelFamily::Llama31 => {
-            bail!("Llama 3.1 engine is under development — not yet exposed via supersonic-serve");
+            bail!("Llama 3.1 is available through the supersonic CLI but is not wired into supersonic-serve yet");
         }
     };
 
@@ -174,7 +187,9 @@ fn ensure_hf_metadata_present(cfg: &LoaderConfig, variant: &ModelVariant) -> Res
     if cfg.model_dir.join("config.json").exists() {
         return Ok(());
     }
-    let bake_variant = if cfg.int4 {
+    let bake_variant = if cfg.q4km {
+        model_store::fetch::BakeVariant::Q4Km
+    } else if cfg.int4 {
         model_store::fetch::BakeVariant::Int4Gptq
     } else if cfg.fp8_runtime {
         model_store::fetch::BakeVariant::Fp8Native
@@ -324,7 +339,9 @@ fn build_qwen(
     // Prefer the baked format; auto-bake BF16/FP8 if missing, fail with a
     // clear message for INT4 (calibration must happen offline).
     let t0 = Instant::now();
-    let variant_bake = if cfg.int4 {
+    let variant_bake = if cfg.q4km {
+        model_store::fetch::BakeVariant::Q4Km
+    } else if cfg.int4 {
         model_store::fetch::BakeVariant::Int4Gptq
     } else if cfg.fp8_runtime {
         model_store::fetch::BakeVariant::Fp8Native
@@ -335,7 +352,14 @@ fn build_qwen(
     let _lock = model_store::BakeLock::acquire(&cfg.model_dir)
         .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
 
-    if !model_store::version_ok(&bake_dir) {
+    let bake_ok = || {
+        if variant_bake == model_store::fetch::BakeVariant::Q4Km {
+            model_store::version_ok_q4km_gptq(&bake_dir)
+        } else {
+            model_store::version_ok(&bake_dir)
+        }
+    };
+    if !bake_ok() {
         let local_bake_ok = matches!(
             variant_bake,
             model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
@@ -356,15 +380,17 @@ fn build_qwen(
         };
         if !downloaded && !local_bake_ok {
             bail!(
-                "no {variant_bake} bake at {} and download unavailable. INT4 calibration \
-                 must happen offline — run `python oracle/bake_int4.py --model-dir {}` on a \
-                 machine with spare RAM or rerun without --no-download to fetch from the \
-                 GitHub bakes-v1 release.",
+                "no {variant_bake} bake at {} and download unavailable. Low-bit baking \
+                 must happen offline — run `python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
+                 for q4km-gptq or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
+                 then rerun without --no-download to fetch from the GitHub bakes-v1 release.",
+                bake_dir.display(),
+                cfg.model_dir.display(),
                 bake_dir.display(),
                 cfg.model_dir.display(),
             );
         }
-        if !model_store::version_ok(&bake_dir) && local_bake_ok {
+        if !bake_ok() && local_bake_ok {
             tracing::info!("baking Qwen3.5 {} weights (one-time)...", variant_bake);
             let bake_start = Instant::now();
             let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)

@@ -56,6 +56,7 @@ OPTIONAL_HF_FILES = [
 
 KNOWN_MODELS = {
     "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b",
+    "qwen3.6-27b", "qwen3.6-35b-a3b",
     "gemma4-e2b", "gemma4-e4b",
     "phi4-mini",
 }
@@ -64,6 +65,8 @@ VARIANT_DIR_SUFFIX = {
     "bf16": "",
     "fp8-native": "-fp8",
     "int4-gptq": "-int4-gptq",
+    "q4km": "-q4km",
+    "q4km-gptq": "-q4km-gptq",
 }
 
 FAMILY_FOR = {
@@ -71,6 +74,8 @@ FAMILY_FOR = {
     "qwen3.5-2b": "qwen35",
     "qwen3.5-4b": "qwen35",
     "qwen3.5-9b": "qwen35",
+    "qwen3.6-27b": "qwen35",
+    "qwen3.6-35b-a3b": "qwen36-moe",
     "gemma4-e2b": "gemma4",
     "gemma4-e4b": "gemma4",
     "phi4-mini": "phi4",
@@ -120,8 +125,12 @@ def validate_bake(bake_dir: Path, variant: str) -> dict:
     # the Fp8Native bake must contain Fp8Native layouts. This catches the case
     # where a user points --int4 at a BF16 bake directory.
     layouts = {t.get("layout") for t in manifest.get("tensors", [])}
-    if variant == "int4-gptq" and "Int4Quantized" not in layouts:
+    if variant in ("int4-gptq", "q4km", "q4km-gptq") and "Int4Quantized" not in layouts:
         sys.exit(f"error: {bake_dir} has no Int4Quantized tensors — wrong variant?")
+    if variant == "q4km" and manifest.get("quant_profile") != "q4km-v1":
+        sys.exit(f"error: {bake_dir} is missing quant_profile=q4km-v1")
+    if variant == "q4km-gptq" and manifest.get("quant_profile") != "q4km-gptq-v1":
+        sys.exit(f"error: {bake_dir} is missing quant_profile=q4km-gptq-v1")
     if variant == "fp8-native" and "Fp8Native" not in layouts:
         sys.exit(f"error: {bake_dir} has no Fp8Native tensors — wrong variant?")
     return manifest
@@ -363,6 +372,9 @@ def main() -> None:
     variant_group.add_argument("--bf16", action="store_true")
     variant_group.add_argument("--fp8-native", action="store_true", dest="fp8_native")
     variant_group.add_argument("--int4", action="store_true", help="INT4 GPTQ bake")
+    variant_group.add_argument("--q4km", action="store_true", help="GGUF-like q4km min/max bake")
+    variant_group.add_argument("--q4km-gptq", action="store_true", dest="q4km_gptq",
+                               help="GGUF-like q4km streaming GPTQ bake")
     ap.add_argument("--tag", default=f"bakes-v{FORMAT_VERSION}")
     ap.add_argument("--dry-run", action="store_true", help="Print gh commands, don't upload")
     ap.add_argument("--prune-old-cvt", action="store_true",
@@ -373,6 +385,10 @@ def main() -> None:
         variant = "bf16"
     elif args.fp8_native:
         variant = "fp8-native"
+    elif args.q4km:
+        variant = "q4km"
+    elif args.q4km_gptq:
+        variant = "q4km-gptq"
     else:
         variant = "int4-gptq"
 

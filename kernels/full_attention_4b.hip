@@ -4503,7 +4503,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
     extern __shared__ float shared_scratch[];
 
     // Load input into shared memory as F32
-    __shared__ float shared_input[4096];  // max in_dim we support
+    __shared__ float shared_input[8192];  // max in_dim we support
     for (int col = tid; col < in_dim; col += block_size) {
         shared_input[col] = dotcache_qwen35_to_float(input[col]);
     }

@@ -4856,6 +4856,8 @@ int persistent_decode_device(
     size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
     if constexpr (SINGLE_STREAM_BF16_SPECIALIZED) {
         shared_bytes += static_cast<size_t>(intermediate_size) * sizeof(T);
+    }
+    if (shared_bytes > static_cast<size_t>(props.sharedMemPerBlock)) {
         cudaError_t attr_err = cudaFuncSetAttribute(
             HIP_KERNEL_NAME(dotcache_qwen35_persistent_decode_kernel<T, SINGLE_STREAM_BF16_SPECIALIZED>),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
