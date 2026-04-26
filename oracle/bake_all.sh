@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# bake_all.sh — produce INT4 (and optionally BF16) bakes for every configured
-# model on a big-box producer, and optionally publish each to the GitHub
-# release as it finishes.
+# bake_all.sh — produce INT4/Q4KM (and optionally BF16) bakes for every
+# configured model on a big-box producer, and optionally publish each to the
+# GitHub release as it finishes.
 #
 # Point env vars at the model directories you want to bake. Any unset var is
 # silently skipped, so you can bake a subset without editing the script.
@@ -12,6 +12,7 @@
 #   QWEN_9B_DIR=/models/Qwen3.5-9B \
 #   GEMMA_E2B_DIR=/models/gemma-4-E2B \
 #   GEMMA_E4B_DIR=/models/gemma-4-E4B \
+#   PHI4_MINI_DIR=/models/Phi-4-mini-instruct \
 #   ./oracle/bake_all.sh --upload
 #
 # Flags:
@@ -21,6 +22,8 @@
 #   --fp8-native    Also produce Qwen FP8-native bakes (needs a model source
 #                   with FP8 tensors; e.g. lovedheart/Qwen3.5-*-FP8). Gemma 4
 #                   has no FP8-native bake format.
+#   --q4km          Also produce Q4KM bakes (Qwen only; Gemma/Phi4 not yet
+#                   supported by oracle/bake_q4km.py).
 #   --no-int4       Skip INT4 bakes (useful with --bf16 for a BF16-only run).
 #   --force         Re-bake even if a valid bake already exists.
 #   --stop-on-error Abort the whole batch if any single bake fails.
@@ -30,6 +33,12 @@
 # (~18 GiB) into GPU memory, which OOMs on ≤16 GiB cards (including gfx1150).
 # Bake it on a box with ≥24 GiB GPU RAM or skip it by leaving QWEN_9B_DIR
 # unset. `oracle/bake_int4.py --help` documents the memory requirements.
+#
+# Auto-update on lm_head INT4: existing Qwen INT4/Q4KM bakes that predate
+# the lm_head-INT4 work (no `lm_head.weight_int4_scale` tensor in the
+# manifest) are treated as needing re-bake even without --force, so a plain
+# `./bake_all.sh` brings every Qwen bake up to the current format. Override
+# this auto-detection by passing --skip-lm-head-int4-refresh.
 #
 # The script is safely re-runnable — existing valid bakes are skipped unless
 # --force is set. Both Python bakers checkpoint per-layer, so an interrupted
@@ -44,16 +53,20 @@ UPLOAD=0
 INCLUDE_BF16=0
 INCLUDE_FP8=0
 INCLUDE_INT4=1
+INCLUDE_Q4KM=0
 FORCE=0
 STOP_ON_ERROR=0
+SKIP_LM_HEAD_INT4_REFRESH=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --upload) UPLOAD=1 ;;
         --bf16) INCLUDE_BF16=1 ;;
         --fp8-native) INCLUDE_FP8=1 ;;
+        --q4km) INCLUDE_Q4KM=1 ;;
         --no-int4) INCLUDE_INT4=0 ;;
         --force) FORCE=1 ;;
+        --skip-lm-head-int4-refresh) SKIP_LM_HEAD_INT4_REFRESH=1 ;;
         --stop-on-error) STOP_ON_ERROR=1 ;;
         -h|--help) awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0" ; exit 0 ;;
         *) echo "unknown flag: $1" >&2 ; exit 2 ;;
@@ -69,6 +82,7 @@ MODELS=(
     "qwen3.5-9b:QWEN_9B_DIR:qwen"
     "gemma4-e2b:GEMMA_E2B_DIR:gemma"
     "gemma4-e4b:GEMMA_E4B_DIR:gemma"
+    "phi4-mini:PHI4_MINI_DIR:phi4"
 )
 
 FORMAT_VERSION=1   # must match crates/model-store/src/manifest.rs
@@ -81,6 +95,8 @@ bake_dir_for() {
         bf16) echo "$model_dir/.supersonic/v${FORMAT_VERSION}" ;;
         fp8-native) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-fp8" ;;
         int4) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-int4-gptq" ;;
+        q4km) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-q4km" ;;
+        q4km-gptq) echo "$model_dir/.supersonic/v${FORMAT_VERSION}-q4km-gptq" ;;
         *) echo "bad variant: $variant" >&2 ; return 2 ;;
     esac
 }
@@ -90,6 +106,16 @@ bake_exists_and_valid() {
     [[ -f "$dir/manifest.json" && -f "$dir/weights.bin" ]] || return 1
     # cheap check — the full version check runs again in the Rust consumer
     grep -q "\"format_version\": *$FORMAT_VERSION" "$dir/manifest.json"
+}
+
+# True iff the bake at `$1` includes an INT4-quantized lm_head. Used to
+# auto-detect bakes that predate the lm_head-INT4 work and force them to
+# re-bake (without requiring callers to remember --force). Only meaningful
+# for Qwen bakes; Gemma/Phi4 bakes intentionally don't quantize lm_head.
+bake_has_lm_head_int4() {
+    local dir="$1"
+    [[ -f "$dir/manifest.json" ]] || return 1
+    grep -q '"name": *"lm_head.weight_int4_scale"' "$dir/manifest.json"
 }
 
 run_or_record() {
@@ -117,7 +143,19 @@ bake_int4() {
     local cli_name="$1" model_dir="$2" family="$3"
     local dir ; dir="$(bake_dir_for "$model_dir" int4)" || return 2
     local label="$cli_name int4"
+    local should_skip=0
     if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
+        should_skip=1
+        # Auto-refresh Qwen INT4 bakes that predate the lm_head-INT4 work.
+        # Gemma/Phi4 bakes intentionally don't quantize lm_head, so the
+        # check is qwen-only.
+        if [[ "$family" == "qwen" && $SKIP_LM_HEAD_INT4_REFRESH -eq 0 ]] \
+            && ! bake_has_lm_head_int4 "$dir"; then
+            echo "[refresh] $label — existing bake lacks lm_head_int4_scale; re-baking"
+            should_skip=0
+        fi
+    fi
+    if [[ $should_skip -eq 1 ]]; then
         echo "[skip] $label — valid bake at $dir"
         SKIPPED+=("$label")
         return 0
@@ -131,10 +169,49 @@ bake_int4() {
             run_or_record "$label" python3 "$SCRIPT_DIR/bake_int4_gemma4.py" \
                 --model-dir "$model_dir" || return $?
             ;;
+        phi4)
+            run_or_record "$label" python3 "$SCRIPT_DIR/bake_int4_phi4.py" \
+                --model-dir "$model_dir" || return $?
+            ;;
+        *)
+            echo "[skip] $label — no INT4 baker for family '$family'"
+            SKIPPED+=("$label")
+            return 0
+            ;;
     esac
     if [[ $UPLOAD -eq 1 ]]; then
         run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
             --model "$cli_name" --int4 --model-dir "$model_dir"
+    fi
+}
+
+bake_q4km() {
+    local cli_name="$1" model_dir="$2" family="$3"
+    if [[ "$family" != "qwen" ]]; then
+        echo "[skip] $cli_name q4km — Q4KM bake supports Qwen only"
+        SKIPPED+=("$cli_name q4km")
+        return 0
+    fi
+    local dir ; dir="$(bake_dir_for "$model_dir" q4km)" || return 2
+    local label="$cli_name q4km"
+    local should_skip=0
+    if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
+        should_skip=1
+        if [[ $SKIP_LM_HEAD_INT4_REFRESH -eq 0 ]] && ! bake_has_lm_head_int4 "$dir"; then
+            echo "[refresh] $label — existing bake lacks lm_head_int4_scale; re-baking"
+            should_skip=0
+        fi
+    fi
+    if [[ $should_skip -eq 1 ]]; then
+        echo "[skip] $label — valid bake at $dir"
+        SKIPPED+=("$label")
+        return 0
+    fi
+    run_or_record "$label" python3 "$SCRIPT_DIR/bake_q4km.py" \
+        --model-dir "$model_dir" || return $?
+    if [[ $UPLOAD -eq 1 ]]; then
+        run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
+            --model "$cli_name" --q4km --model-dir "$model_dir"
     fi
 }
 
@@ -235,6 +312,9 @@ for entry in "${MODELS[@]}"; do
     fi
     if [[ $INCLUDE_INT4 -eq 1 ]]; then
         bake_int4 "$cli_name" "$model_dir" "$family" || true
+    fi
+    if [[ $INCLUDE_Q4KM -eq 1 ]]; then
+        bake_q4km "$cli_name" "$model_dir" "$family" || true
     fi
 done
 
