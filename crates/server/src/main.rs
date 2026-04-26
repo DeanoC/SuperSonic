@@ -25,7 +25,7 @@ struct Cli {
     #[arg(long)]
     model_dir: PathBuf,
 
-    /// Compute backend (`auto`, `hip`, `cuda`).
+    /// Compute backend (`auto`, `hip`, `cuda`, `metal`).
     #[arg(long, default_value = "auto")]
     backend: String,
 

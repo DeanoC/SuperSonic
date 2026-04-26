@@ -16,6 +16,28 @@ use qwen35::weights::Qwen35Weights;
 
 use kernel_ffi::prefill_ffi;
 
+/// D2D copy that stays correctly sequenced with pending GPU work when an
+/// open Metal batch is active. Without an open batch (or on HIP/CUDA), uses
+/// the cheap host memcpy path; with a batch open on Metal, uses a Metal blit
+/// encoded into the shared command buffer.
+///
+/// Use this in any prefill helper that may run inside `metal_v2_decode_step`'s
+/// `MetalBatchGuard` scope. Outside that scope, behavior is unchanged.
+fn copy_d2d_batched(
+    ordinal: usize,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+) -> Result<()> {
+    if prefill_ffi::metal_batch_is_active() {
+        prefill_ffi::metal_copy_d2d(src, dst, bytes)
+            .map_err(|e| anyhow::anyhow!("metal blit copy: {e}"))
+    } else {
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes)
+            .map_err(|e| anyhow::anyhow!("d2d copy: {e}"))
+    }
+}
+
 fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(2)
@@ -460,7 +482,7 @@ fn maybe_attn_rms_norm_rows(
         )
         .map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
     } else {
-        gpu_hal::copy_d2d(
+        copy_d2d_batched(
             ordinal,
             output.as_mut_ptr(),
             input.as_ptr(),
@@ -509,7 +531,7 @@ pub fn compute_logits_for_range(
     let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, hidden_dim])
         .map_err(|e| anyhow::anyhow!("range slice alloc: {e}"))?;
     let src_offset = start * hidden_dim * elem_bytes;
-    gpu_hal::copy_d2d(
+    copy_d2d_batched(
         ordinal,
         slice.as_ptr() as *mut c_void,
         hidden.offset_ptr(src_offset),
@@ -563,6 +585,14 @@ pub fn compute_logits_for_range(
             &mut counter,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head matvec: {e}"))?;
+    }
+
+    // If a Metal batch is open (Metal v2 incremental decode wraps the entire
+    // step in one), commit + wait so the lm_head GPU work is visible to the
+    // host memcpy below. No-op when no batch is active or on non-Metal builds.
+    if prefill_ffi::metal_batch_is_active() {
+        prefill_ffi::flush_metal_batch()
+            .map_err(|e| anyhow::anyhow!("range logits batch flush: {e}"))?;
     }
 
     // D2H + split into one Vec<f32> per position.
@@ -1000,27 +1030,14 @@ fn prefill_inner(
         None
     };
 
-    // Per-layer inter-chunk state for linear attention layers
-    let nv = config.linear_num_value_heads;
-    let khd = config.linear_key_head_dim;
-    let vhd = config.linear_value_head_dim;
+    // Per-layer inter-chunk state for linear attention layers. The F32 recurrent
+    // state lives on the layer (`state.layers[idx].recurrent_state`) and is
+    // updated in place at the end of every chunk — the BF16 sidecar that used
+    // to live here was a precision bug (silently quantized the state at chunk
+    // boundaries) and has been removed.
     let kern = config.linear_conv_kernel_dim;
-    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2 + nv * vhd;
-
-    // Allocate inter-chunk recurrent states (one per linear layer)
-    // These carry the delta recurrent state between chunks.
-    // Must be BF16 because the delta_recurrent_prefill kernel reads initial_state as T (BF16).
-    let mut chunk_recurrent: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
-        .map(|i| {
-            if config.is_full_attention(i) {
-                Ok(None)
-            } else {
-                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nv, khd, vhd])
-                    .map(Some)
-                    .map_err(|e| anyhow::anyhow!("chunk recurrent alloc: {e}"))
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+        + config.linear_num_value_heads * config.linear_value_head_dim;
 
     // Allocate inter-chunk conv tail buffers (last kern-1 QKV tokens per linear layer)
     let mut chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
@@ -1115,7 +1132,6 @@ fn prefill_inner(
                     chunk_len,
                     chunk_start,
                     is_last_chunk,
-                    chunk_recurrent[idx].as_mut().unwrap(),
                     chunk_conv_tail[idx].as_mut().unwrap(),
                     ordinal,
                     trace_linear_debug,
@@ -1525,6 +1541,292 @@ pub fn gpu_reference_replay_step_with_taps(
     Ok((result.logits, taps))
 }
 
+/// Reusable scratch for Metal v2 incremental decode. Sized for chunk_len=1 and
+/// allocated once on the engine; carries the BF16 inter-chunk linear-attention
+/// buffers across decode steps so we don't re-zero them each call.
+pub struct MetalV2DecodeScratch {
+    scratch: PrefillScratch,
+    chunk_conv_tail: Vec<Option<GpuBuffer>>,
+    token_id_buf: GpuBuffer,
+}
+
+impl MetalV2DecodeScratch {
+    pub fn new(config: &TextConfig, ordinal: usize) -> Result<Self> {
+        let scratch = PrefillScratch::new(config, 1, ordinal)?;
+        let kern = config.linear_conv_kernel_dim;
+        let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+            + config.linear_num_value_heads * config.linear_value_head_dim;
+
+        let chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
+            .map(|i| {
+                if config.is_full_attention(i) {
+                    Ok(None)
+                } else {
+                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, kern - 1])
+                        .map(Some)
+                        .map_err(|e| anyhow::anyhow!("metal v2 chunk conv tail alloc: {e}"))
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let token_id_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .map_err(|e| anyhow::anyhow!("metal v2 token id buf: {e}"))?;
+
+        Ok(Self {
+            scratch,
+            chunk_conv_tail,
+            token_id_buf,
+        })
+    }
+}
+
+/// Per-token forward pass body shared by `metal_v2_decode_step` (full-logits)
+/// and `metal_v2_decode_step_greedy` (fused argmax). Performs token embed +
+/// 24-layer transformer pass, leaving the post-final-layer hidden state in
+/// `scratch.scratch.hidden`. Caller is responsible for the final RMSNorm +
+/// lm_head and for owning a `MetalBatchGuard` around the call.
+fn metal_v2_decode_step_body(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<()> {
+    let config = &weights.config;
+    let hidden_dim = config.hidden_size;
+    let chunk_len = 1usize;
+    let chunk_start = seqlen_offset;
+
+    // Seed the inter-chunk conv tail buffers from the persistent layer state.
+    // The recurrent state lives on the layer in F32 and `prefill_linear_attention_layer`
+    // reads/writes it directly, so no separate seeding is needed for it.
+    let kern = config.linear_conv_kernel_dim;
+    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+        + config.linear_num_value_heads * config.linear_value_head_dim;
+    for idx in 0..config.num_hidden_layers {
+        if config.is_full_attention(idx) {
+            continue;
+        }
+        let chunk_tail = scratch.chunk_conv_tail[idx]
+            .as_mut()
+            .expect("metal v2 chunk conv tail missing for linear layer");
+        if let Some(conv_state) = state.layers[idx].conv_state.as_ref() {
+            let bytes = qkv_dim * (kern - 1) * ScalarType::BF16.size_in_bytes();
+            copy_d2d_batched(
+                ordinal,
+                chunk_tail.as_ptr() as *mut c_void,
+                conv_state.as_ptr(),
+                bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("metal v2 layer {idx} seed conv tail: {e}"))?;
+        }
+    }
+
+    // Upload the single token id and embed it into hidden[0].
+    let id_bytes = token_id.to_le_bytes();
+    copy_h2d(
+        ordinal,
+        scratch.token_id_buf.as_ptr() as *mut c_void,
+        id_bytes.as_ptr() as *const c_void,
+        4,
+    )
+    .map_err(|e| anyhow::anyhow!("metal v2 token id upload: {e}"))?;
+    prefill_ffi::embedding_lookup(
+        ordinal,
+        ScalarType::BF16,
+        chunk_len,
+        config.vocab_size,
+        hidden_dim,
+        &weights.embed_tokens,
+        &scratch.token_id_buf,
+        &mut scratch.scratch.hidden,
+    )?;
+
+    for idx in 0..config.num_hidden_layers {
+        rms_norm_rows_model(
+            config,
+            ordinal,
+            chunk_len,
+            hidden_dim,
+            &scratch.scratch.hidden,
+            &weights.layers[idx].input_norm_w,
+            &mut scratch.scratch.normed,
+            &format!("layer {idx} input norm"),
+        )?;
+
+        if config.is_full_attention(idx) {
+            prefill_full_attention_layer(
+                weights,
+                state,
+                rotary,
+                &mut scratch.scratch,
+                config,
+                idx,
+                chunk_len,
+                chunk_start,
+                ordinal,
+                kv_chunk_size,
+                /* commit_kv_filled */ true,
+            )?;
+        } else {
+            let mut no_debug_trace = None;
+            let chunk_tail = scratch.chunk_conv_tail[idx].as_mut().unwrap();
+            prefill_linear_attention_layer(
+                weights,
+                state,
+                &mut scratch.scratch,
+                config,
+                idx,
+                chunk_len,
+                chunk_start,
+                /* is_last_chunk */ true,
+                chunk_tail,
+                ordinal,
+                false,
+                &mut no_debug_trace,
+            )?;
+        }
+
+        rms_norm_rows_model(
+            config,
+            ordinal,
+            chunk_len,
+            hidden_dim,
+            &scratch.scratch.hidden,
+            &weights.layers[idx].post_attn_norm_w,
+            &mut scratch.scratch.normed,
+            &format!("layer {idx} post-attn norm"),
+        )?;
+
+        prefill_mlp_layer(weights, &mut scratch.scratch, config, idx, chunk_len, ordinal)?;
+    }
+
+    Ok(())
+}
+
+/// Single-token incremental decode step for Metal. Mirrors `prefill_inner`'s
+/// chunk-loop body with `chunk_len=1, chunk_start=seqlen_offset, is_last_chunk=true`,
+/// reading and writing the persistent layer state in place. Replaces Metal v1's
+/// O(N²) replay-prefill path with O(N)-per-step proper incremental decode.
+///
+/// Returns the full BF16→f32 logits row over the vocabulary. Use
+/// `metal_v2_decode_step_greedy` to skip the 250k-element D2H + host argmax
+/// when only the sampled token is needed.
+pub fn metal_v2_decode_step(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<Vec<f32>> {
+    // Open one Metal batch around the entire per-token forward pass so all
+    // ~800 kernel dispatches end up in a single command buffer rather than
+    // committing and waiting individually.
+    let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
+        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+
+    metal_v2_decode_step_body(
+        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+    )?;
+
+    let config = &weights.config;
+    let (mut logits_per_pos, _normed) = compute_logits_for_range(
+        &scratch.scratch.hidden,
+        weights,
+        config,
+        0,
+        1,
+        false,
+        ordinal,
+    )?;
+    let logits = logits_per_pos
+        .pop()
+        .expect("count=1 produces exactly one row");
+    Ok(logits)
+}
+
+/// Same forward pass as `metal_v2_decode_step`, but uses the fused
+/// lm_head + argmax kernel and returns just the sampled token id. Skips the
+/// per-token 250k-element BF16 D2H, the bf16→f32 conversion, and the host
+/// argmax loop. Use this when full logits aren't needed (no validation,
+/// no rescore, plain greedy decode).
+pub fn metal_v2_decode_step_greedy(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<u32> {
+    let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
+        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+
+    metal_v2_decode_step_body(
+        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+    )?;
+
+    let config = &weights.config;
+    let hidden_dim = config.hidden_size;
+    let vocab_size = config.vocab_size;
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+
+    // Final RMSNorm + fused lm_head argmax. For chunk_len=1, scratch.hidden is
+    // already a single row, so we apply RMSNorm in-place via a temp slice.
+    let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy slice alloc: {e}"))?;
+    copy_d2d_batched(
+        ordinal,
+        slice.as_ptr() as *mut c_void,
+        scratch.scratch.hidden.as_ptr(),
+        hidden_dim * elem_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy slice copy: {e}"))?;
+
+    let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy normed alloc: {e}"))?;
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &slice,
+        &weights.norm_weight,
+        &mut normed,
+        "greedy final norm",
+    )?;
+
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .map_err(|e| anyhow::anyhow!("greedy out_index alloc: {e}"))?;
+    kernel_ffi::metal_lm_head_argmax_bf16_into(
+        &normed,
+        &*weights.lm_head,
+        &mut out_index,
+        hidden_dim,
+        vocab_size,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy fused lm_head argmax: {e}"))?;
+
+    // Flush before D2H so the GPU work is visible to the host memcpy.
+    if prefill_ffi::metal_batch_is_active() {
+        prefill_ffi::flush_metal_batch()
+            .map_err(|e| anyhow::anyhow!("greedy batch flush: {e}"))?;
+    }
+
+    let bytes = out_index
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("greedy token D2H: {e}"))?;
+    let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(token)
+}
+
 /// Per-layer full-attention prefill step.
 ///
 /// `commit_kv_filled`: when false, K/V are written to the cache at positions
@@ -1611,7 +1913,7 @@ fn prefill_full_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} Q split: {e}"))?;
     } else {
-        gpu_hal::copy_d2d(
+        copy_d2d_batched(
             ordinal,
             query_buf.as_ptr() as *mut c_void,
             q_full.as_ptr(),
@@ -1656,7 +1958,7 @@ fn prefill_full_attention_layer(
             &mut q_normed,
             &format!("layer {idx} Q norm"),
         )?;
-        gpu_hal::copy_d2d(
+        copy_d2d_batched(
             ordinal,
             query_buf.as_ptr() as *mut c_void,
             q_normed.as_ptr(),
@@ -1683,7 +1985,7 @@ fn prefill_full_attention_layer(
             &mut k_normed,
             &format!("layer {idx} K norm"),
         )?;
-        gpu_hal::copy_d2d(
+        copy_d2d_batched(
             ordinal,
             scratch.proj_buf2.as_ptr() as *mut c_void,
             k_normed.as_ptr(),
@@ -1776,7 +2078,7 @@ fn prefill_full_attention_layer(
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 cache_k.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
                 scratch.attn_k.offset_ptr(h * src_stride),
@@ -1792,7 +2094,7 @@ fn prefill_full_attention_layer(
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 cache_v.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
                 scratch.attn_v.offset_ptr(h * src_stride),
@@ -1847,14 +2149,14 @@ fn prefill_full_attention_layer(
         let contig_stride = kv_len * head_dim * elem_bytes;
         let copy_bytes = kv_len * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_k_ref.offset_ptr(h * cap_stride),
                 copy_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
                 cache_v_ref.offset_ptr(h * cap_stride),
@@ -1920,7 +2222,7 @@ fn prefill_full_attention_layer(
             &mut gated,
         )
         .map_err(|e| anyhow::anyhow!("layer {idx} gate: {e}"))?;
-        gpu_hal::copy_d2d(
+        copy_d2d_batched(
             ordinal,
             scratch.proj_buf.as_ptr() as *mut c_void,
             gated.as_ptr(),
@@ -1968,7 +2270,6 @@ fn prefill_linear_attention_layer(
     chunk_len: usize,
     chunk_start: usize,
     is_last_chunk: bool,
-    chunk_recurrent: &mut GpuBuffer,
     chunk_conv_tail: &mut GpuBuffer,
     ordinal: usize,
     trace_linear_debug: bool,
@@ -2026,12 +2327,19 @@ fn prefill_linear_attention_layer(
         });
     }
 
-    // Save last kern-1 QKV rows for conv state (inter-chunk or final decode state).
-    // When chunk_len >= kern-1, use extract_conv_state directly.
-    // When chunk_len < kern-1, assemble from conv_tail + current chunk's QKV.
+    // Compute the post-this-chunk conv tail in a temporary buffer. We DEFER
+    // writing it back to `chunk_conv_tail` / `state.conv_state` until after
+    // the conv1d, because the conv_input padding for this chunk reads from
+    // `chunk_conv_tail` — that source must still be the PREVIOUS chunk's tail
+    // when the conv1d runs. Updating in place here was a cross-platform bug
+    // exposed by chunk_len=1 incremental decode (Metal v2): the new tail
+    // mixed with the current chunk's QKV got fed back into this same chunk's
+    // conv1d window, shifting the inputs.
     let pad = kern - 1;
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+    let mut new_tail = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, pad])
+        .map_err(|e| anyhow::anyhow!("new_tail alloc: {e}"))?;
     if chunk_len >= pad {
-        // Enough rows in this chunk to extract directly
         if trace_linear_debug {
             let trace = linear_debug_trace
                 .as_mut()
@@ -2044,48 +2352,26 @@ fn prefill_linear_attention_layer(
             let start = (chunk_len - pad) * row_bytes;
             trace.qkv_tail = bytes[start..start + pad * row_bytes].to_vec();
         }
-        if is_last_chunk {
-            if let Some(ref mut conv_state) = state.layers[idx].conv_state {
-                prefill_ffi::extract_conv_state(
-                    ordinal,
-                    ScalarType::BF16,
-                    chunk_len,
-                    qkv_dim,
-                    pad,
-                    &scratch.proj_buf,
-                    conv_state,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} extract conv state: {e}"))?;
-            }
-        }
-        if !is_last_chunk {
-            prefill_ffi::extract_conv_state(
-                ordinal,
-                ScalarType::BF16,
-                chunk_len,
-                qkv_dim,
-                pad,
-                &scratch.proj_buf,
-                chunk_conv_tail,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} extract conv tail: {e}"))?;
-        }
+        prefill_ffi::extract_conv_state(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            qkv_dim,
+            pad,
+            &scratch.proj_buf,
+            &mut new_tail,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} extract conv state: {e}"))?;
     } else {
         // chunk_len < pad — assemble from previous conv_tail + current chunk's QKV.
-        // Use a temp buffer to avoid aliasing issues.
         let keep_old = pad - chunk_len;
-        let elem_bytes = ScalarType::BF16.size_in_bytes();
         let tail_stride = pad * elem_bytes;
-
-        let new_tail = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, pad])
-            .map_err(|e| anyhow::anyhow!("new_tail alloc: {e}"))?;
-
         for ch in 0..qkv_dim {
             // Keep last keep_old entries from old tail
             if keep_old > 0 && chunk_start > 0 {
                 let src_off = ch * tail_stride + chunk_len * elem_bytes;
                 let dst_off = ch * tail_stride;
-                gpu_hal::copy_d2d(
+                copy_d2d_batched(
                     ordinal,
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     chunk_conv_tail.offset_ptr(src_off),
@@ -2097,7 +2383,7 @@ fn prefill_linear_attention_layer(
             for t in 0..chunk_len {
                 let src_off = t * qkv_dim * elem_bytes + ch * elem_bytes;
                 let dst_off = ch * tail_stride + (keep_old + t) * elem_bytes;
-                gpu_hal::copy_d2d(
+                copy_d2d_batched(
                     ordinal,
                     new_tail.offset_ptr(dst_off) as *mut c_void,
                     scratch.proj_buf.offset_ptr(src_off),
@@ -2106,27 +2392,6 @@ fn prefill_linear_attention_layer(
                 .map_err(|e| anyhow::anyhow!("layer {idx} conv tail append ch={ch} t={t}: {e}"))?;
             }
         }
-
-        // Copy assembled tail to destination
-        let total_bytes = qkv_dim * pad * elem_bytes;
-        if is_last_chunk {
-            if let Some(ref mut conv_state) = state.layers[idx].conv_state {
-                gpu_hal::copy_d2d(
-                    ordinal,
-                    conv_state.as_ptr() as *mut c_void,
-                    new_tail.as_ptr(),
-                    total_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} conv state final: {e}"))?;
-            }
-        }
-        gpu_hal::copy_d2d(
-            ordinal,
-            chunk_conv_tail.as_ptr() as *mut c_void,
-            new_tail.as_ptr(),
-            total_bytes,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} conv tail update: {e}"))?;
     }
 
     // 2. Z projection: normed [chunk, hidden] → [chunk, z_dim]
@@ -2222,7 +2487,7 @@ fn prefill_linear_attention_layer(
         let conv_input_stride = (pad + chunk_len) * ScalarType::BF16.size_in_bytes();
         let tail_stride = pad * ScalarType::BF16.size_in_bytes();
         for ch in 0..qkv_dim {
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 scratch.conv_input.offset_ptr(ch * conv_input_stride) as *mut c_void,
                 chunk_conv_tail.offset_ptr(ch * tail_stride),
@@ -2247,6 +2512,30 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} conv: {e}"))?;
+
+    // Now (post-conv1d) update the inter-chunk and persistent conv tail
+    // buffers from the new_tail we computed earlier. Order matters: this MUST
+    // happen after `linear_prefill_conv_pack` reads from `chunk_conv_tail`,
+    // otherwise the conv1d window would mix this chunk's QKV with itself.
+    let total_tail_bytes = qkv_dim * pad * elem_bytes;
+    if is_last_chunk {
+        if let Some(ref mut conv_state) = state.layers[idx].conv_state {
+            copy_d2d_batched(
+                ordinal,
+                conv_state.as_ptr() as *mut c_void,
+                new_tail.as_ptr(),
+                total_tail_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} conv state writeback: {e}"))?;
+        }
+    }
+    copy_d2d_batched(
+        ordinal,
+        chunk_conv_tail.as_ptr() as *mut c_void,
+        new_tail.as_ptr(),
+        total_tail_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("layer {idx} chunk_conv_tail writeback: {e}"))?;
 
     // 7. Split conv output [S, qkv_dim] into Q [S, key_dim], K [S, key_dim], V [S, val_dim]
     //    Layout within qkv_dim: [Q(key_dim) | K(key_dim) | V(val_dim)]
@@ -2590,23 +2879,29 @@ fn prefill_linear_attention_layer(
     }
 
     // 11. Delta recurrent prefill
-    // Keep the recurrent scan in F32 so the decode-time recurrent state matches
-    // the decode kernel's native F32 state more closely on larger models.
+    // The recurrent state is the F32 source of truth across chunk boundaries
+    // (and across incremental decode steps). Seed `recurrent_f32` directly from
+    // `state.layers[idx].recurrent_state` to avoid the BF16 round-trip that an
+    // intermediate buffer would introduce — that round-trip was a real
+    // precision bug exposed by chunk_len=1 incremental decode (Metal v2) and
+    // would also have eroded multi-chunk prefill state on every backend.
+    let state_elems = nv * khd * vhd;
+    let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
     let out_rows = chunk_len + khd;
     let mut recurrent_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
         .map_err(|e| anyhow::anyhow!("recurrent_f32 alloc: {e}"))?;
     let mut delta_out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, out_rows, vhd])
         .map_err(|e| anyhow::anyhow!("delta_out alloc: {e}"))?;
 
-    prefill_ffi::cast(
-        ordinal,
-        ScalarType::BF16,
-        ScalarType::F32,
-        nv * khd * vhd,
-        chunk_recurrent,
-        &mut recurrent_f32,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} recurrent init cast: {e}"))?;
+    if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref() {
+        copy_d2d_batched(
+            ordinal,
+            recurrent_f32.as_ptr() as *mut c_void,
+            rec_state.as_ptr(),
+            state_elems * elem_bytes_f32,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} recurrent init copy: {e}"))?;
+    }
 
     prefill_ffi::delta_recurrent_prefill(
         ordinal,
@@ -2625,22 +2920,26 @@ fn prefill_linear_attention_layer(
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
 
-    // 12. Extract recurrent state from delta_out into chunk_recurrent (always)
-    //     and into state.recurrent_state (on last chunk only, for decode).
+    // 12. Extract recurrent state from delta_out and write F32 directly back to
+    //     state.layers[idx].recurrent_state. Always update — between chunks of
+    //     a multi-chunk prefill the previous behavior gated this on
+    //     `is_last_chunk` and used a BF16 sidecar (`chunk_recurrent`) for
+    //     handoff, which silently quantized the recurrent state at every
+    //     boundary. Updating in F32 every chunk preserves precision and makes
+    //     incremental decode (chunk_len=1 across calls) produce identical
+    //     state to single-chunk prefill of the same token history.
     let mut state_bytes_debug: Option<Vec<u8>> = None;
     {
-        let state_elems = nv * khd * vhd;
         let state_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
             .map_err(|e| anyhow::anyhow!("state_f32 alloc: {e}"))?;
 
-        let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
         let state_bytes_per_head = khd * vhd * elem_bytes_f32;
         let out_stride = out_rows * vhd * elem_bytes_f32;
         let attn_offset = chunk_len * vhd * elem_bytes_f32;
         for h in 0..nv {
             let src_off = h * out_stride + attn_offset;
             let dst_off = h * state_bytes_per_head;
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 state_f32.offset_ptr(dst_off) as *mut c_void,
                 delta_out.offset_ptr(src_off),
@@ -2649,29 +2948,16 @@ fn prefill_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state extract h={h}: {e}"))?;
         }
 
-        // Always update chunk_recurrent (BF16) for the next chunk.
-        prefill_ffi::cast(
-            ordinal,
-            ScalarType::F32,
-            ScalarType::BF16,
-            state_elems,
-            &state_f32,
-            chunk_recurrent,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} chunk recurrent update: {e}"))?;
-
-        // On the last chunk, keep the decode-time recurrent state in F32.
-        if is_last_chunk {
-            if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
-                gpu_hal::copy_d2d(
-                    ordinal,
-                    rec_state.as_ptr() as *mut c_void,
-                    state_f32.as_ptr(),
-                    state_elems * elem_bytes_f32,
-                )
-                .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state final copy: {e}"))?;
-            }
+        if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
+            copy_d2d_batched(
+                ordinal,
+                rec_state.as_ptr() as *mut c_void,
+                state_f32.as_ptr(),
+                state_elems * elem_bytes_f32,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} recurrent state writeback: {e}"))?;
         }
+        let _ = is_last_chunk; // recurrent state is now always written; flag still gates conv_state below.
         if trace_linear_debug {
             state_bytes_debug = Some(
                 state_f32
@@ -2694,7 +2980,7 @@ fn prefill_linear_attention_layer(
         for h in 0..nv {
             let src_off = h * out_stride;
             let dst_off = h * attn_bytes_per_head;
-            gpu_hal::copy_d2d(
+            copy_d2d_batched(
                 ordinal,
                 attn_output_f32.offset_ptr(dst_off) as *mut c_void,
                 delta_out.offset_ptr(src_off),

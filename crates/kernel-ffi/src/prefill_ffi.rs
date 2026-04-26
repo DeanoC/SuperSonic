@@ -177,6 +177,13 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+/// True when a Metal batch is currently open (i.e. ops will be accumulated
+/// into the shared command buffer rather than committing one-by-one).
+/// Always false on non-Metal builds.
+pub fn metal_batch_is_active() -> bool {
+    metal_native::batch_is_active()
+}
+
 pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
     metal_native::set_batch_label(label)
 }
@@ -2106,6 +2113,40 @@ pub fn matmul_rhs_transposed(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        // M=1 batch=1 GEMV: SIMD-group cooperative reduction. Used by every
+        // decode-step projection (q/k/v/o/gate/up/down/lm_head). Opt-out for
+        // bring-up/bisect via SUPERSONIC_METAL_DISABLE_GEMV_M1.
+        //
+        // Prefer the tiled variant when K fits in 16 KB of threadgroup memory
+        // (K <= 4096 floats). Reuses `lhs` across 32 output cols per
+        // threadgroup → 32× fewer device reads. Biggest win on lm_head where
+        // N is huge. Falls back to the per-column GEMV when K is too large
+        // (e.g. down_proj K=8960 for qwen3.5-0.8b).
+        if dtype == ScalarType::BF16
+            && batch_elems == 1
+            && m == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_matmul()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_none()
+        {
+            let tiled_disabled =
+                std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some();
+            if !tiled_disabled && k <= 4096 {
+                let result =
+                    metal_profile_time("matmul_rhs_transposed_gemv_m1_tiled", "native", || {
+                        metal_native::matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, lhs, rhs, out)
+                    });
+                if result.is_ok() {
+                    return result;
+                }
+            }
+            let result = metal_profile_time("matmul_rhs_transposed_gemv_m1", "native", || {
+                metal_native::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         if dtype == ScalarType::BF16
             && !metal_native::disabled_by_env()
             && !metal_force_host_matmul()
@@ -2228,6 +2269,14 @@ pub fn matmul_rhs_transposed_int4(
     group_size: usize,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_profile_time("matmul_rhs_transposed_int4", "native", || {
+            metal_native::matmul_rhs_transposed_int4_bf16(
+                batch_elems, m, n, k, group_size, lhs, rhs_int4, scale, zero, out,
+            )
+        });
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_matmul_int4_dequant(
             ScalarType::BF16.kernel_dtype_code(),

@@ -12,6 +12,7 @@ unsafe extern "C" {
     fn supersonic_metal_batch_flush() -> c_int;
     fn supersonic_metal_batch_set_label(label: *const c_char) -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
+    fn supersonic_metal_batch_is_active() -> c_int;
     fn supersonic_metal_copy_d2d(
         src_ptr: *const c_void,
         dst_ptr: *mut c_void,
@@ -34,6 +35,20 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1(
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1_tiled(
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_residual_bf16(
         batch_elems: usize,
         m: usize,
@@ -42,6 +57,18 @@ unsafe extern "C" {
         lhs_ptr: *const c_void,
         rhs_ptr: *const c_void,
         residual_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_int4_bf16(
+        batch_elems: usize,
+        m: usize,
+        n: usize,
+        k: usize,
+        group_size: usize,
+        lhs_ptr: *const c_void,
+        rhs_int4_ptr: *const c_void,
+        scale_ptr: *const c_void,
+        zero_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
@@ -620,6 +647,11 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn batch_is_active() -> bool {
+    unsafe { supersonic_metal_batch_is_active() != 0 }
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
     let label = CString::new(label)
         .map_err(|_| GpuError::Metal("metal native batch label contains NUL byte".to_string()))?;
@@ -848,6 +880,85 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     Ok(())
 }
 
+/// Tiled SIMD-group GEMV. Same algorithm as `matmul_rhs_transposed_bf16_gemv_m1`
+/// but with `lhs` cached in threadgroup memory and reused across 32 output cols.
+/// Caller must ensure K * 4 bytes fits in the device's threadgroup memory
+/// limit (~32KB on Apple Silicon → K <= 8192).
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || rhs.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled expects BF16, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1_tiled(
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// SIMD-group cooperative GEMV for the M=1, batch=1 case. Each output column
+/// is handled by 32 threads cooperating on the K reduction; ~5–10× faster
+/// than the per-cell sequential-K kernel on Apple GPUs.
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || rhs.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1 expects BF16, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1(
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     batch_elems: usize,
@@ -887,6 +998,61 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_residual_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_rhs_transposed_int4_bf16(
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || scale.dtype() != ScalarType::BF16
+        || zero.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_int4_bf16 expects BF16 lhs/scale/zero/out, got {:?}/{:?}/{:?}/{:?}",
+            lhs.dtype(),
+            scale.dtype(),
+            zero.dtype(),
+            out.dtype(),
+        )));
+    }
+    if rhs_int4.dtype() != ScalarType::U8 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_int4_bf16 expects U8 rhs_int4, got {:?}",
+            rhs_int4.dtype(),
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_int4_bf16(
+            batch_elems,
+            m,
+            n,
+            k,
+            group_size,
+            lhs.as_ptr(),
+            rhs_int4.as_ptr(),
+            scale.as_ptr(),
+            zero.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_int4_bf16 failed with status {status}"
         )));
     }
     Ok(())
@@ -3107,6 +3273,11 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn batch_is_active() -> bool {
+    false
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn set_batch_label(_label: &str) -> Result<(), GpuError> {
     Ok(())
 }
@@ -3287,6 +3458,32 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_bf16_gemv_m1 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -3299,6 +3496,25 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
 ) -> Result<(), GpuError> {
     Err(GpuError::Metal(
         "metal native matmul_rhs_transposed_residual_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_rhs_transposed_int4_bf16(
+    _batch_elems: usize,
+    _m: usize,
+    _n: usize,
+    _k: usize,
+    _group_size: usize,
+    _lhs: &GpuBuffer,
+    _rhs_int4: &GpuBuffer,
+    _scale: &GpuBuffer,
+    _zero: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_int4_bf16 is not compiled".into(),
     ))
 }
 
@@ -3959,6 +4175,98 @@ mod tests {
     }
 
     #[test]
+    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_tiled_matches_reference() {
+        // K=128 (covers 4 chunks per SIMD lane), N=70 (multiple threadgroups
+        // since 70 > 32 cols/tg, and last tg is partial).
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let k = 128usize;
+        let n = 70usize;
+
+        let lhs_vals: Vec<f32> = (0..k).map(|i| ((i as f32) - 64.0) * 0.025).collect();
+        let lhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, k], &bf16_bytes(&lhs_vals))
+                .expect("upload lhs");
+
+        let mut rhs_vals: Vec<f32> = Vec::with_capacity(n * k);
+        for col in 0..n {
+            for kk in 0..k {
+                rhs_vals.push((col as f32) * 0.05 - (kk as f32) * 0.005);
+            }
+        }
+        let rhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[n, k], &bf16_bytes(&rhs_vals))
+                .expect("upload rhs");
+
+        let mut out_tiled =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc tiled out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc ref out");
+
+        matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, &lhs, &rhs, &mut out_tiled)
+            .expect("run tiled gemv");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
+            .expect("run reference");
+
+        let actual = read_bf16(&out_tiled);
+        let expected = read_bf16(&out_ref);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            // BF16 mantissa = 7 bits, so per-element rounding ~0.01 absolute,
+            // amplified by K=128 sums; allow generous tolerance.
+            assert!(
+                delta <= 0.5,
+                "idx {idx}: tiled {a} vs reference {e}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_matches_reference() {
+        // K=64 spans multiple SIMD lanes (32 threads × 2 chunks per thread).
+        // N=3 keeps the threadgroup count small but exercises multiple cols.
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let k = 64usize;
+        let n = 3usize;
+
+        let lhs_vals: Vec<f32> = (0..k).map(|i| ((i as f32) - 32.0) * 0.05).collect();
+        let lhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, k], &bf16_bytes(&lhs_vals))
+                .expect("upload lhs");
+
+        let mut rhs_vals: Vec<f32> = Vec::with_capacity(n * k);
+        for col in 0..n {
+            for kk in 0..k {
+                rhs_vals.push((col as f32) * 0.1 - (kk as f32) * 0.01);
+            }
+        }
+        let rhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[n, k], &bf16_bytes(&rhs_vals))
+                .expect("upload rhs");
+
+        let mut out_gemv =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc gemv out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc ref out");
+
+        matmul_rhs_transposed_bf16_gemv_m1(n, k, &lhs, &rhs, &mut out_gemv)
+            .expect("run gemv");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
+            .expect("run reference");
+
+        let actual = read_bf16(&out_gemv);
+        let expected = read_bf16(&out_ref);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.05,
+                "idx {idx}: gemv {a} vs reference {e}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
     fn metal_native_matmul_rhs_transposed_residual_matches_reference() {
         set_backend(Backend::Metal);
         let ordinal = 0usize;
@@ -3995,6 +4303,89 @@ mod tests {
             let delta = (a - e).abs();
             assert!(
                 delta <= 0.02,
+                "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_int4_matches_reference() {
+        // GPTQ INT4: m=1, n=4, k=4, group_size=2.
+        // Scale grid is [n/gs, k/gs] = [2, 2]: cols 0-1 use scale row 0;
+        // cols 2-3 use scale row 1. Each row has two K-direction tiles
+        // (k 0-1 share one (s, z), k 2-3 share another).
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+
+        let lhs_vals: [f32; 4] = [1.0, 0.5, -1.0, 2.0];
+        let lhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, 1, 4], &bf16_bytes(&lhs_vals))
+                .expect("upload lhs");
+
+        // rhs [batch=1, n=4, k/2=2]: low nibble = even k, high nibble = odd k.
+        let nibbles: [[u8; 4]; 4] = [
+            [1, 2, 3, 4], // col 0
+            [5, 6, 7, 8], // col 1
+            [9, 10, 11, 12], // col 2
+            [13, 14, 15, 0], // col 3
+        ];
+        let mut rhs_bytes = Vec::with_capacity(4 * 2);
+        for col_nibbles in &nibbles {
+            rhs_bytes.push(col_nibbles[0] | (col_nibbles[1] << 4));
+            rhs_bytes.push(col_nibbles[2] | (col_nibbles[3] << 4));
+        }
+        let rhs_int4 =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
+                .expect("upload rhs_int4");
+
+        // scale/zero shape [scale_rows=2, scale_cols=2].
+        // Index: sc_idx = (col / gs) * scale_cols + (kk / gs).
+        let scale_vals: [f32; 4] = [0.5, 0.25, 0.125, 1.0];
+        let zero_vals: [f32; 4] = [2.0, 1.0, 4.0, 0.5];
+        let scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 2],
+            &bf16_bytes(&scale_vals),
+        )
+        .expect("upload scale");
+        let zero = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 2],
+            &bf16_bytes(&zero_vals),
+        )
+        .expect("upload zero");
+
+        let mut out =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, 4]).expect("allocate out");
+
+        matmul_rhs_transposed_int4_bf16(1, 1, 4, 4, 2, &lhs, &rhs_int4, &scale, &zero, &mut out)
+            .expect("run native matmul int4");
+
+        let bf16_round = |x: f32| -> f32 { bf16::from_f32(x).to_f32() };
+        let scale_cols_n = 2usize;
+        let group_size = 2usize;
+        let mut expected = [0.0f32; 4];
+        for col in 0..4usize {
+            let scale_row = col / group_size;
+            let mut acc = 0.0f32;
+            for kk in 0..4usize {
+                let sc_col = kk / group_size;
+                let si = scale_row * scale_cols_n + sc_col;
+                let s = scale_vals[si];
+                let z = zero_vals[si];
+                let w = bf16_round(nibbles[col][kk] as f32 * s - z * s);
+                acc += lhs_vals[kk] * w;
+            }
+            expected[col] = acc;
+        }
+
+        let actual = read_bf16(&out);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.05,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
             );
         }

@@ -4,7 +4,7 @@
 //! The engines are synchronous (blocking HIP calls), so `prefill` and
 //! `decode_step` must always be invoked from a `spawn_blocking` context.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 
 use runner::decode_engine::DecodeEngine;
 use runner::gemma4_engine::Gemma4Engine;
@@ -44,6 +44,20 @@ impl InferenceSession {
             Self::Qwen(e) => e.decode_step(token_id, pos),
             Self::Gemma4Bf16(e) => e.decode_step(token_id, pos),
             Self::Gemma4Int4(e) => e.decode_step(token_id, pos),
+        }
+    }
+
+    /// Replay-prefill decode: re-run prefill over the full token history and
+    /// return the last-position logits. Kept as a debug helper after Metal v2
+    /// landed — incremental decode is the default on every backend now, but
+    /// `--gpu-validate` still drives the underlying replay step internally for
+    /// per-step correctness comparisons.
+    pub fn decode_step_replay(&mut self, token_history: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Self::Qwen(e) => e.decode_step_replay(token_history),
+            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
+                "replay-prefill decode is only implemented for the Qwen3.5 engine"
+            )),
         }
     }
 }

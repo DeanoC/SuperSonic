@@ -57,9 +57,6 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     }
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
-    if backend == Backend::Metal {
-        bail!("supersonic-serve does not support --backend metal yet; use the supersonic CLI for Metal v1");
-    }
     gpu_hal::set_backend(backend);
 
     let variant = ModelVariant::from_cli_str(&cfg.model).ok_or_else(|| {
@@ -70,18 +67,32 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         )
     })?;
 
+    if backend == Backend::Metal {
+        if variant != ModelVariant::Qwen3_5_0_8B {
+            bail!("Metal v1 only supports --model qwen3.5-0.8b");
+        }
+        if cfg.int4 {
+            bail!("Metal does not support --int4 yet");
+        }
+        if cfg.fp8_runtime {
+            bail!("Metal does not support --fp8-runtime yet");
+        }
+        if cfg.kv_fp8 {
+            bail!("Metal does not support --kv-fp8 yet");
+        }
+    }
+
     let (arch_name, total_vram, warp_size) = match backend {
         Backend::Hip => {
             let (a, v) = kernel_ffi::query_gpu_info(cfg.device)
                 .map_err(|e| anyhow!("GPU query failed for device {}: {}", cfg.device, e))?;
             (a, v, 32)
         }
-        Backend::Cuda => {
+        Backend::Cuda | Backend::Metal => {
             let info = gpu_hal::query_device_info(backend, cfg.device)
                 .map_err(|e| anyhow!("GPU query failed for device {}: {}", cfg.device, e))?;
             (info.arch_name, info.total_vram_bytes, info.warp_size)
         }
-        Backend::Metal => unreachable!("metal backend is rejected above"),
     };
     let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
     tracing::info!(

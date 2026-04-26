@@ -428,7 +428,7 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
     }
     match backend {
         Backend::Cuda => {
-            let _ = with_device_impl(backend, ordinal, || {
+            let _: Result<()> = with_device_impl(backend, ordinal, || {
                 #[cfg(supersonic_backend_cuda)]
                 {
                     let status = unsafe { cudaFreeHost(ptr) };

@@ -823,8 +823,96 @@ fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result
     Ok(())
 }
 
+/// RAII scope that enables Metal/HAL profiling when SUPERSONIC_METAL_PROFILE
+/// is set in the environment, and dumps a per-op breakdown to stderr when
+/// the scope drops. Used to investigate Metal v2 decode hot paths without
+/// adding a permanent profiling cost.
+struct MetalProfileScope {
+    active: bool,
+}
+
+impl MetalProfileScope {
+    fn new() -> Self {
+        let active = std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some();
+        if active {
+            kernel_ffi::prefill_ffi::metal_profile_set_enabled(true);
+            gpu_hal::hal_profile_set_enabled(true);
+            kernel_ffi::prefill_ffi::metal_profile_reset();
+            gpu_hal::hal_profile_reset();
+        }
+        Self { active }
+    }
+}
+
+impl Drop for MetalProfileScope {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let metal = kernel_ffi::prefill_ffi::metal_profile_snapshot();
+        let hal = gpu_hal::hal_profile_snapshot();
+        eprintln!();
+        eprintln!("=== Metal native/host op profile ===");
+        eprintln!(
+            "calls={} total_ms={:.3} (native={:.3} ms / host={:.3} ms)",
+            metal.total_calls, metal.total_ms, metal.native_ms, metal.host_ms
+        );
+        eprintln!(
+            "{:<48} {:>10} {:>10} {:>12} {:>12}",
+            "op (path)", "calls", "mean_ms", "total_ms", "max_ms"
+        );
+        for entry in metal.entries.iter().take(40) {
+            let mean_ms = if entry.calls > 0 {
+                entry.total_ms / entry.calls as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{:<48} {:>10} {:>10.4} {:>12.3} {:>12.3}",
+                format!("{} ({})", entry.op, entry.path),
+                entry.calls,
+                mean_ms,
+                entry.total_ms,
+                entry.max_ms
+            );
+        }
+        eprintln!();
+        eprintln!("=== HAL op profile (gpu_hal level) ===");
+        eprintln!(
+            "calls={} total_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
+            hal.total_calls,
+            hal.total_ms,
+            hal.alloc_calls,
+            hal.alloc_bytes,
+            hal.h2d_bytes,
+            hal.d2h_bytes,
+            hal.d2d_bytes,
+            hal.memset_bytes,
+            hal.sync_calls,
+        );
+        eprintln!(
+            "{:<32} {:>10} {:>10} {:>12} {:>12} {:>14}",
+            "op", "calls", "mean_ms", "total_ms", "max_ms", "total_bytes"
+        );
+        for entry in hal.entries.iter().take(20) {
+            let mean_ms = if entry.calls > 0 {
+                entry.total_ms / entry.calls as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{:<32} {:>10} {:>10.4} {:>12.3} {:>12.3} {:>14}",
+                entry.op, entry.calls, mean_ms, entry.total_ms, entry.max_ms, entry.total_bytes
+            );
+        }
+        kernel_ffi::prefill_ffi::metal_profile_set_enabled(false);
+        gpu_hal::hal_profile_set_enabled(false);
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let _metal_profile_scope = MetalProfileScope::new();
     let ordinal = cli.device;
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1119,6 +1207,12 @@ fn main() -> Result<()> {
             }
         }
     } else if backend == Backend::Metal {
+        if !matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_0_8B | ModelVariant::Qwen3_5_2B
+        ) {
+            anyhow::bail!("Metal only supports --model qwen3.5-0.8b or qwen3.5-2b");
+        }
         if cli.int4 || cli.q4km {
             anyhow::bail!("Metal does not support low-bit Qwen weights on Qwen3.5 yet");
         }
@@ -1127,6 +1221,12 @@ fn main() -> Result<()> {
         }
         if cli.kv_fp8 {
             anyhow::bail!("Metal does not support --kv-fp8 on Qwen3.5 yet");
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("Metal only supports --batch-size 1");
+        }
+        if cli.force_kernel_decode || cli.force_component_decode {
+            anyhow::bail!("Metal does not support --force-kernel-decode or --force-component-decode");
         }
     }
 
@@ -1772,12 +1872,16 @@ fn main() -> Result<()> {
         && !cli.kv_fp8
         && !cli.force_kernel_decode
         && !cli.force_component_decode;
+    // Metal v2 wires per-op incremental decode through the standard
+    // `engine.decode_step` path; only the legacy 4B / qwen3.5-2b CUDA replay
+    // gates remain.
+    let metal_v2_incremental = backend == Backend::Metal && cli.batch_size == 1;
     let replay_decode_enabled = cli.batch_size == 1
-        && params.use_4b_kernel
-        && (cli.force_replay_decode || cuda_qwen2b_replay_default)
         && !cli.force_kernel_decode
         && !cli.force_component_decode
-        && !cli.kv_fp8;
+        && !cli.kv_fp8
+        && params.use_4b_kernel
+        && (cli.force_replay_decode || cuda_qwen2b_replay_default);
     let replay_kv_fp8_enabled =
         params.use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
     let component_single_decode_enabled =
@@ -1818,6 +1922,26 @@ fn main() -> Result<()> {
         && oracle_output.is_none()
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
+    // Metal fast-greedy: same trigger conditions as CUDA's fast-greedy. Uses the
+    // fused lm_head + argmax kernel and returns just the sampled token, skipping
+    // the per-token 250k-element BF16 D2H + host argmax loop. Disable via env
+    // var for bring-up/bisect.
+    let metal_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_METAL_FAST_GREEDY").is_some();
+    let metal_fast_greedy_enabled = backend == Backend::Metal
+        && metal_v2_incremental
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !cli.force_component_decode
+        && !cli.force_kernel_decode
+        && oracle_output.is_none()
+        && !metal_fast_greedy_disabled;
+    if metal_v2_incremental {
+        if metal_fast_greedy_enabled {
+            eprintln!("[decode] Metal v2 incremental decode (fast-greedy: fused argmax)");
+        } else {
+            eprintln!("[decode] Metal v2 incremental decode");
+        }
+    }
     if replay_decode_enabled {
         if cuda_qwen2b_replay_default {
             eprintln!(
@@ -2038,6 +2162,10 @@ fn main() -> Result<()> {
                     engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
+                maybe_fast_token = Some(token);
+                Vec::new()
+            } else if metal_fast_greedy_enabled {
+                let token = engine.decode_step_metal_fast_greedy(next_token, seqlen_offset)?;
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if cuda_08b_hero_enabled {
