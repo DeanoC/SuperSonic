@@ -192,8 +192,19 @@ fn run(
             break FinishReason::Stop;
         }
 
-        let pos = prompt_ids.len() + emitted_ids.len() - 1;
-        let mut next_logits = guard.decode_step(next_token, pos)?;
+        let mut next_logits = if guard.requires_replay_decode() {
+            // Metal v1: re-run prefill over the full history each step.
+            let history: Vec<u32> = prompt_ids
+                .iter()
+                .copied()
+                .chain(emitted_ids.iter().copied())
+                .chain(std::iter::once(next_token))
+                .collect();
+            guard.decode_step_replay(&history)?
+        } else {
+            let pos = prompt_ids.len() + emitted_ids.len() - 1;
+            guard.decode_step(next_token, pos)?
+        };
         next_token = sample(&mut next_logits, params.temperature, params.top_p, &mut rng);
     };
 

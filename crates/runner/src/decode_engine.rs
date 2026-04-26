@@ -10444,6 +10444,32 @@ impl DecodeEngine {
             .ok_or_else(|| anyhow::anyhow!("decode_step missing logits"))
     }
 
+    /// Backend the engine is running on. Used by callers (the server) that
+    /// need to pick between the incremental [`Self::decode_step`] path and
+    /// the replay-prefill path Metal v1 requires.
+    pub fn backend(&self) -> gpu_hal::Backend {
+        self.hidden_io.backend()
+    }
+
+    /// Replay-prefill decode: runs prefill from scratch over the full
+    /// `token_history` (prompt + everything emitted so far, including the
+    /// freshly sampled token whose logits we need next), and returns the
+    /// last-position logits. O(N²) per generated token but reuses the
+    /// validated prefill pipeline — the v1 path Metal must take because it
+    /// has no megakernel and no per-op decode pipeline yet. Non-destructive
+    /// to engine state (allocates a throwaway `ModelState`).
+    pub fn decode_step_replay(&self, token_history: &[u32]) -> Result<Vec<f32>> {
+        prefill_engine::gpu_reference_replay_step(
+            &self.weights,
+            &self.rotary,
+            token_history,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.use_4b_kernel,
+        )
+    }
+
     /// Forced single-sequence 4B kernel path with native stage timings.
     pub fn decode_step_4b_single_kernel_with_timings(
         &mut self,
