@@ -2274,10 +2274,32 @@ pub fn matmul_rhs_transposed_int4(
         // M=1 batch=1 GEMV: SIMD-group cooperative reduction with on-the-fly
         // nibble dequant. Used by every decode-step projection. Disable via
         // SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1 for bring-up/bisect.
+        //
+        // Prefer the tiled variant when K fits in 16 KB of threadgroup memory
+        // (K <= 4096 floats). Reuses lhs across 32 cols per threadgroup → ~32×
+        // fewer device reads of the lhs vector. Biggest win on lm_head where N
+        // is large. Falls back to the per-column INT4 GEMV for larger K (e.g.
+        // down_proj K=8960).
         if batch_elems == 1
             && m == 1
             && std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1").is_none()
         {
+            let tiled_disabled =
+                std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1_TILED").is_some();
+            if !tiled_disabled && k <= 4096 {
+                let result = metal_profile_time(
+                    "matmul_rhs_transposed_int4_gemv_m1_tiled",
+                    "native",
+                    || {
+                        metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+                            n, k, group_size, lhs, rhs_int4, scale, zero, out,
+                        )
+                    },
+                );
+                if result.is_ok() {
+                    return result;
+                }
+            }
             let result =
                 metal_profile_time("matmul_rhs_transposed_int4_gemv_m1", "native", || {
                     metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(

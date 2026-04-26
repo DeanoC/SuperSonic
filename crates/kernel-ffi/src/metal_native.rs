@@ -81,6 +81,16 @@ unsafe extern "C" {
         zero_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+        n: usize,
+        k: usize,
+        group_size: usize,
+        lhs_ptr: *const c_void,
+        rhs_int4_ptr: *const c_void,
+        scale_ptr: *const c_void,
+        zero_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
         batch_elems: usize,
         m: usize,
@@ -1118,6 +1128,60 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_int4_bf16_gemv_m1 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Tiled SIMD-group INT4 GEMV: caches `lhs` (K floats) in threadgroup memory
+/// and reuses it across 32 output cols per threadgroup. Caller must ensure
+/// `K * 4 bytes` fits within the device threadgroup memory limit (~K <= 4096).
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+    n: usize,
+    k: usize,
+    group_size: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || scale.dtype() != ScalarType::BF16
+        || zero.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled expects BF16 lhs/scale/zero/out, got {:?}/{:?}/{:?}/{:?}",
+            lhs.dtype(),
+            scale.dtype(),
+            zero.dtype(),
+            out.dtype(),
+        )));
+    }
+    if rhs_int4.dtype() != ScalarType::U8 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled expects U8 rhs_int4, got {:?}",
+            rhs_int4.dtype(),
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+            n,
+            k,
+            group_size,
+            lhs.as_ptr(),
+            rhs_int4.as_ptr(),
+            scale.as_ptr(),
+            zero.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled failed with status {status}"
         )));
     }
     Ok(())
@@ -3601,6 +3665,23 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+    _n: usize,
+    _k: usize,
+    _group_size: usize,
+    _lhs: &GpuBuffer,
+    _rhs_int4: &GpuBuffer,
+    _scale: &GpuBuffer,
+    _zero: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_f32(
     _batch_elems: usize,
     _m: usize,
@@ -4469,6 +4550,92 @@ mod tests {
             assert!(
                 delta <= 0.05,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_matches_reference() {
+        // m=1, n=70 (>32 cols → multiple threadgroups, last partial),
+        // k=128, group_size=128 (one scale tile per scale_row).
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let k = 128usize;
+        let n = 70usize;
+        let gs = 128usize;
+
+        let lhs_vals: Vec<f32> = (0..k).map(|i| ((i as f32) - 64.0) * 0.025).collect();
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, k],
+            &bf16_bytes(&lhs_vals),
+        )
+        .expect("upload lhs");
+
+        let mut nibbles_per_col: Vec<Vec<u8>> = Vec::with_capacity(n);
+        for col in 0..n {
+            let mut row = Vec::with_capacity(k);
+            for kk in 0..k {
+                row.push(((col + kk) as u8) & 0xF);
+            }
+            nibbles_per_col.push(row);
+        }
+        let mut rhs_bytes = Vec::with_capacity(n * (k / 2));
+        for nib_row in &nibbles_per_col {
+            for chunk in nib_row.chunks_exact(2) {
+                rhs_bytes.push(chunk[0] | (chunk[1] << 4));
+            }
+        }
+        let rhs_int4 = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U8,
+            &[1, n, k / 2],
+            &rhs_bytes,
+        )
+        .expect("upload rhs_int4");
+
+        // Single scale tile per scale_row: scale_rows = ceil(n/gs) = 1.
+        let scale_rows = (n + gs - 1) / gs;
+        let scale_cols = (k + gs - 1) / gs;
+        let scale_vals: Vec<f32> = (0..scale_rows * scale_cols).map(|i| 0.1 + i as f32 * 0.05).collect();
+        let zero_vals: Vec<f32> = (0..scale_rows * scale_cols).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let scale = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[scale_rows, scale_cols],
+            &bf16_bytes(&scale_vals),
+        )
+        .expect("upload scale");
+        let zero = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[scale_rows, scale_cols],
+            &bf16_bytes(&zero_vals),
+        )
+        .expect("upload zero");
+
+        let mut out_tiled =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, n]).expect("alloc tiled out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, n]).expect("alloc ref out");
+
+        matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+            n, k, gs, &lhs, &rhs_int4, &scale, &zero, &mut out_tiled,
+        )
+        .expect("run tiled int4 gemv");
+        matmul_rhs_transposed_int4_bf16(
+            1, 1, n, k, gs, &lhs, &rhs_int4, &scale, &zero, &mut out_ref,
+        )
+        .expect("run reference int4");
+
+        let actual = read_bf16(&out_tiled);
+        let expected = read_bf16(&out_ref);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.5,
+                "idx {idx}: tiled int4 {a} vs reference {e}, delta {delta}"
             );
         }
     }
