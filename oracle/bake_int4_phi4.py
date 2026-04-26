@@ -65,6 +65,8 @@ def is_int4_target(name: str) -> bool:
     if "layernorm" in name or "norm.weight" in name or "embed_tokens" in name:
         return False
     if "lm_head" in name:
+        # Phi4 ties lm_head to embed_tokens at the runtime; the Phi4 weights
+        # crate has no INT4 lm_head dispatch yet, so leave it BF16 here.
         return False
     return "_proj" in name
 

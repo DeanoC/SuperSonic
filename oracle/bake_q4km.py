@@ -590,13 +590,21 @@ def is_q4km_target(name: str, shape: list[int], group_size: int) -> bool:
         return False
     if shape[1] % group_size != 0 or shape[1] % 2 != 0:
         return False
+    if shape[0] % group_size != 0:
+        # GPTQ scale tile is sized [out/gs, in/gs]; out must align too.
+        return False
     lowered = name.lower()
-    if any(s in lowered for s in ("layernorm", "norm.weight", "embed_tokens", "lm_head", "conv1d")):
+    if any(s in lowered for s in ("layernorm", "norm.weight", "embed_tokens", "conv1d")):
         return False
     if "in_proj_b.weight" in name or "in_proj_a.weight" in name:
         return False
     if ".gate." in name or "router" in lowered:
         return False
+    if name == "lm_head.weight":
+        # The runtime (Qwen35Weights) loads lm_head_int4_scale/zero when present
+        # and dispatches the INT4 matmul on Metal — saves ~4× device-read traffic
+        # on the dominant decode-side matmul.
+        return True
     return "_proj" in name or "experts" in name or "ffn_" in name
 
 
@@ -907,6 +915,34 @@ def bake_from_safetensors(args, weight_prefix: str, layer_types: list[str], fami
             quantized += 1
         if i % 100 == 0:
             log(f"[q4km] processed {i}/{len(eligible)} tensors")
+
+    # Tied embeddings (Qwen3.5-0.8B): when the safetensors index has no
+    # standalone `lm_head.weight`, synthesize one from the embedding table so
+    # we can produce an INT4 lm_head separately. The extra ~half-vocab-sized
+    # tensor is worth it — it lets the runtime read INT4 nibbles instead of
+    # BF16 on what is the dominant decode-side matmul.
+    if "lm_head.weight" not in index:
+        embed_name = f"{weight_prefix}.embed_tokens.weight"
+        if embed_name in index:
+            t, _ = load_source_tensor(index, embed_name)
+            if is_q4km_target("lm_head.weight", list(t.shape), args.group_size):
+                log(
+                    f"[q4km] synthesising lm_head.weight from {embed_name} "
+                    f"(tied embeddings) for INT4 lm_head bake"
+                )
+                if emit_tensor(
+                    tensors_out,
+                    "lm_head.weight",
+                    t,
+                    weight_prefix,
+                    layer_types,
+                    args.group_size,
+                    quantizer,
+                    hessian_dir,
+                    gptq_damp,
+                    gptq_device,
+                ):
+                    quantized += 1
 
     tensors_out.sort(key=lambda x: x[0])
     log(f"[q4km] quantized {quantized} tensors")
