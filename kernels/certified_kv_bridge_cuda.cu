@@ -883,6 +883,7 @@ __global__ void certified_kv_selected_fp16_log_mass_kernel(
 }
 
 constexpr int kCertifiedSelectorMaxBlocks = 2048;
+constexpr int kCertifiedSelectorSortBlocks = 256;
 
 __global__ void certified_kv_selector_init_kernel(
     uint32_t* promote_index,
@@ -1261,6 +1262,235 @@ __global__ void certified_kv_select_blocks_kernel(
         delta_tail_s = delta_tail_final;
         vmax_s = vmax_final;
         true_tail_bound = expf(delta_guard_factor * delta_tail_s) * fmaxf(tail_mass_s, 0.0f);
+        const float e_key =
+            2.0f * vmax_s * true_tail_bound * (expf(2.0f * delta_tail_s) - 1.0f);
+
+        selected_counts[qh] = static_cast<uint32_t>(selected_count_s);
+        delta_tail_by_head[qh] = delta_tail_s;
+        vmax_by_head[qh] = vmax_s;
+        true_tail_by_head[qh] = true_tail_bound;
+        e_key_by_head[qh] = e_key;
+        if (require_certified_tail_bound && true_tail_bound > rung1_threshold) {
+            fallback_flags[qh] = 1;
+        }
+    }
+}
+
+__global__ void certified_kv_select_blocks_sort256_kernel(
+    const __nv_bfloat16* __restrict__ query,
+    const float* __restrict__ key_scale_norm,
+    const float* __restrict__ block_max,
+    const float* __restrict__ block_sum,
+    const float* __restrict__ value_norm,
+    uint32_t* __restrict__ promote_index,
+    uint32_t* __restrict__ selected_blocks,
+    uint32_t* __restrict__ selected_counts,
+    uint32_t* __restrict__ fallback_flags,
+    float* __restrict__ delta_blocks,
+    float* __restrict__ e_key_by_head,
+    float* __restrict__ delta_tail_by_head,
+    float* __restrict__ vmax_by_head,
+    float* __restrict__ true_tail_by_head,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int key_scale_norm_stride_blocks,
+    int value_norm_stride_blocks,
+    int head_dim,
+    int gqa_group,
+    int k_min,
+    int k_max,
+    int max_promoted_blocks,
+    float q_scale,
+    float tau_cov,
+    float rung1_threshold,
+    float rung1_multiplier,
+    float delta_guard_factor,
+    float score_exploration_rate,
+    int require_certified_tail_bound
+) {
+    const int qh = blockIdx.x;
+    if (qh >= q_heads || num_blocks > kCertifiedSelectorSortBlocks) {
+        return;
+    }
+    const int kvh = qh / gqa_group;
+    if (kvh >= kv_heads) {
+        return;
+    }
+
+    __shared__ float prob[kCertifiedSelectorSortBlocks];
+    __shared__ float block_prob[kCertifiedSelectorSortBlocks];
+    __shared__ float delta[kCertifiedSelectorSortBlocks];
+    __shared__ uint32_t order[kCertifiedSelectorSortBlocks];
+    __shared__ uint8_t selected[kCertifiedSelectorSortBlocks];
+    __shared__ float reduce_scratch[256];
+    __shared__ int selected_count_s;
+    __shared__ int slot_cap_s;
+    __shared__ float tail_mass_s;
+    __shared__ float delta_tail_s;
+    __shared__ float vmax_s;
+
+    float q_norm_local = 0.0f;
+    const __nv_bfloat16* q = query + static_cast<size_t>(qh) * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        const float qv = bf16_to_float(q[d]);
+        q_norm_local += qv * qv;
+    }
+    const float q_norm = sqrtf(block_reduce_sum_256(q_norm_local, reduce_scratch));
+
+    float local_max = -INFINITY;
+    const int b = threadIdx.x;
+    if (b < kCertifiedSelectorSortBlocks) {
+        selected[b] = 0;
+        order[b] = static_cast<uint32_t>(b);
+        if (b < num_blocks) {
+            const size_t score_idx = static_cast<size_t>(qh) * num_blocks + b;
+            const float s = fmaxf(block_sum[score_idx], 1.0e-30f);
+            const float lm = block_max[score_idx] + logf(s);
+            prob[b] = lm;
+            local_max = lm;
+            const float scale_norm =
+                key_scale_norm[static_cast<size_t>(kvh) * key_scale_norm_stride_blocks + b];
+            const float db = 0.5f * q_scale * q_norm * scale_norm;
+            delta[b] = db;
+            delta_blocks[static_cast<size_t>(qh) * num_blocks + b] = db;
+        } else {
+            prob[b] = -INFINITY;
+            delta[b] = 0.0f;
+        }
+    }
+    const float max_lm = block_reduce_max_256(local_max, reduce_scratch);
+
+    float local_sum = 0.0f;
+    if (b < num_blocks) {
+        const float p = expf(prob[b] - max_lm);
+        prob[b] = p;
+        block_prob[b] = p;
+        local_sum = p;
+    } else if (b < kCertifiedSelectorSortBlocks) {
+        block_prob[b] = 0.0f;
+    }
+    const float denom = fmaxf(block_reduce_sum_256(local_sum, reduce_scratch), 1.0e-30f);
+    if (b < num_blocks) {
+        prob[b] /= denom;
+        block_prob[b] /= denom;
+    }
+    __syncthreads();
+
+    for (int phase = 0; phase < kCertifiedSelectorSortBlocks; ++phase) {
+        const int i = threadIdx.x * 2 + (phase & 1);
+        if (i + 1 < kCertifiedSelectorSortBlocks) {
+            const float lp = prob[i];
+            const float rp = prob[i + 1];
+            const uint32_t li = order[i];
+            const uint32_t ri = order[i + 1];
+            const bool swap =
+                (rp > lp) || (rp == lp && ri < li);
+            if (swap) {
+                prob[i] = rp;
+                prob[i + 1] = lp;
+                order[i] = ri;
+                order[i + 1] = li;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        int selected_count = 0;
+        float covered = 0.0f;
+        const int k_min_clamped = clamp_i32(k_min, 0, num_blocks);
+        const int k_max_clamped = clamp_i32(k_max, k_min_clamped, num_blocks);
+        slot_cap_s = clamp_i32(max_promoted_blocks, 1, num_blocks);
+        while ((covered < tau_cov || selected_count < k_min_clamped) &&
+               selected_count < k_max_clamped &&
+               selected_count < slot_cap_s) {
+            const uint32_t block = order[selected_count];
+            if (static_cast<int>(block) >= num_blocks) {
+                break;
+            }
+            selected[block] = 1;
+            selected_blocks[static_cast<size_t>(qh) * max_promoted_blocks + selected_count] = block;
+            promote_index[static_cast<size_t>(qh) * num_blocks + block] =
+                static_cast<uint32_t>(selected_count);
+            covered += fmaxf(prob[selected_count], 0.0f);
+            selected_count += 1;
+        }
+        selected_count_s = selected_count;
+    }
+    __syncthreads();
+
+    float tail_mass_local = 0.0f;
+    float delta_tail_local = 0.0f;
+    if (b < num_blocks && !selected[b]) {
+        tail_mass_local = block_prob[b];
+        delta_tail_local = delta[b];
+    }
+    const float tail_mass_initial = block_reduce_sum_256(tail_mass_local, reduce_scratch);
+    const float delta_tail_initial = block_reduce_max_256(delta_tail_local, reduce_scratch);
+    if (threadIdx.x == 0) {
+        tail_mass_s = tail_mass_initial;
+        delta_tail_s = delta_tail_initial;
+        const float true_tail_bound =
+            expf(delta_guard_factor * delta_tail_s) * fmaxf(tail_mass_s, 0.0f);
+        if (true_tail_bound > rung1_threshold && selected_count_s < slot_cap_s) {
+            const int target = clamp_i32(
+                static_cast<int>(ceilf(static_cast<float>(selected_count_s) * rung1_multiplier)),
+                selected_count_s + 1,
+                slot_cap_s
+            );
+            while (selected_count_s < target) {
+                const uint32_t block = order[selected_count_s];
+                if (static_cast<int>(block) >= num_blocks) {
+                    break;
+                }
+                selected[block] = 1;
+                selected_blocks[static_cast<size_t>(qh) * max_promoted_blocks + selected_count_s] =
+                    block;
+                promote_index[static_cast<size_t>(qh) * num_blocks + block] =
+                    static_cast<uint32_t>(selected_count_s);
+                selected_count_s += 1;
+            }
+        }
+        if (score_exploration_rate > 0.0f && selected_count_s < slot_cap_s) {
+            const int period = max(1, static_cast<int>(ceilf(1.0f / score_exploration_rate)));
+            for (int block = 0; block < num_blocks && selected_count_s < slot_cap_s; ++block) {
+                if (selected[block]) {
+                    continue;
+                }
+                const uint32_t hash =
+                    (static_cast<uint32_t>(block) * 1103515245u) ^ static_cast<uint32_t>(qh);
+                if ((hash % static_cast<uint32_t>(period)) == 0u) {
+                    selected[block] = 1;
+                    selected_blocks[
+                        static_cast<size_t>(qh) * max_promoted_blocks + selected_count_s
+                    ] = static_cast<uint32_t>(block);
+                    promote_index[static_cast<size_t>(qh) * num_blocks + block] =
+                        static_cast<uint32_t>(selected_count_s);
+                    selected_count_s += 1;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    tail_mass_local = 0.0f;
+    delta_tail_local = 0.0f;
+    float vmax_local = 0.0f;
+    if (b < num_blocks && !selected[b]) {
+        tail_mass_local = block_prob[b];
+        delta_tail_local = delta[b];
+        vmax_local = value_norm[static_cast<size_t>(kvh) * value_norm_stride_blocks + b];
+    }
+    const float tail_mass_final = block_reduce_sum_256(tail_mass_local, reduce_scratch);
+    const float delta_tail_final = block_reduce_max_256(delta_tail_local, reduce_scratch);
+    const float vmax_final = block_reduce_max_256(vmax_local, reduce_scratch);
+    if (threadIdx.x == 0) {
+        tail_mass_s = tail_mass_final;
+        delta_tail_s = delta_tail_final;
+        vmax_s = vmax_final;
+        const float true_tail_bound =
+            expf(delta_guard_factor * delta_tail_s) * fmaxf(tail_mass_s, 0.0f);
         const float e_key =
             2.0f * vmax_s * true_tail_bound * (expf(2.0f * delta_tail_s) - 1.0f);
 
@@ -3505,6 +3735,43 @@ extern "C" int dotcache_llama31_certified_kv_select_blocks(
         max_promoted_blocks
     );
     if (cudaGetLastError() != cudaSuccess) return 82;
+    if (num_blocks <= kCertifiedSelectorSortBlocks) {
+        certified_kv_select_blocks_sort256_kernel<<<q_heads, 256>>>(
+            static_cast<const __nv_bfloat16*>(query_bf16),
+            static_cast<const float*>(key_scale_norm),
+            static_cast<const float*>(block_max),
+            static_cast<const float*>(block_sum),
+            static_cast<const float*>(value_norm),
+            static_cast<uint32_t*>(promote_index),
+            static_cast<uint32_t*>(selected_blocks),
+            static_cast<uint32_t*>(selected_counts),
+            static_cast<uint32_t*>(fallback_flags),
+            static_cast<float*>(delta_blocks),
+            static_cast<float*>(e_key_by_head),
+            static_cast<float*>(delta_tail_by_head),
+            static_cast<float*>(vmax_by_head),
+            static_cast<float*>(true_tail_by_head),
+            q_heads,
+            kv_heads,
+            num_blocks,
+            key_scale_norm_stride_blocks,
+            value_norm_stride_blocks,
+            head_dim,
+            gqa_group,
+            k_min,
+            k_max,
+            max_promoted_blocks,
+            q_scale,
+            tau_cov,
+            rung1_threshold,
+            rung1_multiplier,
+            delta_guard_factor,
+            score_exploration_rate,
+            require_certified_tail_bound
+        );
+        if (cudaGetLastError() != cudaSuccess) return 83;
+        return 0;
+    }
     certified_kv_select_blocks_kernel<<<q_heads, 256>>>(
         static_cast<const __nv_bfloat16*>(query_bf16),
         static_cast<const float*>(key_scale_norm),
