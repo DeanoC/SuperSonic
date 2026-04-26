@@ -94,16 +94,14 @@ uses replayed GPU prefill for correctness.
 |------------------|:----:|:----:|:-----------:|:------:|
 | qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
 
-Metal v1 is a single supported surface:
+Metal v2 is a single supported surface:
 
 - BF16 single-sequence decode for `qwen3.5-0.8b` only
 - both the `supersonic` CLI and `supersonic-serve` HTTP server work; `/v1/completions`
   and `/v1/chat/completions` (streaming and non-streaming) are exercised end-to-end
-- decode is implemented as **replay-prefill**: each generated token re-runs prefill
-  over the full token history. This is correct (every prefill op has a Metal
-  implementation) but O(N²) per step. Measured on Apple M4: ~800 ms/tok at short
-  contexts, scaling roughly linearly with total context length thereafter.
-  Suitable for short interactions; long chats will degrade sharply
+- decode is implemented as **incremental per-token decode**: each generated token runs
+  a single length-1 forward pass (O(N) per step). Conv and recurrent state are carried
+  across tokens in persistent GPU buffers; KV cache grows with the sequence
 - `--int4`, `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
   and `--force-component-decode` are all rejected at startup
 
@@ -343,19 +341,17 @@ Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 
 ## Metal
 
-Metal support is currently a Qwen3.5 0.8B Apple-silicon bring-up and early
-performance checkpoint on Apple M4. It is still narrower than the HIP/CUDA
-persistent decode paths, but the core Qwen 0.8B path is now practical for
-local development and repeatable performance work on this machine.
+Metal support is currently a Qwen3.5 0.8B Apple-silicon lane validated on Apple M4.
+The core decode path is now O(N) incremental decode — no replay overhead.
 
 Validated Metal scope:
 
 - `qwen3.5-0.8b`
 - Apple M4 / `apple-m4`
 - BF16 prefill parity against the Python CPU oracle
-- CLI/debug harness path
+- CLI and `supersonic-serve` HTTP server
 - native Metal greedy prefill
-- Metal component decode prototype for single-sequence greedy generation
+- Metal v2 incremental decode: length-1 forward pass per token with persistent conv/recurrent/KV state
 - checked token-ID prompt corpus via `qwen35_bughunt`
 
 Metal currently rejects or defers:
@@ -365,13 +361,9 @@ Metal currently rejects or defers:
 - `--fp8-runtime`
 - `--kv-fp8`
 - batched decode
-- persistent megakernel decode
-- server runtime support
+- persistent megakernel decode (all ops fused into one dispatch)
 
-The current Metal implementation intentionally mixes native Metal kernels with
-shared-memory host fallbacks where needed, but the main hot-path bring-up work
-has moved onto native Metal kernels. Native kernels are already used for the
-key Qwen bring-up and first-pass performance primitives promoted so far:
+Native Metal kernels used in the hot path:
 
 - matmul RHS-transposed
 - full-attention prefill core
@@ -388,26 +380,14 @@ key Qwen bring-up and first-pass performance primitives promoted so far:
 Current Apple M4 checkpoint on this machine:
 
 - `qwen35_bughunt --mode gate`: PASS for `hello_world`, `forest_prompt`, and `code_prompt`
-- `qwen35_bughunt --mode bench --prompt hello_world --decode-tokens 4`:
-  - native prefill about `107 ms`
-  - greedy prefill about `100 ms`
-  - replay decode about `84 ms/token`
-  - component decode about `35 ms/token`
-- `supersonic --backend metal --model qwen3.5-0.8b --prompt "Hello, world" --max-new-tokens 8`:
-  - native prefill about `112 ms`
-  - component decode about `34 ms/token`
+- `supersonic --backend metal --model qwen3.5-0.8b --prompt “Hello, world” --max-new-tokens 8`:
+  - prefill about `112 ms`
+  - incremental decode about `34 ms/token` (constant across context lengths)
+- `--gpu-validate` on 16-token sequence: `gpu_oracle_max_delta=0.0000` every step
 
-The biggest Metal performance wins in this checkpoint were:
-
-- command-buffer / encoder churn removal through lazy batch encoder creation
-- switching standalone matvec to native Metal by default
-- keeping component decode greedy argmax on a reused device buffer
-
-Metal is now in a good “working checkpoint” state, but it is still not a
-throughput-complete backend. The next optimization target is decode-side GPU
-work: component decode still spends most of its time in the single per-token
-command-buffer wait, which means deeper decode fusion is the next meaningful
-step rather than more host-side plumbing cleanup.
+The next optimization target is a persistent Metal megakernel — collapsing the
+per-token command-buffer round-trips into a single dispatch, equivalent to the
+HIP persistent decode path.
 
 ### Metal validation
 
@@ -422,8 +402,8 @@ QWEN35_BUGHUNT_REPORT_JSON=/tmp/qwen35_bughunt_gate.json \
 
 The script builds `qwen35_bughunt`, runs the checked-in manifest at
 `crates/runner/bughunt/qwen35_metal_manifest.json`, and compares native Metal
-prefill, GPU replay, selected hidden rows, and final prefill logits against the
-Python oracle on CPU.
+prefill, selected hidden rows, and final prefill logits against the Python oracle
+on CPU.
 
 To run one prompt from the manifest:
 
