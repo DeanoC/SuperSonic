@@ -984,7 +984,13 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
                 continue
             shape = gguf_logical_shape(info)
             raw_layout = ggml_k_layout(info.ggml_type)
-            if raw_layout is not None and is_q4km_target(mapped, shape, args.group_size):
+            if (
+                raw_layout is not None
+                # The runtime lm-head path expects BF16 or native INT4 sidecars,
+                # not raw GGML K-block bytes.
+                and mapped != "lm_head.weight"
+                and is_q4km_target(mapped, shape, args.group_size)
+            ):
                 cols = info.dims[0]
                 rows = prod(info.dims[1:]) if len(info.dims) > 1 else 1
                 row_bytes = ggml_row_size(info.ggml_type, cols)
