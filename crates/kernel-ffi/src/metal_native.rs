@@ -35,6 +35,13 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1(
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_residual_bf16(
         batch_elems: usize,
         m: usize,
@@ -861,6 +868,45 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// SIMD-group cooperative GEMV for the M=1, batch=1 case. Each output column
+/// is handled by 32 threads cooperating on the K reduction; ~5–10× faster
+/// than the per-cell sequential-K kernel on Apple GPUs.
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || rhs.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1 expects BF16, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1(
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1 failed with status {status}"
         )));
     }
     Ok(())
@@ -3365,6 +3411,19 @@ pub(crate) fn matmul_rhs_transposed_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_bf16_gemv_m1 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -4051,6 +4110,51 @@ mod tests {
             assert!(
                 delta <= 0.02,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_matches_reference() {
+        // K=64 spans multiple SIMD lanes (32 threads × 2 chunks per thread).
+        // N=3 keeps the threadgroup count small but exercises multiple cols.
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let k = 64usize;
+        let n = 3usize;
+
+        let lhs_vals: Vec<f32> = (0..k).map(|i| ((i as f32) - 32.0) * 0.05).collect();
+        let lhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, k], &bf16_bytes(&lhs_vals))
+                .expect("upload lhs");
+
+        let mut rhs_vals: Vec<f32> = Vec::with_capacity(n * k);
+        for col in 0..n {
+            for kk in 0..k {
+                rhs_vals.push((col as f32) * 0.1 - (kk as f32) * 0.01);
+            }
+        }
+        let rhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[n, k], &bf16_bytes(&rhs_vals))
+                .expect("upload rhs");
+
+        let mut out_gemv =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc gemv out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc ref out");
+
+        matmul_rhs_transposed_bf16_gemv_m1(n, k, &lhs, &rhs, &mut out_gemv)
+            .expect("run gemv");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
+            .expect("run reference");
+
+        let actual = read_bf16(&out_gemv);
+        let expected = read_bf16(&out_ref);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            assert!(
+                delta <= 0.05,
+                "idx {idx}: gemv {a} vs reference {e}, delta {delta}"
             );
         }
     }

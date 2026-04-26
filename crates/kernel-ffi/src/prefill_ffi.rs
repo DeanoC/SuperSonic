@@ -2113,6 +2113,23 @@ pub fn matmul_rhs_transposed(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        // M=1 batch=1 GEMV: SIMD-group cooperative reduction. Used by every
+        // decode-step projection (q/k/v/o/gate/up/down/lm_head). Opt-out for
+        // bring-up/bisect via SUPERSONIC_METAL_DISABLE_GEMV_M1.
+        if dtype == ScalarType::BF16
+            && batch_elems == 1
+            && m == 1
+            && !metal_native::disabled_by_env()
+            && !metal_force_host_matmul()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_none()
+        {
+            let result = metal_profile_time("matmul_rhs_transposed_gemv_m1", "native", || {
+                metal_native::matmul_rhs_transposed_bf16_gemv_m1(n, k, lhs, rhs, out)
+            });
+            if result.is_ok() {
+                return result;
+            }
+        }
         if dtype == ScalarType::BF16
             && !metal_native::disabled_by_env()
             && !metal_force_host_matmul()

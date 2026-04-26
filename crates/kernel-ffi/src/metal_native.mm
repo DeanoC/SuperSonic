@@ -647,6 +647,108 @@ kernel void supersonic_matmul_rhs_transposed_bf16(
     return pipeline;
 }
 
+// SIMD-group cooperative GEMV for the M=1 decode case: out[1, n] = lhs[1, k] · rhs[n, k]^T.
+// One SIMD-group per output column (32 threads cooperate on the K reduction);
+// `simd_sum` collapses partials, lane 0 writes the result. This replaces the
+// per-cell sequential-K kernel for M=1 — the path lm_head, q/k/v/o projections,
+// and MLP gate/up/down all hit during decode.
+id<MTLComputePipelineState> matmul_pipeline_bf16_gemv_m1(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:501
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"GEMV(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulGemvParams {
+    uint n;
+    uint k;
+};
+
+kernel void supersonic_matmul_rhs_transposed_bf16_gemv_m1(
+    device const bfloat* lhs [[buffer(0)]],
+    device const bfloat* rhs [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant MatmulGemvParams& params [[buffer(3)]],
+    uint col [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (col >= params.n) {
+        return;
+    }
+    uint k = params.k;
+    uint rhs_base = col * k;
+    float partial = 0.0f;
+    for (uint kk = lane; kk < k; kk += 32u) {
+        partial += float(lhs[kk]) * float(rhs[rhs_base + kk]);
+    }
+    float sum = simd_sum(partial);
+    if (lane == 0) {
+        out[col] = bfloat(sum);
+    }
+}
+)GEMV";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:502
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile gemv library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_matmul_rhs_transposed_bf16_gemv_m1"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:503
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load gemv function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:504
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create gemv pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> matmul_pipeline_f32(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -8157,6 +8259,66 @@ extern "C" int supersonic_metal_embedding_lookup_bf16(
             MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 249, 250, 251, 252);
+    }
+}
+
+extern "C" int supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1(
+    size_t n,
+    size_t k,
+    const void* lhs_ptr,
+    const void* rhs_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (n == 0 || k == 0 || lhs_ptr == nullptr || rhs_ptr == nullptr || out_ptr == nullptr) {
+            return 510;
+        }
+        if (n > UINT32_MAX || k > UINT32_MAX) {
+            return 511;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = matmul_pipeline_bf16_gemv_m1(&pipeline_error);
+        if (pipeline == nil) {
+            return 512;
+        }
+
+        id<MTLBuffer> lhs = nil;
+        id<MTLBuffer> rhs = nil;
+        id<MTLBuffer> out = nil;
+        size_t lhs_offset = 0;
+        size_t rhs_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(lhs_ptr, &lhs, &lhs_offset) != 0) {
+            return 513;
+        }
+        if (lookup_buffer(rhs_ptr, &rhs, &rhs_offset) != 0) {
+            return 514;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 515;
+        }
+
+        struct MatmulGemvParams {
+            uint32_t n;
+            uint32_t k;
+        } params = {
+            static_cast<uint32_t>(n),
+            static_cast<uint32_t>(k),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            // One SIMD-group (32 threads) per output column.
+            MTLSize threads_per_group = MTLSizeMake(32, 1, 1);
+            MTLSize threadgroups = MTLSizeMake(n, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 516, 517, 518, 519);
     }
 }
 
