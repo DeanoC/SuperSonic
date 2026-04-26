@@ -2381,6 +2381,119 @@ __global__ void certified_kv_mixed_value_pair_by_dim_kernel(
     }
 }
 
+__global__ void certified_kv_mixed_value_quad_by_dim_kernel(
+    const float* score_scratch,
+    const __nv_bfloat16* promoted_value_bf16,
+    const uint32_t* value_promote_index,
+    const uint8_t* value_int4,
+    const __half* value_scale,
+    const __half* value_zero,
+    const __nv_bfloat16* tail_value,
+    __nv_bfloat16* output_bf16,
+    int q_heads,
+    int kv_heads,
+    int num_blocks,
+    int block_size,
+    int tail_len,
+    int max_promoted_value_blocks,
+    int value_stride_tokens,
+    int tail_value_start_tokens,
+    int tail_value_stride_tokens,
+    int score_stride_tokens,
+    int head_dim,
+    int value_group_size,
+    int gqa_group,
+    const uint32_t* run_flag
+) {
+    if (!certified_kv_should_run(run_flag)) return;
+    const int quad_dim = head_dim / 4;
+    const int packed_dim = head_dim / 2;
+    const int linear = blockIdx.x;
+    const int qh = linear / quad_dim;
+    const int quad = linear - qh * quad_dim;
+    if (qh >= q_heads || quad >= quad_dim) return;
+    const int d0 = quad * 4;
+    const int kvh = qh / gqa_group;
+    if (kvh >= kv_heads) return;
+    const int aligned_tokens = num_blocks * block_size;
+    const int total_tokens = aligned_tokens + tail_len;
+    const int groups = head_dim / value_group_size;
+    const int group = d0 / value_group_size;
+
+    __shared__ float reduce_scratch[256];
+    float local0 = 0.0f;
+    float local1 = 0.0f;
+    float local2 = 0.0f;
+    float local3 = 0.0f;
+    for (int tok = threadIdx.x; tok < total_tokens; tok += blockDim.x) {
+        const float w = score_scratch[static_cast<size_t>(qh) * score_stride_tokens + tok];
+        float v0;
+        float v1;
+        float v2;
+        float v3;
+        if (tok < aligned_tokens) {
+            const int block_id = tok / block_size;
+            const uint32_t promoted_value_slot =
+                value_promote_index[static_cast<size_t>(kvh) * num_blocks + block_id];
+            if (promoted_value_slot != 0xffffffffu &&
+                static_cast<int>(promoted_value_slot) < max_promoted_value_blocks) {
+                const int token_in_block = tok - block_id * block_size;
+                const size_t base =
+                    ((static_cast<size_t>(kvh) * max_promoted_value_blocks +
+                      promoted_value_slot) *
+                         block_size +
+                     token_in_block) *
+                        head_dim +
+                    d0;
+                v0 = bf16_to_float(promoted_value_bf16[base]);
+                v1 = bf16_to_float(promoted_value_bf16[base + 1]);
+                v2 = bf16_to_float(promoted_value_bf16[base + 2]);
+                v3 = bf16_to_float(promoted_value_bf16[base + 3]);
+            } else {
+                const size_t packed_base =
+                    (static_cast<size_t>(kvh) * value_stride_tokens + tok) * packed_dim +
+                    (d0 / 2);
+                const uint8_t packed01 = value_int4[packed_base];
+                const uint8_t packed23 = value_int4[packed_base + 1];
+                const size_t meta_idx =
+                    (static_cast<size_t>(kvh) * value_stride_tokens + tok) * groups + group;
+                const float scale = __half2float(value_scale[meta_idx]);
+                const float zero = __half2float(value_zero[meta_idx]);
+                v0 = static_cast<float>(packed01 & 0x0f) * scale + zero;
+                v1 = static_cast<float>((packed01 >> 4) & 0x0f) * scale + zero;
+                v2 = static_cast<float>(packed23 & 0x0f) * scale + zero;
+                v3 = static_cast<float>((packed23 >> 4) & 0x0f) * scale + zero;
+            }
+        } else {
+            const int tail_tok = tok - aligned_tokens;
+            const size_t base =
+                (static_cast<size_t>(kvh) * tail_value_stride_tokens +
+                 tail_value_start_tokens + tail_tok) *
+                    head_dim +
+                d0;
+            v0 = bf16_to_float(tail_value[base]);
+            v1 = bf16_to_float(tail_value[base + 1]);
+            v2 = bf16_to_float(tail_value[base + 2]);
+            v3 = bf16_to_float(tail_value[base + 3]);
+        }
+        local0 += w * v0;
+        local1 += w * v1;
+        local2 += w * v2;
+        local3 += w * v3;
+    }
+    const float sum0 = block_reduce_sum_256(local0, reduce_scratch);
+    const float sum1 = block_reduce_sum_256(local1, reduce_scratch);
+    const float sum2 = block_reduce_sum_256(local2, reduce_scratch);
+    const float sum3 = block_reduce_sum_256(local3, reduce_scratch);
+    if (threadIdx.x == 0) {
+        const size_t out = static_cast<size_t>(qh) * head_dim + d0;
+        output_bf16[out] = __float2bfloat16(sum0);
+        output_bf16[out + 1] = __float2bfloat16(sum1);
+        output_bf16[out + 2] = __float2bfloat16(sum2);
+        output_bf16[out + 3] = __float2bfloat16(sum3);
+    }
+}
+
 __global__ void certified_kv_all_promoted_score_kernel(
     const __nv_bfloat16* query,
     const __nv_bfloat16* promoted_key_bf16,
@@ -4500,7 +4613,32 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
             static_cast<const uint32_t*>(run_flag)
         );
         if (cudaGetLastError() != cudaSuccess) return 86;
-        if ((head_dim % 2) == 0 && (value_group_size % 2) == 0) {
+        if ((head_dim % 4) == 0 && (value_group_size % 4) == 0) {
+            certified_kv_mixed_value_quad_by_dim_kernel<<<q_heads * (head_dim / 4), 256>>>(
+                static_cast<const float*>(score_scratch),
+                static_cast<const __nv_bfloat16*>(promoted_value_bf16),
+                static_cast<const uint32_t*>(value_promote_index),
+                static_cast<const uint8_t*>(value_int4),
+                static_cast<const __half*>(value_scale),
+                static_cast<const __half*>(value_zero),
+                static_cast<const __nv_bfloat16*>(tail_value_bf16),
+                static_cast<__nv_bfloat16*>(output_bf16),
+                q_heads,
+                kv_heads,
+                num_blocks,
+                block_size,
+                tail_len,
+                max_promoted_value_blocks,
+                value_stride_tokens,
+                tail_value_start_tokens,
+                tail_value_stride_tokens,
+                score_stride_tokens,
+                head_dim,
+                value_group_size,
+                gqa_group,
+                static_cast<const uint32_t*>(run_flag)
+            );
+        } else if ((head_dim % 2) == 0 && (value_group_size % 2) == 0) {
             certified_kv_mixed_value_pair_by_dim_kernel<<<q_heads * (head_dim / 2), 256>>>(
                 static_cast<const float*>(score_scratch),
                 static_cast<const __nv_bfloat16*>(promoted_value_bf16),
