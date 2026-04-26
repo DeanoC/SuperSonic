@@ -2148,12 +2148,30 @@ __global__ void certified_kv_mixed_key_score_kernel(
     const bool promote =
         promoted_slot != 0xffffffffu && static_cast<int>(promoted_slot) < max_promoted_blocks;
 
+    __shared__ float query_s[256];
+    __shared__ float key_scale_s[256];
+    __shared__ float key_zero_s[256];
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        query_s[d] = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+        if (chunk < num_blocks && !promote) {
+            key_scale_s[d] =
+                key_scale[
+                    (static_cast<size_t>(kvh) * key_scale_stride_blocks + chunk) * head_dim + d
+                ];
+            key_zero_s[d] =
+                key_zero[
+                    (static_cast<size_t>(kvh) * key_scale_stride_blocks + chunk) * head_dim + d
+                ];
+        }
+    }
+    __syncthreads();
+
     for (int token_in_chunk = threadIdx.x; token_in_chunk < chunk_tokens; token_in_chunk += blockDim.x) {
         const int tok = token_base + token_in_chunk;
         float acc = 0.0f;
         if (tok < aligned_tokens) {
             for (int d = 0; d < head_dim; ++d) {
-                const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+                const float q = query_s[d];
                 float k;
                 if (promote) {
                     const int promoted_head = (promoted_key_heads == kv_heads) ? kvh : qh;
@@ -2171,22 +2189,14 @@ __global__ void certified_kv_mixed_key_score_kernel(
                     const int8_t kq = static_cast<int8_t>(
                         key_int8[(static_cast<size_t>(kvh) * key_stride_tokens + tok) * head_dim + d]
                     );
-                    const float ks =
-                        key_scale[
-                            (static_cast<size_t>(kvh) * key_scale_stride_blocks + chunk) * head_dim + d
-                        ];
-                    const float kz =
-                        key_zero[
-                            (static_cast<size_t>(kvh) * key_scale_stride_blocks + chunk) * head_dim + d
-                        ];
-                    k = static_cast<float>(kq) * ks + kz;
+                    k = static_cast<float>(kq) * key_scale_s[d] + key_zero_s[d];
                 }
                 acc += q * k;
             }
         } else {
             const int tail_tok = tok - aligned_tokens;
             for (int d = 0; d < head_dim; ++d) {
-                const float q = bf16_to_float(query[static_cast<size_t>(qh) * head_dim + d]);
+                const float q = query_s[d];
                 const float k = bf16_to_float(
                     tail_key[
                         (static_cast<size_t>(kvh) * tail_key_stride_tokens +
