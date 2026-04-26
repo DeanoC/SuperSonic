@@ -42,6 +42,13 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1_tiled(
+        n: usize,
+        k: usize,
+        lhs_ptr: *const c_void,
+        rhs_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_residual_bf16(
         batch_elems: usize,
         m: usize,
@@ -868,6 +875,46 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native matmul_rhs_transposed_bf16 failed with status {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Tiled SIMD-group GEMV. Same algorithm as `matmul_rhs_transposed_bf16_gemv_m1`
+/// but with `lhs` cached in threadgroup memory and reused across 32 output cols.
+/// Caller must ensure K * 4 bytes fits in the device's threadgroup memory
+/// limit (~32KB on Apple Silicon → K <= 8192).
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16
+        || rhs.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled expects BF16, got {:?}/{:?}/{:?}",
+            lhs.dtype(),
+            rhs.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_bf16_gemv_m1_tiled(
+            n,
+            k,
+            lhs.as_ptr(),
+            rhs.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::Metal(format!(
+            "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled failed with status {status}"
         )));
     }
     Ok(())
@@ -3424,6 +3471,19 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
+    _n: usize,
+    _k: usize,
+    _lhs: &GpuBuffer,
+    _rhs: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::Metal(
+        "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn matmul_rhs_transposed_residual_bf16(
     _batch_elems: usize,
     _m: usize,
@@ -4110,6 +4170,53 @@ mod tests {
             assert!(
                 delta <= 0.02,
                 "idx {idx}: expected {e}, got {a}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_native_matmul_rhs_transposed_bf16_gemv_m1_tiled_matches_reference() {
+        // K=128 (covers 4 chunks per SIMD lane), N=70 (multiple threadgroups
+        // since 70 > 32 cols/tg, and last tg is partial).
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let k = 128usize;
+        let n = 70usize;
+
+        let lhs_vals: Vec<f32> = (0..k).map(|i| ((i as f32) - 64.0) * 0.025).collect();
+        let lhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, k], &bf16_bytes(&lhs_vals))
+                .expect("upload lhs");
+
+        let mut rhs_vals: Vec<f32> = Vec::with_capacity(n * k);
+        for col in 0..n {
+            for kk in 0..k {
+                rhs_vals.push((col as f32) * 0.05 - (kk as f32) * 0.005);
+            }
+        }
+        let rhs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[n, k], &bf16_bytes(&rhs_vals))
+                .expect("upload rhs");
+
+        let mut out_tiled =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc tiled out");
+        let mut out_ref =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc ref out");
+
+        matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, &lhs, &rhs, &mut out_tiled)
+            .expect("run tiled gemv");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
+            .expect("run reference");
+
+        let actual = read_bf16(&out_tiled);
+        let expected = read_bf16(&out_ref);
+        for (idx, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (a - e).abs();
+            // BF16 mantissa = 7 bits, so per-element rounding ~0.01 absolute,
+            // amplified by K=128 sums; allow generous tolerance.
+            assert!(
+                delta <= 0.5,
+                "idx {idx}: tiled {a} vs reference {e}, delta {delta}"
             );
         }
     }
