@@ -1678,18 +1678,16 @@ fn main() -> Result<()> {
         && !cli.kv_fp8
         && !cli.force_kernel_decode
         && !cli.force_component_decode;
-    // Metal v1 has no megakernel and no per-op decode pipeline yet — it must
-    // re-run the prefill pipeline for every generated token. Replay-prefill is
-    // O(N²) per step but reuses the validated Metal prefill ops with zero new
-    // kernels, which is the right v1 trade. Per-op decode (one length-1 step
-    // per token) is a Phase 2 follow-up.
-    let metal_replay_default = backend == Backend::Metal && cli.batch_size == 1;
+    // Metal v2 wires per-op incremental decode through the standard
+    // `engine.decode_step` path; only the legacy 4B / qwen3.5-2b CUDA replay
+    // gates remain.
+    let metal_v2_incremental = backend == Backend::Metal && cli.batch_size == 1;
     let replay_decode_enabled = cli.batch_size == 1
         && !cli.force_kernel_decode
         && !cli.force_component_decode
         && !cli.kv_fp8
-        && (metal_replay_default
-            || (params.use_4b_kernel && (cli.force_replay_decode || cuda_qwen2b_replay_default)));
+        && params.use_4b_kernel
+        && (cli.force_replay_decode || cuda_qwen2b_replay_default);
     let replay_kv_fp8_enabled =
         params.use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
     let component_single_decode_enabled =
@@ -1730,10 +1728,11 @@ fn main() -> Result<()> {
         && oracle_output.is_none()
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
+    if metal_v2_incremental {
+        eprintln!("[decode] Metal v2 incremental decode");
+    }
     if replay_decode_enabled {
-        if metal_replay_default {
-            eprintln!("[decode] Metal v1 replays native prefill for each decode step");
-        } else if cuda_qwen2b_replay_default {
+        if cuda_qwen2b_replay_default {
             eprintln!(
                 "[decode] single-sequence CUDA qwen3.5-2b uses replayed GPU prefill for correctness"
             );

@@ -62,8 +62,8 @@ fn metal_qwen_smoke_runs_end_to_end() {
         combined
     );
     assert!(
-        combined.contains("Metal v1 replays native prefill"),
-        "expected replay-prefill Metal decode path:\n{}",
+        combined.contains("Metal v2 incremental decode"),
+        "expected Metal v2 incremental decode path:\n{}",
         combined
     );
     assert!(

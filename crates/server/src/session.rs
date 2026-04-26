@@ -6,7 +6,6 @@
 
 use anyhow::{anyhow, Result};
 
-use gpu_hal::Backend;
 use runner::decode_engine::DecodeEngine;
 use runner::gemma4_engine::Gemma4Engine;
 use runner::gemma4_int4_engine::Gemma4Int4Engine;
@@ -48,28 +47,16 @@ impl InferenceSession {
         }
     }
 
-    /// Whether this session must use the replay-prefill decode path. True
-    /// only for Metal v1, which has no incremental decode pipeline yet.
-    /// Callers that say true here must invoke [`Self::decode_step_replay`]
-    /// instead of [`Self::decode_step`].
-    pub fn requires_replay_decode(&self) -> bool {
-        match self {
-            Self::Qwen(e) => e.backend() == Backend::Metal,
-            // Metal v1 only supports qwen3.5-0.8b, so other engines never
-            // run on Metal. Hard-code false to keep the API explicit.
-            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => false,
-        }
-    }
-
-    /// Replay-prefill decode: re-run prefill over the full token history
-    /// (prompt + everything emitted so far, including the most recently
-    /// sampled token) and return the last-position logits. Required by
-    /// Metal v1; other backends should use [`Self::decode_step`].
+    /// Replay-prefill decode: re-run prefill over the full token history and
+    /// return the last-position logits. Kept as a debug helper after Metal v2
+    /// landed — incremental decode is the default on every backend now, but
+    /// `--gpu-validate` still drives the underlying replay step internally for
+    /// per-step correctness comparisons.
     pub fn decode_step_replay(&mut self, token_history: &[u32]) -> Result<Vec<f32>> {
         match self {
             Self::Qwen(e) => e.decode_step_replay(token_history),
             Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
-                "replay-prefill decode is not implemented for Gemma 4 (Metal v1 only supports qwen3.5-0.8b)"
+                "replay-prefill decode is only implemented for the Qwen3.5 engine"
             )),
         }
     }

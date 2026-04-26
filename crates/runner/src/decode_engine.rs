@@ -851,6 +851,10 @@ pub struct DecodeEngine {
     component_full_attn_scratch: Option<ComponentFullAttentionScratch>,
     /// Reusable fixed-size scratch for component MLP decode.
     component_mlp_scratch: Option<ComponentMlpScratch>,
+    /// Reusable scratch for Metal v2 incremental decode. Lazily allocated on
+    /// the first Metal decode step; carries the BF16 inter-chunk linear-attention
+    /// buffers across decode steps.
+    metal_v2_scratch: Option<prefill_engine::MetalV2DecodeScratch>,
 }
 
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
@@ -9801,6 +9805,7 @@ impl DecodeEngine {
             dflash_fused_verify_cache: None,
             component_full_attn_scratch,
             component_mlp_scratch,
+            metal_v2_scratch: None,
         })
     }
 
@@ -10134,6 +10139,12 @@ impl DecodeEngine {
         sampling_mode: DecodeSamplingMode,
         sync_for_timing: bool,
     ) -> Result<DecodeStepOutput> {
+        // Metal: dispatch to per-op v2 incremental decode. The persistent_decode
+        // megakernel below is HIP/CUDA only.
+        if self.hidden_io.backend() == gpu_hal::Backend::Metal {
+            return self.decode_step_non_4b_metal(token_id, seqlen_offset);
+        }
+
         let config = &self.weights.config;
         let mut timings = DecodeStageTimings::default();
 
@@ -10430,6 +10441,54 @@ impl DecodeEngine {
     }
 
     /// Run one decode step. Returns logits as Vec<f32> on CPU.
+    /// Metal v2 incremental decode: one length-1 forward pass per generated
+    /// token, mutating the engine's `state` in place. Replaces Metal v1's
+    /// O(N²) replay-prefill path. Always returns logits and a host-computed
+    /// argmax; sampling_mode and sync_for_timing in the caller are ignored
+    /// because v2 doesn't have GPU-side fused argmax yet (that's v3).
+    fn decode_step_non_4b_metal(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<DecodeStepOutput> {
+        let config = &self.weights.config;
+        if self.metal_v2_scratch.is_none() {
+            self.metal_v2_scratch = Some(prefill_engine::MetalV2DecodeScratch::new(
+                config,
+                self.ordinal,
+            )?);
+        }
+        let scratch = self
+            .metal_v2_scratch
+            .as_mut()
+            .expect("metal v2 scratch was just initialized");
+        let logits = prefill_engine::metal_v2_decode_step(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            scratch,
+            token_id,
+            seqlen_offset,
+            self.ordinal,
+            self.kv_chunk_size,
+        )?;
+        let sampled_token = logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| {
+                a.1.partial_cmp(b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.0.cmp(&a.0))
+            })
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        Ok(DecodeStepOutput {
+            logits: Some(logits),
+            sampled_token,
+            timings: DecodeStageTimings::default(),
+        })
+    }
+
     pub fn decode_step(&mut self, token_id: u32, seqlen_offset: usize) -> Result<Vec<f32>> {
         if self.use_4b_kernel {
             return self.component_decode_step_4b(token_id, seqlen_offset);
