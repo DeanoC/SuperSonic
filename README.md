@@ -12,7 +12,7 @@ Three backend surfaces are validated today:
 
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
-- **Metal / `apple-m4`** — Apple M4 bring-up path for Qwen3.5 0.8B
+- **Metal / `apple-m4`** — Apple M4, BF16 Qwen3.5 0.8B (CLI + `supersonic-serve`)
 
 ### HIP on `gfx1150`
 
@@ -87,6 +87,25 @@ For `qwen3.5-4b` on `sm86`, normal BF16 single-sequence decode now uses the
 kernel path by default; replayed-prefill decode is legacy debugging behavior
 behind `--force-replay-decode`. CUDA `--kv-fp8` single-sequence decode still
 uses replayed GPU prefill for correctness.
+
+### Metal on `apple-m4`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
+
+Metal v1 is a single supported surface:
+
+- BF16 single-sequence decode for `qwen3.5-0.8b` only
+- both the `supersonic` CLI and `supersonic-serve` HTTP server work; `/v1/completions`
+  and `/v1/chat/completions` (streaming and non-streaming) are exercised end-to-end
+- decode is implemented as **replay-prefill**: each generated token re-runs prefill
+  over the full token history. This is correct (every prefill op has a Metal
+  implementation) but O(N²) per step. Measured on Apple M4: ~800 ms/tok at short
+  contexts, scaling roughly linearly with total context length thereafter.
+  Suitable for short interactions; long chats will degrade sharply
+- `--int4`, `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
+  and `--force-component-decode` are all rejected at startup
 
 ## Quick Start
 
