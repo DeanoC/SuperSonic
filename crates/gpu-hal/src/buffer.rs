@@ -26,6 +26,110 @@ pub struct GpuBuffer {
 unsafe impl Send for GpuBuffer {}
 unsafe impl Sync for GpuBuffer {}
 
+/// Owned host memory used as the certified-KV Tier-2 store.
+///
+/// CUDA/HIP allocate pinned host pages so selected FP16 blocks can be paged
+/// back into device scratch without first staging through pageable memory.
+pub struct HostBuffer {
+    ptr: NonNull<c_void>,
+    len_bytes: usize,
+    dtype: ScalarType,
+    shape: Vec<usize>,
+    device_ordinal: usize,
+    backend: Backend,
+}
+
+unsafe impl Send for HostBuffer {}
+unsafe impl Sync for HostBuffer {}
+
+impl Drop for HostBuffer {
+    fn drop(&mut self) {
+        ops::free_host_pinned(
+            self.backend,
+            self.device_ordinal,
+            self.ptr.as_ptr(),
+            self.len_bytes,
+        );
+    }
+}
+
+impl HostBuffer {
+    pub fn zeros(ordinal: usize, dtype: ScalarType, shape: &[usize]) -> Result<Self> {
+        let elems = ops::elem_count(shape);
+        let len_bytes = ops::byte_len(dtype, elems);
+        let ptr = ops::alloc_host_pinned(ordinal, len_bytes)?;
+        unsafe { std::ptr::write_bytes(ptr.as_ptr() as *mut u8, 0, len_bytes) };
+        Ok(Self {
+            ptr,
+            len_bytes,
+            dtype,
+            shape: shape.to_vec(),
+            device_ordinal: ordinal,
+            backend: crate::current_backend(),
+        })
+    }
+
+    pub fn clone_host(&self) -> Result<Self> {
+        let cloned = Self::zeros(self.device_ordinal, self.dtype, &self.shape)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.ptr.as_ptr() as *const u8,
+                cloned.ptr.as_ptr() as *mut u8,
+                self.len_bytes,
+            );
+        }
+        Ok(cloned)
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.ptr.as_ptr()
+    }
+
+    pub fn device_ptr(&self) -> Result<*const c_void> {
+        ops::host_pinned_device_ptr(self.backend, self.device_ordinal, self.ptr.as_ptr())
+            .map(|ptr| ptr.as_ptr() as *const c_void)
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr.as_ptr()
+    }
+
+    pub fn device_mut_ptr(&mut self) -> Result<*mut c_void> {
+        ops::host_pinned_device_ptr(self.backend, self.device_ordinal, self.ptr.as_ptr())
+            .map(|ptr| ptr.as_ptr())
+    }
+
+    pub fn offset_ptr(&self, byte_offset: usize) -> *const c_void {
+        debug_assert!(byte_offset <= self.len_bytes);
+        unsafe { (self.ptr.as_ptr() as *const u8).add(byte_offset) as *const c_void }
+    }
+
+    pub fn offset_mut_ptr(&mut self, byte_offset: usize) -> *mut c_void {
+        debug_assert!(byte_offset <= self.len_bytes);
+        unsafe { (self.ptr.as_ptr() as *mut u8).add(byte_offset) as *mut c_void }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.len_bytes) }
+    }
+
+    pub fn as_mut_bytes(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.len_bytes) }
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        self.len_bytes
+    }
+
+    pub fn dtype(&self) -> ScalarType {
+        self.dtype
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+}
+
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
         ops::free(self.backend, self.device_ordinal, self.ptr.as_ptr());

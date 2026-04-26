@@ -206,6 +206,64 @@ Notes:
 - ¹ The batched decode figure is aggregate tokens/second across
   `--batch-size 2`.
 
+Llama 3.1 8B arxiv_v1 retrieval smoke QA
+(`./tests/sm86/bench_llama31_arxiv_v1_smoke.sh`, commit `9d00178`):
+
+The current CUDA certified-KV runtime stores completed blocks in Tier-1
+compressed form (INT8 keys + INT4 values) and retains BF16 originals in
+host-pinned Tier-2 storage. The live decode path runs the adaptive selector,
+pages selected key blocks from Tier-2 into a compact device scratch buffer, and
+uses INT4 values for aligned blocks. Value escalation and ranking fallback are
+still not wired in live decode, so the quality contract is not yet the full
+paper ladder.
+
+| Subtask           | Path              | Context | Score | DotCache ref | Decode ms/tok |
+|-------------------|-------------------|--------:|------:|-------------:|--------------:|
+| niah_single       | dense INT8        |    4096 | 1.000 |        1.000 |         397.6 |
+| niah_single       | certified KV INT8 |    4096 | 1.000 |        1.000 |          74.5 |
+| niah_multikey     | dense INT8        |    4096 | 1.000 |        1.000 |         402.1 |
+| niah_multikey     | certified KV INT8 |    4096 | 1.000 |        1.000 |          82.5 |
+| niah_multiquery   | dense INT8        |    4096 | 1.000 |        1.000 |         404.6 |
+| niah_multiquery   | certified KV INT8 |    4096 | 1.000 |        1.000 |          83.2 |
+
+The arxiv_v1 smoke harness replays the DotCache synthetic retrieval subtasks
+with deterministic seeds, scores only the generated suffix, compares against
+the normalized DotCache reference results from
+`/workspace/DotCache/benchmarks/results/arxiv_v1_20260420`, and fails on
+critical certified-vs-dense regressions. The 4K smoke above passed all gates.
+
+Llama 3.1 8B PG-19 teacher-forced smoke QA is covered separately by
+`./tests/sm86/bench_llama31_pg19_smoke.sh`. It uses the Rust
+`--teacher-forced` scorer, which prefills the first token, feeds the true next
+token through dense or certified-KV CUDA decode, and accumulates NLL from the
+returned logits. A tiny local-text probe (`CONTEXTS=32`, one chunk, commit
+`8bffbca`) passed the dense-vs-certified gate:
+
+| Source        | Path              | Context | Chunks | PPL     | Decode ms/tok |
+|---------------|-------------------|--------:|-------:|--------:|--------------:|
+| local fixture | dense INT8        |      32 |      1 | 239.558 |          37.0 |
+| local fixture | certified KV INT8 |      32 |      1 | 235.822 |          36.6 |
+| PG-19 stream  | dense INT8        |     512 |      1 |   6.727 |          53.6 |
+| PG-19 stream  | certified KV INT8 |     512 |      1 |   6.783 |          38.6 |
+| PG-19 stream  | dense INT8        |    4096 |      1 |   6.279 |         222.7 |
+| PG-19 stream  | certified KV INT8 |    4096 |      1 |   6.294 |          99.1 |
+
+The 512-token PG-19 smoke (`target/pg19_smoke_real_512.json`, one streamed
+test chunk, commit `8bffbca` + docs update) passed the default
+`MAX_CERTIFIED_DELTA=0.10` gate with certified delta `+0.055` ppl. This is
+still a quick smoke baseline rather than a final quality number.
+
+The 4K reference-grade smoke (`target/pg19_smoke_reference_4k.json`) uses the
+DotCache PG-19 protocol: dense scores the full 4095-token target stream, while
+certified uses a 50% dense prefix (`dense_prefix_len=2048`), skips the boundary
+target, and scores the certified suffix (`4094` scored tokens,
+`2047` certified decode steps). It passed `REFERENCE_SMOKE=1` and
+`FAIL_ABOVE_REFERENCE=1` against
+`/workspace/DotCache/benchmarks/results/arxiv_v1_20260420`: dense PPL
+`6.279` vs DotCache `6.259`, certified PPL `6.294` vs DotCache `6.284`, and
+certified-vs-dense delta `+0.015` ppl. Use:
+`CONTEXTS=4096 REFERENCE_SMOKE=1 FAIL_ABOVE_REFERENCE=1` for this lane.
+
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
 [qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
@@ -287,4 +345,15 @@ SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
   --prompt "Hello" \
   --max-new-tokens 32 \
   --int8
+
+# CUDA / sm86 Llama 3.1 8B arxiv_v1 retrieval smoke QA
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
+# CUDA / sm86 Llama 3.1 8B PG-19 teacher-forced smoke QA
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
 ```

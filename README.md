@@ -170,6 +170,32 @@ SUPERSONIC_BACKENDS=cuda TIMEOUT=1200 CORPUS_TIMEOUT=1200 ./tests/sm86/run_4b_lo
 # Qwen3.5-4B batched decode
 SUPERSONIC_BACKENDS=cuda TIMEOUT=900 CORPUS_TIMEOUT=600 ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 
+# Llama 3.1 8B INT8 component decode
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
+  --backend cuda \
+  --model llama3.1-8b \
+  --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" \
+  --max-new-tokens 32 \
+  --int8
+
+# Llama 3.1 8B arxiv_v1 retrieval smoke QA
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
+# Llama 3.1 8B PG-19 teacher-forced smoke QA
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
+# Llama 3.1 8B PG-19 DotCache reference smoke QA
+CONTEXTS='4096' NUM_CHUNKS=1 CONFIG=both REFERENCE_SMOKE=1 \
+  FAIL_ABOVE_REFERENCE=1 TIMEOUT=1200 \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+
 # Combined wrapper
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
@@ -188,6 +214,14 @@ Each `sm86` script currently validates:
 `tests/sm86/run_batch.sh` adds `qwen3.5-4b --batch-size 2` coverage on the same `sm86` target.
 `tests/sm86/run_fast_greedy.sh` checks that the CUDA fast-greedy 0.8B path
 matches the legacy host-logits sampling path on short, medium, and long prompts.
+`llama3.1-8b --int8` is checked with the PyTorch oracle, `--gpu-validate`, and
+fast-greedy/full-logits token regression runs.
+`tests/sm86/bench_llama31_arxiv_v1_smoke.sh` covers generated RULER/NIAH-style
+retrieval smoke QA, and `tests/sm86/bench_llama31_pg19_smoke.sh` covers
+teacher-forced PG-19/perplexity smoke QA for dense INT8 vs certified KV.
+The CUDA certified-KV runtime validates Tier-1 compressed KV plus adaptive
+BF16-key promotion, with BF16 originals retained in host-pinned Tier-2 storage
+and promoted keys/values paged into compact device scratch by the fallback path.
 `tests/sm86/run_negative.sh` covers unsupported CUDA v1 flags and explicit failure modes.
 The default short/medium `sm86` scripts still validate against the CUDA oracle.
 The long-context scripts use the CPU oracle on this box, because that is the stable reference
@@ -411,6 +445,20 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run.sh /path/to/Qwen3.5-0.8B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_4b.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh /path/to/Qwen3.5-0.8B /path/to/Qwen3.5-4B
+SUPERSONIC_BACKENDS=cuda ./target/release/supersonic --backend cuda \
+  --model llama3.1-8b --model-dir /path/to/Meta-Llama-3.1-8B \
+  --prompt "Hello" --max-new-tokens 32 --int8
+CONTEXTS='4096' SUBTASKS='niah_single niah_multikey niah_multiquery' \
+  SAMPLES=1 CONFIG=both TIMEOUT=900 \
+  ./tests/sm86/bench_llama31_arxiv_v1_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
+CONTEXTS='4096' NUM_CHUNKS=1 CONFIG=both REFERENCE_SMOKE=1 \
+  FAIL_ABOVE_REFERENCE=1 TIMEOUT=1200 \
+  ./tests/sm86/bench_llama31_pg19_smoke.sh \
+  /path/to/Meta-Llama-3.1-8B
 
 # apple-m4 (Apple silicon) — Qwen3.5-0.8B Metal bughunt gate
 SUPERSONIC_BACKENDS=metal QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B ./tests/metal/qwen35_bughunt_gate.sh

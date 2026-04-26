@@ -16,12 +16,12 @@ use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::Parser;
-use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
@@ -34,7 +34,9 @@ mod oracle;
 use oracle::OracleOutput;
 
 #[derive(Parser, Debug)]
-#[command(about = "Validate Gemma 4 end-to-end greedy decode against the PyTorch oracle via the persistent megakernel")]
+#[command(
+    about = "Validate Gemma 4 end-to-end greedy decode against the PyTorch oracle via the persistent megakernel"
+)]
 struct Cli {
     #[arg(long)]
     model_dir: PathBuf,
@@ -61,7 +63,12 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -95,8 +102,8 @@ impl UnbakedLoader {
             let mut shards = Vec::with_capacity(shard_files.len());
             for filename in &shard_files {
                 let path = dir.join(filename);
-                let file = File::open(&path)
-                    .with_context(|| format!("open shard {}", path.display()))?;
+                let file =
+                    File::open(&path).with_context(|| format!("open shard {}", path.display()))?;
                 shards.push(unsafe { Mmap::map(&file)? });
             }
             let mut index = std::collections::BTreeMap::new();
@@ -112,15 +119,17 @@ impl UnbakedLoader {
             if !single.exists() {
                 bail!("no safetensors found in {}", dir.display());
             }
-            let file = File::open(&single)
-                .with_context(|| format!("open {}", single.display()))?;
+            let file = File::open(&single).with_context(|| format!("open {}", single.display()))?;
             let mmap = unsafe { Mmap::map(&file)? };
             let st = SafeTensors::deserialize(&mmap)?;
             let mut index = std::collections::BTreeMap::new();
             for name in st.names() {
                 index.insert(name.to_string(), 0);
             }
-            Ok(Self { shards: vec![mmap], index })
+            Ok(Self {
+                shards: vec![mmap],
+                index,
+            })
         }
     }
 
@@ -139,7 +148,12 @@ impl UnbakedLoader {
 
     fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::BF16,
+            &shape,
+            bytes,
+        )?)
     }
 }
 
@@ -192,7 +206,10 @@ fn build_proportional_rope_table(
 ) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let rope_angles = (partial_rotary_factor * (head_dim as f64) / 2.0) as usize;
-    assert!(rope_angles <= half, "rope_angles {rope_angles} > head_dim/2 {half}");
+    assert!(
+        rope_angles <= half,
+        "rope_angles {rope_angles} > head_dim/2 {half}"
+    );
 
     let mut inv_freq = vec![0.0f32; half];
     for j in 0..rope_angles {
@@ -279,8 +296,14 @@ fn compute_per_layer_inputs(
 
     let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
     g4::matvec(
-        0, dtype, &mut proj, &main_embed_gpu, per_layer_model_projection_w,
-        hidden_size, total, counter,
+        0,
+        dtype,
+        &mut proj,
+        &main_embed_gpu,
+        per_layer_model_projection_w,
+        hidden_size,
+        total,
+        counter,
     )?;
 
     let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
@@ -292,8 +315,14 @@ fn compute_per_layer_inputs(
     let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
     let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
     g4::rms_norm_per_row(
-        0, dtype, &mut proj_normed, &proj_reshaped,
-        Some(per_layer_projection_norm_w), eps, num_layers, ple_hidden,
+        0,
+        dtype,
+        &mut proj_normed,
+        &proj_reshaped,
+        Some(per_layer_projection_norm_w),
+        eps,
+        num_layers,
+        ple_hidden,
     )?;
     let proj_normed_host = download_bf16(&proj_normed)?;
 
@@ -330,9 +359,7 @@ fn seed_kv_cache_from_oracle(
         );
     }
     if positions_to_copy > prompt_tokens {
-        bail!(
-            "positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",
-        );
+        bail!("positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",);
     }
     let bf16_sz = 2;
     let total_bytes = num_kv_heads * max_t * head_dim * bf16_sz;
@@ -391,7 +418,11 @@ fn compare_vectors(got: &[f32], want: &[f32]) -> Result<CompareStats> {
     } else {
         0.0
     };
-    Ok(CompareStats { cos_sim, max_abs, rel_err_norm })
+    Ok(CompareStats {
+        cos_sim,
+        max_abs,
+        rel_err_norm,
+    })
 }
 
 fn argmax(v: &[f32]) -> usize {
@@ -512,14 +543,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
 
-    let config: Config = g4_config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let config: Config =
+        g4_config::load_config(&cli.model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
     let tcfg: &TextConfig = &config.text_config;
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
-    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
-        .context("parse oracle JSON")?;
+    let oracle: OracleOutput =
+        serde_json::from_slice(&oracle_bytes).context("parse oracle JSON")?;
     let prompt_token_ids = oracle
         .prompt_token_ids
         .as_ref()
@@ -549,7 +580,8 @@ fn main() -> Result<()> {
     if max_new_tokens > oracle.generated_tokens {
         bail!(
             "--max-new-tokens {} exceeds oracle.generated_tokens {}",
-            max_new_tokens, oracle.generated_tokens
+            max_new_tokens,
+            oracle.generated_tokens
         );
     }
     if oracle.decode_logits.len() < max_new_tokens.saturating_sub(1) {
@@ -573,8 +605,9 @@ fn main() -> Result<()> {
 
     let lm_head_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.embed_tokens.weight"))?;
     let final_norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
-    let per_layer_model_projection_w =
-        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+    let per_layer_model_projection_w = loader.load_bf16_to_gpu(&format!(
+        "{weight_prefix}.per_layer_model_projection.weight"
+    ))?;
     let per_layer_projection_norm_w =
         loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
 
@@ -600,11 +633,21 @@ fn main() -> Result<()> {
         let v_bytes = B64.decode(&kv.v).context("decode kv.v base64")?;
         let positions_to_copy = prompt_tokens.saturating_sub(1);
         let kc = seed_kv_cache_from_oracle(
-            &k_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+            &k_bytes,
+            &kv.k_shape,
+            num_kv_heads,
+            prompt_tokens,
+            w.head_dim,
+            max_t,
             positions_to_copy,
         )?;
         let vc = seed_kv_cache_from_oracle(
-            &v_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+            &v_bytes,
+            &kv.v_shape,
+            num_kv_heads,
+            prompt_tokens,
+            w.head_dim,
+            max_t,
             positions_to_copy,
         )?;
         k_caches[l] = Some(kc);
@@ -620,9 +663,13 @@ fn main() -> Result<()> {
     let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
     let full_head_dim = tcfg.head_dim_for(AttnKind::Full);
 
-    let (scos_h, ssin_h) = build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
+    let (scos_h, ssin_h) =
+        build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
     let (fcos_h, fsin_h) = build_proportional_rope_table(
-        full_head_dim, full_rope.rope_theta, full_rope.partial_rotary_factor, max_t,
+        full_head_dim,
+        full_rope.rope_theta,
+        full_rope.partial_rotary_factor,
+        max_t,
     );
     let sliding_cos = upload_bf16(&[max_t, sliding_head_dim], &scos_h)?;
     let sliding_sin = upload_bf16(&[max_t, sliding_head_dim], &ssin_h)?;
@@ -655,9 +702,21 @@ fn main() -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow!("missing owning V cache at layer {src_idx} for layer {l}"))?;
 
-        let k_proj_ptr = w.k_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-        let v_proj_ptr = w.v_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-        let k_norm_ptr = w.k_norm.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let k_proj_ptr = w
+            .k_proj
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let v_proj_ptr = w
+            .v_proj
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let k_norm_ptr = w
+            .k_norm
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
 
         descs.push(Gemma4DecodeLayerDesc {
             layer_type: kind_code,
@@ -695,17 +754,10 @@ fn main() -> Result<()> {
 
     let desc_stride = std::mem::size_of::<Gemma4DecodeLayerDesc>();
     let desc_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(
-            descs.as_ptr() as *const u8,
-            descs.len() * desc_stride,
-        )
+        std::slice::from_raw_parts(descs.as_ptr() as *const u8, descs.len() * desc_stride)
     };
-    let layers_gpu = GpuBuffer::from_host_bytes(
-        0,
-        ScalarType::U8,
-        &[desc_bytes.len()],
-        desc_bytes,
-    )?;
+    let layers_gpu =
+        GpuBuffer::from_host_bytes(0, ScalarType::U8, &[desc_bytes.len()], desc_bytes)?;
 
     // --- Megakernel workspace (max of phase A / phase B across all layers). ---
     let max_intermediate = (0..num_layers)
@@ -713,11 +765,15 @@ fn main() -> Result<()> {
         .max()
         .unwrap_or(tcfg.intermediate_size);
     let workspace_elems = g4::persistent_decode_workspace_elems(
-        hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
-        max_intermediate, ple_hidden,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        full_head_dim,
+        max_t,
+        max_intermediate,
+        ple_hidden,
     );
-    let mut mega_workspace =
-        GpuBuffer::zeros(0, ScalarType::F32, &[workspace_elems])?;
+    let mut mega_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[workspace_elems])?;
     let mut mega_matvec_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut mega_barrier_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut mega_barrier_flag = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
@@ -751,24 +807,28 @@ fn main() -> Result<()> {
         let mut h_running = upload_bf16(&[hidden_size], &h_in_host)?;
 
         let pli_bytes = compute_per_layer_inputs(
-            &loader, weight_prefix, tcfg, input_token_id,
-            &per_layer_model_projection_w, &per_layer_projection_norm_w,
+            &loader,
+            weight_prefix,
+            tcfg,
+            input_token_id,
+            &per_layer_model_projection_w,
+            &per_layer_projection_norm_w,
             &mut counter,
         )?;
         let expected_pli_bytes = num_layers * ple_hidden * 2;
         if pli_bytes.len() != expected_pli_bytes {
             bail!(
                 "compute_per_layer_inputs returned {} bytes, expected {}",
-                pli_bytes.len(), expected_pli_bytes
+                pli_bytes.len(),
+                expected_pli_bytes
             );
         }
-        let pli_gpu = GpuBuffer::from_host_bytes(
-            0, dtype, &[num_layers, ple_hidden], &pli_bytes,
-        )?;
+        let pli_gpu = GpuBuffer::from_host_bytes(0, dtype, &[num_layers, ple_hidden], &pli_bytes)?;
 
         // --- Single-kernel persistent decode: 35 layers in one launch. ---
         g4::persistent_decode(
-            0, dtype,
+            0,
+            dtype,
             &layers_gpu,
             &mut h_running,
             &pli_gpu,
@@ -776,17 +836,36 @@ fn main() -> Result<()> {
             &mut mega_matvec_counter,
             &mut mega_barrier_counter,
             &mut mega_barrier_flag,
-            num_layers, hidden_size, ple_hidden, pos, eps, 1.0f32,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            pos,
+            eps,
+            1.0f32,
         )?;
 
         // --- Final norm + tied lm_head + softcap (still primitives). ---
         let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut post_norm, &h_running, Some(&final_norm_w), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut post_norm,
+            &h_running,
+            Some(&final_norm_w),
+            eps,
+            hidden_size,
+        )?;
 
         let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
         g4::matvec(
-            0, dtype, &mut logits_gpu, &post_norm, &lm_head_w,
-            hidden_size, vocab_size, &mut counter,
+            0,
+            dtype,
+            &mut logits_gpu,
+            &post_norm,
+            &lm_head_w,
+            hidden_size,
+            vocab_size,
+            &mut counter,
         )?;
         let mut logits_host = download_bf16(&logits_gpu)?;
         for v in logits_host.iter_mut() {
@@ -801,7 +880,9 @@ fn main() -> Result<()> {
         if want_logits.len() != vocab_size {
             bail!(
                 "oracle {} len {} != vocab_size {}",
-                source_tag, want_logits.len(), vocab_size
+                source_tag,
+                want_logits.len(),
+                vocab_size
             );
         }
         let stats = compare_vectors(&logits_host, want_logits)?;
@@ -822,7 +903,11 @@ fn main() -> Result<()> {
         println!(
             "  argmax got={got_arg} want={want_arg} expected_gen_id={expected_gen_id} \
              argmax_vs_logits={} argmax_vs_gen_id={} top5_overlap={top5_overlap}/5",
-            if match_oracle_arg { "MATCH" } else { "MISMATCH" },
+            if match_oracle_arg {
+                "MATCH"
+            } else {
+                "MISMATCH"
+            },
             if match_argmax { "MATCH" } else { "MISMATCH" },
         );
         println!("  top5_got={:?} top5_want={:?}", top5_got, top5_want);

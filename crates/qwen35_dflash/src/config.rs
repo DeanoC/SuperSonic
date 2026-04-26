@@ -92,7 +92,8 @@ fn validate(c: &DFlashConfig) -> Result<(), String> {
             c.num_attention_heads, c.num_key_value_heads
         ));
     }
-    if c.hidden_size % c.num_attention_heads != 0 && c.head_dim * c.num_attention_heads != c.hidden_size
+    if c.hidden_size % c.num_attention_heads != 0
+        && c.head_dim * c.num_attention_heads != c.hidden_size
     {
         // Qwen3's head_dim can be independent of hidden_size / num_heads (true here:
         // 128 * 32 = 4096 which happens to match but don't assume it).

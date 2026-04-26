@@ -53,10 +53,10 @@ fn reference_matmul(
     n: usize,
     k: usize,
     gs: usize,
-    lhs: &[f32],               // [m, k] BF16-rounded values
-    nibbles: &[u8],            // [n, k]
-    scales: &[f32],            // [n/gs, k/gs] BF16-rounded values
-    zeros: &[f32],             // [n/gs, k/gs] BF16-rounded values
+    lhs: &[f32],    // [m, k] BF16-rounded values
+    nibbles: &[u8], // [n, k]
+    scales: &[f32], // [n/gs, k/gs] BF16-rounded values
+    zeros: &[f32],  // [n/gs, k/gs] BF16-rounded values
 ) -> Vec<f32> {
     let scale_cols = (k + gs - 1) / gs;
     let mut out = vec![0f32; m * n];
@@ -133,34 +133,53 @@ fn run_case(ordinal: usize, c: &TestCase) -> Result<()> {
     }
 
     // --- GPU buffers ---
-    let lhs_gpu = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
-        .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
 
     let packed = pack_nibbles(&nibbles, n, k);
-    let rhs_gpu = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::U8, &[n, k / 2], &packed)
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, k / 2], &packed)
         .map_err(|e| anyhow!("rhs upload: {e}"))?;
 
     let scale_gpu = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[sr, sc], &f32_to_bf16_bytes(&scales))
-        .map_err(|e| anyhow!("scale upload: {e}"))?;
+        ordinal,
+        ScalarType::BF16,
+        &[sr, sc],
+        &f32_to_bf16_bytes(&scales),
+    )
+    .map_err(|e| anyhow!("scale upload: {e}"))?;
 
     let zero_gpu = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[sr, sc], &f32_to_bf16_bytes(&zeros))
-        .map_err(|e| anyhow!("zero upload: {e}"))?;
+        ordinal,
+        ScalarType::BF16,
+        &[sr, sc],
+        &f32_to_bf16_bytes(&zeros),
+    )
+    .map_err(|e| anyhow!("zero upload: {e}"))?;
 
     let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
         .map_err(|e| anyhow!("out alloc: {e}"))?;
 
     prefill_ffi::matmul_rhs_transposed_int4(
-        ordinal, 1, m, n, k,
-        &lhs_gpu, &rhs_gpu, &scale_gpu, &zero_gpu,
-        gs, &mut out_gpu,
-    ).map_err(|e| anyhow!("int4 matmul: {e}"))?;
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &scale_gpu,
+        &zero_gpu,
+        gs,
+        &mut out_gpu,
+    )
+    .map_err(|e| anyhow!("int4 matmul: {e}"))?;
 
-    let out_host = bf16_bytes_to_f32(&out_gpu.to_host_bytes()
-        .map_err(|e| anyhow!("out d2h: {e}"))?);
+    let out_host = bf16_bytes_to_f32(
+        &out_gpu
+            .to_host_bytes()
+            .map_err(|e| anyhow!("out d2h: {e}"))?,
+    );
 
     let ref_out = reference_matmul(m, n, k, gs, &lhs, &nibbles, &scales, &zeros);
 
@@ -187,7 +206,10 @@ fn run_case(ordinal: usize, c: &TestCase) -> Result<()> {
             }
         }
     }
-    println!("  max_abs={max_abs:.5e}  max_rel={max_rel:.5e}  bad={nbad}/{}", m * n);
+    println!(
+        "  max_abs={max_abs:.5e}  max_rel={max_rel:.5e}  bad={nbad}/{}",
+        m * n
+    );
     if let Some((mi, ni, g, r)) = first_bad {
         println!("  first bad @ [{mi},{ni}]: gpu={g:.6} ref={r:.6}");
     }
@@ -195,8 +217,10 @@ fn run_case(ordinal: usize, c: &TestCase) -> Result<()> {
     // Dump a few sample values for sanity
     println!(
         "  samples: gpu[0,0]={:.4}  ref[0,0]={:.4}  gpu[{}, {}]={:.4}  ref={:.4}",
-        out_host[0], ref_out[0],
-        m - 1, n - 1,
+        out_host[0],
+        ref_out[0],
+        m - 1,
+        n - 1,
         out_host[(m - 1) * n + (n - 1)],
         ref_out[(m - 1) * n + (n - 1)],
     );
@@ -215,13 +239,55 @@ fn main() -> Result<()> {
     gpu_hal::set_device(ordinal).map_err(|e| anyhow!("set_device: {e}"))?;
 
     let cases = [
-        TestCase { name: "single group, single tile",  m: 16, n: 16, k: 128, gs: 128 },
-        TestCase { name: "2 groups in k",              m: 16, n: 16, k: 256, gs: 128 },
-        TestCase { name: "2 groups in n",              m: 16, n: 32, k: 128, gs: 128 },
-        TestCase { name: "multi-tile, aligned",        m: 32, n: 32, k: 256, gs: 128 },
-        TestCase { name: "Qwen-size group=128",        m: 1,  n: 128, k: 256, gs: 128 },
-        TestCase { name: "k spans many groups",        m: 4,  n: 16,  k: 1024, gs: 128 },
-        TestCase { name: "prefill-like shape",         m: 8,  n: 128, k: 2560, gs: 128 },
+        TestCase {
+            name: "single group, single tile",
+            m: 16,
+            n: 16,
+            k: 128,
+            gs: 128,
+        },
+        TestCase {
+            name: "2 groups in k",
+            m: 16,
+            n: 16,
+            k: 256,
+            gs: 128,
+        },
+        TestCase {
+            name: "2 groups in n",
+            m: 16,
+            n: 32,
+            k: 128,
+            gs: 128,
+        },
+        TestCase {
+            name: "multi-tile, aligned",
+            m: 32,
+            n: 32,
+            k: 256,
+            gs: 128,
+        },
+        TestCase {
+            name: "Qwen-size group=128",
+            m: 1,
+            n: 128,
+            k: 256,
+            gs: 128,
+        },
+        TestCase {
+            name: "k spans many groups",
+            m: 4,
+            n: 16,
+            k: 1024,
+            gs: 128,
+        },
+        TestCase {
+            name: "prefill-like shape",
+            m: 8,
+            n: 128,
+            k: 2560,
+            gs: 128,
+        },
     ];
 
     for c in &cases {

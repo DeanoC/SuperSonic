@@ -10,8 +10,8 @@ pub const MAX_BATCH_SIZE: usize = 8;
 #[derive(Debug, Clone)]
 pub struct DecodeLayerDesc {
     // --- Common fields ---
-    pub layer_type: c_int,          // 0 = linear_attention, 1 = full_attention
-    pub intermediate_size: c_int,   // MLP intermediate dim
+    pub layer_type: c_int,        // 0 = linear_attention, 1 = full_attention
+    pub intermediate_size: c_int, // MLP intermediate dim
     pub input_norm_w: *const c_void,
     pub input_norm_eps: f32,
     pub post_attn_norm_w: *const c_void,

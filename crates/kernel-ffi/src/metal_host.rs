@@ -1603,8 +1603,8 @@ pub(crate) fn linear_decode_apply(
             let pair_base = pair * packed_width;
             let q = &packed[pair_base..pair_base + head_k_dim];
             let k = &packed[pair_base + head_k_dim..pair_base + 2 * head_k_dim];
-            let value = &packed
-                [pair_base + 2 * head_k_dim..pair_base + 2 * head_k_dim + head_v_dim];
+            let value =
+                &packed[pair_base + 2 * head_k_dim..pair_base + 2 * head_k_dim + head_v_dim];
             let beta = packed[pair_base + 2 * head_k_dim + head_v_dim];
             let g_exp = packed[pair_base + 2 * head_k_dim + head_v_dim + 1];
             for v_idx in 0..head_v_dim {
@@ -1619,8 +1619,10 @@ pub(crate) fn linear_decode_apply(
                 }
                 let delta = (value[v_idx] - kv_mem) * beta;
                 let mut out_value = 0.0f32;
-                let state_out_base =
-                    b * (value_dim + state_dim) + value_dim + (v_head * head_k_dim) * head_v_dim + v_idx;
+                let state_out_base = b * (value_dim + state_dim)
+                    + value_dim
+                    + (v_head * head_k_dim) * head_v_dim
+                    + v_idx;
                 for k_idx in 0..head_k_dim {
                     state[k_idx] += k[k_idx] * delta;
                     out_value += state[k_idx] * q[k_idx];

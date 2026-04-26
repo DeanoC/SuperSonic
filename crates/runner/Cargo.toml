@@ -68,6 +68,10 @@ name = "qwen35_bughunt"
 path = "src/bin/qwen35_bughunt.rs"
 required-features = ["bughunt"]
 
+[[bin]]
+name = "llama31_certified_kv_microbench"
+path = "src/bin/llama31_certified_kv_microbench.rs"
+
 [dependencies]
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

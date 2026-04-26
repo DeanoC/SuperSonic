@@ -376,7 +376,11 @@ pub fn persistent_decode(
         }
     };
     if status != 0 {
-        return Err(phi4_backend_error(backend, "phi4 persistent decode kernel", status));
+        return Err(phi4_backend_error(
+            backend,
+            "phi4 persistent decode kernel",
+            status,
+        ));
     }
     Ok(())
 }

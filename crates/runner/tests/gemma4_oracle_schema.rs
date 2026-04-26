@@ -10,8 +10,8 @@ use std::path::PathBuf;
 
 #[test]
 fn gemma4_oracle_json_deserializes_into_oracle_output() {
-    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/gemma4_oracle_sample.json");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gemma4_oracle_sample.json");
     let raw = std::fs::read_to_string(&fixture)
         .unwrap_or_else(|e| panic!("read {}: {e}", fixture.display()));
 
@@ -71,9 +71,17 @@ fn gemma4_oracle_state_json_deserializes_and_layout_matches_e2b() {
     for (i, kv) in kv_caches.iter().enumerate() {
         assert_eq!(kv.layer, i, "layer index should match slot order");
         assert_eq!(kv.k_shape, kv.v_shape, "K and V shapes must match");
-        assert_eq!(kv.k_shape.len(), 4, "expected [batch, kv_heads, seq, head_dim]");
+        assert_eq!(
+            kv.k_shape.len(),
+            4,
+            "expected [batch, kv_heads, seq, head_dim]"
+        );
         let head_dim = kv.k_shape[3];
-        let expected = if full_attn_slots.contains(&i) { FULL_HEAD_DIM } else { SWA_HEAD_DIM };
+        let expected = if full_attn_slots.contains(&i) {
+            FULL_HEAD_DIM
+        } else {
+            SWA_HEAD_DIM
+        };
         assert_eq!(head_dim, expected, "slot {i} head_dim mismatch");
     }
 

@@ -19,7 +19,7 @@ pub mod rotary;
 pub mod state;
 pub mod weights;
 
-pub use config::{DFlashConfig, load_config};
+pub use config::{load_config, DFlashConfig};
 pub use forward::{forward, ForwardParams};
 pub use loader::LoadError;
 pub use rotary::RotaryTables;

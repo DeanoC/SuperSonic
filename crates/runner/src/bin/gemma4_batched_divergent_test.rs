@@ -87,11 +87,7 @@ impl Runtime {
             Self::Int4(e) => e.decode_step(tok, pos),
         }
     }
-    fn decode_step_batch(
-        &mut self,
-        toks: &[u32],
-        positions: &[usize],
-    ) -> Result<Vec<Vec<f32>>> {
+    fn decode_step_batch(&mut self, toks: &[u32], positions: &[usize]) -> Result<Vec<Vec<f32>>> {
         match self {
             Self::Bf16(e) => e.decode_step_batch(toks, positions),
             Self::Int4(e) => e.decode_step_batch(toks, positions),
@@ -123,11 +119,7 @@ fn greedy_sample(logits: &[f32]) -> u32 {
     best as u32
 }
 
-fn load_engine(
-    cli: &Cli,
-    weight_prefix: &'static str,
-    batch_size: usize,
-) -> Result<Runtime> {
+fn load_engine(cli: &Cli, weight_prefix: &'static str, batch_size: usize) -> Result<Runtime> {
     // `context_tokens` must fit prompt + max_new_tokens + stagger step.
     let context_tokens = 128usize;
     if cli.int4 {
@@ -223,7 +215,8 @@ fn main() -> Result<()> {
     if seq0_first != reference[1] {
         bail!(
             "stagger failed: single-seq decode_step produced {} but ref[1]={}",
-            seq0_first, reference[1]
+            seq0_first,
+            reference[1]
         );
     }
 
@@ -269,8 +262,13 @@ fn main() -> Result<()> {
             if actual != expected {
                 failures.push(format!(
                     "seq {seq} step {k}: pos={} expected {} got {}",
-                    if seq == 0 { prompt_len + 1 + k } else { prompt_len + k },
-                    expected, actual
+                    if seq == 0 {
+                        prompt_len + 1 + k
+                    } else {
+                        prompt_len + k
+                    },
+                    expected,
+                    actual
                 ));
             }
         }
@@ -293,6 +291,9 @@ fn main() -> Result<()> {
         for f in &failures {
             eprintln!("  FAIL: {f}");
         }
-        bail!("divergent-position test failed with {} mismatches", failures.len());
+        bail!(
+            "divergent-position test failed with {} mismatches",
+            failures.len()
+        );
     }
 }

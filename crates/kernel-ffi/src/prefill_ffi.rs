@@ -544,15 +544,7 @@ pub fn metal_qwen_full_projections_bf16(
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_full_projections", "native", || {
         metal_native::qwen_full_projections_bf16(
-            hidden_dim,
-            q_proj_dim,
-            kv_dim,
-            input,
-            q_weight,
-            k_weight,
-            v_weight,
-            q_out,
-            k_out,
+            hidden_dim, q_proj_dim, kv_dim, input, q_weight, k_weight, v_weight, q_out, k_out,
             v_out,
         )
     })
@@ -1383,7 +1375,9 @@ pub fn full_attention_decode_flat(
         )
     };
     if status != 0 {
-        return Err(ffi_error(format!("full_attention_decode_flat failed: {status}")));
+        return Err(ffi_error(format!(
+            "full_attention_decode_flat failed: {status}"
+        )));
     }
     Ok(())
 }
@@ -1421,31 +1415,31 @@ pub fn full_attention_decode_flat_strided(
             ));
         }
 
-    let num_kv_groups = q_heads / kv_heads;
-    let status = unsafe {
-        dotcache_qwen35_hip_full_attention_decode_flat_strided(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            batch_size,
-            q_heads,
-            kv_heads,
-            kv_len,
-            kv_stride,
-            head_dim,
-            num_kv_groups,
-            scale,
-            query.as_ptr(),
-            key.as_ptr(),
-            value.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "full_attention_decode_flat_strided failed: {status}"
-        )));
-    }
-    Ok(())
+        let num_kv_groups = q_heads / kv_heads;
+        let status = unsafe {
+            dotcache_qwen35_hip_full_attention_decode_flat_strided(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                q_heads,
+                kv_heads,
+                kv_len,
+                kv_stride,
+                head_dim,
+                num_kv_groups,
+                scale,
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "full_attention_decode_flat_strided failed: {status}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1708,8 +1702,7 @@ pub fn linear_stateful_conv_value_decay_4b(
         if dtype == ScalarType::BF16
             && batch_size == 1
             && seq_len == 1
-            && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY")
-                .is_none()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_NATIVE_LINEAR_CONV_VALUE_DECAY").is_none()
         {
             return metal_profile_time("linear_stateful_conv_value_decay_4b", "native", || {
                 metal_native::linear_conv_value_decay_bf16(
@@ -2171,7 +2164,14 @@ pub fn metal_matmul_rhs_transposed_residual_bf16(
 ) -> Result<(), GpuError> {
     metal_profile_time("matmul_rhs_transposed_residual", "native", || {
         metal_native::matmul_rhs_transposed_residual_bf16(
-            batch_elems, m, n, k, lhs, rhs, residual, out,
+            batch_elems,
+            m,
+            n,
+            k,
+            lhs,
+            rhs,
+            residual,
+            out,
         )
     })
 }
@@ -2278,24 +2278,26 @@ pub fn matmul_rhs_transposed_int8(
             ));
         }
 
-    let status = unsafe {
-        dotcache_qwen35_4b_hip_matmul_int8(
-            ScalarType::BF16.kernel_dtype_code(),
-            ordinal,
-            batch_elems,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            lhs.as_ptr(),
-            rhs_int8.as_ptr(),
-            scale.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("matmul_rhs_transposed_int8 failed: {status}")));
-    }
-    Ok(())
+        let status = unsafe {
+            dotcache_qwen35_4b_hip_matmul_int8(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_int8.as_ptr(),
+                scale.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "matmul_rhs_transposed_int8 failed: {status}"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -2326,25 +2328,25 @@ pub fn int8_outlier_add(
             ));
         }
 
-    let status = unsafe {
-        dotcache_qwen35_4b_hip_int8_outlier_add(
-            ScalarType::BF16.kernel_dtype_code(),
-            ordinal,
-            rows as c_int,
-            n as c_int,
-            k as c_int,
-            sub_cols as c_int,
-            rhs_int8.as_ptr(),
-            scale.as_ptr(),
-            outlier_cols.as_ptr(),
-            outlier_vals.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
-    }
-    Ok(())
+        let status = unsafe {
+            dotcache_qwen35_4b_hip_int8_outlier_add(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                rows as c_int,
+                n as c_int,
+                k as c_int,
+                sub_cols as c_int,
+                rhs_int8.as_ptr(),
+                scale.as_ptr(),
+                outlier_cols.as_ptr(),
+                outlier_vals.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
+        }
+        Ok(())
     }
 }
 

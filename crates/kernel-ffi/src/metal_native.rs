@@ -752,7 +752,8 @@ pub(crate) fn argmax_bf16(
             "metal native argmax_bf16 n exceeds u32: n={n}"
         )));
     }
-    let status = unsafe { supersonic_metal_argmax_bf16(n, logits.as_ptr(), out_index.as_mut_ptr()) };
+    let status =
+        unsafe { supersonic_metal_argmax_bf16(n, logits.as_ptr(), out_index.as_mut_ptr()) };
     if status != 0 {
         return Err(GpuError::Metal(format!(
             "metal native argmax_bf16 failed with status {status}"
@@ -1154,14 +1155,16 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
         residual.dtype(),
         out.dtype(),
     ];
-    if dtypes != [
-        ScalarType::F32,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-    ] {
+    if dtypes
+        != [
+            ScalarType::F32,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+        ]
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native qwen_linear_out_residual_f32_bf16 expects F32/BF16/BF16/BF16/BF16/BF16, got {dtypes:?}"
         )));
@@ -1215,14 +1218,16 @@ pub(crate) fn qwen_linear_out_residual_bf16_bf16(
         residual.dtype(),
         out.dtype(),
     ];
-    if dtypes != [
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-        ScalarType::BF16,
-    ] {
+    if dtypes
+        != [
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+            ScalarType::BF16,
+        ]
+    {
         return Err(GpuError::InvalidArg(format!(
             "metal native qwen_linear_out_residual_bf16_bf16 expects BF16 buffers, got {dtypes:?}"
         )));
@@ -4104,15 +4109,7 @@ mod tests {
         let mut v_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim]).expect("v out");
 
         qwen_full_projections_bf16(
-            hidden_dim,
-            q_proj_dim,
-            kv_dim,
-            &input,
-            &q_w,
-            &k_w,
-            &v_w,
-            &mut q_out,
-            &mut k_out,
+            hidden_dim, q_proj_dim, kv_dim, &input, &q_w, &k_w, &v_w, &mut q_out, &mut k_out,
             &mut v_out,
         )
         .expect("run fused qwen full projections");
@@ -4150,21 +4147,27 @@ mod tests {
             ordinal,
             ScalarType::BF16,
             &[intermediate, hidden_dim],
-            &bf16_bytes(&[1.0, 0.0, 1.0, 0.5, -1.0, 2.0, -2.0, 0.5, 1.0, 0.25, 0.75, -0.5]),
+            &bf16_bytes(&[
+                1.0, 0.0, 1.0, 0.5, -1.0, 2.0, -2.0, 0.5, 1.0, 0.25, 0.75, -0.5,
+            ]),
         )
         .expect("upload gate weight");
         let up_w = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
             &[intermediate, hidden_dim],
-            &bf16_bytes(&[0.0, 1.0, 0.5, 1.0, 1.0, -1.0, 0.25, -0.5, 2.0, -1.0, 0.0, 0.5]),
+            &bf16_bytes(&[
+                0.0, 1.0, 0.5, 1.0, 1.0, -1.0, 0.25, -0.5, 2.0, -1.0, 0.0, 0.5,
+            ]),
         )
         .expect("upload up weight");
         let down_w = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
             &[hidden_dim, intermediate],
-            &bf16_bytes(&[0.5, 1.0, -0.25, 0.75, -1.0, 0.25, 0.5, 1.5, 0.0, -0.5, 1.0, 0.25]),
+            &bf16_bytes(&[
+                0.5, 1.0, -0.25, 0.75, -1.0, 0.25, 0.5, 1.5, 0.0, -0.5, 1.0, 0.25,
+            ]),
         )
         .expect("upload down weight");
         let residual = GpuBuffer::from_host_bytes(
@@ -4186,12 +4189,9 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out ref");
         let mut gate =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("gate");
-        let mut up =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("up");
-        let mut mlp =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("mlp");
-        let mut out =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out");
+        let mut up = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("up");
+        let mut mlp = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate]).expect("mlp");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim]).expect("out");
 
         crate::metal_host::matmul_rhs_transposed(
             ScalarType::BF16,
@@ -4215,8 +4215,14 @@ mod tests {
             &mut up_ref,
         )
         .expect("host up");
-        crate::metal_host::swiglu_mul(ScalarType::BF16, intermediate, &gate_ref, &up_ref, &mut mlp_ref)
-            .expect("host swiglu");
+        crate::metal_host::swiglu_mul(
+            ScalarType::BF16,
+            intermediate,
+            &gate_ref,
+            &up_ref,
+            &mut mlp_ref,
+        )
+        .expect("host swiglu");
         crate::metal_host::matmul_rhs_transposed(
             ScalarType::BF16,
             1,
@@ -4228,8 +4234,14 @@ mod tests {
             &mut down_ref,
         )
         .expect("host down");
-        crate::metal_host::element_add(ScalarType::BF16, hidden_dim, &residual, &down_ref, &mut out_ref)
-            .expect("host residual");
+        crate::metal_host::element_add(
+            ScalarType::BF16,
+            hidden_dim,
+            &residual,
+            &down_ref,
+            &mut out_ref,
+        )
+        .expect("host residual");
 
         qwen_mlp_gate_up_bf16(
             hidden_dim,
@@ -4241,15 +4253,8 @@ mod tests {
             &mut up,
         )
         .expect("native gate/up");
-        qwen_mlp_gate_up_swiglu_bf16(
-            hidden_dim,
-            intermediate,
-            &input,
-            &gate_w,
-            &up_w,
-            &mut mlp,
-        )
-        .expect("native gate/up/swiglu");
+        qwen_mlp_gate_up_swiglu_bf16(hidden_dim, intermediate, &input, &gate_w, &up_w, &mut mlp)
+            .expect("native gate/up/swiglu");
         qwen_mlp_down_residual_bf16(
             hidden_dim,
             intermediate,
@@ -4415,8 +4420,8 @@ mod tests {
         .expect("upload a_log_exp");
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[conv_dim + num_heads]).expect("out ref");
-        let mut out_fused =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[conv_dim + num_heads]).expect("out fused");
+        let mut out_fused = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[conv_dim + num_heads])
+            .expect("out fused");
 
         linear_conv_value_decay_bf16(
             conv_dim,
@@ -4552,7 +4557,11 @@ mod tests {
             .iter()
             .map(|value| bf16::from_f32(*value).to_f32())
             .collect();
-        for (idx, (actual, expected)) in read_bf16(&attn_inplace).iter().zip(expected_attn.iter()).enumerate() {
+        for (idx, (actual, expected)) in read_bf16(&attn_inplace)
+            .iter()
+            .zip(expected_attn.iter())
+            .enumerate()
+        {
             assert!(
                 (actual - expected).abs() <= 0.0,
                 "attn {idx}: expected {expected}, got {actual}"

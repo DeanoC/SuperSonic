@@ -41,16 +41,24 @@ impl std::fmt::Display for LoadError {
 impl std::error::Error for LoadError {}
 
 impl From<std::io::Error> for LoadError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 impl From<safetensors::SafeTensorError> for LoadError {
-    fn from(e: safetensors::SafeTensorError) -> Self { Self::Safetensors(e) }
+    fn from(e: safetensors::SafeTensorError) -> Self {
+        Self::Safetensors(e)
+    }
 }
 impl From<GpuError> for LoadError {
-    fn from(e: GpuError) -> Self { Self::Gpu(e) }
+    fn from(e: GpuError) -> Self {
+        Self::Gpu(e)
+    }
 }
 impl From<serde_json::Error> for LoadError {
-    fn from(e: serde_json::Error) -> Self { Self::Json(e) }
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(e)
+    }
 }
 
 pub struct WeightLoader {
@@ -82,7 +90,10 @@ impl WeightLoader {
         for name in tensors.names() {
             index.insert(name.to_string(), 0);
         }
-        Ok(Self { shards: vec![mmap], index })
+        Ok(Self {
+            shards: vec![mmap],
+            index,
+        })
     }
 
     fn from_sharded(dir: &Path, index_path: &Path) -> Result<Self, LoadError> {

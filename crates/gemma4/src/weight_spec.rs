@@ -42,10 +42,7 @@ pub fn global_tensors(cfg: &TextConfig, prefix: &str) -> Vec<TensorSpec> {
             format!("{prefix}.embed_tokens_per_layer.weight"),
             vec![cfg.vocab_size, ple_table_dim],
         ),
-        TensorSpec::new(
-            format!("{prefix}.norm.weight"),
-            vec![cfg.hidden_size],
-        ),
+        TensorSpec::new(format!("{prefix}.norm.weight"), vec![cfg.hidden_size]),
         TensorSpec::new(
             format!("{prefix}.per_layer_model_projection.weight"),
             vec![ple_table_dim, cfg.hidden_size],
@@ -72,7 +69,9 @@ pub fn mlp_intermediate(cfg: &TextConfig, layer_idx: usize) -> usize {
 
 /// Expected per-layer tensors for a single decoder layer.
 pub fn layer_tensors(cfg: &TextConfig, prefix: &str, layer_idx: usize) -> Vec<TensorSpec> {
-    let kind = cfg.attn_kind(layer_idx).expect("caller must validate layer_types before calling layer_tensors");
+    let kind = cfg
+        .attn_kind(layer_idx)
+        .expect("caller must validate layer_types before calling layer_tensors");
     let head_dim = cfg.head_dim_for(kind);
     let q_dim = cfg.num_attention_heads * head_dim;
     let kv_dim = cfg.num_key_value_heads * head_dim;
@@ -114,7 +113,7 @@ pub fn all_tensors(cfg: &TextConfig, prefix: &str) -> Vec<TensorSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config};
+    use crate::config::Config;
 
     const E2B_SHAPE: &str = include_str!("../tests/e2b_config.json");
 
@@ -144,14 +143,34 @@ mod tests {
         let cfg = e2b_config();
         let t = &cfg.text_config;
         let ts = layer_tensors(t, "model.language_model", 0);
-        let by_name: std::collections::HashMap<_, _> =
-            ts.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
-        assert_eq!(by_name["model.language_model.layers.0.self_attn.q_proj.weight"], vec![2048, 1536]);
-        assert_eq!(by_name["model.language_model.layers.0.self_attn.k_proj.weight"], vec![256, 1536]);
-        assert_eq!(by_name["model.language_model.layers.0.self_attn.v_proj.weight"], vec![256, 1536]);
-        assert_eq!(by_name["model.language_model.layers.0.self_attn.o_proj.weight"], vec![1536, 2048]);
-        assert_eq!(by_name["model.language_model.layers.0.self_attn.k_norm.weight"], vec![256]);
-        assert_eq!(by_name["model.language_model.layers.0.mlp.gate_proj.weight"], vec![6144, 1536]);
+        let by_name: std::collections::HashMap<_, _> = ts
+            .iter()
+            .map(|t| (t.name.clone(), t.shape.clone()))
+            .collect();
+        assert_eq!(
+            by_name["model.language_model.layers.0.self_attn.q_proj.weight"],
+            vec![2048, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.0.self_attn.k_proj.weight"],
+            vec![256, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.0.self_attn.v_proj.weight"],
+            vec![256, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.0.self_attn.o_proj.weight"],
+            vec![1536, 2048]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.0.self_attn.k_norm.weight"],
+            vec![256]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.0.mlp.gate_proj.weight"],
+            vec![6144, 1536]
+        );
     }
 
     #[test]
@@ -159,13 +178,30 @@ mod tests {
         let cfg = e2b_config();
         let t = &cfg.text_config;
         let ts = layer_tensors(t, "model.language_model", 4);
-        let by_name: std::collections::HashMap<_, _> =
-            ts.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
-        assert_eq!(by_name["model.language_model.layers.4.self_attn.q_proj.weight"], vec![4096, 1536]);
-        assert_eq!(by_name["model.language_model.layers.4.self_attn.k_proj.weight"], vec![512, 1536]);
-        assert_eq!(by_name["model.language_model.layers.4.self_attn.v_proj.weight"], vec![512, 1536]);
-        assert_eq!(by_name["model.language_model.layers.4.self_attn.o_proj.weight"], vec![1536, 4096]);
-        assert_eq!(by_name["model.language_model.layers.4.self_attn.k_norm.weight"], vec![512]);
+        let by_name: std::collections::HashMap<_, _> = ts
+            .iter()
+            .map(|t| (t.name.clone(), t.shape.clone()))
+            .collect();
+        assert_eq!(
+            by_name["model.language_model.layers.4.self_attn.q_proj.weight"],
+            vec![4096, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.4.self_attn.k_proj.weight"],
+            vec![512, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.4.self_attn.v_proj.weight"],
+            vec![512, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.4.self_attn.o_proj.weight"],
+            vec![1536, 4096]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.4.self_attn.k_norm.weight"],
+            vec![512]
+        );
     }
 
     #[test]
@@ -174,10 +210,18 @@ mod tests {
         let t = &cfg.text_config;
         // Layer 15 is the first shared-KV layer (35 - 20 = 15).
         let ts = layer_tensors(t, "model.language_model", 15);
-        let by_name: std::collections::HashMap<_, _> =
-            ts.iter().map(|t| (t.name.clone(), t.shape.clone())).collect();
-        assert_eq!(by_name["model.language_model.layers.15.mlp.gate_proj.weight"], vec![12288, 1536]);
-        assert_eq!(by_name["model.language_model.layers.15.mlp.down_proj.weight"], vec![1536, 12288]);
+        let by_name: std::collections::HashMap<_, _> = ts
+            .iter()
+            .map(|t| (t.name.clone(), t.shape.clone()))
+            .collect();
+        assert_eq!(
+            by_name["model.language_model.layers.15.mlp.gate_proj.weight"],
+            vec![12288, 1536]
+        );
+        assert_eq!(
+            by_name["model.language_model.layers.15.mlp.down_proj.weight"],
+            vec![1536, 12288]
+        );
     }
 
     #[test]

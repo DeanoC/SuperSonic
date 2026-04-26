@@ -13,7 +13,7 @@ mod scalar_type;
 pub use backend::{
     compiled_backends, current_backend, is_backend_compiled, set_backend, Backend, DeviceInfo,
 };
-pub use buffer::GpuBuffer;
+pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::GpuError;
 pub use ops::{
     alloc, alloc_zeros, copy_d2d, copy_d2h, copy_h2d, hal_profile_reset, hal_profile_set_enabled,

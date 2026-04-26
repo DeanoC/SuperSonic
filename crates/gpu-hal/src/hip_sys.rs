@@ -12,6 +12,8 @@ unsafe extern "C" {
     pub(crate) fn hipSetDevice(device: c_int) -> c_int;
     pub(crate) fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     pub(crate) fn hipFree(ptr: *mut c_void) -> c_int;
+    pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
+    pub(crate) fn hipHostFree(ptr: *mut c_void) -> c_int;
     pub(crate) fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,
@@ -24,9 +26,5 @@ unsafe extern "C" {
     pub(crate) fn hipEventDestroy(event: *mut c_void) -> c_int;
     pub(crate) fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
     pub(crate) fn hipEventSynchronize(event: *mut c_void) -> c_int;
-    pub(crate) fn hipEventElapsedTime(
-        ms: *mut f32,
-        start: *mut c_void,
-        end: *mut c_void,
-    ) -> c_int;
+    pub(crate) fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> c_int;
 }

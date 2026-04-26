@@ -1640,10 +1640,10 @@ pub struct Gemma4DecodeLayerDesc {
     // --- Attention weights ---
     pub input_norm_w: *const c_void,
     pub q_proj_w: *const c_void,
-    pub k_proj_w: *const c_void,       // null when `shared_kv`
-    pub v_proj_w: *const c_void,       // null when `shared_kv`
+    pub k_proj_w: *const c_void, // null when `shared_kv`
+    pub v_proj_w: *const c_void, // null when `shared_kv`
     pub q_norm_w: *const c_void,
-    pub k_norm_w: *const c_void,       // null when `shared_kv`
+    pub k_norm_w: *const c_void, // null when `shared_kv`
     pub o_proj_w: *const c_void,
     pub post_attn_norm_w: *const c_void,
 
@@ -1782,7 +1782,11 @@ pub fn persistent_decode_workspace_elems(
     ple_hidden: usize,
 ) -> usize {
     let attn = fused_attn_block_workspace_elems(
-        hidden_size, num_q_heads, num_kv_heads, head_dim_max, max_t,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        head_dim_max,
+        max_t,
     );
     let mlp = fused_mlp_ple_workspace_elems(hidden_size, intermediate_size_max, ple_hidden);
     attn.max(mlp)

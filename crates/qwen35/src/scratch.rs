@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::mem;
 
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
-use kernel_ffi::{DecodeLayerDesc, KVCacheFp8Desc, BatchSeqDesc};
+use kernel_ffi::{BatchSeqDesc, DecodeLayerDesc, KVCacheFp8Desc};
 
 pub const PERSISTENT_4B_TIMING_SLOTS_PER_LAYER: usize = 43;
 pub const PERSISTENT_SYNC_COUNTER_BYTES: usize = 24;
@@ -17,9 +17,7 @@ pub fn required_attn_scratch_floats(
     max_context_tokens: usize,
     kv_chunk_size: usize,
 ) -> usize {
-    let aligned_kv_t = max_context_tokens
-        .div_ceil(kv_chunk_size.max(1))
-        * kv_chunk_size.max(1);
+    let aligned_kv_t = max_context_tokens.div_ceil(kv_chunk_size.max(1)) * kv_chunk_size.max(1);
     3 * num_attention_heads * head_dim + num_attention_heads * aligned_kv_t
 }
 
@@ -62,12 +60,9 @@ impl PersistentDecodeScratch {
             + hidden_dim
             + hidden_dim
             + attn_scratch_floats
-            + saved_gate_floats) * b;
-        let workspace = GpuBuffer::zeros(
-            ordinal,
-            ScalarType::F32,
-            &[workspace_floats],
-        )?;
+            + saved_gate_floats)
+            * b;
+        let workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])?;
 
         let sync_bytes = PERSISTENT_SYNC_COUNTER_BYTES
             + num_layers * PERSISTENT_4B_TIMING_SLOTS_PER_LAYER * std::mem::size_of::<u64>();

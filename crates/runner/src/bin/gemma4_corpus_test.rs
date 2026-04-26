@@ -125,7 +125,12 @@ fn load_corpus(path: &PathBuf) -> Result<Vec<CorpusEntry>> {
             continue;
         }
         let entry: CorpusEntry = serde_json::from_str(trimmed).with_context(|| {
-            format!("{}:{} invalid JSON: {}", path.display(), lineno + 1, trimmed)
+            format!(
+                "{}:{} invalid JSON: {}",
+                path.display(),
+                lineno + 1,
+                trimmed
+            )
         })?;
         out.push(entry);
     }
@@ -133,10 +138,7 @@ fn load_corpus(path: &PathBuf) -> Result<Vec<CorpusEntry>> {
 }
 
 fn entry_name(entry: &CorpusEntry, idx: usize) -> String {
-    entry
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("entry_{idx}"))
+    entry.name.clone().unwrap_or_else(|| format!("entry_{idx}"))
 }
 
 fn main() -> Result<()> {
@@ -199,15 +201,15 @@ fn main() -> Result<()> {
             // means downstream exact-match is impossible, so catch it early.
             if let Some(ref oracle_ids) = expected.prompt_token_ids {
                 if &ids != oracle_ids {
-                    bail!(
-                        "tokenizer mismatch on '{name}': rust={ids:?} oracle={oracle_ids:?}"
-                    );
+                    bail!("tokenizer mismatch on '{name}': rust={ids:?} oracle={oracle_ids:?}");
                 }
             }
             let want = expected
                 .expected_generated_token_ids
                 .clone()
-                .ok_or_else(|| anyhow!("oracle missing expected_generated_token_ids for '{name}'"))?;
+                .ok_or_else(|| {
+                    anyhow!("oracle missing expected_generated_token_ids for '{name}'")
+                })?;
             (ids, Some(want))
         };
 

@@ -32,12 +32,12 @@ use std::ffi::c_void;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::Parser;
-use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
@@ -89,7 +89,12 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 fn download_bf16(buf: &GpuBuffer) -> Result<Vec<f32>> {
@@ -128,8 +133,8 @@ impl UnbakedLoader {
             let mut shards = Vec::with_capacity(shard_files.len());
             for filename in &shard_files {
                 let path = dir.join(filename);
-                let file = File::open(&path)
-                    .with_context(|| format!("open shard {}", path.display()))?;
+                let file =
+                    File::open(&path).with_context(|| format!("open shard {}", path.display()))?;
                 shards.push(unsafe { Mmap::map(&file)? });
             }
             let mut index = std::collections::BTreeMap::new();
@@ -145,15 +150,17 @@ impl UnbakedLoader {
             if !single.exists() {
                 bail!("no safetensors found in {}", dir.display());
             }
-            let file = File::open(&single)
-                .with_context(|| format!("open {}", single.display()))?;
+            let file = File::open(&single).with_context(|| format!("open {}", single.display()))?;
             let mmap = unsafe { Mmap::map(&file)? };
             let st = SafeTensors::deserialize(&mmap)?;
             let mut index = std::collections::BTreeMap::new();
             for name in st.names() {
                 index.insert(name.to_string(), 0);
             }
-            Ok(Self { shards: vec![mmap], index })
+            Ok(Self {
+                shards: vec![mmap],
+                index,
+            })
         }
     }
 
@@ -173,7 +180,12 @@ impl UnbakedLoader {
 
     fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::BF16,
+            &shape,
+            bytes,
+        )?)
     }
 }
 
@@ -254,7 +266,10 @@ fn build_proportional_rope_table(
 ) -> (Vec<f32>, Vec<f32>) {
     let half = head_dim / 2;
     let rope_angles = (partial_rotary_factor * (head_dim as f64) / 2.0) as usize;
-    assert!(rope_angles <= half, "rope_angles {rope_angles} > head_dim/2 {half}");
+    assert!(
+        rope_angles <= half,
+        "rope_angles {rope_angles} > head_dim/2 {half}"
+    );
 
     let mut inv_freq = vec![0.0f32; half];
     for j in 0..rope_angles {
@@ -325,9 +340,7 @@ fn seed_kv_cache_from_oracle(
         );
     }
     if positions_to_copy > prompt_tokens {
-        bail!(
-            "positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",
-        );
+        bail!("positions_to_copy {positions_to_copy} > prompt_tokens {prompt_tokens}",);
     }
     let bf16_sz = 2;
     let total_bytes = num_kv_heads * max_t * head_dim * bf16_sz;
@@ -396,7 +409,11 @@ fn compare_vectors(got: &[f32], want: &[f32]) -> Result<CompareStats> {
     } else {
         0.0
     };
-    Ok(CompareStats { cos_sim, max_abs, rel_err_norm })
+    Ok(CompareStats {
+        cos_sim,
+        max_abs,
+        rel_err_norm,
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -408,18 +425,22 @@ fn main() -> Result<()> {
     gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
 
     // --- Config + oracle ---
-    let config: Config = g4_config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let config: Config =
+        g4_config::load_config(&cli.model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
     let tcfg: &TextConfig = &config.text_config;
 
     if cli.layer >= tcfg.num_hidden_layers {
-        bail!("--layer {} >= num_hidden_layers {}", cli.layer, tcfg.num_hidden_layers);
+        bail!(
+            "--layer {} >= num_hidden_layers {}",
+            cli.layer,
+            tcfg.num_hidden_layers
+        );
     }
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
-    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
-        .context("parse oracle JSON")?;
+    let oracle: OracleOutput =
+        serde_json::from_slice(&oracle_bytes).context("parse oracle JSON")?;
     let prompt_token_ids = oracle
         .prompt_token_ids
         .as_ref()
@@ -447,7 +468,10 @@ fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("oracle JSON missing per_layer_inputs_shape"))?;
 
     if cli.layer >= pre_ple.len() {
-        bail!("prefill_per_layer_pre_ple has only {} entries", pre_ple.len());
+        bail!(
+            "prefill_per_layer_pre_ple has only {} entries",
+            pre_ple.len()
+        );
     }
 
     let last_token_id = *prompt_token_ids
@@ -466,7 +490,9 @@ fn main() -> Result<()> {
     {
         bail!(
             "per_layer_inputs shape {:?} != [{}, {}]",
-            per_layer_inputs_shape, tcfg.num_hidden_layers, ple_hidden
+            per_layer_inputs_shape,
+            tcfg.num_hidden_layers,
+            ple_hidden
         );
     }
     let all_pli_bytes = B64
@@ -491,7 +517,9 @@ fn main() -> Result<()> {
         )?
     } else {
         let b64 = &per_layer_hidden[start_layer - 1];
-        let bytes = B64.decode(b64).context("decode prefill_per_layer_hidden base64")?;
+        let bytes = B64
+            .decode(b64)
+            .context("decode prefill_per_layer_hidden base64")?;
         let full = bf16_bytes_to_f32(&bytes);
         if full.len() != hidden_size {
             bail!(
@@ -587,8 +615,10 @@ fn main() -> Result<()> {
         let gate_proj = loader.load_bf16_to_gpu(&want("mlp.gate_proj.weight")?)?;
         let up_proj = loader.load_bf16_to_gpu(&want("mlp.up_proj.weight")?)?;
         let down_proj = loader.load_bf16_to_gpu(&want("mlp.down_proj.weight")?)?;
-        let per_layer_input_gate_w = loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?;
-        let per_layer_projection_w = loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?;
+        let per_layer_input_gate_w =
+            loader.load_bf16_to_gpu(&want("per_layer_input_gate.weight")?)?;
+        let per_layer_projection_w =
+            loader.load_bf16_to_gpu(&want("per_layer_projection.weight")?)?;
         let post_per_layer_input_norm_w =
             loader.load_bf16_to_gpu(&want("post_per_layer_input_norm.weight")?)?;
         let layer_scalar_value: f32 = {
@@ -611,7 +641,10 @@ fn main() -> Result<()> {
         let (cos_host, sin_host) = match kind {
             AttnKind::Sliding => build_sliding_rope_table(head_dim, rope_theta, prompt_tokens),
             AttnKind::Full => build_proportional_rope_table(
-                head_dim, rope_theta, partial_rotary_factor, prompt_tokens,
+                head_dim,
+                rope_theta,
+                partial_rotary_factor,
+                prompt_tokens,
             ),
         };
         let cos_table = upload_bf16(&[prompt_tokens, head_dim], &cos_host)?;
@@ -630,11 +663,21 @@ fn main() -> Result<()> {
         let k_oracle_bytes = B64.decode(&kv.k).context("decode kv.k base64")?;
         let v_oracle_bytes = B64.decode(&kv.v).context("decode kv.v base64")?;
         let k_cache = seed_kv_cache_from_oracle(
-            &k_oracle_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+            &k_oracle_bytes,
+            &kv.k_shape,
+            num_kv_heads,
+            prompt_tokens,
+            head_dim,
+            max_t,
             positions_to_copy,
         )?;
         let v_cache = seed_kv_cache_from_oracle(
-            &v_oracle_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, head_dim, max_t,
+            &v_oracle_bytes,
+            &kv.v_shape,
+            num_kv_heads,
+            prompt_tokens,
+            head_dim,
+            max_t,
             positions_to_copy,
         )?;
 
@@ -648,37 +691,125 @@ fn main() -> Result<()> {
 
         // Q = matvec(q_proj, x) always; K/V skipped on shared layers.
         let mut q = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-        g4::matvec(0, dtype, &mut q, &x, &q_proj, hidden_size, q_dim, &mut counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut q,
+            &x,
+            &q_proj,
+            hidden_size,
+            q_dim,
+            &mut counter,
+        )?;
 
         // Per-head Q_norm (weight per head_dim).
         let mut q_normed = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
-        g4::rms_norm_per_row(0, dtype, &mut q_normed, &q, Some(&q_norm), eps, num_q_heads, head_dim)?;
+        g4::rms_norm_per_row(
+            0,
+            dtype,
+            &mut q_normed,
+            &q,
+            Some(&q_norm),
+            eps,
+            num_q_heads,
+            head_dim,
+        )?;
 
         // RoPE on Q (always).
-        g4::rope_decode(0, dtype, &mut q_normed, &cos_table, &sin_table, num_q_heads, head_dim, rotary_dim, pos)?;
+        g4::rope_decode(
+            0,
+            dtype,
+            &mut q_normed,
+            &cos_table,
+            &sin_table,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            pos,
+        )?;
 
         // K/V compute, norm, RoPE-on-K, and kv_append only on non-shared layers.
         let (mut k_cache, mut v_cache) = (k_cache, v_cache);
         if !shared_kv {
-            let k_proj = k_proj.as_ref().expect("k_proj must be loaded on non-shared layers");
-            let v_proj = v_proj.as_ref().expect("v_proj must be loaded on non-shared layers");
-            let k_norm = k_norm.as_ref().expect("k_norm must be loaded on non-shared layers");
+            let k_proj = k_proj
+                .as_ref()
+                .expect("k_proj must be loaded on non-shared layers");
+            let v_proj = v_proj
+                .as_ref()
+                .expect("v_proj must be loaded on non-shared layers");
+            let k_norm = k_norm
+                .as_ref()
+                .expect("k_norm must be loaded on non-shared layers");
 
             let mut k = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::matvec(0, dtype, &mut k, &x, k_proj, hidden_size, kv_dim, &mut counter)?;
+            g4::matvec(
+                0,
+                dtype,
+                &mut k,
+                &x,
+                k_proj,
+                hidden_size,
+                kv_dim,
+                &mut counter,
+            )?;
             let mut v = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::matvec(0, dtype, &mut v, &x, v_proj, hidden_size, kv_dim, &mut counter)?;
+            g4::matvec(
+                0,
+                dtype,
+                &mut v,
+                &x,
+                v_proj,
+                hidden_size,
+                kv_dim,
+                &mut counter,
+            )?;
 
             let mut k_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::rms_norm_per_row(0, dtype, &mut k_normed, &k, Some(k_norm), eps, num_kv_heads, head_dim)?;
+            g4::rms_norm_per_row(
+                0,
+                dtype,
+                &mut k_normed,
+                &k,
+                Some(k_norm),
+                eps,
+                num_kv_heads,
+                head_dim,
+            )?;
             let mut v_normed = GpuBuffer::zeros(0, dtype, &[num_kv_heads, head_dim])?;
-            g4::rms_norm_per_row(0, dtype, &mut v_normed, &v, None, eps, num_kv_heads, head_dim)?;
+            g4::rms_norm_per_row(
+                0,
+                dtype,
+                &mut v_normed,
+                &v,
+                None,
+                eps,
+                num_kv_heads,
+                head_dim,
+            )?;
 
-            g4::rope_decode(0, dtype, &mut k_normed, &cos_table, &sin_table, num_kv_heads, head_dim, rotary_dim, pos)?;
+            g4::rope_decode(
+                0,
+                dtype,
+                &mut k_normed,
+                &cos_table,
+                &sin_table,
+                num_kv_heads,
+                head_dim,
+                rotary_dim,
+                pos,
+            )?;
 
             g4::kv_append(
-                0, dtype, &k_normed, &v_normed, &mut k_cache, &mut v_cache,
-                num_kv_heads, head_dim, pos, max_t,
+                0,
+                dtype,
+                &k_normed,
+                &v_normed,
+                &mut k_cache,
+                &mut v_cache,
+                num_kv_heads,
+                head_dim,
+                pos,
+                max_t,
             )?;
         }
 
@@ -686,8 +817,20 @@ fn main() -> Result<()> {
         let mut attn_out = GpuBuffer::zeros(0, dtype, &[num_q_heads, head_dim])?;
         let mut scores = GpuBuffer::zeros(0, ScalarType::F32, &[num_q_heads, max_t])?;
         g4::swa_attn_decode(
-            0, dtype, &q_normed, &k_cache, &v_cache, &mut scores, &mut attn_out,
-            num_q_heads, num_kv_heads, head_dim, prompt_tokens, max_t, sliding_window, 1.0,
+            0,
+            dtype,
+            &q_normed,
+            &k_cache,
+            &v_cache,
+            &mut scores,
+            &mut attn_out,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+            prompt_tokens,
+            max_t,
+            sliding_window,
+            1.0,
         )?;
 
         // o = o_proj @ attn_out.flatten
@@ -697,36 +840,96 @@ fn main() -> Result<()> {
             GpuBuffer::from_host_bytes(0, dtype, &attn_flat_shape, &bytes)?
         };
         let mut o = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::matvec(0, dtype, &mut o, &attn_flat, &o_proj, q_dim, hidden_size, &mut counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut o,
+            &attn_flat,
+            &o_proj,
+            q_dim,
+            hidden_size,
+            &mut counter,
+        )?;
 
         // x2 = rms_norm(o, post_attention_layernorm.weight); h = residual + x2
         let mut x2 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x2, &o, Some(&post_attn_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x2,
+            &o,
+            Some(&post_attn_norm),
+            eps,
+            hidden_size,
+        )?;
         let residual_h = download_bf16(&residual)?;
         let x2_h = download_bf16(&x2)?;
-        let h1_h: Vec<f32> = residual_h.iter().zip(x2_h.iter()).map(|(a, b)| a + b).collect();
+        let h1_h: Vec<f32> = residual_h
+            .iter()
+            .zip(x2_h.iter())
+            .map(|(a, b)| a + b)
+            .collect();
         let h_mid = upload_bf16(&[hidden_size], &h1_h)?;
 
         let residual2 = h_mid.clone_device()?;
 
         let mut x3 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut x3, &h_mid, Some(&pre_ff_norm), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut x3,
+            &h_mid,
+            Some(&pre_ff_norm),
+            eps,
+            hidden_size,
+        )?;
 
         let mut gate = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
-        g4::matvec(0, dtype, &mut gate, &x3, &gate_proj, hidden_size, intermediate_size, &mut counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut gate,
+            &x3,
+            &gate_proj,
+            hidden_size,
+            intermediate_size,
+            &mut counter,
+        )?;
         let mut up_buf = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
-        g4::matvec(0, dtype, &mut up_buf, &x3, &up_proj, hidden_size, intermediate_size, &mut counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut up_buf,
+            &x3,
+            &up_proj,
+            hidden_size,
+            intermediate_size,
+            &mut counter,
+        )?;
         let mut y = GpuBuffer::zeros(0, dtype, &[intermediate_size])?;
         g4::gelu_tanh_gate_mul(0, dtype, &mut y, &gate, &up_buf, intermediate_size)?;
 
         let mut m = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::matvec(0, dtype, &mut m, &y, &down_proj, intermediate_size, hidden_size, &mut counter)?;
+        g4::matvec(
+            0,
+            dtype,
+            &mut m,
+            &y,
+            &down_proj,
+            intermediate_size,
+            hidden_size,
+            &mut counter,
+        )?;
 
         let mut x4 = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::rms_norm(0, dtype, &mut x4, &m, Some(&post_ff_norm), eps, hidden_size)?;
         let residual2_h = download_bf16(&residual2)?;
         let x4_h = download_bf16(&x4)?;
-        let h_pre_ple: Vec<f32> = residual2_h.iter().zip(x4_h.iter()).map(|(a, b)| a + b).collect();
+        let h_pre_ple: Vec<f32> = residual2_h
+            .iter()
+            .zip(x4_h.iter())
+            .map(|(a, b)| a + b)
+            .collect();
 
         // --- PLE branch: gate → gelu_tanh → * per_layer_input[N] → projection →
         //     post_per_layer_input_norm → residual add → * layer_scalar ---
@@ -741,25 +944,47 @@ fn main() -> Result<()> {
 
         let mut gated = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
         g4::matvec(
-            0, dtype, &mut gated, &h_in_ple, &per_layer_input_gate_w,
-            hidden_size, ple_hidden, &mut counter,
+            0,
+            dtype,
+            &mut gated,
+            &h_in_ple,
+            &per_layer_input_gate_w,
+            hidden_size,
+            ple_hidden,
+            &mut counter,
         )?;
 
         let mut gated_act = GpuBuffer::zeros(0, dtype, &[ple_hidden])?;
         g4::gelu_tanh_gate_mul(
-            0, dtype, &mut gated_act, &gated, &per_layer_input_gpu, ple_hidden,
+            0,
+            dtype,
+            &mut gated_act,
+            &gated,
+            &per_layer_input_gpu,
+            ple_hidden,
         )?;
 
         let mut projected = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::matvec(
-            0, dtype, &mut projected, &gated_act, &per_layer_projection_w,
-            ple_hidden, hidden_size, &mut counter,
+            0,
+            dtype,
+            &mut projected,
+            &gated_act,
+            &per_layer_projection_w,
+            ple_hidden,
+            hidden_size,
+            &mut counter,
         )?;
 
         let mut normed = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         g4::rms_norm(
-            0, dtype, &mut normed, &projected, Some(&post_per_layer_input_norm_w),
-            eps, hidden_size,
+            0,
+            dtype,
+            &mut normed,
+            &projected,
+            Some(&post_per_layer_input_norm_w),
+            eps,
+            hidden_size,
         )?;
 
         let ple_residual_h = download_bf16(&ple_residual)?;
@@ -793,7 +1018,12 @@ fn main() -> Result<()> {
         .context("decode prefill_per_layer_pre_ple base64")?;
     let pre_ple_want = bf16_bytes_to_f32(&pre_ple_want_bytes);
     if pre_ple_want.len() != hidden_size {
-        bail!("pre_ple[{}] len {} != hidden_size {}", cli.layer, pre_ple_want.len(), hidden_size);
+        bail!(
+            "pre_ple[{}] len {} != hidden_size {}",
+            cli.layer,
+            pre_ple_want.len(),
+            hidden_size
+        );
     }
     let pre_ple_stats = compare_vectors(&final_pre_ple, &pre_ple_want)?;
     println!(
@@ -808,7 +1038,9 @@ fn main() -> Result<()> {
     if post_ple_want.len() != hidden_size {
         bail!(
             "per_layer_hidden[{}] len {} != hidden_size {}",
-            cli.layer, post_ple_want.len(), hidden_size
+            cli.layer,
+            post_ple_want.len(),
+            hidden_size
         );
     }
 
@@ -822,7 +1054,15 @@ fn main() -> Result<()> {
         let norm_w = loader.load_bf16_to_gpu(&format!("{weight_prefix}.norm.weight"))?;
         let in_gpu = upload_bf16(&[hidden_size], &final_post_ple)?;
         let mut out_gpu = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-        g4::rms_norm(0, dtype, &mut out_gpu, &in_gpu, Some(&norm_w), eps, hidden_size)?;
+        g4::rms_norm(
+            0,
+            dtype,
+            &mut out_gpu,
+            &in_gpu,
+            Some(&norm_w),
+            eps,
+            hidden_size,
+        )?;
         (download_bf16(&out_gpu)?, "post-PLE+final-norm")
     } else {
         (final_post_ple.clone(), "post-PLE")
@@ -830,12 +1070,23 @@ fn main() -> Result<()> {
     let post_ple_stats = compare_vectors(&post_ple_got, &post_ple_want)?;
     println!(
         "[layer{} {}] cos_sim={:.6}  max_abs={:.6}  rel_err_norm={:.6} (layer_scalar={:.4})",
-        cli.layer, compare_tag,
-        post_ple_stats.cos_sim, post_ple_stats.max_abs,
-        post_ple_stats.rel_err_norm, final_layer_scalar,
+        cli.layer,
+        compare_tag,
+        post_ple_stats.cos_sim,
+        post_ple_stats.max_abs,
+        post_ple_stats.rel_err_norm,
+        final_layer_scalar,
     );
-    let first: Vec<String> = post_ple_got.iter().take(6).map(|v| format!("{v:+.4}")).collect();
-    let want_first: Vec<String> = post_ple_want.iter().take(6).map(|v| format!("{v:+.4}")).collect();
+    let first: Vec<String> = post_ple_got
+        .iter()
+        .take(6)
+        .map(|v| format!("{v:+.4}"))
+        .collect();
+    let want_first: Vec<String> = post_ple_want
+        .iter()
+        .take(6)
+        .map(|v| format!("{v:+.4}"))
+        .collect();
     println!("  got[..6]  = [{}]", first.join(", "));
     println!("  want[..6] = [{}]", want_first.join(", "));
 
@@ -863,8 +1114,14 @@ fn main() -> Result<()> {
             let normed_hidden = upload_bf16(&[hidden_size], &post_ple_got)?;
             let mut logits_gpu = GpuBuffer::zeros(0, dtype, &[vocab_size])?;
             g4::matvec(
-                0, dtype, &mut logits_gpu, &normed_hidden, &lm_head_w,
-                hidden_size, vocab_size, &mut counter,
+                0,
+                dtype,
+                &mut logits_gpu,
+                &normed_hidden,
+                &lm_head_w,
+                hidden_size,
+                vocab_size,
+                &mut counter,
             )?;
             let mut logits_host = download_bf16(&logits_gpu)?;
             let cap = tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
@@ -875,7 +1132,8 @@ fn main() -> Result<()> {
             if oracle.prefill_logits.len() != vocab_size {
                 bail!(
                     "oracle.prefill_logits len {} != vocab_size {}",
-                    oracle.prefill_logits.len(), vocab_size
+                    oracle.prefill_logits.len(),
+                    vocab_size
                 );
             }
             let logit_stats = compare_vectors(&logits_host, &oracle.prefill_logits)?;
@@ -894,8 +1152,15 @@ fn main() -> Result<()> {
             let want_val = oracle.prefill_logits[argmax_want];
             println!(
                 "  argmax got={} ({:+.4})  want={} ({:+.4})  {}",
-                argmax_got, got_val, argmax_want, want_val,
-                if argmax_got == argmax_want { "MATCH" } else { "MISMATCH" }
+                argmax_got,
+                got_val,
+                argmax_want,
+                want_val,
+                if argmax_got == argmax_want {
+                    "MATCH"
+                } else {
+                    "MISMATCH"
+                }
             );
             println!(
                 "  top5 got={:?}  want={:?}  overlap={}/5",
@@ -909,10 +1174,7 @@ fn main() -> Result<()> {
                 );
             }
             if argmax_got != argmax_want {
-                bail!(
-                    "argmax mismatch: got {} want {}",
-                    argmax_got, argmax_want
-                );
+                bail!("argmax mismatch: got {} want {}", argmax_got, argmax_want);
             }
         }
     }

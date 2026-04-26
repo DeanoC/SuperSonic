@@ -1,3 +1,4 @@
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::BTreeMap;
 use std::ffi::{c_int, c_void};
 use std::ptr::NonNull;
@@ -341,6 +342,125 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
             })
         })
     })
+}
+
+/// Allocate host memory suitable for fast host-to-device page-in.
+pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
+    let backend = current_backend();
+    if len_bytes == 0 {
+        return Err(GpuError::InvalidArg(
+            "host allocation size must be > 0".into(),
+        ));
+    }
+    match backend {
+        Backend::Cuda => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let mut ptr = std::ptr::null_mut();
+                const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
+                let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, CUDA_HOST_ALLOC_MAPPED) };
+                if status != 0 {
+                    return Err(cuda_error("cudaHostAlloc", status));
+                }
+                NonNull::new(ptr)
+                    .ok_or_else(|| GpuError::Cuda("cudaHostAlloc returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+        }),
+        Backend::Hip => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_hip)]
+            {
+                let mut ptr = std::ptr::null_mut();
+                let status = unsafe { hipHostMalloc(&mut ptr, len_bytes, 0) };
+                if status != 0 {
+                    return Err(hip_error("hipHostMalloc", status));
+                }
+                NonNull::new(ptr).ok_or_else(|| GpuError::Hip("hipHostMalloc returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+        }),
+        Backend::Metal => {
+            let layout = Layout::from_size_align(len_bytes, 64)
+                .map_err(|e| GpuError::InvalidArg(format!("host allocation layout failed: {e}")))?;
+            let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
+            NonNull::new(ptr).ok_or_else(|| GpuError::Metal("host allocation returned null".into()))
+        }
+    }
+}
+
+/// Return the device-visible pointer for mapped pinned host memory.
+pub fn host_pinned_device_ptr(
+    backend: Backend,
+    ordinal: usize,
+    ptr: *mut c_void,
+) -> Result<NonNull<c_void>> {
+    if ptr.is_null() {
+        return Err(GpuError::InvalidArg(
+            "host_pinned_device_ptr: null host pointer".into(),
+        ));
+    }
+    match backend {
+        Backend::Cuda => with_device_impl(backend, ordinal, || {
+            #[cfg(supersonic_backend_cuda)]
+            {
+                let mut device_ptr = std::ptr::null_mut();
+                let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
+                if status != 0 {
+                    return Err(cuda_error("cudaHostGetDevicePointer", status));
+                }
+                NonNull::new(device_ptr)
+                    .ok_or_else(|| GpuError::Cuda("cudaHostGetDevicePointer returned null".into()))
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+        }),
+        Backend::Hip | Backend::Metal => NonNull::new(ptr)
+            .ok_or_else(|| GpuError::InvalidArg("host_pinned_device_ptr returned null".into())),
+    }
+}
+
+/// Free host memory allocated by `alloc_host_pinned`.
+pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_bytes: usize) {
+    if ptr.is_null() {
+        return;
+    }
+    match backend {
+        Backend::Cuda => {
+            let _ = with_device_impl(backend, ordinal, || {
+                #[cfg(supersonic_backend_cuda)]
+                {
+                    let status = unsafe { cudaFreeHost(ptr) };
+                    if status != 0 {
+                        return Err(cuda_error("cudaFreeHost", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_cuda))]
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            });
+        }
+        Backend::Hip => {
+            let _: Result<()> = with_device_impl(backend, ordinal, || {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipHostFree(ptr) };
+                    if status != 0 {
+                        return Err(hip_error("hipHostFree", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            });
+        }
+        Backend::Metal => {
+            if let Ok(layout) = Layout::from_size_align(len_bytes, 64) {
+                unsafe { dealloc(ptr as *mut u8, layout) };
+            }
+        }
+    }
 }
 
 /// Allocate `len_bytes` of device memory, zeroed.

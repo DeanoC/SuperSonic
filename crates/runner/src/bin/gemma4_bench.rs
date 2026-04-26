@@ -19,12 +19,12 @@ use std::ffi::{c_int, c_void};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
+use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use clap::Parser;
-use ::gemma4::config::{self as g4_config, AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use gpu_hal::{GpuBuffer, GpuEvent, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
@@ -68,7 +68,12 @@ fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 fn upload_bf16(shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);
-    Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bytes)?)
+    Ok(GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        shape,
+        &bytes,
+    )?)
 }
 
 struct UnbakedLoader {
@@ -98,8 +103,8 @@ impl UnbakedLoader {
             let mut shards = Vec::with_capacity(shard_files.len());
             for filename in &shard_files {
                 let path = dir.join(filename);
-                let file = File::open(&path)
-                    .with_context(|| format!("open shard {}", path.display()))?;
+                let file =
+                    File::open(&path).with_context(|| format!("open shard {}", path.display()))?;
                 shards.push(unsafe { Mmap::map(&file)? });
             }
             let mut index = std::collections::BTreeMap::new();
@@ -115,15 +120,17 @@ impl UnbakedLoader {
             if !single.exists() {
                 bail!("no safetensors found in {}", dir.display());
             }
-            let file = File::open(&single)
-                .with_context(|| format!("open {}", single.display()))?;
+            let file = File::open(&single).with_context(|| format!("open {}", single.display()))?;
             let mmap = unsafe { Mmap::map(&file)? };
             let st = SafeTensors::deserialize(&mmap)?;
             let mut index = std::collections::BTreeMap::new();
             for name in st.names() {
                 index.insert(name.to_string(), 0);
             }
-            Ok(Self { shards: vec![mmap], index })
+            Ok(Self {
+                shards: vec![mmap],
+                index,
+            })
         }
     }
 
@@ -142,7 +149,12 @@ impl UnbakedLoader {
 
     fn load_bf16_to_gpu(&self, name: &str) -> Result<GpuBuffer> {
         let (shape, bytes) = self.tensor_bytes(name)?;
-        Ok(GpuBuffer::from_host_bytes(0, ScalarType::BF16, &shape, bytes)?)
+        Ok(GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::BF16,
+            &shape,
+            bytes,
+        )?)
     }
 }
 
@@ -387,14 +399,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     gpu_hal::set_device(0).map_err(|e| anyhow!("set_device: {e}"))?;
 
-    let config: Config = g4_config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow!("load_config: {e}"))?;
+    let config: Config =
+        g4_config::load_config(&cli.model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
     let tcfg: &TextConfig = &config.text_config;
 
     let oracle_bytes = std::fs::read(&cli.oracle_json)
         .with_context(|| format!("read {}", cli.oracle_json.display()))?;
-    let oracle: OracleOutput = serde_json::from_slice(&oracle_bytes)
-        .context("parse oracle JSON")?;
+    let oracle: OracleOutput =
+        serde_json::from_slice(&oracle_bytes).context("parse oracle JSON")?;
     let prompt_token_ids = oracle
         .prompt_token_ids
         .as_ref()
@@ -437,20 +449,23 @@ fn main() -> Result<()> {
     // Per-step PLI inputs are precomputed once (using the last prompt token)
     // so the bench loop can reuse the same BF16 buffer for every iteration —
     // the forward-pass timing excludes PLE recompute by design.
-    let per_layer_model_projection_w =
-        loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_model_projection.weight"))?;
+    let per_layer_model_projection_w = loader.load_bf16_to_gpu(&format!(
+        "{weight_prefix}.per_layer_model_projection.weight"
+    ))?;
     let per_layer_projection_norm_w =
         loader.load_bf16_to_gpu(&format!("{weight_prefix}.per_layer_projection_norm.weight"))?;
     let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
 
     let pli_bytes = compute_per_layer_inputs(
-        &loader, weight_prefix, tcfg, last_token_id,
-        &per_layer_model_projection_w, &per_layer_projection_norm_w,
+        &loader,
+        weight_prefix,
+        tcfg,
+        last_token_id,
+        &per_layer_model_projection_w,
+        &per_layer_projection_norm_w,
         &mut counter,
     )?;
-    let pli_gpu = GpuBuffer::from_host_bytes(
-        0, dtype, &[num_layers, ple_hidden], &pli_bytes,
-    )?;
+    let pli_gpu = GpuBuffer::from_host_bytes(0, dtype, &[num_layers, ple_hidden], &pli_bytes)?;
 
     // Pre-upload the initial hidden BF16 vector (scaled embed of the last
     // prompt token). The bench loop uploads a fresh copy into `h_running`
@@ -472,7 +487,10 @@ fn main() -> Result<()> {
     let (scos_h, ssin_h) =
         build_sliding_rope_table(sliding_head_dim, sliding_rope.rope_theta, max_t);
     let (fcos_h, fsin_h) = build_proportional_rope_table(
-        full_head_dim, full_rope.rope_theta, full_rope.partial_rotary_factor, max_t,
+        full_head_dim,
+        full_rope.rope_theta,
+        full_rope.partial_rotary_factor,
+        max_t,
     );
     let sliding_cos = upload_bf16(&[max_t, sliding_head_dim], &scos_h)?;
     let sliding_sin = upload_bf16(&[max_t, sliding_head_dim], &ssin_h)?;
@@ -500,11 +518,21 @@ fn main() -> Result<()> {
             let v_bytes = B64.decode(&kv.v).context("decode kv.v")?;
             let positions_to_copy = prompt_tokens.saturating_sub(1);
             let kc = seed_kv_cache_from_oracle(
-                &k_bytes, &kv.k_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+                &k_bytes,
+                &kv.k_shape,
+                num_kv_heads,
+                prompt_tokens,
+                w.head_dim,
+                max_t,
                 positions_to_copy,
             )?;
             let vc = seed_kv_cache_from_oracle(
-                &v_bytes, &kv.v_shape, num_kv_heads, prompt_tokens, w.head_dim, max_t,
+                &v_bytes,
+                &kv.v_shape,
+                num_kv_heads,
+                prompt_tokens,
+                w.head_dim,
+                max_t,
                 positions_to_copy,
             )?;
             k_caches.push(kc);
@@ -517,18 +545,20 @@ fn main() -> Result<()> {
     let (mut fused_k_caches, mut fused_v_caches) = seed_all_caches(true)?;
 
     let fused_ws_elems = g4::fused_attn_block_workspace_elems(
-        hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        full_head_dim,
+        max_t,
     );
     let mut fused_attn_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[fused_ws_elems])?;
     let max_intermediate = (0..num_layers)
         .map(|l| g4_spec::mlp_intermediate(tcfg, l))
         .max()
         .unwrap_or(tcfg.intermediate_size);
-    let fused_mlp_ws_elems = g4::fused_mlp_ple_workspace_elems(
-        hidden_size, max_intermediate, ple_hidden,
-    );
-    let mut fused_mlp_workspace =
-        GpuBuffer::zeros(0, ScalarType::F32, &[fused_mlp_ws_elems])?;
+    let fused_mlp_ws_elems =
+        g4::fused_mlp_ple_workspace_elems(hidden_size, max_intermediate, ple_hidden);
+    let mut fused_mlp_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[fused_mlp_ws_elems])?;
     let mut fused_matvec_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut fused_barrier_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
     let mut fused_barrier_flag = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
@@ -540,8 +570,13 @@ fn main() -> Result<()> {
     let (mega_k_caches, mega_v_caches) = seed_all_caches(false)?;
 
     let mega_ws_elems = g4::persistent_decode_workspace_elems(
-        hidden_size, num_q_heads, num_kv_heads, full_head_dim, max_t,
-        max_intermediate, ple_hidden,
+        hidden_size,
+        num_q_heads,
+        num_kv_heads,
+        full_head_dim,
+        max_t,
+        max_intermediate,
+        ple_hidden,
     );
     let mut mega_workspace = GpuBuffer::zeros(0, ScalarType::F32, &[mega_ws_elems])?;
     let mut mega_matvec_counter = GpuBuffer::zeros(0, ScalarType::U32, &[1])?;
@@ -570,9 +605,21 @@ fn main() -> Result<()> {
         let k_buf = &mega_k_caches[src_idx];
         let v_buf = &mega_v_caches[src_idx];
 
-        let k_proj_ptr = w.k_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-        let v_proj_ptr = w.v_proj.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
-        let k_norm_ptr = w.k_norm.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let k_proj_ptr = w
+            .k_proj
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let v_proj_ptr = w
+            .v_proj
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let k_norm_ptr = w
+            .k_norm
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null());
 
         descs.push(Gemma4DecodeLayerDesc {
             layer_type: kind_code,
@@ -613,13 +660,10 @@ fn main() -> Result<()> {
             descs.len() * std::mem::size_of::<Gemma4DecodeLayerDesc>(),
         )
     };
-    let layers_gpu = GpuBuffer::from_host_bytes(
-        0, ScalarType::U8, &[desc_bytes.len()], desc_bytes,
-    )?;
+    let layers_gpu =
+        GpuBuffer::from_host_bytes(0, ScalarType::U8, &[desc_bytes.len()], desc_bytes)?;
 
-    let mut h_running = GpuBuffer::from_host_bytes(
-        0, dtype, &[hidden_size], &h_in_bf16,
-    )?;
+    let mut h_running = GpuBuffer::from_host_bytes(0, dtype, &[hidden_size], &h_in_bf16)?;
 
     println!(
         "[cfg] prompt_tokens={prompt_tokens} last_token_id={last_token_id} \
@@ -632,15 +676,15 @@ fn main() -> Result<()> {
     // shared-KV slot replication via copy_kv_slot, plus PLI slice D2D copy.
     // -------------------------------------------------------------------
     let fused_forward = |h_in: &mut GpuBuffer,
-                        pos: usize,
-                        k_caches: &mut [GpuBuffer],
-                        v_caches: &mut [GpuBuffer],
-                        attn_ws: &mut GpuBuffer,
-                        mlp_ws: &mut GpuBuffer,
-                        mv_counter: &mut GpuBuffer,
-                        bar_counter: &mut GpuBuffer,
-                        bar_flag: &mut GpuBuffer,
-                        pli_slot: &mut GpuBuffer|
+                         pos: usize,
+                         k_caches: &mut [GpuBuffer],
+                         v_caches: &mut [GpuBuffer],
+                         attn_ws: &mut GpuBuffer,
+                         mlp_ws: &mut GpuBuffer,
+                         mv_counter: &mut GpuBuffer,
+                         bar_counter: &mut GpuBuffer,
+                         bar_flag: &mut GpuBuffer,
+                         pli_slot: &mut GpuBuffer|
      -> Result<()> {
         let mut h_running_local = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
         // Copy h_in → h_running_local so each iteration starts from the
@@ -665,24 +709,37 @@ fn main() -> Result<()> {
             };
             let mut h_mid = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
             g4::fused_attn_block(
-                0, dtype,
-                &h_running_local, &mut h_mid,
+                0,
+                dtype,
+                &h_running_local,
+                &mut h_mid,
                 &w.input_norm,
                 &w.q_proj,
-                w.k_proj.as_ref(), w.v_proj.as_ref(),
+                w.k_proj.as_ref(),
+                w.v_proj.as_ref(),
                 &w.q_norm,
                 w.k_norm.as_ref(),
                 &w.o_proj,
                 &w.post_attn_norm,
-                cos_table, sin_table,
-                &mut k_caches[layer_idx], &mut v_caches[layer_idx],
+                cos_table,
+                sin_table,
+                &mut k_caches[layer_idx],
+                &mut v_caches[layer_idx],
                 attn_ws,
                 mv_counter,
-                bar_counter, bar_flag,
-                hidden_size, num_q_heads, num_kv_heads, head_dim, head_dim,
-                sliding_window, pos, max_t,
+                bar_counter,
+                bar_flag,
+                hidden_size,
+                num_q_heads,
+                num_kv_heads,
+                head_dim,
+                head_dim,
+                sliding_window,
+                pos,
+                max_t,
                 w.shared_kv,
-                eps, 1.0f32,
+                eps,
+                1.0f32,
             )?;
 
             if !w.shared_kv {
@@ -690,36 +747,55 @@ fn main() -> Result<()> {
                     let s = &layers[shared_layer];
                     if s.shared_kv && s.kv_source == layer_idx {
                         let (lo, hi) = k_caches.split_at_mut(shared_layer);
-                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                        copy_kv_slot(
+                            &lo[layer_idx],
+                            &mut hi[0],
+                            num_kv_heads,
+                            max_t,
+                            head_dim,
+                            pos,
+                        )?;
                         let (lo, hi) = v_caches.split_at_mut(shared_layer);
-                        copy_kv_slot(&lo[layer_idx], &mut hi[0], num_kv_heads, max_t, head_dim, pos)?;
+                        copy_kv_slot(
+                            &lo[layer_idx],
+                            &mut hi[0],
+                            num_kv_heads,
+                            max_t,
+                            head_dim,
+                            pos,
+                        )?;
                     }
                 }
             }
 
             let pli_byte_off = layer_idx * ple_hidden * 2;
             let pli_slice_ptr = pli_gpu.offset_ptr(pli_byte_off);
-            gpu_hal::copy_d2d(
-                0,
-                pli_slot.as_mut_ptr(),
-                pli_slice_ptr,
-                ple_hidden * 2,
-            )?;
+            gpu_hal::copy_d2d(0, pli_slot.as_mut_ptr(), pli_slice_ptr, ple_hidden * 2)?;
 
             let mut h_new = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
             g4::fused_mlp_ple(
-                0, dtype,
-                &h_mid, &mut h_new,
+                0,
+                dtype,
+                &h_mid,
+                &mut h_new,
                 &w.pre_ff_norm,
-                &w.gate_proj, &w.up_proj, &w.down_proj, &w.post_ff_norm,
+                &w.gate_proj,
+                &w.up_proj,
+                &w.down_proj,
+                &w.post_ff_norm,
                 pli_slot,
-                &w.per_layer_input_gate_w, &w.per_layer_projection_w,
+                &w.per_layer_input_gate_w,
+                &w.per_layer_projection_w,
                 &w.post_per_layer_input_norm_w,
                 mlp_ws,
                 mv_counter,
-                bar_counter, bar_flag,
-                hidden_size, w.intermediate_size, ple_hidden,
-                eps, w.layer_scalar,
+                bar_counter,
+                bar_flag,
+                hidden_size,
+                w.intermediate_size,
+                ple_hidden,
+                eps,
+                w.layer_scalar,
             )?;
             h_running_local = h_new;
         }
@@ -737,11 +813,15 @@ fn main() -> Result<()> {
     let mut pos_cursor = prompt_tokens - 1;
     for _ in 0..warmup {
         fused_forward(
-            &mut h_running, pos_cursor,
-            &mut fused_k_caches, &mut fused_v_caches,
-            &mut fused_attn_workspace, &mut fused_mlp_workspace,
+            &mut h_running,
+            pos_cursor,
+            &mut fused_k_caches,
+            &mut fused_v_caches,
+            &mut fused_attn_workspace,
+            &mut fused_mlp_workspace,
             &mut fused_matvec_counter,
-            &mut fused_barrier_counter, &mut fused_barrier_flag,
+            &mut fused_barrier_counter,
+            &mut fused_barrier_flag,
             &mut fused_pli_slot,
         )?;
         pos_cursor += 1;
@@ -754,11 +834,15 @@ fn main() -> Result<()> {
     fused_start.record()?;
     for _ in 0..iters {
         fused_forward(
-            &mut h_running, pos_cursor,
-            &mut fused_k_caches, &mut fused_v_caches,
-            &mut fused_attn_workspace, &mut fused_mlp_workspace,
+            &mut h_running,
+            pos_cursor,
+            &mut fused_k_caches,
+            &mut fused_v_caches,
+            &mut fused_attn_workspace,
+            &mut fused_mlp_workspace,
             &mut fused_matvec_counter,
-            &mut fused_barrier_counter, &mut fused_barrier_flag,
+            &mut fused_barrier_counter,
+            &mut fused_barrier_flag,
             &mut fused_pli_slot,
         )?;
         pos_cursor += 1;
@@ -783,7 +867,8 @@ fn main() -> Result<()> {
             hidden_size * 2,
         )?;
         g4::persistent_decode(
-            0, dtype,
+            0,
+            dtype,
             &layers_gpu,
             h_io,
             &pli_gpu,
@@ -791,7 +876,12 @@ fn main() -> Result<()> {
             &mut mega_matvec_counter,
             &mut mega_barrier_counter,
             &mut mega_barrier_flag,
-            num_layers, hidden_size, ple_hidden, pos, eps, 1.0f32,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            pos,
+            eps,
+            1.0f32,
         )?;
         Ok(())
     };
@@ -824,17 +914,26 @@ fn main() -> Result<()> {
     println!("=== Gemma 4 E2B decode forward-pass benchmark ===");
     println!("iters={iters} warmup={warmup}");
     println!();
-    println!("fused-per-layer (35 × fused_attn_block + fused_mlp_ple + shared-KV D2D + PLI slice D2D):");
-    println!("  total = {:.3} ms   ms/tok = {:.3}   tokens/sec = {:.2}",
-             fused_total_ms, fused_ms_per_tok, fused_tok_per_s);
+    println!(
+        "fused-per-layer (35 × fused_attn_block + fused_mlp_ple + shared-KV D2D + PLI slice D2D):"
+    );
+    println!(
+        "  total = {:.3} ms   ms/tok = {:.3}   tokens/sec = {:.2}",
+        fused_total_ms, fused_ms_per_tok, fused_tok_per_s
+    );
     println!();
     println!("persistent megakernel (single persistent_decode launch):");
-    println!("  total = {:.3} ms   ms/tok = {:.3}   tokens/sec = {:.2}",
-             mega_total_ms, mega_ms_per_tok, mega_tok_per_s);
+    println!(
+        "  total = {:.3} ms   ms/tok = {:.3}   tokens/sec = {:.2}",
+        mega_total_ms, mega_ms_per_tok, mega_tok_per_s
+    );
     println!();
     let speedup = fused_ms_per_tok / mega_ms_per_tok;
-    println!("speedup (fused → mega): {:.3}x  ({:.3} ms/tok saved)",
-             speedup, fused_ms_per_tok - mega_ms_per_tok);
+    println!(
+        "speedup (fused → mega): {:.3}x  ({:.3} ms/tok saved)",
+        speedup,
+        fused_ms_per_tok - mega_ms_per_tok
+    );
 
     Ok(())
 }
@@ -868,8 +967,14 @@ fn compute_per_layer_inputs(
 
     let mut proj = GpuBuffer::zeros(0, dtype, &[total])?;
     g4::matvec(
-        0, dtype, &mut proj, &main_embed_gpu, per_layer_model_projection_w,
-        hidden_size, total, counter,
+        0,
+        dtype,
+        &mut proj,
+        &main_embed_gpu,
+        per_layer_model_projection_w,
+        hidden_size,
+        total,
+        counter,
     )?;
 
     let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
@@ -882,13 +987,20 @@ fn compute_per_layer_inputs(
     let proj_reshaped = upload_bf16(&[num_layers, ple_hidden], &proj_host)?;
     let mut proj_normed = GpuBuffer::zeros(0, dtype, &[num_layers, ple_hidden])?;
     g4::rms_norm_per_row(
-        0, dtype, &mut proj_normed, &proj_reshaped,
-        Some(per_layer_projection_norm_w), eps, num_layers, ple_hidden,
+        0,
+        dtype,
+        &mut proj_normed,
+        &proj_reshaped,
+        Some(per_layer_projection_norm_w),
+        eps,
+        num_layers,
+        ple_hidden,
     )?;
     let proj_normed_bytes = proj_normed.to_host_bytes()?;
     let proj_normed_host = bf16_bytes_to_f32(&proj_normed_bytes);
 
-    let (shape, bytes) = loader.tensor_bytes(&format!("{weight_prefix}.embed_tokens_per_layer.weight"))?;
+    let (shape, bytes) =
+        loader.tensor_bytes(&format!("{weight_prefix}.embed_tokens_per_layer.weight"))?;
     if shape.len() != 2 || shape[1] != total {
         bail!("embed_tokens_per_layer shape mismatch");
     }

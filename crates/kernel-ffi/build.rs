@@ -226,6 +226,11 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             "qwen35_prefill_helpers_cuda.o",
             "building prefill helpers CUDA bridge",
         ),
+        (
+            "certified_kv_bridge_cuda.cu",
+            "llama31_certified_kv_cuda.o",
+            "building Llama31 certified KV CUDA bridge",
+        ),
     ];
     let archs = detect_cuda_archs();
     println!(
@@ -328,6 +333,7 @@ fn main() {
         "full_attention_bridge_cuda.cu",
         "full_attention_bridge_4b_cuda.cu",
         "prefill_helpers_bridge_cuda.cu",
+        "certified_kv_bridge_cuda.cu",
     ] {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }

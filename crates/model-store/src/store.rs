@@ -21,8 +21,7 @@ unsafe impl Send for BakedStore {}
 unsafe impl Sync for BakedStore {}
 
 fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
-    ScalarType::from_name(name)
-        .ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
+    ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
 }
 
 impl BakedStore {
@@ -72,9 +71,8 @@ impl BakedStore {
         if end > self.data_len {
             return None;
         }
-        let slice = unsafe {
-            std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize)
-        };
+        let slice =
+            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
         Some(slice)
     }
 
@@ -95,7 +93,8 @@ impl BakedStore {
             )));
         }
 
-        let slice = unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
+        let slice =
+            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
         let dtype = parse_dtype(&meta.dtype)?;
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &meta.shape, slice)?;
         Ok(buf)

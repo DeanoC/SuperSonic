@@ -1,14 +1,26 @@
 /// Squeeze dimension 1 from a depthwise conv1d weight.
 /// Shape [C_out, 1, K] becomes [C_out, K]. Bytes are unchanged.
 pub fn squeeze_dim1(bytes: &[u8], shape: &[usize]) -> (Vec<u8>, Vec<usize>) {
-    assert_eq!(shape.len(), 3, "squeeze_dim1: expected 3D shape, got {shape:?}");
-    assert_eq!(shape[1], 1, "squeeze_dim1: middle dim must be 1, got {}", shape[1]);
+    assert_eq!(
+        shape.len(),
+        3,
+        "squeeze_dim1: expected 3D shape, got {shape:?}"
+    );
+    assert_eq!(
+        shape[1], 1,
+        "squeeze_dim1: middle dim must be 1, got {}",
+        shape[1]
+    );
     (bytes.to_vec(), vec![shape[0], shape[2]])
 }
 
 /// Reshape a 1D bias from [H] to [1, 1, H]. Bytes are unchanged.
 pub fn head_bias_reshape(bytes: &[u8], shape: &[usize]) -> (Vec<u8>, Vec<usize>) {
-    assert_eq!(shape.len(), 1, "head_bias_reshape: expected 1D shape, got {shape:?}");
+    assert_eq!(
+        shape.len(),
+        1,
+        "head_bias_reshape: expected 1D shape, got {shape:?}"
+    );
     (bytes.to_vec(), vec![1, 1, shape[0]])
 }
 
@@ -28,7 +40,11 @@ fn fp8_e4m3_to_f32(byte: u8) -> f32 {
         // Normal: 2^(exp-7) * (1 + mantissa/8)
         (1.0 + f32::from(mantissa) / 8.0) * (2.0f32).powi(exp as i32 - 7)
     };
-    if sign == 1 { -val } else { val }
+    if sign == 1 {
+        -val
+    } else {
+        val
+    }
 }
 
 /// Dequantize FP8 E4M3 weight to BF16 using block-wise scale_inv.
@@ -41,14 +57,30 @@ pub fn fp8_dequant_to_bf16(
     scale_shape: &[usize],
     block_size: usize,
 ) -> (Vec<u8>, Vec<usize>) {
-    assert_eq!(weight_shape.len(), 2, "fp8_dequant: expected 2D weight, got {weight_shape:?}");
-    assert_eq!(scale_shape.len(), 2, "fp8_dequant: expected 2D scale, got {scale_shape:?}");
+    assert_eq!(
+        weight_shape.len(),
+        2,
+        "fp8_dequant: expected 2D weight, got {weight_shape:?}"
+    );
+    assert_eq!(
+        scale_shape.len(),
+        2,
+        "fp8_dequant: expected 2D scale, got {scale_shape:?}"
+    );
     let rows = weight_shape[0];
     let cols = weight_shape[1];
     let scale_rows = scale_shape[0];
     let scale_cols = scale_shape[1];
-    assert_eq!(fp8_bytes.len(), rows * cols, "fp8_dequant: byte count mismatch");
-    assert_eq!(scale_inv_bytes.len(), scale_rows * scale_cols * 2, "fp8_dequant: scale byte count mismatch");
+    assert_eq!(
+        fp8_bytes.len(),
+        rows * cols,
+        "fp8_dequant: byte count mismatch"
+    );
+    assert_eq!(
+        scale_inv_bytes.len(),
+        scale_rows * scale_cols * 2,
+        "fp8_dequant: scale byte count mismatch"
+    );
 
     let mut out = Vec::with_capacity(rows * cols * 2); // BF16 = 2 bytes each
     for r in 0..rows {
@@ -81,7 +113,14 @@ pub fn split_qkv_proj(
     k_rows: usize,
     v_rows: usize,
     dtype_bytes: usize,
-) -> (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>) {
+) -> (
+    Vec<u8>,
+    Vec<usize>,
+    Vec<u8>,
+    Vec<usize>,
+    Vec<u8>,
+    Vec<usize>,
+) {
     assert_eq!(shape.len(), 2, "split_qkv_proj: expected 2D, got {shape:?}");
     assert_eq!(
         shape[0],
@@ -121,7 +160,11 @@ pub fn split_gate_up_proj(
     intermediate_size: usize,
     dtype_bytes: usize,
 ) -> (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>) {
-    assert_eq!(shape.len(), 2, "split_gate_up_proj: expected 2D, got {shape:?}");
+    assert_eq!(
+        shape.len(),
+        2,
+        "split_gate_up_proj: expected 2D, got {shape:?}"
+    );
     assert_eq!(
         shape[0],
         2 * intermediate_size,
@@ -219,7 +262,11 @@ mod split_tests {
 
 /// Transform A_log (F32) to exp(A_log) (BF16) and reshape [H] to [1, 1, H].
 pub fn a_log_to_exp_bf16(bytes: &[u8], shape: &[usize]) -> (Vec<u8>, Vec<usize>) {
-    assert_eq!(shape.len(), 1, "a_log_to_exp_bf16: expected 1D shape, got {shape:?}");
+    assert_eq!(
+        shape.len(),
+        1,
+        "a_log_to_exp_bf16: expected 1D shape, got {shape:?}"
+    );
     let out: Vec<u8> = bytes
         .chunks_exact(4)
         .flat_map(|b| {

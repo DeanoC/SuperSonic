@@ -13,10 +13,33 @@ use qwen35::rotary::RotaryTables;
 use qwen35::weights::{FullWeights, LayerKind, LayerWeights, Qwen35Weights};
 use serde::Deserialize;
 
-use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
+use crate::decode_engine::{CertifiedKvDecodeParams, DecodeEngine, DecodeStageTimings};
 use crate::oracle as oracle_mod;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::validate;
+
+fn certified_kv_decode_params(
+    cfg: &crate::certified_kv::CertifiedKvConfig,
+) -> CertifiedKvDecodeParams {
+    CertifiedKvDecodeParams {
+        block_size: cfg.block_size,
+        value_group_size: cfg.value_group_size,
+        bf16_values: cfg.bf16_values,
+        tau_cov: cfg.tau_cov,
+        k_min: cfg.k_min,
+        k_max: cfg.k_max,
+        v_tol: cfg.v_tol,
+        value_cache_blocks: cfg.value_cache_blocks,
+        ranking_r: cfg.ranking_r,
+        rung1_threshold: cfg.rung1_threshold,
+        rung1_multiplier: cfg.rung1_multiplier,
+        key_cache_blocks: cfg.key_cache_blocks,
+        delta_guard_factor: cfg.delta_guard_factor,
+        score_exploration_rate: cfg.score_exploration_rate,
+        require_certified_tail_bound: cfg.require_certified_tail_bound,
+        eps_guard: cfg.eps_guard,
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 struct Llama31RopeScaling {
@@ -111,8 +134,8 @@ fn build_rotary_tables(config: &Llama31Config, ordinal: usize) -> Result<RotaryT
         } else if wavelen < high_freq_wavelen {
             base_inv
         } else {
-            let smooth_factor =
-                (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor);
+            let smooth_factor = (old_context_len / wavelen - low_freq_factor)
+                / (high_freq_factor - low_freq_factor);
             let inv_freq_llama = base_inv;
             (1.0 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
         };
@@ -274,7 +297,11 @@ fn load_baked_weight_raw(store: &BakedStore, name: &str, ordinal: usize) -> Resu
         .map_err(|e| anyhow!("load {name}: {e}"))
 }
 
-fn load_baked_scb(store: &BakedStore, weight_name: &str, ordinal: usize) -> Result<Option<GpuBuffer>> {
+fn load_baked_scb(
+    store: &BakedStore,
+    weight_name: &str,
+    ordinal: usize,
+) -> Result<Option<GpuBuffer>> {
     let name = scb_name(weight_name);
     if !store.contains(&name) {
         return Ok(None);
@@ -335,9 +362,17 @@ fn load_baked_int8_weights(
             gate_proj_scale: None,
             up_proj_scale: None,
             down_proj_scale: None,
-            gate_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.gate_proj.weight"), ordinal)?,
+            gate_proj_int8_scale: load_baked_scb(
+                &store,
+                &format!("{mlp}.gate_proj.weight"),
+                ordinal,
+            )?,
             up_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.up_proj.weight"), ordinal)?,
-            down_proj_int8_scale: load_baked_scb(&store, &format!("{mlp}.down_proj.weight"), ordinal)?,
+            down_proj_int8_scale: load_baked_scb(
+                &store,
+                &format!("{mlp}.down_proj.weight"),
+                ordinal,
+            )?,
             gate_proj_int4_scale: None,
             gate_proj_int4_zero: None,
             up_proj_int4_scale: None,
@@ -395,7 +430,7 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         return;
     }
     eprintln!(
-        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} layer_compute={:.1} full_attn={:.1} full_attn_proj={:.1} full_attn_core={:.1} full_attn_out={:.1} linear={:.1} mlp={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
+        "[stage] tokens={} total_ms={:.1} per_tok_ms={:.1} layer_compute={:.1} full_attn={:.1} full_attn_proj={:.1} full_attn_core={:.1} cert_key_q={:.1} cert_val_q={:.1} cert_score={:.1} cert_selector={:.1} cert_gather={:.1} cert_score_check={:.1} cert_rank_log={:.1} cert_rank_cpu={:.1} cert_attend={:.1} cert_cast={:.1} full_attn_out={:.1} linear={:.1} mlp={:.1} rms_norm={:.1} lm_head={:.1} logits_d2h={:.1} host_sampling={:.1}",
         tokens,
         timings.total_ms(),
         timings.total_ms() / tokens as f64,
@@ -403,6 +438,16 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         timings.persistent_full_attn_ms,
         timings.persistent_full_attn_proj_ms,
         timings.persistent_full_attn_core_ms,
+        timings.certified_kv_key_quantize_ms,
+        timings.certified_kv_value_quantize_ms,
+        timings.certified_kv_score_ms,
+        timings.certified_kv_selector_ms,
+        timings.certified_kv_gather_ms,
+        timings.certified_kv_score_consistency_ms,
+        timings.certified_kv_rank_log_ms,
+        timings.certified_kv_ranking_cpu_ms,
+        timings.certified_kv_attend_ms,
+        timings.certified_kv_cast_ms,
         timings.persistent_full_attn_out_ms,
         timings.persistent_linear_core_ms,
         timings.persistent_mlp_down_ms,
@@ -411,6 +456,366 @@ fn print_stage_timings(timings: DecodeStageTimings, tokens: usize) {
         timings.logits_d2h_ms,
         timings.host_sampling_ms,
     );
+}
+
+fn target_nll_from_logits(logits: &[f32], target_token: u32) -> Result<f64> {
+    let target_idx = target_token as usize;
+    let target_logit = logits.get(target_idx).ok_or_else(|| {
+        anyhow!(
+            "target token {target_token} outside logits len {}",
+            logits.len()
+        )
+    })?;
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp = logits
+        .iter()
+        .map(|&x| ((x as f64) - max_logit).exp())
+        .sum::<f64>();
+    Ok(max_logit + sum_exp.ln() - *target_logit as f64)
+}
+
+fn run_llama31_teacher_forced(
+    cli: &crate::Cli,
+    model_variant: &ModelVariant,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    certified_kv_cfg: Option<&crate::certified_kv::CertifiedKvConfig>,
+) -> Result<()> {
+    if prompt_ids.len() < 2 {
+        bail!("--teacher-forced requires at least 2 prompt tokens");
+    }
+    if cli.validate || cli.gpu_validate {
+        bail!("--teacher-forced does not currently support --validate or --gpu-validate");
+    }
+    if cli.trace_prefill_layers
+        || cli.trace_oracle_prefill_layer.is_some()
+        || cli.certified_kv_trace_layer.is_some()
+        || cli.certified_kv_trace_all
+        || cli.certified_kv_shadow_validate
+    {
+        bail!("--teacher-forced does not support trace/debug validation flags yet");
+    }
+    let dense_prefix_len = cli.teacher_forced_dense_prefix_len.unwrap_or(0);
+    if dense_prefix_len > 0 {
+        if certified_kv_cfg.is_none() {
+            bail!("--teacher-forced-dense-prefix-len requires --certified-kv");
+        }
+        if dense_prefix_len >= prompt_ids.len() {
+            bail!(
+                "--teacher-forced-dense-prefix-len ({dense_prefix_len}) must be less than prompt token count ({})",
+                prompt_ids.len()
+            );
+        }
+    }
+
+    let score_start = Instant::now();
+    let prefill_start = Instant::now();
+    let use_gpu_prefill_scoring =
+        !cli.teacher_forced_decode_step && (certified_kv_cfg.is_none() || dense_prefix_len > 1);
+    let mut logits;
+    let mut total_nll = 0.0f64;
+    let mut scored_tokens = 0usize;
+    let mut skipped_boundary_tokens = 0usize;
+    let mut decode_loop_start = 1usize;
+
+    if use_gpu_prefill_scoring && certified_kv_cfg.is_none() {
+        let targets = &prompt_ids[1..];
+        let prefill = engine.prefill_native_with_target_nll(prompt_ids, 0, targets)?;
+        let scored = prefill
+            .target_nll
+            .as_ref()
+            .ok_or_else(|| anyhow!("scored prefill did not return target NLL"))?;
+        total_nll += scored.total_nll;
+        scored_tokens += scored.scored_tokens;
+        logits = prefill.logits;
+        decode_loop_start = prompt_ids.len();
+    } else if use_gpu_prefill_scoring && dense_prefix_len > 1 {
+        let prefix = &prompt_ids[..dense_prefix_len];
+        let targets = &prompt_ids[1..dense_prefix_len];
+        let prefill = engine.prefill_native_with_target_nll(prefix, 0, targets)?;
+        let scored = prefill
+            .target_nll
+            .as_ref()
+            .ok_or_else(|| anyhow!("scored prefix prefill did not return target NLL"))?;
+        total_nll += scored.total_nll;
+        scored_tokens += scored.scored_tokens;
+        logits = prefill.logits;
+        decode_loop_start = dense_prefix_len;
+    } else {
+        logits = engine.prefill_native(&prompt_ids[..1])?;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut decode_steps = 0usize;
+    let mut certified_decode_steps = 0usize;
+    let mut stage_totals = DecodeStageTimings::default();
+    let use_decode_target_nll =
+        *model_variant == ModelVariant::Llama3_1_8B && !cli.teacher_forced_decode_step;
+
+    let should_score = |target_idx: usize| {
+        dense_prefix_len == 0 || target_idx < dense_prefix_len || target_idx > dense_prefix_len
+    };
+
+    if use_decode_target_nll {
+        engine.reset_target_nll_accum()?;
+        if decode_loop_start < prompt_ids.len() {
+            if should_score(decode_loop_start) {
+                total_nll += target_nll_from_logits(&logits, prompt_ids[decode_loop_start])?;
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
+        }
+        for input_idx in decode_loop_start..prompt_ids.len().saturating_sub(1) {
+            let input_token = prompt_ids[input_idx];
+            let pos = input_idx;
+            let target_idx = input_idx + 1;
+            let target_token = prompt_ids[target_idx];
+            let use_certified_decode =
+                certified_kv_cfg.is_some() && (dense_prefix_len == 0 || pos >= dense_prefix_len);
+            let certified_params =
+                use_certified_decode.then(|| certified_kv_decode_params(certified_kv_cfg.unwrap()));
+            if use_certified_decode {
+                certified_decode_steps += 1;
+            }
+            let timings = if should_score(target_idx) {
+                engine.component_decode_step_4b_accumulate_target_nll(
+                    input_token,
+                    pos,
+                    target_token,
+                    certified_params,
+                    cli.emit_stage_timings,
+                )?
+            } else {
+                let (_nll, timings) = engine.component_decode_step_4b_target_nll(
+                    input_token,
+                    pos,
+                    target_token,
+                    certified_params,
+                    cli.emit_stage_timings,
+                )?;
+                timings
+            };
+            if cli.emit_stage_timings {
+                stage_totals.add_assign(timings);
+            }
+            if should_score(target_idx) {
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
+            decode_steps += 1;
+        }
+        total_nll += engine.read_target_nll_accum()? as f64;
+    } else {
+        for target_idx in decode_loop_start..prompt_ids.len() {
+            let score_token = should_score(target_idx);
+            if score_token {
+                total_nll += target_nll_from_logits(&logits, prompt_ids[target_idx])?;
+                scored_tokens += 1;
+            } else {
+                skipped_boundary_tokens += 1;
+            }
+            if target_idx + 1 < prompt_ids.len() {
+                let input_token = prompt_ids[target_idx];
+                let pos = target_idx;
+                let use_certified_decode = certified_kv_cfg.is_some()
+                    && (dense_prefix_len == 0 || pos >= dense_prefix_len);
+                logits = if use_certified_decode {
+                    let cfg = certified_kv_cfg.expect("checked above");
+                    certified_decode_steps += 1;
+                    if cli.emit_stage_timings {
+                        let (next_logits, timings) = engine
+                            .component_decode_step_4b_certified_kv_with_timings(
+                                input_token,
+                                pos,
+                                certified_kv_decode_params(cfg),
+                            )?;
+                        stage_totals.add_assign(timings);
+                        next_logits
+                    } else {
+                        engine.component_decode_step_4b_certified_kv(
+                            input_token,
+                            pos,
+                            certified_kv_decode_params(cfg),
+                        )?
+                    }
+                } else if cli.emit_stage_timings {
+                    let (next_logits, timings) =
+                        engine.decode_step_with_timings(input_token, pos)?;
+                    stage_totals.add_assign(timings);
+                    next_logits
+                } else {
+                    engine.decode_step(input_token, pos)?
+                };
+                decode_steps += 1;
+            }
+        }
+    }
+    if scored_tokens == 0 {
+        bail!("--teacher-forced scored zero tokens");
+    }
+
+    let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_nll = total_nll / scored_tokens as f64;
+    let perplexity = avg_nll.exp();
+    let bits_per_token = avg_nll / std::f64::consts::LN_2;
+    let ms_per_token = total_ms / scored_tokens as f64;
+    eprintln!(
+        "[teacher_forced] tokens={} scored_tokens={} skipped_boundary_tokens={} dense_prefix_len={} decode_steps={} certified_decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        prompt_ids.len(),
+        scored_tokens,
+        skipped_boundary_tokens,
+        dense_prefix_len,
+        decode_steps,
+        certified_decode_steps,
+        total_nll,
+        avg_nll,
+        perplexity,
+        bits_per_token,
+        prefill_ms,
+        total_ms,
+        ms_per_token,
+    );
+    println!(
+        "[teacher_forced_json] {}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": "cuda",
+            "model": model_variant.to_string(),
+            "mode": if certified_kv_cfg.is_some() { "certified_kv" } else { "dense" },
+            "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll" } else { "decode_step_logits" },
+            "prompt_tokens": prompt_ids.len(),
+            "scored_tokens": scored_tokens,
+            "skipped_boundary_tokens": skipped_boundary_tokens,
+            "dense_prefix_len": dense_prefix_len,
+            "decode_steps": decode_steps,
+            "certified_decode_steps": certified_decode_steps,
+            "total_nll": total_nll,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+            "bits_per_token": bits_per_token,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "ms_per_token": ms_per_token,
+        }))?
+    );
+    if cli.emit_stage_timings {
+        print_stage_timings(stage_totals, decode_steps);
+    }
+    if let Some(cfg) = certified_kv_cfg {
+        if let Some(path) = cfg.telemetry_path.as_ref() {
+            let memory_stats = engine.certified_kv_memory_stats(0);
+            let payload = serde_json::json!({
+                "backend": "cuda",
+                "model": model_variant.to_string(),
+                "mode": "certified_kv_teacher_forced",
+                "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll_prefix_plus_decode_suffix" } else { "decode_step_logits" },
+                "implementation_stage": "cuda_tier1_mapped_cpu_tier2_gpu_page_cache",
+                "tier1_storage": if cfg.bf16_values {
+                    "int8_keys_bf16_values"
+                } else {
+                    "int8_keys_int4_values"
+                },
+                "tier2_storage": "cpu_pinned_bf16_original_kv",
+                "paper_tier2_cpu_pinned": true,
+                "prompt_tokens": prompt_ids.len(),
+                "scored_tokens": scored_tokens,
+                "decode_steps": decode_steps,
+                "certified_decode_steps": certified_decode_steps,
+                "perplexity": perplexity,
+                "bits_per_token": bits_per_token,
+                "prefill_ms": prefill_ms,
+                "total_ms": total_ms,
+                "ms_per_token": ms_per_token,
+                "stage_total_ms": stage_totals.total_ms(),
+                "stage_persistent_ms": stage_totals.persistent_ms,
+                "stage_persistent_full_attn_ms": stage_totals.persistent_full_attn_ms,
+                "stage_persistent_full_attn_proj_ms": stage_totals.persistent_full_attn_proj_ms,
+                "stage_persistent_full_attn_core_ms": stage_totals.persistent_full_attn_core_ms,
+                "stage_persistent_full_attn_out_ms": stage_totals.persistent_full_attn_out_ms,
+                "stage_persistent_linear_core_ms": stage_totals.persistent_linear_core_ms,
+                "stage_persistent_mlp_down_ms": stage_totals.persistent_mlp_down_ms,
+                "stage_rms_norm_ms": stage_totals.rms_norm_ms,
+                "stage_lm_head_ms": stage_totals.lm_head_ms,
+                "stage_logits_d2h_ms": stage_totals.logits_d2h_ms,
+                "stage_host_sampling_ms": stage_totals.host_sampling_ms,
+                "certified_kv_key_quantize_ms": stage_totals.certified_kv_key_quantize_ms,
+                "certified_kv_value_quantize_ms": stage_totals.certified_kv_value_quantize_ms,
+                "certified_kv_score_ms": stage_totals.certified_kv_score_ms,
+                "certified_kv_selector_ms": stage_totals.certified_kv_selector_ms,
+                "certified_kv_gather_ms": stage_totals.certified_kv_gather_ms,
+                "certified_kv_score_consistency_ms": stage_totals.certified_kv_score_consistency_ms,
+                "certified_kv_rank_log_ms": stage_totals.certified_kv_rank_log_ms,
+                "certified_kv_ranking_cpu_ms": stage_totals.certified_kv_ranking_cpu_ms,
+                "certified_kv_attend_ms": stage_totals.certified_kv_attend_ms,
+                "certified_kv_cast_ms": stage_totals.certified_kv_cast_ms,
+                "certified_kv_value_escalation_heads": stage_totals.certified_kv_value_escalation_heads,
+                "certified_kv_ranking_fallback_heads": stage_totals.certified_kv_ranking_fallback_heads,
+                "certified_kv_dense_fallback_layers": stage_totals.certified_kv_dense_fallback_layers,
+                "certified_kv_promoted_key_h2d_bytes": stage_totals.certified_kv_promoted_key_h2d_bytes,
+                "certified_kv_promoted_value_h2d_bytes": stage_totals.certified_kv_promoted_value_h2d_bytes,
+                "certified_kv_promoted_key_cache_hits": stage_totals.certified_kv_promoted_key_cache_hits,
+                "certified_kv_promoted_key_cache_misses": stage_totals.certified_kv_promoted_key_cache_misses,
+                "certified_kv_promoted_key_cache_overflows": stage_totals.certified_kv_promoted_key_cache_overflows,
+                "certified_kv_promoted_value_cache_hits": stage_totals.certified_kv_promoted_value_cache_hits,
+                "certified_kv_promoted_value_cache_misses": stage_totals.certified_kv_promoted_value_cache_misses,
+                "certified_kv_promoted_value_cache_overflows": stage_totals.certified_kv_promoted_value_cache_overflows,
+                "certified_kv_ranking_prefix_cache_hits": stage_totals.certified_kv_ranking_prefix_cache_hits,
+                "certified_kv_ranking_prefix_cache_misses": stage_totals.certified_kv_ranking_prefix_cache_misses,
+                "certified_kv_ranking_prefix_h2d_bytes": stage_totals.certified_kv_ranking_prefix_h2d_bytes,
+                "certified_kv_ranking_prefix_reuse_bytes": stage_totals.certified_kv_ranking_prefix_reuse_bytes,
+                "certified_kv_e_key_max": stage_totals.certified_kv_e_key_max,
+                "certified_kv_e_val_max": stage_totals.certified_kv_e_val_max,
+                "certified_kv_bound_total_max": stage_totals.certified_kv_bound_total_max,
+                "certified_kv_delta_tail_max": stage_totals.certified_kv_delta_tail_max,
+                "certified_kv_vmax_max": stage_totals.certified_kv_vmax_max,
+                "certified_kv_true_tail_bound_max": stage_totals.certified_kv_true_tail_bound_max,
+                "certified_kv_uncertified_tail_heads": stage_totals.certified_kv_uncertified_tail_heads,
+                "certified_kv_score_consistency_violations": stage_totals.certified_kv_score_consistency_violations,
+                "memory_full_attention_layers": memory_stats.full_attention_layers,
+                "memory_tier1_compressed_vram_bytes": memory_stats.tier1_compressed_vram_bytes,
+                "memory_tier2_host_pinned_bytes": memory_stats.tier2_host_pinned_bytes,
+                "memory_tail_bf16_vram_bytes": memory_stats.tail_bf16_vram_bytes,
+                "memory_promoted_key_cache_vram_bytes": memory_stats.promoted_key_cache_vram_bytes,
+                "memory_promoted_value_cache_vram_bytes": memory_stats.promoted_value_cache_vram_bytes,
+                "memory_ranking_prefix_scratch_vram_bytes": memory_stats.ranking_prefix_scratch_vram_bytes,
+                "memory_dense_bf16_kv_vram_bytes": memory_stats.dense_bf16_kv_vram_bytes,
+                "memory_total_certified_vram_bytes": memory_stats.total_certified_vram_bytes(),
+                "block_size": cfg.block_size,
+                "value_group_size": cfg.value_group_size,
+                "value_mode": if cfg.bf16_values { "bf16" } else { "int4" },
+                "tau_cov": cfg.tau_cov,
+                "k_min": cfg.k_min,
+                "k_max": cfg.k_max,
+                "v_tol": cfg.v_tol,
+                "key_cache_blocks": cfg.key_cache_blocks,
+                "value_cache_blocks": cfg.value_cache_blocks,
+                "ranking_r": cfg.ranking_r,
+                "rung1_threshold": cfg.rung1_threshold,
+                "rung1_multiplier": cfg.rung1_multiplier,
+                "delta_guard_factor": cfg.delta_guard_factor,
+                "score_exploration_rate": cfg.score_exploration_rate,
+                "require_certified_tail_bound": cfg.require_certified_tail_bound,
+                "eps_guard": cfg.eps_guard,
+            });
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("create certified KV telemetry dir {}", parent.display())
+                    })?;
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open certified KV telemetry {}", path.display()))?;
+            use std::io::Write as _;
+            writeln!(file, "{payload}")
+                .with_context(|| format!("write certified KV telemetry {}", path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 pub fn run_llama31(
@@ -434,6 +839,11 @@ pub fn run_llama31(
     if cli.fp8_runtime || cli.int4 || cli.kv_fp8 {
         bail!("Llama 3.1 CUDA path does not support --fp8-runtime, --int4, or --kv-fp8");
     }
+    let certified_kv_cfg = if cli.certified_kv {
+        Some(crate::certified_kv::CertifiedKvConfig::from_cli(cli)?)
+    } else {
+        None
+    };
     if cli.int8 && cli.no_bake {
         bail!("--int8 requires the baked path; drop --no-bake");
     }
@@ -458,21 +868,26 @@ pub fn run_llama31(
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), true)
+        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     if prompt_ids.is_empty() {
         bail!("empty prompt after tokenization");
     }
 
+    let reserve_tokens = if cli.teacher_forced {
+        0
+    } else {
+        cli.max_new_tokens
+    };
     let context_tokens = cli
         .context_size
-        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
-    if context_tokens < prompt_ids.len() + cli.max_new_tokens {
+        .unwrap_or(prompt_ids.len() + reserve_tokens);
+    if context_tokens < prompt_ids.len() + reserve_tokens {
         bail!(
             "--context-size {context_tokens} < prompt_tokens {} + max_new_tokens {}",
             prompt_ids.len(),
-            cli.max_new_tokens,
+            reserve_tokens,
         );
     }
 
@@ -552,9 +967,14 @@ pub fn run_llama31(
             let bake_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(|p| p.parent())
-                .ok_or_else(|| anyhow!("could not derive bake script path from CARGO_MANIFEST_DIR"))?
+                .ok_or_else(|| {
+                    anyhow!("could not derive bake script path from CARGO_MANIFEST_DIR")
+                })?
                 .join("oracle/bake_int8_llama31.py");
-            eprintln!("[weights] baking local INT8 package at {}", bake_dir.display());
+            eprintln!(
+                "[weights] baking local INT8 package at {}",
+                bake_dir.display()
+            );
             let output = Command::new("python3")
                 .arg(&bake_script)
                 .arg("--model-dir")
@@ -574,10 +994,13 @@ pub fn run_llama31(
                 );
             }
         }
-        eprintln!("[weights] loading baked INT8 package {}", bake_dir.display());
+        eprintln!(
+            "[weights] loading baked INT8 package {}",
+            bake_dir.display()
+        );
         let store = Arc::new(
             BakedStore::open(&bake_dir)
-                .map_err(|e| anyhow!("open INT8 bake {}: {e}", bake_dir.display()))?
+                .map_err(|e| anyhow!("open INT8 bake {}: {e}", bake_dir.display()))?,
         );
         load_baked_int8_weights(
             &cli.model_dir,
@@ -615,6 +1038,29 @@ pub fn run_llama31(
         false,
         1,
     )?;
+    engine.set_decode_context_limit(context_tokens);
+    if let Some(cfg) = &certified_kv_cfg {
+        eprintln!("[certified-kv] {}", cfg.summary());
+        if cfg.bf16_values {
+            eprintln!(
+                "[certified-kv] decode uses experimental INT8-key/BF16-value CUDA attention for full-attention layers"
+            );
+        } else {
+            eprintln!(
+                "[certified-kv] decode uses experimental INT8-key/INT4-value CUDA attention for full-attention layers"
+            );
+        }
+    }
+
+    if cli.teacher_forced {
+        return run_llama31_teacher_forced(
+            cli,
+            model_variant,
+            &mut engine,
+            &prompt_ids,
+            certified_kv_cfg.as_ref(),
+        );
+    }
 
     let prefill_start = Instant::now();
     let prefill = if cli.trace_prefill_layers {
@@ -635,6 +1081,53 @@ pub fn run_llama31(
         prompt_ids.len(),
         prefill_start.elapsed().as_millis()
     );
+    let certified_kv_shadow_stats = if let Some(cfg) = &certified_kv_cfg {
+        if cli.certified_kv_shadow_validate {
+            let stats = engine.certified_kv_shadow_quantize_probe(
+                cfg.block_size,
+                cfg.value_group_size,
+                cfg.tau_cov,
+                cfg.k_min,
+                cfg.k_max,
+                cfg.v_tol,
+                cfg.rung1_threshold,
+                cfg.rung1_multiplier,
+            )?;
+            let selector_mean_k = if stats.selector_heads == 0 {
+                0.0
+            } else {
+                stats.selector_selected_blocks as f32 / stats.selector_heads as f32
+            };
+            eprintln!(
+                "[certified-kv-shadow] layers={} aligned_tokens={} tier1_bytes={} quantize_ms={:.3} max_value_error={:.6} score_layers={} score_ms={:.3} max_score_ref_delta={:.6} selector_heads={} selector_mean_k={:.2} selector_max_tail_mass={:.6} selector_rung1_heads={} value_bound_max={:.6} value_escalation_blocks={} attend_layers={} attend_ms={:.3} attend_max_abs={:.6} attend_ref_max_delta={:.6} attend_bf16_value_ms={:.3} attend_bf16_value_ref_max_delta={:.6}",
+                stats.layers,
+                stats.aligned_tokens,
+                stats.compressed_vram_bytes,
+                stats.quantize_ms,
+                stats.max_value_error,
+                stats.score_layers,
+                stats.score_ms,
+                stats.max_score_ref_delta,
+                stats.selector_heads,
+                selector_mean_k,
+                stats.selector_max_tail_mass,
+                stats.selector_rung1_heads,
+                stats.value_bound_max,
+                stats.value_escalation_blocks,
+                stats.attend_layers,
+                stats.attend_ms,
+                stats.attend_max_abs,
+                stats.attend_ref_max_delta,
+                stats.attend_bf16_value_ms,
+                stats.attend_bf16_value_ref_max_delta,
+            );
+            Some(stats)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if gpu_validate_enabled {
         eprintln!("[gpu-validate] replaying decode steps through GPU prefill reference");
     }
@@ -651,9 +1144,7 @@ pub fn run_llama31(
             }
             _ => String::new(),
         };
-        eprintln!(
-            "[validate] prefill delta={delta:.4} rust_next={next_token}{mismatch}"
-        );
+        eprintln!("[validate] prefill delta={delta:.4} rust_next={next_token}{mismatch}");
 
         if let (Some(native_final_norm_trace), Some(oracle_final_norm_b64)) = (
             prefill.final_norm_trace.as_deref(),
@@ -701,9 +1192,35 @@ pub fn run_llama31(
     }
     while generated.len() < cli.max_new_tokens && !eos_ids.contains(&next_token) {
         let pos = prompt_ids.len() + generated.len() - 1;
-        let (native_next, logits_for_validation) = if cuda_fast_greedy_enabled {
-            let (token, timings) =
-                engine.component_decode_step_4b_cuda_fast_greedy(next_token, pos, cli.emit_stage_timings)?;
+        let certified_decode_cfg = certified_kv_cfg.as_ref();
+        let (native_next, logits_for_validation) = if let Some(cfg) = certified_decode_cfg {
+            if cuda_fast_greedy_enabled {
+                let (token, timings) = engine
+                    .component_decode_step_4b_certified_kv_cuda_fast_greedy(
+                        next_token,
+                        pos,
+                        certified_kv_decode_params(cfg),
+                        cli.emit_stage_timings,
+                    )?;
+                if cli.emit_stage_timings {
+                    stage_totals.add_assign(timings);
+                }
+                (token, None)
+            } else {
+                let logits = engine.component_decode_step_4b_certified_kv(
+                    next_token,
+                    pos,
+                    certified_kv_decode_params(cfg),
+                )?;
+                let native_next = DecodeEngine::greedy_sample(&logits);
+                (native_next, Some(logits))
+            }
+        } else if cuda_fast_greedy_enabled {
+            let (token, timings) = engine.component_decode_step_4b_cuda_fast_greedy(
+                next_token,
+                pos,
+                cli.emit_stage_timings,
+            )?;
             if cli.emit_stage_timings {
                 stage_totals.add_assign(timings);
             }
@@ -720,9 +1237,9 @@ pub fn run_llama31(
             (native_next, Some(logits))
         };
         if let Some(ref oracle) = oracle_output {
-            let logits = logits_for_validation
-                .as_ref()
-                .ok_or_else(|| anyhow!("validation requires logits; fast greedy should be disabled"))?;
+            let logits = logits_for_validation.as_ref().ok_or_else(|| {
+                anyhow!("validation requires logits; fast greedy should be disabled")
+            })?;
             let decode_idx = generated.len() - 1;
             if let Some(oracle_logits) = oracle.decode_logits.get(decode_idx) {
                 let delta = validate::max_abs_delta(&logits, oracle_logits);
@@ -757,15 +1274,19 @@ pub fn run_llama31(
                 cli.prefill_chunk_size,
                 true,
             )?;
-            let logits = logits_for_validation
-                .as_ref()
-                .ok_or_else(|| anyhow!("GPU validation requires logits; fast greedy should be disabled"))?;
+            let logits = logits_for_validation.as_ref().ok_or_else(|| {
+                anyhow!("GPU validation requires logits; fast greedy should be disabled")
+            })?;
             let delta = validate::max_abs_delta(&logits, &gpu_logits);
             if delta > gpu_max_delta {
                 gpu_max_delta = delta;
             }
             let gpu_next = DecodeEngine::greedy_sample(&gpu_logits);
-            let mismatch = if gpu_next == native_next { "" } else { " MISMATCH" };
+            let mismatch = if gpu_next == native_next {
+                ""
+            } else {
+                " MISMATCH"
+            };
             eprintln!(
                 "[gpu-validate] step={} pos={} input_tok={} delta={delta:.4} native_next={} gpu_next={}{}",
                 generated.len() - 1,
@@ -810,17 +1331,23 @@ pub fn run_llama31(
                         .layer_attn_trace
                         .as_ref()
                         .and_then(|layers| layers.get(layer_idx))
-                        .ok_or_else(|| anyhow!("internal: missing replay attn trace for layer {layer_idx}"))?;
+                        .ok_or_else(|| {
+                            anyhow!("internal: missing replay attn trace for layer {layer_idx}")
+                        })?;
                     let replay_post = replay
                         .layer_post_attn_norm_trace
                         .as_ref()
                         .and_then(|layers| layers.get(layer_idx))
-                        .ok_or_else(|| anyhow!("internal: missing replay post trace for layer {layer_idx}"))?;
+                        .ok_or_else(|| {
+                            anyhow!("internal: missing replay post trace for layer {layer_idx}")
+                        })?;
                     let replay_mlp = replay
                         .layer_mlp_out_trace
                         .as_ref()
                         .and_then(|layers| layers.get(layer_idx))
-                        .ok_or_else(|| anyhow!("internal: missing replay mlp trace for layer {layer_idx}"))?;
+                        .ok_or_else(|| {
+                            anyhow!("internal: missing replay mlp trace for layer {layer_idx}")
+                        })?;
                     engine.rebuild_prefill_state(prefix_token_ids, false)?;
                     let (_trace_logits, layer_trace) =
                         engine.component_decode_step_4b_trace_layer(next_token, pos, layer_idx)?;
@@ -850,20 +1377,26 @@ pub fn run_llama31(
                             .layer_attn_trace
                             .as_ref()
                             .and_then(|layers| layers.get(prev_idx))
-                            .ok_or_else(|| anyhow!("internal: missing replay attn trace for layer {prev_idx}"))?;
+                            .ok_or_else(|| {
+                                anyhow!("internal: missing replay attn trace for layer {prev_idx}")
+                            })?;
                         let replay_prev_post = replay
                             .layer_post_attn_norm_trace
                             .as_ref()
                             .and_then(|layers| layers.get(prev_idx))
-                            .ok_or_else(|| anyhow!("internal: missing replay post trace for layer {prev_idx}"))?;
+                            .ok_or_else(|| {
+                                anyhow!("internal: missing replay post trace for layer {prev_idx}")
+                            })?;
                         let replay_prev_mlp = replay
                             .layer_mlp_out_trace
                             .as_ref()
                             .and_then(|layers| layers.get(prev_idx))
-                            .ok_or_else(|| anyhow!("internal: missing replay mlp trace for layer {prev_idx}"))?;
+                            .ok_or_else(|| {
+                                anyhow!("internal: missing replay mlp trace for layer {prev_idx}")
+                            })?;
                         engine.rebuild_prefill_state(prefix_token_ids, false)?;
-                        let (_prev_logits, prev_trace) =
-                            engine.component_decode_step_4b_trace_layer(next_token, pos, prev_idx)?;
+                        let (_prev_logits, prev_trace) = engine
+                            .component_decode_step_4b_trace_layer(next_token, pos, prev_idx)?;
                         let prev_attn_delta = validate::max_abs_delta(
                             &decode_bf16_le(&prev_trace.attn_hidden),
                             &decode_bf16_le(replay_prev_attn),
@@ -896,16 +1429,16 @@ pub fn run_llama31(
                         );
                         engine.rebuild_prefill_state(prefix_token_ids, false)?;
                         engine.set_hidden_from_bytes(&native_input_hidden)?;
-                        let native_stage = engine.component_trace_full_attention_from_current_hidden_with_seqlen(
-                            layer_idx,
-                            pos,
-                        )?;
+                        let native_stage = engine
+                            .component_trace_full_attention_from_current_hidden_with_seqlen(
+                                layer_idx, pos,
+                            )?;
                         engine.rebuild_prefill_state(prefix_token_ids, false)?;
                         engine.set_hidden_from_bytes(replay_input_hidden)?;
-                        let replay_stage = engine.component_trace_full_attention_from_current_hidden_with_seqlen(
-                            layer_idx,
-                            pos,
-                        )?;
+                        let replay_stage = engine
+                            .component_trace_full_attention_from_current_hidden_with_seqlen(
+                                layer_idx, pos,
+                            )?;
                         let q_proj_delta = validate::max_abs_delta(
                             &decode_bf16_le(&native_stage.q_proj),
                             &decode_bf16_le(&replay_stage.q_proj),
@@ -954,8 +1487,8 @@ pub fn run_llama31(
                         if engine.weights().config.is_full_attention(prev_idx) && prev_idx > 0 {
                             let replay_prev_input_hidden = &replay_hidden[prev_idx - 1];
                             engine.rebuild_prefill_state(prefix_token_ids, false)?;
-                            let (_prev_stage_logits, prev_input_hidden) =
-                                engine.component_decode_step_4b_traced(next_token, pos, prev_idx)?;
+                            let (_prev_stage_logits, prev_input_hidden) = engine
+                                .component_decode_step_4b_traced(next_token, pos, prev_idx)?;
                             let prev_input_delta = validate::max_abs_delta(
                                 &decode_bf16_le(&prev_input_hidden),
                                 &decode_bf16_le(replay_prev_input_hidden),
@@ -1021,7 +1554,16 @@ pub fn run_llama31(
     let text = tokenizer
         .decode(&all_ids, true)
         .map_err(|e| anyhow!("detokenize: {e}"))?;
+    let generated_text = tokenizer
+        .decode(&generated, true)
+        .map_err(|e| anyhow!("detokenize generated suffix: {e}"))?;
     println!("{text}");
+    if cli.emit_generated_json {
+        println!(
+            "[generated_json] {}",
+            serde_json::to_string(&generated_text)?
+        );
+    }
     println!(
         "[tokens] {}",
         generated
@@ -1042,9 +1584,7 @@ pub fn run_llama31(
         generated.len(),
     );
     if oracle_output.is_some() {
-        eprintln!(
-            "[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}"
-        );
+        eprintln!("[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}");
     }
     if gpu_validate_enabled {
         eprintln!("[gpu-validate] max_delta={gpu_max_delta:.4}");
@@ -1052,12 +1592,322 @@ pub fn run_llama31(
     if cli.emit_stage_timings {
         print_stage_timings(stage_totals, generated.len().saturating_sub(1));
     }
+    if let Some(cfg) = &certified_kv_cfg {
+        if cli.certified_kv_trace_all {
+            trace_llama31_certified_kv_all_layers(&mut engine, &prompt_ids, cfg)?;
+        } else if let Some(trace_layer) = cli.certified_kv_trace_layer {
+            trace_llama31_certified_kv_layer(&mut engine, &prompt_ids, trace_layer, cfg)?;
+        }
+    }
+    if let Some(cfg) = &certified_kv_cfg {
+        if let Some(path) = cfg.telemetry_path.as_ref() {
+            let live_mode = if cfg.bf16_values {
+                "certified_kv_cuda_int8_key_bf16_value_host_tier2"
+            } else {
+                "certified_kv_cuda_mixed_key_int4_value_host_tier2"
+            };
+            let memory_stats = engine.certified_kv_memory_stats(0);
+            let ranking_prefix_cache_total = stage_totals.certified_kv_ranking_prefix_cache_hits
+                + stage_totals.certified_kv_ranking_prefix_cache_misses;
+            let ranking_prefix_cache_hit_rate = if ranking_prefix_cache_total == 0 {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!(
+                    stage_totals.certified_kv_ranking_prefix_cache_hits as f64
+                        / ranking_prefix_cache_total as f64
+                )
+            };
+            let payload = serde_json::json!({
+                "backend": "cuda",
+                "model": model_variant.to_string(),
+                "mode": live_mode,
+                "implementation_stage": "cuda_tier1_mapped_cpu_tier2_gpu_page_cache",
+                "tier1_storage": if cfg.bf16_values {
+                    "int8_keys_bf16_values"
+                } else {
+                    "int8_keys_int4_values"
+                },
+                "tier2_storage": "cpu_pinned_bf16_original_kv",
+                "paper_tier2_cpu_pinned": true,
+                "promoted_key_pagein": !cfg.bf16_values,
+                "promoted_key_scratch": if cfg.bf16_values { "none" } else { "bounded_per_query_head_page_cache" },
+                "adaptive_key_promotion_decode": !cfg.bf16_values,
+                "value_escalation_decode": stage_totals.certified_kv_value_escalation_heads > 0,
+                "ranking_fallback_decode": stage_totals.certified_kv_ranking_fallback_heads > 0,
+                "value_escalation_decode_heads": stage_totals.certified_kv_value_escalation_heads,
+                "ranking_fallback_decode_heads": stage_totals.certified_kv_ranking_fallback_heads,
+                "dense_fallback_layers": stage_totals.certified_kv_dense_fallback_layers,
+                "promoted_key_h2d_bytes": stage_totals.certified_kv_promoted_key_h2d_bytes,
+                "promoted_value_h2d_bytes": stage_totals.certified_kv_promoted_value_h2d_bytes,
+                "promoted_key_cache_hits": stage_totals.certified_kv_promoted_key_cache_hits,
+                "promoted_key_cache_misses": stage_totals.certified_kv_promoted_key_cache_misses,
+                "promoted_key_cache_overflows": stage_totals.certified_kv_promoted_key_cache_overflows,
+                "promoted_value_cache_hits": stage_totals.certified_kv_promoted_value_cache_hits,
+                "promoted_value_cache_misses": stage_totals.certified_kv_promoted_value_cache_misses,
+                "promoted_value_cache_overflows": stage_totals.certified_kv_promoted_value_cache_overflows,
+                "ranking_prefix_cache_hits": stage_totals.certified_kv_ranking_prefix_cache_hits,
+                "ranking_prefix_cache_misses": stage_totals.certified_kv_ranking_prefix_cache_misses,
+                "ranking_prefix_cache_hit_rate": ranking_prefix_cache_hit_rate,
+                "ranking_prefix_h2d_bytes": stage_totals.certified_kv_ranking_prefix_h2d_bytes,
+                "ranking_prefix_reuse_bytes": stage_totals.certified_kv_ranking_prefix_reuse_bytes,
+                "certificate_e_key_max": stage_totals.certified_kv_e_key_max,
+                "certificate_e_val_max": stage_totals.certified_kv_e_val_max,
+                "certificate_bound_total_max": stage_totals.certified_kv_bound_total_max,
+                "certificate_delta_tail_max": stage_totals.certified_kv_delta_tail_max,
+                "certificate_vmax_max": stage_totals.certified_kv_vmax_max,
+                "certificate_true_tail_bound_max": stage_totals.certified_kv_true_tail_bound_max,
+                "certificate_uncertified_tail_heads": stage_totals.certified_kv_uncertified_tail_heads,
+                "score_consistency_violations": stage_totals.certified_kv_score_consistency_violations,
+                "memory_full_attention_layers": memory_stats.full_attention_layers,
+                "memory_tier1_compressed_vram_bytes": memory_stats.tier1_compressed_vram_bytes,
+                "memory_tier2_host_pinned_bytes": memory_stats.tier2_host_pinned_bytes,
+                "memory_tail_bf16_vram_bytes": memory_stats.tail_bf16_vram_bytes,
+                "memory_promoted_key_cache_vram_bytes": memory_stats.promoted_key_cache_vram_bytes,
+                "memory_promoted_value_cache_vram_bytes": memory_stats.promoted_value_cache_vram_bytes,
+                "memory_ranking_prefix_scratch_vram_bytes": memory_stats.ranking_prefix_scratch_vram_bytes,
+                "memory_dense_bf16_kv_vram_bytes": memory_stats.dense_bf16_kv_vram_bytes,
+                "memory_total_certified_vram_bytes": memory_stats.total_certified_vram_bytes(),
+                "prompt_tokens": prompt_ids.len(),
+                "generated_tokens": generated.len(),
+                "decode_ms": decode_ms,
+                "ms_per_step": ms_per_step,
+                "block_size": cfg.block_size,
+                "value_group_size": cfg.value_group_size,
+                "value_mode": if cfg.bf16_values { "bf16" } else { "int4" },
+                "tau_cov": cfg.tau_cov,
+                "k_min": cfg.k_min,
+                "k_max": cfg.k_max,
+                "v_tol": cfg.v_tol,
+                "key_cache_blocks": cfg.key_cache_blocks,
+                "value_cache_blocks": cfg.value_cache_blocks,
+                "ranking_r": cfg.ranking_r,
+                "rung1_threshold": cfg.rung1_threshold,
+                "rung1_multiplier": cfg.rung1_multiplier,
+                "delta_guard_factor": cfg.delta_guard_factor,
+                "score_exploration_rate": cfg.score_exploration_rate,
+                "require_certified_tail_bound": cfg.require_certified_tail_bound,
+                "eps_guard": cfg.eps_guard,
+                "rung4_forced_dense_steps": stage_totals.certified_kv_dense_fallback_layers,
+                "shadow_layers": certified_kv_shadow_stats.map(|s| s.layers),
+                "shadow_aligned_tokens": certified_kv_shadow_stats.map(|s| s.aligned_tokens),
+                "shadow_tier1_bytes": certified_kv_shadow_stats.map(|s| s.compressed_vram_bytes),
+                "shadow_quantize_ms": certified_kv_shadow_stats.map(|s| s.quantize_ms),
+                "shadow_max_value_error": certified_kv_shadow_stats.map(|s| s.max_value_error),
+                "shadow_score_layers": certified_kv_shadow_stats.map(|s| s.score_layers),
+                "shadow_score_ms": certified_kv_shadow_stats.map(|s| s.score_ms),
+                "shadow_max_score_ref_delta": certified_kv_shadow_stats.map(|s| s.max_score_ref_delta),
+                "shadow_selector_heads": certified_kv_shadow_stats.map(|s| s.selector_heads),
+                "shadow_selector_mean_k": certified_kv_shadow_stats.map(|s| {
+                    if s.selector_heads == 0 {
+                        0.0
+                    } else {
+                        s.selector_selected_blocks as f32 / s.selector_heads as f32
+                    }
+                }),
+                "shadow_selector_max_tail_mass": certified_kv_shadow_stats.map(|s| s.selector_max_tail_mass),
+                "shadow_selector_rung1_heads": certified_kv_shadow_stats.map(|s| s.selector_rung1_heads),
+                "shadow_value_bound_heads": certified_kv_shadow_stats.map(|s| s.value_bound_heads),
+                "shadow_value_bound_max": certified_kv_shadow_stats.map(|s| s.value_bound_max),
+                "shadow_value_escalation_blocks": certified_kv_shadow_stats.map(|s| s.value_escalation_blocks),
+                "shadow_attend_layers": certified_kv_shadow_stats.map(|s| s.attend_layers),
+                "shadow_attend_ms": certified_kv_shadow_stats.map(|s| s.attend_ms),
+                "shadow_attend_max_abs": certified_kv_shadow_stats.map(|s| s.attend_max_abs),
+                "shadow_attend_ref_max_delta": certified_kv_shadow_stats.map(|s| s.attend_ref_max_delta),
+                "shadow_attend_bf16_value_ms": certified_kv_shadow_stats.map(|s| s.attend_bf16_value_ms),
+                "shadow_attend_bf16_value_ref_max_delta": certified_kv_shadow_stats.map(|s| s.attend_bf16_value_ref_max_delta),
+            });
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("create certified KV telemetry dir {}", parent.display())
+                    })?;
+                }
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .with_context(|| format!("open certified KV telemetry {}", path.display()))?;
+            use std::io::Write as _;
+            writeln!(file, "{payload}")
+                .with_context(|| format!("write certified KV telemetry {}", path.display()))?;
+        }
+    }
 
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CertifiedKvLayerTrace {
+    layer: usize,
+    trace_tokens: usize,
+    prefix_tokens: usize,
+    pre_gate_delta: f32,
+    gated_delta: f32,
+    attn_hidden_delta: f32,
+    key_only_pre_gate_delta: Option<f32>,
+    value_only_pre_gate_delta: Option<f32>,
+}
+
+fn trace_llama31_certified_kv_all_layers(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    cfg: &crate::certified_kv::CertifiedKvConfig,
+) -> Result<()> {
+    let text_config = engine.weights().config.clone();
+    let mut traces = Vec::new();
+    for layer in 1..text_config.num_hidden_layers {
+        if text_config.is_full_attention(layer) {
+            traces.push(trace_llama31_certified_kv_layer(
+                engine, prompt_ids, layer, cfg,
+            )?);
+        }
+    }
+    let Some(worst_pre) = traces
+        .iter()
+        .max_by(|a, b| a.pre_gate_delta.total_cmp(&b.pre_gate_delta))
+    else {
+        bail!("certified KV trace found no full-attention layers");
+    };
+    let worst_hidden = traces
+        .iter()
+        .max_by(|a, b| a.attn_hidden_delta.total_cmp(&b.attn_hidden_delta))
+        .expect("trace list is non-empty");
+    let worst_gated = traces
+        .iter()
+        .max_by(|a, b| a.gated_delta.total_cmp(&b.gated_delta))
+        .expect("trace list is non-empty");
+    let worst_key_only = traces
+        .iter()
+        .filter_map(|trace| {
+            trace
+                .key_only_pre_gate_delta
+                .map(|delta| (trace.layer, delta))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    let worst_value_only = traces
+        .iter()
+        .filter_map(|trace| {
+            trace
+                .value_only_pre_gate_delta
+                .map(|delta| (trace.layer, delta))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+    eprintln!(
+        "[certified-kv-trace-summary] layers={} trace_tokens={} prefix_tokens={} worst_pre_gate_layer={} worst_pre_gate_delta={:.6} worst_gated_layer={} worst_gated_delta={:.6} worst_attn_hidden_layer={} worst_attn_hidden_delta={:.6} worst_key_only_layer={} worst_key_only_delta={:.6} worst_value_only_layer={} worst_value_only_delta={:.6}",
+        traces.len(),
+        worst_pre.trace_tokens,
+        worst_pre.prefix_tokens,
+        worst_pre.layer,
+        worst_pre.pre_gate_delta,
+        worst_gated.layer,
+        worst_gated.gated_delta,
+        worst_hidden.layer,
+        worst_hidden.attn_hidden_delta,
+        worst_key_only.map(|v| v.0).unwrap_or(usize::MAX),
+        worst_key_only.map(|v| v.1).unwrap_or(f32::NAN),
+        worst_value_only.map(|v| v.0).unwrap_or(usize::MAX),
+        worst_value_only.map(|v| v.1).unwrap_or(f32::NAN),
+    );
+    Ok(())
+}
+
+fn trace_llama31_certified_kv_layer(
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    trace_layer: usize,
+    cfg: &crate::certified_kv::CertifiedKvConfig,
+) -> Result<CertifiedKvLayerTrace> {
+    let text_config = engine.weights().config.clone();
+    anyhow::ensure!(
+        text_config.is_full_attention(trace_layer),
+        "certified KV trace layer {trace_layer} is not full attention"
+    );
+    anyhow::ensure!(
+        trace_layer > 0,
+        "--certified-kv-trace-layer currently requires layer > 0"
+    );
+    let trace_len = prompt_ids.len();
+    anyhow::ensure!(
+        trace_len >= cfg.block_size && trace_len > 1,
+        "prompt has {} tokens, not enough for certified KV trace with block_size={}",
+        prompt_ids.len(),
+        cfg.block_size
+    );
+    let trace_ids = &prompt_ids[..trace_len];
+    let prefix_ids = &trace_ids[..trace_len - 1];
+    let seqlen_offset = prefix_ids.len();
+    engine.reset()?;
+    let replay = engine.prefill_native_with_trace(trace_ids)?;
+    let replay_hidden = replay
+        .layer_hidden_trace
+        .as_ref()
+        .and_then(|layers| layers.get(trace_layer - 1))
+        .ok_or_else(|| {
+            anyhow!("missing replay hidden before certified KV trace layer {trace_layer}")
+        })?
+        .clone();
+    engine.rebuild_prefill_state(prefix_ids, false)?;
+    let dense = engine.trace_full_attention_layer_output_from_hidden_current_state(
+        trace_layer,
+        0,
+        &replay_hidden,
+        seqlen_offset,
+    )?;
+    let certified = engine
+        .trace_certified_kv_full_attention_layer_output_from_hidden_current_state(
+            trace_layer,
+            0,
+            &replay_hidden,
+            seqlen_offset,
+            cfg.block_size,
+            cfg.value_group_size,
+            cfg.bf16_values,
+        )?;
+    let pre_gate_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.pre_gate),
+        &decode_bf16_le(&certified.pre_gate),
+    );
+    let gated_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.gated),
+        &decode_bf16_le(&certified.gated),
+    );
+    let attn_hidden_delta = validate::max_abs_delta(
+        &decode_bf16_le(&dense.attn_hidden),
+        &decode_bf16_le(&certified.attn_hidden),
+    );
+    let key_only_pre_gate_delta = certified.key_only_pre_gate.as_ref().map(|bytes| {
+        validate::max_abs_delta(&decode_bf16_le(&dense.pre_gate), &decode_bf16_le(bytes))
+    });
+    let value_only_pre_gate_delta = certified.value_only_pre_gate.as_ref().map(|bytes| {
+        validate::max_abs_delta(&decode_bf16_le(&dense.pre_gate), &decode_bf16_le(bytes))
+    });
+    eprintln!(
+        "[certified-kv-trace] layer={} trace_tokens={} prefix_tokens={} pre_gate_delta={:.6} gated_delta={:.6} attn_hidden_delta={:.6} key_only_pre_gate_delta={:.6} value_only_pre_gate_delta={:.6}",
+        trace_layer,
+        trace_len,
+        seqlen_offset,
+        pre_gate_delta,
+        gated_delta,
+        attn_hidden_delta,
+        key_only_pre_gate_delta.unwrap_or(f32::NAN),
+        value_only_pre_gate_delta.unwrap_or(f32::NAN),
+    );
+    Ok(CertifiedKvLayerTrace {
+        layer: trace_layer,
+        trace_tokens: trace_len,
+        prefix_tokens: seqlen_offset,
+        pre_gate_delta,
+        gated_delta,
+        attn_hidden_delta,
+        key_only_pre_gate_delta,
+        value_only_pre_gate_delta,
+    })
+}
+
 fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
-    bytes.chunks_exact(2)
+    bytes
+        .chunks_exact(2)
         .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
         .collect()
 }
@@ -1131,14 +1981,26 @@ fn trace_llama31_prefill_layers(
                         .map_err(|e| anyhow!("decode oracle kv v[{layer}]: {e}"))?;
                     format!(
                         " kv_k_delta={:.4} kv_v_delta={:.4}",
-                        validate::max_abs_delta(&decode_bf16_le(&native_k), &decode_bf16_le(&oracle_k)),
-                        validate::max_abs_delta(&decode_bf16_le(&native_v), &decode_bf16_le(&oracle_v)),
+                        validate::max_abs_delta(
+                            &decode_bf16_le(&native_k),
+                            &decode_bf16_le(&oracle_k)
+                        ),
+                        validate::max_abs_delta(
+                            &decode_bf16_le(&native_v),
+                            &decode_bf16_le(&oracle_v)
+                        ),
                     )
                 }
                 _ => String::new(),
             };
             if first_bad.is_none() && layer_delta > 0.5 {
-                first_bad = Some((layer, attn_delta, post_norm_delta, mlp_out_delta, layer_delta));
+                first_bad = Some((
+                    layer,
+                    attn_delta,
+                    post_norm_delta,
+                    mlp_out_delta,
+                    layer_delta,
+                ));
             }
             eprintln!(
                 "[trace-prefill] layer={layer} attn_delta={attn_delta:.4} post_norm_delta={post_norm_delta:.4} mlp_out_delta={mlp_out_delta:.4} layer_delta={layer_delta:.4}{state_delta}"
@@ -1235,30 +2097,27 @@ fn trace_llama31_oracle_prefill_layer(
         )?
     } else {
         last_row(
-            b64.decode(
-                oracle_inputs
-                    .get(trace_layer - 1)
-                    .ok_or_else(|| anyhow!("oracle layer_hidden_states missing layer {}", trace_layer - 1))?,
-            )
+            b64.decode(oracle_inputs.get(trace_layer - 1).ok_or_else(|| {
+                anyhow!(
+                    "oracle layer_hidden_states missing layer {}",
+                    trace_layer - 1
+                )
+            })?)
             .map_err(|e| anyhow!("decode oracle input hidden for layer {trace_layer}: {e}"))?,
             "oracle input hidden",
         )?
     };
     let oracle_attn_bytes = last_row(
-        b64.decode(
-            oracle_attn
-                .get(trace_layer)
-                .ok_or_else(|| anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}"))?,
-        )
+        b64.decode(oracle_attn.get(trace_layer).ok_or_else(|| {
+            anyhow!("oracle layer_attn_residual_states missing layer {trace_layer}")
+        })?)
         .map_err(|e| anyhow!("decode oracle attn for layer {trace_layer}: {e}"))?,
         "oracle attn",
     )?;
     let oracle_post_bytes = last_row(
-        b64.decode(
-            oracle_post
-                .get(trace_layer)
-                .ok_or_else(|| anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}"))?,
-        )
+        b64.decode(oracle_post.get(trace_layer).ok_or_else(|| {
+            anyhow!("oracle layer_post_attn_norm_states missing layer {trace_layer}")
+        })?)
         .map_err(|e| anyhow!("decode oracle post-norm for layer {trace_layer}: {e}"))?,
         "oracle post-norm",
     )?;
@@ -1271,15 +2130,14 @@ fn trace_llama31_oracle_prefill_layer(
         .map_err(|e| anyhow!("decode oracle mlp for layer {trace_layer}: {e}"))?,
         "oracle mlp",
     )?;
-    let oracle_hidden_bytes = last_row(
-        b64.decode(
-            oracle_inputs
-                .get(trace_layer)
-                .ok_or_else(|| anyhow!("oracle layer_hidden_states missing layer {trace_layer}"))?,
-        )
-        .map_err(|e| anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?,
-        "oracle hidden",
-    )?;
+    let oracle_hidden_bytes =
+        last_row(
+            b64.decode(oracle_inputs.get(trace_layer).ok_or_else(|| {
+                anyhow!("oracle layer_hidden_states missing layer {trace_layer}")
+            })?)
+            .map_err(|e| anyhow!("decode oracle hidden for layer {trace_layer}: {e}"))?,
+            "oracle hidden",
+        )?;
 
     engine.set_hidden_from_bytes(&oracle_input_bytes)?;
     let trace = engine.component_trace_full_layer_from_current_hidden_with_seqlen(
@@ -1309,7 +2167,11 @@ fn trace_llama31_oracle_prefill_layer(
     if oracle_full.traced_mlp_down.is_some() {
         let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
             let bytes = b64
-                .decode(field.as_ref().ok_or_else(|| anyhow!("oracle output missing {label}"))?)
+                .decode(
+                    field
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("oracle output missing {label}"))?,
+                )
                 .map_err(|e| anyhow!("decode oracle {label}: {e}"))?;
             Ok(decode_bf16_le(&bytes))
         };
@@ -1340,19 +2202,50 @@ fn trace_llama31_oracle_prefill_layer(
     {
         let decode_opt_bf16 = |field: &Option<String>, label: &str| -> Result<Vec<f32>> {
             let bytes = b64
-                .decode(field.as_ref().ok_or_else(|| anyhow!("oracle output missing {label}"))?)
+                .decode(
+                    field
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("oracle output missing {label}"))?,
+                )
                 .map_err(|e| anyhow!("decode oracle {label}: {e}"))?;
             Ok(decode_bf16_le(&bytes))
         };
-        let oracle_normed = decode_opt_bf16(&oracle_full.traced_full_attn_normed, "traced_full_attn_normed")?;
-        let oracle_q_proj = decode_opt_bf16(&oracle_full.traced_full_attn_q_proj, "traced_full_attn_q_proj")?;
-        let oracle_gate = decode_opt_bf16(&oracle_full.traced_full_attn_gate_proj, "traced_full_attn_gate_proj")?;
-        let oracle_k_proj = decode_opt_bf16(&oracle_full.traced_full_attn_k_proj, "traced_full_attn_k_proj")?;
-        let oracle_v_proj = decode_opt_bf16(&oracle_full.traced_full_attn_v_proj, "traced_full_attn_v_proj")?;
-        let oracle_q_rope = decode_opt_bf16(&oracle_full.traced_full_attn_q_rope, "traced_full_attn_q_rope")?;
-        let oracle_k_rope = decode_opt_bf16(&oracle_full.traced_full_attn_k_rope, "traced_full_attn_k_rope")?;
-        let oracle_pre_gate = decode_opt_bf16(&oracle_full.traced_full_attn_pre_gate, "traced_full_attn_pre_gate")?;
-        let oracle_gated = decode_opt_bf16(&oracle_full.traced_full_attn_gated, "traced_full_attn_gated")?;
+        let oracle_normed = decode_opt_bf16(
+            &oracle_full.traced_full_attn_normed,
+            "traced_full_attn_normed",
+        )?;
+        let oracle_q_proj = decode_opt_bf16(
+            &oracle_full.traced_full_attn_q_proj,
+            "traced_full_attn_q_proj",
+        )?;
+        let oracle_gate = decode_opt_bf16(
+            &oracle_full.traced_full_attn_gate_proj,
+            "traced_full_attn_gate_proj",
+        )?;
+        let oracle_k_proj = decode_opt_bf16(
+            &oracle_full.traced_full_attn_k_proj,
+            "traced_full_attn_k_proj",
+        )?;
+        let oracle_v_proj = decode_opt_bf16(
+            &oracle_full.traced_full_attn_v_proj,
+            "traced_full_attn_v_proj",
+        )?;
+        let oracle_q_rope = decode_opt_bf16(
+            &oracle_full.traced_full_attn_q_rope,
+            "traced_full_attn_q_rope",
+        )?;
+        let oracle_k_rope = decode_opt_bf16(
+            &oracle_full.traced_full_attn_k_rope,
+            "traced_full_attn_k_rope",
+        )?;
+        let oracle_pre_gate = decode_opt_bf16(
+            &oracle_full.traced_full_attn_pre_gate,
+            "traced_full_attn_pre_gate",
+        )?;
+        let oracle_gated = decode_opt_bf16(
+            &oracle_full.traced_full_attn_gated,
+            "traced_full_attn_gated",
+        )?;
 
         let stage = engine.trace_full_attention_stages_from_hidden(
             trace_layer,
@@ -1367,7 +2260,8 @@ fn trace_llama31_oracle_prefill_layer(
         )?;
         let normed_delta = validate::max_abs_delta(&decode_bf16_le(&stage.normed), &oracle_normed);
         let q_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_proj), &oracle_q_proj);
-        let gate_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.gate_proj), &oracle_gate);
+        let gate_proj_delta =
+            validate::max_abs_delta(&decode_bf16_le(&stage.gate_proj), &oracle_gate);
         let k_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.k_proj), &oracle_k_proj);
         let v_proj_delta = validate::max_abs_delta(&decode_bf16_le(&stage.v_proj), &oracle_v_proj);
         let q_rope_delta = validate::max_abs_delta(&decode_bf16_le(&stage.q_rope), &oracle_q_rope);

@@ -109,6 +109,13 @@ unsafe extern "C" {
     pub(crate) fn cudaSetDevice(device: c_int) -> c_int;
     pub(crate) fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     pub(crate) fn cudaFree(ptr: *mut c_void) -> c_int;
+    pub(crate) fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
+    pub(crate) fn cudaHostGetDevicePointer(
+        device_ptr: *mut *mut c_void,
+        host_ptr: *mut c_void,
+        flags: c_uint,
+    ) -> c_int;
+    pub(crate) fn cudaFreeHost(ptr: *mut c_void) -> c_int;
     pub(crate) fn cudaMemcpy(
         dst: *mut c_void,
         src: *const c_void,

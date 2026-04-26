@@ -1,12 +1,12 @@
-pub mod manifest;
-pub mod transforms;
 pub mod baker;
-pub mod store;
 pub mod fetch;
+pub mod manifest;
+pub mod store;
+pub mod transforms;
 
 use std::path::{Path, PathBuf};
 
-use manifest::{CONVERTER_VERSION, FORMAT_VERSION, Manifest};
+use manifest::{Manifest, CONVERTER_VERSION, FORMAT_VERSION};
 
 pub use baker::{bake_phi4, bake_qwen35};
 pub use store::BakedStore;

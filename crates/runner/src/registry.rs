@@ -456,17 +456,7 @@ mod tests {
 
     #[test]
     fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
-        assert!(lookup(
-            &ModelVariant::Qwen3_5_2B,
-            &Backend::Cuda,
-            &GpuArch::Sm86,
-        )
-        .is_some());
-        assert!(lookup(
-            &ModelVariant::Qwen3_5_9B,
-            &Backend::Cuda,
-            &GpuArch::Sm86,
-        )
-        .is_some());
+        assert!(lookup(&ModelVariant::Qwen3_5_2B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
+        assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
     }
 }

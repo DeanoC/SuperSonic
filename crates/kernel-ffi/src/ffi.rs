@@ -189,6 +189,23 @@ unsafe extern "C" {
         out_index: *mut c_void,
     ) -> c_int;
 
+    fn dotcache_qwen35_cuda_target_nll_bf16(
+        device_ordinal: usize,
+        rows: usize,
+        vocab_size: usize,
+        logits: *const c_void,
+        targets: *const c_void,
+        out_nll: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+        device_ordinal: usize,
+        vocab_size: usize,
+        logits: *const c_void,
+        target: u32,
+        out_sum: *mut c_void,
+    ) -> c_int;
+
     fn dotcache_qwen35_cuda_lm_head_argmax_bf16(
         device_ordinal: usize,
         hidden_dim: usize,
@@ -198,6 +215,15 @@ unsafe extern "C" {
         block_best_vals: *mut c_void,
         block_best_idxs: *mut c_void,
         out_index: *mut c_void,
+    ) -> c_int;
+
+    fn dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+        device_ordinal: usize,
+        in_dim: usize,
+        out_dim: usize,
+        input: *const c_void,
+        weight: *const c_void,
+        output: *mut c_void,
     ) -> c_int;
 }
 
@@ -765,6 +791,113 @@ pub fn cuda_lm_head_argmax_bf16(
     }
 }
 
+pub fn cuda_target_nll_bf16(
+    ordinal: usize,
+    logits: &GpuBuffer,
+    targets: &GpuBuffer,
+    out_nll: &mut GpuBuffer,
+    rows: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Cuda
+        || targets.backend() != Backend::Cuda
+        || out_nll.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_target_nll_bf16 requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if targets.dtype() != ScalarType::U32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires U32 targets".into(),
+        ));
+    }
+    if out_nll.dtype() != ScalarType::F32 || out_nll.elem_count() < rows {
+        return Err(GpuError::InvalidArg(
+            "cuda_target_nll_bf16 requires F32 out_nll with at least rows elements".into(),
+        ));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_target_nll_bf16(
+            ordinal,
+            rows,
+            vocab_size,
+            logits.as_ptr(),
+            targets.as_ptr(),
+            out_nll.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_target_nll_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, logits, targets, out_nll, rows, vocab_size);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn cuda_accumulate_target_nll_bf16(
+    ordinal: usize,
+    logits: &GpuBuffer,
+    target: u32,
+    out_sum: &mut GpuBuffer,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Cuda || out_sum.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "cuda_accumulate_target_nll_bf16 requires CUDA buffers".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_accumulate_target_nll_bf16 requires BF16 logits, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if out_sum.dtype() != ScalarType::F32 || out_sum.elem_count() < 1 {
+        return Err(GpuError::InvalidArg(
+            "cuda_accumulate_target_nll_bf16 requires F32[1] output sum".into(),
+        ));
+    }
+    if target as usize >= vocab_size {
+        return Err(GpuError::InvalidArg(format!(
+            "target token {target} outside vocab size {vocab_size}"
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+            ordinal,
+            vocab_size,
+            logits.as_ptr(),
+            target,
+            out_sum.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::Cuda(format!(
+                "cuda_accumulate_target_nll_bf16 failed with status {status}"
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, logits, target, out_sum, vocab_size);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
 pub fn metal_lm_head_argmax_bf16(
     ordinal: usize,
     hidden: &GpuBuffer,
@@ -1083,6 +1216,72 @@ pub fn standalone_matvec_4b(
     Ok(())
 }
 
+pub fn cuda_lm_head_bf16_gemm_4b(
+    ordinal: usize,
+    output: &mut GpuBuffer,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    in_dim: usize,
+    out_dim: usize,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Cuda
+        || input.backend() != Backend::Cuda
+        || weight.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_bf16_gemm_4b requires CUDA buffers".into(),
+        ));
+    }
+    if output.dtype() != ScalarType::BF16
+        || input.dtype() != ScalarType::BF16
+        || weight.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b requires BF16 output/input/weight, got {:?}/{:?}/{:?}",
+            output.dtype(),
+            input.dtype(),
+            weight.dtype()
+        )));
+    }
+    if input.elem_count() < in_dim || output.elem_count() < out_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b buffer too small: input elems={} output elems={} in_dim={in_dim} out_dim={out_dim}",
+            input.elem_count(),
+            output.elem_count()
+        )));
+    }
+    if weight.elem_count() < in_dim * out_dim {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_bf16_gemm_4b weight elems={} smaller than {out_dim}x{in_dim}",
+            weight.elem_count()
+        )));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+            ordinal,
+            in_dim,
+            out_dim,
+            input.as_ptr(),
+            weight.as_ptr(),
+            output.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(backend_error(
+                Backend::Cuda,
+                "cuda_lm_head_bf16_gemm_4b",
+                status,
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (ordinal, output, input, weight, in_dim, out_dim);
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
 /// 4B RMSNorm over multiple contiguous rows.
 pub fn rms_norm_4b_multirow(
     ordinal: usize,
@@ -1382,8 +1581,10 @@ pub fn standalone_matvec(
                 metal_host::standalone_matvec(dtype, input, weight, output, in_dim, out_dim)
             });
         }
-        return crate::prefill_ffi::metal_profile_time("standalone_matvec", "native", || {
-            match dtype {
+        return crate::prefill_ffi::metal_profile_time(
+            "standalone_matvec",
+            "native",
+            || match dtype {
                 ScalarType::BF16 => crate::metal_native::matmul_rhs_transposed_bf16(
                     1, 1, out_dim, in_dim, input, weight, output,
                 ),
@@ -1393,8 +1594,8 @@ pub fn standalone_matvec(
                 other => Err(GpuError::InvalidArg(format!(
                     "standalone_matvec unsupported Metal dtype {other:?}"
                 ))),
-            }
-        });
+            },
+        );
     }
     // Reset the atomic row counter to 0
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;

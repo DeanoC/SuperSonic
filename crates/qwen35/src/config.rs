@@ -1,15 +1,35 @@
 use serde::Deserialize;
 
-fn default_head_dim() -> usize { 256 }
-fn default_linear_conv_kernel_dim() -> usize { 4 }
-fn default_linear_key_head_dim() -> usize { 128 }
-fn default_linear_value_head_dim() -> usize { 128 }
-fn default_linear_num_key_heads() -> usize { 16 }
-fn default_linear_num_value_heads() -> usize { 32 }
-fn default_partial_rotary_factor() -> f64 { 0.25 }
-fn default_rope_theta() -> f64 { 10_000.0 }
-fn default_rope_type() -> String { "default".to_string() }
-fn default_rms_norm_add_unit_offset() -> bool { true }
+fn default_head_dim() -> usize {
+    256
+}
+fn default_linear_conv_kernel_dim() -> usize {
+    4
+}
+fn default_linear_key_head_dim() -> usize {
+    128
+}
+fn default_linear_value_head_dim() -> usize {
+    128
+}
+fn default_linear_num_key_heads() -> usize {
+    16
+}
+fn default_linear_num_value_heads() -> usize {
+    32
+}
+fn default_partial_rotary_factor() -> f64 {
+    0.25
+}
+fn default_rope_theta() -> f64 {
+    10_000.0
+}
+fn default_rope_type() -> String {
+    "default".to_string()
+}
+fn default_rms_norm_add_unit_offset() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct RopeParameters {
@@ -117,11 +137,10 @@ impl TextConfig {
             Some(serde_json::Value::Number(n)) => {
                 n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
             }
-            Some(serde_json::Value::Array(arr)) => {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u32))
-                    .collect()
-            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect(),
             _ => vec![],
         }
     }

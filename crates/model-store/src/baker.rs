@@ -6,9 +6,7 @@ use std::path::Path;
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
-use crate::manifest::{
-    CONVERTER_VERSION, FORMAT_VERSION, LayoutTag, Manifest, TensorMeta,
-};
+use crate::manifest::{LayoutTag, Manifest, TensorMeta, CONVERTER_VERSION, FORMAT_VERSION};
 use crate::transforms;
 use crate::Error;
 
@@ -227,7 +225,11 @@ pub fn bake_qwen35(
                 };
 
                 let (bytes, final_shape) = transforms::fp8_dequant_to_bf16(
-                    raw_bytes, &shape, scale_bytes, &scale_shape, block_size,
+                    raw_bytes,
+                    &shape,
+                    scale_bytes,
+                    &scale_shape,
+                    block_size,
                 );
 
                 let offset = align_up(cursor, 4096);
@@ -313,7 +315,10 @@ pub fn bake_qwen35(
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     fs::write(crate::manifest_path(&bake_dir), manifest_json)?;
 
-    progress(&format!("[bake] manifest written to {}", bake_dir.display()));
+    progress(&format!(
+        "[bake] manifest written to {}",
+        bake_dir.display()
+    ));
     Ok(())
 }
 
@@ -382,9 +387,8 @@ pub fn bake_phi4(
         let dt_name = dtype_name(raw_dtype)?.to_string();
 
         if let Some((prefix, _)) = split_phi4_qkv_name(name) {
-            let (qb, qs, kb, ks, vb, vs) = transforms::split_qkv_proj(
-                raw_bytes, &shape, q_rows, k_rows, v_rows, dt_bytes,
-            );
+            let (qb, qs, kb, ks, vb, vs) =
+                transforms::split_qkv_proj(raw_bytes, &shape, q_rows, k_rows, v_rows, dt_bytes);
             for (suffix, bytes, shape) in [
                 ("q_proj.weight", qb, qs),
                 ("k_proj.weight", kb, ks),
@@ -406,13 +410,10 @@ pub fn bake_phi4(
         }
 
         if let Some(prefix) = split_phi4_gate_up_name(name) {
-            let (gb, gs, ub, us) = transforms::split_gate_up_proj(
-                raw_bytes, &shape, intermediate_size, dt_bytes,
-            );
-            for (suffix, bytes, shape) in [
-                ("gate_proj.weight", gb, gs),
-                ("up_proj.weight", ub, us),
-            ] {
+            let (gb, gs, ub, us) =
+                transforms::split_gate_up_proj(raw_bytes, &shape, intermediate_size, dt_bytes);
+            for (suffix, bytes, shape) in [("gate_proj.weight", gb, gs), ("up_proj.weight", ub, us)]
+            {
                 let out_name = format!("{prefix}.{suffix}");
                 cursor = write_entry(
                     &mut weights_file,
@@ -475,7 +476,10 @@ pub fn bake_phi4(
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     fs::write(crate::manifest_path(&bake_dir), manifest_json)?;
 
-    progress(&format!("[bake] manifest written to {}", bake_dir.display()));
+    progress(&format!(
+        "[bake] manifest written to {}",
+        bake_dir.display()
+    ));
     Ok(())
 }
 
@@ -536,7 +540,8 @@ mod tests {
 
     #[test]
     fn qkv_name_match() {
-        let (prefix, idx) = split_phi4_qkv_name("model.layers.7.self_attn.qkv_proj.weight").unwrap();
+        let (prefix, idx) =
+            split_phi4_qkv_name("model.layers.7.self_attn.qkv_proj.weight").unwrap();
         assert_eq!(prefix, "model.layers.7.self_attn");
         assert_eq!(idx, 7);
         assert!(split_phi4_qkv_name("model.layers.7.self_attn.o_proj.weight").is_none());

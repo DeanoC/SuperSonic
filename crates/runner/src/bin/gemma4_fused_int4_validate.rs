@@ -146,12 +146,22 @@ fn main() -> Result<()> {
     );
 
     let fused_tokens = run_path(
-        "fused", &cli.model_dir, &cli.weight_prefix,
-        max_t, &prompt_tokens, cli.max_new_tokens, true,
+        "fused",
+        &cli.model_dir,
+        &cli.weight_prefix,
+        max_t,
+        &prompt_tokens,
+        cli.max_new_tokens,
+        true,
     )?;
     let primitive_tokens = run_path(
-        "primitive", &cli.model_dir, &cli.weight_prefix,
-        max_t, &prompt_tokens, cli.max_new_tokens, false,
+        "primitive",
+        &cli.model_dir,
+        &cli.weight_prefix,
+        max_t,
+        &prompt_tokens,
+        cli.max_new_tokens,
+        false,
     )?;
 
     eprintln!("[fused]     tokens = {:?}", fused_tokens);

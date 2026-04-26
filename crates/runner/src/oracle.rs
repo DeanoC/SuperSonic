@@ -20,11 +20,11 @@ pub struct OracleOutput {
     pub decode_logits: Vec<Vec<f32>>,
     pub generated_token_ids: Vec<u32>,
     // State export (only present with --emit-state)
-    pub prefill_hidden: Option<String>,      // base64
+    pub prefill_hidden: Option<String>, // base64
     pub prefill_hidden_shape: Option<Vec<usize>>,
     pub layer_attn_residual_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
     pub layer_post_attn_norm_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
-    pub layer_mlp_outputs: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer
+    pub layer_mlp_outputs: Option<Vec<String>>,          // base64 BF16 [1,1,hidden] per layer
     pub layer_hidden_states: Option<Vec<String>>, // base64 BF16 [1,1,hidden] per layer, decoder block output
     pub kv_caches: Option<Vec<KvCacheDump>>,
     pub conv_states: Option<Vec<StateDump>>,
@@ -214,16 +214,16 @@ pub struct Qwen35TraceOutput {
 #[derive(Debug, Deserialize)]
 pub struct KvCacheDump {
     pub layer: usize,
-    pub k: String,       // base64
+    pub k: String, // base64
     pub k_shape: Vec<usize>,
-    pub v: String,       // base64
+    pub v: String, // base64
     pub v_shape: Vec<usize>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct StateDump {
     pub layer: usize,
-    pub data: String,    // base64
+    pub data: String, // base64
     pub shape: Vec<usize>,
 }
 
@@ -265,11 +265,16 @@ pub fn run_oracle(
 
     let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
-        .arg("--model-id").arg(model_id)
-        .arg("--prompt-ids").arg(&ids_str)
-        .arg("--max-new-tokens").arg(max_new_tokens.to_string())
-        .arg("--dtype").arg(dtype)
-        .arg("--device").arg(device);
+        .arg("--model-id")
+        .arg(model_id)
+        .arg("--prompt-ids")
+        .arg(&ids_str)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--dtype")
+        .arg(dtype)
+        .arg("--device")
+        .arg(device);
     if emit_state {
         cmd.arg("--emit-state");
     }
@@ -283,7 +288,9 @@ pub fn run_oracle(
         cmd.arg("--trace-full-attn-layer").arg(layer.to_string());
     }
 
-    let fp8_flag = fp8_model_dir.map(|d| format!(" --fp8-model-dir {}", d.display())).unwrap_or_default();
+    let fp8_flag = fp8_model_dir
+        .map(|d| format!(" --fp8-model-dir {}", d.display()))
+        .unwrap_or_default();
     let int8_flag = if load_in_8bit { " --load-in-8bit" } else { "" };
     let trace_flag = trace_full_attn_layer
         .map(|layer| format!(" --trace-full-attn-layer {layer}"))
@@ -384,11 +391,16 @@ pub fn run_phi4_oracle(
     let python = resolve_oracle_python();
     let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
-        .arg("--model-dir").arg(model_dir)
-        .arg("--prompt").arg(prompt)
-        .arg("--max-new-tokens").arg(max_new_tokens.to_string())
-        .arg("--dtype").arg(dtype)
-        .arg("--device").arg(device);
+        .arg("--model-dir")
+        .arg(model_dir)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--dtype")
+        .arg(dtype)
+        .arg("--device")
+        .arg(device);
 
     eprintln!(
         "[oracle] running: {python} {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}",
@@ -396,15 +408,17 @@ pub fn run_phi4_oracle(
         model_dir.display(),
     );
 
-    let output = cmd.output().context("failed to start phi4 oracle process")?;
+    let output = cmd
+        .output()
+        .context("failed to start phi4 oracle process")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("phi4 oracle failed (exit {}): {stderr}", output.status);
     }
 
     let stdout = String::from_utf8(output.stdout).context("phi4 oracle stdout not UTF-8")?;
-    let oracle: OracleOutput = serde_json::from_str(&stdout)
-        .context("failed to parse phi4 oracle JSON output")?;
+    let oracle: OracleOutput =
+        serde_json::from_str(&stdout).context("failed to parse phi4 oracle JSON output")?;
     eprintln!(
         "[oracle] done: load={:.0}ms prefill={:.0}ms decode={:.0}ms tokens={}",
         oracle.load_ms, oracle.prefill_ms, oracle.decode_ms, oracle.generated_tokens
@@ -425,10 +439,14 @@ pub fn run_gemma4_oracle(
 ) -> Result<OracleOutput> {
     let mut cmd = Command::new("python3");
     cmd.arg(oracle_script)
-        .arg("--model-dir").arg(model_dir)
-        .arg("--prompt").arg(prompt)
-        .arg("--max-new-tokens").arg(max_new_tokens.to_string())
-        .arg("--dtype").arg(dtype);
+        .arg("--model-dir")
+        .arg(model_dir)
+        .arg("--prompt")
+        .arg(prompt)
+        .arg("--max-new-tokens")
+        .arg(max_new_tokens.to_string())
+        .arg("--dtype")
+        .arg(dtype);
 
     eprintln!(
         "[oracle] running: python3 {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype}",
@@ -436,15 +454,17 @@ pub fn run_gemma4_oracle(
         model_dir.display(),
     );
 
-    let output = cmd.output().context("failed to start gemma4 oracle process")?;
+    let output = cmd
+        .output()
+        .context("failed to start gemma4 oracle process")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         bail!("gemma4 oracle failed (exit {}): {stderr}", output.status);
     }
 
     let stdout = String::from_utf8(output.stdout).context("gemma4 oracle stdout not UTF-8")?;
-    let oracle: OracleOutput = serde_json::from_str(&stdout)
-        .context("failed to parse gemma4 oracle JSON output")?;
+    let oracle: OracleOutput =
+        serde_json::from_str(&stdout).context("failed to parse gemma4 oracle JSON output")?;
     eprintln!(
         "[oracle] done: load={:.0}ms prefill={:.0}ms decode={:.0}ms tokens={}",
         oracle.load_ms, oracle.prefill_ms, oracle.decode_ms, oracle.generated_tokens

@@ -42,7 +42,8 @@ fn main() {
 
     // Mirror kernel-ffi: in auto mode, prefer CUDA when both are present; otherwise
     // fall back to whichever toolchain is available. Explicit selection wins.
-    let (enable_hip, enable_cuda, enable_metal) = if explicit_hip || explicit_cuda || explicit_metal {
+    let (enable_hip, enable_cuda, enable_metal) = if explicit_hip || explicit_cuda || explicit_metal
+    {
         (explicit_hip, explicit_cuda, explicit_metal)
     } else if have_cuda_toolchain {
         (false, true, false)

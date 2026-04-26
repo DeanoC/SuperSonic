@@ -66,7 +66,11 @@ pub fn forward<'a>(
     let eps = cfg.rms_norm_eps as f32;
     let scale = 1.0_f32 / (hd as f32).sqrt();
 
-    let ForwardParams { ctx_len, q_len, pos_offset } = params;
+    let ForwardParams {
+        ctx_len,
+        q_len,
+        pos_offset,
+    } = params;
     if ctx_len == 0 || q_len == 0 {
         return Err(GpuError::InvalidArg(
             "dflash::forward: ctx_len and q_len must both be > 0".into(),
@@ -105,13 +109,24 @@ pub fn forward<'a>(
 
     // ----- Per-round fuser (runs once, reused by every layer) -----
     prefill_ffi::matmul_rhs_transposed(
-        ordinal, dtype, 1,
-        ctx_len, hidden, cfg.fuser_in_dim(),
-        target_hidden_raw, &weights.fc_w, &mut scratch.target_hidden_ctx,
+        ordinal,
+        dtype,
+        1,
+        ctx_len,
+        hidden,
+        cfg.fuser_in_dim(),
+        target_hidden_raw,
+        &weights.fc_w,
+        &mut scratch.target_hidden_ctx,
     )?;
     prefill_ffi::rms_norm_rows_plain(
-        ordinal, dtype, ctx_len, hidden, eps,
-        &scratch.target_hidden_ctx, &weights.hidden_norm_w,
+        ordinal,
+        dtype,
+        ctx_len,
+        hidden,
+        eps,
+        &scratch.target_hidden_ctx,
+        &weights.hidden_norm_w,
         &mut scratch.target_hidden_ctx_norm,
     )?;
 
@@ -135,8 +150,14 @@ pub fn forward<'a>(
 
         // 1) input_layernorm (noise side only).
         prefill_ffi::rms_norm_rows_plain(
-            ordinal, dtype, q_len, hidden, eps,
-            &scratch.hidden_a, &layer.input_norm_w, &mut scratch.hidden_norm,
+            ordinal,
+            dtype,
+            q_len,
+            hidden,
+            eps,
+            &scratch.hidden_a,
+            &layer.input_norm_w,
+            &mut scratch.hidden_norm,
         )?;
 
         // 2) Concat [target_hidden_ctx_norm; hidden_norm] into norm_concat.
@@ -149,8 +170,7 @@ pub fn forward<'a>(
             ctx_bytes,
         )?;
         let concat_noise_dst = unsafe {
-            (scratch.norm_concat.as_mut_ptr() as *mut u8).add(ctx_bytes)
-                as *mut std::ffi::c_void
+            (scratch.norm_concat.as_mut_ptr() as *mut u8).add(ctx_bytes) as *mut std::ffi::c_void
         };
         gpu_hal::copy_d2d(
             ordinal,
@@ -161,44 +181,82 @@ pub fn forward<'a>(
 
         // 3) Q from draft-only; K/V from concat (shared k_proj/v_proj).
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            q_len, q_out, hidden,
-            &scratch.hidden_norm, &layer.q_proj_w, &mut scratch.q_proj,
+            ordinal,
+            dtype,
+            1,
+            q_len,
+            q_out,
+            hidden,
+            &scratch.hidden_norm,
+            &layer.q_proj_w,
+            &mut scratch.q_proj,
         )?;
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            kv_seq, kv_out, hidden,
-            &scratch.norm_concat, &layer.k_proj_w, &mut scratch.k_concat,
+            ordinal,
+            dtype,
+            1,
+            kv_seq,
+            kv_out,
+            hidden,
+            &scratch.norm_concat,
+            &layer.k_proj_w,
+            &mut scratch.k_concat,
         )?;
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            kv_seq, kv_out, hidden,
-            &scratch.norm_concat, &layer.v_proj_w, &mut scratch.v_concat,
+            ordinal,
+            dtype,
+            1,
+            kv_seq,
+            kv_out,
+            hidden,
+            &scratch.norm_concat,
+            &layer.v_proj_w,
+            &mut scratch.v_concat,
         )?;
 
         // 4) Per-head q_norm / k_norm (in-place over head_dim).
         prefill_ffi::rms_norm_rows_plain_inplace(
-            ordinal, dtype, q_len * nh, hd, eps,
-            &mut scratch.q_proj, &layer.q_norm_w,
+            ordinal,
+            dtype,
+            q_len * nh,
+            hd,
+            eps,
+            &mut scratch.q_proj,
+            &layer.q_norm_w,
         )?;
         prefill_ffi::rms_norm_rows_plain_inplace(
-            ordinal, dtype, kv_seq * nkv, hd, eps,
-            &mut scratch.k_concat, &layer.k_norm_w,
+            ordinal,
+            dtype,
+            kv_seq * nkv,
+            hd,
+            eps,
+            &mut scratch.k_concat,
+            &layer.k_norm_w,
         )?;
 
         // 5) RoPE — full-dim rotary. Q at pos_offset + ctx_len; K across full
         //    kv_seq starting at pos_offset. V is not rotated (dflash.py).
         prefill_ffi::apply_rope_prefill(
-            ordinal, dtype,
-            kv_seq, nkv, hd, rotary.rotary_dim,
-            &rotary.cos, &rotary.sin,
+            ordinal,
+            dtype,
+            kv_seq,
+            nkv,
+            hd,
+            rotary.rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
             pos_offset,
             &mut scratch.k_concat,
         )?;
         prefill_ffi::apply_rope_prefill(
-            ordinal, dtype,
-            q_len, nh, hd, rotary.rotary_dim,
-            &rotary.cos, &rotary.sin,
+            ordinal,
+            dtype,
+            q_len,
+            nh,
+            hd,
+            rotary.rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
             pos_offset + ctx_len,
             &mut scratch.q_proj,
         )?;
@@ -232,51 +290,99 @@ pub fn forward<'a>(
         //    [0..full_seq, nKV, hd]. The stride (nKV*hd) is identical either
         //    way, so passing the cache pointer with seq_len=full_seq is safe.
         dflash::bidir_attention(
-            ordinal, dtype,
-            q_len, full_seq, nh, nkv, hd, scale,
-            &scratch.q_proj, &layer_kv.cache_k, &layer_kv.cache_v,
+            ordinal,
+            dtype,
+            q_len,
+            full_seq,
+            nh,
+            nkv,
+            hd,
+            scale,
+            &scratch.q_proj,
+            &layer_kv.cache_k,
+            &layer_kv.cache_v,
             &mut scratch.attn_out,
         )?;
 
         // 8) o_proj into hidden_b, residual-add into hidden_a.
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            q_len, hidden, q_out,
-            &scratch.attn_out, &layer.o_proj_w, &mut scratch.hidden_b,
+            ordinal,
+            dtype,
+            1,
+            q_len,
+            hidden,
+            q_out,
+            &scratch.attn_out,
+            &layer.o_proj_w,
+            &mut scratch.hidden_b,
         )?;
         let hidden_elems = q_len * hidden;
         prefill_ffi::element_add_inplace(
-            ordinal, dtype, hidden_elems,
-            &mut scratch.hidden_a, &scratch.hidden_b,
+            ordinal,
+            dtype,
+            hidden_elems,
+            &mut scratch.hidden_a,
+            &scratch.hidden_b,
         )?;
 
         // 9) post_attention_layernorm → gate + up → SwiGLU → down → residual.
         prefill_ffi::rms_norm_rows_plain(
-            ordinal, dtype, q_len, hidden, eps,
-            &scratch.hidden_a, &layer.post_attn_norm_w, &mut scratch.post_attn_norm,
+            ordinal,
+            dtype,
+            q_len,
+            hidden,
+            eps,
+            &scratch.hidden_a,
+            &layer.post_attn_norm_w,
+            &mut scratch.post_attn_norm,
         )?;
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            q_len, intermediate, hidden,
-            &scratch.post_attn_norm, &layer.gate_proj_w, &mut scratch.gate,
+            ordinal,
+            dtype,
+            1,
+            q_len,
+            intermediate,
+            hidden,
+            &scratch.post_attn_norm,
+            &layer.gate_proj_w,
+            &mut scratch.gate,
         )?;
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            q_len, intermediate, hidden,
-            &scratch.post_attn_norm, &layer.up_proj_w, &mut scratch.up,
+            ordinal,
+            dtype,
+            1,
+            q_len,
+            intermediate,
+            hidden,
+            &scratch.post_attn_norm,
+            &layer.up_proj_w,
+            &mut scratch.up,
         )?;
         prefill_ffi::swiglu_mul(
-            ordinal, dtype, q_len * intermediate,
-            &scratch.gate, &scratch.up, &mut scratch.swiglu_out,
+            ordinal,
+            dtype,
+            q_len * intermediate,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.swiglu_out,
         )?;
         prefill_ffi::matmul_rhs_transposed(
-            ordinal, dtype, 1,
-            q_len, hidden, intermediate,
-            &scratch.swiglu_out, &layer.down_proj_w, &mut scratch.hidden_b,
+            ordinal,
+            dtype,
+            1,
+            q_len,
+            hidden,
+            intermediate,
+            &scratch.swiglu_out,
+            &layer.down_proj_w,
+            &mut scratch.hidden_b,
         )?;
         prefill_ffi::element_add_inplace(
-            ordinal, dtype, hidden_elems,
-            &mut scratch.hidden_a, &scratch.hidden_b,
+            ordinal,
+            dtype,
+            hidden_elems,
+            &mut scratch.hidden_a,
+            &scratch.hidden_b,
         )?;
     }
 
@@ -285,8 +391,14 @@ pub fn forward<'a>(
 
     // ----- Final norm (before lm_head) -----
     prefill_ffi::rms_norm_rows_plain(
-        ordinal, dtype, q_len, hidden, eps,
-        &scratch.hidden_a, &weights.norm_w, &mut scratch.final_hidden,
+        ordinal,
+        dtype,
+        q_len,
+        hidden,
+        eps,
+        &scratch.hidden_a,
+        &weights.norm_w,
+        &mut scratch.final_hidden,
     )?;
 
     Ok(&scratch.final_hidden)

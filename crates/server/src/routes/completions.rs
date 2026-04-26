@@ -22,11 +22,10 @@ pub async fn completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let prompt = req
-        .prompt
-        .clone()
-        .into_single()
-        .ok_or_else(|| ApiError::bad_request("prompt must be a string or single-element array"))?;
+    let prompt =
+        req.prompt.clone().into_single().ok_or_else(|| {
+            ApiError::bad_request("prompt must be a string or single-element array")
+        })?;
 
     let params = GenParams {
         temperature: req.temperature.unwrap_or(1.0),
@@ -50,7 +49,9 @@ pub async fn completions(
     if req.stream {
         let rx = generate::spawn(state.clone(), prompt_ids, params);
         let stream = completion_sse_stream(rx, id, created, model);
-        Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     } else {
         let rx = generate::spawn(state.clone(), prompt_ids, params);
         let result = generate::collect(rx)

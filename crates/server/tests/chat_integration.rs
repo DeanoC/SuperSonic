@@ -132,7 +132,9 @@ async fn collect_sse(resp: reqwest::Response) -> Vec<SseEvent> {
             let raw = buf[..idx].to_string();
             buf = buf[idx + 2..].to_string();
             for line in raw.lines() {
-                let Some(payload) = line.strip_prefix("data:") else { continue; };
+                let Some(payload) = line.strip_prefix("data:") else {
+                    continue;
+                };
                 let payload = payload.trim_start();
                 if payload == "[DONE]" {
                     events.push(SseEvent::Done);
@@ -159,9 +161,16 @@ async fn has_chat_template(h: &Harness) -> bool {
         "messages": [{"role": "user", "content": "probe"}],
         "max_tokens": 1
     });
-    let resp = h.client.post(format!("{}/v1/chat/completions", h.base))
-        .json(&body).send().await.expect("probe send");
-    if resp.status().is_success() { return true; }
+    let resp = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("probe send");
+    if resp.status().is_success() {
+        return true;
+    }
     let text = resp.text().await.unwrap_or_default();
     !text.contains("no chat_template")
 }
@@ -206,7 +215,9 @@ async fn test_chat_non_stream(h: &Harness) {
     assert_eq!(resp["object"], "chat.completion");
     let choice = &resp["choices"][0];
     assert_eq!(choice["message"]["role"], "assistant");
-    let content = choice["message"]["content"].as_str().expect("content string");
+    let content = choice["message"]["content"]
+        .as_str()
+        .expect("content string");
     assert!(!content.is_empty(), "chat content must not be empty");
     let finish = choice["finish_reason"].as_str().expect("finish_reason");
     assert!(
@@ -240,11 +251,20 @@ async fn test_chat_stream(h: &Harness) {
     let events = collect_sse(resp).await;
     assert!(!events.is_empty(), "stream produced no events");
     // First data chunk should establish role=assistant.
-    let first = events.iter().find_map(|e| {
-        if let SseEvent::Data(v) = e { Some(v) } else { None }
-    }).expect("at least one data event");
-    assert_eq!(first["choices"][0]["delta"]["role"], "assistant",
-        "first chunk must open with role=assistant");
+    let first = events
+        .iter()
+        .find_map(|e| {
+            if let SseEvent::Data(v) = e {
+                Some(v)
+            } else {
+                None
+            }
+        })
+        .expect("at least one data event");
+    assert_eq!(
+        first["choices"][0]["delta"]["role"], "assistant",
+        "first chunk must open with role=assistant"
+    );
 
     // Should have at least one content delta, a final finish_reason chunk, and a [DONE].
     let mut content = String::new();
@@ -267,8 +287,11 @@ async fn test_chat_stream(h: &Harness) {
     assert!(!content.is_empty(), "streamed content empty");
     assert!(saw_finish, "no finish_reason chunk before [DONE]");
     assert!(saw_done, "never saw [DONE] sentinel");
-    eprintln!("[scenario] chat stream → OK ({} chunks, content={:?})",
-        events.len(), content);
+    eprintln!(
+        "[scenario] chat stream → OK ({} chunks, content={:?})",
+        events.len(),
+        content
+    );
 }
 
 async fn test_completions_non_stream(h: &Harness) {
@@ -329,24 +352,48 @@ async fn test_completions_stream(h: &Harness) {
     assert!(!text.is_empty(), "streamed completion text empty");
     assert!(saw_finish, "no finish_reason chunk");
     assert!(saw_done, "no [DONE]");
-    eprintln!("[scenario] completions stream → OK ({} events)", events.len());
+    eprintln!(
+        "[scenario] completions stream → OK ({} events)",
+        events.len()
+    );
 }
 
 async fn test_seed_determinism(h: &Harness) {
-    let mk = || json!({
-        "prompt": "Once upon a time",
-        "max_tokens": 10,
-        "temperature": 0.8,
-        "top_p": 0.95,
-        "seed": 1337
-    });
-    let a: Value = h.client.post(format!("{}/v1/completions", h.base))
-        .json(&mk()).send().await.expect("req a").json().await.expect("json a");
-    let b: Value = h.client.post(format!("{}/v1/completions", h.base))
-        .json(&mk()).send().await.expect("req b").json().await.expect("json b");
+    let mk = || {
+        json!({
+            "prompt": "Once upon a time",
+            "max_tokens": 10,
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "seed": 1337
+        })
+    };
+    let a: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&mk())
+        .send()
+        .await
+        .expect("req a")
+        .json()
+        .await
+        .expect("json a");
+    let b: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&mk())
+        .send()
+        .await
+        .expect("req b")
+        .json()
+        .await
+        .expect("json b");
     let ta = a["choices"][0]["text"].as_str().expect("text a");
     let tb = b["choices"][0]["text"].as_str().expect("text b");
-    assert_eq!(ta, tb, "same seed must produce same content: {ta:?} vs {tb:?}");
+    assert_eq!(
+        ta, tb,
+        "same seed must produce same content: {ta:?} vs {tb:?}"
+    );
     eprintln!("[scenario] seed determinism → OK ({:?})", ta);
 }
 
@@ -362,9 +409,19 @@ async fn test_multi_turn(h: &Harness) {
         "max_tokens": 12,
         "temperature": 0
     });
-    let resp: Value = h.client.post(format!("{}/v1/chat/completions", h.base))
-        .json(&body).send().await.expect("POST multi-turn").json().await.expect("json");
-    let content = resp["choices"][0]["message"]["content"].as_str().expect("content");
+    let resp: Value = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST multi-turn")
+        .json()
+        .await
+        .expect("json");
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content");
     assert!(!content.is_empty(), "multi-turn content empty");
     eprintln!("[scenario] multi-turn → OK ({:?})", content);
 }
@@ -378,9 +435,19 @@ async fn test_system_prompt(h: &Harness) {
         "max_tokens": 12,
         "temperature": 0
     });
-    let resp: Value = h.client.post(format!("{}/v1/chat/completions", h.base))
-        .json(&body).send().await.expect("POST system").json().await.expect("json");
-    let content = resp["choices"][0]["message"]["content"].as_str().expect("content");
+    let resp: Value = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST system")
+        .json()
+        .await
+        .expect("json");
+    let content = resp["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("content");
     assert!(!content.is_empty(), "system-prompt content empty");
     eprintln!("[scenario] system prompt → OK ({:?})", content);
 }
@@ -395,20 +462,35 @@ async fn test_stop_sequence(h: &Harness) {
         "temperature": 0,
         "stop": ["E"]
     });
-    let resp: Value = h.client.post(format!("{}/v1/completions", h.base))
-        .json(&body).send().await.expect("POST stop").json().await.expect("json");
+    let resp: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST stop")
+        .json()
+        .await
+        .expect("json");
     let text = resp["choices"][0]["text"].as_str().expect("text");
-    let finish = resp["choices"][0]["finish_reason"].as_str().expect("finish");
+    let finish = resp["choices"][0]["finish_reason"]
+        .as_str()
+        .expect("finish");
     // Accept either "stop" (string hit) or "length" (model never emitted it).
     // When finish=="stop", the returned text must have the stop string
     // trimmed out — OpenAI semantics, and the behavior we verify post-P2.
     // (A one-token overshoot is theoretically possible if a BPE token
     // straddles the stop string; single-letter 'E' is unlikely to straddle.)
     if finish == "stop" {
-        assert!(!text.contains('E'),
-            "finish=stop but returned text still contains the stop string 'E': {text:?}");
+        assert!(
+            !text.contains('E'),
+            "finish=stop but returned text still contains the stop string 'E': {text:?}"
+        );
     }
-    eprintln!("[scenario] stop sequence → OK (finish={}, text={:?})", finish, text);
+    eprintln!(
+        "[scenario] stop sequence → OK (finish={}, text={:?})",
+        finish, text
+    );
 }
 
 async fn test_concurrent_requests(h: &Harness) {
@@ -421,8 +503,15 @@ async fn test_concurrent_requests(h: &Harness) {
         let url = format!("{}/v1/completions", h.base);
         handles.push(tokio::spawn(async move {
             let body = json!({"prompt": p, "max_tokens": 6, "temperature": 0});
-            let v: Value = client.post(url).json(&body).send().await
-                .expect("concurrent send").json().await.expect("concurrent json");
+            let v: Value = client
+                .post(url)
+                .json(&body)
+                .send()
+                .await
+                .expect("concurrent send")
+                .json()
+                .await
+                .expect("concurrent json");
             v["choices"][0]["text"].as_str().unwrap_or("").to_string()
         }));
     }
@@ -439,13 +528,21 @@ async fn test_concurrent_requests(h: &Harness) {
 
 async fn test_empty_messages_error(h: &Harness) {
     let body = json!({"messages": [], "max_tokens": 4});
-    let resp = h.client.post(format!("{}/v1/chat/completions", h.base))
-        .json(&body).send().await.expect("POST empty");
+    let resp = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST empty");
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let v: Value = resp.json().await.expect("parse error body");
     assert_eq!(v["error"]["type"], "invalid_request_error");
     let msg = v["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("messages"), "error message should mention messages: {msg}");
+    assert!(
+        msg.contains("messages"),
+        "error message should mention messages: {msg}"
+    );
     eprintln!("[scenario] empty messages → OK (400 invalid_request_error)");
 }
 
@@ -453,11 +550,24 @@ async fn test_max_tokens_zero(h: &Harness) {
     // max_tokens=0 must produce an empty completion without invoking the
     // engine loop. finish_reason=length, completion_tokens=0.
     let body = json!({"prompt": "Hello", "max_tokens": 0, "temperature": 0});
-    let resp: Value = h.client.post(format!("{}/v1/completions", h.base))
-        .json(&body).send().await.expect("POST zero").json().await.expect("json");
+    let resp: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST zero")
+        .json()
+        .await
+        .expect("json");
     let text = resp["choices"][0]["text"].as_str().expect("text");
-    assert_eq!(text, "", "max_tokens=0 must return empty text, got {text:?}");
-    let finish = resp["choices"][0]["finish_reason"].as_str().expect("finish");
+    assert_eq!(
+        text, "",
+        "max_tokens=0 must return empty text, got {text:?}"
+    );
+    let finish = resp["choices"][0]["finish_reason"]
+        .as_str()
+        .expect("finish");
     assert_eq!(finish, "length");
     let ct = resp["usage"]["completion_tokens"].as_u64().expect("ct");
     assert_eq!(ct, 0, "completion_tokens must be 0");
@@ -466,17 +576,27 @@ async fn test_max_tokens_zero(h: &Harness) {
 
 async fn test_context_overflow_error(h: &Harness) {
     let body = json!({"prompt": "x", "max_tokens": 999_999});
-    let resp = h.client.post(format!("{}/v1/completions", h.base))
-        .json(&body).send().await.expect("POST overflow");
+    let resp = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("POST overflow");
     // Post-refactor this is a client error (400) because the check runs
     // in the handler before we commit to an SSE response.
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST,
-        "expected 400 for context overflow");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "expected 400 for context overflow"
+    );
     let v: Value = resp.json().await.expect("parse body");
     assert_eq!(v["error"]["type"], "invalid_request_error");
     let msg = v["error"]["message"].as_str().unwrap_or("");
-    assert!(msg.contains("max_context") || msg.contains("exceeds"),
-        "error should mention context overflow: {msg}");
+    assert!(
+        msg.contains("max_context") || msg.contains("exceeds"),
+        "error should mention context overflow: {msg}"
+    );
     eprintln!("[scenario] context overflow → OK (400 invalid_request_error)");
 }
 

@@ -24,12 +24,11 @@ pub async fn completions(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiError> {
-    let template = state
-        .chat_template
-        .clone()
-        .ok_or_else(|| ApiError::bad_request(
+    let template = state.chat_template.clone().ok_or_else(|| {
+        ApiError::bad_request(
             "this model has no chat_template; use /v1/completions with a raw prompt instead",
-        ))?;
+        )
+    })?;
     if req.messages.is_empty() {
         return Err(ApiError::bad_request("messages must not be empty"));
     }
@@ -62,7 +61,9 @@ pub async fn completions(
     if req.stream {
         let rx = generate::spawn(state.clone(), prompt_ids, params);
         let stream = chat_sse_stream(rx, id, created, model);
-        Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+        Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response())
     } else {
         let rx = generate::spawn(state.clone(), prompt_ids, params);
         let result = generate::collect(rx)

@@ -34,10 +34,10 @@ use half::bf16;
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-#[path = "../gemma4_int4_engine.rs"]
-mod gemma4_int4_engine;
 #[path = "../gemma4_engine.rs"]
 mod gemma4_engine;
+#[path = "../gemma4_int4_engine.rs"]
+mod gemma4_int4_engine;
 use gemma4_engine::Gemma4Engine;
 use gemma4_int4_engine::{int4_bake_ok, Gemma4Int4Engine};
 
@@ -131,7 +131,10 @@ fn max_abs_delta(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn l2_norm(a: &[f32]) -> f32 {
-    a.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt() as f32
+    a.iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        .sqrt() as f32
 }
 
 fn argmax(logits: &[f32]) -> usize {
@@ -216,8 +219,8 @@ fn main() -> Result<()> {
     );
 
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow!("tokenizer load failed: {e}"))?;
+    let tokenizer =
+        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("tokenizer load failed: {e}"))?;
     let encoded = tokenizer
         .encode(cli.prompt.as_str(), true)
         .map_err(|e| anyhow!("tokenize failed: {e}"))?;
@@ -332,8 +335,13 @@ fn main() -> Result<()> {
 
     if let Some(out_path) = &cli.dump_rust {
         dump_rust_captures(
-            out_path, &prompt_tokens, py.hidden_size, py.vocab_size,
-            &rust_per_layer, &rust_final_norm, &logits,
+            out_path,
+            &prompt_tokens,
+            py.hidden_size,
+            py.vocab_size,
+            &rust_per_layer,
+            &rust_final_norm,
+            &logits,
         )?;
         eprintln!("[rust] dumped captures to {}", out_path.display());
     }
@@ -356,11 +364,7 @@ fn main() -> Result<()> {
     let mut min_cos = f32::INFINITY;
     let mut min_cos_layer = 0usize;
 
-    for (i, (rust_h, py_h)) in rust_per_layer
-        .iter()
-        .zip(py_per_layer.iter())
-        .enumerate()
-    {
+    for (i, (rust_h, py_h)) in rust_per_layer.iter().zip(py_per_layer.iter()).enumerate() {
         let cos = cosine_similarity(rust_h, py_h);
         let max_abs = max_abs_delta(rust_h, py_h);
         let nr = l2_norm(rust_h);
@@ -407,7 +411,11 @@ fn main() -> Result<()> {
         max_abs_logits,
         rust_argmax,
         py_argmax,
-        if rust_argmax == py_argmax { "MATCH" } else { "MISS" },
+        if rust_argmax == py_argmax {
+            "MATCH"
+        } else {
+            "MISS"
+        },
         top5_overlap,
     );
 
@@ -420,16 +428,24 @@ fn main() -> Result<()> {
         drift_layers.len()
     );
     if !bug_layers.is_empty() {
-        println!("[verdict] BUG suspected — layers with cos_sim < {:.4}: {:?}",
-            cli.bug_threshold, bug_layers);
+        println!(
+            "[verdict] BUG suspected — layers with cos_sim < {:.4}: {:?}",
+            cli.bug_threshold, bug_layers
+        );
         // Still exit 0 — this binary is a diagnostic; the operator reads the
         // table and decides. Non-zero exit would make shell one-liners awkward.
     } else if !drift_layers.is_empty() {
-        println!("[verdict] CLEAN with drift — {} layers between {:.4} and {:.4}",
-            drift_layers.len(), cli.bug_threshold, cli.drift_threshold);
+        println!(
+            "[verdict] CLEAN with drift — {} layers between {:.4} and {:.4}",
+            drift_layers.len(),
+            cli.bug_threshold,
+            cli.drift_threshold
+        );
     } else {
-        println!("[verdict] CLEAN — every layer above drift threshold {:.4}",
-            cli.drift_threshold);
+        println!(
+            "[verdict] CLEAN — every layer above drift threshold {:.4}",
+            cli.drift_threshold
+        );
     }
 
     Ok(())

@@ -15,9 +15,15 @@
 
 use serde::Deserialize;
 
-fn default_rope_theta() -> f64 { 10_000.0 }
-fn default_partial_rotary_factor() -> f64 { 1.0 }
-fn default_rope_type() -> String { "default".to_string() }
+fn default_rope_theta() -> f64 {
+    10_000.0
+}
+fn default_partial_rotary_factor() -> f64 {
+    1.0
+}
+fn default_rope_type() -> String {
+    "default".to_string()
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct GemmaRope {
@@ -138,7 +144,9 @@ pub struct TextConfig {
 
 impl TextConfig {
     pub fn attn_kind(&self, layer_idx: usize) -> Option<AttnKind> {
-        self.layer_types.get(layer_idx).and_then(|s| AttnKind::parse(s))
+        self.layer_types
+            .get(layer_idx)
+            .and_then(|s| AttnKind::parse(s))
     }
 
     pub fn head_dim_for(&self, kind: AttnKind) -> usize {
@@ -150,8 +158,16 @@ impl TextConfig {
 
     pub fn rope_for(&self, kind: AttnKind) -> GemmaRope {
         match kind {
-            AttnKind::Sliding => self.rope_parameters.sliding_attention.clone().unwrap_or_default(),
-            AttnKind::Full => self.rope_parameters.full_attention.clone().unwrap_or_default(),
+            AttnKind::Sliding => self
+                .rope_parameters
+                .sliding_attention
+                .clone()
+                .unwrap_or_default(),
+            AttnKind::Full => self
+                .rope_parameters
+                .full_attention
+                .clone()
+                .unwrap_or_default(),
         }
     }
 
@@ -170,7 +186,8 @@ impl TextConfig {
     /// Count of layers that actually own their K/V projections.
     /// The last `num_kv_shared_layers` reuse K/V from earlier layers.
     pub fn num_kv_owning_layers(&self) -> usize {
-        self.num_hidden_layers.saturating_sub(self.num_kv_shared_layers)
+        self.num_hidden_layers
+            .saturating_sub(self.num_kv_shared_layers)
     }
 
     /// For shared-KV layers (the last `num_kv_shared_layers`), return the
@@ -185,13 +202,17 @@ impl TextConfig {
             return None;
         }
         let my_kind = self.attn_kind(layer_idx)?;
-        (0..first_kv_shared).rev().find(|&j| self.attn_kind(j) == Some(my_kind))
+        (0..first_kv_shared)
+            .rev()
+            .find(|&j| self.attn_kind(j) == Some(my_kind))
     }
 
     /// EOS token IDs (may be a single ID or a list, matching Qwen's config shape).
     pub fn eos_token_ids(&self) -> Vec<u32> {
         match &self.eos_token_id {
-            Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| vec![v as u32]).unwrap_or_default(),
+            Some(serde_json::Value::Number(n)) => {
+                n.as_u64().map(|v| vec![v as u32]).unwrap_or_default()
+            }
             Some(serde_json::Value::Array(arr)) => arr
                 .iter()
                 .filter_map(|v| v.as_u64().map(|n| n as u32))
@@ -329,9 +350,8 @@ mod tests {
         let mut v: serde_json::Value = serde_json::from_str(E2B_CONFIG).unwrap();
         v["text_config"]["num_hidden_layers"] = serde_json::json!(35);
         v["text_config"]["num_kv_shared_layers"] = serde_json::json!(20);
-        v["text_config"]["layer_types"] = serde_json::Value::Array(
-            types.into_iter().map(serde_json::Value::String).collect(),
-        );
+        v["text_config"]["layer_types"] =
+            serde_json::Value::Array(types.into_iter().map(serde_json::Value::String).collect());
         let cfg: Config = serde_json::from_value(v).unwrap();
         let t = &cfg.text_config;
         // Non-shared layers (0..15) return None.
@@ -369,9 +389,8 @@ mod tests {
         v["text_config"]["num_hidden_layers"] = serde_json::json!(42);
         v["text_config"]["num_kv_shared_layers"] = serde_json::json!(18);
         v["text_config"]["use_double_wide_mlp"] = serde_json::json!(false);
-        v["text_config"]["layer_types"] = serde_json::Value::Array(
-            types.into_iter().map(serde_json::Value::String).collect(),
-        );
+        v["text_config"]["layer_types"] =
+            serde_json::Value::Array(types.into_iter().map(serde_json::Value::String).collect());
         let cfg: Config = serde_json::from_value(v).unwrap();
         let t = &cfg.text_config;
         // 24 owning layers: 0..=23. Full-attn layers are at positions 5,11,17,23,29,35,41.
