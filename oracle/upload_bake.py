@@ -66,6 +66,7 @@ VARIANT_DIR_SUFFIX = {
     "fp8-native": "-fp8",
     "int4-gptq": "-int4-gptq",
     "q4km": "-q4km",
+    "q4km-gptq": "-q4km-gptq",
 }
 
 FAMILY_FOR = {
@@ -125,10 +126,12 @@ def validate_bake(bake_dir: Path, variant: str) -> dict:
     # where a user points --int4 at a BF16 bake directory.
     layouts = {t.get("layout") for t in manifest.get("tensors", [])}
     lowbit_layouts = {"Int4Quantized", "GgmlQ4K", "GgmlQ5K", "GgmlQ6K"}
-    if variant in ("int4-gptq", "q4km") and not (layouts & lowbit_layouts):
+    if variant in ("int4-gptq", "q4km", "q4km-gptq") and not (layouts & lowbit_layouts):
         sys.exit(f"error: {bake_dir} has no Int4Quantized tensors — wrong variant?")
     if variant == "q4km" and manifest.get("quant_profile") != "q4km-ggml-v1":
         sys.exit(f"error: {bake_dir} is missing quant_profile=q4km-ggml-v1")
+    if variant == "q4km-gptq" and manifest.get("quant_profile") != "q4km-gptq-v1":
+        sys.exit(f"error: {bake_dir} is missing quant_profile=q4km-gptq-v1")
     if variant == "fp8-native" and "Fp8Native" not in layouts:
         sys.exit(f"error: {bake_dir} has no Fp8Native tensors — wrong variant?")
     return manifest
@@ -371,6 +374,8 @@ def main() -> None:
     variant_group.add_argument("--fp8-native", action="store_true", dest="fp8_native")
     variant_group.add_argument("--int4", action="store_true", help="INT4 GPTQ bake")
     variant_group.add_argument("--q4km", action="store_true", help="GGUF q4km raw GGML K-block bake")
+    variant_group.add_argument("--q4km-gptq", action="store_true", dest="q4km_gptq",
+                               help="Q4KM-sourced GPTQ/native INT4 bake")
     ap.add_argument("--tag", default=f"bakes-v{FORMAT_VERSION}")
     ap.add_argument("--dry-run", action="store_true", help="Print gh commands, don't upload")
     ap.add_argument("--prune-old-cvt", action="store_true",
@@ -383,6 +388,8 @@ def main() -> None:
         variant = "fp8-native"
     elif args.q4km:
         variant = "q4km"
+    elif args.q4km_gptq:
+        variant = "q4km-gptq"
     else:
         variant = "int4-gptq"
 

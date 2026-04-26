@@ -43,6 +43,7 @@ pub struct LoaderConfig {
     pub max_context: usize,
     pub int4: bool,
     pub q4km: bool,
+    pub q4km_gptq: bool,
     pub fp8_runtime: bool,
     pub kv_fp8: bool,
     pub api_key: Option<String>,
@@ -52,8 +53,12 @@ pub struct LoaderConfig {
 }
 
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
-    if cfg.q4km && (cfg.int4 || cfg.fp8_runtime) {
-        bail!("--q4km is mutually exclusive with --int4 and --fp8-runtime");
+    let q4km_like = cfg.q4km || cfg.q4km_gptq;
+    if cfg.q4km && cfg.q4km_gptq {
+        bail!("--q4km is mutually exclusive with --q4km-gptq");
+    }
+    if q4km_like && (cfg.int4 || cfg.fp8_runtime) {
+        bail!("--q4km/--q4km-gptq are mutually exclusive with --int4 and --fp8-runtime");
     }
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
@@ -66,16 +71,16 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             registry::supported_models_list().join(", ")
         )
     })?;
-    if cfg.q4km
+    if q4km_like
         && !matches!(
             variant.family(),
             ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
         )
     {
-        bail!("--q4km is currently supported only for Qwen models");
+        bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
     }
-    if cfg.q4km && backend != Backend::Cuda {
-        bail!("--q4km is currently supported only on CUDA");
+    if q4km_like && backend != Backend::Cuda {
+        bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
     }
 
     if backend == Backend::Metal {
@@ -190,7 +195,9 @@ fn ensure_hf_metadata_present(cfg: &LoaderConfig, variant: &ModelVariant) -> Res
     if cfg.model_dir.join("config.json").exists() {
         return Ok(());
     }
-    let bake_variant = if cfg.q4km {
+    let bake_variant = if cfg.q4km_gptq {
+        model_store::fetch::BakeVariant::Q4KmGptq
+    } else if cfg.q4km {
         model_store::fetch::BakeVariant::Q4Km
     } else if cfg.int4 {
         model_store::fetch::BakeVariant::Int4Gptq
@@ -342,7 +349,9 @@ fn build_qwen(
     // Prefer the baked format; auto-bake BF16/FP8 if missing, fail with a
     // clear message for INT4 (calibration must happen offline).
     let t0 = Instant::now();
-    let variant_bake = if cfg.q4km {
+    let variant_bake = if cfg.q4km_gptq {
+        model_store::fetch::BakeVariant::Q4KmGptq
+    } else if cfg.q4km {
         model_store::fetch::BakeVariant::Q4Km
     } else if cfg.int4 {
         model_store::fetch::BakeVariant::Int4Gptq
@@ -355,12 +364,10 @@ fn build_qwen(
     let _lock = model_store::BakeLock::acquire(&cfg.model_dir)
         .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
 
-    let bake_ok = || {
-        if variant_bake == model_store::fetch::BakeVariant::Q4Km {
-            model_store::version_ok_q4km(&bake_dir)
-        } else {
-            model_store::version_ok(&bake_dir)
-        }
+    let bake_ok = || match variant_bake {
+        model_store::fetch::BakeVariant::Q4Km => model_store::version_ok_q4km(&bake_dir),
+        model_store::fetch::BakeVariant::Q4KmGptq => model_store::version_ok_q4km_gptq(&bake_dir),
+        _ => model_store::version_ok(&bake_dir),
     };
     if !bake_ok() {
         let local_bake_ok = matches!(

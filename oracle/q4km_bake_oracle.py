@@ -212,6 +212,8 @@ def main() -> int:
                 actual = dequant_int4_tensor(by_name, weights, mapped)
             else:
                 actual = load_baked_raw(by_name, weights, mapped)
+                if meta["dtype"] == "bf16":
+                    expected = torch.from_numpy(expected).to(torch.bfloat16).to(torch.float32).cpu().numpy()
             max_abs, mean_abs, rel_rmse, samples = compare_arrays(actual, expected, args.max_items)
             checks.append(TensorCheck(mapped, info.name, meta["layout"], max_abs, mean_abs, rel_rmse, samples))
 
