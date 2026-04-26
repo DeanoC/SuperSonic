@@ -754,6 +754,22 @@ fn cli_variant(cli: &Cli) -> model_store::fetch::BakeVariant {
     }
 }
 
+fn variant_version_ok(
+    variant: model_store::fetch::BakeVariant,
+    bake_dir: &std::path::Path,
+) -> bool {
+    if variant == model_store::fetch::BakeVariant::Q4Km
+        && bake_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with("-q4km-gptq"))
+    {
+        model_store::version_ok_q4km_gptq(bake_dir)
+    } else {
+        model_store::version_ok(bake_dir)
+    }
+}
+
 fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -934,6 +950,14 @@ fn main() -> Result<()> {
 
     if cli.q4km && (cli.int4 || cli.int8 || cli.fp8_runtime) {
         anyhow::bail!("--q4km is mutually exclusive with --int4, --int8, and --fp8-runtime");
+    }
+    if cli.q4km
+        && !matches!(
+            model_variant.family(),
+            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+        )
+    {
+        anyhow::bail!("--q4km is currently supported only for Qwen models");
     }
     if cli.gguf_file.is_some() && !cli.q4km {
         anyhow::bail!("--gguf-file requires --q4km");
@@ -1336,11 +1360,11 @@ fn main() -> Result<()> {
         } else {
             model_store::fetch::BakeVariant::Bf16
         };
-        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let mut bake_dir = variant.bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
 
-        if cli.download_bake || !model_store::version_ok(&bake_dir) {
+        if cli.download_bake || !variant_version_ok(variant, &bake_dir) {
             let local_bake_ok = matches!(
                 variant,
                 model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
@@ -1356,10 +1380,10 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "no {variant} bake at {} and --no-download set.\n\
-                                 Run a GGUF translation into the directory runtime reads:\n  \
-                                 python oracle/bake_q4km.py --model {} --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}",
+                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
+                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
+                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
                                 bake_dir.display(),
-                                cli.model,
                                 cli.model_dir.display(),
                                 bake_dir.display(),
                             );
@@ -1380,10 +1404,9 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "could not obtain {variant} bake: {e}\n\n\
-                                 Run a GGUF translation into the directory runtime reads:\n  \
-                                 python oracle/bake_q4km.py --model {} --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
-                                 For a release-compatible GPTQ bake, use oracle/q4km_stream_gptq_bake.py with the same --out-dir before uploading with --q4km-gptq.",
-                                cli.model,
+                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
+                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
+                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
                                 cli.model_dir.display(),
                                 bake_dir.display(),
                             );
@@ -1401,10 +1424,13 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            if !model_store::version_ok(&bake_dir) && local_bake_ok {
+            if !variant_version_ok(variant, &bake_dir) && local_bake_ok {
                 let bake_start = Instant::now();
                 if cli.q4km {
-                    run_q4km_baker(&cli, &bake_dir)?;
+                    bake_dir = model_store::bake_dir_q4km_minmax(&cli.model_dir);
+                    if !model_store::version_ok(&bake_dir) {
+                        run_q4km_baker(&cli, &bake_dir)?;
+                    }
                 } else {
                     let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
                     eprintln!(
@@ -1426,7 +1452,7 @@ fn main() -> Result<()> {
                 eprintln!("[bake] done in {:.1}s", bake_start.elapsed().as_secs_f64());
             }
         }
-        if model_store::version_ok(&bake_dir) {
+        if variant_version_ok(variant, &bake_dir) {
             eprintln!("[weights] found baked package at {}", bake_dir.display());
         }
         let store = model_store::BakedStore::open(&bake_dir)

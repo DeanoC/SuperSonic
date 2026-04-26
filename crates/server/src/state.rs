@@ -66,6 +66,14 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             registry::supported_models_list().join(", ")
         )
     })?;
+    if cfg.q4km
+        && !matches!(
+            variant.family(),
+            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+        )
+    {
+        bail!("--q4km is currently supported only for Qwen models");
+    }
 
     if backend == Backend::Metal {
         if variant != ModelVariant::Qwen3_5_0_8B {
@@ -344,7 +352,14 @@ fn build_qwen(
     let _lock = model_store::BakeLock::acquire(&cfg.model_dir)
         .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
 
-    if !model_store::version_ok(&bake_dir) {
+    let bake_ok = || {
+        if variant_bake == model_store::fetch::BakeVariant::Q4Km {
+            model_store::version_ok_q4km_gptq(&bake_dir)
+        } else {
+            model_store::version_ok(&bake_dir)
+        }
+    };
+    if !bake_ok() {
         let local_bake_ok = matches!(
             variant_bake,
             model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
@@ -366,8 +381,8 @@ fn build_qwen(
         if !downloaded && !local_bake_ok {
             bail!(
                 "no {variant_bake} bake at {} and download unavailable. Low-bit baking \
-                 must happen offline — run `python oracle/bake_q4km.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
-                 for q4km or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
+                 must happen offline — run `python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
+                 for q4km-gptq or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
                  then rerun without --no-download to fetch from the GitHub bakes-v1 release.",
                 bake_dir.display(),
                 cfg.model_dir.display(),
@@ -375,7 +390,7 @@ fn build_qwen(
                 cfg.model_dir.display(),
             );
         }
-        if !model_store::version_ok(&bake_dir) && local_bake_ok {
+        if !bake_ok() && local_bake_ok {
             tracing::info!("baking Qwen3.5 {} weights (one-time)...", variant_bake);
             let bake_start = Instant::now();
             let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)

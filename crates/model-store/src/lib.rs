@@ -148,3 +148,20 @@ pub fn version_ok(bake_dir: &Path) -> bool {
         && m.converter_version == CONVERTER_VERSION
         && weights_bin_path(bake_dir).exists()
 }
+
+/// Check if a valid Q4KM GPTQ baked package exists at the given bake directory.
+/// This rejects older calibration-free Q4KM packages if they were written into
+/// the GPTQ directory by an older runner.
+pub fn version_ok_q4km_gptq(bake_dir: &Path) -> bool {
+    let mp = manifest_path(bake_dir);
+    let Ok(text) = std::fs::read_to_string(&mp) else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_str::<Manifest>(&text) else {
+        return false;
+    };
+    m.format_version == FORMAT_VERSION
+        && m.converter_version == CONVERTER_VERSION
+        && m.quant_profile.as_deref() == Some("q4km-gptq-v1")
+        && weights_bin_path(bake_dir).exists()
+}
