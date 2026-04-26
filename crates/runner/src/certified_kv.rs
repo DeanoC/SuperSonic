@@ -17,6 +17,7 @@ pub(crate) struct CertifiedKvConfig {
     pub ranking_r: usize,
     pub rung1_threshold: f32,
     pub rung1_multiplier: f32,
+    pub key_cache_blocks: usize,
     pub delta_guard_factor: f32,
     pub score_exploration_rate: f32,
     pub require_certified_tail_bound: bool,
@@ -38,6 +39,7 @@ impl CertifiedKvConfig {
             ranking_r: cli.certified_kv_ranking_r,
             rung1_threshold: cli.certified_kv_rung1_threshold,
             rung1_multiplier: cli.certified_kv_rung1_multiplier,
+            key_cache_blocks: cli.certified_kv_key_cache_blocks,
             delta_guard_factor: cli.certified_kv_delta_guard_factor,
             score_exploration_rate: cli.certified_kv_score_exploration_rate,
             require_certified_tail_bound: !cli.certified_kv_allow_uncertified_tail,
@@ -79,6 +81,14 @@ impl CertifiedKvConfig {
         if self.rung1_multiplier < 1.0 {
             bail!("--certified-kv-rung1-multiplier must be >= 1");
         }
+        let expanded_key_budget = self
+            .k_max
+            .saturating_mul(self.rung1_multiplier.ceil().max(1.0) as usize);
+        if self.key_cache_blocks < expanded_key_budget {
+            bail!(
+                "--certified-kv-key-cache-blocks must be >= ceil(--certified-kv-rung1-multiplier) * --certified-kv-k-max"
+            );
+        }
         if self.delta_guard_factor < 0.0 {
             bail!("--certified-kv-delta-guard-factor must be >= 0");
         }
@@ -93,7 +103,7 @@ impl CertifiedKvConfig {
 
     pub(crate) fn summary(&self) -> String {
         format!(
-            "block={} value_group={} value_mode={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} delta_guard_factor={:.3} score_exploration_rate={:.3} require_certified_tail_bound={} eps_guard={:.6} telemetry={}",
+            "block={} value_group={} value_mode={} tau_cov={:.6} k_min={} k_max={} v_tol={:.6} key_cache_blocks={} value_cache_blocks={} ranking_r={} rung1_threshold={:.6} rung1_multiplier={:.3} delta_guard_factor={:.3} score_exploration_rate={:.3} require_certified_tail_bound={} eps_guard={:.6} telemetry={}",
             self.block_size,
             self.value_group_size,
             if self.bf16_values { "bf16" } else { "int4" },
@@ -101,6 +111,8 @@ impl CertifiedKvConfig {
             self.k_min,
             self.k_max,
             self.v_tol,
+            self.key_cache_blocks,
+            self.value_cache_blocks,
             self.ranking_r,
             self.rung1_threshold,
             self.rung1_multiplier,

@@ -59,7 +59,12 @@ pub struct LayerState {
     pub certified_kv_tail_v: Option<GpuBuffer>,
     pub certified_kv_gpu_tail_only: bool,
     pub certified_kv_promoted_key_cache: Option<GpuBuffer>,
-    pub certified_kv_promoted_key_cache_tokens: usize,
+    pub certified_kv_promoted_key_cache_tags_gpu: Option<GpuBuffer>,
+    pub certified_kv_promoted_key_cache_lru_gpu: Option<GpuBuffer>,
+    pub certified_kv_promoted_key_cache_capacity: usize,
+    pub certified_kv_promoted_key_cache_tags: Vec<usize>,
+    pub certified_kv_promoted_key_cache_lru: Vec<u64>,
+    pub certified_kv_promoted_key_cache_tick: u64,
     pub certified_kv_promoted_value_cache: Option<GpuBuffer>,
     pub certified_kv_promoted_value_cache_capacity: usize,
     pub certified_kv_promoted_value_cache_tags: Vec<usize>,
@@ -133,7 +138,12 @@ impl LayerState {
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
             certified_kv_promoted_key_cache: None,
-            certified_kv_promoted_key_cache_tokens: 0,
+            certified_kv_promoted_key_cache_tags_gpu: None,
+            certified_kv_promoted_key_cache_lru_gpu: None,
+            certified_kv_promoted_key_cache_capacity: 0,
+            certified_kv_promoted_key_cache_tags: Vec::new(),
+            certified_kv_promoted_key_cache_lru: Vec::new(),
+            certified_kv_promoted_key_cache_tick: 0,
             certified_kv_promoted_value_cache: None,
             certified_kv_promoted_value_cache_capacity: 0,
             certified_kv_promoted_value_cache_tags: Vec::new(),
@@ -188,7 +198,12 @@ impl LayerState {
             certified_kv_tail_v: None,
             certified_kv_gpu_tail_only: false,
             certified_kv_promoted_key_cache: None,
-            certified_kv_promoted_key_cache_tokens: 0,
+            certified_kv_promoted_key_cache_tags_gpu: None,
+            certified_kv_promoted_key_cache_lru_gpu: None,
+            certified_kv_promoted_key_cache_capacity: 0,
+            certified_kv_promoted_key_cache_tags: Vec::new(),
+            certified_kv_promoted_key_cache_lru: Vec::new(),
+            certified_kv_promoted_key_cache_tick: 0,
             certified_kv_promoted_value_cache: None,
             certified_kv_promoted_value_cache_capacity: 0,
             certified_kv_promoted_value_cache_tags: Vec::new(),
@@ -317,9 +332,14 @@ impl LayerState {
         if filled < self.certified_kv_host_tokens {
             self.certified_kv_host_tokens = 0;
         }
-        if filled < self.certified_kv_promoted_key_cache_tokens {
+        if filled == 0 {
             self.certified_kv_promoted_key_cache = None;
-            self.certified_kv_promoted_key_cache_tokens = 0;
+            self.certified_kv_promoted_key_cache_tags_gpu = None;
+            self.certified_kv_promoted_key_cache_lru_gpu = None;
+            self.certified_kv_promoted_key_cache_capacity = 0;
+            self.certified_kv_promoted_key_cache_tags.clear();
+            self.certified_kv_promoted_key_cache_lru.clear();
+            self.certified_kv_promoted_key_cache_tick = 0;
         }
         if filled == 0 {
             self.certified_kv_promoted_value_cache = None;
@@ -363,7 +383,12 @@ impl LayerState {
             self.certified_kv_host_value_error_cache.clear();
             self.certified_kv_host_value_norm_cache.clear();
             self.certified_kv_promoted_key_cache = None;
-            self.certified_kv_promoted_key_cache_tokens = 0;
+            self.certified_kv_promoted_key_cache_tags_gpu = None;
+            self.certified_kv_promoted_key_cache_lru_gpu = None;
+            self.certified_kv_promoted_key_cache_capacity = 0;
+            self.certified_kv_promoted_key_cache_tags.clear();
+            self.certified_kv_promoted_key_cache_lru.clear();
+            self.certified_kv_promoted_key_cache_tick = 0;
             self.certified_kv_promoted_value_cache = None;
             self.certified_kv_promoted_value_cache_capacity = 0;
             self.certified_kv_promoted_value_cache_tags.clear();
@@ -447,7 +472,16 @@ impl LayerState {
             certified_kv_tail_v: clone_opt(&self.certified_kv_tail_v)?,
             certified_kv_gpu_tail_only: self.certified_kv_gpu_tail_only,
             certified_kv_promoted_key_cache: clone_opt(&self.certified_kv_promoted_key_cache)?,
-            certified_kv_promoted_key_cache_tokens: self.certified_kv_promoted_key_cache_tokens,
+            certified_kv_promoted_key_cache_tags_gpu: clone_opt(
+                &self.certified_kv_promoted_key_cache_tags_gpu,
+            )?,
+            certified_kv_promoted_key_cache_lru_gpu: clone_opt(
+                &self.certified_kv_promoted_key_cache_lru_gpu,
+            )?,
+            certified_kv_promoted_key_cache_capacity: self.certified_kv_promoted_key_cache_capacity,
+            certified_kv_promoted_key_cache_tags: self.certified_kv_promoted_key_cache_tags.clone(),
+            certified_kv_promoted_key_cache_lru: self.certified_kv_promoted_key_cache_lru.clone(),
+            certified_kv_promoted_key_cache_tick: self.certified_kv_promoted_key_cache_tick,
             certified_kv_promoted_value_cache: clone_opt(&self.certified_kv_promoted_value_cache)?,
             certified_kv_promoted_value_cache_capacity: self
                 .certified_kv_promoted_value_cache_capacity,

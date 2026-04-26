@@ -811,6 +811,8 @@ struct ComponentFullAttentionScratch {
     certified_delta_blocks: Option<GpuBuffer>,
     certified_selected_blocks: Option<GpuBuffer>,
     certified_selected_counts: Option<GpuBuffer>,
+    certified_key_gather_index: Option<GpuBuffer>,
+    certified_key_cache_counters: Option<GpuBuffer>,
     certified_selector_e_key: Option<GpuBuffer>,
     certified_selector_delta_tail: Option<GpuBuffer>,
     certified_selector_vmax: Option<GpuBuffer>,
@@ -891,6 +893,8 @@ impl ComponentFullAttentionScratch {
             certified_delta_blocks: None,
             certified_selected_blocks: None,
             certified_selected_counts: None,
+            certified_key_gather_index: None,
+            certified_key_cache_counters: None,
             certified_selector_e_key: None,
             certified_selector_delta_tail: None,
             certified_selector_vmax: None,
@@ -1013,6 +1017,9 @@ pub struct DecodeStageTimings {
     pub certified_kv_dense_fallback_layers: usize,
     pub certified_kv_promoted_key_h2d_bytes: usize,
     pub certified_kv_promoted_value_h2d_bytes: usize,
+    pub certified_kv_promoted_key_cache_hits: usize,
+    pub certified_kv_promoted_key_cache_misses: usize,
+    pub certified_kv_promoted_key_cache_overflows: usize,
     pub certified_kv_promoted_value_cache_hits: usize,
     pub certified_kv_promoted_value_cache_misses: usize,
     pub certified_kv_promoted_value_cache_overflows: usize,
@@ -1066,6 +1073,10 @@ impl DecodeStageTimings {
         self.certified_kv_dense_fallback_layers += rhs.certified_kv_dense_fallback_layers;
         self.certified_kv_promoted_key_h2d_bytes += rhs.certified_kv_promoted_key_h2d_bytes;
         self.certified_kv_promoted_value_h2d_bytes += rhs.certified_kv_promoted_value_h2d_bytes;
+        self.certified_kv_promoted_key_cache_hits += rhs.certified_kv_promoted_key_cache_hits;
+        self.certified_kv_promoted_key_cache_misses += rhs.certified_kv_promoted_key_cache_misses;
+        self.certified_kv_promoted_key_cache_overflows +=
+            rhs.certified_kv_promoted_key_cache_overflows;
         self.certified_kv_promoted_value_cache_hits += rhs.certified_kv_promoted_value_cache_hits;
         self.certified_kv_promoted_value_cache_misses +=
             rhs.certified_kv_promoted_value_cache_misses;
@@ -1125,6 +1136,8 @@ pub struct CertifiedKvMemoryStats {
     pub tier1_compressed_vram_bytes: usize,
     pub tier2_host_pinned_bytes: usize,
     pub tail_bf16_vram_bytes: usize,
+    pub promoted_key_cache_vram_bytes: usize,
+    pub promoted_value_cache_vram_bytes: usize,
     pub ranking_prefix_scratch_vram_bytes: usize,
     pub dense_bf16_kv_vram_bytes: usize,
 }
@@ -1133,6 +1146,8 @@ impl CertifiedKvMemoryStats {
     pub fn total_certified_vram_bytes(&self) -> usize {
         self.tier1_compressed_vram_bytes
             + self.tail_bf16_vram_bytes
+            + self.promoted_key_cache_vram_bytes
+            + self.promoted_value_cache_vram_bytes
             + self.ranking_prefix_scratch_vram_bytes
             + self.dense_bf16_kv_vram_bytes
     }
@@ -1151,6 +1166,7 @@ pub struct CertifiedKvDecodeParams {
     pub ranking_r: usize,
     pub rung1_threshold: f32,
     pub rung1_multiplier: f32,
+    pub key_cache_blocks: usize,
     pub delta_guard_factor: f32,
     pub score_exploration_rate: f32,
     pub require_certified_tail_bound: bool,
@@ -1171,6 +1187,7 @@ impl CertifiedKvDecodeParams {
             ranking_r: 1,
             rung1_threshold: 0.005,
             rung1_multiplier: 2.0,
+            key_cache_blocks: 256,
             delta_guard_factor: 3.0,
             score_exploration_rate: 0.01,
             require_certified_tail_bound: true,
@@ -5625,175 +5642,148 @@ impl DecodeEngine {
                     let key_scale_stride_blocks = key_scale.shape()[1];
                     let value_error_stride_blocks =
                         ls.certified_kv_value_error.as_ref().unwrap().shape()[1];
-                    // If the configured key budget, including the Rung-1 expansion cap,
-                    // can cover the whole cache, conservatively promote every block.
-                    // This is paper-exact: the INT8 tail is empty, so E_key=0 and the
-                    // ranking check is vacuous. It uses the BF16 scratch/cache path but
-                    // does not make Tier-2 BF16 KV resident outside fallback scratch.
-                    let expanded_key_budget = cfg
-                        .k_max
-                        .saturating_mul(cfg.rung1_multiplier.ceil().max(1.0) as usize);
-                    let key_budget_covers_all_blocks = expanded_key_budget >= num_blocks;
-                    let use_device_selector =
-                        !key_budget_covers_all_blocks && cfg.ranking_r <= 1 && num_blocks <= 2048;
+                    // Paper contract: every BF16 key use must be driven by the
+                    // selector/page path. Do not bypass scoring/selection or
+                    // silently materialise an all-key mirror in VRAM, even when
+                    // the selected set happens to cover the whole prefix.
+                    let use_device_selector = cfg.ranking_r <= 1 && num_blocks <= 2048;
                     let mut block_max_host = Vec::new();
                     let mut block_sum_host = Vec::new();
                     let mut query_f32_all = Vec::new();
-                    if !key_budget_covers_all_blocks {
-                        let block_score_shape = [num_q_heads, num_blocks];
-                        if scratch
-                            .certified_block_max
-                            .as_ref()
-                            .map(|buf| buf.shape() != block_score_shape)
-                            .unwrap_or(true)
-                        {
-                            scratch.certified_block_max = Some(
-                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV block_max alloc: {e}"
-                                        )
-                                    })?,
-                            );
-                        }
-                        if scratch
-                            .certified_block_sum
-                            .as_ref()
-                            .map(|buf| buf.shape() != block_score_shape)
-                            .unwrap_or(true)
-                        {
-                            scratch.certified_block_sum = Some(
-                                GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV block_sum alloc: {e}"
-                                        )
-                                    })?,
-                            );
-                        }
-                        let cert_score_start = Instant::now();
-                        kernel_ffi::certified_kv::score_blocks_int8(
-                            self.ordinal,
-                            attn_q,
-                            key_i8,
-                            key_scale,
-                            key_zero,
-                            block_size,
-                            gqa_group,
-                            q_scale,
-                            scratch.certified_block_max.as_mut().unwrap(),
-                            scratch.certified_block_sum.as_mut().unwrap(),
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV score blocks: {e}")
-                        })?;
-                        if !use_device_selector {
-                            block_max_host = decode_f32_le(
-                                &scratch
-                                    .certified_block_max
-                                    .as_ref()
-                                    .unwrap()
-                                    .to_host_bytes()
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV block_max D2H: {e}"
-                                        )
-                                    })?,
-                            );
-                            block_sum_host = decode_f32_le(
-                                &scratch
-                                    .certified_block_sum
-                                    .as_ref()
-                                    .unwrap()
-                                    .to_host_bytes()
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV block_sum D2H: {e}"
-                                        )
-                                    })?,
-                            );
-                            query_f32_all =
-                                decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
-                                })?);
-                        }
-                        if let Some(t) = timings.as_mut() {
-                            t.certified_kv_score_ms +=
-                                cert_score_start.elapsed().as_secs_f64() * 1000.0;
-                        }
-                        let need_meta_refresh = !use_device_selector
-                            && (ls.certified_kv_host_meta_blocks != num_blocks
-                                || ls.certified_kv_host_meta_key_stride_tokens
-                                    != key_stride_tokens
-                                || ls.certified_kv_host_meta_key_scale_stride_blocks
-                                    != key_scale_stride_blocks
-                                || ls.certified_kv_host_meta_value_error_stride_blocks
-                                    != value_error_stride_blocks);
-                        if need_meta_refresh {
-                            ls.certified_kv_host_value_error_cache = decode_f32_le(
-                                &ls.certified_kv_value_error
-                                    .as_ref()
-                                    .unwrap()
-                                    .to_host_bytes()
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV value_error D2H: {e}"
-                                        )
-                                    })?,
-                            );
-                            ls.certified_kv_host_value_norm_cache = decode_f32_le(
-                                &ls.certified_kv_value_norm
-                                    .as_ref()
-                                    .unwrap()
-                                    .to_host_bytes()
-                                    .map_err(|e| {
-                                        anyhow::anyhow!(
-                                            "layer {idx} certified KV value_norm D2H: {e}"
-                                        )
-                                    })?,
-                            );
-                            ls.certified_kv_host_key_scale_cache =
-                                decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
-                                    anyhow::anyhow!("layer {idx} certified KV key_scale D2H: {e}")
-                                })?);
-                            ls.certified_kv_host_key_scale_channel_max_cache =
-                                vec![0.0; num_kv_heads * head_dim];
-                            for kvh in 0..num_kv_heads {
-                                for block in 0..num_blocks {
-                                    let scale_base =
-                                        (kvh * key_scale_stride_blocks + block) * head_dim;
-                                    let max_base = kvh * head_dim;
-                                    for dim in 0..head_dim {
-                                        let scale =
-                                            ls.certified_kv_host_key_scale_cache[scale_base + dim];
-                                        let max_slot = &mut ls
-                                            .certified_kv_host_key_scale_channel_max_cache
-                                            [max_base + dim];
-                                        *max_slot = (*max_slot).max(scale);
-                                    }
+                    let block_score_shape = [num_q_heads, num_blocks];
+                    if scratch
+                        .certified_block_max
+                        .as_ref()
+                        .map(|buf| buf.shape() != block_score_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_block_max = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_max alloc: {e}")
+                                })?,
+                        );
+                    }
+                    if scratch
+                        .certified_block_sum
+                        .as_ref()
+                        .map(|buf| buf.shape() != block_score_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_block_sum = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::F32, &block_score_shape)
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_sum alloc: {e}")
+                                })?,
+                        );
+                    }
+                    let cert_score_start = Instant::now();
+                    kernel_ffi::certified_kv::score_blocks_int8(
+                        self.ordinal,
+                        attn_q,
+                        key_i8,
+                        key_scale,
+                        key_zero,
+                        block_size,
+                        gqa_group,
+                        q_scale,
+                        scratch.certified_block_max.as_mut().unwrap(),
+                        scratch.certified_block_sum.as_mut().unwrap(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {idx} certified KV score blocks: {e}"))?;
+                    if !use_device_selector {
+                        block_max_host = decode_f32_le(
+                            &scratch
+                                .certified_block_max
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_max D2H: {e}")
+                                })?,
+                        );
+                        block_sum_host = decode_f32_le(
+                            &scratch
+                                .certified_block_sum
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV block_sum D2H: {e}")
+                                })?,
+                        );
+                        query_f32_all =
+                            decode_bf16_le_host(&attn_q.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV query D2H: {e}")
+                            })?);
+                    }
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_score_ms +=
+                            cert_score_start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    let need_meta_refresh = !use_device_selector
+                        && (ls.certified_kv_host_meta_blocks != num_blocks
+                            || ls.certified_kv_host_meta_key_stride_tokens != key_stride_tokens
+                            || ls.certified_kv_host_meta_key_scale_stride_blocks
+                                != key_scale_stride_blocks
+                            || ls.certified_kv_host_meta_value_error_stride_blocks
+                                != value_error_stride_blocks);
+                    if need_meta_refresh {
+                        ls.certified_kv_host_value_error_cache = decode_f32_le(
+                            &ls.certified_kv_value_error
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV value_error D2H: {e}")
+                                })?,
+                        );
+                        ls.certified_kv_host_value_norm_cache = decode_f32_le(
+                            &ls.certified_kv_value_norm
+                                .as_ref()
+                                .unwrap()
+                                .to_host_bytes()
+                                .map_err(|e| {
+                                    anyhow::anyhow!("layer {idx} certified KV value_norm D2H: {e}")
+                                })?,
+                        );
+                        ls.certified_kv_host_key_scale_cache =
+                            decode_f32_le(&key_scale.to_host_bytes().map_err(|e| {
+                                anyhow::anyhow!("layer {idx} certified KV key_scale D2H: {e}")
+                            })?);
+                        ls.certified_kv_host_key_scale_channel_max_cache =
+                            vec![0.0; num_kv_heads * head_dim];
+                        for kvh in 0..num_kv_heads {
+                            for block in 0..num_blocks {
+                                let scale_base = (kvh * key_scale_stride_blocks + block) * head_dim;
+                                let max_base = kvh * head_dim;
+                                for dim in 0..head_dim {
+                                    let scale =
+                                        ls.certified_kv_host_key_scale_cache[scale_base + dim];
+                                    let max_slot = &mut ls
+                                        .certified_kv_host_key_scale_channel_max_cache
+                                        [max_base + dim];
+                                    *max_slot = (*max_slot).max(scale);
                                 }
                             }
-                            ls.certified_kv_host_meta_blocks = num_blocks;
-                            ls.certified_kv_host_meta_key_stride_tokens = key_stride_tokens;
-                            ls.certified_kv_host_meta_key_scale_stride_blocks =
-                                key_scale_stride_blocks;
-                            ls.certified_kv_host_meta_value_error_stride_blocks =
-                                value_error_stride_blocks;
                         }
+                        ls.certified_kv_host_meta_blocks = num_blocks;
+                        ls.certified_kv_host_meta_key_stride_tokens = key_stride_tokens;
+                        ls.certified_kv_host_meta_key_scale_stride_blocks = key_scale_stride_blocks;
+                        ls.certified_kv_host_meta_value_error_stride_blocks =
+                            value_error_stride_blocks;
                     }
-                    let mut promote_index_host = if key_budget_covers_all_blocks {
-                        Vec::new()
-                    } else {
-                        vec![u32::MAX; num_q_heads * num_blocks]
-                    };
-                    let mut value_promote_index_host = if key_budget_covers_all_blocks {
-                        Vec::new()
-                    } else {
-                        vec![u32::MAX; num_kv_heads * num_blocks]
-                    };
+                    let mut promote_index_host = vec![u32::MAX; num_q_heads * num_blocks];
+                    let mut value_promote_index_host = vec![u32::MAX; num_kv_heads * num_blocks];
                     let mut selected_by_head = Vec::with_capacity(num_q_heads);
                     let mut max_promoted_blocks = 1usize;
                     let mut value_promote_flags = vec![false; num_kv_heads * num_blocks];
+                    let key_cache_capacity = cfg.key_cache_blocks.max(1).min(num_blocks.max(1));
+                    // The paper requires promoted BF16 keys to go through the
+                    // selector/page-cache path, not a silent all-key mirror.
+                    // Misses page BF16 blocks from Tier-2 into bounded scratch
+                    // slots; hits reuse those slots.
+                    let use_key_page_cache = cfg.key_cache_blocks > 0;
                     // Recoverable certificate failures are handled by the Rung-3
                     // per-head dense path. Keep Rung-4 available for future
                     // unrecoverable layer-wide failures without making common
@@ -5808,6 +5798,8 @@ impl DecodeEngine {
                     let mut true_tail_bound_by_head = Vec::with_capacity(num_q_heads);
                     let collect_cert_host_telemetry =
                         std::env::var_os("SUPERSONIC_CERTIFIED_HOST_TELEMETRY").is_some();
+                    let trace_cert_phases =
+                        std::env::var_os("SUPERSONIC_CERTIFIED_TRACE_PHASES").is_some();
                     let cert_selector_start = Instant::now();
                     if use_device_selector {
                         let max_device_promoted_blocks = cfg
@@ -6008,6 +6000,9 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV device selector: {e}")
                         })?;
+                        if trace_cert_phases {
+                            eprintln!("cert-kv layer {idx}: device selector done");
+                        }
                         selected_by_head.resize_with(num_q_heads, Vec::new);
                         if collect_cert_host_telemetry {
                             dense_fallback_qhead_flags = decode_u32_le(
@@ -6081,22 +6076,55 @@ impl DecodeEngine {
                             vmax_by_head.resize(num_q_heads, 0.0);
                             true_tail_bound_by_head.resize(num_q_heads, 0.0);
                         }
+                        if use_key_page_cache {
+                            let selected_counts = decode_u32_le(
+                                &scratch
+                                    .certified_selected_counts
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV selected counts D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            let selected_blocks = decode_u32_le(
+                                &scratch
+                                    .certified_selected_blocks
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV selected blocks D2H: {e}"
+                                        )
+                                    })?,
+                            );
+                            selected_by_head.clear();
+                            selected_by_head.reserve(num_q_heads);
+                            for qh in 0..num_q_heads {
+                                let count = selected_counts
+                                    .get(qh)
+                                    .copied()
+                                    .unwrap_or(0)
+                                    .min(max_device_promoted_blocks as u32)
+                                    as usize;
+                                let base = qh * max_device_promoted_blocks;
+                                selected_by_head.push(
+                                    selected_blocks[base..base + count]
+                                        .iter()
+                                        .map(|&block| block as usize)
+                                        .filter(|&block| block < num_blocks)
+                                        .collect(),
+                                );
+                            }
+                        }
                     } else {
                         for qh in 0..num_q_heads {
                             let score_start = qh * num_blocks;
                             let score_end = score_start + num_blocks;
                             let kvh = qh / gqa_group;
-                            if key_budget_covers_all_blocks {
-                                let selected_indices: Vec<usize> = (0..num_blocks).collect();
-                                e_key_by_head.push(0.0);
-                                delta_tail_by_head.push(0.0);
-                                vmax_by_head.push(0.0);
-                                true_tail_bound_by_head.push(0.0);
-                                delta_blocks_by_head.push(vec![0.0; num_blocks]);
-                                max_promoted_blocks = max_promoted_blocks.max(num_blocks);
-                                selected_by_head.push(selected_indices);
-                                continue;
-                            }
                             let value_error_host = &ls.certified_kv_host_value_error_cache;
                             let value_norm_host = &ls.certified_kv_host_value_norm_cache;
                             let key_scale_channel_max_host =
@@ -6262,8 +6290,7 @@ impl DecodeEngine {
                     let initial_value_cache_fits_step = selected_value_blocks_by_kvh
                         .iter()
                         .all(|blocks| blocks.len() <= value_cache_capacity);
-                    let use_initial_value_cache = !key_budget_covers_all_blocks
-                        && cfg.value_cache_blocks > 0
+                    let use_initial_value_cache = cfg.value_cache_blocks > 0
                         && has_value_promotions
                         && initial_value_cache_fits_step;
                     let mut value_gather_index_host = value_promote_index_host.clone();
@@ -6342,9 +6369,232 @@ impl DecodeEngine {
                         }
                         max_promoted_value_blocks = value_cache_capacity;
                     }
+                    let mut key_gather_index_host = promote_index_host.clone();
+                    let mut key_cache_hits = 0usize;
+                    let mut key_cache_misses = 0usize;
+                    let mut key_cache_overflows = 0usize;
+                    let key_block_bytes = block_size * head_dim * elem_bytes;
+                    let selected_key_block_count = if use_device_selector {
+                        // Keep telemetry nonzero without forcing selector D2H on
+                        // the fast path. This is an upper bound when the GPU
+                        // selector chooses fewer than its slot budget.
+                        num_q_heads * max_promoted_blocks
+                    } else {
+                        selected_by_head.iter().map(Vec::len).sum::<usize>()
+                    };
+                    if use_key_page_cache {
+                        let tag_len = num_q_heads * key_cache_capacity;
+                        let cache_shape = [num_q_heads, key_cache_capacity, block_size, head_dim];
+                        let reset_cache = ls
+                            .certified_kv_promoted_key_cache
+                            .as_ref()
+                            .map(|buf| buf.shape() != cache_shape)
+                            .unwrap_or(true)
+                            || ls
+                                .certified_kv_promoted_key_cache_tags_gpu
+                                .as_ref()
+                                .map(|buf| buf.shape() != [num_q_heads, key_cache_capacity])
+                                .unwrap_or(true)
+                            || ls
+                                .certified_kv_promoted_key_cache_lru_gpu
+                                .as_ref()
+                                .map(|buf| buf.shape() != [num_q_heads, key_cache_capacity])
+                                .unwrap_or(true)
+                            || ls.certified_kv_promoted_key_cache_capacity != key_cache_capacity
+                            || ls.certified_kv_promoted_key_cache_tags.len() != tag_len;
+                        if reset_cache {
+                            ls.certified_kv_promoted_key_cache = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &cache_shape)
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV promoted key cache alloc: {e}"
+                                        )
+                                    })?,
+                            );
+                            ls.certified_kv_promoted_key_cache_tags_gpu = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::U32,
+                                    &[num_q_heads, key_cache_capacity],
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV promoted key cache tags alloc: {e}"
+                                    )
+                                })?,
+                            );
+                            ls.certified_kv_promoted_key_cache_lru_gpu = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::U32,
+                                    &[num_q_heads, key_cache_capacity],
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV promoted key cache lru alloc: {e}"
+                                    )
+                                })?,
+                            );
+                            kernel_ffi::certified_kv::init_key_page_cache(
+                                self.ordinal,
+                                ls.certified_kv_promoted_key_cache_tags_gpu
+                                    .as_mut()
+                                    .unwrap(),
+                                ls.certified_kv_promoted_key_cache_lru_gpu.as_mut().unwrap(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV promoted key cache init: {e}"
+                                )
+                            })?;
+                            ls.certified_kv_promoted_key_cache_capacity = key_cache_capacity;
+                            ls.certified_kv_promoted_key_cache_tags = vec![usize::MAX; tag_len];
+                            ls.certified_kv_promoted_key_cache_lru = vec![0; tag_len];
+                            ls.certified_kv_promoted_key_cache_tick = 0;
+                        }
+                        if scratch
+                            .certified_key_gather_index
+                            .as_ref()
+                            .map(|buf| buf.shape() != [num_q_heads, num_blocks])
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_key_gather_index = Some(
+                                GpuBuffer::zeros(
+                                    self.ordinal,
+                                    ScalarType::U32,
+                                    &[num_q_heads, num_blocks],
+                                )
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV key gather index alloc: {e}"
+                                    )
+                                })?,
+                            );
+                        }
+                        if scratch
+                            .certified_key_cache_counters
+                            .as_ref()
+                            .map(|buf| buf.shape() != [3])
+                            .unwrap_or(true)
+                        {
+                            scratch.certified_key_cache_counters = Some(
+                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[3]).map_err(
+                                    |e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV key cache counters alloc: {e}"
+                                        )
+                                    },
+                                )?,
+                            );
+                        }
+                        if use_device_selector {
+                            ls.certified_kv_promoted_key_cache_tick = ls
+                                .certified_kv_promoted_key_cache_tick
+                                .wrapping_add(max_promoted_blocks as u64 + 1);
+                            kernel_ffi::certified_kv::resolve_key_page_cache(
+                                self.ordinal,
+                                scratch.certified_selected_blocks.as_ref().unwrap(),
+                                scratch.certified_selected_counts.as_ref().unwrap(),
+                                ls.certified_kv_promoted_key_cache_tags_gpu
+                                    .as_mut()
+                                    .unwrap(),
+                                ls.certified_kv_promoted_key_cache_lru_gpu.as_mut().unwrap(),
+                                scratch.certified_promote_index.as_mut().unwrap(),
+                                scratch.certified_key_gather_index.as_mut().unwrap(),
+                                scratch.certified_key_cache_counters.as_mut().unwrap(),
+                                ls.certified_kv_promoted_key_cache_tick as u32,
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV key page-cache resolve: {e}"
+                                )
+                            })?;
+                            let collect_key_cache_counters =
+                                collect_cert_host_telemetry || trace_cert_phases;
+                            if collect_key_cache_counters {
+                                let counter_bytes = scratch
+                                    .certified_key_cache_counters
+                                    .as_ref()
+                                    .unwrap()
+                                    .to_host_bytes()
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV key cache counters D2H: {e}"
+                                        )
+                                    })?;
+                                let counters = decode_u32_le(&counter_bytes);
+                                key_cache_hits = counters.first().copied().unwrap_or(0) as usize;
+                                key_cache_misses = counters.get(1).copied().unwrap_or(0) as usize;
+                                key_cache_overflows =
+                                    counters.get(2).copied().unwrap_or(0) as usize;
+                            }
+                        } else {
+                            promote_index_host.fill(u32::MAX);
+                            key_gather_index_host.fill(u32::MAX);
+                            for qh in 0..num_q_heads {
+                                for &block in &selected_by_head[qh] {
+                                    let base = qh * key_cache_capacity;
+                                    ls.certified_kv_promoted_key_cache_tick =
+                                        ls.certified_kv_promoted_key_cache_tick.wrapping_add(1);
+                                    let tick = ls.certified_kv_promoted_key_cache_tick;
+                                    let mut slot = (0..key_cache_capacity).find(|&s| {
+                                        ls.certified_kv_promoted_key_cache_tags[base + s] == block
+                                    });
+                                    if let Some(s) = slot {
+                                        key_cache_hits += 1;
+                                        ls.certified_kv_promoted_key_cache_lru[base + s] = tick;
+                                    } else {
+                                        key_cache_misses += 1;
+                                        slot = (0..key_cache_capacity).find(|&s| {
+                                            ls.certified_kv_promoted_key_cache_tags[base + s]
+                                                == usize::MAX
+                                        });
+                                        let s = if let Some(s) = slot {
+                                            s
+                                        } else {
+                                            key_cache_overflows += 1;
+                                            (0..key_cache_capacity)
+                                                .min_by_key(|&s| {
+                                                    ls.certified_kv_promoted_key_cache_lru[base + s]
+                                                })
+                                                .unwrap_or(0)
+                                        };
+                                        ls.certified_kv_promoted_key_cache_tags[base + s] = block;
+                                        ls.certified_kv_promoted_key_cache_lru[base + s] = tick;
+                                        key_gather_index_host[qh * num_blocks + block] = s as u32;
+                                        slot = Some(s);
+                                    }
+                                    promote_index_host[qh * num_blocks + block] =
+                                        slot.unwrap() as u32;
+                                }
+                            }
+                        }
+                        max_promoted_blocks = key_cache_capacity;
+                    }
+                    if trace_cert_phases {
+                        eprintln!(
+                            "cert-kv layer {idx}: cache resolved key_hits={} key_misses={} key_overflows={} max_key_slots={}",
+                            key_cache_hits,
+                            key_cache_misses,
+                            key_cache_overflows,
+                            max_promoted_blocks
+                        );
+                    }
                     if let Some(t) = timings.as_mut() {
                         t.certified_kv_selector_ms +=
                             cert_selector_start.elapsed().as_secs_f64() * 1000.0;
+                        t.certified_kv_promoted_key_cache_hits += key_cache_hits;
+                        t.certified_kv_promoted_key_cache_misses += key_cache_misses;
+                        t.certified_kv_promoted_key_cache_overflows += key_cache_overflows;
+                        t.certified_kv_promoted_key_h2d_bytes += if use_key_page_cache {
+                            if collect_cert_host_telemetry || trace_cert_phases {
+                                key_cache_misses * key_block_bytes
+                            } else {
+                                selected_key_block_count * key_block_bytes
+                            }
+                        } else {
+                            selected_key_block_count * key_block_bytes
+                        };
                         t.certified_kv_promoted_value_cache_hits += value_cache_hits;
                         t.certified_kv_promoted_value_cache_misses += value_cache_misses;
                         t.certified_kv_promoted_value_cache_overflows += value_cache_overflows;
@@ -6354,11 +6604,8 @@ impl DecodeEngine {
                             selected_value_block_count * value_block_bytes
                         };
                     }
-                    let promoted_key_shape = if key_budget_covers_all_blocks {
-                        [num_kv_heads, num_blocks, block_size, head_dim]
-                    } else {
-                        [num_q_heads, max_promoted_blocks, block_size, head_dim]
-                    };
+                    let promoted_key_shape =
+                        [num_q_heads, max_promoted_blocks, block_size, head_dim];
                     let promoted_value_shape = [
                         num_kv_heads,
                         max_promoted_value_blocks,
@@ -6456,32 +6703,12 @@ impl DecodeEngine {
                                 })?,
                         );
                     }
-                    if key_budget_covers_all_blocks {
-                        if ls
-                            .certified_kv_promoted_key_cache
+                    if !use_key_page_cache
+                        && scratch
+                            .certified_promoted_key_bf16
                             .as_ref()
                             .map(|buf| buf.shape() != promoted_key_shape)
                             .unwrap_or(true)
-                        {
-                            ls.certified_kv_promoted_key_cache = Some(
-                                GpuBuffer::zeros(
-                                    self.ordinal,
-                                    ScalarType::BF16,
-                                    &promoted_key_shape,
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "layer {idx} certified KV promoted key cache alloc: {e}"
-                                    )
-                                })?,
-                            );
-                            ls.certified_kv_promoted_key_cache_tokens = 0;
-                        }
-                    } else if scratch
-                        .certified_promoted_key_bf16
-                        .as_ref()
-                        .map(|buf| buf.shape() != promoted_key_shape)
-                        .unwrap_or(true)
                     {
                         scratch.certified_promoted_key_bf16 = Some(
                             GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &promoted_key_shape)
@@ -6512,23 +6739,16 @@ impl DecodeEngine {
                         }
                     }
                     let cert_gather_start = Instant::now();
-                    if key_budget_covers_all_blocks {
-                        let promote_index_buf = scratch.certified_promote_index.as_mut().unwrap();
-                        let value_promote_index_buf =
-                            scratch.certified_value_promote_index.as_mut().unwrap();
-                        kernel_ffi::certified_kv::init_all_promoted_indices(
-                            self.ordinal,
-                            promote_index_buf,
-                            value_promote_index_buf,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV all-promoted index init: {e}")
-                        })?;
-                    } else if !use_device_selector {
+                    if !use_device_selector {
+                        let promote_index_upload = if use_key_page_cache {
+                            &key_gather_index_host
+                        } else {
+                            &promote_index_host
+                        };
                         let promote_index_bytes = unsafe {
                             std::slice::from_raw_parts(
-                                promote_index_host.as_ptr() as *const u8,
-                                promote_index_host.len() * std::mem::size_of::<u32>(),
+                                promote_index_upload.as_ptr() as *const u8,
+                                promote_index_upload.len() * std::mem::size_of::<u32>(),
                             )
                         };
                         gpu_hal::copy_h2d(
@@ -6549,28 +6769,30 @@ impl DecodeEngine {
                         } else {
                             &value_promote_index_host
                         };
-                        let value_promote_index_bytes = unsafe {
-                            std::slice::from_raw_parts(
-                                value_promote_upload.as_ptr() as *const u8,
-                                value_promote_upload.len() * std::mem::size_of::<u32>(),
+                        if !use_device_selector || use_initial_value_cache {
+                            let value_promote_index_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    value_promote_upload.as_ptr() as *const u8,
+                                    value_promote_upload.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_value_promote_index
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                value_promote_index_bytes.as_ptr() as *const c_void,
+                                value_promote_index_bytes.len(),
                             )
-                        };
-                        gpu_hal::copy_h2d(
-                            self.ordinal,
-                            scratch
-                                .certified_value_promote_index
-                                .as_mut()
-                                .unwrap()
-                                .as_mut_ptr(),
-                            value_promote_index_bytes.as_ptr() as *const c_void,
-                            value_promote_index_bytes.len(),
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV value promote index H2D: {e}")
-                        })?;
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV value promote index H2D: {e}"
+                                )
+                            })?;
+                        }
                     }
-                    let promoted_key_cache_valid = key_budget_covers_all_blocks
-                        && ls.certified_kv_promoted_key_cache_tokens >= aligned;
                     let tier2_value_device_ptr = ls
                         .certified_kv_host_v
                         .as_ref()
@@ -6579,24 +6801,7 @@ impl DecodeEngine {
                         .map_err(|e| {
                             anyhow::anyhow!("layer {idx} certified KV Tier-2 value map: {e}")
                         })?;
-                    if key_budget_covers_all_blocks && promoted_key_cache_valid {
-                        if has_value_promotions {
-                            kernel_ffi::certified_kv::gather_promoted_values_bf16_from_tier2(
-                                self.ordinal,
-                                tier2_value_device_ptr,
-                                scratch.certified_value_promote_index.as_ref().unwrap(),
-                                scratch.certified_promoted_value_bf16.as_mut().unwrap(),
-                                block_size,
-                                cap,
-                                max_promoted_value_blocks,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} certified KV promoted BF16 value gather: {e}"
-                                )
-                            })?;
-                        }
-                    } else {
+                    {
                         let tier2_key_device_ptr = ls
                             .certified_kv_host_k
                             .as_ref()
@@ -6605,35 +6810,24 @@ impl DecodeEngine {
                             .map_err(|e| {
                                 anyhow::anyhow!("layer {idx} certified KV Tier-2 key map: {e}")
                             })?;
-                        if key_budget_covers_all_blocks {
+                        if use_initial_value_cache {
+                            let key_gather_index_ref = if use_key_page_cache && use_device_selector
+                            {
+                                scratch.certified_key_gather_index.as_ref().unwrap()
+                            } else {
+                                scratch.certified_promote_index.as_ref().unwrap()
+                            };
                             kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
                                 self.ordinal,
                                 tier2_key_device_ptr,
                                 tier2_value_device_ptr,
-                                scratch.certified_promote_index.as_ref().unwrap(),
+                                key_gather_index_ref,
                                 scratch.certified_value_promote_index.as_ref().unwrap(),
-                                ls.certified_kv_promoted_key_cache.as_mut().unwrap(),
-                                scratch.certified_promoted_value_bf16.as_mut().unwrap(),
-                                block_size,
-                                cap,
-                                max_promoted_blocks,
-                                max_promoted_value_blocks,
-                                gqa_group,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} certified KV promoted BF16 gather: {e}"
-                                )
-                            })?;
-                            ls.certified_kv_promoted_key_cache_tokens = aligned;
-                        } else if use_initial_value_cache {
-                            kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
-                                self.ordinal,
-                                tier2_key_device_ptr,
-                                tier2_value_device_ptr,
-                                scratch.certified_promote_index.as_ref().unwrap(),
-                                scratch.certified_value_promote_index.as_ref().unwrap(),
-                                scratch.certified_promoted_key_bf16.as_mut().unwrap(),
+                                if use_key_page_cache {
+                                    ls.certified_kv_promoted_key_cache.as_mut().unwrap()
+                                } else {
+                                    scratch.certified_promoted_key_bf16.as_mut().unwrap()
+                                },
                                 ls.certified_kv_promoted_value_cache.as_mut().unwrap(),
                                 block_size,
                                 cap,
@@ -6668,13 +6862,23 @@ impl DecodeEngine {
                                 )
                             })?;
                         } else {
+                            let key_gather_index_ref = if use_key_page_cache && use_device_selector
+                            {
+                                scratch.certified_key_gather_index.as_ref().unwrap()
+                            } else {
+                                scratch.certified_promote_index.as_ref().unwrap()
+                            };
                             kernel_ffi::certified_kv::gather_promoted_bf16_from_tier2(
                                 self.ordinal,
                                 tier2_key_device_ptr,
                                 tier2_value_device_ptr,
-                                scratch.certified_promote_index.as_ref().unwrap(),
+                                key_gather_index_ref,
                                 scratch.certified_value_promote_index.as_ref().unwrap(),
-                                scratch.certified_promoted_key_bf16.as_mut().unwrap(),
+                                if use_key_page_cache {
+                                    ls.certified_kv_promoted_key_cache.as_mut().unwrap()
+                                } else {
+                                    scratch.certified_promoted_key_bf16.as_mut().unwrap()
+                                },
                                 scratch.certified_promoted_value_bf16.as_mut().unwrap(),
                                 block_size,
                                 cap,
@@ -6688,6 +6892,32 @@ impl DecodeEngine {
                                 )
                             })?;
                         }
+                        if use_key_page_cache && !use_device_selector {
+                            let promote_index_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    promote_index_host.as_ptr() as *const u8,
+                                    promote_index_host.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_promote_index
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                promote_index_bytes.as_ptr() as *const c_void,
+                                promote_index_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV cached key promote index H2D: {e}"
+                                )
+                            })?;
+                        }
+                    }
+                    if trace_cert_phases {
+                        eprintln!("cert-kv layer {idx}: gather done");
                     }
                     if timings.is_some() {
                         gpu_hal::sync(self.ordinal).map_err(|e| {
@@ -6699,78 +6929,82 @@ impl DecodeEngine {
                             cert_gather_start.elapsed().as_secs_f64() * 1000.0;
                     }
                     let mut score_consistency_violations = 0usize;
-                    if !key_budget_covers_all_blocks {
-                        let score_flags_shape = [num_q_heads];
-                        if scratch
-                            .certified_score_consistency_flags
-                            .as_ref()
-                            .map(|buf| buf.shape() != score_flags_shape)
-                            .unwrap_or(true)
-                        {
-                            scratch.certified_score_consistency_flags = Some(
-                                GpuBuffer::zeros(self.ordinal, ScalarType::U32, &score_flags_shape)
-                                    .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "layer {idx} certified KV score-consistency flags alloc: {e}"
-                                    )
-                                })?,
-                            );
-                        }
-                        let cert_score_consistency_start = Instant::now();
-                        let score_consistency_flags_ref = if use_device_selector {
-                            scratch
-                                .certified_ranking_fallback_head_flags
-                                .as_mut()
-                                .unwrap()
-                        } else {
-                            scratch.certified_score_consistency_flags.as_mut().unwrap()
-                        };
-                        kernel_ffi::certified_kv::score_consistency(
-                            self.ordinal,
-                            attn_q,
-                            key_i8,
-                            key_scale,
-                            key_zero,
-                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                            scratch.certified_promote_index.as_ref().unwrap(),
-                            score_consistency_flags_ref,
-                            block_size,
-                            max_promoted_blocks,
-                            gqa_group,
-                            q_scale,
-                            cfg.eps_guard,
-                        )
-                        .map_err(|e| {
-                            anyhow::anyhow!("layer {idx} certified KV score consistency: {e}")
-                        })?;
-                        if !use_device_selector {
-                            let score_consistency_flags = scratch
-                                .certified_score_consistency_flags
-                                .as_ref()
-                                .unwrap()
-                                .to_host_bytes()
+                    let score_flags_shape = [num_q_heads];
+                    if scratch
+                        .certified_score_consistency_flags
+                        .as_ref()
+                        .map(|buf| buf.shape() != score_flags_shape)
+                        .unwrap_or(true)
+                    {
+                        scratch.certified_score_consistency_flags = Some(
+                            GpuBuffer::zeros(self.ordinal, ScalarType::U32, &score_flags_shape)
                                 .map_err(|e| {
                                     anyhow::anyhow!(
-                                        "layer {idx} certified KV score-consistency flags D2H: {e}"
-                                    )
-                                })?;
-                            for (qh, chunk) in score_consistency_flags
-                                .chunks_exact(std::mem::size_of::<u32>())
-                                .enumerate()
-                            {
-                                if u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0
-                                {
-                                    score_consistency_violations += 1;
-                                    dense_fallback_qhead_flags[qh] = true;
-                                }
+                                    "layer {idx} certified KV score-consistency flags alloc: {e}"
+                                )
+                                })?,
+                        );
+                    }
+                    let cert_score_consistency_start = Instant::now();
+                    let score_consistency_flags_ref = if use_device_selector {
+                        scratch
+                            .certified_ranking_fallback_head_flags
+                            .as_mut()
+                            .unwrap()
+                    } else {
+                        scratch.certified_score_consistency_flags.as_mut().unwrap()
+                    };
+                    kernel_ffi::certified_kv::score_consistency(
+                        self.ordinal,
+                        attn_q,
+                        key_i8,
+                        key_scale,
+                        key_zero,
+                        if use_key_page_cache {
+                            ls.certified_kv_promoted_key_cache.as_ref().unwrap()
+                        } else {
+                            scratch.certified_promoted_key_bf16.as_ref().unwrap()
+                        },
+                        scratch.certified_promote_index.as_ref().unwrap(),
+                        score_consistency_flags_ref,
+                        block_size,
+                        max_promoted_blocks,
+                        gqa_group,
+                        q_scale,
+                        cfg.eps_guard,
+                    )
+                    .map_err(|e| {
+                        anyhow::anyhow!("layer {idx} certified KV score consistency: {e}")
+                    })?;
+                    if trace_cert_phases {
+                        eprintln!("cert-kv layer {idx}: score consistency done");
+                    }
+                    if !use_device_selector {
+                        let score_consistency_flags = scratch
+                            .certified_score_consistency_flags
+                            .as_ref()
+                            .unwrap()
+                            .to_host_bytes()
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV score-consistency flags D2H: {e}"
+                                )
+                            })?;
+                        for (qh, chunk) in score_consistency_flags
+                            .chunks_exact(std::mem::size_of::<u32>())
+                            .enumerate()
+                        {
+                            if u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) != 0 {
+                                score_consistency_violations += 1;
+                                dense_fallback_qhead_flags[qh] = true;
                             }
                         }
-                        if let Some(t) = timings.as_mut() {
-                            t.certified_kv_score_consistency_ms +=
-                                cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
-                        }
                     }
-                    if cfg.ranking_r > 0 && !key_budget_covers_all_blocks {
+                    if let Some(t) = timings.as_mut() {
+                        t.certified_kv_score_consistency_ms +=
+                            cert_score_consistency_start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                    if cfg.ranking_r > 0 {
                         let selected_log_mass_shape = [num_q_heads, max_promoted_blocks];
                         if scratch
                             .certified_selected_fp16_log_masses
@@ -6795,7 +7029,11 @@ impl DecodeEngine {
                         kernel_ffi::certified_kv::selected_fp16_log_masses(
                             self.ordinal,
                             attn_q,
-                            scratch.certified_promoted_key_bf16.as_ref().unwrap(),
+                            if use_key_page_cache {
+                                ls.certified_kv_promoted_key_cache.as_ref().unwrap()
+                            } else {
+                                scratch.certified_promoted_key_bf16.as_ref().unwrap()
+                            },
                             scratch.certified_promote_index.as_ref().unwrap(),
                             scratch.certified_selected_fp16_log_masses.as_mut().unwrap(),
                             block_size,
@@ -6807,6 +7045,9 @@ impl DecodeEngine {
                                 "layer {idx} certified KV selected FP16 log-masses: {e}"
                             )
                         })?;
+                        if trace_cert_phases {
+                            eprintln!("cert-kv layer {idx}: selected fp16 log masses done");
+                        }
                         if use_device_selector {
                             kernel_ffi::certified_kv::ranking_flags_device(
                                 self.ordinal,
@@ -6826,6 +7067,14 @@ impl DecodeEngine {
                                     "layer {idx} certified KV device ranking check: {e}"
                                 )
                             })?;
+                            if trace_cert_phases {
+                                gpu_hal::sync(self.ordinal).map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "layer {idx} certified KV trace sync after device ranking: {e}"
+                                    )
+                                })?;
+                                eprintln!("cert-kv layer {idx}: device ranking check done");
+                            }
                             if collect_cert_host_telemetry {
                                 let device_fallback_flags = decode_u32_le(
                                     &scratch
@@ -6865,13 +7114,15 @@ impl DecodeEngine {
                                 let fp16_selected_log_masses: Vec<(usize, f32)> = selected_by_head
                                     [qh]
                                     .iter()
-                                    .enumerate()
-                                    .map(|(slot, &block)| {
-                                        (
-                                            block,
-                                            selected_fp16_log_mass_host
-                                                [qh * max_promoted_blocks + slot],
-                                        )
+                                    .filter_map(|&block| {
+                                        let slot = promote_index_host[score_start + block] as usize;
+                                        (slot < max_promoted_blocks).then(|| {
+                                            (
+                                                block,
+                                                selected_fp16_log_mass_host
+                                                    [qh * max_promoted_blocks + slot],
+                                            )
+                                        })
                                     })
                                     .collect();
                                 if certified_kv_ranking_mismatch(
@@ -7076,80 +7327,67 @@ impl DecodeEngine {
                             })?;
                         }
                         let attend_start = Instant::now();
-                        if key_budget_covers_all_blocks && ranking_fallback_qheads.is_empty() {
-                            kernel_ffi::certified_kv::attend_all_promoted_int4_with_bf16_tail(
-                                self.ordinal,
-                                attn_q,
-                                ls.certified_kv_promoted_key_cache.as_ref().unwrap(),
-                                scratch.certified_promoted_value_bf16.as_ref().unwrap(),
-                                scratch.certified_value_promote_index.as_ref().unwrap(),
-                                ls.certified_kv_value_i4.as_ref().unwrap(),
-                                ls.certified_kv_value_scale.as_ref().unwrap(),
-                                ls.certified_kv_value_zero.as_ref().unwrap(),
-                                tail_key_kernel_ref,
-                                tail_value_kernel_ref,
-                                kv_len,
-                                block_size,
-                                value_group_size,
-                                num_q_heads / num_kv_heads,
-                                q_scale,
-                                score_scratch,
-                                scratch.certified_softmax_stats.as_mut().unwrap(),
-                                attn_out_bf16,
-                                None,
-                            )
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "layer {idx} certified KV all-promoted INT4 attention: {e}"
-                                )
-                            })?;
+                        let promoted_value_ref = if use_initial_value_cache {
+                            ls.certified_kv_promoted_value_cache.as_ref().unwrap()
                         } else {
-                            let promoted_value_ref = if use_initial_value_cache {
-                                ls.certified_kv_promoted_value_cache.as_ref().unwrap()
+                            scratch.certified_promoted_value_bf16.as_ref().unwrap()
+                        };
+                        kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                            self.ordinal,
+                            attn_q,
+                            key_i8,
+                            key_scale,
+                            key_zero,
+                            if use_key_page_cache {
+                                ls.certified_kv_promoted_key_cache.as_ref().unwrap()
                             } else {
-                                scratch.certified_promoted_value_bf16.as_ref().unwrap()
-                            };
-                            kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
-                                self.ordinal,
-                                attn_q,
-                                key_i8,
-                                key_scale,
-                                key_zero,
-                                scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                                scratch.certified_promote_index.as_ref().unwrap(),
-                                promoted_value_ref,
-                                scratch.certified_value_promote_index.as_ref().unwrap(),
-                                ls.certified_kv_value_i4.as_ref().unwrap(),
-                                ls.certified_kv_value_scale.as_ref().unwrap(),
-                                ls.certified_kv_value_zero.as_ref().unwrap(),
-                                tail_key_kernel_ref,
-                                tail_value_kernel_ref,
-                                kv_len,
-                                block_size,
-                                value_group_size,
-                                num_q_heads / num_kv_heads,
-                                q_scale,
-                                score_scratch,
-                                attn_out_bf16,
-                                None,
+                                scratch.certified_promoted_key_bf16.as_ref().unwrap()
+                            },
+                            scratch.certified_promote_index.as_ref().unwrap(),
+                            promoted_value_ref,
+                            scratch.certified_value_promote_index.as_ref().unwrap(),
+                            ls.certified_kv_value_i4.as_ref().unwrap(),
+                            ls.certified_kv_value_scale.as_ref().unwrap(),
+                            ls.certified_kv_value_zero.as_ref().unwrap(),
+                            tail_key_kernel_ref,
+                            tail_value_kernel_ref,
+                            kv_len,
+                            block_size,
+                            value_group_size,
+                            num_q_heads / num_kv_heads,
+                            q_scale,
+                            score_scratch,
+                            attn_out_bf16,
+                            None,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} certified KV mixed-key INT4 attention: {e}"
                             )
-                            .map_err(|e| {
+                        })?;
+                        if trace_cert_phases {
+                            gpu_hal::sync(self.ordinal).map_err(|e| {
                                 anyhow::anyhow!(
-                                    "layer {idx} certified KV mixed-key INT4 attention: {e}"
+                                    "layer {idx} certified KV trace sync after initial attend: {e}"
                                 )
                             })?;
+                            eprintln!("cert-kv layer {idx}: initial attend done");
                         }
                         kernel_ffi::certified_kv::block_masses_from_token_probs(
                             self.ordinal,
                             score_scratch,
                             scratch.certified_final_block_mass.as_mut().unwrap(),
                             block_size,
+                            None,
                         )
                         .map_err(|e| {
                             anyhow::anyhow!(
                                 "layer {idx} certified KV final block mass reduction: {e}"
                             )
                         })?;
+                        if trace_cert_phases {
+                            eprintln!("cert-kv layer {idx}: final block masses done");
+                        }
                         let ranking_fallback_head_flags_ref = if use_device_selector {
                             scratch.certified_ranking_fallback_head_flags.as_ref()
                         } else if ranking_fallback_qheads.is_empty() {
@@ -7217,12 +7455,16 @@ impl DecodeEngine {
                             scratch.certified_value_e_val_by_head.as_mut().unwrap(),
                             gqa_group,
                             cfg.v_tol,
+                            None,
                         )
                         .map_err(|e| {
                             anyhow::anyhow!(
                                 "layer {idx} certified KV final value-promotion evaluation: {e}"
                             )
                         })?;
+                        if trace_cert_phases {
+                            eprintln!("cert-kv layer {idx}: final value promotion eval done");
+                        }
                         let added_value_promotions = if use_device_selector {
                             true
                         } else {
@@ -7281,7 +7523,6 @@ impl DecodeEngine {
                                     .iter()
                                     .all(|blocks| blocks.len() <= value_cache_capacity);
                             let use_final_value_cache = !use_device_selector
-                                && !key_budget_covers_all_blocks
                                 && cfg.value_cache_blocks > 0
                                 && final_value_cache_fits_step;
                             let final_promoted_value_ref: &GpuBuffer;
@@ -7399,6 +7640,7 @@ impl DecodeEngine {
                                     block_size,
                                     cap,
                                     value_cache_capacity,
+                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
                                 )
                                 .map_err(|e| {
                                     anyhow::anyhow!(
@@ -7473,6 +7715,7 @@ impl DecodeEngine {
                                     block_size,
                                     cap,
                                     max_promoted_value_blocks,
+                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
                                 )
                                 .map_err(|e| {
                                     anyhow::anyhow!(
@@ -7507,69 +7750,45 @@ impl DecodeEngine {
                                 final_promoted_value_ref =
                                     scratch.certified_promoted_value_bf16.as_ref().unwrap();
                             }
-                            if key_budget_covers_all_blocks && ranking_fallback_qheads.is_empty() {
-                                kernel_ffi::certified_kv::attend_all_promoted_int4_with_bf16_tail(
-                                    self.ordinal,
-                                    attn_q,
-                                    ls.certified_kv_promoted_key_cache.as_ref().unwrap(),
-                                    final_promoted_value_ref,
-                                    scratch.certified_value_promote_index.as_ref().unwrap(),
-                                    ls.certified_kv_value_i4.as_ref().unwrap(),
-                                    ls.certified_kv_value_scale.as_ref().unwrap(),
-                                    ls.certified_kv_value_zero.as_ref().unwrap(),
-                                    tail_key_kernel_ref,
-                                    tail_value_kernel_ref,
-                                    kv_len,
-                                    block_size,
-                                    value_group_size,
-                                    num_q_heads / num_kv_heads,
-                                    q_scale,
-                                    score_scratch,
-                                    scratch.certified_softmax_stats.as_mut().unwrap(),
-                                    attn_out_bf16,
-                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
+                            kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
+                                self.ordinal,
+                                attn_q,
+                                key_i8,
+                                key_scale,
+                                key_zero,
+                                if use_key_page_cache {
+                                    ls.certified_kv_promoted_key_cache.as_ref().unwrap()
+                                } else {
+                                    scratch.certified_promoted_key_bf16.as_ref().unwrap()
+                                },
+                                scratch.certified_promote_index.as_ref().unwrap(),
+                                final_promoted_value_ref,
+                                scratch.certified_value_promote_index.as_ref().unwrap(),
+                                ls.certified_kv_value_i4.as_ref().unwrap(),
+                                ls.certified_kv_value_scale.as_ref().unwrap(),
+                                ls.certified_kv_value_zero.as_ref().unwrap(),
+                                tail_key_kernel_ref,
+                                tail_value_kernel_ref,
+                                kv_len,
+                                block_size,
+                                value_group_size,
+                                num_q_heads / num_kv_heads,
+                                q_scale,
+                                score_scratch,
+                                attn_out_bf16,
+                                Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV exact mixed-key INT4 attention: {e}"
                                 )
-                                .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "layer {idx} certified KV exact all-promoted INT4 attention: {e}"
-                                    )
-                                })?;
-                            } else {
-                                kernel_ffi::certified_kv::attend_mixed_key_int4_with_bf16_tail_strided(
-                                    self.ordinal,
-                                    attn_q,
-                                    key_i8,
-                                    key_scale,
-                                    key_zero,
-                                    scratch.certified_promoted_key_bf16.as_ref().unwrap(),
-                                    scratch.certified_promote_index.as_ref().unwrap(),
-                                    final_promoted_value_ref,
-                                    scratch.certified_value_promote_index.as_ref().unwrap(),
-                                    ls.certified_kv_value_i4.as_ref().unwrap(),
-                                    ls.certified_kv_value_scale.as_ref().unwrap(),
-                                    ls.certified_kv_value_zero.as_ref().unwrap(),
-                                    tail_key_kernel_ref,
-                                    tail_value_kernel_ref,
-                                    kv_len,
-                                    block_size,
-                                    value_group_size,
-                                    num_q_heads / num_kv_heads,
-                                    q_scale,
-                                    score_scratch,
-                                    attn_out_bf16,
-                                    Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
-                                )
-                                .map_err(|e| {
-                                    anyhow::anyhow!(
-                                        "layer {idx} certified KV exact mixed-key INT4 attention: {e}"
-                                    )
-                                })?;
-                            }
+                            })?;
                             kernel_ffi::certified_kv::block_masses_from_token_probs(
                                 self.ordinal,
                                 score_scratch,
                                 scratch.certified_final_block_mass.as_mut().unwrap(),
                                 block_size,
+                                Some(scratch.certified_value_promotion_any.as_ref().unwrap()),
                             )
                             .map_err(|e| {
                                 anyhow::anyhow!(
@@ -7591,6 +7810,7 @@ impl DecodeEngine {
                                 scratch.certified_value_e_val_by_head.as_mut().unwrap(),
                                 gqa_group,
                                 cfg.v_tol,
+                                None,
                             )
                             .map_err(|e| {
                                 anyhow::anyhow!(
@@ -7669,8 +7889,7 @@ impl DecodeEngine {
                                 }
                             }
                         }
-                        if use_device_selector && cfg.ranking_r > 0 && !key_budget_covers_all_blocks
-                        {
+                        if use_device_selector && cfg.ranking_r > 0 {
                             let prefix_tokens = aligned.min(kv_len);
                             let prefix_shape = [num_kv_heads, cap, head_dim];
                             let reset_prefix_cache = ls
@@ -9587,6 +9806,21 @@ impl DecodeEngine {
             .flatten()
             {
                 stats.tail_bf16_vram_bytes += buf.len_bytes();
+            }
+            if let Some(buf) = layer.certified_kv_promoted_key_cache.as_ref() {
+                stats.promoted_key_cache_vram_bytes += buf.len_bytes();
+            }
+            for buf in [
+                layer.certified_kv_promoted_key_cache_tags_gpu.as_ref(),
+                layer.certified_kv_promoted_key_cache_lru_gpu.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                stats.promoted_key_cache_vram_bytes += buf.len_bytes();
+            }
+            if let Some(buf) = layer.certified_kv_promoted_value_cache.as_ref() {
+                stats.promoted_value_cache_vram_bytes += buf.len_bytes();
             }
             for buf in [
                 layer.certified_kv_ranking_prefix_k.as_ref(),

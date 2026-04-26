@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod certified_kv;
 mod decode_engine;
@@ -472,6 +472,10 @@ pub(crate) struct Cli {
     /// Certified KV Rung 1 K expansion multiplier.
     #[arg(long, default_value = "2.0", hide = true)]
     certified_kv_rung1_multiplier: f32,
+
+    /// FP16 key scratch cache capacity in blocks per layer/KV head.
+    #[arg(long, default_value = "256", hide = true)]
+    certified_kv_key_cache_blocks: usize,
 
     /// Certified KV guard exponent applied to tail-mass certificates.
     #[arg(long, default_value = "3.0", hide = true)]
