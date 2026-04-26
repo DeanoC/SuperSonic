@@ -169,7 +169,12 @@ pub fn bake_qwen35(
         .keys()
         .filter(|name| {
             if name.ends_with("_scale_inv") {
-                return fp8_native; // keep scale tensors only in FP8-native mode
+                let Some(weight_name) = name.strip_suffix("_scale_inv") else {
+                    return false;
+                };
+                return fp8_native
+                    && (weight_name.starts_with(&format!("{weight_prefix}."))
+                        || weight_name == "lm_head.weight");
             }
             name.starts_with(&format!("{weight_prefix}.")) || *name == "lm_head.weight"
         })
@@ -310,6 +315,9 @@ pub fn bake_qwen35(
         format_version: FORMAT_VERSION,
         converter_version: CONVERTER_VERSION,
         model_family: "qwen35".to_string(),
+        quant_profile: None,
+        source_format: None,
+        source_quant: None,
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -471,6 +479,9 @@ pub fn bake_phi4(
         format_version: FORMAT_VERSION,
         converter_version: CONVERTER_VERSION,
         model_family: "phi4".to_string(),
+        quant_profile: None,
+        source_format: None,
+        source_quant: None,
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;

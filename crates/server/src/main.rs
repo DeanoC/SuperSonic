@@ -42,6 +42,10 @@ struct Cli {
     #[arg(long)]
     int4: bool,
 
+    /// Use a GGUF-like Q4KM bake in SuperSonic's native low-bit runtime layout.
+    #[arg(long)]
+    q4km: bool,
+
     /// Keep FP8 weights on GPU and dequant at runtime (Qwen3.5 only).
     #[arg(long)]
     fp8_runtime: bool,
@@ -86,6 +90,7 @@ fn main() -> Result<()> {
         device: cli.device,
         max_context: cli.max_context,
         int4: cli.int4,
+        q4km: cli.q4km,
         fp8_runtime: cli.fp8_runtime,
         kv_fp8: cli.kv_fp8,
         api_key: cli.api_key,

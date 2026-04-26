@@ -48,5 +48,11 @@ pub struct Manifest {
     pub format_version: u32,
     pub converter_version: u32,
     pub model_family: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_format: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_quant: Option<String>,
     pub tensors: Vec<TensorMeta>,
 }

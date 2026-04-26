@@ -1,4 +1,6 @@
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn command_exists(name: &str) -> bool {
@@ -10,10 +12,56 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn detect_cuda_root() -> Option<PathBuf> {
+    for var in ["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(value) = env::var(var) {
+            let path = PathBuf::from(value);
+            if path.join("bin/nvcc").exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    let Ok(output) = Command::new("sh")
+        .arg("-lc")
+        .arg("command -v nvcc")
+        .output()
+    else {
+        return None;
+    };
+    if !output.status.success() {
+        return None;
+    }
+
+    let nvcc = fs::canonicalize(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+    .ok()?;
+    nvcc.parent()
+        .and_then(|bin| bin.parent())
+        .map(Path::to_path_buf)
+}
+
+fn detect_cuda_lib_dir() -> Option<PathBuf> {
+    let root = detect_cuda_root()?;
+    for candidate in [
+        root.join("lib64"),
+        root.join("targets/x86_64-linux/lib"),
+        root.join("lib"),
+    ] {
+        if candidate.join("libcudart.so").exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/metal_bridge.mm");
     println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_cuda)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_metal)");
@@ -63,6 +111,12 @@ fn main() {
         println!("cargo:rustc-cfg=supersonic_backend_hip");
     }
     if enable_cuda {
+        let cuda_lib_dir = detect_cuda_lib_dir().unwrap_or_else(|| {
+            panic!(
+                "could not locate libcudart.so; set CUDA_HOME or CUDA_PATH to a valid CUDA toolkit root"
+            )
+        });
+        println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
         println!("cargo:rustc-cfg=supersonic_backend_cuda");
     }
     if enable_metal {
