@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         &scale_gpu,
         &zero_gpu,
         meta.group_size,
+        qwen35::weights::LOWBIT_NATIVE_INT4,
         &mut out_gpu,
     )
     .map_err(|e| anyhow!("matmul int4 call: {e}"))?;

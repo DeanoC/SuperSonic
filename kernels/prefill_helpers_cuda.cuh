@@ -73,9 +73,9 @@ __global__ void pfx_element_add_kernel(
 // Applies RoPE in-place on tensor with layout [seq_len, num_heads, head_dim].
 // Only the first rotary_dim dimensions of each head are rotated.
 // cos_table/sin_table: [max_pos, half_rot] where half_rot = rotary_dim / 2.
-// Qwen3.5 uses rotate_half over the rotary slice:
-// new[i]            = old[i] * cos[i] - old[i + half_rot] * sin[i]
-// new[i + half_rot] = old[i] * sin[i] + old[i + half_rot] * cos[i]
+// Qwen3.6 GGUF uses interleaved RoPE pairs over the rotary slice:
+// new[2*i]     = old[2*i] * cos[i] - old[2*i + 1] * sin[i]
+// new[2*i + 1] = old[2*i] * sin[i] + old[2*i + 1] * cos[i]
 
 template <typename T>
 __global__ void pfx_apply_rope_prefill_kernel(
@@ -101,11 +101,13 @@ __global__ void pfx_apply_rope_prefill_kernel(
 
     const size_t base = static_cast<size_t>(pos) * num_heads * head_dim
                       + static_cast<size_t>(h) * head_dim;
-    const float x0 = pfx_to_float(data[base + i]);
-    const float x1 = pfx_to_float(data[base + half_rot + i]);
+    const int d0 = i;
+    const int d1 = half_rot + i;
+    const float x0 = pfx_to_float(data[base + d0]);
+    const float x1 = pfx_to_float(data[base + d1]);
 
-    data[base + i]            = pfx_from_float<T>(x0 * c - x1 * s);
-    data[base + half_rot + i] = pfx_from_float<T>(x0 * s + x1 * c);
+    data[base + d0] = pfx_from_float<T>(x0 * c - x1 * s);
+    data[base + d1] = pfx_from_float<T>(x0 * s + x1 * c);
 }
 
 // ---- Kernel 3: Transpose [S, H, D] <-> [H, S, D] ----
@@ -290,8 +292,8 @@ __global__ void pfx_split_qkv_kernel(
 }
 
 // ---- Kernel 10: Repeat interleave along head dimension ----
-// src: [S, n_heads, head_dim] → dst: [S, n_heads * repeats, head_dim]
-// Each head is repeated 'repeats' times consecutively.
+// src: [S, n_heads, head_dim] -> dst: [S, n_heads * repeats, head_dim].
+// Qwen gated-delta-net maps value head h to key/query head h % n_heads.
 
 template <typename T>
 __global__ void pfx_repeat_interleave_heads_kernel(
@@ -307,7 +309,7 @@ __global__ void pfx_repeat_interleave_heads_kernel(
     const int d = static_cast<int>(idx % head_dim);
     const int oh = static_cast<int>((idx / head_dim) % out_heads);
     const int s = static_cast<int>(idx / (static_cast<size_t>(head_dim) * out_heads));
-    const int src_h = oh / repeats;
+    const int src_h = oh % n_heads;
 
     const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
                          + static_cast<size_t>(src_h) * head_dim + d;

@@ -3680,6 +3680,7 @@ int matmul_int4_dequant_device(
     const void* scale,
     const void* zero,
     int group_size,
+    int quant_type,
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
@@ -3698,6 +3699,7 @@ int matmul_int4_dequant_device(
         static_cast<const T*>(scale),
         static_cast<const T*>(zero),
         group_size,
+        quant_type,
         static_cast<T*>(out));
     cudaError_t launch_err = cudaGetLastError();
     cudaError_t sync_err = cudaDeviceSynchronize();
@@ -3716,12 +3718,13 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     const void* scale,
     const void* zero,
     int group_size,
+    int quant_type,
     void* out) {
     switch (dtype) {
     case 2:
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
-            lhs, rhs_int4, scale, zero, group_size, out);
+            lhs, rhs_int4, scale, zero, group_size, quant_type, out);
     default:
         return 272;
     }

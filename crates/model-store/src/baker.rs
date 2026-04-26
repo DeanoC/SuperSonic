@@ -279,8 +279,11 @@ pub fn bake_qwen35(
             LayoutTag::Fp8Dequantized
             | LayoutTag::Fp8Native
             | LayoutTag::Int8Quantized
-            | LayoutTag::Int4Quantized => {
-                unreachable!("FP8/INT8/INT4 tensors are handled before this match")
+            | LayoutTag::Int4Quantized
+            | LayoutTag::GgmlQ4K
+            | LayoutTag::GgmlQ5K
+            | LayoutTag::GgmlQ6K => {
+                unreachable!("low-bit tensors are handled by external bakers")
             }
         };
 

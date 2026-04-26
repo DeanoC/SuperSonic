@@ -819,6 +819,7 @@ unsafe extern "C" {
         scale: *const c_void,
         zero: *const c_void,
         group_size: c_int,
+        quant_type: c_int,
         out: *mut c_void,
     ) -> c_int;
 
@@ -2267,6 +2268,7 @@ pub fn matmul_rhs_transposed_int4(
     scale: &GpuBuffer,
     zero: &GpuBuffer,
     group_size: usize,
+    quant_type: i32,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
@@ -2300,19 +2302,27 @@ pub fn matmul_rhs_transposed_int4(
                     return result;
                 }
             }
-            let result =
-                metal_profile_time("matmul_rhs_transposed_int4_gemv_m1", "native", || {
-                    metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
-                        n, k, group_size, lhs, rhs_int4, scale, zero, out,
-                    )
-                });
+            let result = metal_profile_time("matmul_rhs_transposed_int4_gemv_m1", "native", || {
+                metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
+                    n, k, group_size, lhs, rhs_int4, scale, zero, out,
+                )
+            });
             if result.is_ok() {
                 return result;
             }
         }
         return metal_profile_time("matmul_rhs_transposed_int4", "native", || {
             metal_native::matmul_rhs_transposed_int4_bf16(
-                batch_elems, m, n, k, group_size, lhs, rhs_int4, scale, zero, out,
+                batch_elems,
+                m,
+                n,
+                k,
+                group_size,
+                lhs,
+                rhs_int4,
+                scale,
+                zero,
+                out,
             )
         });
     }
@@ -2329,6 +2339,7 @@ pub fn matmul_rhs_transposed_int4(
             scale.as_ptr(),
             zero.as_ptr(),
             group_size as c_int,
+            quant_type as c_int,
             out.as_mut_ptr(),
         )
     };

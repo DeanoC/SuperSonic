@@ -27,6 +27,7 @@ struct Qwen35DecodeLayerDesc {
     float input_norm_eps;
     const void* post_attn_norm_w;      // [hidden_size] BF16
     float post_attn_norm_eps;
+    int rms_norm_add_unit_offset;
     // --- MLP weights (both layer types) ---
     const void* gate_proj_w;           // [intermediate_size, hidden_size] BF16
     const void* up_proj_w;             // [intermediate_size, hidden_size] BF16

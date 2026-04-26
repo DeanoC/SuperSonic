@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gpu_hal::{GpuBuffer, ScalarType};
+use model_store::manifest::LayoutTag;
 
 use crate::config::TextConfig;
 use crate::loader::{LoadError, WeightLoader};
@@ -33,6 +34,40 @@ fn ensure_f32_on_gpu(buf: GpuBuffer, ordinal: usize) -> Result<GpuBuffer, model_
     )
     .map_err(|e| model_store::Error::Other(format!("norm_w bf16->f32 cast: {e}")))?;
     Ok(out)
+}
+
+pub const LOWBIT_NATIVE_INT4: i32 = 4;
+pub const LOWBIT_GGML_Q4_K: i32 = 12;
+pub const LOWBIT_GGML_Q5_K: i32 = 13;
+pub const LOWBIT_GGML_Q6_K: i32 = 14;
+
+pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
+    if cols % 256 != 0 {
+        return None;
+    }
+    let blocks = cols / 256;
+    match qtype {
+        LOWBIT_GGML_Q4_K => Some(blocks * 144),
+        LOWBIT_GGML_Q5_K => Some(blocks * 176),
+        LOWBIT_GGML_Q6_K => Some(blocks * 210),
+        _ => None,
+    }
+}
+
+pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: bool) -> i32 {
+    if weight.dtype() != ScalarType::U8 || weight.shape().len() < 2 {
+        return 0;
+    }
+    if native_int4 {
+        return LOWBIT_NATIVE_INT4;
+    }
+    let row_bytes = weight.shape()[1];
+    for qtype in [LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K] {
+        if ggml_k_row_bytes(qtype, logical_cols) == Some(row_bytes) {
+            return qtype;
+        }
+    }
+    0
 }
 
 /// All immutable model weights on GPU.
@@ -366,6 +401,12 @@ impl Qwen35Weights {
                     Ok((None, None))
                 }
             };
+        let is_ggml_lowbit = |name: &str| -> bool {
+            matches!(
+                store.layout(name),
+                Some(LayoutTag::GgmlQ4K | LayoutTag::GgmlQ5K | LayoutTag::GgmlQ6K)
+            )
+        };
 
         let embed_tokens =
             Arc::new(store.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?);
@@ -438,6 +479,9 @@ impl Qwen35Weights {
                     } else {
                         int4_group_size = 128;
                     }
+                } else if is_ggml_lowbit(&gate_name) {
+                    is_int4 = true;
+                    int4_group_size = 128;
                 }
             }
 

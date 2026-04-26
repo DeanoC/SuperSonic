@@ -758,13 +758,8 @@ fn variant_version_ok(
     variant: model_store::fetch::BakeVariant,
     bake_dir: &std::path::Path,
 ) -> bool {
-    if variant == model_store::fetch::BakeVariant::Q4Km
-        && bake_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with("-q4km-gptq"))
-    {
-        model_store::version_ok_q4km_gptq(bake_dir)
+    if variant == model_store::fetch::BakeVariant::Q4Km {
+        model_store::version_ok_q4km(bake_dir)
     } else {
         model_store::version_ok(bake_dir)
     }
@@ -1380,11 +1375,7 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "no {variant} bake at {} and --no-download set.\n\
-                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
-                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
-                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
-                                bake_dir.display(),
-                                cli.model_dir.display(),
+                                 Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake.",
                                 bake_dir.display(),
                             );
                         } else {
@@ -1404,11 +1395,7 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "could not obtain {variant} bake: {e}\n\n\
-                                 Build a GPTQ-profiled bake into the directory runtime reads:\n  \
-                                 python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
-                                 Or rerun with --gguf-file /path/to/model.gguf to create a local calibration-free q4km bake.",
-                                cli.model_dir.display(),
-                                bake_dir.display(),
+                                 Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake.",
                             );
                         } else {
                             anyhow::bail!(
@@ -1427,8 +1414,8 @@ fn main() -> Result<()> {
             if !variant_version_ok(variant, &bake_dir) && local_bake_ok {
                 let bake_start = Instant::now();
                 if cli.q4km {
-                    bake_dir = model_store::bake_dir_q4km_minmax(&cli.model_dir);
-                    if !model_store::version_ok(&bake_dir) {
+                    bake_dir = model_store::bake_dir_q4km(&cli.model_dir);
+                    if !model_store::version_ok_q4km(&bake_dir) {
                         run_q4km_baker(&cli, &bake_dir)?;
                     }
                 } else {
