@@ -1816,8 +1816,25 @@ fn main() -> Result<()> {
         && oracle_output.is_none()
         && !cuda_08b_hero_enabled
         && !cuda_fast_greedy_disabled;
+    // Metal fast-greedy: same trigger conditions as CUDA's fast-greedy. Uses the
+    // fused lm_head + argmax kernel and returns just the sampled token, skipping
+    // the per-token 250k-element BF16 D2H + host argmax loop. Disable via env
+    // var for bring-up/bisect.
+    let metal_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_METAL_FAST_GREEDY").is_some();
+    let metal_fast_greedy_enabled = backend == Backend::Metal
+        && metal_v2_incremental
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !cli.force_component_decode
+        && !cli.force_kernel_decode
+        && oracle_output.is_none()
+        && !metal_fast_greedy_disabled;
     if metal_v2_incremental {
-        eprintln!("[decode] Metal v2 incremental decode");
+        if metal_fast_greedy_enabled {
+            eprintln!("[decode] Metal v2 incremental decode (fast-greedy: fused argmax)");
+        } else {
+            eprintln!("[decode] Metal v2 incremental decode");
+        }
     }
     if replay_decode_enabled {
         if cuda_qwen2b_replay_default {
@@ -2039,6 +2056,10 @@ fn main() -> Result<()> {
                     engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
+                maybe_fast_token = Some(token);
+                Vec::new()
+            } else if metal_fast_greedy_enabled {
+                let token = engine.decode_step_metal_fast_greedy(next_token, seqlen_offset)?;
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if cuda_08b_hero_enabled {

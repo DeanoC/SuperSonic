@@ -1580,11 +1580,12 @@ impl MetalV2DecodeScratch {
     }
 }
 
-/// Single-token incremental decode step for Metal. Mirrors `prefill_inner`'s
-/// chunk-loop body with `chunk_len=1, chunk_start=seqlen_offset, is_last_chunk=true`,
-/// reading and writing the persistent layer state in place. Replaces Metal v1's
-/// O(N²) replay-prefill path with O(N)-per-step proper incremental decode.
-pub fn metal_v2_decode_step(
+/// Per-token forward pass body shared by `metal_v2_decode_step` (full-logits)
+/// and `metal_v2_decode_step_greedy` (fused argmax). Performs token embed +
+/// 24-layer transformer pass, leaving the post-final-layer hidden state in
+/// `scratch.scratch.hidden`. Caller is responsible for the final RMSNorm +
+/// lm_head and for owning a `MetalBatchGuard` around the call.
+fn metal_v2_decode_step_body(
     weights: &Qwen35Weights,
     state: &mut ModelState,
     rotary: &RotaryTables,
@@ -1593,20 +1594,11 @@ pub fn metal_v2_decode_step(
     seqlen_offset: usize,
     ordinal: usize,
     kv_chunk_size: usize,
-) -> Result<Vec<f32>> {
+) -> Result<()> {
     let config = &weights.config;
     let hidden_dim = config.hidden_size;
     let chunk_len = 1usize;
     let chunk_start = seqlen_offset;
-
-    // Open one Metal batch around the entire per-token forward pass so all
-    // ~800 kernel dispatches end up in a single command buffer rather than
-    // committing and waiting individually. The guard's Drop ends the batch
-    // (commit + wait) on any return path. Profile (32 tokens, M4) showed
-    // command_buffer_wait at 0.46 ms × 26k calls = 12 s of pure waiting;
-    // collapsing to one buffer per token is the dominant decode-side win.
-    let _metal_batch =
-        prefill_ffi::MetalBatchGuard::begin().map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
 
     // Seed the inter-chunk conv tail buffers from the persistent layer state.
     // The recurrent state lives on the layer in F32 and `prefill_linear_attention_layer`
@@ -1712,6 +1704,38 @@ pub fn metal_v2_decode_step(
         prefill_mlp_layer(weights, &mut scratch.scratch, config, idx, chunk_len, ordinal)?;
     }
 
+    Ok(())
+}
+
+/// Single-token incremental decode step for Metal. Mirrors `prefill_inner`'s
+/// chunk-loop body with `chunk_len=1, chunk_start=seqlen_offset, is_last_chunk=true`,
+/// reading and writing the persistent layer state in place. Replaces Metal v1's
+/// O(N²) replay-prefill path with O(N)-per-step proper incremental decode.
+///
+/// Returns the full BF16→f32 logits row over the vocabulary. Use
+/// `metal_v2_decode_step_greedy` to skip the 250k-element D2H + host argmax
+/// when only the sampled token is needed.
+pub fn metal_v2_decode_step(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<Vec<f32>> {
+    // Open one Metal batch around the entire per-token forward pass so all
+    // ~800 kernel dispatches end up in a single command buffer rather than
+    // committing and waiting individually.
+    let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
+        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+
+    metal_v2_decode_step_body(
+        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+    )?;
+
+    let config = &weights.config;
     let (mut logits_per_pos, _normed) = compute_logits_for_range(
         &scratch.scratch.hidden,
         weights,
@@ -1725,6 +1749,82 @@ pub fn metal_v2_decode_step(
         .pop()
         .expect("count=1 produces exactly one row");
     Ok(logits)
+}
+
+/// Same forward pass as `metal_v2_decode_step`, but uses the fused
+/// lm_head + argmax kernel and returns just the sampled token id. Skips the
+/// per-token 250k-element BF16 D2H, the bf16→f32 conversion, and the host
+/// argmax loop. Use this when full logits aren't needed (no validation,
+/// no rescore, plain greedy decode).
+pub fn metal_v2_decode_step_greedy(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    scratch: &mut MetalV2DecodeScratch,
+    token_id: u32,
+    seqlen_offset: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+) -> Result<u32> {
+    let _metal_batch = prefill_ffi::MetalBatchGuard::begin()
+        .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
+
+    metal_v2_decode_step_body(
+        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+    )?;
+
+    let config = &weights.config;
+    let hidden_dim = config.hidden_size;
+    let vocab_size = config.vocab_size;
+    let elem_bytes = ScalarType::BF16.size_in_bytes();
+
+    // Final RMSNorm + fused lm_head argmax. For chunk_len=1, scratch.hidden is
+    // already a single row, so we apply RMSNorm in-place via a temp slice.
+    let slice = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy slice alloc: {e}"))?;
+    copy_d2d_batched(
+        ordinal,
+        slice.as_ptr() as *mut c_void,
+        scratch.scratch.hidden.as_ptr(),
+        hidden_dim * elem_bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy slice copy: {e}"))?;
+
+    let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_dim])
+        .map_err(|e| anyhow::anyhow!("greedy normed alloc: {e}"))?;
+    rms_norm_rows_model(
+        config,
+        ordinal,
+        1,
+        hidden_dim,
+        &slice,
+        &weights.norm_weight,
+        &mut normed,
+        "greedy final norm",
+    )?;
+
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .map_err(|e| anyhow::anyhow!("greedy out_index alloc: {e}"))?;
+    kernel_ffi::metal_lm_head_argmax_bf16_into(
+        &normed,
+        &*weights.lm_head,
+        &mut out_index,
+        hidden_dim,
+        vocab_size,
+    )
+    .map_err(|e| anyhow::anyhow!("greedy fused lm_head argmax: {e}"))?;
+
+    // Flush before D2H so the GPU work is visible to the host memcpy.
+    if prefill_ffi::metal_batch_is_active() {
+        prefill_ffi::flush_metal_batch()
+            .map_err(|e| anyhow::anyhow!("greedy batch flush: {e}"))?;
+    }
+
+    let bytes = out_index
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("greedy token D2H: {e}"))?;
+    let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    Ok(token)
 }
 
 /// Per-layer full-attention prefill step.

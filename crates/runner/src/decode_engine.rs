@@ -10446,6 +10446,42 @@ impl DecodeEngine {
     /// O(N²) replay-prefill path. Always returns logits and a host-computed
     /// argmax; sampling_mode and sync_for_timing in the caller are ignored
     /// because v2 doesn't have GPU-side fused argmax yet (that's v3).
+    /// Metal-only fast-greedy single-step decode that uses the fused
+    /// lm_head + argmax kernel and skips the per-token 250k-element BF16 D2H
+    /// + bf16→f32 conversion + host argmax. Returns just the sampled token.
+    /// Caller must guarantee greedy mode (no sampling, no host rescore, no
+    /// validation that needs the full logits row).
+    pub fn decode_step_metal_fast_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<u32> {
+        if self.hidden_io.backend() != gpu_hal::Backend::Metal {
+            anyhow::bail!("decode_step_metal_fast_greedy requires the Metal backend");
+        }
+        let config = &self.weights.config;
+        if self.metal_v2_scratch.is_none() {
+            self.metal_v2_scratch = Some(prefill_engine::MetalV2DecodeScratch::new(
+                config,
+                self.ordinal,
+            )?);
+        }
+        let scratch = self
+            .metal_v2_scratch
+            .as_mut()
+            .expect("metal v2 scratch was just initialized");
+        prefill_engine::metal_v2_decode_step_greedy(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            scratch,
+            token_id,
+            seqlen_offset,
+            self.ordinal,
+            self.kv_chunk_size,
+        )
+    }
+
     fn decode_step_non_4b_metal(
         &mut self,
         token_id: u32,
