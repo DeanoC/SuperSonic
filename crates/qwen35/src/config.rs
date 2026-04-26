@@ -28,7 +28,7 @@ fn default_rope_type() -> String {
     "default".to_string()
 }
 fn default_rms_norm_add_unit_offset() -> bool {
-    false
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -255,6 +255,6 @@ mod tests {
         assert_eq!(text.rotary_dim(), 64);
         assert_eq!(text.rope_theta(), 10_000_000.0);
         assert_eq!(text.kv_bytes_per_token(2), 65_536);
-        assert!(!text.rms_norm_add_unit_offset);
+        assert!(text.rms_norm_add_unit_offset);
     }
 }

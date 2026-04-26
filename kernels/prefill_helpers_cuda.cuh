@@ -293,7 +293,8 @@ __global__ void pfx_split_qkv_kernel(
 
 // ---- Kernel 10: Repeat interleave along head dimension ----
 // src: [S, n_heads, head_dim] -> dst: [S, n_heads * repeats, head_dim].
-// Qwen gated-delta-net maps value head h to key/query head h % n_heads.
+// Qwen gated-delta-net expands key/query heads with repeat_interleave:
+// source heads appear in contiguous repeat blocks.
 
 template <typename T>
 __global__ void pfx_repeat_interleave_heads_kernel(
@@ -309,7 +310,7 @@ __global__ void pfx_repeat_interleave_heads_kernel(
     const int d = static_cast<int>(idx % head_dim);
     const int oh = static_cast<int>((idx / head_dim) % out_heads);
     const int s = static_cast<int>(idx / (static_cast<size_t>(head_dim) * out_heads));
-    const int src_h = oh % n_heads;
+    const int src_h = oh / repeats;
 
     const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
                          + static_cast<size_t>(src_h) * head_dim + d;
