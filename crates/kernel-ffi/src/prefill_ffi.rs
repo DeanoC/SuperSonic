@@ -2271,6 +2271,23 @@ pub fn matmul_rhs_transposed_int4(
 ) -> Result<(), GpuError> {
     if out.backend() == Backend::Metal {
         let _ = ordinal;
+        // M=1 batch=1 GEMV: SIMD-group cooperative reduction with on-the-fly
+        // nibble dequant. Used by every decode-step projection. Disable via
+        // SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1 for bring-up/bisect.
+        if batch_elems == 1
+            && m == 1
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1").is_none()
+        {
+            let result =
+                metal_profile_time("matmul_rhs_transposed_int4_gemv_m1", "native", || {
+                    metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1(
+                        n, k, group_size, lhs, rhs_int4, scale, zero, out,
+                    )
+                });
+            if result.is_ok() {
+                return result;
+            }
+        }
         return metal_profile_time("matmul_rhs_transposed_int4", "native", || {
             metal_native::matmul_rhs_transposed_int4_bf16(
                 batch_elems, m, n, k, group_size, lhs, rhs_int4, scale, zero, out,

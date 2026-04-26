@@ -864,6 +864,133 @@ kernel void supersonic_matmul_rhs_transposed_bf16_gemv_m1_tiled(
     return pipeline;
 }
 
+// SIMD-group INT4 GEMV (M=1, batch=1). Same shape as the BF16 GEMV but
+// dequants nibbles on the fly. Each SIMD-group (32 threads) handles one
+// output column; lanes stride through K with `kk += 32`, dequant via
+// `bf16_round_rne(nibble * scale - zero * scale)`, then `simd_sum`.
+// Replaces the per-cell sequential-K kernel from Step 3 for the M=1
+// decode case — every projection in `metal_v2_decode_step` hits it,
+// not just lm_head.
+id<MTLComputePipelineState> matmul_pipeline_int4_bf16_gemv_m1(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:701
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"INT4GEMV(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulInt4GemvParams {
+    uint n;
+    uint k;
+    uint group_size;
+};
+
+inline float bf16_round_rne_finite(float x) {
+    uint bits = as_type<uint>(x);
+    uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    return as_type<float>(bits);
+}
+
+kernel void supersonic_matmul_rhs_transposed_int4_bf16_gemv_m1(
+    device const bfloat* lhs [[buffer(0)]],
+    device const uchar* rhs_int4 [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device const bfloat* zero [[buffer(3)]],
+    device bfloat* out [[buffer(4)]],
+    constant MatmulInt4GemvParams& params [[buffer(5)]],
+    uint col [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (col >= params.n) {
+        return;
+    }
+    uint k = params.k;
+    uint k_packed = k / 2u;
+    uint group_size = params.group_size;
+    uint scale_cols = (k + group_size - 1u) / group_size;
+    uint scale_row = col / group_size;
+    uint rhs_base = col * k_packed;
+
+    float partial = 0.0f;
+    for (uint kk = lane; kk < k; kk += 32u) {
+        uint byte_idx = kk >> 1u;
+        uint packed_byte = uint(rhs_int4[rhs_base + byte_idx]);
+        uint nibble = (kk & 1u) != 0u ? ((packed_byte >> 4u) & 0xFu) : (packed_byte & 0xFu);
+        uint sc_idx = scale_row * scale_cols + (kk / group_size);
+        float s = float(scale[sc_idx]);
+        float z = float(zero[sc_idx]);
+        float w = bf16_round_rne_finite(float(nibble) * s - z * s);
+        partial += float(lhs[kk]) * w;
+    }
+    float sum = simd_sum(partial);
+    if (lane == 0) {
+        out[col] = bfloat(sum);
+    }
+}
+)INT4GEMV";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:702
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile int4 gemv library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_matmul_rhs_transposed_int4_bf16_gemv_m1"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:703
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load int4 gemv function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:704
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create int4 gemv pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> matmul_pipeline_f32(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -8634,6 +8761,88 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_residual_bf16(
             MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 351, 352, 353, 354);
+    }
+}
+
+extern "C" int supersonic_metal_matmul_rhs_transposed_int4_bf16_gemv_m1(
+    size_t n,
+    size_t k,
+    size_t group_size,
+    const void* lhs_ptr,
+    const void* rhs_int4_ptr,
+    const void* scale_ptr,
+    const void* zero_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (n == 0 || k == 0 || group_size == 0 || lhs_ptr == nullptr ||
+            rhs_int4_ptr == nullptr || scale_ptr == nullptr || zero_ptr == nullptr ||
+            out_ptr == nullptr) {
+            return 720;
+        }
+        if (k % 2 != 0) {
+            return 721;
+        }
+        if (n > UINT32_MAX || k > UINT32_MAX || group_size > UINT32_MAX) {
+            return 722;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = matmul_pipeline_int4_bf16_gemv_m1(&pipeline_error);
+        if (pipeline == nil) {
+            return 723;
+        }
+
+        id<MTLBuffer> lhs = nil;
+        id<MTLBuffer> rhs = nil;
+        id<MTLBuffer> sc = nil;
+        id<MTLBuffer> zr = nil;
+        id<MTLBuffer> out = nil;
+        size_t lhs_offset = 0;
+        size_t rhs_offset = 0;
+        size_t sc_offset = 0;
+        size_t zr_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(lhs_ptr, &lhs, &lhs_offset) != 0) {
+            return 724;
+        }
+        if (lookup_buffer(rhs_int4_ptr, &rhs, &rhs_offset) != 0) {
+            return 725;
+        }
+        if (lookup_buffer(scale_ptr, &sc, &sc_offset) != 0) {
+            return 726;
+        }
+        if (lookup_buffer(zero_ptr, &zr, &zr_offset) != 0) {
+            return 727;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 728;
+        }
+
+        struct MatmulInt4GemvParams {
+            uint32_t n;
+            uint32_t k;
+            uint32_t group_size;
+        } params = {
+            static_cast<uint32_t>(n),
+            static_cast<uint32_t>(k),
+            static_cast<uint32_t>(group_size),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:sc offset:sc_offset atIndex:2];
+            [encoder setBuffer:zr offset:zr_offset atIndex:3];
+            [encoder setBuffer:out offset:out_offset atIndex:4];
+            [encoder setBytes:&params length:sizeof(params) atIndex:5];
+
+            // One SIMD-group (32 threads) per output column.
+            MTLSize threads_per_group = MTLSizeMake(32, 1, 1);
+            MTLSize threadgroups = MTLSizeMake(n, 1, 1);
+            [encoder dispatchThreadgroups:threadgroups threadsPerThreadgroup:threads_per_group];
+        }, 729, 730, 731, 732);
     }
 }
 
