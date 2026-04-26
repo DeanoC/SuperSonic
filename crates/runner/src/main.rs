@@ -1226,7 +1226,9 @@ fn main() -> Result<()> {
             anyhow::bail!("Metal only supports --batch-size 1");
         }
         if cli.force_kernel_decode || cli.force_component_decode {
-            anyhow::bail!("Metal does not support --force-kernel-decode or --force-component-decode");
+            anyhow::bail!(
+                "Metal does not support --force-kernel-decode or --force-component-decode"
+            );
         }
     }
 
@@ -1342,7 +1344,8 @@ fn main() -> Result<()> {
             let local_bake_ok = matches!(
                 variant,
                 model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
-            ) || (variant == model_store::fetch::BakeVariant::Q4Km && cli.gguf_file.is_some());
+            ) || (variant == model_store::fetch::BakeVariant::Q4Km
+                && cli.gguf_file.is_some());
             let canonical_model = model_variant.to_string();
             match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
                 Ok(true) => {
@@ -1353,10 +1356,12 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "no {variant} bake at {} and --no-download set.\n\
-                                 Run:\n  python oracle/bake_q4km.py --model {} --model-dir {}",
+                                 Run a GGUF translation into the directory runtime reads:\n  \
+                                 python oracle/bake_q4km.py --model {} --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}",
                                 bake_dir.display(),
                                 cli.model,
                                 cli.model_dir.display(),
+                                bake_dir.display(),
                             );
                         } else {
                             anyhow::bail!(
@@ -1375,12 +1380,12 @@ fn main() -> Result<()> {
                         if cli.q4km {
                             anyhow::bail!(
                                 "could not obtain {variant} bake: {e}\n\n\
-                                 Run:\n  python oracle/bake_q4km.py --model {} --model-dir {}\n\
-                                 then `python oracle/upload_bake.py --model {} --q4km --model-dir {}` to publish.",
+                                 Run a GGUF translation into the directory runtime reads:\n  \
+                                 python oracle/bake_q4km.py --model {} --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}\n\
+                                 For a release-compatible GPTQ bake, use oracle/q4km_stream_gptq_bake.py with the same --out-dir before uploading with --q4km-gptq.",
                                 cli.model,
                                 cli.model_dir.display(),
-                                cli.model,
-                                cli.model_dir.display(),
+                                bake_dir.display(),
                             );
                         } else {
                             anyhow::bail!(

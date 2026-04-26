@@ -366,11 +366,12 @@ fn build_qwen(
         if !downloaded && !local_bake_ok {
             bail!(
                 "no {variant_bake} bake at {} and download unavailable. Low-bit baking \
-                 must happen offline — run `python oracle/bake_q4km.py --model-dir {}` \
+                 must happen offline — run `python oracle/bake_q4km.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
                  for q4km or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
                  then rerun without --no-download to fetch from the GitHub bakes-v1 release.",
                 bake_dir.display(),
                 cfg.model_dir.display(),
+                bake_dir.display(),
                 cfg.model_dir.display(),
             );
         }

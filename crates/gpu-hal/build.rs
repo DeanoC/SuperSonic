@@ -43,17 +43,42 @@ fn detect_cuda_root() -> Option<PathBuf> {
 }
 
 fn detect_cuda_lib_dir() -> Option<PathBuf> {
-    let root = detect_cuda_root()?;
-    for candidate in [
-        root.join("lib64"),
-        root.join("targets/x86_64-linux/lib"),
-        root.join("lib"),
-    ] {
-        if candidate.join("libcudart.so").exists() {
+    let mut candidates = Vec::new();
+    if let Some(root) = detect_cuda_root() {
+        candidates.extend([
+            root.join("lib64"),
+            root.join("targets/x86_64-linux/lib"),
+            root.join("lib"),
+        ]);
+    }
+    candidates.extend([
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/usr/local/lib"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/lib"),
+    ]);
+    for candidate in candidates {
+        if has_libcudart(&candidate) {
             return Some(candidate);
         }
     }
     None
+}
+
+fn has_libcudart(dir: &Path) -> bool {
+    if dir.join("libcudart.so").exists() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libcudart.so.")
+        })
 }
 
 fn main() {
@@ -111,12 +136,13 @@ fn main() {
         println!("cargo:rustc-cfg=supersonic_backend_hip");
     }
     if enable_cuda {
-        let cuda_lib_dir = detect_cuda_lib_dir().unwrap_or_else(|| {
-            panic!(
-                "could not locate libcudart.so; set CUDA_HOME or CUDA_PATH to a valid CUDA toolkit root"
-            )
-        });
-        println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
+        if let Some(cuda_lib_dir) = detect_cuda_lib_dir() {
+            println!("cargo:rustc-link-search=native={}", cuda_lib_dir.display());
+        } else {
+            println!(
+                "cargo:warning=could not locate libcudart under CUDA_HOME/CUDA_PATH or common system library paths; falling back to linker search path"
+            );
+        }
         println!("cargo:rustc-cfg=supersonic_backend_cuda");
     }
     if enable_metal {
