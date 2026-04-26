@@ -1057,9 +1057,6 @@ fn main() -> Result<()> {
         ) {
             anyhow::bail!("Metal only supports --model qwen3.5-0.8b or qwen3.5-2b");
         }
-        if cli.int4 {
-            anyhow::bail!("Metal does not support --int4 on Qwen3.5 yet");
-        }
         if cli.fp8_runtime {
             anyhow::bail!("Metal does not support --fp8-runtime on Qwen3.5 yet");
         }

@@ -97,13 +97,15 @@ uses replayed GPU prefill for correctness.
 
 Metal v2 is a single supported surface:
 
-- BF16 single-sequence decode for `qwen3.5-0.8b` only
+- BF16 single-sequence decode for `qwen3.5-0.8b` and `qwen3.5-2b`
 - both the `supersonic` CLI and `supersonic-serve` HTTP server work; `/v1/completions`
   and `/v1/chat/completions` (streaming and non-streaming) are exercised end-to-end
 - decode is implemented as **incremental per-token decode**: each generated token runs
   a single length-1 forward pass (O(N) per step). Conv and recurrent state are carried
   across tokens in persistent GPU buffers; KV cache grows with the sequence
-- `--int4`, `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
+- INT4 GPTQ kernel is wired in (bit-exact CPU reference unit test passes); end-to-end
+  validation against a baked INT4 model is pending hardware time
+- `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
   and `--force-component-decode` are all rejected at startup
 
 ## Quick Start
@@ -358,7 +360,6 @@ Validated Metal scope:
 Metal currently rejects or defers:
 
 - models other than `qwen3.5-0.8b` and `qwen3.5-2b`
-- `--int4`
 - `--fp8-runtime`
 - `--kv-fp8`
 - batched decode
@@ -366,7 +367,7 @@ Metal currently rejects or defers:
 
 Native Metal kernels used in the hot path:
 
-- matmul RHS-transposed
+- matmul RHS-transposed (BF16 + INT4 GPTQ dequant)
 - full-attention prefill core
 - lm-head argmax
 - RMSNorm rows

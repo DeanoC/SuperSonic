@@ -2228,6 +2228,14 @@ pub fn matmul_rhs_transposed_int4(
     group_size: usize,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_profile_time("matmul_rhs_transposed_int4", "native", || {
+            metal_native::matmul_rhs_transposed_int4_bf16(
+                batch_elems, m, n, k, group_size, lhs, rhs_int4, scale, zero, out,
+            )
+        });
+    }
     let status = unsafe {
         dotcache_qwen35_4b_hip_matmul_int4_dequant(
             ScalarType::BF16.kernel_dtype_code(),

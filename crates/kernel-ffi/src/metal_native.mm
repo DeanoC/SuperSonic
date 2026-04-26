@@ -745,6 +745,135 @@ kernel void supersonic_matmul_rhs_transposed_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> matmul_int4_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:401
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                // GPTQ INT4 dequant matmul, bit-exact with the HIP/CUDA path:
+                //   rhs       [batch, n, k/2]      packed u8 (low nibble = even k index)
+                //   scale     [n/group, k/group]   bf16
+                //   zero      [n/group, k/group]   bf16
+                //   out       [batch, m, n]        bf16 = lhs · dequant(rhs)^T
+                // Dequant: w = bf16_round_rne(nibble * scale - zero * scale).
+                static const char* kSource = R"INT4MATMUL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct MatmulInt4Params {
+    uint batch_elems;
+    uint m;
+    uint n;
+    uint k;
+    uint group_size;
+};
+
+inline float bf16_round_rne_finite(float x) {
+    uint bits = as_type<uint>(x);
+    uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    return as_type<float>(bits);
+}
+
+kernel void supersonic_matmul_rhs_transposed_int4_bf16(
+    device const bfloat* lhs [[buffer(0)]],
+    device const uchar* rhs_int4 [[buffer(1)]],
+    device const bfloat* scale [[buffer(2)]],
+    device const bfloat* zero [[buffer(3)]],
+    device bfloat* out [[buffer(4)]],
+    constant MatmulInt4Params& params [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint col = gid.x;
+    uint row = gid.y;
+    uint batch = gid.z;
+    if (batch >= params.batch_elems || row >= params.m || col >= params.n) {
+        return;
+    }
+    uint k = params.k;
+    uint k_packed = k / 2u;
+    uint group_size = params.group_size;
+    uint scale_cols = (k + group_size - 1u) / group_size;
+    uint scale_row = col / group_size;
+
+    uint lhs_base = (batch * params.m + row) * k;
+    uint rhs_base = (batch * params.n + col) * k_packed;
+
+    float acc = 0.0f;
+    for (uint kk = 0; kk < k; ++kk) {
+        uint byte_idx = kk >> 1u;
+        uint packed_byte = uint(rhs_int4[rhs_base + byte_idx]);
+        uint nibble = (kk & 1u) != 0u ? ((packed_byte >> 4u) & 0xFu) : (packed_byte & 0xFu);
+        uint sc_idx = scale_row * scale_cols + (kk / group_size);
+        float s = float(scale[sc_idx]);
+        float z = float(zero[sc_idx]);
+        float w = bf16_round_rne_finite(float(nibble) * s - z * s);
+        acc += float(lhs[lhs_base + kk]) * w;
+    }
+    out[(batch * params.m + row) * params.n + col] = bfloat(acc);
+}
+)INT4MATMUL";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:402
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile int4 matmul library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_matmul_rhs_transposed_int4_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:403
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load int4 matmul function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:404
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create int4 matmul pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> matmul_residual_pipeline_bf16(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -8159,6 +8288,100 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_residual_bf16(
             MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 351, 352, 353, 354);
+    }
+}
+
+extern "C" int supersonic_metal_matmul_rhs_transposed_int4_bf16(
+    size_t batch_elems,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t group_size,
+    const void* lhs_ptr,
+    const void* rhs_int4_ptr,
+    const void* scale_ptr,
+    const void* zero_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (batch_elems == 0 || m == 0 || n == 0 || k == 0 || group_size == 0 ||
+            lhs_ptr == nullptr || rhs_int4_ptr == nullptr || scale_ptr == nullptr ||
+            zero_ptr == nullptr || out_ptr == nullptr) {
+            return 410;
+        }
+        if (k % 2 != 0) {
+            return 411;
+        }
+        if (batch_elems > UINT32_MAX || m > UINT32_MAX || n > UINT32_MAX ||
+            k > UINT32_MAX || group_size > UINT32_MAX) {
+            return 412;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = matmul_int4_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 413;
+        }
+
+        id<MTLBuffer> lhs = nil;
+        id<MTLBuffer> rhs = nil;
+        id<MTLBuffer> sc = nil;
+        id<MTLBuffer> zr = nil;
+        id<MTLBuffer> out = nil;
+        size_t lhs_offset = 0;
+        size_t rhs_offset = 0;
+        size_t sc_offset = 0;
+        size_t zr_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(lhs_ptr, &lhs, &lhs_offset) != 0) {
+            return 414;
+        }
+        if (lookup_buffer(rhs_int4_ptr, &rhs, &rhs_offset) != 0) {
+            return 415;
+        }
+        if (lookup_buffer(scale_ptr, &sc, &sc_offset) != 0) {
+            return 416;
+        }
+        if (lookup_buffer(zero_ptr, &zr, &zr_offset) != 0) {
+            return 417;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 418;
+        }
+
+        struct MatmulInt4Params {
+            uint32_t batch_elems;
+            uint32_t m;
+            uint32_t n;
+            uint32_t k;
+            uint32_t group_size;
+        } params = {
+            static_cast<uint32_t>(batch_elems),
+            static_cast<uint32_t>(m),
+            static_cast<uint32_t>(n),
+            static_cast<uint32_t>(k),
+            static_cast<uint32_t>(group_size),
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:lhs offset:lhs_offset atIndex:0];
+            [encoder setBuffer:rhs offset:rhs_offset atIndex:1];
+            [encoder setBuffer:sc offset:sc_offset atIndex:2];
+            [encoder setBuffer:zr offset:zr_offset atIndex:3];
+            [encoder setBuffer:out offset:out_offset atIndex:4];
+            [encoder setBytes:&params length:sizeof(params) atIndex:5];
+
+            NSUInteger tg_width = std::min<NSUInteger>(8, std::max<NSUInteger>(1, n));
+            NSUInteger tg_height =
+                std::min<NSUInteger>(8, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup / tg_width));
+            if (tg_height == 0) {
+                tg_height = 1;
+            }
+            MTLSize threads_per_group = MTLSizeMake(tg_width, tg_height, 1);
+            MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 419, 420, 421, 422);
     }
 }
 
