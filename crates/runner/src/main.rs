@@ -1051,8 +1051,11 @@ fn main() -> Result<()> {
             }
         }
     } else if backend == Backend::Metal {
-        if model_variant != ModelVariant::Qwen3_5_0_8B {
-            anyhow::bail!("Metal v1 only supports --model qwen3.5-0.8b");
+        if !matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_0_8B | ModelVariant::Qwen3_5_2B
+        ) {
+            anyhow::bail!("Metal only supports --model qwen3.5-0.8b or qwen3.5-2b");
         }
         if cli.int4 {
             anyhow::bail!("Metal does not support --int4 on Qwen3.5 yet");
@@ -1064,10 +1067,10 @@ fn main() -> Result<()> {
             anyhow::bail!("Metal does not support --kv-fp8 on Qwen3.5 yet");
         }
         if cli.batch_size != 1 {
-            anyhow::bail!("Metal v1 only supports --batch-size 1");
+            anyhow::bail!("Metal only supports --batch-size 1");
         }
         if cli.force_kernel_decode || cli.force_component_decode {
-            anyhow::bail!("Metal v1 only supports replay-prefill decode");
+            anyhow::bail!("Metal does not support --force-kernel-decode or --force-component-decode");
         }
     }
 

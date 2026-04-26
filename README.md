@@ -93,6 +93,7 @@ uses replayed GPU prefill for correctness.
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
 |------------------|:----:|:----:|:-----------:|:------:|
 | qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
+| qwen3.5-2b       |  ✅  |  —   |      —      |    —   |
 
 Metal v2 is a single supported surface:
 
@@ -346,7 +347,7 @@ The core decode path is now O(N) incremental decode — no replay overhead.
 
 Validated Metal scope:
 
-- `qwen3.5-0.8b`
+- `qwen3.5-0.8b`, `qwen3.5-2b`
 - Apple M4 / `apple-m4`
 - BF16 prefill parity against the Python CPU oracle
 - CLI and `supersonic-serve` HTTP server
@@ -356,7 +357,7 @@ Validated Metal scope:
 
 Metal currently rejects or defers:
 
-- models other than `qwen3.5-0.8b`
+- models other than `qwen3.5-0.8b` and `qwen3.5-2b`
 - `--int4`
 - `--fp8-runtime`
 - `--kv-fp8`

@@ -323,6 +323,23 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM4,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_4B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
@@ -458,5 +475,23 @@ mod tests {
     fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
         assert!(lookup(&ModelVariant::Qwen3_5_2B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
         assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
+    }
+
+    #[test]
+    fn metal_apple_m4_registry_includes_08b_and_2b() {
+        let e08b = lookup(&ModelVariant::Qwen3_5_0_8B, &Backend::Metal, &GpuArch::AppleM4);
+        let e2b = lookup(&ModelVariant::Qwen3_5_2B, &Backend::Metal, &GpuArch::AppleM4);
+        assert!(e08b.is_some());
+        assert!(e2b.is_some());
+        let p08b = match &e08b.unwrap().params {
+            FamilyParams::Qwen35(p) => p,
+            _ => panic!("wrong family"),
+        };
+        let p2b = match &e2b.unwrap().params {
+            FamilyParams::Qwen35(p) => p,
+            _ => panic!("wrong family"),
+        };
+        assert!(!p08b.use_4b_kernel);
+        assert!(!p2b.use_4b_kernel);
     }
 }
