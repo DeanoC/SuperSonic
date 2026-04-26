@@ -231,6 +231,43 @@ fn certified_kv_block_log_mass(max_v: f32, sum_v: f32) -> Option<f32> {
     }
 }
 
+fn flush_metal_batch_for_host_boundary(buffer: &GpuBuffer, label: &str) -> Result<()> {
+    if buffer.backend() == gpu_hal::Backend::Metal {
+        kernel_ffi::prefill_ffi::flush_metal_batch()
+            .map_err(|e| anyhow::anyhow!("{label} Metal flush: {e}"))?;
+    }
+    Ok(())
+}
+
+fn metal_profile_flush_layers_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_PROFILE_FLUSH_LAYERS").is_some()
+}
+
+fn metal_matmul_lm_head_argmax_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_MATMUL_LM_HEAD_ARGMAX").is_some()
+}
+
+fn metal_full_attention_decode_kernel_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FULL_ATTENTION_DECODE_KERNEL").is_some()
+}
+
+fn copy_d2d_ordered(
+    ordinal: usize,
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    backend_hint: &GpuBuffer,
+    label: &str,
+) -> Result<()> {
+    if backend_hint.backend() == gpu_hal::Backend::Metal {
+        kernel_ffi::prefill_ffi::metal_copy_d2d(src, dst, bytes)
+            .map_err(|e| anyhow::anyhow!("{label} Metal blit copy: {e}"))?;
+    } else {
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes).map_err(|e| anyhow::anyhow!("{label}: {e}"))?;
+    }
+    Ok(())
+}
+
 fn certified_kv_selected_block_fp16_log_masses_from_tier2(
     query_f32_all: &[f32],
     tier2_key: &[u8],
@@ -489,6 +526,68 @@ fn residual_add(
     let lhs: &GpuBuffer = unsafe { &*(dst as *const GpuBuffer) };
     kernel_ffi::prefill_ffi::element_add(ordinal, ScalarType::BF16, total_elems, lhs, src, dst)
         .map_err(|e| anyhow::anyhow!("residual_add failed: {e}"))?;
+    Ok(())
+}
+
+fn metal_fused_residual_projection_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_RESIDUAL_PROJ").is_some()
+}
+
+fn metal_fused_mlp_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_MLP").is_some()
+}
+
+fn metal_fused_mlp_gate_up_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP").is_none()
+}
+
+fn metal_fused_mlp_gate_up_swiglu_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_MLP_GATE_UP_SWIGLU").is_none()
+}
+
+fn metal_fused_full_projection_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_FULL_PROJ").is_some()
+}
+
+fn metal_fused_full_qk_prep_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_QK_PREP").is_some()
+}
+
+fn metal_fused_full_attention_gate_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_FULL_ATTENTION_GATE").is_some()
+}
+
+fn metal_fused_linear_out_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT").is_some()
+}
+
+fn metal_fused_linear_out_bf16_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_FUSED_LINEAR_OUT_BF16").is_some()
+}
+
+fn metal_fused_linear_decode_apply_inplace_disabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_FUSED_LINEAR_DECODE_APPLY_INPLACE").is_some()
+}
+
+fn metal_matmul_residual_add_bf16(
+    input_dim: usize,
+    output_dim: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    residual_out: &mut GpuBuffer,
+) -> Result<()> {
+    let residual: &GpuBuffer = unsafe { &*(residual_out as *const GpuBuffer) };
+    kernel_ffi::prefill_ffi::metal_matmul_rhs_transposed_residual_bf16(
+        1,
+        1,
+        output_dim,
+        input_dim,
+        input,
+        weight,
+        residual,
+        residual_out,
+    )
+    .map_err(|e| anyhow::anyhow!("fused residual projection failed: {e}"))?;
     Ok(())
 }
 
@@ -3718,7 +3817,6 @@ impl DecodeEngine {
             if let Some(t) = timings.as_mut() {
                 t.lm_head_ms += lm_head_start.elapsed().as_secs_f64() * 1000.0;
             }
-
             let token_d2h_start = Instant::now();
             let token_bytes = self
                 .argmax_buf
@@ -9111,7 +9209,6 @@ impl DecodeEngine {
         } else {
             None
         };
-
         matmul_proj(
             self.ordinal,
             1,

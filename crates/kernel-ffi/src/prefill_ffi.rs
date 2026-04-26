@@ -415,6 +415,38 @@ pub fn metal_qwen_mlp_gate_up_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_mlp_gate_up_swiglu_bf16(
+    hidden_dim: usize,
+    intermediate_dim: usize,
+    input: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    up_weight: &GpuBuffer,
+    mlp_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_mlp_gate_up_swiglu", "native", || {
+        metal_native::qwen_mlp_gate_up_swiglu_bf16(
+            hidden_dim,
+            intermediate_dim,
+            input,
+            gate_weight,
+            up_weight,
+            mlp_out,
+        )
+    })
+}
+
+pub fn metal_full_attention_gate_bf16(
+    total_elems: usize,
+    attn_f32: &GpuBuffer,
+    gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("full_attention_gate", "native", || {
+        metal_native::full_attention_gate_bf16(total_elems, attn_f32, gate, out)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn metal_qwen_mlp_down_residual_bf16(
     hidden_dim: usize,
     intermediate_dim: usize,
@@ -452,6 +484,26 @@ pub fn metal_qwen_linear_out_residual_f32_bf16(
 ) -> Result<(), GpuError> {
     metal_profile_time("qwen_linear_out_residual", "native", || {
         metal_native::qwen_linear_out_residual_f32_bf16(
+            hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_qwen_linear_out_residual_bf16_bf16(
+    hidden_dim: usize,
+    num_rows: usize,
+    row_dim: usize,
+    eps: f32,
+    attn: &GpuBuffer,
+    gate: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_proj: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("qwen_linear_out_residual_bf16", "native", || {
+        metal_native::qwen_linear_out_residual_bf16_bf16(
             hidden_dim, num_rows, row_dim, eps, attn, gate, weight, out_proj, residual, out,
         )
     })
@@ -1265,6 +1317,26 @@ pub fn metal_full_attention_prefill_strided_bf16_f32(
             key,
             value,
             out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn metal_full_attention_decode_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    kv_len: usize,
+    kv_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    metal_profile_time("full_attention_decode", "native", || {
+        metal_native::full_attention_decode_bf16_f32(
+            q_heads, kv_heads, kv_len, kv_stride, head_dim, scale, query, key, value, out,
         )
     })
 }

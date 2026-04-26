@@ -54,6 +54,9 @@ struct Cli {
 
     #[arg(long)]
     profile_ops: bool,
+
+    #[arg(long)]
+    profile_layers: bool,
 }
 
 fn main() -> Result<()> {
@@ -67,6 +70,13 @@ fn main() -> Result<()> {
         // low-precision Metal lm-head path cannot mask or fabricate oracle
         // failures.
         std::env::set_var("SUPERSONIC_METAL_FORCE_F32_FINAL_NORM", "1");
+    }
+    if cli.backend == BackendArg::Metal
+        && matches!(cli.mode, BughuntMode::Bench)
+        && cli.profile_layers
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE_FLUSH_LAYERS").is_none()
+    {
+        std::env::set_var("SUPERSONIC_METAL_PROFILE_FLUSH_LAYERS", "1");
     }
     let report = runner::bughunt::run(BughuntArgs {
         mode: cli.mode,
