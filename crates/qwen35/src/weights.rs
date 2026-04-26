@@ -42,6 +42,12 @@ pub struct Qwen35Weights {
     pub embed_tokens: Arc<GpuBuffer>,
     pub lm_head: Arc<GpuBuffer>,
     pub lm_head_scale: Option<GpuBuffer>,
+    /// INT4 GPTQ scale tile for the lm_head when present in the baked package.
+    /// Shape `[vocab/group_size, hidden/group_size]`, BF16. Implies `lm_head`
+    /// holds packed-u8 nibbles instead of BF16 weights.
+    pub lm_head_int4_scale: Option<GpuBuffer>,
+    /// INT4 GPTQ zero tile, parallel to `lm_head_int4_scale`. BF16.
+    pub lm_head_int4_zero: Option<GpuBuffer>,
     pub norm_weight: GpuBuffer,
     pub layers: Vec<LayerWeights>,
     /// True if weights are FP8 with runtime dequant (native FP8 bake).
@@ -310,6 +316,8 @@ impl Qwen35Weights {
             embed_tokens,
             lm_head,
             lm_head_scale: None,
+            lm_head_int4_scale: None,
+            lm_head_int4_zero: None,
             norm_weight,
             layers,
             is_fp8: false,
@@ -369,6 +377,7 @@ impl Qwen35Weights {
             embed_tokens.clone()
         };
         let lm_head_scale = load_scale(lm_head_name)?;
+        let (lm_head_int4_scale, lm_head_int4_zero) = load_int4(lm_head_name)?;
 
         let norm_weight = store.load_to_gpu(&format!("{prefix}.norm.weight"), ordinal)?;
 
@@ -544,6 +553,8 @@ impl Qwen35Weights {
             embed_tokens,
             lm_head,
             lm_head_scale,
+            lm_head_int4_scale,
+            lm_head_int4_zero,
             norm_weight,
             layers,
             is_fp8,

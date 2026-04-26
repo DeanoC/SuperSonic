@@ -69,9 +69,7 @@ def is_int4_target(name: str) -> bool:
         return False
     if "in_proj_b.weight" in name or "in_proj_a.weight" in name:
         return False
-    if "lm_head" in name:
-        return False
-    return "_proj" in name
+    return ("_proj" in name) or (name == "lm_head.weight")
 
 
 # ---------------------------------------------------------------------------
@@ -496,6 +494,45 @@ def quantize_model(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+    # --- lm_head GPTQ pass ---
+    # The transformer layer loop above hooks every nn.Linear inside `inner.layers`,
+    # but lm_head sits outside. Capture its Hessian here (post-final-norm hidden
+    # state) and run the same column-wise GPTQ. This lets the runtime skip the
+    # 250k×hidden BF16 read on the dominant decode-side matmul.
+    final_norm = getattr(inner, "norm", None)
+    lm_head = getattr(model, "lm_head", None)
+    if (
+        isinstance(lm_head, nn.Linear)
+        and final_norm is not None
+        and is_int4_target("lm_head.weight")
+    ):
+        log(f"[gptq] lm_head: collecting Hessian over {nsamples} samples")
+        hook = HessianHook(lm_head)
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                normed = final_norm(hs)
+                _ = lm_head(normed)
+                del hs, normed
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        H = hook.H
+        hook.close()
+        if H is None:
+            log("[gptq]   lm_head: WARNING no activations captured, skipping")
+        else:
+            t0 = time.perf_counter()
+            W = lm_head.weight.data.to(torch.float32)
+            Q_dq, nibbles, scale_t, zero_t = gptq_quantize(W, H, group_size, damp)
+            elapsed = time.perf_counter() - t0
+            log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
+                f"H_N={hook.N} took {elapsed:.1f}s")
+            # Swap in dequantized weights so the perplexity check below sees the
+            # quantized lm_head too.
+            lm_head.weight.data.copy_(Q_dq.to(lm_head.weight.dtype))
+            quantized["lm_head.weight"] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
+            del W, Q_dq, nibbles, scale_t, zero_t, H
+
     return quantized
 
 
@@ -836,6 +873,17 @@ def main() -> None:
     eligible.sort()
 
     sd = model.state_dict()
+    # When `lm_head.weight` is tied to `embed_tokens.weight`, the HF state dict
+    # entry usually has no safetensors counterpart and the eligible loop above
+    # skips it. But if we just ran GPTQ on `model.lm_head` and produced a
+    # quantized tensor for it, force-include `lm_head.weight` so the runtime
+    # loads the INT4 version instead of falling back to the BF16 embed alias.
+    if "lm_head.weight" in quantized and "lm_head.weight" not in eligible:
+        eligible.append("lm_head.weight")
+        if "lm_head.weight" not in hf_to_raw:
+            hf_to_raw["lm_head.weight"] = "lm_head.weight"
+        if "lm_head.weight" not in sd and hasattr(model, "lm_head"):
+            sd["lm_head.weight"] = model.lm_head.weight.data
     tensors_out: list[tuple[str, bytes, list[int], str, str]] = []
     for hf_name in eligible:
         raw_name = hf_to_raw[hf_name]

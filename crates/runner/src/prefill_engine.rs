@@ -558,7 +558,28 @@ pub fn compute_logits_for_range(
     // keeps the single-row score path numerically aligned with decode.
     let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
         .map_err(|e| anyhow::anyhow!("range logits alloc: {e}"))?;
-    if count > 1 {
+    // INT4 lm_head: when the baked package quantized lm_head weights to GPTQ
+    // INT4, dispatch through the INT4 dequant matmul. Saves ~4x device memory
+    // bandwidth on what is the dominant matmul on small models.
+    if let (Some(scale), Some(zero)) = (
+        weights.lm_head_int4_scale.as_ref(),
+        weights.lm_head_int4_zero.as_ref(),
+    ) {
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            count,
+            vocab_size,
+            hidden_dim,
+            &normed,
+            &*weights.lm_head,
+            scale,
+            zero,
+            weights.int4_group_size,
+            &mut logits_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("range lm_head int4: {e}"))?;
+    } else if count > 1 {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal,
             ScalarType::BF16,
@@ -1805,14 +1826,42 @@ pub fn metal_v2_decode_step_greedy(
 
     let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
         .map_err(|e| anyhow::anyhow!("greedy out_index alloc: {e}"))?;
-    kernel_ffi::metal_lm_head_argmax_bf16_into(
-        &normed,
-        &*weights.lm_head,
-        &mut out_index,
-        hidden_dim,
-        vocab_size,
-    )
-    .map_err(|e| anyhow::anyhow!("greedy fused lm_head argmax: {e}"))?;
+    if let (Some(scale), Some(zero)) = (
+        weights.lm_head_int4_scale.as_ref(),
+        weights.lm_head_int4_zero.as_ref(),
+    ) {
+        // INT4 lm_head: there is no fused INT4 matmul + argmax kernel, so do
+        // them separately. Both run inside the open Metal batch — the cost of
+        // the extra argmax dispatch is dwarfed by the 4x bandwidth win on the
+        // matmul.
+        let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, vocab_size])
+            .map_err(|e| anyhow::anyhow!("greedy int4 logits alloc: {e}"))?;
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            1,
+            vocab_size,
+            hidden_dim,
+            &normed,
+            &*weights.lm_head,
+            scale,
+            zero,
+            weights.int4_group_size,
+            &mut logits_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("greedy lm_head int4: {e}"))?;
+        kernel_ffi::metal_argmax_bf16_into(&logits_buf, &mut out_index, vocab_size)
+            .map_err(|e| anyhow::anyhow!("greedy int4 argmax: {e}"))?;
+    } else {
+        kernel_ffi::metal_lm_head_argmax_bf16_into(
+            &normed,
+            &*weights.lm_head,
+            &mut out_index,
+            hidden_dim,
+            vocab_size,
+        )
+        .map_err(|e| anyhow::anyhow!("greedy fused lm_head argmax: {e}"))?;
+    }
 
     // Flush before D2H so the GPU work is visible to the host memcpy.
     if prefill_ffi::metal_batch_is_active() {
