@@ -177,6 +177,13 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+/// True when a Metal batch is currently open (i.e. ops will be accumulated
+/// into the shared command buffer rather than committing one-by-one).
+/// Always false on non-Metal builds.
+pub fn metal_batch_is_active() -> bool {
+    metal_native::batch_is_active()
+}
+
 pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
     metal_native::set_batch_label(label)
 }

@@ -5860,6 +5860,10 @@ extern "C" int supersonic_metal_batch_end() {
     }
 }
 
+extern "C" int supersonic_metal_batch_is_active() {
+    return metal_batch_depth > 0 ? 1 : 0;
+}
+
 extern "C" int supersonic_metal_copy_d2d(
     const void* src_ptr,
     void* dst_ptr,

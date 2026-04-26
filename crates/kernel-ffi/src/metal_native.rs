@@ -12,6 +12,7 @@ unsafe extern "C" {
     fn supersonic_metal_batch_flush() -> c_int;
     fn supersonic_metal_batch_set_label(label: *const c_char) -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
+    fn supersonic_metal_batch_is_active() -> c_int;
     fn supersonic_metal_copy_d2d(
         src_ptr: *const c_void,
         dst_ptr: *mut c_void,
@@ -629,6 +630,11 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn batch_is_active() -> bool {
+    unsafe { supersonic_metal_batch_is_active() != 0 }
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -3171,6 +3177,11 @@ impl MetalBatchGuard {
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn flush_batch() -> Result<(), GpuError> {
     Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn batch_is_active() -> bool {
+    false
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
