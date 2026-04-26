@@ -308,6 +308,16 @@ struct Qwen35INT4ScaleDesc {
     const void* o_proj_zero;
     // Group size for INT4 quantization (typically 128)
     int group_size;
+    int gate_proj_type;
+    int up_proj_type;
+    int down_proj_type;
+    int qkv_proj_type;
+    int z_proj_type;
+    int linear_out_proj_type;
+    int q_proj_type;
+    int k_proj_type;
+    int v_proj_type;
+    int o_proj_type;
 };
 
 // Dequantize 8 INT4 weights from 4 packed bytes.

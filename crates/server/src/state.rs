@@ -74,6 +74,9 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     {
         bail!("--q4km is currently supported only for Qwen models");
     }
+    if cfg.q4km && backend != Backend::Cuda {
+        bail!("--q4km is currently supported only on CUDA");
+    }
 
     if backend == Backend::Metal {
         if variant != ModelVariant::Qwen3_5_0_8B {

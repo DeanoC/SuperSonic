@@ -954,6 +954,9 @@ fn main() -> Result<()> {
     {
         anyhow::bail!("--q4km is currently supported only for Qwen models");
     }
+    if cli.q4km && backend != Backend::Cuda {
+        anyhow::bail!("--q4km is currently supported only on CUDA");
+    }
     if cli.gguf_file.is_some() && !cli.q4km {
         anyhow::bail!("--gguf-file requires --q4km");
     }
