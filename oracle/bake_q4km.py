@@ -2,13 +2,9 @@
 """
 Create a SuperSonic q4km bake.
 
-The runtime format is intentionally the existing SuperSonic INT4 layout:
-packed nibbles plus BF16 scale/zero tensors.  By default this uses a
-calibration-free min/max requantizer for a fast GGUF-like memory footprint
-path.  With --quantizer gptq and a --hessian-dir, it reuses the same GPTQ
-column/error-propagation quantizer as oracle/bake_int4.py while still accepting
-GGUF as the source container.  GGML blocks are not executed directly by the
-runtime.
+The runtime format preserves GGML K-block tensors from GGUF for target
+projection weights. CUDA interprets Q4_K/Q5_K/Q6_K blocks directly instead of
+requantizing them into SuperSonic's older native INT4 layout.
 """
 
 from __future__ import annotations
@@ -34,13 +30,16 @@ try:
 except Exception:
     gptq_quantize = None
 
-FORMAT_VERSION = 1
-CONVERTER_VERSION = 2
+FORMAT_VERSION = 2
+CONVERTER_VERSION = 1
 LAYOUT_RAW = "Raw"
 LAYOUT_CONV_SQ = "DepthwiseConvSqueezed"
 LAYOUT_HEAD_BIAS = "HeadBiasReshaped"
 LAYOUT_HEAD_EXP = "HeadExpReshaped"
 LAYOUT_INT4 = "Int4Quantized"
+LAYOUT_GGML_Q4K = "GgmlQ4K"
+LAYOUT_GGML_Q5K = "GgmlQ5K"
+LAYOUT_GGML_Q6K = "GgmlQ6K"
 QUANT_MINMAX = "minmax"
 QUANT_GPTQ = "gptq"
 
@@ -277,6 +276,25 @@ def gguf_tensor_nbytes(info: GgufTensorInfo) -> int:
         raise SystemExit(f"{info.name}: scalar GGUF tensor is not supported")
     rows = prod(info.dims[1:]) if len(info.dims) > 1 else 1
     return ggml_row_size(info.ggml_type, info.dims[0]) * rows
+
+
+def raw_gguf_tensor_bytes(g: GgufFile, info: GgufTensorInfo) -> bytes:
+    nbytes = gguf_tensor_nbytes(info)
+    start = g.data_start + info.offset
+    raw = bytes(g.blob[start:start + nbytes])
+    if len(raw) != nbytes:
+        raise SystemExit(f"{info.name}: tensor data extends past EOF")
+    return raw
+
+
+def ggml_k_layout(ggml_type: int) -> str | None:
+    if ggml_type == GGML_TYPE_Q4_K:
+        return LAYOUT_GGML_Q4K
+    if ggml_type == GGML_TYPE_Q5_K:
+        return LAYOUT_GGML_Q5K
+    if ggml_type == GGML_TYPE_Q6_K:
+        return LAYOUT_GGML_Q6K
+    return None
 
 
 def get_scale_min_k4(j: int, q: bytes) -> tuple[int, int]:
@@ -560,26 +578,20 @@ def undo_gguf_tensor_transform(name: str, t: torch.Tensor) -> tuple[torch.Tensor
     """
     if name.endswith(".linear_attn.A_log"):
         return -t.to(torch.float32), True
-    if (
-        name.endswith(".norm.weight")
-        or name.endswith(".input_layernorm.weight")
-        or name.endswith(".post_attention_layernorm.weight")
-        or name.endswith(".q_norm.weight")
-        or name.endswith(".k_norm.weight")
-    ) and ".linear_attn.norm.weight" not in name:
-        return t.to(torch.float32) - 1.0, False
     return t, False
 
 
 def apply_layout(t: torch.Tensor, shape: list[int], layout: str, dtype_str: str) -> tuple[bytes, list[int], str]:
     if layout == LAYOUT_RAW:
+        if dtype_str in ("f32", "f16", "bf16"):
+            return tensor_to_bytes(t, "bf16"), shape, "bf16"
         return tensor_to_bytes(t, dtype_str), shape, dtype_str
     if layout == LAYOUT_CONV_SQ:
         if len(shape) == 3:
-            return tensor_to_bytes(t.squeeze(1), dtype_str), [shape[0], shape[2]], dtype_str
-        return tensor_to_bytes(t, dtype_str), shape, dtype_str
+            return tensor_to_bytes(t.squeeze(1), "bf16"), [shape[0], shape[2]], "bf16"
+        return tensor_to_bytes(t, "bf16"), shape, "bf16"
     if layout == LAYOUT_HEAD_BIAS:
-        return tensor_to_bytes(t.reshape(1, 1, shape[0]), dtype_str), [1, 1, shape[0]], dtype_str
+        return tensor_to_bytes(t.reshape(1, 1, shape[0]), "bf16"), [1, 1, shape[0]], "bf16"
     if layout == LAYOUT_HEAD_EXP:
         return bf16_to_bytes(torch.exp(t.to(torch.float32)).reshape(1, 1, shape[0])), [1, 1, shape[0]], "bf16"
     raise ValueError(f"unknown layout {layout}")
@@ -947,7 +959,7 @@ def bake_from_safetensors(args, weight_prefix: str, layer_types: list[str], fami
     tensors_out.sort(key=lambda x: x[0])
     log(f"[q4km] quantized {quantized} tensors")
     source_quant = "q4km-gptq-hessian" if quantizer == QUANT_GPTQ else "q4km-minmax"
-    quant_profile = "q4km-gptq-v1" if quantizer == QUANT_GPTQ else "q4km-v1"
+    quant_profile = "q4km-native-int4-v1"
     write_bake(out_dir, tensors_out, family, "safetensors", source_quant, quant_profile)
 
 
@@ -969,6 +981,29 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
                 continue
             if mapped.startswith(f"{weight_prefix}.visual.") or ".mtp." in mapped:
                 skipped += 1
+                continue
+            shape = gguf_logical_shape(info)
+            raw_layout = ggml_k_layout(info.ggml_type)
+            if (
+                raw_layout is not None
+                # The runtime lm-head path expects BF16 or native INT4 sidecars,
+                # not raw GGML K-block bytes.
+                and mapped != "lm_head.weight"
+                and is_q4km_target(mapped, shape, args.group_size)
+            ):
+                cols = info.dims[0]
+                rows = prod(info.dims[1:]) if len(info.dims) > 1 else 1
+                row_bytes = ggml_row_size(info.ggml_type, cols)
+                tensors_out.append((
+                    mapped,
+                    raw_gguf_tensor_bytes(gguf, info),
+                    [rows, row_bytes],
+                    "u8",
+                    raw_layout,
+                ))
+                quantized += 1
+                if i % 100 == 0:
+                    log(f"[q4km] processed {i}/{len(gguf.tensors)} GGUF tensors")
                 continue
             t = load_gguf_tensor(gguf, info)
             t, a_log_precomputed = undo_gguf_tensor_transform(mapped, t)
@@ -998,7 +1033,7 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
         tensors_out.sort(key=lambda x: x[0])
         log(f"[q4km] quantized {quantized} tensors, skipped {skipped} unmapped GGUF tensors")
         source_quant = "ggml-q4-k-family+gptq-hessian" if quantizer == QUANT_GPTQ else "ggml-q4-k-family"
-        quant_profile = "q4km-gptq-v1" if quantizer == QUANT_GPTQ else "q4km-v1"
+        quant_profile = "q4km-ggml-v1"
         write_bake(out_dir, tensors_out, family, "gguf", source_quant, quant_profile)
     finally:
         gguf.close()

@@ -16,6 +16,7 @@ pub struct DecodeLayerDesc {
     pub input_norm_eps: f32,
     pub post_attn_norm_w: *const c_void,
     pub post_attn_norm_eps: f32,
+    pub rms_norm_add_unit_offset: c_int,
     pub gate_proj_w: *const c_void,
     pub up_proj_w: *const c_void,
     pub down_proj_w: *const c_void,
@@ -137,11 +138,11 @@ impl Default for KVCacheFp8Desc {
     }
 }
 
-/// INT4 weight quantization descriptors for runtime dequantization.
+/// Low-bit weight descriptors for runtime dequantization.
 /// Parallel struct to DecodeLayerDesc — one per layer.
 /// Passed as a separate kernel argument (same pattern as FP8ScaleDesc).
-/// Each weight has a scale and zero_point pointer (BF16) for asymmetric group quantization.
-/// Weights are packed as 2×INT4 per byte (low nibble = even col, high nibble = odd col).
+/// Type code 4 means native packed INT4 with scale/zero sidecars. Type codes
+/// 12/13/14 mean verbatim GGML Q4_K/Q5_K/Q6_K blocks.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct INT4ScaleDesc {
@@ -170,6 +171,16 @@ pub struct INT4ScaleDesc {
     pub o_proj_zero: *const c_void,
     // Group size for INT4 quantization (typically 128)
     pub group_size: c_int,
+    pub gate_proj_type: c_int,
+    pub up_proj_type: c_int,
+    pub down_proj_type: c_int,
+    pub qkv_proj_type: c_int,
+    pub z_proj_type: c_int,
+    pub linear_out_proj_type: c_int,
+    pub q_proj_type: c_int,
+    pub k_proj_type: c_int,
+    pub v_proj_type: c_int,
+    pub o_proj_type: c_int,
 }
 
 unsafe impl Send for INT4ScaleDesc {}

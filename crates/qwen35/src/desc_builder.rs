@@ -3,7 +3,7 @@ use kernel_ffi::{
 };
 
 use crate::state::ModelState;
-use crate::weights::{LayerKind, Qwen35Weights};
+use crate::weights::{infer_lowbit_type, LayerKind, Qwen35Weights};
 
 /// Build the array of layer descriptors for the persistent decode kernel.
 /// Must be called each decode step (kv_len changes).
@@ -29,6 +29,11 @@ pub fn build_layer_descs(
         d.input_norm_eps = config.rms_norm_eps as f32;
         d.post_attn_norm_w = lw.post_attn_norm_w.as_ptr();
         d.post_attn_norm_eps = config.rms_norm_eps as f32;
+        d.rms_norm_add_unit_offset = if config.rms_norm_add_unit_offset {
+            1
+        } else {
+            0
+        };
         d.gate_proj_w = lw.gate_proj_w.as_ptr();
         d.up_proj_w = lw.up_proj_w.as_ptr();
         d.down_proj_w = lw.down_proj_w.as_ptr();
@@ -185,6 +190,21 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
         d.up_proj_zero = ptr(&lw.up_proj_int4_zero);
         d.down_proj_scale = ptr(&lw.down_proj_int4_scale);
         d.down_proj_zero = ptr(&lw.down_proj_int4_zero);
+        d.gate_proj_type = infer_lowbit_type(
+            &lw.gate_proj_w,
+            weights.config.hidden_size,
+            lw.gate_proj_int4_scale.is_some(),
+        );
+        d.up_proj_type = infer_lowbit_type(
+            &lw.up_proj_w,
+            weights.config.hidden_size,
+            lw.up_proj_int4_scale.is_some(),
+        );
+        d.down_proj_type = infer_lowbit_type(
+            &lw.down_proj_w,
+            weights.config.intermediate_size,
+            lw.down_proj_int4_scale.is_some(),
+        );
 
         match lw.kind {
             LayerKind::Linear => {
@@ -195,6 +215,21 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                 d.z_proj_zero = ptr(&lin.z_proj_int4_zero);
                 d.linear_out_proj_scale = ptr(&lin.out_proj_int4_scale);
                 d.linear_out_proj_zero = ptr(&lin.out_proj_int4_zero);
+                d.qkv_proj_type = infer_lowbit_type(
+                    &lin.qkv_proj_w,
+                    weights.config.hidden_size,
+                    lin.qkv_proj_int4_scale.is_some(),
+                );
+                d.z_proj_type = infer_lowbit_type(
+                    &lin.z_proj_w,
+                    weights.config.hidden_size,
+                    lin.z_proj_int4_scale.is_some(),
+                );
+                d.linear_out_proj_type = infer_lowbit_type(
+                    &lin.out_proj_w,
+                    weights.config.linear_num_value_heads * weights.config.linear_value_head_dim,
+                    lin.out_proj_int4_scale.is_some(),
+                );
             }
             LayerKind::Full => {
                 let fa = lw.full.as_ref().unwrap();
@@ -206,6 +241,26 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                 d.v_proj_zero = ptr(&fa.v_proj_int4_zero);
                 d.o_proj_scale = ptr(&fa.o_proj_int4_scale);
                 d.o_proj_zero = ptr(&fa.o_proj_int4_zero);
+                d.q_proj_type = infer_lowbit_type(
+                    &fa.q_proj_w,
+                    weights.config.hidden_size,
+                    fa.q_proj_int4_scale.is_some(),
+                );
+                d.k_proj_type = infer_lowbit_type(
+                    &fa.k_proj_w,
+                    weights.config.hidden_size,
+                    fa.k_proj_int4_scale.is_some(),
+                );
+                d.v_proj_type = infer_lowbit_type(
+                    &fa.v_proj_w,
+                    weights.config.hidden_size,
+                    fa.v_proj_int4_scale.is_some(),
+                );
+                d.o_proj_type = infer_lowbit_type(
+                    &fa.o_proj_w,
+                    weights.config.num_attention_heads * weights.config.head_dim,
+                    fa.o_proj_int4_scale.is_some(),
+                );
             }
         }
 

@@ -59,32 +59,11 @@ pub fn bake_dir_int4(model_dir: &Path) -> PathBuf {
         .join(format!("v{FORMAT_VERSION}-int4-gptq"))
 }
 
-/// Return the calibration-free bake directory for GGUF-like Q4KM weights.
-pub fn bake_dir_q4km_minmax(model_dir: &Path) -> PathBuf {
+/// Return the bake directory for GGUF Q4_K_M-compatible raw GGML K-block weights.
+pub fn bake_dir_q4km(model_dir: &Path) -> PathBuf {
     model_dir
         .join(".supersonic")
         .join(format!("v{FORMAT_VERSION}-q4km"))
-}
-
-/// Return the GPTQ-calibrated bake directory for GGUF-like Q4KM weights.
-pub fn bake_dir_q4km_gptq(model_dir: &Path) -> PathBuf {
-    model_dir
-        .join(".supersonic")
-        .join(format!("v{FORMAT_VERSION}-q4km-gptq"))
-}
-
-/// Return the preferred bake directory for GGUF-like Q4KM quantized weights.
-/// The runtime layout is SuperSonic-native packed INT4 with BF16 scale/zero
-/// companions. Prefer the calibrated GPTQ package when it exists, otherwise
-/// fall back to the older min/max package path so local GGUF translation still
-/// has a deterministic destination.
-pub fn bake_dir_q4km(model_dir: &Path) -> PathBuf {
-    let gptq = bake_dir_q4km_gptq(model_dir);
-    if gptq.exists() {
-        gptq
-    } else {
-        bake_dir_q4km_minmax(model_dir)
-    }
 }
 
 /// Return the bake directory for INT8 BitsAndBytes-style weights.
@@ -149,10 +128,8 @@ pub fn version_ok(bake_dir: &Path) -> bool {
         && weights_bin_path(bake_dir).exists()
 }
 
-/// Check if a valid Q4KM GPTQ baked package exists at the given bake directory.
-/// This rejects older calibration-free Q4KM packages if they were written into
-/// the GPTQ directory by an older runner.
-pub fn version_ok_q4km_gptq(bake_dir: &Path) -> bool {
+/// Check if a valid Q4KM GGML K-block baked package exists at the given bake directory.
+pub fn version_ok_q4km(bake_dir: &Path) -> bool {
     let mp = manifest_path(bake_dir);
     let Ok(text) = std::fs::read_to_string(&mp) else {
         return false;
@@ -162,6 +139,6 @@ pub fn version_ok_q4km_gptq(bake_dir: &Path) -> bool {
     };
     m.format_version == FORMAT_VERSION
         && m.converter_version == CONVERTER_VERSION
-        && m.quant_profile.as_deref() == Some("q4km-gptq-v1")
+        && m.quant_profile.as_deref() == Some("q4km-ggml-v1")
         && weights_bin_path(bake_dir).exists()
 }

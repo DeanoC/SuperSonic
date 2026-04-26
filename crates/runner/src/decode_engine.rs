@@ -456,7 +456,10 @@ fn matmul_proj(
     int4_zero: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
-    if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
+    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qtype != 0 {
+        let sc = int4_scale.unwrap_or(weight);
+        let zr = int4_zero.unwrap_or(weight);
         kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
             ordinal,
             batch,
@@ -468,6 +471,7 @@ fn matmul_proj(
             sc,
             zr,
             int4_group_size,
+            qtype,
             out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))

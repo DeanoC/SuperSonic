@@ -74,6 +74,9 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     {
         bail!("--q4km is currently supported only for Qwen models");
     }
+    if cfg.q4km && backend != Backend::Cuda {
+        bail!("--q4km is currently supported only on CUDA");
+    }
 
     if backend == Backend::Metal {
         if variant != ModelVariant::Qwen3_5_0_8B {
@@ -354,7 +357,7 @@ fn build_qwen(
 
     let bake_ok = || {
         if variant_bake == model_store::fetch::BakeVariant::Q4Km {
-            model_store::version_ok_q4km_gptq(&bake_dir)
+            model_store::version_ok_q4km(&bake_dir)
         } else {
             model_store::version_ok(&bake_dir)
         }
@@ -381,9 +384,9 @@ fn build_qwen(
         if !downloaded && !local_bake_ok {
             bail!(
                 "no {variant_bake} bake at {} and download unavailable. Low-bit baking \
-                 must happen offline — run `python oracle/q4km_stream_gptq_bake.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
-                 for q4km-gptq or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
-                 then rerun without --no-download to fetch from the GitHub bakes-v1 release.",
+                 must happen offline — run `python oracle/bake_q4km.py --model-dir {} --gguf-file /path/to/model.gguf --out-dir {}` \
+                 for q4km or `python oracle/bake_int4.py --model-dir {}` for GPTQ INT4, \
+                 then rerun without --no-download to fetch from the GitHub bakes release.",
                 bake_dir.display(),
                 cfg.model_dir.display(),
                 bake_dir.display(),

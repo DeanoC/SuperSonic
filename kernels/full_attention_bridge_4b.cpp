@@ -3928,7 +3928,13 @@ extern "C" int dotcache_qwen35_4b_hip_matmul_int4_dequant(
     const void* scale,
     const void* zero,
     int group_size,
+    int quant_type,
     void* out) {
+    constexpr int QWEN35_LOWBIT_NATIVE_INT4 = 4;
+    if (quant_type != QWEN35_LOWBIT_NATIVE_INT4) {
+        return 273;
+    }
+
     switch (dtype) {
     case 2: {
         // The tiled WMMA kernel fetches one (scale, zero) pair per BK-wide

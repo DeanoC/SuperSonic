@@ -5,7 +5,7 @@ use std::path::Path;
 use gpu_hal::{GpuBuffer, ScalarType};
 use memmap2::Mmap;
 
-use crate::manifest::{Manifest, TensorMeta};
+use crate::manifest::{LayoutTag, Manifest, TensorMeta};
 use crate::Error;
 
 /// A memory-mapped baked weight store for fast GPU loading.
@@ -58,6 +58,14 @@ impl BakedStore {
     /// Get the shape of a tensor without loading it.
     pub fn shape(&self, name: &str) -> Option<&[usize]> {
         self.index.get(name).map(|m| m.shape.as_slice())
+    }
+
+    pub fn meta(&self, name: &str) -> Option<&TensorMeta> {
+        self.index.get(name)
+    }
+
+    pub fn layout(&self, name: &str) -> Option<&LayoutTag> {
+        self.index.get(name).map(|m| &m.layout)
     }
 
     /// Return the raw mmap-backed bytes of a tensor. Useful for tensors that

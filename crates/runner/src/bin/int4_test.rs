@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
-use half::bf16;
+use half::{bf16, f16};
 use kernel_ffi::prefill_ffi;
 
 fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
@@ -81,6 +81,170 @@ fn reference_matmul(
 /// Round an f32 to bf16 and back — mimics what the baker does when serialising scale/zero.
 fn bf16_round(x: f32) -> f32 {
     bf16::from_f32(x).to_f32()
+}
+
+fn push_f16_le(out: &mut Vec<u8>, v: f32) {
+    out.extend_from_slice(&f16::from_f32(v).to_bits().to_le_bytes());
+}
+
+fn ggml_q4k_row(row: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut out = Vec::with_capacity(144);
+    push_f16_le(&mut out, 1.0);
+    push_f16_le(&mut out, 0.0);
+    out.extend_from_slice(&[1u8; 12]);
+    let mut vals = vec![0f32; 256];
+    for g in 0..4 {
+        for l in 0..32 {
+            let lo = ((row * 7 + g * 3 + l) & 0x0f) as u8;
+            let hi = ((row * 11 + g * 5 + l + 1) & 0x0f) as u8;
+            out.push(lo | (hi << 4));
+            vals[g * 64 + l] = lo as f32;
+            vals[g * 64 + 32 + l] = hi as f32;
+        }
+    }
+    (out, vals)
+}
+
+fn ggml_q5k_row(row: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut out = Vec::with_capacity(176);
+    push_f16_le(&mut out, 1.0);
+    push_f16_le(&mut out, 0.0);
+    out.extend_from_slice(&[1u8; 12]);
+    let qh_start = out.len();
+    out.extend_from_slice(&[0u8; 32]);
+    let mut qs = Vec::with_capacity(128);
+    let mut vals = vec![0f32; 256];
+    for g in 0..4 {
+        for l in 0..32 {
+            let v0 = ((row * 13 + g * 17 + l) & 0x1f) as u8;
+            let v1 = ((row * 19 + g * 23 + l + 3) & 0x1f) as u8;
+            qs.push((v0 & 0x0f) | ((v1 & 0x0f) << 4));
+            if (v0 & 0x10) != 0 {
+                out[qh_start + l] |= 1 << (2 * g);
+            }
+            if (v1 & 0x10) != 0 {
+                out[qh_start + l] |= 2 << (2 * g);
+            }
+            vals[g * 64 + l] = v0 as f32;
+            vals[g * 64 + 32 + l] = v1 as f32;
+        }
+    }
+    out.extend_from_slice(&qs);
+    (out, vals)
+}
+
+fn ggml_q6k_row(row: usize) -> (Vec<u8>, Vec<f32>) {
+    let mut ql = vec![0u8; 128];
+    let mut qh = vec![0u8; 64];
+    let scales = [1i8; 16];
+    let mut vals = vec![0f32; 256];
+    for half in 0..2 {
+        for l in 0..32 {
+            let base = half * 128;
+            let vs = [
+                ((row * 5 + half * 7 + l) & 0x3f) as u8,
+                ((row * 11 + half * 13 + l + 1) & 0x3f) as u8,
+                ((row * 17 + half * 19 + l + 2) & 0x3f) as u8,
+                ((row * 23 + half * 29 + l + 3) & 0x3f) as u8,
+            ];
+            ql[half * 64 + l] = (vs[0] & 0x0f) | ((vs[2] & 0x0f) << 4);
+            ql[half * 64 + 32 + l] = (vs[1] & 0x0f) | ((vs[3] & 0x0f) << 4);
+            qh[half * 32 + l] = ((vs[0] >> 4) & 3)
+                | (((vs[1] >> 4) & 3) << 2)
+                | (((vs[2] >> 4) & 3) << 4)
+                | (((vs[3] >> 4) & 3) << 6);
+            vals[base + l] = vs[0] as f32 - 32.0;
+            vals[base + 32 + l] = vs[1] as f32 - 32.0;
+            vals[base + 64 + l] = vs[2] as f32 - 32.0;
+            vals[base + 96 + l] = vs[3] as f32 - 32.0;
+        }
+    }
+    let mut out = Vec::with_capacity(210);
+    out.extend_from_slice(&ql);
+    out.extend_from_slice(&qh);
+    out.extend(scales.iter().map(|v| *v as u8));
+    push_f16_le(&mut out, 1.0);
+    (out, vals)
+}
+
+fn run_ggml_case(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+) -> Result<()> {
+    let (m, n, k) = (3usize, 17usize, 256usize);
+    println!("=== {name}: m={m} n={n} k={k} ===");
+    let mut lhs = vec![0f32; m * k];
+    for mi in 0..m {
+        for ki in 0..k {
+            lhs[mi * k + ki] = bf16_round((((mi + 1) as f32) * 0.01 + (ki as f32) * 0.003).sin());
+        }
+    }
+    let mut rhs = Vec::new();
+    let mut rows = Vec::new();
+    for ni in 0..n {
+        let (bytes, vals) = row_fn(ni);
+        rhs.extend_from_slice(&bytes);
+        rows.push(vals);
+    }
+    let row_bytes = rhs.len() / n;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("rhs upload: {e}"))?;
+    let dummy_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[1, 1],
+        &f32_to_bf16_bytes(&[0.0]),
+    )
+    .map_err(|e| anyhow!("dummy upload: {e}"))?;
+    let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out alloc: {e}"))?;
+    prefill_ffi::matmul_rhs_transposed_int4(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &dummy_gpu,
+        &dummy_gpu,
+        128,
+        qtype,
+        &mut out_gpu,
+    )
+    .map_err(|e| anyhow!("ggml matmul: {e}"))?;
+    let out_host = bf16_bytes_to_f32(
+        &out_gpu
+            .to_host_bytes()
+            .map_err(|e| anyhow!("out d2h: {e}"))?,
+    );
+    let mut nbad = 0usize;
+    let mut max_abs = 0f32;
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0f32;
+            for ki in 0..k {
+                acc += lhs[mi * k + ki] * rows[ni][ki];
+            }
+            let r = bf16_round(acc);
+            let g = out_host[mi * n + ni];
+            let d = (g - r).abs();
+            max_abs = max_abs.max(d);
+            if d > 0.25 {
+                nbad += 1;
+            }
+        }
+    }
+    println!("  max_abs={max_abs:.5e} bad={nbad}/{}", m * n);
+    if nbad > 0 {
+        return Err(anyhow!("{name} mismatches"));
+    }
+    Ok(())
 }
 
 struct TestCase {
@@ -171,6 +335,7 @@ fn run_case(ordinal: usize, c: &TestCase) -> Result<()> {
         &scale_gpu,
         &zero_gpu,
         gs,
+        qwen35::weights::LOWBIT_NATIVE_INT4,
         &mut out_gpu,
     )
     .map_err(|e| anyhow!("int4 matmul: {e}"))?;
@@ -293,6 +458,24 @@ fn main() -> Result<()> {
     for c in &cases {
         run_case(ordinal, c)?;
     }
+    run_ggml_case(
+        ordinal,
+        "GGML Q4_K",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+    )?;
+    run_ggml_case(
+        ordinal,
+        "GGML Q5_K",
+        qwen35::weights::LOWBIT_GGML_Q5_K,
+        ggml_q5k_row,
+    )?;
+    run_ggml_case(
+        ordinal,
+        "GGML Q6_K",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+    )?;
 
     Ok(())
 }

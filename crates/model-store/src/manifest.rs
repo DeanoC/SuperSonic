@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-pub const FORMAT_VERSION: u32 = 1;
-pub const CONVERTER_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 2;
+pub const CONVERTER_VERSION: u32 = 1;
 
 /// Describes the layout transformation applied to a tensor at bake time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,6 +26,12 @@ pub enum LayoutTag {
     /// INT4 quantized weight. Packed as 2 nibbles per byte.
     /// Companion _int4_scale and _int4_zero tensors stored separately.
     Int4Quantized,
+    /// Verbatim GGML K-block quantized tensors from GGUF. Shape is
+    /// `[rows, row_bytes]`, dtype is `u8`, and logical input columns are
+    /// supplied by the model descriptor at runtime.
+    GgmlQ4K,
+    GgmlQ5K,
+    GgmlQ6K,
 }
 
 /// Metadata for a single tensor in the baked package.

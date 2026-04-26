@@ -6,7 +6,8 @@ This validates the bake itself, not full model quality:
   * every mapped GGUF tensor has a native-bake entry;
   * layout/shape/dtype metadata matches the expected SuperSonic transform;
   * selected raw tensors match the GGUF source after inverse llama.cpp transforms;
-  * selected native INT4 tensors reconstruct close to the dequantized GGUF source.
+  * selected GGML K-block tensors preserve the exact source block bytes;
+  * selected native INT4 tensors, if present, reconstruct close to the source.
 
 The INT4 reconstruction reuses `int4_corpus_compare.dequant_int4_tensor`, which
 matches the runtime packed-nibble + BF16 scale/zero semantics used by kernels.
@@ -143,13 +144,11 @@ def main() -> int:
     ap.add_argument("--raw-max-abs", type=float, default=0.02)
     args = ap.parse_args()
 
-    default_gptq = args.model_dir / ".supersonic" / f"v{bake_q4km.FORMAT_VERSION}-q4km-gptq"
-    default_minmax = args.model_dir / ".supersonic" / f"v{bake_q4km.FORMAT_VERSION}-q4km"
-    bake_dir = args.bake_dir or (default_gptq if default_gptq.exists() else default_minmax)
+    bake_dir = args.bake_dir or (args.model_dir / ".supersonic" / f"v{bake_q4km.FORMAT_VERSION}-q4km")
     manifest, weights = load_bake(bake_dir)
     by_name = {t["name"]: t for t in manifest["tensors"]}
-    if manifest.get("quant_profile") not in ("q4km-v1", "q4km-gptq-v1"):
-        raise SystemExit(f"{bake_dir}: expected quant_profile=q4km-v1 or q4km-gptq-v1")
+    if manifest.get("quant_profile") != "q4km-ggml-v1":
+        raise SystemExit(f"{bake_dir}: expected quant_profile=q4km-ggml-v1")
 
     _, layer_types = bake_q4km.load_config_context(args.model_dir)
     gguf = bake_q4km.parse_gguf(args.gguf_file)
@@ -173,6 +172,31 @@ def main() -> int:
         selected = choose_validation_tensors(mapped_infos, by_name, args.max_tensors)
         for info, mapped in selected:
             meta = by_name[mapped]
+            raw_layout = bake_q4km.ggml_k_layout(info.ggml_type)
+            if raw_layout is not None and meta["layout"] in (
+                bake_q4km.LAYOUT_GGML_Q4K,
+                bake_q4km.LAYOUT_GGML_Q5K,
+                bake_q4km.LAYOUT_GGML_Q6K,
+            ):
+                if meta["layout"] != raw_layout:
+                    raise SystemExit(f"{mapped}: layout {meta['layout']} != expected {raw_layout}")
+                cols = info.dims[0]
+                rows = bake_q4km.prod(info.dims[1:]) if len(info.dims) > 1 else 1
+                row_bytes = bake_q4km.ggml_row_size(info.ggml_type, cols)
+                if meta["dtype"] != "u8" or meta["shape"] != [rows, row_bytes]:
+                    raise SystemExit(
+                        f"{mapped}: raw GGML metadata dtype/shape {meta['dtype']} {meta['shape']} "
+                        f"!= u8 {[rows, row_bytes]}"
+                    )
+                raw = weights[meta["offset"]: meta["offset"] + meta["byte_len"]]
+                actual = np.frombuffer(raw, dtype=np.uint8)
+                expected = np.frombuffer(bake_q4km.raw_gguf_tensor_bytes(gguf, info), dtype=np.uint8)
+                max_abs, mean_abs, rel_rmse, samples = compare_arrays(actual, expected, args.max_items)
+                if max_abs != 0.0:
+                    raise SystemExit(f"{mapped}: raw GGML block bytes differ from source")
+                checks.append(TensorCheck(mapped, info.name, meta["layout"], max_abs, mean_abs, rel_rmse, samples))
+                continue
+
             source = bake_q4km.load_gguf_tensor(gguf, info)
             source, a_log_precomputed = bake_q4km.undo_gguf_tensor_transform(mapped, source)
             expected_layout = bake_q4km.classify_tensor(

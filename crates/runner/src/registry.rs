@@ -47,8 +47,9 @@ impl ModelVariant {
             "qwen3.6-27b" | "qwen36-27b" | "qwen3.6-27b-fp8" | "qwen36-27b-fp8" => {
                 Some(Self::Qwen3_6_27B)
             }
-            "qwen3.6-35b-a3b" | "qwen36-35b-a3b" | "qwen3.6-35b-a3b-fp8"
-            | "qwen36-35b-a3b-fp8" => Some(Self::Qwen3_6_35B_A3B),
+            "qwen3.6-35b-a3b" | "qwen36-35b-a3b" | "qwen3.6-35b-a3b-fp8" | "qwen36-35b-a3b-fp8" => {
+                Some(Self::Qwen3_6_35B_A3B)
+            }
             "gemma4-e2b" | "gemma-4-e2b" | "e2b" => Some(Self::Gemma4_E2B),
             "gemma4-e4b" | "gemma-4-e4b" | "e4b" => Some(Self::Gemma4_E4B),
             "phi4-mini" | "phi-4-mini" | "phi4mini" => Some(Self::Phi4_Mini),
@@ -545,17 +546,22 @@ mod tests {
             ModelVariant::Qwen3_6_35B_A3B.family(),
             ModelFamily::Qwen36Moe
         );
-        assert_eq!(
-            ModelVariant::Qwen3_6_35B_A3B.to_string(),
-            "qwen3.6-35b-a3b"
-        );
+        assert_eq!(ModelVariant::Qwen3_6_35B_A3B.to_string(), "qwen3.6-35b-a3b");
         assert!(supported_models_list().contains(&"qwen3.6-27b"));
     }
 
     #[test]
     fn metal_apple_m4_registry_includes_08b_and_2b() {
-        let e08b = lookup(&ModelVariant::Qwen3_5_0_8B, &Backend::Metal, &GpuArch::AppleM4);
-        let e2b = lookup(&ModelVariant::Qwen3_5_2B, &Backend::Metal, &GpuArch::AppleM4);
+        let e08b = lookup(
+            &ModelVariant::Qwen3_5_0_8B,
+            &Backend::Metal,
+            &GpuArch::AppleM4,
+        );
+        let e2b = lookup(
+            &ModelVariant::Qwen3_5_2B,
+            &Backend::Metal,
+            &GpuArch::AppleM4,
+        );
         assert!(e08b.is_some());
         assert!(e2b.is_some());
         let p08b = match &e08b.unwrap().params {

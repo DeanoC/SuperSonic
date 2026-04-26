@@ -4368,8 +4368,7 @@ mod tests {
 
         matmul_rhs_transposed_bf16_gemv_m1_tiled(n, k, &lhs, &rhs, &mut out_tiled)
             .expect("run tiled gemv");
-        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
-            .expect("run reference");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref).expect("run reference");
 
         let actual = read_bf16(&out_tiled);
         let expected = read_bf16(&out_ref);
@@ -4413,10 +4412,8 @@ mod tests {
         let mut out_ref =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, n]).expect("alloc ref out");
 
-        matmul_rhs_transposed_bf16_gemv_m1(n, k, &lhs, &rhs, &mut out_gemv)
-            .expect("run gemv");
-        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref)
-            .expect("run reference");
+        matmul_rhs_transposed_bf16_gemv_m1(n, k, &lhs, &rhs, &mut out_gemv).expect("run gemv");
+        matmul_rhs_transposed_bf16(1, 1, n, k, &lhs, &rhs, &mut out_ref).expect("run reference");
 
         let actual = read_bf16(&out_gemv);
         let expected = read_bf16(&out_ref);
@@ -4481,14 +4478,18 @@ mod tests {
         let ordinal = 0usize;
 
         let lhs_vals: [f32; 4] = [1.0, 0.5, -1.0, 2.0];
-        let lhs =
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[1, 1, 4], &bf16_bytes(&lhs_vals))
-                .expect("upload lhs");
+        let lhs = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1, 4],
+            &bf16_bytes(&lhs_vals),
+        )
+        .expect("upload lhs");
 
         // rhs [batch=1, n=4, k/2=2]: low nibble = even k, high nibble = odd k.
         let nibbles: [[u8; 4]; 4] = [
-            [1, 2, 3, 4], // col 0
-            [5, 6, 7, 8], // col 1
+            [1, 2, 3, 4],    // col 0
+            [5, 6, 7, 8],    // col 1
             [9, 10, 11, 12], // col 2
             [13, 14, 15, 0], // col 3
         ];
@@ -4497,9 +4498,8 @@ mod tests {
             rhs_bytes.push(col_nibbles[0] | (col_nibbles[1] << 4));
             rhs_bytes.push(col_nibbles[2] | (col_nibbles[3] << 4));
         }
-        let rhs_int4 =
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
-                .expect("upload rhs_int4");
+        let rhs_int4 = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
+            .expect("upload rhs_int4");
 
         // scale/zero shape [scale_rows=2, scale_cols=2].
         // Index: sc_idx = (col / gs) * scale_cols + (kk / gs).
@@ -4512,13 +4512,9 @@ mod tests {
             &bf16_bytes(&scale_vals),
         )
         .expect("upload scale");
-        let zero = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[2, 2],
-            &bf16_bytes(&zero_vals),
-        )
-        .expect("upload zero");
+        let zero =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2, 2], &bf16_bytes(&zero_vals))
+                .expect("upload zero");
 
         let mut out =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, 4]).expect("allocate out");
@@ -4587,19 +4583,19 @@ mod tests {
                 rhs_bytes.push(chunk[0] | (chunk[1] << 4));
             }
         }
-        let rhs_int4 = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::U8,
-            &[1, n, k / 2],
-            &rhs_bytes,
-        )
-        .expect("upload rhs_int4");
+        let rhs_int4 =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, n, k / 2], &rhs_bytes)
+                .expect("upload rhs_int4");
 
         // Single scale tile per scale_row: scale_rows = ceil(n/gs) = 1.
         let scale_rows = (n + gs - 1) / gs;
         let scale_cols = (k + gs - 1) / gs;
-        let scale_vals: Vec<f32> = (0..scale_rows * scale_cols).map(|i| 0.1 + i as f32 * 0.05).collect();
-        let zero_vals: Vec<f32> = (0..scale_rows * scale_cols).map(|i| 1.0 + i as f32 * 0.25).collect();
+        let scale_vals: Vec<f32> = (0..scale_rows * scale_cols)
+            .map(|i| 0.1 + i as f32 * 0.05)
+            .collect();
+        let zero_vals: Vec<f32> = (0..scale_rows * scale_cols)
+            .map(|i| 1.0 + i as f32 * 0.25)
+            .collect();
         let scale = GpuBuffer::from_host_bytes(
             ordinal,
             ScalarType::BF16,
@@ -4621,11 +4617,27 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, n]).expect("alloc ref out");
 
         matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
-            n, k, gs, &lhs, &rhs_int4, &scale, &zero, &mut out_tiled,
+            n,
+            k,
+            gs,
+            &lhs,
+            &rhs_int4,
+            &scale,
+            &zero,
+            &mut out_tiled,
         )
         .expect("run tiled int4 gemv");
         matmul_rhs_transposed_int4_bf16(
-            1, 1, n, k, gs, &lhs, &rhs_int4, &scale, &zero, &mut out_ref,
+            1,
+            1,
+            n,
+            k,
+            gs,
+            &lhs,
+            &rhs_int4,
+            &scale,
+            &zero,
+            &mut out_ref,
         )
         .expect("run reference int4");
 
@@ -4656,20 +4668,14 @@ mod tests {
         )
         .expect("upload lhs");
 
-        let nibbles: [[u8; 4]; 4] = [
-            [1, 2, 3, 4],
-            [5, 6, 7, 8],
-            [9, 10, 11, 12],
-            [13, 14, 15, 0],
-        ];
+        let nibbles: [[u8; 4]; 4] = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 0]];
         let mut rhs_bytes = Vec::with_capacity(4 * 2);
         for col_nibbles in &nibbles {
             rhs_bytes.push(col_nibbles[0] | (col_nibbles[1] << 4));
             rhs_bytes.push(col_nibbles[2] | (col_nibbles[3] << 4));
         }
-        let rhs_int4 =
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
-                .expect("upload rhs_int4");
+        let rhs_int4 = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
+            .expect("upload rhs_int4");
 
         let scale_vals: [f32; 4] = [0.5, 0.25, 0.125, 1.0];
         let zero_vals: [f32; 4] = [2.0, 1.0, 4.0, 0.5];
@@ -4680,13 +4686,9 @@ mod tests {
             &bf16_bytes(&scale_vals),
         )
         .expect("upload scale");
-        let zero = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[2, 2],
-            &bf16_bytes(&zero_vals),
-        )
-        .expect("upload zero");
+        let zero =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2, 2], &bf16_bytes(&zero_vals))
+                .expect("upload zero");
 
         let mut out_gemv =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, 4]).expect("alloc gemv out");
@@ -4694,11 +4696,27 @@ mod tests {
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 1, 4]).expect("alloc ref out");
 
         matmul_rhs_transposed_int4_bf16_gemv_m1(
-            4, 4, 2, &lhs, &rhs_int4, &scale, &zero, &mut out_gemv,
+            4,
+            4,
+            2,
+            &lhs,
+            &rhs_int4,
+            &scale,
+            &zero,
+            &mut out_gemv,
         )
         .expect("run gemv int4");
         matmul_rhs_transposed_int4_bf16(
-            1, 1, 4, 4, 2, &lhs, &rhs_int4, &scale, &zero, &mut out_ref,
+            1,
+            1,
+            4,
+            4,
+            2,
+            &lhs,
+            &rhs_int4,
+            &scale,
+            &zero,
+            &mut out_ref,
         )
         .expect("run reference int4");
 

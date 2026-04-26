@@ -33,8 +33,7 @@ fn copy_d2d_batched(
         prefill_ffi::metal_copy_d2d(src, dst, bytes)
             .map_err(|e| anyhow::anyhow!("metal blit copy: {e}"))
     } else {
-        gpu_hal::copy_d2d(ordinal, dst, src, bytes)
-            .map_err(|e| anyhow::anyhow!("d2d copy: {e}"))
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes).map_err(|e| anyhow::anyhow!("d2d copy: {e}"))
     }
 }
 
@@ -370,7 +369,10 @@ fn matmul_proj(
     int4_zero: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
-    if let (Some(sc), Some(zr)) = (int4_scale, int4_zero) {
+    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    if qtype != 0 {
+        let sc = int4_scale.unwrap_or(weight);
+        let zr = int4_zero.unwrap_or(weight);
         prefill_ffi::matmul_rhs_transposed_int4(
             ordinal,
             batch,
@@ -382,6 +384,7 @@ fn matmul_proj(
             sc,
             zr,
             int4_group_size,
+            qtype,
             out,
         )
         .map_err(|e| anyhow::anyhow!("matmul_int4: {e}"))
@@ -576,6 +579,7 @@ pub fn compute_logits_for_range(
             scale,
             zero,
             weights.int4_group_size,
+            qwen35::weights::LOWBIT_NATIVE_INT4,
             &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("range lm_head int4: {e}"))?;
@@ -1722,7 +1726,14 @@ fn metal_v2_decode_step_body(
             &format!("layer {idx} post-attn norm"),
         )?;
 
-        prefill_mlp_layer(weights, &mut scratch.scratch, config, idx, chunk_len, ordinal)?;
+        prefill_mlp_layer(
+            weights,
+            &mut scratch.scratch,
+            config,
+            idx,
+            chunk_len,
+            ordinal,
+        )?;
     }
 
     Ok(())
@@ -1753,7 +1764,14 @@ pub fn metal_v2_decode_step(
         .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
 
     metal_v2_decode_step_body(
-        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+        weights,
+        state,
+        rotary,
+        scratch,
+        token_id,
+        seqlen_offset,
+        ordinal,
+        kv_chunk_size,
     )?;
 
     let config = &weights.config;
@@ -1791,7 +1809,14 @@ pub fn metal_v2_decode_step_greedy(
         .map_err(|e| anyhow::anyhow!("metal v2 batch begin: {e}"))?;
 
     metal_v2_decode_step_body(
-        weights, state, rotary, scratch, token_id, seqlen_offset, ordinal, kv_chunk_size,
+        weights,
+        state,
+        rotary,
+        scratch,
+        token_id,
+        seqlen_offset,
+        ordinal,
+        kv_chunk_size,
     )?;
 
     let config = &weights.config;
@@ -1847,6 +1872,7 @@ pub fn metal_v2_decode_step_greedy(
             scale,
             zero,
             weights.int4_group_size,
+            qwen35::weights::LOWBIT_NATIVE_INT4,
             &mut logits_buf,
         )
         .map_err(|e| anyhow::anyhow!("greedy lm_head int4: {e}"))?;
@@ -1865,8 +1891,7 @@ pub fn metal_v2_decode_step_greedy(
 
     // Flush before D2H so the GPU work is visible to the host memcpy.
     if prefill_ffi::metal_batch_is_active() {
-        prefill_ffi::flush_metal_batch()
-            .map_err(|e| anyhow::anyhow!("greedy batch flush: {e}"))?;
+        prefill_ffi::flush_metal_batch().map_err(|e| anyhow::anyhow!("greedy batch flush: {e}"))?;
     }
 
     let bytes = out_index
@@ -2906,7 +2931,7 @@ fn prefill_linear_attention_layer(
         let mut packed_equiv = vec![0f32; nv * packed_width];
         let last_t = chunk_len - 1;
         for v_head in 0..nv {
-            let k_head = v_head / head_repeat;
+            let k_head = v_head % nk;
             let out_base = v_head * packed_width;
             let q_base = last_t * key_dim + k_head * khd;
             let k_base = (last_t * nk + k_head) * khd;
