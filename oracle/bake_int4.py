@@ -522,14 +522,15 @@ def quantize_model(
             log("[gptq]   lm_head: WARNING no activations captured, skipping")
         else:
             t0 = time.perf_counter()
-            W = lm_head.weight.data.to(torch.float32)
+            # The output head is huge on 9B-class checkpoints. Quantize it on
+            # CPU to avoid requiring an extra multi-GiB clone on an already-full
+            # producer GPU after the layer sweep.
+            W = lm_head.weight.data.detach().to(device="cpu", dtype=torch.float32)
+            H = H.detach().to(device="cpu", dtype=torch.float32)
             Q_dq, nibbles, scale_t, zero_t = gptq_quantize(W, H, group_size, damp)
             elapsed = time.perf_counter() - t0
             log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
                 f"H_N={hook.N} took {elapsed:.1f}s")
-            # Swap in dequantized weights so the perplexity check below sees the
-            # quantized lm_head too.
-            lm_head.weight.data.copy_(Q_dq.to(lm_head.weight.dtype))
             quantized["lm_head.weight"] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
             del W, Q_dq, nibbles, scale_t, zero_t, H
 
