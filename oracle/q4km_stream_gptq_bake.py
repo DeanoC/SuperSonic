@@ -90,7 +90,9 @@ class CpuHessianHook:
         self._handle = linear.register_forward_pre_hook(self._pre)
 
     def _pre(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
-        x = inputs[0]
+        self.observe(inputs[0])
+
+    def observe(self, x: torch.Tensor) -> None:
         if x.dim() > 2:
             x = x.reshape(-1, x.shape[-1])
         x = x.detach().to(device="cpu", dtype=torch.float32)
@@ -401,7 +403,7 @@ def main() -> int:
                     for s in range(len(hidden_cpu)):
                         hs = hidden_cpu[s].to(device)
                         normed = final_norm(hs)
-                        _ = lm_head(normed)
+                        hook.observe(normed)
                         del hs, normed
                     if hook.H is None:
                         log("[stream-gptq]   lm_head: WARNING no activations captured, emitting source tensor")
@@ -438,10 +440,6 @@ def main() -> int:
                             )
                         writer.write_entries(entries)
                         emitted.add("lm_head.weight")
-                        if tuple(lm_head.weight.shape) == tuple(q_dq_cpu.shape):
-                            lm_head.weight.data.copy_(
-                                q_dq_cpu.to(device=lm_head.weight.device, dtype=lm_head.weight.dtype)
-                            )
                         log(f"[stream-gptq]   lm_head.weight: H_N={hook.N} emitted")
                 finally:
                     hook.close()
