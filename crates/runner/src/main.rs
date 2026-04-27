@@ -773,6 +773,34 @@ fn variant_version_ok(
     }
 }
 
+fn should_fetch_bake(
+    download_bake: bool,
+    bootstrap_downloaded: bool,
+    local_version_ok: bool,
+) -> bool {
+    (download_bake && !bootstrap_downloaded) || !local_version_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_fetch_bake;
+
+    #[test]
+    fn bootstrap_download_satisfies_forced_bake_download() {
+        assert!(!should_fetch_bake(true, true, true));
+    }
+
+    #[test]
+    fn forced_bake_download_still_fetches_without_bootstrap() {
+        assert!(should_fetch_bake(true, false, true));
+    }
+
+    #[test]
+    fn invalid_local_bake_fetches_even_after_bootstrap_attempt() {
+        assert!(should_fetch_bake(false, true, false));
+    }
+}
+
 fn repo_root() -> Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir
@@ -1114,8 +1142,11 @@ fn main() -> Result<()> {
             let bake_dir = variant.bake_dir(&cli.model_dir);
             let _lock = model_store::BakeLock::acquire(&cli.model_dir)
                 .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-            if (cli.download_bake && !bootstrap_downloaded) || !model_store::version_ok(&bake_dir)
-            {
+            if should_fetch_bake(
+                cli.download_bake,
+                bootstrap_downloaded,
+                model_store::version_ok(&bake_dir),
+            ) {
                 let canonical_model = model_variant.to_string();
                 match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
                     Ok(true) => {
@@ -1375,7 +1406,11 @@ fn main() -> Result<()> {
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
 
-        if (cli.download_bake && !bootstrap_downloaded) || !variant_version_ok(variant, &bake_dir) {
+        if should_fetch_bake(
+            cli.download_bake,
+            bootstrap_downloaded,
+            variant_version_ok(variant, &bake_dir),
+        ) {
             let local_bake_ok = matches!(
                 variant,
                 model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
@@ -2726,9 +2761,11 @@ fn run_gemma4(
         let target = gemma4_int4_engine::int4_bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-        if (cli.download_bake && !bootstrap_downloaded)
-            || !gemma4_int4_engine::int4_bake_ok(&cli.model_dir)
-        {
+        if should_fetch_bake(
+            cli.download_bake,
+            bootstrap_downloaded,
+            gemma4_int4_engine::int4_bake_ok(&cli.model_dir),
+        ) {
             let canonical_model = model_variant.to_string();
             match try_download_bake(
                 cli,
