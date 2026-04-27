@@ -42,8 +42,8 @@ import torch
 import torch.nn as nn
 
 # -- constants mirrored from crates/model-store/src/manifest.rs --
-FORMAT_VERSION = 1
-CONVERTER_VERSION = 2
+FORMAT_VERSION = 2
+CONVERTER_VERSION = 1
 
 # LayoutTag strings must match the Rust enum variants exactly.
 LAYOUT_RAW = "Raw"
