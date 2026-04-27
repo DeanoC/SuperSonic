@@ -781,6 +781,10 @@ fn should_fetch_bake(
     (download_bake && !bootstrap_downloaded) || !local_version_ok
 }
 
+fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
+    download_bake || !local_version_ok
+}
+
 fn effective_fixed_vram(
     fixed_bytes: u64,
     q4km: bool,
@@ -805,7 +809,7 @@ fn effective_fixed_vram(
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_fixed_vram, should_fetch_bake};
+    use super::{effective_fixed_vram, should_fetch_bake, should_fetch_exact_bake};
 
     #[test]
     fn bootstrap_download_satisfies_forced_bake_download() {
@@ -820,6 +824,11 @@ mod tests {
     #[test]
     fn invalid_local_bake_fetches_even_after_bootstrap_attempt() {
         assert!(should_fetch_bake(false, true, false));
+    }
+
+    #[test]
+    fn forced_exact_bake_fetch_ignores_metadata_bootstrap() {
+        assert!(should_fetch_exact_bake(true, true));
     }
 
     #[test]
@@ -1163,17 +1172,13 @@ fn main() -> Result<()> {
         // machine: ensure_hf_metadata_present fetches HF metadata from the
         // bake tarball if config.json is missing, then we verify or download
         // the INT4 bake itself.
-        let bootstrap_downloaded = ensure_hf_metadata_present(&cli, &model_variant)?;
+        ensure_hf_metadata_present(&cli, &model_variant)?;
         if !cli.no_bake {
             let variant = model_store::fetch::BakeVariant::Int4Gptq;
             let bake_dir = variant.bake_dir(&cli.model_dir);
             let _lock = model_store::BakeLock::acquire(&cli.model_dir)
                 .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-            if should_fetch_bake(
-                cli.download_bake,
-                bootstrap_downloaded,
-                model_store::version_ok(&bake_dir),
-            ) {
+            if should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir)) {
                 let canonical_model = model_variant.to_string();
                 match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
                     Ok(true) => {
