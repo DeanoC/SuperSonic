@@ -817,12 +817,12 @@ fn run_q4km_baker(cli: &Cli, bake_dir: &std::path::Path) -> Result<()> {
 /// metadata under `hf/`, which the downloader extracts into `--model-dir`
 /// before anything else reads from it. This is the "fresh empty model dir"
 /// path that makes release-hosted bakes self-sufficient.
-fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<()> {
+fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<bool> {
     if cli.no_bake || cli.no_download {
-        return Ok(());
+        return Ok(false);
     }
     if cli.model_dir.join("config.json").exists() {
-        return Ok(());
+        return Ok(false);
     }
     let variant = cli_variant(cli);
     let bake_dir = variant.bake_dir(&cli.model_dir);
@@ -831,7 +831,7 @@ fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result
     // Race: another process might have populated config between our check
     // above and the lock acquisition.
     if cli.model_dir.join("config.json").exists() {
-        return Ok(());
+        return Ok(false);
     }
     let canonical_model = model_variant.to_string();
     eprintln!(
@@ -839,7 +839,7 @@ fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result
          HF metadata and weights in one pass"
     );
     try_download_bake(cli, variant, &canonical_model, &bake_dir)?;
-    Ok(())
+    Ok(true)
 }
 
 /// RAII scope that enables Metal/HAL profiling when SUPERSONIC_METAL_PROFILE
@@ -1108,13 +1108,14 @@ fn main() -> Result<()> {
         // machine: ensure_hf_metadata_present fetches HF metadata from the
         // bake tarball if config.json is missing, then we verify or download
         // the INT4 bake itself.
-        ensure_hf_metadata_present(&cli, &model_variant)?;
+        let bootstrap_downloaded = ensure_hf_metadata_present(&cli, &model_variant)?;
         if !cli.no_bake {
             let variant = model_store::fetch::BakeVariant::Int4Gptq;
             let bake_dir = variant.bake_dir(&cli.model_dir);
             let _lock = model_store::BakeLock::acquire(&cli.model_dir)
                 .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-            if cli.download_bake || !model_store::version_ok(&bake_dir) {
+            if (cli.download_bake && !bootstrap_downloaded) || !model_store::version_ok(&bake_dir)
+            {
                 let canonical_model = model_variant.to_string();
                 match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
                     Ok(true) => {
@@ -1270,7 +1271,7 @@ fn main() -> Result<()> {
 
     // If --model-dir is pristine (no config.json), fetch a bake first so the
     // downloader can populate HF metadata before we try to read it.
-    ensure_hf_metadata_present(&cli, &model_variant)?;
+    let bootstrap_downloaded = ensure_hf_metadata_present(&cli, &model_variant)?;
 
     // Load config
     let config = qwen35::config::load_config(&cli.model_dir)
@@ -1374,7 +1375,7 @@ fn main() -> Result<()> {
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
 
-        if cli.download_bake || !variant_version_ok(variant, &bake_dir) {
+        if (cli.download_bake && !bootstrap_downloaded) || !variant_version_ok(variant, &bake_dir) {
             let local_bake_ok = matches!(
                 variant,
                 model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
@@ -2629,7 +2630,7 @@ fn run_gemma4(
     }
 
     // Fetch first if --model-dir is pristine so HF metadata lands before config load.
-    ensure_hf_metadata_present(cli, model_variant)?;
+    let bootstrap_downloaded = ensure_hf_metadata_present(cli, model_variant)?;
 
     let cfg = gemma4::config::load_config(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
@@ -2725,7 +2726,9 @@ fn run_gemma4(
         let target = gemma4_int4_engine::int4_bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-        if cli.download_bake || !gemma4_int4_engine::int4_bake_ok(&cli.model_dir) {
+        if (cli.download_bake && !bootstrap_downloaded)
+            || !gemma4_int4_engine::int4_bake_ok(&cli.model_dir)
+        {
             let canonical_model = model_variant.to_string();
             match try_download_bake(
                 cli,
