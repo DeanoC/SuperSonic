@@ -56,6 +56,16 @@ def log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def copy_weight_in_row_chunks(dst: torch.Tensor, src: torch.Tensor, rows_per_chunk: int = 4096) -> None:
+    """Copy a large CPU weight into an existing module parameter without a full-device clone."""
+    with torch.no_grad():
+        for start in range(0, src.shape[0], rows_per_chunk):
+            end = min(start + rows_per_chunk, src.shape[0])
+            dst[start:end].copy_(
+                src[start:end].to(device=dst.device, dtype=dst.dtype, non_blocking=True)
+            )
+
+
 # ---------------------------------------------------------------------------
 # Target-tensor selection (mirrors crates/model-store/src/baker.rs::is_int4_target)
 # ---------------------------------------------------------------------------
@@ -531,6 +541,7 @@ def quantize_model(
             elapsed = time.perf_counter() - t0
             log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
                 f"H_N={hook.N} took {elapsed:.1f}s")
+            copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
             quantized["lm_head.weight"] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
             del W, Q_dq, nibbles, scale_t, zero_t, H
 
