@@ -46,6 +46,10 @@ struct Cli {
     #[arg(long)]
     q4km: bool,
 
+    /// Use a Q4KM-sourced GPTQ bake in SuperSonic's native INT4 runtime layout.
+    #[arg(long)]
+    q4km_gptq: bool,
+
     /// Keep FP8 weights on GPU and dequant at runtime (Qwen3.5 only).
     #[arg(long)]
     fp8_runtime: bool,
@@ -91,6 +95,7 @@ fn main() -> Result<()> {
         max_context: cli.max_context,
         int4: cli.int4,
         q4km: cli.q4km,
+        q4km_gptq: cli.q4km_gptq,
         fp8_runtime: cli.fp8_runtime,
         kv_fp8: cli.kv_fp8,
         api_key: cli.api_key,

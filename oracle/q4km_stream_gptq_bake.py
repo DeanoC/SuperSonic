@@ -43,6 +43,8 @@ def log(msg: str) -> None:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Stream a GGUF -> Q4KM-GPTQ SuperSonic bake")
     p.add_argument("--model-dir", required=True, type=Path)
+    p.add_argument("--activation-model-dir", type=Path, default=None,
+                   help="Optional HF/Transformers model directory used only for activation collection")
     p.add_argument("--gguf-file", required=True, type=Path)
     p.add_argument("--out-dir", type=Path, default=None)
     p.add_argument("--model", default="qwen3.6-27b")
@@ -88,7 +90,9 @@ class CpuHessianHook:
         self._handle = linear.register_forward_pre_hook(self._pre)
 
     def _pre(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
-        x = inputs[0]
+        self.observe(inputs[0])
+
+    def observe(self, x: torch.Tensor) -> None:
         if x.dim() > 2:
             x = x.reshape(-1, x.shape[-1])
         x = x.detach().to(device="cpu", dtype=torch.float32)
@@ -174,16 +178,14 @@ def encode_raw_or_minmax(
 
 
 @torch.no_grad()
-def quantize_target_from_gguf(
-    gguf: bake_q4km.GgufFile,
-    info: bake_q4km.GgufTensorInfo,
+def quantize_target_tensor(
     raw_name: str,
+    W: torch.Tensor,
     H: torch.Tensor,
     group_size: int,
     damp: float,
     device: torch.device,
 ) -> tuple[list[tuple[str, bytes, list[int], str, str]], torch.Tensor]:
-    W, _, _ = load_transformed_gguf_tensor(gguf, info, raw_name)
     if W.ndim != 2:
         raise SystemExit(f"{raw_name}: GPTQ target must be 2D, got {tuple(W.shape)}")
     rows, cols = W.shape
@@ -202,6 +204,20 @@ def quantize_target_from_gguf(
         (f"{raw_name}_int4_zero", bake_q4km.bf16_to_bytes(zeros.cpu()), list(zeros.shape), "bf16", bake_q4km.LAYOUT_RAW),
     ]
     return entries, Q_dq.detach().cpu()
+
+
+@torch.no_grad()
+def quantize_target_from_gguf(
+    gguf: bake_q4km.GgufFile,
+    info: bake_q4km.GgufTensorInfo,
+    raw_name: str,
+    H: torch.Tensor,
+    group_size: int,
+    damp: float,
+    device: torch.device,
+) -> tuple[list[tuple[str, bytes, list[int], str, str]], torch.Tensor]:
+    W, _, _ = load_transformed_gguf_tensor(gguf, info, raw_name)
+    return quantize_target_tensor(raw_name, W, H, group_size, damp, device)
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
@@ -224,7 +240,8 @@ def load_model(args: argparse.Namespace, device: torch.device) -> nn.Module:
     if args.offload_folder:
         kwargs["offload_folder"] = str(args.offload_folder)
 
-    model = AutoModelForCausalLM.from_pretrained(str(args.model_dir), **kwargs)
+    model_dir = args.activation_model_dir or args.model_dir
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), **kwargs)
     if not args.device_map:
         model = model.to(device)
     model.eval()
@@ -288,6 +305,8 @@ def main() -> int:
             # Emit top-level tensors first.
             for raw_name in sorted(source_by_raw):
                 if layer_idx_from_name(raw_name, args.weight_prefix) is not None:
+                    continue
+                if raw_name == "lm_head.weight" and is_int4_target("lm_head.weight"):
                     continue
                 writer.write_entries(encode_raw_or_minmax(
                     gguf, source_by_raw[raw_name], raw_name,
@@ -368,6 +387,62 @@ def main() -> int:
                         out = out[0]
                     hidden_cpu[s] = out.detach().cpu()
                     del hs, out
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+
+            final_norm = getattr(inner, "norm", None)
+            lm_head = getattr(model, "lm_head", None)
+            if (
+                isinstance(lm_head, nn.Linear)
+                and final_norm is not None
+                and is_int4_target("lm_head.weight")
+            ):
+                log(f"[stream-gptq] lm_head: collecting Hessian over {len(hidden_cpu)} samples")
+                hook = CpuHessianHook(lm_head)
+                try:
+                    for s in range(len(hidden_cpu)):
+                        hs = hidden_cpu[s].to(device)
+                        normed = final_norm(hs)
+                        hook.observe(normed)
+                        del hs, normed
+                    if hook.H is None:
+                        log("[stream-gptq]   lm_head: WARNING no activations captured, emitting source tensor")
+                    else:
+                        if "lm_head.weight" in source_by_raw:
+                            entries, q_dq_cpu = quantize_target_from_gguf(
+                                gguf,
+                                source_by_raw["lm_head.weight"],
+                                "lm_head.weight",
+                                hook.H,
+                                args.group_size,
+                                args.damp,
+                                gptq_device,
+                            )
+                        else:
+                            embed_name = f"{args.weight_prefix}.embed_tokens.weight"
+                            if embed_name not in source_by_raw:
+                                raise SystemExit(
+                                    "lm_head.weight is missing from GGUF and tied embedding source "
+                                    f"{embed_name} was not found"
+                                )
+                            W, _, _ = load_transformed_gguf_tensor(
+                                gguf,
+                                source_by_raw[embed_name],
+                                embed_name,
+                            )
+                            entries, q_dq_cpu = quantize_target_tensor(
+                                "lm_head.weight",
+                                W,
+                                hook.H,
+                                args.group_size,
+                                args.damp,
+                                gptq_device,
+                            )
+                        writer.write_entries(entries)
+                        emitted.add("lm_head.weight")
+                        log(f"[stream-gptq]   lm_head.weight: H_N={hook.N} emitted")
+                finally:
+                    hook.close()
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 

@@ -66,6 +66,13 @@ pub fn bake_dir_q4km(model_dir: &Path) -> PathBuf {
         .join(format!("v{FORMAT_VERSION}-q4km"))
 }
 
+/// Return the bake directory for Q4KM-sourced GPTQ/native INT4 weights.
+pub fn bake_dir_q4km_gptq(model_dir: &Path) -> PathBuf {
+    model_dir
+        .join(".supersonic")
+        .join(format!("v{FORMAT_VERSION}-q4km-gptq"))
+}
+
 /// Return the bake directory for INT8 BitsAndBytes-style weights.
 /// Uses a separate directory so BF16/FP8/INT4/INT8 baked packages coexist.
 pub fn bake_dir_int8(model_dir: &Path) -> PathBuf {
@@ -130,6 +137,15 @@ pub fn version_ok(bake_dir: &Path) -> bool {
 
 /// Check if a valid Q4KM GGML K-block baked package exists at the given bake directory.
 pub fn version_ok_q4km(bake_dir: &Path) -> bool {
+    version_ok_with_quant_profile(bake_dir, "q4km-ggml-v1")
+}
+
+/// Check if a valid Q4KM GPTQ baked package exists at the given bake directory.
+pub fn version_ok_q4km_gptq(bake_dir: &Path) -> bool {
+    version_ok_with_quant_profile(bake_dir, "q4km-gptq-v1")
+}
+
+fn version_ok_with_quant_profile(bake_dir: &Path, quant_profile: &str) -> bool {
     let mp = manifest_path(bake_dir);
     let Ok(text) = std::fs::read_to_string(&mp) else {
         return false;
@@ -139,6 +155,6 @@ pub fn version_ok_q4km(bake_dir: &Path) -> bool {
     };
     m.format_version == FORMAT_VERSION
         && m.converter_version == CONVERTER_VERSION
-        && m.quant_profile.as_deref() == Some("q4km-ggml-v1")
+        && m.quant_profile.as_deref() == Some(quant_profile)
         && weights_bin_path(bake_dir).exists()
 }

@@ -39,8 +39,8 @@ import torch
 import torch.nn as nn
 
 # -- constants mirrored from crates/model-store/src/manifest.rs --
-FORMAT_VERSION = 1
-CONVERTER_VERSION = 2
+FORMAT_VERSION = 2
+CONVERTER_VERSION = 1
 
 # LayoutTag strings must match the Rust enum variants exactly (serde default).
 LAYOUT_RAW = "Raw"
@@ -54,6 +54,16 @@ LAYOUT_INT4 = "Int4Quantized"
 
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def copy_weight_in_row_chunks(dst: torch.Tensor, src: torch.Tensor, rows_per_chunk: int = 4096) -> None:
+    """Copy a large CPU weight into an existing module parameter without a full-device clone."""
+    with torch.no_grad():
+        for start in range(0, src.shape[0], rows_per_chunk):
+            end = min(start + rows_per_chunk, src.shape[0])
+            dst[start:end].copy_(
+                src[start:end].to(device=dst.device, dtype=dst.dtype, non_blocking=True)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -522,14 +532,16 @@ def quantize_model(
             log("[gptq]   lm_head: WARNING no activations captured, skipping")
         else:
             t0 = time.perf_counter()
-            W = lm_head.weight.data.to(torch.float32)
+            # The output head is huge on 9B-class checkpoints. Quantize it on
+            # CPU to avoid requiring an extra multi-GiB clone on an already-full
+            # producer GPU after the layer sweep.
+            W = lm_head.weight.data.detach().to(device="cpu", dtype=torch.float32)
+            H = H.detach().to(device="cpu", dtype=torch.float32)
             Q_dq, nibbles, scale_t, zero_t = gptq_quantize(W, H, group_size, damp)
             elapsed = time.perf_counter() - t0
             log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
                 f"H_N={hook.N} took {elapsed:.1f}s")
-            # Swap in dequantized weights so the perplexity check below sees the
-            # quantized lm_head too.
-            lm_head.weight.data.copy_(Q_dq.to(lm_head.weight.dtype))
+            copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
             quantized["lm_head.weight"] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
             del W, Q_dq, nibbles, scale_t, zero_t, H
 

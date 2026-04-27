@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::manifest::{CONVERTER_VERSION, FORMAT_VERSION};
-use crate::{bake_dir, bake_dir_fp8, bake_dir_int4, bake_dir_q4km, version_ok};
+use crate::{bake_dir, bake_dir_fp8, bake_dir_int4, bake_dir_q4km, bake_dir_q4km_gptq, version_ok};
 
 /// Default GitHub repo that hosts release assets.
 pub const DEFAULT_REPO: &str = "DeanoC/SuperSonic";
@@ -47,6 +47,8 @@ pub enum BakeVariant {
     Int4Gptq,
     /// GGUF Q4_K_M-compatible raw GGML K-block weights.
     Q4Km,
+    /// Q4KM-sourced GPTQ/native INT4 weights.
+    Q4KmGptq,
 }
 
 impl BakeVariant {
@@ -56,6 +58,7 @@ impl BakeVariant {
             Self::Fp8Native => "fp8-native",
             Self::Int4Gptq => "int4-gptq",
             Self::Q4Km => "q4km",
+            Self::Q4KmGptq => "q4km-gptq",
         }
     }
 
@@ -66,6 +69,7 @@ impl BakeVariant {
             Self::Fp8Native => bake_dir_fp8(model_dir),
             Self::Int4Gptq => bake_dir_int4(model_dir),
             Self::Q4Km => bake_dir_q4km(model_dir),
+            Self::Q4KmGptq => bake_dir_q4km_gptq(model_dir),
         }
     }
 }
@@ -844,8 +848,16 @@ mod tests {
             BakeVariant::Q4Km.bake_dir(md)
         );
         assert_ne!(
+            BakeVariant::Bf16.bake_dir(md),
+            BakeVariant::Q4KmGptq.bake_dir(md)
+        );
+        assert_ne!(
             BakeVariant::Int4Gptq.bake_dir(md),
             BakeVariant::Q4Km.bake_dir(md)
+        );
+        assert_ne!(
+            BakeVariant::Q4Km.bake_dir(md),
+            BakeVariant::Q4KmGptq.bake_dir(md)
         );
         assert_ne!(
             BakeVariant::Fp8Native.bake_dir(md),

@@ -10,6 +10,10 @@
 #   QWEN_2B_DIR=/models/Qwen3.5-2B \
 #   QWEN_4B_DIR=/models/Qwen3.5-4B \
 #   QWEN_9B_DIR=/models/Qwen3.5-9B \
+#   QWEN_36_27B_DIR=/models/Qwen3.6-27B \
+#   QWEN_36_27B_GGUF=/models/Qwen3.6-27B-Q4_K_M.gguf \
+#   QWEN_36_27B_ACTIVATION_DIR=/models/Qwen3.6-27B-FP8 \
+#   Q4KM_GPTQ_EXTRA_ARGS='--device-map auto --max-memory {"0":"22GiB","cpu":"48GiB"} --offload-folder /tmp/qwen36-offload' \
 #   GEMMA_E2B_DIR=/models/gemma-4-E2B \
 #   GEMMA_E4B_DIR=/models/gemma-4-E4B \
 #   PHI4_MINI_DIR=/models/Phi-4-mini-instruct \
@@ -24,6 +28,8 @@
 #                   has no FP8-native bake format.
 #   --q4km          Also produce Q4KM bakes (Qwen only; Gemma/Phi4 not yet
 #                   supported by oracle/bake_q4km.py).
+#   --q4km-gptq     Also produce Q4KM-sourced GPTQ/native INT4 bakes (Qwen
+#                   only; requires the matching ${ENV_VAR%_DIR}_GGUF path).
 #   --no-int4       Skip INT4 bakes (useful with --bf16 for a BF16-only run).
 #   --force         Re-bake even if a valid bake already exists.
 #   --stop-on-error Abort the whole batch if any single bake fails.
@@ -54,6 +60,7 @@ INCLUDE_BF16=0
 INCLUDE_FP8=0
 INCLUDE_INT4=1
 INCLUDE_Q4KM=0
+INCLUDE_Q4KM_GPTQ=0
 FORCE=0
 STOP_ON_ERROR=0
 SKIP_LM_HEAD_INT4_REFRESH=0
@@ -64,6 +71,7 @@ while [[ $# -gt 0 ]]; do
         --bf16) INCLUDE_BF16=1 ;;
         --fp8-native) INCLUDE_FP8=1 ;;
         --q4km) INCLUDE_Q4KM=1 ;;
+        --q4km-gptq) INCLUDE_Q4KM_GPTQ=1 ;;
         --no-int4) INCLUDE_INT4=0 ;;
         --force) FORCE=1 ;;
         --skip-lm-head-int4-refresh) SKIP_LM_HEAD_INT4_REFRESH=1 ;;
@@ -80,12 +88,14 @@ MODELS=(
     "qwen3.5-2b:QWEN_2B_DIR:qwen"
     "qwen3.5-4b:QWEN_4B_DIR:qwen"
     "qwen3.5-9b:QWEN_9B_DIR:qwen"
+    "qwen3.6-27b:QWEN_36_27B_DIR:qwen"
+    "qwen3.6-35b-a3b:QWEN_36_35B_A3B_DIR:qwen"
     "gemma4-e2b:GEMMA_E2B_DIR:gemma"
     "gemma4-e4b:GEMMA_E4B_DIR:gemma"
     "phi4-mini:PHI4_MINI_DIR:phi4"
 )
 
-FORMAT_VERSION=1   # must match crates/model-store/src/manifest.rs
+FORMAT_VERSION=2   # must match crates/model-store/src/manifest.rs
 
 declare -a SUCCEEDED FAILED SKIPPED
 
@@ -116,6 +126,35 @@ bake_has_lm_head_int4() {
     local dir="$1"
     [[ -f "$dir/manifest.json" ]] || return 1
     grep -q '"name": *"lm_head.weight_int4_scale"' "$dir/manifest.json"
+}
+
+gguf_file_for() {
+    local env_var="$1"
+    local gguf_env="${env_var%_DIR}_GGUF"
+    local gguf_file="${!gguf_env:-}"
+    if [[ -z "$gguf_file" ]]; then
+        echo "missing $gguf_env; set it to the matching GGUF source" >&2
+        return 1
+    fi
+    if [[ ! -f "$gguf_file" ]]; then
+        echo "$gguf_env=$gguf_file is not a file" >&2
+        return 1
+    fi
+    echo "$gguf_file"
+}
+
+activation_dir_for() {
+    local env_var="$1"
+    local activation_env="${env_var%_DIR}_ACTIVATION_DIR"
+    local activation_dir="${!activation_env:-}"
+    if [[ -z "$activation_dir" ]]; then
+        return 1
+    fi
+    if [[ ! -d "$activation_dir" ]]; then
+        echo "$activation_env=$activation_dir is not a directory" >&2
+        return 1
+    fi
+    echo "$activation_dir"
 }
 
 run_or_record() {
@@ -186,7 +225,7 @@ bake_int4() {
 }
 
 bake_q4km() {
-    local cli_name="$1" model_dir="$2" family="$3"
+    local cli_name="$1" model_dir="$2" family="$3" env_var="$4"
     if [[ "$family" != "qwen" ]]; then
         echo "[skip] $cli_name q4km — Q4KM bake supports Qwen only"
         SKIPPED+=("$cli_name q4km")
@@ -207,11 +246,61 @@ bake_q4km() {
         SKIPPED+=("$label")
         return 0
     fi
+    local gguf_file ; gguf_file="$(gguf_file_for "$env_var")" || {
+        echo "[skip] $label — no GGUF source configured"
+        SKIPPED+=("$label")
+        return 0
+    }
     run_or_record "$label" python3 "$SCRIPT_DIR/bake_q4km.py" \
-        --model-dir "$model_dir" || return $?
+        --model "$cli_name" \
+        --model-dir "$model_dir" \
+        --gguf-file "$gguf_file" || return $?
     if [[ $UPLOAD -eq 1 ]]; then
         run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
             --model "$cli_name" --q4km --model-dir "$model_dir"
+    fi
+}
+
+bake_q4km_gptq() {
+    local cli_name="$1" model_dir="$2" family="$3" env_var="$4"
+    if [[ "$family" != "qwen" ]]; then
+        echo "[skip] $cli_name q4km-gptq — Q4KM-GPTQ bake supports Qwen only"
+        SKIPPED+=("$cli_name q4km-gptq")
+        return 0
+    fi
+    local dir ; dir="$(bake_dir_for "$model_dir" q4km-gptq)" || return 2
+    local label="$cli_name q4km-gptq"
+    if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
+        echo "[skip] $label — valid bake at $dir"
+        SKIPPED+=("$label")
+        return 0
+    fi
+    local gguf_file ; gguf_file="$(gguf_file_for "$env_var")" || {
+        echo "[skip] $label — no GGUF source configured"
+        SKIPPED+=("$label")
+        return 0
+    }
+    local -a cmd=(
+        python3 "$SCRIPT_DIR/q4km_stream_gptq_bake.py"
+        --model "$cli_name" \
+        --model-dir "$model_dir" \
+        --gguf-file "$gguf_file"
+    )
+    local activation_dir
+    if activation_dir="$(activation_dir_for "$env_var")"; then
+        cmd+=(--activation-model-dir "$activation_dir")
+    else
+        cmd+=(--use-gguf-loader)
+    fi
+    if [[ -n "${Q4KM_GPTQ_EXTRA_ARGS:-}" ]]; then
+        # shellcheck disable=SC2206
+        local -a extra_args=( $Q4KM_GPTQ_EXTRA_ARGS )
+        cmd+=("${extra_args[@]}")
+    fi
+    run_or_record "$label" "${cmd[@]}" || return $?
+    if [[ $UPLOAD -eq 1 ]]; then
+        run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
+            --model "$cli_name" --q4km-gptq --model-dir "$model_dir"
     fi
 }
 
@@ -277,17 +366,26 @@ bake_fp8_native() {
 }
 
 print_summary() {
-    local succeeded_count=${#SUCCEEDED[@]}
-    local skipped_count=${#SKIPPED[@]}
-    local failed_count=${#FAILED[@]}
+    local succeeded_count=0
+    local skipped_count=0
+    local failed_count=0
+    [[ ${SUCCEEDED+x} ]] && succeeded_count=${#SUCCEEDED[@]}
+    [[ ${SKIPPED+x} ]] && skipped_count=${#SKIPPED[@]}
+    [[ ${FAILED+x} ]] && failed_count=${#FAILED[@]}
     echo
     echo "==== bake_all summary ===="
     echo "succeeded: $succeeded_count"
-    for s in "${SUCCEEDED[@]:-}"; do [[ -n "$s" ]] && echo "  OK   $s"; done
+    if [[ $succeeded_count -gt 0 ]]; then
+        for s in "${SUCCEEDED[@]}"; do echo "  OK   $s"; done
+    fi
     echo "skipped:   $skipped_count"
-    for s in "${SKIPPED[@]:-}"; do [[ -n "$s" ]] && echo "  --   $s"; done
+    if [[ $skipped_count -gt 0 ]]; then
+        for s in "${SKIPPED[@]}"; do echo "  --   $s"; done
+    fi
     echo "failed:    $failed_count"
-    for s in "${FAILED[@]:-}"; do [[ -n "$s" ]] && echo "  FAIL $s"; done
+    if [[ $failed_count -gt 0 ]]; then
+        for s in "${FAILED[@]}"; do echo "  FAIL $s"; done
+    fi
 }
 
 any_configured=0
@@ -314,7 +412,10 @@ for entry in "${MODELS[@]}"; do
         bake_int4 "$cli_name" "$model_dir" "$family" || true
     fi
     if [[ $INCLUDE_Q4KM -eq 1 ]]; then
-        bake_q4km "$cli_name" "$model_dir" "$family" || true
+        bake_q4km "$cli_name" "$model_dir" "$family" "$env_var" || true
+    fi
+    if [[ $INCLUDE_Q4KM_GPTQ -eq 1 ]]; then
+        bake_q4km_gptq "$cli_name" "$model_dir" "$family" "$env_var" || true
     fi
 done
 
@@ -325,4 +426,6 @@ fi
 
 print_summary
 # Exit non-zero iff anything failed, so CI can gate on the script's return.
-[[ ${#FAILED[@]} -eq 0 ]]
+failed_count=0
+[[ ${FAILED+x} ]] && failed_count=${#FAILED[@]}
+[[ $failed_count -eq 0 ]]
