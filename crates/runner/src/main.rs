@@ -781,9 +781,31 @@ fn should_fetch_bake(
     (download_bake && !bootstrap_downloaded) || !local_version_ok
 }
 
+fn effective_fixed_vram(
+    fixed_bytes: u64,
+    q4km: bool,
+    q4km_gptq: bool,
+    int4: bool,
+    fp8_runtime: bool,
+) -> u64 {
+    if q4km {
+        (fixed_bytes as f64 * 0.30) as u64
+    } else if q4km_gptq || int4 {
+        // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1
+        // INT4 weights = weights / 4 + ~5% scale/zero overhead
+        // total ≈ fixed * 0.9 * 0.3 + fixed * 0.1 = fixed * 0.37
+        (fixed_bytes as f64 * 0.37) as u64
+    } else if fp8_runtime {
+        // FP8: weights / 2
+        (fixed_bytes as f64 * 0.55) as u64
+    } else {
+        fixed_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::should_fetch_bake;
+    use super::{effective_fixed_vram, should_fetch_bake};
 
     #[test]
     fn bootstrap_download_satisfies_forced_bake_download() {
@@ -798,6 +820,11 @@ mod tests {
     #[test]
     fn invalid_local_bake_fetches_even_after_bootstrap_attempt() {
         assert!(should_fetch_bake(false, true, false));
+    }
+
+    #[test]
+    fn q4km_gptq_uses_int4_vram_estimate() {
+        assert_eq!(effective_fixed_vram(100, false, true, false, false), 37);
     }
 }
 
@@ -1345,19 +1372,13 @@ fn main() -> Result<()> {
     // matmul weights but keep embeddings/lm_head and scratch in higher
     // precision. Q4KM is measured from real 27B GGUF bakes at ~0.30x fixed;
     // GPTQ INT4 keeps the older conservative 0.37x estimate.
-    let effective_fixed = if q4km_like {
-        (entry.vram.fixed_bytes as f64 * 0.30) as u64
-    } else if cli.int4 {
-        // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1
-        // INT4 weights = weights / 4 + ~5% scale/zero overhead
-        // total ≈ fixed * 0.9 * 0.3 + fixed * 0.1 = fixed * 0.37
-        (entry.vram.fixed_bytes as f64 * 0.37) as u64
-    } else if cli.fp8_runtime {
-        // FP8: weights / 2
-        (entry.vram.fixed_bytes as f64 * 0.55) as u64
-    } else {
-        entry.vram.fixed_bytes
-    };
+    let effective_fixed = effective_fixed_vram(
+        entry.vram.fixed_bytes,
+        cli.q4km,
+        cli.q4km_gptq,
+        cli.int4,
+        cli.fp8_runtime,
+    );
     let estimated_vram = {
         let kv_bytes = kv_per_token * context_tokens as u64;
         ((effective_fixed + kv_bytes) as f64 * entry.vram.overhead_factor) as u64
