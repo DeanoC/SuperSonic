@@ -153,6 +153,13 @@ pub fn run_phi4(
     let weights = if cli.int4 {
         let variant = model_store::fetch::BakeVariant::Int4Gptq;
         let bake_dir = variant.bake_dir(&cli.model_dir);
+        // Serialise the version_ok check + try_download_bake call under
+        // BakeLock so two concurrent `--int4 phi4-mini` runs against the
+        // same --model-dir can't both decide the bake is missing and race
+        // while extracting into the same target directory. Mirrors the
+        // Qwen / Gemma / Phi-4-BF16 paths.
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
         if !model_store::version_ok(&bake_dir) && !cli.no_download {
             let canonical_model = model_variant.to_string();
             match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
