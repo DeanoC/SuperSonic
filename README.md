@@ -8,11 +8,32 @@ Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-Three backend surfaces are validated today:
+Four backend surfaces are validated today:
 
+- **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
 - **Metal / `apple-m4`** — Apple M4, BF16 Qwen3.5 0.8B (CLI + `supersonic-serve`)
+
+### HIP on `gfx1100`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| gemma4-e2b       |  ✅  |  ✅  |      —      |   —    |
+| gemma4-e4b       |  ✅  |  —¹  |      —      |   —    |
+| phi4-mini        |  ✅  |  ✅² |      —      |   —    |
+
+¹ Gemma E4B INT4 calibration is parked. The bake itself completes on the
+  24 GiB `gfx1100` (no OOM, unlike `gfx1150`), but generated output is
+  incoherent — same calibration-quality issue documented for `gfx1150`
+  (`docs/performance.md`); needs a revisit independent of VRAM.
+² Phi-4-mini INT4 needs a local bake (`oracle/bake_int4_phi4.py`,
+  ~4 min on `gfx1100`); no release asset is published. Verified end-to-end
+  with the BF16 oracle, zero token mismatches.
 
 ### HIP on `gfx1150`
 

@@ -3849,7 +3849,26 @@ impl DecodeEngine {
         }
 
         let lm_head_start = Instant::now();
-        if self.logits_buf.backend() == gpu_hal::Backend::Cuda
+        if let (Some(scale), Some(zero)) = (
+            self.weights.lm_head_int4_scale.as_ref(),
+            self.weights.lm_head_int4_zero.as_ref(),
+        ) {
+            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                self.ordinal,
+                1,
+                1,
+                vocab_size,
+                hidden_dim,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                scale,
+                zero,
+                self.weights.int4_group_size,
+                qwen35::weights::LOWBIT_NATIVE_INT4,
+                &mut self.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("component decode lm_head int4 matmul: {e}"))?;
+        } else if self.logits_buf.backend() == gpu_hal::Backend::Cuda
             && std::env::var_os("SUPERSONIC_LLAMA31_DISABLE_CUBLAS_LM_HEAD").is_none()
         {
             kernel_ffi::cuda_lm_head_bf16_gemm_4b(
@@ -10765,17 +10784,38 @@ impl DecodeEngine {
             hidden_dim,
         )
         .map_err(|e| anyhow::anyhow!("dflash-taps final rms_norm: {e}"))?;
-        kernel_ffi::standalone_matvec_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            &mut self.logits_buf,
-            &self.normed_buf,
-            &*self.weights.lm_head,
-            hidden_dim,
-            config.vocab_size,
-            &mut self.matvec_counter,
-        )
-        .map_err(|e| anyhow::anyhow!("dflash-taps lm_head matvec: {e}"))?;
+        if let (Some(scale), Some(zero)) = (
+            self.weights.lm_head_int4_scale.as_ref(),
+            self.weights.lm_head_int4_zero.as_ref(),
+        ) {
+            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                self.ordinal,
+                1,
+                1,
+                config.vocab_size,
+                hidden_dim,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                scale,
+                zero,
+                self.weights.int4_group_size,
+                qwen35::weights::LOWBIT_NATIVE_INT4,
+                &mut self.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("dflash-taps lm_head int4 matmul: {e}"))?;
+        } else {
+            kernel_ffi::standalone_matvec_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                &mut self.logits_buf,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                hidden_dim,
+                config.vocab_size,
+                &mut self.matvec_counter,
+            )
+            .map_err(|e| anyhow::anyhow!("dflash-taps lm_head matvec: {e}"))?;
+        }
         let logits_bytes = self
             .logits_buf
             .to_host_bytes()
@@ -11058,18 +11098,39 @@ impl DecodeEngine {
         )
         .map_err(|e| anyhow::anyhow!("fused verify final rms_norm: {e}"))?;
 
-        kernel_ffi::matmul_rhs_transposed_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            b,
-            vocab_size,
-            hidden_dim,
-            &cache.normed_buf,
-            &*self.weights.lm_head,
-            &mut cache.logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("fused verify lm_head matmul: {e}"))?;
+        if let (Some(scale), Some(zero)) = (
+            self.weights.lm_head_int4_scale.as_ref(),
+            self.weights.lm_head_int4_zero.as_ref(),
+        ) {
+            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                self.ordinal,
+                1,
+                b,
+                vocab_size,
+                hidden_dim,
+                &cache.normed_buf,
+                &*self.weights.lm_head,
+                scale,
+                zero,
+                self.weights.int4_group_size,
+                qwen35::weights::LOWBIT_NATIVE_INT4,
+                &mut cache.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("fused verify lm_head int4 matmul: {e}"))?;
+        } else {
+            kernel_ffi::matmul_rhs_transposed_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                b,
+                vocab_size,
+                hidden_dim,
+                &cache.normed_buf,
+                &*self.weights.lm_head,
+                &mut cache.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("fused verify lm_head matmul: {e}"))?;
+        }
 
         let logits_host = cache
             .logits_buf
@@ -11545,18 +11606,39 @@ impl DecodeEngine {
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        kernel_ffi::matmul_rhs_transposed_4b(
-            self.ordinal,
-            ScalarType::BF16,
-            1,
-            b,
-            config.vocab_size,
-            config.hidden_size,
-            &self.normed_buf,
-            &*self.weights.lm_head,
-            &mut self.logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("tiled lm_head batch matmul: {e}"))?;
+        if let (Some(scale), Some(zero)) = (
+            self.weights.lm_head_int4_scale.as_ref(),
+            self.weights.lm_head_int4_zero.as_ref(),
+        ) {
+            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                self.ordinal,
+                1,
+                b,
+                config.vocab_size,
+                config.hidden_size,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                scale,
+                zero,
+                self.weights.int4_group_size,
+                qwen35::weights::LOWBIT_NATIVE_INT4,
+                &mut self.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("tiled lm_head batch int4 matmul: {e}"))?;
+        } else {
+            kernel_ffi::matmul_rhs_transposed_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                b,
+                config.vocab_size,
+                config.hidden_size,
+                &self.normed_buf,
+                &*self.weights.lm_head,
+                &mut self.logits_buf,
+            )
+            .map_err(|e| anyhow::anyhow!("tiled lm_head batch matmul: {e}"))?;
+        }
         timings.lm_head_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();

@@ -717,7 +717,7 @@ fn log_fetch_progress() -> impl Fn(model_store::fetch::FetchProgress) {
     }
 }
 
-fn try_download_bake(
+pub(crate) fn try_download_bake(
     cli: &Cli,
     variant: model_store::fetch::BakeVariant,
     model_cli_name: &str,
