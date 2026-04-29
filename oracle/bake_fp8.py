@@ -63,7 +63,9 @@ def align_up(x: int, a: int = ALIGN) -> int:
 # ---------------------------------------------------------------------------
 # Tensor classification
 # ---------------------------------------------------------------------------
-def is_fp8_quant_target(name: str, shape: tuple[int, ...]) -> bool:
+def is_fp8_quant_target(
+    name: str, shape: tuple[int, ...], block_size: int = BLOCK_SIZE
+) -> bool:
     """True if this 2D weight should be quantized to FP8.
 
     Match every per-layer projection by looking for `_proj` anywhere in the
@@ -108,7 +110,30 @@ def is_fp8_quant_target(name: str, shape: tuple[int, ...]) -> bool:
         return False
     if "_proj" not in name:
         return False
-    return shape[0] % BLOCK_SIZE == 0 and shape[1] % BLOCK_SIZE == 0
+    return shape[0] % block_size == 0 and shape[1] % block_size == 0
+
+
+def detect_model_family(config_path: Path) -> str:
+    """Map a HF config to the SuperSonic model_family name in the manifest.
+
+    Mirrors `FAMILY_FOR` in oracle/upload_bake.py:
+      * qwen36-moe → Qwen 3.6 MoE (qwen3.6-35b-a3b)
+      * qwen35     → Qwen 3.5 dense and Qwen 3.6 27B (uses Qwen35 hybrid kernel)
+    Anything else falls back to "qwen35", which is fine for the Qwen3.5
+    family the script targets; users producing non-Qwen bakes should pass
+    `--model-family` explicitly.
+    """
+    cfg = json.load(open(config_path))
+    archs: list[str] = []
+    if isinstance(cfg.get("architectures"), list):
+        archs.extend(str(a) for a in cfg["architectures"])
+    text_cfg = cfg.get("text_config") or {}
+    if isinstance(text_cfg.get("architectures"), list):
+        archs.extend(str(a) for a in text_cfg["architectures"])
+    model_type = str(text_cfg.get("model_type", cfg.get("model_type", "")))
+    if any("Moe" in a or "MoE" in a for a in archs) or "moe" in model_type.lower():
+        return "qwen36-moe"
+    return "qwen35"
 
 
 def linear_attn_layer_indices(config_path: Path) -> set[int]:
@@ -157,32 +182,34 @@ def classify_layout(name: str, shape: tuple[int, ...], linear_layer_idx: set[int
 # ---------------------------------------------------------------------------
 # FP8 quantization
 # ---------------------------------------------------------------------------
-def quantize_bf16_to_fp8(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """BF16 [rows, cols] → (FP8-E4M3 [rows, cols] uint8, scale [rows/128, cols/128] BF16).
+def quantize_bf16_to_fp8(
+    weight: torch.Tensor, block_size: int = BLOCK_SIZE
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 [rows, cols] → (FP8-E4M3 [rows, cols] uint8, scale [rows/B, cols/B] BF16).
 
-    Per-block (128×128) absmax: scale = absmax / MAX_E4M3, then
+    Per-block (B×B) absmax: scale = absmax / MAX_E4M3, then
     quantized_byte = round_to_e4m3(value / scale). The kernel reads back as
     `value ≈ fp8_to_f32(byte) * bf16_to_f32(scale)`.
     """
     assert weight.dim() == 2, f"expected 2D, got {tuple(weight.shape)}"
     rows, cols = weight.shape
-    assert rows % BLOCK_SIZE == 0 and cols % BLOCK_SIZE == 0, \
-        f"shape {tuple(weight.shape)} not divisible by {BLOCK_SIZE}"
+    assert rows % block_size == 0 and cols % block_size == 0, \
+        f"shape {tuple(weight.shape)} not divisible by {block_size}"
 
     w_f32 = weight.float()
-    # Reshape into [rows/128, 128, cols/128, 128] and absmax over the inner
-    # (1, 3) dims to get [rows/128, cols/128].
-    sr = rows // BLOCK_SIZE
-    sc = cols // BLOCK_SIZE
-    blocks = w_f32.view(sr, BLOCK_SIZE, sc, BLOCK_SIZE).permute(0, 2, 1, 3).contiguous()
-    # blocks: [sr, sc, 128, 128]
+    # Reshape into [rows/B, B, cols/B, B] and absmax over the inner
+    # (1, 3) dims to get [rows/B, cols/B].
+    sr = rows // block_size
+    sc = cols // block_size
+    blocks = w_f32.view(sr, block_size, sc, block_size).permute(0, 2, 1, 3).contiguous()
+    # blocks: [sr, sc, block_size, block_size]
     absmax = blocks.abs().amax(dim=(2, 3))  # [sr, sc]
     # Avoid /0 for all-zero blocks.
     scale = (absmax / MAX_E4M3).clamp_min(torch.finfo(torch.float32).tiny)
     # Per-element scale matrix [rows, cols] via repeat-interleave.
     scale_full = (
-        scale.repeat_interleave(BLOCK_SIZE, dim=0)
-              .repeat_interleave(BLOCK_SIZE, dim=1)
+        scale.repeat_interleave(block_size, dim=0)
+              .repeat_interleave(block_size, dim=1)
     )
     # Divide by scale, cast to E4M3 (rounds + clamps to representable range),
     # reinterpret bytes as uint8.
@@ -275,13 +302,13 @@ class StreamingTensorWriter:
         })
         self.cursor = offset + len(data)
 
-    def close(self) -> None:
+    def close(self, model_family: str = "qwen35") -> None:
         self.f.close()
         sorted_entries = sorted(self.entries, key=lambda e: e["name"])
         manifest = {
             "format_version": FORMAT_VERSION,
             "converter_version": CONVERTER_VERSION,
-            "model_family": "qwen35",
+            "model_family": model_family,
             "tensors": sorted_entries,
         }
         with open(self.out_dir / "manifest.json", "w") as f:
@@ -310,12 +337,20 @@ def main() -> None:
     ap.add_argument("--model-dir", required=True, type=Path)
     ap.add_argument("--out-dir", default=None, type=Path,
                     help="Override output dir (default: {model-dir}/.supersonic/v{FORMAT_VERSION}-fp8)")
-    ap.add_argument("--block-size", type=int, default=BLOCK_SIZE)
+    ap.add_argument("--block-size", type=int, default=BLOCK_SIZE,
+                    help=f"Per-tile FP8 block size (default {BLOCK_SIZE}; "
+                         f"the Rust runtime currently only supports 128).")
+    ap.add_argument("--model-family", default=None,
+                    help="Override the manifest model_family field (default: "
+                         "auto-detect from config.json — qwen36-moe for MoE "
+                         "checkpoints, qwen35 otherwise).")
     args = ap.parse_args()
 
-    if args.block_size != BLOCK_SIZE:
-        log(f"[bake-fp8] WARNING: --block-size={args.block_size} is non-default; "
-            "the Rust runtime currently assumes 128.")
+    block_size: int = args.block_size
+    if block_size != BLOCK_SIZE:
+        log(f"[bake-fp8] WARNING: --block-size={block_size} is non-default; "
+            "the Rust runtime currently assumes 128 — set this only for "
+            "calibration/perplexity experiments, not for production bakes.")
 
     model_dir = args.model_dir.resolve()
     out_dir = args.out_dir or (model_dir / ".supersonic" / f"v{FORMAT_VERSION}-fp8")
@@ -323,6 +358,8 @@ def main() -> None:
     config_path = model_dir / "config.json"
     if not config_path.exists():
         raise SystemExit(f"missing config.json under {model_dir}")
+    model_family = args.model_family or detect_model_family(config_path)
+    log(f"[bake-fp8] model_family={model_family}")
     linear_idx = linear_attn_layer_indices(config_path)
     log(f"[bake-fp8] linear-attn layer indices ({len(linear_idx)}): "
         f"{sorted(linear_idx)[:8]}{' ...' if len(linear_idx) > 8 else ''}")
@@ -360,10 +397,10 @@ def main() -> None:
             shape = tuple(t.shape)
 
             # FP8 quantization / pass-through candidate.
-            if is_fp8_quant_target(name, shape):
+            if is_fp8_quant_target(name, shape, block_size):
                 if t.dtype == torch.bfloat16:
                     # BF16 source → quantize to E4M3 with per-block scales.
-                    packed, scale_bf16 = quantize_bf16_to_fp8(t)
+                    packed, scale_bf16 = quantize_bf16_to_fp8(t, block_size)
                     writer.add(
                         name,
                         tensor_to_bytes(packed, "f8_e4m3"),
@@ -426,7 +463,7 @@ def main() -> None:
             except Exception:
                 pass
 
-    writer.close()
+    writer.close(model_family=model_family)
     elapsed = time.perf_counter() - t0
     log(f"[bake-fp8] quantized {n_quant} projection tensors, "
         f"passed through {n_skip} layout/raw tensors in {elapsed:.1f}s")
