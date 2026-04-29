@@ -16,7 +16,7 @@ use kernel_ffi::phi4 as phi4_ffi;
 
 use crate::oracle::OracleOutput;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
-use crate::{oracle as oracle_mod, try_download_bake, validate};
+use crate::{oracle as oracle_mod, should_fetch_exact_bake, try_download_bake, validate};
 use phi4::config::{load_config, Phi4Config};
 use phi4::rope::Phi4LongRope;
 use phi4::state::Phi4ModelState;
@@ -160,7 +160,13 @@ pub fn run_phi4(
         // Qwen / Gemma / Phi-4-BF16 paths.
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
-        if !model_store::version_ok(&bake_dir) && !cli.no_download {
+        // `should_fetch_exact_bake` is the same predicate the other engines
+        // use: refetch when --download-bake is set OR when the local bake
+        // is missing/stale. Honors the documented CLI semantics so users
+        // who explicitly pass --download-bake actually get a refresh.
+        if !cli.no_download
+            && should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir))
+        {
             let canonical_model = model_variant.to_string();
             match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
                 Ok(true) => eprintln!(

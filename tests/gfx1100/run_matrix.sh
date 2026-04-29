@@ -17,6 +17,12 @@ SUPERSONIC="$REPO_ROOT/target/release/supersonic"
 PROMPT="The quick brown fox"
 MAX_NEW=6
 TIMEOUT="${TIMEOUT:-180}"
+# Any `--int4` lane may auto-fetch a multi-GiB INT4 bake from the GitHub
+# release on a fresh consumer box (Qwen 4B/9B and Gemma E4B are the largest,
+# at ~2-7 GiB compressed). 600s comfortably covers fetch + extract + decode
+# on normal links; override via FETCH_TIMEOUT if the producer box is on a
+# constrained connection.
+FETCH_TIMEOUT="${FETCH_TIMEOUT:-600}"
 
 MODEL_DIR_08B="${MODEL_DIR_08B:-${SUPERSONIC_MODEL_DIR_08B:-${SUPERSONIC_MODEL_DIR:-}}}"
 MODEL_DIR_2B="${MODEL_DIR_2B:-${SUPERSONIC_MODEL_DIR_2B:-}}"
@@ -36,12 +42,15 @@ FAILED=0
 SKIPPED=0
 
 # check_case <label> <model> <model_dir> <expected_tokens> <flags...>
+# Pre-set CASE_TIMEOUT before the call to override the default for one case
+# (used for first-run auto-fetch lanes).
 check_case() {
     local label="$1"; shift
     local model="$1"; shift
     local model_dir="$1"; shift
     local expected="$1"; shift
     local flags=("$@")
+    local effective_timeout="${CASE_TIMEOUT:-$TIMEOUT}"
 
     if [ -z "$model_dir" ] || [ ! -f "$model_dir/config.json" ]; then
         printf "  %-32s SKIP (model dir missing)\n" "$label"
@@ -50,7 +59,7 @@ check_case() {
     fi
 
     local out
-    if ! out=$(timeout "$TIMEOUT" "$SUPERSONIC" \
+    if ! out=$(timeout "$effective_timeout" "$SUPERSONIC" \
         --model "$model" --model-dir "$model_dir" \
         --prompt "$PROMPT" --max-new-tokens "$MAX_NEW" \
         "${flags[@]}" 2>&1); then
@@ -90,6 +99,7 @@ echo "--- Qwen3.5 0.8B ---"
 check_case "0.8B bf16"               qwen3.5-0.8b "$MODEL_DIR_08B" "$EXPECTED_QWEN_08B_FOX"
 check_case "0.8B --fp8-runtime"      qwen3.5-0.8b "$MODEL_DIR_08B" "$EXPECTED_QWEN_08B_FOX" --fp8-runtime
 check_case "0.8B --kv-fp8"           qwen3.5-0.8b "$MODEL_DIR_08B" "$EXPECTED_QWEN_08B_FOX" --kv-fp8
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "0.8B --int4"             qwen3.5-0.8b "$MODEL_DIR_08B" "369 264 1546 5243 321 5243" --int4
 
 echo ""
@@ -97,6 +107,7 @@ echo "--- Qwen3.5 2B ---"
 check_case "2B bf16"                 qwen3.5-2b   "$MODEL_DIR_2B"  "$EXPECTED_QWEN_FOX"
 check_case "2B --fp8-runtime"        qwen3.5-2b   "$MODEL_DIR_2B"  "$EXPECTED_QWEN_FOX" --fp8-runtime
 check_case "2B --kv-fp8"             qwen3.5-2b   "$MODEL_DIR_2B"  "$EXPECTED_QWEN_FOX" --kv-fp8
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "2B --int4"               qwen3.5-2b   "$MODEL_DIR_2B"  "369 264 3542 303 279 220" --int4
 
 echo ""
@@ -104,6 +115,7 @@ echo "--- Qwen3.5 4B ---"
 check_case "4B bf16"                 qwen3.5-4b   "$MODEL_DIR_4B"  "$EXPECTED_QWEN_FOX"
 check_case "4B --fp8-runtime"        qwen3.5-4b   "$MODEL_DIR_4B"  "$EXPECTED_QWEN_FOX" --fp8-runtime
 check_case "4B --kv-fp8"             qwen3.5-4b   "$MODEL_DIR_4B"  "$EXPECTED_QWEN_FOX" --kv-fp8
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "4B --int4"               qwen3.5-4b   "$MODEL_DIR_4B"  "33075 888 279 15217 7993 13" --int4
 
 echo ""
@@ -111,15 +123,18 @@ echo "--- Qwen3.5 9B ---"
 check_case "9B bf16"                 qwen3.5-9b   "$MODEL_DIR_9B"  "$EXPECTED_QWEN_FOX"
 check_case "9B --fp8-runtime"        qwen3.5-9b   "$MODEL_DIR_9B"  "$EXPECTED_QWEN_FOX" --fp8-runtime
 check_case "9B --kv-fp8"             qwen3.5-9b   "$MODEL_DIR_9B"  "$EXPECTED_QWEN_FOX" --kv-fp8
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "9B --int4"               qwen3.5-9b   "$MODEL_DIR_9B"  "$EXPECTED_QWEN_FOX" --int4
 
 echo ""
 echo "--- Gemma 4 ---"
 check_case "E2B bf16"                gemma4-e2b   "$MODEL_DIR_GEMMA_E2B" "$EXPECTED_GEMMA_FOX"
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "E2B --int4"              gemma4-e2b   "$MODEL_DIR_GEMMA_E2B" "563 496 3823 8864 37423 236761" --int4
 check_case "E4B bf16"                gemma4-e4b   "$MODEL_DIR_GEMMA_E4B" "$EXPECTED_GEMMA_FOX"
 # E4B INT4 needs the gs=64 calibration (oracle/bake_all.sh handles it); the
 # released bake is the corrected version. Token sequence is INT4-specific.
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "E4B --int4"              gemma4-e4b   "$MODEL_DIR_GEMMA_E4B" "563 496 3103 529 496 31481" --int4
 
 echo ""
@@ -128,6 +143,7 @@ check_case "phi4 bf16"               phi4-mini    "$MODEL_DIR_PHI4" "65613 1072 
 # phi4-mini --int4 auto-fetches the published release bake on first run
 # (~2 GiB tarball; ~3-5 min depending on connection). Token sequence matches
 # the BF16 oracle.
+CASE_TIMEOUT="$FETCH_TIMEOUT" \
 check_case "phi4 --int4"             phi4-mini    "$MODEL_DIR_PHI4" "65613 1072 290 29082 6446 13" --int4
 
 echo ""

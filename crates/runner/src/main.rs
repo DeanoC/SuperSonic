@@ -781,7 +781,7 @@ fn should_fetch_bake(
     (download_bake && !bootstrap_downloaded) || !local_version_ok
 }
 
-fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
+pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
     download_bake || !local_version_ok
 }
 
