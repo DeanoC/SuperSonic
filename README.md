@@ -25,7 +25,7 @@ Four backend surfaces are validated today:
 | qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | gemma4-e2b       |  ✅  |  ✅  |      —      |   —    |
 | gemma4-e4b       |  ✅  |  ✅¹ |      —      |   —    |
-| phi4-mini        |  ✅  |  ✅  |      —      |   —    |
+| phi4-mini        |  ✅  |  ✅  |      —      |   ✅   |
 
 ¹ Gemma E4B INT4 needs `--group-size 64` at calibration time (the default
   128 produces gibberish — see fix in `oracle/bake_all.sh`). The published
