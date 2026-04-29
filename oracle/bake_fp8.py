@@ -66,8 +66,24 @@ def align_up(x: int, a: int = ALIGN) -> int:
 def is_fp8_quant_target(name: str, shape: tuple[int, ...]) -> bool:
     """True if this 2D weight should be quantized to FP8.
 
-    Quantize: every per-layer projection (gate/up/down_proj, q/k/v/o_proj,
-    qkv_proj, z_proj, in_proj_qkv, in_proj_z, out_proj for linear layers).
+    Match every per-layer projection by looking for `_proj` anywhere in the
+    leaf module name. Covers:
+
+      * `gate_proj` / `up_proj` / `down_proj`     (MLP)
+      * `q_proj` / `k_proj` / `v_proj` / `o_proj` (full attention)
+      * `out_proj`                                (linear-attn output)
+      * `in_proj_qkv` / `in_proj_z`               (linear-attn input)
+      * `in_proj_a` / `in_proj_b`                 (linear-attn input;
+                                                   filtered by the shape
+                                                   divisibility check below
+                                                   — Qwen 3.5 stores those
+                                                   at `[16, hidden]`, 16 < 128)
+
+    The previous check `"_proj.weight" in name` matched only names where
+    `_proj` was the immediate parent of `.weight`, so every linear-attention
+    `in_proj_qkv.weight` / `in_proj_z.weight` was silently left BF16,
+    leaving the bake only partially quantized for the linear layers (about
+    a third of the tensors in a Qwen 3.5 hybrid model).
 
     Skip everything else: norms, embeddings, conv1d / dt_bias / A_log
     transforms, layer scalars, rotary buffers. **Also skip `lm_head.weight`**
@@ -90,10 +106,9 @@ def is_fp8_quant_target(name: str, shape: tuple[int, ...]) -> bool:
     # Norms (caught by 1D check above mostly, but be explicit).
     if "layernorm" in name or name.endswith(".norm.weight"):
         return False
-    # All projection weights are valid targets.
-    if "_proj.weight" in name or name.endswith(".out_proj.weight"):
-        return shape[0] % BLOCK_SIZE == 0 and shape[1] % BLOCK_SIZE == 0
-    return False
+    if "_proj" not in name:
+        return False
+    return shape[0] % BLOCK_SIZE == 0 and shape[1] % BLOCK_SIZE == 0
 
 
 def linear_attn_layer_indices(config_path: Path) -> set[int]:
@@ -213,9 +228,19 @@ def torch_dtype_to_str(dt: torch.dtype) -> str:
 
 
 def tensor_to_bytes(t: torch.Tensor, dtype_str: str) -> bytes:
-    """Return the LE byte representation of `t`, asserting the requested dtype."""
+    """Return the LE byte representation of `t`, validating the requested dtype.
+
+    f8_e4m3 accepts either a `torch.uint8` reinterpret (what `quantize_bf16_to_fp8`
+    produces) or a native `torch.float8_e4m3fn` tensor — viewed as uint8 before
+    `numpy.tobytes()` because numpy doesn't know about float8.
+    """
     if dtype_str == "f8_e4m3":
-        assert t.dtype == torch.uint8, "f8_e4m3 must be passed as uint8 reinterpret"
+        if t.dtype == torch.float8_e4m3fn:
+            t = t.view(torch.uint8)
+        elif t.dtype != torch.uint8:
+            raise AssertionError(
+                f"f8_e4m3 must be uint8 or float8_e4m3fn, got {t.dtype}"
+            )
         return t.contiguous().cpu().numpy().tobytes()
     expected = {"bf16": torch.bfloat16, "f32": torch.float32, "f16": torch.float16, "u8": torch.uint8}[dtype_str]
     if t.dtype != expected:
