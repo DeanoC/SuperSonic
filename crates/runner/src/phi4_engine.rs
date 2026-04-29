@@ -38,8 +38,8 @@ pub fn run_phi4(
         }
     };
 
-    if cli.fp8_runtime || cli.kv_fp8 {
-        bail!("Phi-4 has no --fp8-runtime / --kv-fp8 path yet");
+    if cli.fp8_runtime {
+        bail!("Phi-4 has no --fp8-runtime path yet");
     }
     if cli.batch_size != 1 {
         bail!("Phi-4 engine is single-sequence at launch (--batch-size must be 1)");
@@ -289,6 +289,20 @@ pub fn run_phi4(
     let mut desc_device = GpuBuffer::zeros(ordinal, ScalarType::U8, &[desc_size_bytes])
         .map_err(|e| anyhow!("alloc desc_device: {e}"))?;
 
+    // Pre-allocate the per-layer KV-FP8 scale descriptor buffer when --kv-fp8
+    // is set. Rebuilt + h2d'd every step like the main descs because the
+    // scale-buffer pointers can move when ensure_kv_capacity grows the cache.
+    let mut kv_fp8_desc_device: Option<GpuBuffer> = if cli.kv_fp8 {
+        let kv_fp8_desc_bytes =
+            num_layers * std::mem::size_of::<phi4_ffi::Phi4KVCacheFp8Desc>();
+        Some(
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_fp8_desc_bytes])
+                .map_err(|e| anyhow!("alloc kv_fp8 desc_device: {e}"))?,
+        )
+    } else {
+        None
+    };
+
     // INT4 scale/zero descriptor array — built once, uploaded once. Pointers
     // into the (already-resident) weight buffers stay valid for the engine's
     // lifetime. Empty when weights aren't INT4.
@@ -340,7 +354,7 @@ pub fn run_phi4(
 
         // 2. Ensure KV capacity for every layer (Phi-4 is pure full-attention).
         for ls in state.layers.iter_mut() {
-            ls.ensure_kv_capacity(pos, ordinal, &config, kv_chunk)
+            ls.ensure_kv_capacity(pos, ordinal, &config, kv_chunk, cli.kv_fp8)
                 .map_err(|e| anyhow!("ensure KV capacity at step {step}: {e}"))?;
         }
 
@@ -356,6 +370,28 @@ pub fn run_phi4(
             desc_bytes.len(),
         )
         .map_err(|e| anyhow!("upload layer descs at step {step}: {e}"))?;
+
+        // KV-FP8 scale descs (parallel to layer descs). Pointers can shift
+        // whenever ensure_kv_capacity grows the cache, so rebuild every step.
+        if cli.kv_fp8 {
+            let kv_fp8_descs = build_kv_fp8_descs(&state);
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    kv_fp8_descs.as_ptr() as *const u8,
+                    kv_fp8_descs.len() * std::mem::size_of::<phi4_ffi::Phi4KVCacheFp8Desc>(),
+                )
+            };
+            let buf = kv_fp8_desc_device
+                .as_mut()
+                .expect("kv_fp8_desc_device allocated when --kv-fp8 set");
+            gpu_hal::copy_h2d(
+                ordinal,
+                buf.as_mut_ptr(),
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+            )
+            .map_err(|e| anyhow!("upload kv_fp8 descs at step {step}: {e}"))?;
+        }
 
         // 4. Reset per-step scratch (workspace + counters/barrier).
         gpu_hal::memset_zeros(ordinal, workspace.as_mut_ptr(), workspace.len_bytes())
@@ -383,7 +419,7 @@ pub fn run_phi4(
             proj_buf_floats,
             attn_scratch_floats,
             None,
-            None,
+            kv_fp8_desc_device.as_ref(),
             1,
             None,
             int4_scale_device.as_ref(),
@@ -608,6 +644,27 @@ fn build_descs(
 fn descriptor_bytes(descs: &[phi4_ffi::Phi4DecodeLayerDesc]) -> &[u8] {
     let len_bytes = descs.len() * std::mem::size_of::<phi4_ffi::Phi4DecodeLayerDesc>();
     unsafe { std::slice::from_raw_parts(descs.as_ptr() as *const u8, len_bytes) }
+}
+
+/// Build the per-layer parallel-struct array of KV-FP8 scale-buffer pointers.
+/// Pointers reference the per-layer scale buffers held by `state`; struct must
+/// remain alive only as long as those buffers do (the engine owns both).
+/// Caller is responsible for only invoking this when `state` was allocated
+/// with `kv_fp8 = true` (otherwise the scale buffers are `None`).
+fn build_kv_fp8_descs(state: &Phi4ModelState) -> Vec<phi4_ffi::Phi4KVCacheFp8Desc> {
+    use std::ffi::c_void;
+    let mut descs = Vec::with_capacity(state.layers.len());
+    for ls in &state.layers {
+        let mut d = phi4_ffi::Phi4KVCacheFp8Desc::default();
+        if let Some(ref sk) = ls.kv_scale_k {
+            d.kv_scale_k = sk.as_ptr() as *mut c_void;
+        }
+        if let Some(ref sv) = ls.kv_scale_v {
+            d.kv_scale_v = sv.as_ptr() as *mut c_void;
+        }
+        descs.push(d);
+    }
+    descs
 }
 
 /// Build the per-layer parallel-struct array of INT4 scale/zero pointers.
