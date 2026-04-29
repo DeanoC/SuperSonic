@@ -97,7 +97,24 @@ pub fn run_phi4(
         );
     }
 
-    let kv_per_token = config.kv_bytes_per_token(ScalarType::BF16.size_in_bytes());
+    // KV cache cost per token: under --kv-fp8 the cache stores K/V at 1
+    // byte/elem (half BF16's 2) plus an F32 absmax scale per (head, position)
+    // for both K and V. Falling back to BF16 sizing under --kv-fp8 was
+    // overestimating by ~2× and could spuriously abort runs that would
+    // actually fit on a memory-constrained GPU.
+    let kv_dtype_bytes = if cli.kv_fp8 {
+        ScalarType::U8.size_in_bytes()
+    } else {
+        ScalarType::BF16.size_in_bytes()
+    };
+    let mut kv_per_token = config.kv_bytes_per_token(kv_dtype_bytes);
+    if cli.kv_fp8 {
+        // Two F32 scale buffers (K + V), one entry per (head, position),
+        // per layer.
+        let scale_bytes_per_layer =
+            (2 * config.num_key_value_heads * ScalarType::F32.size_in_bytes()) as u64;
+        kv_per_token += scale_bytes_per_layer * config.num_hidden_layers as u64;
+    }
     let kv_bytes = kv_per_token * context_tokens as u64;
     let estimated_vram =
         ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
