@@ -107,6 +107,7 @@ impl fmt::Display for ModelVariant {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuArch {
+    Gfx1100,
     Gfx1150,
     Sm86,
     AppleM4,
@@ -117,6 +118,7 @@ impl GpuArch {
     pub fn from_backend_name(backend: &Backend, name: &str) -> Self {
         match backend {
             Backend::Hip => match name.trim() {
+                "gfx1100" => Self::Gfx1100,
                 "gfx1150" => Self::Gfx1150,
                 other => Self::Unknown(other.to_owned()),
             },
@@ -135,6 +137,7 @@ impl GpuArch {
 impl fmt::Display for GpuArch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Gfx1100 => write!(f, "gfx1100"),
             Self::Gfx1150 => write!(f, "gfx1150"),
             Self::Sm86 => write!(f, "sm86"),
             Self::AppleM4 => write!(f, "apple-m4"),
@@ -208,6 +211,74 @@ pub struct RegistryEntry {
 const GIB: u64 = 1024 * 1024 * 1024;
 
 static REGISTRY: &[RegistryEntry] = &[
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 2 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+            hip_launch_preset: None,
+        }),
+    },
     RegistryEntry {
         model: ModelVariant::Qwen3_5_0_8B,
         backend: Backend::Hip,
@@ -413,6 +484,32 @@ static REGISTRY: &[RegistryEntry] = &[
     RegistryEntry {
         model: ModelVariant::Gemma4_E2B,
         backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 11 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E2B,
+        backend: Backend::Hip,
         arch: GpuArch::Gfx1150,
         vram: VramBudget {
             fixed_bytes: 11 * GIB,
@@ -439,6 +536,19 @@ static REGISTRY: &[RegistryEntry] = &[
     // Phi-4-mini: 3.8B dense, full-attention all 32 layers, LongRoPE.
     // BF16 weights ≈ 7.6 GiB; KV cache at 4K ctx ≈ 520 MiB (32 layers × 2 × 8 kv_heads × 128 head_dim × 2 B).
     // Fits gfx1150 with headroom. Weight prefix is bare `model` (Phi stores tensors as `model.*`).
+    RegistryEntry {
+        model: ModelVariant::Phi4_Mini,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 8 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Phi4(Phi4KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
     RegistryEntry {
         model: ModelVariant::Phi4_Mini,
         backend: Backend::Hip,
@@ -514,6 +624,25 @@ mod tests {
     fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
         assert!(lookup(&ModelVariant::Qwen3_5_2B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
         assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
+    }
+
+    #[test]
+    fn hip_gfx1100_registry_includes_rdna3_targets() {
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Hip, "gfx1100"),
+            GpuArch::Gfx1100
+        );
+        for model in [
+            ModelVariant::Qwen3_5_0_8B,
+            ModelVariant::Qwen3_5_2B,
+            ModelVariant::Qwen3_5_4B,
+            ModelVariant::Qwen3_5_9B,
+            ModelVariant::Gemma4_E2B,
+            ModelVariant::Gemma4_E4B,
+            ModelVariant::Phi4_Mini,
+        ] {
+            assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx1100).is_some());
+        }
     }
 
     #[test]

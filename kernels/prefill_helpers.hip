@@ -5,6 +5,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <math.h>
 
 // ---- Type conversion helpers (matching the megakernel's conventions) ----
 
@@ -42,6 +43,13 @@ __device__ inline float pfx_from_float<float>(float value) {
 template <>
 __device__ inline hip_bfloat16 pfx_from_float<hip_bfloat16>(float value) {
     return hip_bfloat16(value);
+}
+
+__device__ inline float pfx_wave_sum(float value) {
+    for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+        value += __shfl_down(value, offset);
+    }
+    return value;
 }
 
 // ---- Kernel 1: Element-wise addition ----
@@ -302,4 +310,95 @@ __global__ void pfx_repeat_interleave_heads_kernel(
     const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
                          + static_cast<size_t>(src_h) * head_dim + d;
     dst[idx] = src[src_off];
+}
+
+// ---- Kernel 11: Decode-only full attention for q_len=1 ----
+// query: [B, QH, D], key/value: [B, KVH, T, D], out: [B, QH, D].
+
+template <typename T>
+__global__ void pfx_full_attention_decode_flat_kernel(
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int kv_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const T* query,
+    const T* key,
+    const T* value,
+    T* out
+) {
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) return;
+
+    const int total_rows = batch_size * q_heads;
+    const int row = blockIdx.x;
+    if (row >= total_rows) return;
+
+    const int q_head = row % q_heads;
+    const int batch = row / q_heads;
+    const int kv_head = q_head / num_kv_groups;
+
+    const T* q_row = query + (static_cast<size_t>(batch) * q_heads + q_head) * head_dim;
+    const T* k_head = key + (static_cast<size_t>(batch) * kv_heads + kv_head) * kv_len * head_dim;
+    const T* v_head = value + (static_cast<size_t>(batch) * kv_heads + kv_head) * kv_len * head_dim;
+    T* out_row = out + (static_cast<size_t>(batch) * q_heads + q_head) * head_dim;
+
+    float local_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int local_dims[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    int local_count = 0;
+    for (int d = lane; d < head_dim && local_count < 8; d += warpSize) {
+        local_dims[local_count++] = d;
+    }
+
+    __shared__ float shared_max;
+    __shared__ float shared_denom;
+    __shared__ float shared_weight;
+    __shared__ float shared_inv_denom;
+
+    if (lane == 0) shared_max = -INFINITY;
+    __syncthreads();
+
+    for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
+        const T* k_row = k_head + static_cast<size_t>(k_pos) * head_dim;
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += warpSize) {
+            partial += pfx_to_float(q_row[d]) * pfx_to_float(k_row[d]);
+        }
+        const float score = pfx_wave_sum(partial) * scale;
+        if (lane == 0 && score > shared_max) shared_max = score;
+        __syncthreads();
+    }
+
+    if (lane == 0) shared_denom = 0.0f;
+    __syncthreads();
+
+    for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
+        const T* k_row = k_head + static_cast<size_t>(k_pos) * head_dim;
+        const T* v_row = v_head + static_cast<size_t>(k_pos) * head_dim;
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += warpSize) {
+            partial += pfx_to_float(q_row[d]) * pfx_to_float(k_row[d]);
+        }
+        const float score = pfx_wave_sum(partial) * scale;
+
+        if (lane == 0) {
+            shared_weight = expf(score - shared_max);
+            shared_denom += shared_weight;
+        }
+        __syncthreads();
+
+        for (int i = 0; i < local_count; ++i) {
+            local_acc[i] += shared_weight * pfx_to_float(v_row[local_dims[i]]);
+        }
+        __syncthreads();
+    }
+
+    if (lane == 0) shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
+    __syncthreads();
+
+    for (int i = 0; i < local_count; ++i) {
+        out_row[local_dims[i]] = pfx_from_float<T>(local_acc[i] * shared_inv_denom);
+    }
 }
