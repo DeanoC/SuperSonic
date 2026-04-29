@@ -351,6 +351,11 @@ bake_fp8_native() {
         SKIPPED+=("$cli_name fp8-native")
         return 0
     fi
+    if [[ "$family" == "phi4" ]]; then
+        echo "[skip] $cli_name fp8-native — Phi-4 FP8 baker not implemented yet"
+        SKIPPED+=("$cli_name fp8-native")
+        return 0
+    fi
     local dir ; dir="$(bake_dir_for "$model_dir" fp8-native)" || return 2
     local label="$cli_name fp8-native"
     if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
@@ -358,17 +363,13 @@ bake_fp8_native() {
         SKIPPED+=("$label")
         return 0
     fi
-    # --fp8-runtime requires the source model to ship FP8 tensors (e.g.
-    # lovedheart/Qwen3.5-*-FP8). A stock BF16 checkpoint will fail the bake
-    # with a clear error; don't treat that as a script bug.
-    run_or_record "$label" cargo run --release --manifest-path "$REPO_ROOT/Cargo.toml" \
-        --bin supersonic -- \
-        --model "$cli_name" \
-        --model-dir "$model_dir" \
-        --prompt "bake-trigger" \
-        --max-new-tokens 1 \
-        --fp8-runtime \
-        --no-download || return $?
+    # Per-block FP8-E4M3 calibration from the BF16 source. Produces FP8
+    # weights + BF16 scale_inv tensors at v{FORMAT_VERSION}-fp8/, the same
+    # layout the Rust runtime uses for Qwen 3.6 native FP8 checkpoints. The
+    # `bake_fp8.py` quantizer reads BF16 source safetensors and writes the
+    # bake directly — no need to round-trip through the Rust auto-baker.
+    run_or_record "$label" python3 "$SCRIPT_DIR/bake_fp8.py" \
+        --model-dir "$model_dir" || return $?
     if [[ $UPLOAD -eq 1 ]]; then
         run_or_record "$label upload" python3 "$SCRIPT_DIR/upload_bake.py" \
             --model "$cli_name" --fp8-native --model-dir "$model_dir"
