@@ -8,11 +8,28 @@ Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-Three backend surfaces are validated today:
+Four backend surfaces are validated today:
 
+- **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
 - **Metal / `apple-m4`** — Apple M4, BF16 Qwen3.5 0.8B (CLI + `supersonic-serve`)
+
+### HIP on `gfx1100`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| gemma4-e2b       |  ✅  |  ✅  |      —      |   —    |
+| gemma4-e4b       |  ✅  |  ✅¹ |      —      |   —    |
+| phi4-mini        |  ✅  |  ✅  |      —      |   —    |
+
+¹ Gemma E4B INT4 needs `--group-size 64` at calibration time (the default
+  128 produces gibberish — see fix in `oracle/bake_all.sh`). The published
+  release bake is the gs=64 version; consumers fetch it automatically.
 
 ### HIP on `gfx1150`
 

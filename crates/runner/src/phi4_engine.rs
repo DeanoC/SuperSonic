@@ -16,7 +16,7 @@ use kernel_ffi::phi4 as phi4_ffi;
 
 use crate::oracle::OracleOutput;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
-use crate::{oracle as oracle_mod, validate};
+use crate::{oracle as oracle_mod, should_fetch_exact_bake, try_download_bake, validate};
 use phi4::config::{load_config, Phi4Config};
 use phi4::rope::Phi4LongRope;
 use phi4::state::Phi4ModelState;
@@ -151,10 +151,35 @@ pub fn run_phi4(
 
     let t0 = Instant::now();
     let weights = if cli.int4 {
-        let bake_dir = model_store::fetch::BakeVariant::Int4Gptq.bake_dir(&cli.model_dir);
+        let variant = model_store::fetch::BakeVariant::Int4Gptq;
+        let bake_dir = variant.bake_dir(&cli.model_dir);
+        // Serialise the version_ok check + try_download_bake call under
+        // BakeLock so two concurrent `--int4 phi4-mini` runs against the
+        // same --model-dir can't both decide the bake is missing and race
+        // while extracting into the same target directory. Mirrors the
+        // Qwen / Gemma / Phi-4-BF16 paths.
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        // `should_fetch_exact_bake` is the same predicate the other engines
+        // use: refetch when --download-bake is set OR when the local bake
+        // is missing/stale. Honors the documented CLI semantics so users
+        // who explicitly pass --download-bake actually get a refresh.
+        if !cli.no_download
+            && should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir))
+        {
+            let canonical_model = model_variant.to_string();
+            match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
+                Ok(true) => eprintln!(
+                    "[fetch] installed Phi-4 INT4 bake at {}",
+                    bake_dir.display()
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("[fetch] Phi-4 INT4 bake fetch failed: {e}"),
+            }
+        }
         if !model_store::version_ok(&bake_dir) {
             bail!(
-                "Phi-4 INT4 bake not found at {}.\n\
+                "Phi-4 INT4 bake not found at {} and download disabled / failed.\n\
                  Run: python3 oracle/bake_int4_phi4.py --model-dir {}",
                 bake_dir.display(),
                 cli.model_dir.display(),

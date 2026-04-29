@@ -205,8 +205,18 @@ bake_int4() {
                 --model-dir "$model_dir" || return $?
             ;;
         gemma)
+            # gemma4-e4b needs group_size=64 — at the default 128 the
+            # per-tensor INT4 rounding error compounds across the deeper
+            # 42-layer stack and produces post-calibration gibberish.
+            # Verified: gs=128 → "The quick brown fox 0 � 0",
+            #          gs=64  → "The quick brown fox is a bit of a joke".
+            # E2B is fine at gs=128.
+            local extra_args=()
+            if [[ "$cli_name" == "gemma4-e4b" ]]; then
+                extra_args+=("--group-size" "64")
+            fi
             run_or_record "$label" python3 "$SCRIPT_DIR/bake_int4_gemma4.py" \
-                --model-dir "$model_dir" || return $?
+                --model-dir "$model_dir" "${extra_args[@]}" || return $?
             ;;
         phi4)
             run_or_record "$label" python3 "$SCRIPT_DIR/bake_int4_phi4.py" \

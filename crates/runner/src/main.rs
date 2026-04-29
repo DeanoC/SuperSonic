@@ -717,7 +717,7 @@ fn log_fetch_progress() -> impl Fn(model_store::fetch::FetchProgress) {
     }
 }
 
-fn try_download_bake(
+pub(crate) fn try_download_bake(
     cli: &Cli,
     variant: model_store::fetch::BakeVariant,
     model_cli_name: &str,
@@ -781,7 +781,7 @@ fn should_fetch_bake(
     (download_bake && !bootstrap_downloaded) || !local_version_ok
 }
 
-fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
+pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
     download_bake || !local_version_ok
 }
 
