@@ -27,6 +27,11 @@ pub struct Phi4Weights {
     pub layers: Vec<Phi4LayerWeights>,
     pub is_int4: bool,
     pub int4_group_size: usize,
+    /// True when the bake stored projection weights as FP8-E4M3 with per-block
+    /// `_scale_inv` companions (produced by `oracle/bake_fp8_phi4.py`).
+    pub is_fp8: bool,
+    /// Per-block scale tile dimension (typically 128). Only valid when `is_fp8`.
+    pub fp8_block_size: usize,
 }
 
 pub struct Phi4LayerWeights {
@@ -53,6 +58,15 @@ pub struct Phi4LayerWeights {
     pub up_proj_int4_zero: Option<GpuBuffer>,
     pub down_proj_int4_scale: Option<GpuBuffer>,
     pub down_proj_int4_zero: Option<GpuBuffer>,
+    /// Per-projection FP8 `_scale_inv` tile (BF16, shape `[rows/block, cols/block]`).
+    /// `None` for BF16 / INT4 modes.
+    pub q_proj_fp8_scale: Option<GpuBuffer>,
+    pub k_proj_fp8_scale: Option<GpuBuffer>,
+    pub v_proj_fp8_scale: Option<GpuBuffer>,
+    pub o_proj_fp8_scale: Option<GpuBuffer>,
+    pub gate_proj_fp8_scale: Option<GpuBuffer>,
+    pub up_proj_fp8_scale: Option<GpuBuffer>,
+    pub down_proj_fp8_scale: Option<GpuBuffer>,
 }
 
 impl Phi4Weights {
@@ -134,6 +148,13 @@ impl Phi4Weights {
                 up_proj_int4_zero: None,
                 down_proj_int4_scale: None,
                 down_proj_int4_zero: None,
+                q_proj_fp8_scale: None,
+                k_proj_fp8_scale: None,
+                v_proj_fp8_scale: None,
+                o_proj_fp8_scale: None,
+                gate_proj_fp8_scale: None,
+                up_proj_fp8_scale: None,
+                down_proj_fp8_scale: None,
             });
         }
 
@@ -145,6 +166,8 @@ impl Phi4Weights {
             layers,
             is_int4: false,
             int4_group_size: 0,
+            is_fp8: false,
+            fp8_block_size: 0,
         })
     }
 
@@ -171,6 +194,14 @@ impl Phi4Weights {
                     Ok((None, None))
                 }
             };
+        let load_fp8_scale = |name: &str| -> Result<Option<GpuBuffer>, model_store::Error> {
+            let scale_name = format!("{name}_scale_inv");
+            if store.contains(&scale_name) {
+                Ok(Some(store.load_to_gpu(&scale_name, ordinal)?))
+            } else {
+                Ok(None)
+            }
+        };
 
         let embed_tokens =
             Arc::new(store.load_to_gpu(&format!("{prefix}.embed_tokens.weight"), ordinal)?);
@@ -183,6 +214,8 @@ impl Phi4Weights {
 
         let mut is_int4 = false;
         let mut int4_group_size: usize = 0;
+        let mut is_fp8 = false;
+        let mut fp8_block_size: usize = 0;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for idx in 0..config.num_hidden_layers {
@@ -216,6 +249,14 @@ impl Phi4Weights {
             let (up_i4s, up_i4z) = load_int4(&up_name)?;
             let (down_i4s, down_i4z) = load_int4(&down_name)?;
 
+            let q_fp8_s = load_fp8_scale(&q_name)?;
+            let k_fp8_s = load_fp8_scale(&k_name)?;
+            let v_fp8_s = load_fp8_scale(&v_name)?;
+            let o_fp8_s = load_fp8_scale(&o_name)?;
+            let gate_fp8_s = load_fp8_scale(&gate_name)?;
+            let up_fp8_s = load_fp8_scale(&up_name)?;
+            let down_fp8_s = load_fp8_scale(&down_name)?;
+
             if !is_int4 {
                 if let Some(ref i4_scale) = q_i4s {
                     is_int4 = true;
@@ -224,6 +265,21 @@ impl Phi4Weights {
                     let original_cols = packed_cols * 2;
                     int4_group_size = if s_shape.len() == 2 && s_shape[1] > 0 {
                         original_cols / s_shape[1]
+                    } else {
+                        128
+                    };
+                }
+            }
+            if !is_fp8 {
+                if let Some(ref fp8_scale) = q_fp8_s {
+                    is_fp8 = true;
+                    // Scale shape is [rows/block, cols/block]; derive block
+                    // from the q_proj weight (FP8 storage is u8, so cols
+                    // already match the original BF16 width 1:1).
+                    let s_shape = fp8_scale.shape();
+                    let cols = q_proj_w.shape()[1];
+                    fp8_block_size = if s_shape.len() == 2 && s_shape[1] > 0 {
+                        cols / s_shape[1]
                     } else {
                         128
                     };
@@ -254,6 +310,13 @@ impl Phi4Weights {
                 up_proj_int4_zero: up_i4z,
                 down_proj_int4_scale: down_i4s,
                 down_proj_int4_zero: down_i4z,
+                q_proj_fp8_scale: q_fp8_s,
+                k_proj_fp8_scale: k_fp8_s,
+                v_proj_fp8_scale: v_fp8_s,
+                o_proj_fp8_scale: o_fp8_s,
+                gate_proj_fp8_scale: gate_fp8_s,
+                up_proj_fp8_scale: up_fp8_s,
+                down_proj_fp8_scale: down_fp8_s,
             });
         }
 
@@ -265,6 +328,8 @@ impl Phi4Weights {
             layers,
             is_int4,
             int4_group_size,
+            is_fp8,
+            fp8_block_size,
         })
     }
 }
