@@ -64,27 +64,33 @@ def align_up(x: int, a: int = ALIGN) -> int:
 # Tensor classification
 # ---------------------------------------------------------------------------
 def is_fp8_quant_target(name: str, shape: tuple[int, ...]) -> bool:
-    """True if this 2D BF16 weight should be quantized to FP8.
+    """True if this 2D weight should be quantized to FP8.
 
     Quantize: every per-layer projection (gate/up/down_proj, q/k/v/o_proj,
-    qkv_proj, z_proj, in_proj_qkv, in_proj_z, out_proj for linear layers,
-    plus lm_head). Skip everything else (norms, embeddings, conv1d/dt_bias/
-    A_log, layer scalars, rotary buffers).
+    qkv_proj, z_proj, in_proj_qkv, in_proj_z, out_proj for linear layers).
+
+    Skip everything else: norms, embeddings, conv1d / dt_bias / A_log
+    transforms, layer scalars, rotary buffers. **Also skip `lm_head.weight`**
+    — the runtime does not currently consume `lm_head_scale` (decode lm_head
+    matmul is BF16-only across `decode_engine.rs` and `compute_logits_for_range`),
+    so quantizing it would feed FP8 bytes into a BF16 matmul and either
+    corrupt logits or page-fault. Tied-embedding checkpoints (most Qwen3.5
+    sizes) don't have a standalone `lm_head.weight` so this never mattered;
+    Qwen3.5-9B does, and was producing GPU memory faults until this exclusion
+    landed.
     """
     if len(shape) != 2:
         return False
-    if not name.endswith(".weight") and name != "lm_head.weight":
+    if not name.endswith(".weight"):
         return False
-    # Embedding table — skip (it's an index lookup, not a matmul).
-    if "embed_tokens" in name:
+    # Embedding / lm_head tables — skip until runtime lm_head FP8 support
+    # is wired (runtime currently only knows BF16 lm_head).
+    if "embed_tokens" in name or name == "lm_head.weight":
         return False
     # Norms (caught by 1D check above mostly, but be explicit).
     if "layernorm" in name or name.endswith(".norm.weight"):
         return False
-    # All projection weights and lm_head are valid targets.
-    if name == "lm_head.weight":
-        # Both row and col must be multiples of BLOCK_SIZE for clean tiling.
-        return shape[0] % BLOCK_SIZE == 0 and shape[1] % BLOCK_SIZE == 0
+    # All projection weights are valid targets.
     if "_proj.weight" in name or name.endswith(".out_proj.weight"):
         return shape[0] % BLOCK_SIZE == 0 and shape[1] % BLOCK_SIZE == 0
     return False
@@ -328,25 +334,47 @@ def main() -> None:
             t = handle.get_tensor(name)
             shape = tuple(t.shape)
 
-            # FP8 quantization candidate.
-            if is_fp8_quant_target(name, shape) and t.dtype == torch.bfloat16:
-                packed, scale_bf16 = quantize_bf16_to_fp8(t)
-                writer.add(
-                    name,
-                    tensor_to_bytes(packed, "f8_e4m3"),
-                    list(shape),
-                    "f8_e4m3",
-                    LAYOUT_FP8_NATIVE,
-                )
-                writer.add(
-                    f"{name}_scale_inv",
-                    tensor_to_bytes(scale_bf16, "bf16"),
-                    list(scale_bf16.shape),
-                    "bf16",
-                    LAYOUT_RAW,
-                )
-                n_quant += 1
-                continue
+            # FP8 quantization / pass-through candidate.
+            if is_fp8_quant_target(name, shape):
+                if t.dtype == torch.bfloat16:
+                    # BF16 source → quantize to E4M3 with per-block scales.
+                    packed, scale_bf16 = quantize_bf16_to_fp8(t)
+                    writer.add(
+                        name,
+                        tensor_to_bytes(packed, "f8_e4m3"),
+                        list(shape),
+                        "f8_e4m3",
+                        LAYOUT_FP8_NATIVE,
+                    )
+                    writer.add(
+                        f"{name}_scale_inv",
+                        tensor_to_bytes(scale_bf16, "bf16"),
+                        list(scale_bf16.shape),
+                        "bf16",
+                        LAYOUT_RAW,
+                    )
+                    n_quant += 1
+                    continue
+                if t.dtype == torch.float8_e4m3fn:
+                    # FP8-native source (e.g. Qwen 3.6 *-FP8 checkpoints) —
+                    # store the bytes as-is with the Fp8Native layout tag so
+                    # `upload_bake.py --fp8-native` accepts the bake. The
+                    # companion `_scale_inv` tensor is in source safetensors
+                    # already and falls through to the raw write path below.
+                    fp8_bytes = t.contiguous().cpu().view(torch.uint8).numpy().tobytes()
+                    writer.add(
+                        name,
+                        fp8_bytes,
+                        list(shape),
+                        "f8_e4m3",
+                        LAYOUT_FP8_NATIVE,
+                    )
+                    n_quant += 1
+                    continue
+                # Other dtype on a quant-target name: warn loudly and fall
+                # through to the raw path so we don't silently drop tensors.
+                log(f"[bake-fp8] WARNING: quant target {name} has unexpected "
+                    f"dtype {t.dtype}; storing raw")
 
             # Layout-transform path.
             layout = classify_layout(name, shape, linear_idx)
