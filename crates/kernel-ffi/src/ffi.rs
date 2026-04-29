@@ -1740,9 +1740,35 @@ pub fn qwen_rms_norm_standalone_matvec_host_f32(
 
 /// Query GPU architecture name and total VRAM for a given device ordinal.
 pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
-    let backend = gpu_hal::current_backend();
-    let info = gpu_hal::query_device_info(backend, ordinal)?;
-    Ok((info.arch_name, info.total_vram_bytes))
+    #[cfg(not(supersonic_backend_hip))]
+    {
+        let _ = ordinal;
+        return Err(GpuError::InvalidArg("HIP backend not compiled".into()));
+    }
+    #[cfg(supersonic_backend_hip)]
+    {
+        let mut arch_name = vec![0u8; 64];
+        let mut total_vram = 0u64;
+        let status = unsafe {
+            dotcache_query_gpu_info(
+                ordinal as c_int,
+                arch_name.as_mut_ptr(),
+                arch_name.len(),
+                &mut total_vram,
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dotcache_query_gpu_info failed with status {status}"
+            )));
+        }
+        let nul_pos = arch_name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(arch_name.len());
+        let arch_name = String::from_utf8_lossy(&arch_name[..nul_pos]).into_owned();
+        Ok((arch_name, total_vram))
+    }
 }
 
 /// Query the HIP device clock rate (kHz) for cycle→ms conversion in `--emit-stage-timings`.

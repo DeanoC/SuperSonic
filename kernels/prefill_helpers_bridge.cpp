@@ -242,6 +242,38 @@ int repeat_interleave_heads_device(int device_ordinal,
     return 0;
 }
 
+// ---- full_attention_decode_flat ----
+
+template <typename T>
+int full_attention_decode_flat_device(int device_ordinal,
+                                      int batch_size,
+                                      int q_heads,
+                                      int kv_heads,
+                                      int kv_len,
+                                      int head_dim,
+                                      int num_kv_groups,
+                                      float scale,
+                                      const void* query,
+                                      const void* key,
+                                      const void* value,
+                                      void* out) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 32;
+    if (head_dim > block * 8) return 401;
+    const int rows = batch_size * q_heads;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_full_attention_decode_flat_kernel<T>),
+        dim3(rows), dim3(block), 0, 0,
+        batch_size, q_heads, kv_heads, kv_len, head_dim, num_kv_groups, scale,
+        static_cast<const T*>(query),
+        static_cast<const T*>(key),
+        static_cast<const T*>(value),
+        static_cast<T*>(out));
+    if (hipGetLastError() != hipSuccess) return 402;
+    if (hipDeviceSynchronize() != hipSuccess) return 403;
+    return 0;
+}
+
 } // namespace
 
 // ---- extern "C" wrappers ----
@@ -406,5 +438,35 @@ extern "C" int dotcache_qwen35_hip_repeat_interleave_heads(
                 static_cast<int>(S), static_cast<int>(n_heads), static_cast<int>(head_dim),
                 static_cast<int>(repeats), src, dst);
     default: return 390;
+    }
+}
+
+extern "C" int dotcache_qwen35_hip_full_attention_decode_flat(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_size,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t kv_len,
+    size_t head_dim,
+    size_t num_kv_groups,
+    float scale,
+    const void* query,
+    const void* key,
+    const void* value,
+    void* out
+) {
+    switch (dtype) {
+    case 0: return full_attention_decode_flat_device<half>(
+                static_cast<int>(device_ordinal), static_cast<int>(batch_size),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(kv_len), static_cast<int>(head_dim),
+                static_cast<int>(num_kv_groups), scale, query, key, value, out);
+    case 2: return full_attention_decode_flat_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal), static_cast<int>(batch_size),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(kv_len), static_cast<int>(head_dim),
+                static_cast<int>(num_kv_groups), scale, query, key, value, out);
+    default: return 400;
     }
 }
