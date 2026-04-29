@@ -118,12 +118,16 @@ echo "--- Gemma 4 ---"
 check_case "E2B bf16"                gemma4-e2b   "$MODEL_DIR_GEMMA_E2B" "$EXPECTED_GEMMA_FOX"
 check_case "E2B --int4"              gemma4-e2b   "$MODEL_DIR_GEMMA_E2B" "563 496 3823 8864 37423 236761" --int4
 check_case "E4B bf16"                gemma4-e4b   "$MODEL_DIR_GEMMA_E4B" "$EXPECTED_GEMMA_FOX"
+# E4B INT4 needs the gs=64 calibration (oracle/bake_all.sh handles it); the
+# released bake is the corrected version. Token sequence is INT4-specific.
+check_case "E4B --int4"              gemma4-e4b   "$MODEL_DIR_GEMMA_E4B" "563 496 3103 529 496 31481" --int4
 
 echo ""
 echo "--- Phi-4-mini ---"
 check_case "phi4 bf16"               phi4-mini    "$MODEL_DIR_PHI4" "65613 1072 290 29082 6446 13"
-# phi4-mini --int4 needs a local bake (oracle/bake_int4_phi4.py, ~4 min on gfx1100).
-# No GitHub-release asset; once baked, the runtime --int4 path picks it up automatically.
+# phi4-mini --int4 auto-fetches the published release bake on first run
+# (~2 GiB tarball; ~3-5 min depending on connection). Token sequence matches
+# the BF16 oracle.
 check_case "phi4 --int4"             phi4-mini    "$MODEL_DIR_PHI4" "65613 1072 290 29082 6446 13" --int4
 
 echo ""

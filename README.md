@@ -24,16 +24,12 @@ Four backend surfaces are validated today:
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | gemma4-e2b       |  ✅  |  ✅  |      —      |   —    |
-| gemma4-e4b       |  ✅  |  —¹  |      —      |   —    |
-| phi4-mini        |  ✅  |  ✅² |      —      |   —    |
+| gemma4-e4b       |  ✅  |  ✅¹ |      —      |   —    |
+| phi4-mini        |  ✅  |  ✅  |      —      |   —    |
 
-¹ Gemma E4B INT4 calibration is parked. The bake itself completes on the
-  24 GiB `gfx1100` (no OOM, unlike `gfx1150`), but generated output is
-  incoherent — same calibration-quality issue documented for `gfx1150`
-  (`docs/performance.md`); needs a revisit independent of VRAM.
-² Phi-4-mini INT4 needs a local bake (`oracle/bake_int4_phi4.py`,
-  ~4 min on `gfx1100`); no release asset is published. Verified end-to-end
-  with the BF16 oracle, zero token mismatches.
+¹ Gemma E4B INT4 needs `--group-size 64` at calibration time (the default
+  128 produces gibberish — see fix in `oracle/bake_all.sh`). The published
+  release bake is the gs=64 version; consumers fetch it automatically.
 
 ### HIP on `gfx1150`
 
