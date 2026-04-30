@@ -475,6 +475,18 @@ pub struct Gemma4Engine {
 
     // Shared counter reused across one-shot primitives (matvec row-steal).
     counter: GpuBuffer,
+
+    /// Per-(seq, layer) F32 absmax scale buffers for FP8 KV cache. Populated
+    /// only when `--kv-fp8` is active (alloc path lands in the engine-wiring
+    /// PR). Layout: `[batch_size][num_layers]`, each `[num_kv_heads, max_t]`.
+    /// Shared-KV layers alias the source layer's `Arc`/buffer.
+    #[allow(dead_code)]
+    kv_scale_k: Option<Vec<Vec<GpuBuffer>>>,
+    #[allow(dead_code)]
+    kv_scale_v: Option<Vec<Vec<GpuBuffer>>>,
+    /// Per-sequence GPU array of `Gemma4KVCacheFp8Desc` (one entry per layer).
+    /// `None` when KV cache is BF16. Plumbed through to `persistent_decode`.
+    kv_fp8_descs_gpu: Option<Vec<GpuBuffer>>,
 }
 
 impl Gemma4Engine {
@@ -770,6 +782,9 @@ impl Gemma4Engine {
             mega_barrier_counter,
             mega_barrier_flag,
             counter,
+            kv_scale_k: None,
+            kv_scale_v: None,
+            kv_fp8_descs_gpu: None,
         })
     }
 
@@ -1418,6 +1433,9 @@ impl Gemma4Engine {
             device,
             dtype,
             &self.layers_gpu[seq_idx],
+            self.kv_fp8_descs_gpu
+                .as_ref()
+                .map(|v| &v[seq_idx]),
             &mut h_running,
             &pli_gpu,
             &mut self.mega_workspace,

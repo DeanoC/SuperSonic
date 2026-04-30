@@ -838,6 +838,7 @@ int persistent_decode_device(int device_ordinal,
                              int num_layers, int hidden_size, int ple_hidden,
                              int position, float eps, float scale,
                              const void* layers,
+                             const void* kv_fp8_descs,
                              void* hidden_io, const void* per_layer_inputs,
                              void* workspace,
                              unsigned int* matvec_counter,
@@ -860,6 +861,7 @@ int persistent_decode_device(int device_ordinal,
         dim3(num_blocks), dim3(BLOCK), lds_bytes, 0,
         num_layers, hidden_size, ple_hidden, position, eps, scale,
         static_cast<const Gemma4DecodeLayerDesc*>(layers),
+        static_cast<const Gemma4KVCacheFp8Desc*>(kv_fp8_descs),
         static_cast<T*>(hidden_io),
         static_cast<const T*>(per_layer_inputs),
         static_cast<float*>(workspace),
@@ -1536,7 +1538,9 @@ extern "C" int dotcache_gemma4_hip_persistent_decode(
     int dtype, size_t device_ordinal,
     size_t num_layers, size_t hidden_size, size_t ple_hidden,
     size_t position, float eps, float scale,
-    const void* layers, void* hidden_io, const void* per_layer_inputs,
+    const void* layers,
+    const void* kv_fp8_descs,
+    void* hidden_io, const void* per_layer_inputs,
     void* workspace,
     unsigned int* matvec_counter,
     unsigned int* barrier_counter,
@@ -1546,8 +1550,8 @@ extern "C" int dotcache_gemma4_hip_persistent_decode(
         static_cast<int>(device_ordinal),                                      \
         static_cast<int>(num_layers), static_cast<int>(hidden_size),           \
         static_cast<int>(ple_hidden), static_cast<int>(position),              \
-        eps, scale, layers, hidden_io, per_layer_inputs, workspace,            \
-        matvec_counter, barrier_counter, barrier_flag
+        eps, scale, layers, kv_fp8_descs, hidden_io, per_layer_inputs,         \
+        workspace, matvec_counter, barrier_counter, barrier_flag
     switch (dtype) {
     case 0: return persistent_decode_device<__half>(G4_PERSIST_ARGS);
     case 1: return persistent_decode_device<float>(G4_PERSIST_ARGS);
