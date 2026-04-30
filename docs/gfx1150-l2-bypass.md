@@ -120,3 +120,41 @@ echo auto | sudo tee /sys/class/drm/card1/device/power_dpm_force_performance_lev
 If the cache-fitting rates equalize on a future stack (newer ROCm,
 RDNA4, etc.), revisit `ArchProfile::buffer_policy` — the Scratch-only
 opt-in could become a Persistent default.
+
+## Survey: where is `Scratch` actually a win?
+
+A pass over the ~1100 `GpuBuffer` allocation sites (2026-04-30) looked
+for one-shot patterns where `BufferKind::Scratch` could capture the
+H2D driver-call savings without losing cache reuse. The honest answer
+on gfx1150: **almost nowhere on the hot path.**
+
+Categories surveyed:
+- **Weights, KV cache, scratch workspaces** (the bulk of allocations
+  in `decode_engine.rs`, `gemma4_engine.rs`, `prefill_engine.rs`,
+  `kernel-ffi/src/certified_kv.rs`): all read repeatedly across decode
+  steps. `Persistent` is correct.
+- **Per-step decode input IDs** (a few bytes uploaded each token):
+  cost is dominated by allocation/free, not the H2D copy. No clean
+  win, and per-token churn risks regression.
+- **KV-shadow restore buffers** in `decode_engine::load_kv_shadow_for_state_static`
+  (`tmp_k` / `tmp_v`): genuinely one-shot — written once via H2D,
+  DMA'd into the shadow buffer once, dropped at end of the layer
+  iteration. Marked as `Scratch` as a working demonstration. Saves
+  driver overhead at session-start KV restore (a few ms one-time
+  across all layers); not a per-token win.
+- **`trace_*` diagnostic functions**: only run with debug flags;
+  perf-irrelevant either way.
+
+The microbench evidence also tempers the optimism: even cache-irrelevant
+access patterns (the 1024-buffer scatter test) show host-mapped 3×
+slower than `hipMalloc`, likely TLB / page-walk overhead. A
+write-once-read-once buffer saves ~88 µs in driver call but pays
+some-µs-per-read in slower DMA — a wash at small sizes, possibly net
+loss at larger ones.
+
+**Conclusion**: the `BufferKind` API is the right shape (other arches
+may have different mappings), but on gfx1150 specifically there isn't
+a meaningful per-token win to mine from `Scratch` opt-ins. The
+demonstration marking on `tmp_k` / `tmp_v` shows the API works in
+real usage; future opt-ins should be measurement-driven, not
+speculative.
