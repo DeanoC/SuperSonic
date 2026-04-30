@@ -1,21 +1,28 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use crate::backend::Backend;
+use crate::backend::{Backend, BufferKind};
 use crate::error::{GpuError, Result};
 use crate::ops::{self, AllocatorKind};
 use crate::scalar_type::ScalarType;
 
 /// Owned GPU device memory with shape and dtype metadata.
 ///
-/// Allocation routes through `ops::alloc`, which branches on the active
-/// `MemoryArchitecture`: `Discrete` arches use `hipMalloc` / `cudaMalloc` /
-/// metal device memory; `Unified` HIP arches (gfx1150 APU) use
-/// `hipHostMalloc(MAPPED)` + `hipHostGetDevicePointer` so host and device
-/// share the same physical pages without coherence-protocol traffic. Each
-/// buffer remembers which allocator produced it (and, for `UnifiedHost`,
-/// the original host pointer needed by `hipHostFree`) so `Drop` issues
-/// the matching free call.
+/// Allocation routes through `ops::alloc`, which dispatches based on the
+/// active `BufferPolicy`'s mapping for the supplied `BufferKind`:
+/// `AllocStrategy::Default` uses `hipMalloc` / `cudaMalloc` / metal device
+/// memory (always GPU-cacheable); `AllocStrategy::HostMapped` (HIP only)
+/// uses `hipHostMalloc(MAPPED)` + `hipHostGetDevicePointer` so host and
+/// device share the same physical pages — saves the H2D copy, but
+/// bypasses GPU L2 on RDNA3.5 APUs. Each buffer remembers which
+/// allocator produced it (and, for `UnifiedHost`, the original host
+/// pointer needed by `hipHostFree`) so `Drop` issues the matching free.
+///
+/// The `_with_kind` constructors take an explicit `BufferKind`; the
+/// short-named ones default to `BufferKind::Persistent` — the right
+/// choice for weights, KV cache, activations, anything re-read across
+/// kernel launches. Use `BufferKind::Scratch` only for one-shot staging
+/// buffers with no GPU L2 reuse.
 pub struct GpuBuffer {
     ptr: NonNull<c_void>,
     len_bytes: usize,
@@ -152,10 +159,22 @@ impl Drop for GpuBuffer {
 
 impl GpuBuffer {
     /// Allocate uninitialized device memory for the given shape and dtype.
+    /// Defaults to `BufferKind::Persistent` — use `alloc_with_kind` to opt
+    /// into `Scratch`.
     pub fn alloc(ordinal: usize, dtype: ScalarType, shape: &[usize]) -> Result<Self> {
+        Self::alloc_with_kind(ordinal, dtype, shape, BufferKind::Persistent)
+    }
+
+    /// Allocate uninitialized device memory with an explicit kind hint.
+    pub fn alloc_with_kind(
+        ordinal: usize,
+        dtype: ScalarType,
+        shape: &[usize],
+        kind: BufferKind,
+    ) -> Result<Self> {
         let elems = ops::elem_count(shape);
         let len_bytes = ops::byte_len(dtype, elems);
-        let (ptr, allocator) = ops::alloc(ordinal, len_bytes)?;
+        let (ptr, allocator) = ops::alloc(ordinal, len_bytes, kind)?;
         Ok(Self {
             ptr,
             len_bytes,
@@ -167,11 +186,21 @@ impl GpuBuffer {
         })
     }
 
-    /// Allocate zero-filled device memory.
+    /// Allocate zero-filled device memory. Defaults to `BufferKind::Persistent`.
     pub fn zeros(ordinal: usize, dtype: ScalarType, shape: &[usize]) -> Result<Self> {
+        Self::zeros_with_kind(ordinal, dtype, shape, BufferKind::Persistent)
+    }
+
+    /// Allocate zero-filled device memory with an explicit kind hint.
+    pub fn zeros_with_kind(
+        ordinal: usize,
+        dtype: ScalarType,
+        shape: &[usize],
+        kind: BufferKind,
+    ) -> Result<Self> {
         let elems = ops::elem_count(shape);
         let len_bytes = ops::byte_len(dtype, elems);
-        let (ptr, allocator) = ops::alloc_zeros(ordinal, len_bytes)?;
+        let (ptr, allocator) = ops::alloc_zeros(ordinal, len_bytes, kind)?;
         Ok(Self {
             ptr,
             len_bytes,
@@ -183,12 +212,25 @@ impl GpuBuffer {
         })
     }
 
-    /// Allocate device memory and copy host data into it.
+    /// Allocate device memory and copy host data into it. Defaults to
+    /// `BufferKind::Persistent` since this constructor is typically used for
+    /// weight uploads.
     pub fn from_host_bytes(
         ordinal: usize,
         dtype: ScalarType,
         shape: &[usize],
         data: &[u8],
+    ) -> Result<Self> {
+        Self::from_host_bytes_with_kind(ordinal, dtype, shape, data, BufferKind::Persistent)
+    }
+
+    /// `from_host_bytes` with an explicit kind hint.
+    pub fn from_host_bytes_with_kind(
+        ordinal: usize,
+        dtype: ScalarType,
+        shape: &[usize],
+        data: &[u8],
+        kind: BufferKind,
     ) -> Result<Self> {
         let elems = ops::elem_count(shape);
         let expected = ops::byte_len(dtype, elems);
@@ -198,7 +240,7 @@ impl GpuBuffer {
                 data.len()
             )));
         }
-        let (ptr, allocator) = ops::alloc(ordinal, expected)?;
+        let (ptr, allocator) = ops::alloc(ordinal, expected, kind)?;
         ops::copy_h2d(
             ordinal,
             ptr.as_ptr(),
