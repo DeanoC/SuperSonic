@@ -1,19 +1,23 @@
 use std::fmt;
 
+use crate::backend::Backend;
+
 #[derive(Debug)]
 pub enum GpuError {
-    Hip(String),
-    Cuda(String),
-    Metal(String),
+    Backend { backend: Backend, message: String },
     InvalidArg(String),
+}
+
+impl GpuError {
+    pub fn backend(backend: Backend, message: String) -> Self {
+        Self::Backend { backend, message }
+    }
 }
 
 impl fmt::Display for GpuError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Hip(msg) => write!(f, "HIP error: {msg}"),
-            Self::Cuda(msg) => write!(f, "CUDA error: {msg}"),
-            Self::Metal(msg) => write!(f, "Metal error: {msg}"),
+            Self::Backend { backend, message } => write!(f, "{backend} error: {message}"),
             Self::InvalidArg(msg) => write!(f, "invalid argument: {msg}"),
         }
     }
@@ -23,14 +27,6 @@ impl std::error::Error for GpuError {}
 
 pub type Result<T> = std::result::Result<T, GpuError>;
 
-pub(crate) fn hip_error(op: &str, status: i32) -> GpuError {
-    GpuError::Hip(format!("{op} failed with status {status}"))
-}
-
-pub(crate) fn cuda_error(op: &str, status: i32) -> GpuError {
-    GpuError::Cuda(format!("{op} failed with status {status}"))
-}
-
-pub(crate) fn metal_error(op: &str, status: i32) -> GpuError {
-    GpuError::Metal(format!("{op} failed with status {status}"))
+pub(crate) fn backend_error(backend: Backend, op: &str, status: i32) -> GpuError {
+    GpuError::backend(backend, format!("{op} failed with status {status}"))
 }

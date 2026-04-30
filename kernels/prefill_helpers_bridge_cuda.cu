@@ -600,7 +600,7 @@ int lm_head_argmax_bf16_device(
 
 // ---- extern "C" wrappers ----
 
-extern "C" int dotcache_qwen35_hip_element_add(
+extern "C" int supersonic_qwen35_hip_element_add(
     int dtype, size_t device_ordinal, size_t total_elems,
     const void* lhs, const void* rhs, void* out
 ) {
@@ -612,7 +612,7 @@ extern "C" int dotcache_qwen35_hip_element_add(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_apply_rope_prefill(
+extern "C" int supersonic_qwen35_hip_apply_rope_prefill(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t num_heads, size_t head_dim, size_t half_rot,
     const void* cos_table, const void* sin_table, void* data
@@ -634,7 +634,7 @@ extern "C" int dotcache_qwen35_hip_apply_rope_prefill(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_transpose_shd_hsd(
+extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
     int dtype, size_t device_ordinal,
     size_t S, size_t H, size_t D,
     const void* src, void* dst
@@ -650,7 +650,7 @@ extern "C" int dotcache_qwen35_hip_transpose_shd_hsd(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_transpose_pad_conv(
+extern "C" int supersonic_qwen35_hip_transpose_pad_conv(
     int dtype, size_t device_ordinal,
     size_t S, size_t C, size_t pad,
     const void* src, void* dst
@@ -666,7 +666,7 @@ extern "C" int dotcache_qwen35_hip_transpose_pad_conv(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_extract_conv_state(
+extern "C" int supersonic_qwen35_hip_extract_conv_state(
     int dtype, size_t device_ordinal,
     size_t S, size_t C, size_t kern_minus_1,
     const void* src, void* dst
@@ -682,7 +682,7 @@ extern "C" int dotcache_qwen35_hip_extract_conv_state(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_sigmoid_mul(
+extern "C" int supersonic_qwen35_hip_sigmoid_mul(
     int dtype, size_t device_ordinal, size_t total_elems,
     const void* data, const void* gate, void* out
 ) {
@@ -694,7 +694,7 @@ extern "C" int dotcache_qwen35_hip_sigmoid_mul(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_compute_beta_g(
+extern "C" int supersonic_qwen35_hip_compute_beta_g(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t nv,
     const void* B, const void* A,
@@ -712,7 +712,7 @@ extern "C" int dotcache_qwen35_hip_compute_beta_g(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_split_qgate(
+extern "C" int supersonic_qwen35_hip_split_qgate(
     int dtype, size_t device_ordinal,
     size_t S, size_t num_heads, size_t head_dim,
     const void* src, void* query_out, void* gate_out
@@ -728,7 +728,7 @@ extern "C" int dotcache_qwen35_hip_split_qgate(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_split_qkv(
+extern "C" int supersonic_qwen35_hip_split_qkv(
     int dtype, size_t device_ordinal,
     size_t S, size_t key_dim, size_t val_dim,
     const void* src, void* Q, void* K, void* V
@@ -744,7 +744,7 @@ extern "C" int dotcache_qwen35_hip_split_qkv(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_repeat_interleave_heads(
+extern "C" int supersonic_qwen35_hip_repeat_interleave_heads(
     int dtype, size_t device_ordinal,
     size_t S, size_t n_heads, size_t head_dim, size_t repeats,
     const void* src, void* dst
@@ -763,7 +763,7 @@ extern "C" int dotcache_qwen35_hip_repeat_interleave_heads(
     }
 }
 
-extern "C" int dotcache_qwen35_cuda_argmax_bf16(
+extern "C" int supersonic_qwen35_cuda_argmax_bf16(
     size_t device_ordinal,
     size_t n,
     const void* logits,
@@ -772,7 +772,7 @@ extern "C" int dotcache_qwen35_cuda_argmax_bf16(
     return argmax_bf16_device(static_cast<int>(device_ordinal), n, logits, out_index);
 }
 
-extern "C" int dotcache_qwen35_cuda_target_nll_bf16(
+extern "C" int supersonic_qwen35_cuda_target_nll_bf16(
     size_t device_ordinal,
     size_t rows,
     size_t vocab_size,
@@ -789,7 +789,7 @@ extern "C" int dotcache_qwen35_cuda_target_nll_bf16(
         out_nll);
 }
 
-extern "C" int dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+extern "C" int supersonic_qwen35_cuda_accumulate_target_nll_bf16(
     size_t device_ordinal,
     size_t vocab_size,
     const void* logits,
@@ -804,7 +804,7 @@ extern "C" int dotcache_qwen35_cuda_accumulate_target_nll_bf16(
         out_sum);
 }
 
-extern "C" int dotcache_qwen35_cuda_lm_head_argmax_bf16(
+extern "C" int supersonic_qwen35_cuda_lm_head_argmax_bf16(
     size_t device_ordinal,
     size_t hidden_dim,
     size_t vocab_size,

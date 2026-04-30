@@ -3192,7 +3192,7 @@ __global__ void certified_kv_attend_int8_bf16_values_kernel(
 
 } // namespace
 
-extern "C" int dotcache_llama31_certified_kv_copy_step_bf16(
+extern "C" int supersonic_llama31_certified_kv_copy_step_bf16(
     size_t device_ordinal,
     const void* src_key_bf16,
     const void* src_value_bf16,
@@ -3229,7 +3229,7 @@ extern "C" int dotcache_llama31_certified_kv_copy_step_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_copy_token_range_bf16(
+extern "C" int supersonic_llama31_certified_kv_copy_token_range_bf16(
     size_t device_ordinal,
     const void* src_key_bf16,
     const void* src_value_bf16,
@@ -3274,7 +3274,7 @@ extern "C" int dotcache_llama31_certified_kv_copy_token_range_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_quantize_bf16(
+extern "C" int supersonic_llama31_certified_kv_quantize_bf16(
     size_t device_ordinal,
     const void* key_bf16,
     const void* value_bf16,
@@ -3354,7 +3354,7 @@ extern "C" int dotcache_llama31_certified_kv_quantize_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16(
+extern "C" int supersonic_llama31_certified_kv_quantize_keys_bf16(
     size_t device_ordinal,
     const void* key_bf16,
     void* key_int8,
@@ -3397,7 +3397,7 @@ extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+extern "C" int supersonic_llama31_certified_kv_quantize_keys_bf16_range(
     size_t device_ordinal,
     const void* key_bf16,
     void* key_int8,
@@ -3450,7 +3450,7 @@ extern "C" int dotcache_llama31_certified_kv_quantize_keys_bf16_range(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_quantize_values_bf16_range(
+extern "C" int supersonic_llama31_certified_kv_quantize_values_bf16_range(
     size_t device_ordinal,
     const void* value_bf16,
     void* value_int4,
@@ -3513,7 +3513,7 @@ extern "C" int dotcache_llama31_certified_kv_quantize_values_bf16_range(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_score_blocks_int8(
+extern "C" int supersonic_llama31_certified_kv_score_blocks_int8(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -3570,7 +3570,7 @@ extern "C" int dotcache_llama31_certified_kv_score_blocks_int8(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_key_scale_norms(
+extern "C" int supersonic_llama31_certified_kv_key_scale_norms(
     size_t device_ordinal,
     const void* key_scale,
     void* key_scale_norm,
@@ -3601,7 +3601,7 @@ extern "C" int dotcache_llama31_certified_kv_key_scale_norms(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_score_consistency(
+extern "C" int supersonic_llama31_certified_kv_score_consistency(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -3665,7 +3665,7 @@ extern "C" int dotcache_llama31_certified_kv_score_consistency(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
+extern "C" int supersonic_llama31_certified_kv_gather_promoted_bf16(
     size_t device_ordinal,
     const void* tier2_key_bf16,
     const void* tier2_value_bf16,
@@ -3743,7 +3743,7 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_init_key_cache(
+extern "C" int supersonic_llama31_certified_kv_init_key_cache(
     size_t device_ordinal,
     void* cache_tags,
     void* cache_lru,
@@ -3764,7 +3764,7 @@ extern "C" int dotcache_llama31_certified_kv_init_key_cache(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_resolve_key_cache(
+extern "C" int supersonic_llama31_certified_kv_resolve_key_cache(
     size_t device_ordinal,
     const void* selected_blocks,
     const void* selected_counts,
@@ -3809,7 +3809,7 @@ extern "C" int dotcache_llama31_certified_kv_resolve_key_cache(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+extern "C" int supersonic_llama31_certified_kv_gather_promoted_values_bf16(
     size_t device_ordinal,
     const void* tier2_value_bf16,
     const void* value_promote_index,
@@ -3849,7 +3849,7 @@ extern "C" int dotcache_llama31_certified_kv_gather_promoted_values_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_selected_fp16_log_masses(
+extern "C" int supersonic_llama31_certified_kv_selected_fp16_log_masses(
     size_t device_ordinal,
     const void* query_bf16,
     const void* promoted_key_bf16,
@@ -3890,7 +3890,7 @@ extern "C" int dotcache_llama31_certified_kv_selected_fp16_log_masses(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_select_blocks(
+extern "C" int supersonic_llama31_certified_kv_select_blocks(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_scale_norm,
@@ -4075,7 +4075,7 @@ extern "C" int dotcache_llama31_certified_kv_select_blocks(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_ranking_flags(
+extern "C" int supersonic_llama31_certified_kv_ranking_flags(
     size_t device_ordinal,
     const void* block_max,
     const void* block_sum,
@@ -4111,7 +4111,7 @@ extern "C" int dotcache_llama31_certified_kv_ranking_flags(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_int4(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_int4(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4169,7 +4169,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4242,7 +4242,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4333,7 +4333,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_bf16_values(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4396,7 +4396,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_bf16_values_strided(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4471,7 +4471,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4562,7 +4562,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,
@@ -4792,7 +4792,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_str
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* promoted_key_bf16,
@@ -4915,7 +4915,7 @@ extern "C" int dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
+extern "C" int supersonic_llama31_certified_kv_score_all_promoted_bf16_keys(
     size_t device_ordinal,
     const void* query_bf16,
     const void* promoted_key_bf16,
@@ -4994,7 +4994,7 @@ extern "C" int dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_apply_all_promoted_values_from_probs(
+extern "C" int supersonic_llama31_certified_kv_apply_all_promoted_values_from_probs(
     size_t device_ordinal,
     const void* score_scratch,
     const void* promoted_value_bf16,
@@ -5069,7 +5069,7 @@ extern "C" int dotcache_llama31_certified_kv_apply_all_promoted_values_from_prob
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_block_masses_from_probs(
+extern "C" int supersonic_llama31_certified_kv_block_masses_from_probs(
     size_t device_ordinal,
     const void* score_scratch,
     void* block_mass,
@@ -5100,7 +5100,7 @@ extern "C" int dotcache_llama31_certified_kv_block_masses_from_probs(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_value_promotions_from_block_masses(
+extern "C" int supersonic_llama31_certified_kv_value_promotions_from_block_masses(
     size_t device_ordinal,
     const void* block_mass,
     const void* value_error,
@@ -5164,7 +5164,7 @@ extern "C" int dotcache_llama31_certified_kv_value_promotions_from_block_masses(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_init_all_promoted_indices(
+extern "C" int supersonic_llama31_certified_kv_init_all_promoted_indices(
     size_t device_ordinal,
     void* promote_index,
     void* value_promote_index,
@@ -5193,7 +5193,7 @@ extern "C" int dotcache_llama31_certified_kv_init_all_promoted_indices(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_dense_selected_heads_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* fallback_heads,
@@ -5264,7 +5264,7 @@ extern "C" int dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_dense_flagged_heads_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* fallback_flags,
@@ -5334,7 +5334,7 @@ extern "C" int dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
     return 0;
 }
 
-extern "C" int dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
+extern "C" int supersonic_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
     size_t device_ordinal,
     const void* query_bf16,
     const void* key_int8,

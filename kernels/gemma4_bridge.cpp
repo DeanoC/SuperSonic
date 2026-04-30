@@ -1050,7 +1050,7 @@ int embed_gather_scaled_device(int device_ordinal, int seq_len, int hidden_size,
 // dtype encoding: 0 = __half (fp16), 1 = float (fp32), 2 = hip_bfloat16
 // -----------------------------------------------------------------------------
 
-extern "C" int dotcache_gemma4_hip_rms_norm(
+extern "C" int supersonic_gemma4_hip_rms_norm(
     int dtype, size_t device_ordinal, size_t n_cols, float eps,
     const void* xs, const void* weight, void* out
 ) {
@@ -1065,7 +1065,7 @@ extern "C" int dotcache_gemma4_hip_rms_norm(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_matvec(
+extern "C" int supersonic_gemma4_hip_matvec(
     int dtype, size_t device_ordinal, size_t in_dim, size_t out_dim,
     const void* x, const void* W, void* out, unsigned int* row_counter
 ) {
@@ -1080,7 +1080,7 @@ extern "C" int dotcache_gemma4_hip_matvec(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_gelu_tanh_gate_mul(
+extern "C" int supersonic_gemma4_hip_gelu_tanh_gate_mul(
     int dtype, size_t device_ordinal, size_t n,
     const void* gate, const void* up, void* out
 ) {
@@ -1095,7 +1095,7 @@ extern "C" int dotcache_gemma4_hip_gelu_tanh_gate_mul(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_rope_decode(
+extern "C" int supersonic_gemma4_hip_rope_decode(
     int dtype, size_t device_ordinal,
     size_t num_heads, size_t head_dim, size_t rotary_dim, size_t position,
     const void* cos_table, const void* sin_table, void* x
@@ -1117,7 +1117,7 @@ extern "C" int dotcache_gemma4_hip_rope_decode(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_swa_attn_decode(
+extern "C" int supersonic_gemma4_hip_swa_attn_decode(
     int dtype, size_t device_ordinal,
     size_t num_q_heads, size_t num_kv_heads,
     size_t head_dim, size_t kv_len, size_t max_T,
@@ -1145,7 +1145,7 @@ extern "C" int dotcache_gemma4_hip_swa_attn_decode(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_kv_append(
+extern "C" int supersonic_gemma4_hip_kv_append(
     int dtype, size_t device_ordinal,
     size_t num_kv_heads, size_t head_dim, size_t pos, size_t max_T,
     const void* k_in, const void* v_in, void* k_cache, void* v_cache
@@ -1169,7 +1169,7 @@ extern "C" int dotcache_gemma4_hip_kv_append(
 
 // ------------------------ Prefill / batched entry points ---------------------
 
-extern "C" int dotcache_gemma4_hip_rms_norm_rows(
+extern "C" int supersonic_gemma4_hip_rms_norm_rows(
     int dtype, size_t device_ordinal, size_t n_rows, size_t n_cols, float eps,
     const void* xs, const void* weight, void* out
 ) {
@@ -1187,7 +1187,7 @@ extern "C" int dotcache_gemma4_hip_rms_norm_rows(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_matvec_batched(
+extern "C" int supersonic_gemma4_hip_matvec_batched(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t in_dim, size_t out_dim,
     const void* x, const void* W, void* out, unsigned int* counter
@@ -1215,7 +1215,7 @@ extern "C" int dotcache_gemma4_hip_matvec_batched(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_rope_prefill(
+extern "C" int supersonic_gemma4_hip_rope_prefill(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t num_heads, size_t head_dim,
     size_t rotary_dim, size_t pos_base,
@@ -1238,7 +1238,7 @@ extern "C" int dotcache_gemma4_hip_rope_prefill(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_kv_append_prefill(
+extern "C" int supersonic_gemma4_hip_kv_append_prefill(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t num_kv_heads, size_t head_dim,
     size_t pos_base, size_t max_T,
@@ -1261,7 +1261,7 @@ extern "C" int dotcache_gemma4_hip_kv_append_prefill(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_attn_prefill(
+extern "C" int supersonic_gemma4_hip_attn_prefill(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t num_q_heads, size_t num_kv_heads,
     size_t head_dim, size_t pos_base, size_t max_T,
@@ -1292,7 +1292,7 @@ extern "C" int dotcache_gemma4_hip_attn_prefill(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_add_residual(
+extern "C" int supersonic_gemma4_hip_add_residual(
     int dtype, size_t device_ordinal, size_t n,
     const void* a, const void* b, void* out
 ) {
@@ -1307,7 +1307,7 @@ extern "C" int dotcache_gemma4_hip_add_residual(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_add_scaled_residual(
+extern "C" int supersonic_gemma4_hip_add_scaled_residual(
     int dtype, size_t device_ordinal, size_t n, float scalar,
     const void* a, const void* b, void* out
 ) {
@@ -1322,7 +1322,7 @@ extern "C" int dotcache_gemma4_hip_add_scaled_residual(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_scalar_mul_inplace(
+extern "C" int supersonic_gemma4_hip_scalar_mul_inplace(
     int dtype, size_t device_ordinal, size_t n, float scalar, void* x
 ) {
     switch (dtype) {
@@ -1336,7 +1336,7 @@ extern "C" int dotcache_gemma4_hip_scalar_mul_inplace(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_fused_attn_block(
+extern "C" int supersonic_gemma4_hip_fused_attn_block(
     int dtype, size_t device_ordinal,
     size_t hidden_size, size_t num_q_heads, size_t num_kv_heads,
     size_t head_dim, size_t rotary_dim, size_t position, size_t max_T,
@@ -1374,7 +1374,7 @@ extern "C" int dotcache_gemma4_hip_fused_attn_block(
     #undef G4_FUSED_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_fused_attn_block_int4(
+extern "C" int supersonic_gemma4_hip_fused_attn_block_int4(
     int dtype, size_t device_ordinal,
     size_t hidden_size, size_t num_q_heads, size_t num_kv_heads,
     size_t head_dim, size_t rotary_dim, size_t position, size_t max_T,
@@ -1419,7 +1419,7 @@ extern "C" int dotcache_gemma4_hip_fused_attn_block_int4(
     #undef G4_FUSED_INT4_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_fused_mlp_ple(
+extern "C" int supersonic_gemma4_hip_fused_mlp_ple(
     int dtype, size_t device_ordinal,
     size_t hidden_size, size_t intermediate_size, size_t ple_hidden,
     float eps, float layer_scalar,
@@ -1454,7 +1454,7 @@ extern "C" int dotcache_gemma4_hip_fused_mlp_ple(
     #undef G4_MLP_PLE_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_fused_mlp_ple_int4(
+extern "C" int supersonic_gemma4_hip_fused_mlp_ple_int4(
     int dtype, size_t device_ordinal,
     size_t hidden_size, size_t intermediate_size, size_t ple_hidden,
     int group_size,
@@ -1500,7 +1500,7 @@ extern "C" int dotcache_gemma4_hip_fused_mlp_ple_int4(
     #undef G4_MLP_PLE_INT4_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_gather_layer_slice(
+extern "C" int supersonic_gemma4_hip_gather_layer_slice(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t num_layers, size_t ple_hidden, size_t layer_idx,
     const void* src, void* out
@@ -1522,7 +1522,7 @@ extern "C" int dotcache_gemma4_hip_gather_layer_slice(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_embed_gather_scaled(
+extern "C" int supersonic_gemma4_hip_embed_gather_scaled(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t hidden_size, size_t vocab_size, float scale,
     const unsigned int* token_ids, const void* table, void* out
@@ -1541,7 +1541,7 @@ extern "C" int dotcache_gemma4_hip_embed_gather_scaled(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_persistent_decode(
+extern "C" int supersonic_gemma4_hip_persistent_decode(
     int dtype, size_t device_ordinal,
     size_t num_layers, size_t hidden_size, size_t ple_hidden,
     size_t position, float eps, float scale,
@@ -1570,7 +1570,7 @@ extern "C" int dotcache_gemma4_hip_persistent_decode(
     #undef G4_PERSIST_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_persistent_decode_batch(
+extern "C" int supersonic_gemma4_hip_persistent_decode_batch(
     int dtype, size_t device_ordinal,
     size_t num_layers, size_t hidden_size, size_t ple_hidden,
     float eps, float scale,
@@ -1599,7 +1599,7 @@ extern "C" int dotcache_gemma4_hip_persistent_decode_batch(
     #undef G4_PERSIST_BATCH_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_persistent_decode_batch_int4(
+extern "C" int supersonic_gemma4_hip_persistent_decode_batch_int4(
     int dtype, size_t device_ordinal,
     size_t num_layers, size_t hidden_size, size_t ple_hidden,
     float eps, float scale,
@@ -1629,7 +1629,7 @@ extern "C" int dotcache_gemma4_hip_persistent_decode_batch_int4(
     #undef G4_PERSIST_BATCH_INT4_ARGS
 }
 
-extern "C" int dotcache_gemma4_hip_persistent_decode_int4(
+extern "C" int supersonic_gemma4_hip_persistent_decode_int4(
     int dtype, size_t device_ordinal,
     size_t num_layers, size_t hidden_size, size_t ple_hidden,
     size_t position, float eps, float scale,
@@ -1658,7 +1658,7 @@ extern "C" int dotcache_gemma4_hip_persistent_decode_int4(
 
 // INT4 matvec (single-token). Activation dtype is controlled by `dtype`;
 // weight format is always (packed u8, bf16 scale, bf16 zero).
-extern "C" int dotcache_gemma4_hip_matvec_int4(
+extern "C" int supersonic_gemma4_hip_matvec_int4(
     int dtype, size_t device_ordinal,
     size_t in_dim, size_t out_dim, size_t group_size,
     const void* x,
@@ -1685,7 +1685,7 @@ extern "C" int dotcache_gemma4_hip_matvec_int4(
     }
 }
 
-extern "C" int dotcache_gemma4_hip_matvec_batched_int4(
+extern "C" int supersonic_gemma4_hip_matvec_batched_int4(
     int dtype, size_t device_ordinal,
     size_t seq_len, size_t in_dim, size_t out_dim, size_t group_size,
     const void* x,

@@ -10,11 +10,11 @@
 
 use std::ffi::{c_int, c_uint, c_void};
 
-use gpu_hal::{GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn dotcache_gemma4_hip_rms_norm(
+    fn supersonic_gemma4_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
         n_cols: usize,
@@ -24,7 +24,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_matvec(
+    fn supersonic_gemma4_hip_matvec(
         dtype: c_int,
         device_ordinal: usize,
         in_dim: usize,
@@ -35,7 +35,7 @@ unsafe extern "C" {
         row_counter: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_gelu_tanh_gate_mul(
+    fn supersonic_gemma4_hip_gelu_tanh_gate_mul(
         dtype: c_int,
         device_ordinal: usize,
         n: usize,
@@ -44,7 +44,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_rope_decode(
+    fn supersonic_gemma4_hip_rope_decode(
         dtype: c_int,
         device_ordinal: usize,
         num_heads: usize,
@@ -56,7 +56,7 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_swa_attn_decode(
+    fn supersonic_gemma4_hip_swa_attn_decode(
         dtype: c_int,
         device_ordinal: usize,
         num_q_heads: usize,
@@ -73,7 +73,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_kv_append(
+    fn supersonic_gemma4_hip_kv_append(
         dtype: c_int,
         device_ordinal: usize,
         num_kv_heads: usize,
@@ -86,7 +86,7 @@ unsafe extern "C" {
         v_cache: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_rms_norm_rows(
+    fn supersonic_gemma4_hip_rms_norm_rows(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -97,7 +97,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_matvec_batched(
+    fn supersonic_gemma4_hip_matvec_batched(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -109,7 +109,7 @@ unsafe extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_matvec_int4(
+    fn supersonic_gemma4_hip_matvec_int4(
         dtype: c_int,
         device_ordinal: usize,
         in_dim: usize,
@@ -123,7 +123,7 @@ unsafe extern "C" {
         row_counter: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_matvec_batched_int4(
+    fn supersonic_gemma4_hip_matvec_batched_int4(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -138,7 +138,7 @@ unsafe extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_rope_prefill(
+    fn supersonic_gemma4_hip_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -151,7 +151,7 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_kv_append_prefill(
+    fn supersonic_gemma4_hip_kv_append_prefill(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -165,7 +165,7 @@ unsafe extern "C" {
         v_cache: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_attn_prefill(
+    fn supersonic_gemma4_hip_attn_prefill(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -183,7 +183,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_add_residual(
+    fn supersonic_gemma4_hip_add_residual(
         dtype: c_int,
         device_ordinal: usize,
         n: usize,
@@ -192,7 +192,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_add_scaled_residual(
+    fn supersonic_gemma4_hip_add_scaled_residual(
         dtype: c_int,
         device_ordinal: usize,
         n: usize,
@@ -202,7 +202,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_scalar_mul_inplace(
+    fn supersonic_gemma4_hip_scalar_mul_inplace(
         dtype: c_int,
         device_ordinal: usize,
         n: usize,
@@ -210,7 +210,7 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_fused_attn_block(
+    fn supersonic_gemma4_hip_fused_attn_block(
         dtype: c_int,
         device_ordinal: usize,
         hidden_size: usize,
@@ -244,7 +244,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_fused_attn_block_int4(
+    fn supersonic_gemma4_hip_fused_attn_block_int4(
         dtype: c_int,
         device_ordinal: usize,
         hidden_size: usize,
@@ -287,7 +287,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_fused_mlp_ple_int4(
+    fn supersonic_gemma4_hip_fused_mlp_ple_int4(
         dtype: c_int,
         device_ordinal: usize,
         hidden_size: usize,
@@ -323,7 +323,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_fused_mlp_ple(
+    fn supersonic_gemma4_hip_fused_mlp_ple(
         dtype: c_int,
         device_ordinal: usize,
         hidden_size: usize,
@@ -348,7 +348,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_gather_layer_slice(
+    fn supersonic_gemma4_hip_gather_layer_slice(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -359,7 +359,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_embed_gather_scaled(
+    fn supersonic_gemma4_hip_embed_gather_scaled(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -371,7 +371,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_persistent_decode_int4(
+    fn supersonic_gemma4_hip_persistent_decode_int4(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -390,7 +390,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_persistent_decode(
+    fn supersonic_gemma4_hip_persistent_decode(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -410,7 +410,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_persistent_decode_batch(
+    fn supersonic_gemma4_hip_persistent_decode_batch(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -430,7 +430,7 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_gemma4_hip_persistent_decode_batch_int4(
+    fn supersonic_gemma4_hip_persistent_decode_batch_int4(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -467,32 +467,32 @@ macro_rules! gemma4_stub {
 
 #[cfg(not(supersonic_backend_hip))]
 gemma4_stub! {
-    fn dotcache_gemma4_hip_rms_norm(dtype: c_int, device_ordinal: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_matvec(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_gelu_tanh_gate_mul(dtype: c_int, device_ordinal: usize, n: usize, gate: *const c_void, up: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_rope_decode(dtype: c_int, device_ordinal: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_swa_attn_decode(dtype: c_int, device_ordinal: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, kv_len: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_kv_append(dtype: c_int, device_ordinal: usize, num_kv_heads: usize, head_dim: usize, pos: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_rms_norm_rows(dtype: c_int, device_ordinal: usize, n_rows: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_matvec_batched(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_matvec_int4(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_matvec_batched_int4(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_rope_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, pos_base: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_kv_append_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_attn_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_add_residual(dtype: c_int, device_ordinal: usize, n: usize, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_add_scaled_residual(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_scalar_mul_inplace(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, x: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_fused_attn_block(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_w: *const c_void, k_proj_w: *const c_void, v_proj_w: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_w: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_fused_attn_block_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, group_size: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_packed: *const c_void, q_proj_scale: *const c_void, q_proj_zero: *const c_void, k_proj_packed: *const c_void, k_proj_scale: *const c_void, k_proj_zero: *const c_void, v_proj_packed: *const c_void, v_proj_scale: *const c_void, v_proj_zero: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_packed: *const c_void, o_proj_scale: *const c_void, o_proj_zero: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_fused_mlp_ple_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, group_size: c_int, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_packed: *const c_void, gate_proj_scale: *const c_void, gate_proj_zero: *const c_void, up_proj_packed: *const c_void, up_proj_scale: *const c_void, up_proj_zero: *const c_void, down_proj_packed: *const c_void, down_proj_scale: *const c_void, down_proj_zero: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_packed: *const c_void, per_layer_input_gate_scale: *const c_void, per_layer_input_gate_zero: *const c_void, per_layer_projection_packed: *const c_void, per_layer_projection_scale: *const c_void, per_layer_projection_zero: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_fused_mlp_ple(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_w: *const c_void, up_proj_w: *const c_void, down_proj_w: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_w: *const c_void, per_layer_projection_w: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_gather_layer_slice(dtype: c_int, device_ordinal: usize, seq_len: usize, num_layers: usize, ple_hidden: usize, layer_idx: usize, src: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_embed_gather_scaled(dtype: c_int, device_ordinal: usize, seq_len: usize, hidden_size: usize, vocab_size: usize, scale: f32, token_ids: *const c_uint, table: *const c_void, out: *mut c_void) -> c_int;
-    fn dotcache_gemma4_hip_persistent_decode_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, int4_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, kv_fp8_descs: *const c_void, fp8_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_persistent_decode_batch(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_persistent_decode_batch_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, int4_scales: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_rms_norm(dtype: c_int, device_ordinal: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_matvec(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_gelu_tanh_gate_mul(dtype: c_int, device_ordinal: usize, n: usize, gate: *const c_void, up: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_rope_decode(dtype: c_int, device_ordinal: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_swa_attn_decode(dtype: c_int, device_ordinal: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, kv_len: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_kv_append(dtype: c_int, device_ordinal: usize, num_kv_heads: usize, head_dim: usize, pos: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_rms_norm_rows(dtype: c_int, device_ordinal: usize, n_rows: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_matvec_batched(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_matvec_int4(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_matvec_batched_int4(dtype: c_int, device_ordinal: usize, seq_len: usize, in_dim: usize, out_dim: usize, group_size: usize, x: *const c_void, w_packed: *const c_void, w_scale: *const c_void, w_zero: *const c_void, out: *mut c_void, counter: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_rope_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_heads: usize, head_dim: usize, rotary_dim: usize, pos_base: usize, cos_table: *const c_void, sin_table: *const c_void, x: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_kv_append_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, k_in: *const c_void, v_in: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_attn_prefill(dtype: c_int, device_ordinal: usize, seq_len: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, pos_base: usize, max_t: usize, sliding_window: c_int, scale: f32, q: *const c_void, k_cache: *const c_void, v_cache: *const c_void, scores_scratch: *mut c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_add_residual(dtype: c_int, device_ordinal: usize, n: usize, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_add_scaled_residual(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, a: *const c_void, b: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_scalar_mul_inplace(dtype: c_int, device_ordinal: usize, n: usize, scalar: f32, x: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_fused_attn_block(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_w: *const c_void, k_proj_w: *const c_void, v_proj_w: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_w: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_fused_attn_block_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, num_q_heads: usize, num_kv_heads: usize, head_dim: usize, rotary_dim: usize, position: usize, max_t: usize, sliding_window: c_int, shared_kv: c_int, group_size: c_int, eps: f32, scale: f32, hidden_in: *const c_void, hidden_out: *mut c_void, input_norm_w: *const c_void, q_proj_packed: *const c_void, q_proj_scale: *const c_void, q_proj_zero: *const c_void, k_proj_packed: *const c_void, k_proj_scale: *const c_void, k_proj_zero: *const c_void, v_proj_packed: *const c_void, v_proj_scale: *const c_void, v_proj_zero: *const c_void, q_norm_w: *const c_void, k_norm_w: *const c_void, o_proj_packed: *const c_void, o_proj_scale: *const c_void, o_proj_zero: *const c_void, post_attn_norm_w: *const c_void, cos_table: *const c_void, sin_table: *const c_void, k_cache: *mut c_void, v_cache: *mut c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_fused_mlp_ple_int4(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, group_size: c_int, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_packed: *const c_void, gate_proj_scale: *const c_void, gate_proj_zero: *const c_void, up_proj_packed: *const c_void, up_proj_scale: *const c_void, up_proj_zero: *const c_void, down_proj_packed: *const c_void, down_proj_scale: *const c_void, down_proj_zero: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_packed: *const c_void, per_layer_input_gate_scale: *const c_void, per_layer_input_gate_zero: *const c_void, per_layer_projection_packed: *const c_void, per_layer_projection_scale: *const c_void, per_layer_projection_zero: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_fused_mlp_ple(dtype: c_int, device_ordinal: usize, hidden_size: usize, intermediate_size: usize, ple_hidden: usize, eps: f32, layer_scalar: f32, hidden_in: *const c_void, hidden_out: *mut c_void, pre_ff_norm_w: *const c_void, gate_proj_w: *const c_void, up_proj_w: *const c_void, down_proj_w: *const c_void, post_ff_norm_w: *const c_void, per_layer_input: *const c_void, per_layer_input_gate_w: *const c_void, per_layer_projection_w: *const c_void, post_per_layer_input_norm_w: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_gather_layer_slice(dtype: c_int, device_ordinal: usize, seq_len: usize, num_layers: usize, ple_hidden: usize, layer_idx: usize, src: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_embed_gather_scaled(dtype: c_int, device_ordinal: usize, seq_len: usize, hidden_size: usize, vocab_size: usize, scale: f32, token_ids: *const c_uint, table: *const c_void, out: *mut c_void) -> c_int;
+    fn supersonic_gemma4_hip_persistent_decode_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, int4_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, kv_fp8_descs: *const c_void, fp8_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_persistent_decode_batch(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn supersonic_gemma4_hip_persistent_decode_batch_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, int4_scales: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
 }
 
 /// Gemma-variant RMSNorm — plain `weight * (x / sqrt(mean(x^2) + eps))` with
@@ -509,7 +509,7 @@ pub fn rms_norm(
 ) -> Result<(), GpuError> {
     let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let status = unsafe {
-        dotcache_gemma4_hip_rms_norm(
+        supersonic_gemma4_hip_rms_norm(
             dtype.kernel_dtype_code(),
             ordinal,
             n_cols,
@@ -520,7 +520,7 @@ pub fn rms_norm(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 rms_norm failed with status {status}"
         )));
     }
@@ -555,7 +555,7 @@ pub fn rms_norm_per_row(
         let in_ptr = unsafe { in_base.add(offset) as *const c_void };
         let out_ptr = unsafe { out_base.add(offset) as *mut c_void };
         let status = unsafe {
-            dotcache_gemma4_hip_rms_norm(
+            supersonic_gemma4_hip_rms_norm(
                 dtype.kernel_dtype_code(),
                 ordinal,
                 n_cols,
@@ -566,7 +566,7 @@ pub fn rms_norm_per_row(
             )
         };
         if status != 0 {
-            return Err(GpuError::Hip(format!(
+            return Err(GpuError::backend(Backend::Hip, format!(
                 "gemma4 rms_norm_per_row failed at row {row} with status {status}"
             )));
         }
@@ -588,7 +588,7 @@ pub fn matvec(
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_matvec(
+        supersonic_gemma4_hip_matvec(
             dtype.kernel_dtype_code(),
             ordinal,
             in_dim,
@@ -600,7 +600,7 @@ pub fn matvec(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 matvec failed with status {status}"
         )));
     }
@@ -626,7 +626,7 @@ pub fn matvec_int4(
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_matvec_int4(
+        supersonic_gemma4_hip_matvec_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             in_dim,
@@ -641,7 +641,7 @@ pub fn matvec_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 matvec_int4 failed with status {status}"
         )));
     }
@@ -665,7 +665,7 @@ pub fn matvec_batched_int4(
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_matvec_batched_int4(
+        supersonic_gemma4_hip_matvec_batched_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -681,7 +681,7 @@ pub fn matvec_batched_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 matvec_batched_int4 failed with status {status}"
         )));
     }
@@ -699,7 +699,7 @@ pub fn gelu_tanh_gate_mul(
     n: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_gelu_tanh_gate_mul(
+        supersonic_gemma4_hip_gelu_tanh_gate_mul(
             dtype.kernel_dtype_code(),
             ordinal,
             n,
@@ -709,7 +709,7 @@ pub fn gelu_tanh_gate_mul(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 gelu_tanh_gate_mul failed with status {status}"
         )));
     }
@@ -732,7 +732,7 @@ pub fn rope_decode(
     position: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_rope_decode(
+        supersonic_gemma4_hip_rope_decode(
             dtype.kernel_dtype_code(),
             ordinal,
             num_heads,
@@ -745,7 +745,7 @@ pub fn rope_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 rope_decode failed with status {status}"
         )));
     }
@@ -780,7 +780,7 @@ pub fn swa_attn_decode(
     scale: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_swa_attn_decode(
+        supersonic_gemma4_hip_swa_attn_decode(
             dtype.kernel_dtype_code(),
             ordinal,
             num_q_heads,
@@ -798,7 +798,7 @@ pub fn swa_attn_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 swa_attn_decode failed with status {status}"
         )));
     }
@@ -822,7 +822,7 @@ pub fn kv_append(
     max_t: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_kv_append(
+        supersonic_gemma4_hip_kv_append(
             dtype.kernel_dtype_code(),
             ordinal,
             num_kv_heads,
@@ -836,7 +836,7 @@ pub fn kv_append(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 kv_append failed with status {status}"
         )));
     }
@@ -868,7 +868,7 @@ pub fn rms_norm_rows(
 ) -> Result<(), GpuError> {
     let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let status = unsafe {
-        dotcache_gemma4_hip_rms_norm_rows(
+        supersonic_gemma4_hip_rms_norm_rows(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -880,7 +880,7 @@ pub fn rms_norm_rows(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 rms_norm_rows failed with status {status}"
         )));
     }
@@ -901,7 +901,7 @@ pub fn matvec_batched(
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_matvec_batched(
+        supersonic_gemma4_hip_matvec_batched(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -914,7 +914,7 @@ pub fn matvec_batched(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 matvec_batched failed with status {status}"
         )));
     }
@@ -938,7 +938,7 @@ pub fn rope_prefill(
     pos_base: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_rope_prefill(
+        supersonic_gemma4_hip_rope_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -952,7 +952,7 @@ pub fn rope_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 rope_prefill failed with status {status}"
         )));
     }
@@ -976,7 +976,7 @@ pub fn kv_append_prefill(
     max_t: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_kv_append_prefill(
+        supersonic_gemma4_hip_kv_append_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -991,7 +991,7 @@ pub fn kv_append_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 kv_append_prefill failed with status {status}"
         )));
     }
@@ -1024,7 +1024,7 @@ pub fn attn_prefill(
     scale: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_attn_prefill(
+        supersonic_gemma4_hip_attn_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -1043,7 +1043,7 @@ pub fn attn_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 attn_prefill failed with status {status}"
         )));
     }
@@ -1060,7 +1060,7 @@ pub fn add_residual(
     n: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_add_residual(
+        supersonic_gemma4_hip_add_residual(
             dtype.kernel_dtype_code(),
             ordinal,
             n,
@@ -1070,7 +1070,7 @@ pub fn add_residual(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 add_residual failed with status {status}"
         )));
     }
@@ -1089,7 +1089,7 @@ pub fn add_scaled_residual(
     n: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_add_scaled_residual(
+        supersonic_gemma4_hip_add_scaled_residual(
             dtype.kernel_dtype_code(),
             ordinal,
             n,
@@ -1100,7 +1100,7 @@ pub fn add_scaled_residual(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 add_scaled_residual failed with status {status}"
         )));
     }
@@ -1119,7 +1119,7 @@ pub fn scalar_mul_inplace(
     n: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_scalar_mul_inplace(
+        supersonic_gemma4_hip_scalar_mul_inplace(
             dtype.kernel_dtype_code(),
             ordinal,
             n,
@@ -1128,7 +1128,7 @@ pub fn scalar_mul_inplace(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 scalar_mul_inplace failed with status {status}"
         )));
     }
@@ -1198,7 +1198,7 @@ pub fn fused_attn_block(
     let v_proj_ptr = v_proj_w.map(|b| b.as_ptr()).unwrap_or(null);
     let k_norm_ptr = k_norm_w.map(|b| b.as_ptr()).unwrap_or(null);
     let status = unsafe {
-        dotcache_gemma4_hip_fused_attn_block(
+        supersonic_gemma4_hip_fused_attn_block(
             dtype.kernel_dtype_code(),
             ordinal,
             hidden_size,
@@ -1233,7 +1233,7 @@ pub fn fused_attn_block(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 fused_attn_block failed with status {status}"
         )));
     }
@@ -1311,7 +1311,7 @@ pub fn fused_attn_block_int4(
     let v_zero_ptr = v_proj_zero.map(|b| b.as_ptr()).unwrap_or(null);
     let k_norm_ptr = k_norm_w.map(|b| b.as_ptr()).unwrap_or(null);
     let status = unsafe {
-        dotcache_gemma4_hip_fused_attn_block_int4(
+        supersonic_gemma4_hip_fused_attn_block_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             hidden_size,
@@ -1355,7 +1355,7 @@ pub fn fused_attn_block_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 fused_attn_block_int4 failed with status {status}"
         )));
     }
@@ -1411,7 +1411,7 @@ pub fn fused_mlp_ple_int4(
     layer_scalar: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_fused_mlp_ple_int4(
+        supersonic_gemma4_hip_fused_mlp_ple_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             hidden_size,
@@ -1448,7 +1448,7 @@ pub fn fused_mlp_ple_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 fused_mlp_ple_int4 failed with status {status}"
         )));
     }
@@ -1496,7 +1496,7 @@ pub fn fused_mlp_ple(
     layer_scalar: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_fused_mlp_ple(
+        supersonic_gemma4_hip_fused_mlp_ple(
             dtype.kernel_dtype_code(),
             ordinal,
             hidden_size,
@@ -1522,7 +1522,7 @@ pub fn fused_mlp_ple(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 fused_mlp_ple failed with status {status}"
         )));
     }
@@ -1544,7 +1544,7 @@ pub fn gather_layer_slice(
     layer_idx: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_gather_layer_slice(
+        supersonic_gemma4_hip_gather_layer_slice(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -1556,7 +1556,7 @@ pub fn gather_layer_slice(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 gather_layer_slice failed with status {status}"
         )));
     }
@@ -1580,7 +1580,7 @@ pub fn embed_gather_scaled(
     scale: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_embed_gather_scaled(
+        supersonic_gemma4_hip_embed_gather_scaled(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -1593,7 +1593,7 @@ pub fn embed_gather_scaled(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 embed_gather_scaled failed with status {status}"
         )));
     }
@@ -1900,7 +1900,7 @@ pub fn persistent_decode(
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
     let status = unsafe {
-        dotcache_gemma4_hip_persistent_decode(
+        supersonic_gemma4_hip_persistent_decode(
             dtype.kernel_dtype_code(),
             ordinal,
             num_layers,
@@ -1921,7 +1921,7 @@ pub fn persistent_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode failed with status {status}"
         )));
     }
@@ -1971,13 +1971,13 @@ pub fn persistent_decode_batch(
     scale: f32,
 ) -> Result<(), GpuError> {
     if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode_batch: batch_size {batch_size} out of range [1, {}]",
             crate::layer_desc::MAX_BATCH_SIZE
         )));
     }
     let status = unsafe {
-        dotcache_gemma4_hip_persistent_decode_batch(
+        supersonic_gemma4_hip_persistent_decode_batch(
             dtype.kernel_dtype_code(),
             ordinal,
             num_layers,
@@ -1998,7 +1998,7 @@ pub fn persistent_decode_batch(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode_batch failed with status {status}"
         )));
     }
@@ -2039,7 +2039,7 @@ pub fn persistent_decode_int4(
     scale: f32,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_gemma4_hip_persistent_decode_int4(
+        supersonic_gemma4_hip_persistent_decode_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             num_layers,
@@ -2059,7 +2059,7 @@ pub fn persistent_decode_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode_int4 failed with status {status}"
         )));
     }
@@ -2096,13 +2096,13 @@ pub fn persistent_decode_batch_int4(
     scale: f32,
 ) -> Result<(), GpuError> {
     if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode_batch_int4: batch_size {batch_size} out of range [1, {}]",
             crate::layer_desc::MAX_BATCH_SIZE
         )));
     }
     let status = unsafe {
-        dotcache_gemma4_hip_persistent_decode_batch_int4(
+        supersonic_gemma4_hip_persistent_decode_batch_int4(
             dtype.kernel_dtype_code(),
             ordinal,
             num_layers,
@@ -2124,7 +2124,7 @@ pub fn persistent_decode_batch_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::Hip(format!(
+        return Err(GpuError::backend(Backend::Hip, format!(
             "gemma4 persistent_decode_batch_int4 failed with status {status}"
         )));
     }

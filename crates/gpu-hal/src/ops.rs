@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::backend::{current_backend, Backend, DeviceInfo};
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
-use crate::error::{cuda_error, hip_error, metal_error, GpuError, Result};
+use crate::error::{backend_error, GpuError, Result};
 #[cfg(supersonic_backend_hip)]
 use crate::hip_sys::*;
 #[cfg(supersonic_backend_metal)]
@@ -162,7 +162,7 @@ fn with_device_impl<T>(
             {
                 let status = unsafe { hipGetDevice(&mut prev) };
                 if status != 0 {
-                    return Err(hip_error("hipGetDevice", status));
+                    return Err(backend_error(Backend::Hip, "hipGetDevice", status));
                 }
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -173,7 +173,7 @@ fn with_device_impl<T>(
             {
                 let status = unsafe { cudaGetDevice(&mut prev) };
                 if status != 0 {
-                    return Err(cuda_error("cudaGetDevice", status));
+                    return Err(backend_error(Backend::Cuda, "cudaGetDevice", status));
                 }
             }
             #[cfg(not(supersonic_backend_cuda))]
@@ -209,9 +209,9 @@ fn with_device_impl<T>(
         };
         if status != 0 {
             return Err(match backend {
-                Backend::Hip => hip_error("hipSetDevice", status),
-                Backend::Cuda => cuda_error("cudaSetDevice", status),
-                Backend::Metal => metal_error("metalSetDevice", status),
+                Backend::Hip => backend_error(Backend::Hip, "hipSetDevice", status),
+                Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice", status),
+                Backend::Metal => backend_error(Backend::Metal, "metalSetDevice", status),
             });
         }
         Some(prev)
@@ -242,9 +242,9 @@ fn with_device_impl<T>(
         };
         if status != 0 {
             return Err(match backend {
-                Backend::Hip => hip_error("hipSetDevice(restore)", status),
-                Backend::Cuda => cuda_error("cudaSetDevice(restore)", status),
-                Backend::Metal => metal_error("metalSetDevice(restore)", status),
+                Backend::Hip => backend_error(Backend::Hip, "hipSetDevice(restore)", status),
+                Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice(restore)", status),
+                Backend::Metal => backend_error(Backend::Metal, "metalSetDevice(restore)", status),
             });
         }
     }
@@ -283,8 +283,8 @@ pub fn set_device(ordinal: usize) -> Result<()> {
     };
     if status != 0 {
         return Err(match backend {
-            Backend::Hip => hip_error("hipSetDevice", status),
-            Backend::Cuda => cuda_error("cudaSetDevice", status),
+            Backend::Hip => backend_error(Backend::Hip, "hipSetDevice", status),
+            Backend::Cuda => backend_error(Backend::Cuda, "cudaSetDevice", status),
             Backend::Metal => GpuError::InvalidArg(
                 "Metal backend currently supports only device ordinal 0".into(),
             ),
@@ -330,15 +330,15 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipMalloc", status),
-                    Backend::Cuda => cuda_error("cudaMalloc", status),
-                    Backend::Metal => metal_error("metalAlloc", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipMalloc", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMalloc", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalAlloc", status),
                 });
             }
             NonNull::new(ptr).ok_or_else(|| match backend {
-                Backend::Hip => GpuError::Hip("hipMalloc returned null".into()),
-                Backend::Cuda => GpuError::Cuda("cudaMalloc returned null".into()),
-                Backend::Metal => GpuError::Metal("metalAlloc returned null".into()),
+                Backend::Hip => GpuError::backend(Backend::Hip, "hipMalloc returned null".into()),
+                Backend::Cuda => GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into()),
+                Backend::Metal => GpuError::backend(Backend::Metal, "metalAlloc returned null".into()),
             })
         })
     })
@@ -360,10 +360,10 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
                 const CUDA_HOST_ALLOC_MAPPED: u32 = 0x02;
                 let status = unsafe { cudaHostAlloc(&mut ptr, len_bytes, CUDA_HOST_ALLOC_MAPPED) };
                 if status != 0 {
-                    return Err(cuda_error("cudaHostAlloc", status));
+                    return Err(backend_error(Backend::Cuda, "cudaHostAlloc", status));
                 }
                 NonNull::new(ptr)
-                    .ok_or_else(|| GpuError::Cuda("cudaHostAlloc returned null".into()))
+                    .ok_or_else(|| GpuError::backend(Backend::Cuda, "cudaHostAlloc returned null".into()))
             }
             #[cfg(not(supersonic_backend_cuda))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -374,9 +374,9 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
                 let mut ptr = std::ptr::null_mut();
                 let status = unsafe { hipHostMalloc(&mut ptr, len_bytes, 0) };
                 if status != 0 {
-                    return Err(hip_error("hipHostMalloc", status));
+                    return Err(backend_error(Backend::Hip, "hipHostMalloc", status));
                 }
-                NonNull::new(ptr).ok_or_else(|| GpuError::Hip("hipHostMalloc returned null".into()))
+                NonNull::new(ptr).ok_or_else(|| GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into()))
             }
             #[cfg(not(supersonic_backend_hip))]
             Err(GpuError::InvalidArg("HIP backend not compiled".into()))
@@ -385,7 +385,7 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
             let layout = Layout::from_size_align(len_bytes, 64)
                 .map_err(|e| GpuError::InvalidArg(format!("host allocation layout failed: {e}")))?;
             let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
-            NonNull::new(ptr).ok_or_else(|| GpuError::Metal("host allocation returned null".into()))
+            NonNull::new(ptr).ok_or_else(|| GpuError::backend(Backend::Metal, "host allocation returned null".into()))
         }
     }
 }
@@ -408,10 +408,10 @@ pub fn host_pinned_device_ptr(
                 let mut device_ptr = std::ptr::null_mut();
                 let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
                 if status != 0 {
-                    return Err(cuda_error("cudaHostGetDevicePointer", status));
+                    return Err(backend_error(Backend::Cuda, "cudaHostGetDevicePointer", status));
                 }
                 NonNull::new(device_ptr)
-                    .ok_or_else(|| GpuError::Cuda("cudaHostGetDevicePointer returned null".into()))
+                    .ok_or_else(|| GpuError::backend(Backend::Cuda, "cudaHostGetDevicePointer returned null".into()))
             }
             #[cfg(not(supersonic_backend_cuda))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -433,7 +433,7 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
                 {
                     let status = unsafe { cudaFreeHost(ptr) };
                     if status != 0 {
-                        return Err(cuda_error("cudaFreeHost", status));
+                        return Err(backend_error(Backend::Cuda, "cudaFreeHost", status));
                     }
                     Ok(())
                 }
@@ -447,7 +447,7 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
                 {
                     let status = unsafe { hipHostFree(ptr) };
                     if status != 0 {
-                        return Err(hip_error("hipHostFree", status));
+                        return Err(backend_error(Backend::Hip, "hipHostFree", status));
                     }
                     Ok(())
                 }
@@ -505,9 +505,9 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipFree", status),
-                    Backend::Cuda => cuda_error("cudaFree", status),
-                    Backend::Metal => metal_error("metalFree", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipFree", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaFree", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalFree", status),
                 });
             }
             Ok(())
@@ -551,9 +551,9 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipMemcpy(H2D)", status),
-                    Backend::Cuda => cuda_error("cudaMemcpy(H2D)", status),
-                    Backend::Metal => metal_error("metalMemcpy(H2D)", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(H2D)", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(H2D)", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(H2D)", status),
                 });
             }
             Ok(())
@@ -597,9 +597,9 @@ pub fn copy_d2h(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipMemcpy(D2H)", status),
-                    Backend::Cuda => cuda_error("cudaMemcpy(D2H)", status),
-                    Backend::Metal => metal_error("metalMemcpy(D2H)", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(D2H)", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(D2H)", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(D2H)", status),
                 });
             }
             Ok(())
@@ -643,9 +643,9 @@ pub fn copy_d2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipMemcpy(D2D)", status),
-                    Backend::Cuda => cuda_error("cudaMemcpy(D2D)", status),
-                    Backend::Metal => metal_error("metalMemcpy(D2D)", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipMemcpy(D2D)", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemcpy(D2D)", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalMemcpy(D2D)", status),
                 });
             }
             Ok(())
@@ -689,9 +689,9 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipMemset", status),
-                    Backend::Cuda => cuda_error("cudaMemset", status),
-                    Backend::Metal => metal_error("metalMemset", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipMemset", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMemset", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalMemset", status),
                 });
             }
             Ok(())
@@ -725,9 +725,9 @@ pub fn sync(ordinal: usize) -> Result<()> {
             };
             if status != 0 {
                 return Err(match backend {
-                    Backend::Hip => hip_error("hipDeviceSynchronize", status),
-                    Backend::Cuda => cuda_error("cudaDeviceSynchronize", status),
-                    Backend::Metal => metal_error("metalDeviceSynchronize", status),
+                    Backend::Hip => backend_error(Backend::Hip, "hipDeviceSynchronize", status),
+                    Backend::Cuda => backend_error(Backend::Cuda, "cudaDeviceSynchronize", status),
+                    Backend::Metal => backend_error(Backend::Metal, "metalDeviceSynchronize", status),
                 });
             }
             Ok(())
@@ -756,7 +756,7 @@ impl GpuEvent {
                 {
                     let status = unsafe { hipEventCreate(&mut raw) };
                     if status != 0 {
-                        return Err(hip_error("hipEventCreate", status));
+                        return Err(backend_error(Backend::Hip, "hipEventCreate", status));
                     }
                     Ok(())
                 }
@@ -784,7 +784,7 @@ impl GpuEvent {
                 {
                     let status = unsafe { hipEventRecord(self.raw, std::ptr::null_mut()) };
                     if status != 0 {
-                        return Err(hip_error("hipEventRecord", status));
+                        return Err(backend_error(Backend::Hip, "hipEventRecord", status));
                     }
                     Ok(())
                 }
@@ -807,7 +807,7 @@ impl GpuEvent {
                 {
                     let status = unsafe { hipEventSynchronize(self.raw) };
                     if status != 0 {
-                        return Err(hip_error("hipEventSynchronize", status));
+                        return Err(backend_error(Backend::Hip, "hipEventSynchronize", status));
                     }
                     Ok(())
                 }
@@ -837,7 +837,7 @@ impl GpuEvent {
                     with_device_impl(start.backend, start.ordinal, || {
                         let status = unsafe { hipEventElapsedTime(&mut ms, start.raw, end.raw) };
                         if status != 0 {
-                            return Err(hip_error("hipEventElapsedTime", status));
+                            return Err(backend_error(Backend::Hip, "hipEventElapsedTime", status));
                         }
                         Ok(())
                     })?;
@@ -867,7 +867,7 @@ impl Drop for GpuEvent {
                 {
                     let status = unsafe { hipEventDestroy(self.raw) };
                     if status != 0 {
-                        return Err(hip_error("hipEventDestroy", status));
+                        return Err(backend_error(Backend::Hip, "hipEventDestroy", status));
                     }
                     Ok(())
                 }
@@ -894,7 +894,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                 let mut props = unsafe { std::mem::zeroed::<CudaDeviceProp>() };
                 let status = unsafe { cudaGetDeviceProperties(&mut props, ordinal_i32) };
                 if status != 0 {
-                    return Err(cuda_error("cudaGetDeviceProperties", status));
+                    return Err(backend_error(Backend::Cuda, "cudaGetDeviceProperties", status));
                 }
                 let arch_name = format!("sm{}{}", props.major, props.minor);
                 Ok(DeviceInfo {
@@ -927,7 +927,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                     )
                 };
                 if status != 0 {
-                    return Err(metal_error("metalQueryDeviceInfo", status));
+                    return Err(backend_error(Backend::Metal, "metalQueryDeviceInfo", status));
                 }
                 let nul_pos = arch_name
                     .iter()
@@ -959,7 +959,7 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
 fn metal_runtime_compile_smoke() -> Result<()> {
     let status = unsafe { supersonic_metal_compile_shader_smoke() };
     if status != 0 {
-        return Err(metal_error("metalCompileShaderSmoke", status));
+        return Err(backend_error(Backend::Metal, "metalCompileShaderSmoke", status));
     }
     Ok(())
 }

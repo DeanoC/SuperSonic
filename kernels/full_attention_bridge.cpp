@@ -94,7 +94,7 @@ int full_attention_prefill_device(
     const int block = props.warpSize > 0 ? props.warpSize : 32;
     if (head_dim > block * 8) return 14;
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_full_attention_prefill_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_full_attention_prefill_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -138,7 +138,7 @@ int linear_prefill_conv_pack_device(
         static_cast<size_t>(conv_dim);
     const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_linear_prefill_conv_pack_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_linear_prefill_conv_pack_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -175,7 +175,7 @@ int linear_stateful_conv_device(
         static_cast<size_t>(conv_dim);
     const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_linear_stateful_conv_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -218,7 +218,7 @@ int linear_stateful_conv_value_decay_device(
     const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
     if (kernel_size == 4 && state_len == 3) {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_kernel_k4s3<T>),
             dim3(grid),
             dim3(block),
             0,
@@ -236,7 +236,7 @@ int linear_stateful_conv_value_decay_device(
             static_cast<T*>(out));
     } else {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_linear_stateful_conv_value_decay_kernel<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_kernel<T>),
             dim3(grid),
             dim3(block),
             0,
@@ -288,7 +288,7 @@ int linear_stateful_conv_value_decay_with_state_device(
     const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
     if (kernel_size == 4 && state_len == 3) {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3<T>),
             dim3(grid),
             dim3(block),
             0,
@@ -338,7 +338,7 @@ int linear_decode_prepare_device(
         block <<= 1;
     }
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_linear_decode_prepare_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_linear_decode_prepare_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -380,7 +380,7 @@ int linear_decode_apply_device(
         block <<= 1;
     }
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_linear_decode_apply_kernel<>),
+        HIP_KERNEL_NAME(supersonic_qwen35_linear_decode_apply_kernel<>),
         dim3(grid),
         dim3(block),
         0,
@@ -419,7 +419,7 @@ int delta_recurrent_prefill_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_recurrent_prefill_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_recurrent_prefill_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -461,7 +461,7 @@ int delta_chunk_single_prefill_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_chunk_single_prefill_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_chunk_single_prefill_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -503,7 +503,7 @@ int delta_chunk_step_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_chunk_step_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_chunk_step_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -547,7 +547,7 @@ int delta_chunk_scan_raw_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_chunk_scan_raw_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_chunk_scan_raw_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -589,7 +589,7 @@ int delta_state_scan_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_state_scan_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_state_scan_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -627,7 +627,7 @@ int delta_chunk_fused_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_chunk_fused_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_chunk_fused_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -669,7 +669,7 @@ int delta_full_scan_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_full_scan_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_full_scan_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -713,7 +713,7 @@ int delta_local_attn_scan_device(
             static_cast<size_t>(chunk_size) * static_cast<size_t>(chunk_size);
         const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_delta_local_attn_scan_flat_kernel<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_local_attn_scan_flat_kernel<T>),
             dim3(grid),
             dim3(block),
             0,
@@ -733,7 +733,7 @@ int delta_local_attn_scan_device(
             static_cast<size_t>(chunk_size);
         const unsigned int grid = static_cast<unsigned int>(total_rows);
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_delta_local_attn_scan_row_kernel<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_delta_local_attn_scan_row_kernel<T>),
             dim3(grid),
             dim3(block),
             0,
@@ -772,7 +772,7 @@ int delta_base_attn_scan_device(
         static_cast<size_t>(chunk_size) * static_cast<size_t>(chunk_size);
     const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_base_attn_scan_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_base_attn_scan_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -805,7 +805,7 @@ int delta_attn_solve_scan_device(
     const unsigned int grid =
         static_cast<unsigned int>(batch_heads * num_chunks);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_attn_solve_scan_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_attn_solve_scan_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -838,7 +838,7 @@ int delta_attn_solve_from_inputs_device(
     const unsigned int grid =
         static_cast<unsigned int>(batch_heads * num_chunks);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_attn_solve_from_inputs_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_attn_solve_from_inputs_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -868,7 +868,7 @@ int swiglu_mul_device(
     constexpr int block = 256;
     const unsigned int grid = static_cast<unsigned int>((elem_count + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_swiglu_mul_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_swiglu_mul_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -897,7 +897,7 @@ int embedding_lookup_device(
     const int total_elems = token_count * hidden_size;
     const unsigned int grid = static_cast<unsigned int>((total_elems + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_embedding_lookup_kernel<T, IndexT>),
+        HIP_KERNEL_NAME(supersonic_qwen35_embedding_lookup_kernel<T, IndexT>),
         dim3(grid),
         dim3(block),
         0,
@@ -927,7 +927,7 @@ int causal_mask_device(
     const int total_elems = batch_size * tgt_len * kv_len;
     const unsigned int grid = static_cast<unsigned int>((total_elems + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_causal_mask_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_causal_mask_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -951,7 +951,7 @@ int cumsum_last_dim_device(
 ) {
     ScopedHipDevice scoped(device_ordinal);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_cumsum_last_dim_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_cumsum_last_dim_kernel<T>),
         dim3(static_cast<unsigned int>(rows)),
         dim3(1),
         0,
@@ -977,7 +977,7 @@ int exp_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_exp_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_exp_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1002,7 +1002,7 @@ int recip_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_recip_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_recip_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1027,7 +1027,7 @@ int sigmoid_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_sigmoid_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_sigmoid_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1052,7 +1052,7 @@ int log_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_log_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_log_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1077,7 +1077,7 @@ int cast_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_cast_kernel<In, Out>),
+        HIP_KERNEL_NAME(supersonic_qwen35_cast_kernel<In, Out>),
         dim3(grid),
         dim3(block),
         0,
@@ -1123,7 +1123,7 @@ int unary_view_device(
     const unsigned int grid =
         static_cast<unsigned int>((total_elems + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_unary_view_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_unary_view_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1188,7 +1188,7 @@ int cast_view_device(
     const unsigned int grid =
         static_cast<unsigned int>((total_elems + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_cast_view_kernel<In, Out>),
+        HIP_KERNEL_NAME(supersonic_qwen35_cast_view_kernel<In, Out>),
         dim3(grid),
         dim3(block),
         0,
@@ -1260,7 +1260,7 @@ int binary_broadcast_device(
     const unsigned int grid =
         static_cast<unsigned int>((total_elems + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_binary_broadcast_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_binary_broadcast_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1326,7 +1326,7 @@ int reduce_keepdim_view_device(
     const unsigned int grid =
         static_cast<unsigned int>((total_out_elems + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_reduce_keepdim_view_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_reduce_keepdim_view_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1406,7 +1406,7 @@ int batched_matmul_device(
     const unsigned int grid =
         static_cast<unsigned int>((total + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_batched_matmul_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_batched_matmul_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1495,7 +1495,7 @@ int batched_matmul_view_device(
     const unsigned int grid =
         static_cast<unsigned int>((total + static_cast<size_t>(block) - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_batched_matmul_view_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_batched_matmul_view_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1552,7 +1552,7 @@ int mul_scalar_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_mul_scalar_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_mul_scalar_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1582,7 +1582,7 @@ int reduce_keepdim_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_reduce_keepdim_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_reduce_keepdim_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1611,7 +1611,7 @@ int add_scalar_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_add_scalar_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_add_scalar_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1637,7 +1637,7 @@ int sqrt_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_sqrt_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_sqrt_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1671,7 +1671,7 @@ int delta_full_scan_pack_device(
         static_cast<size_t>(chunk_size);
     const unsigned int grid = static_cast<unsigned int>((total_rows + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_full_scan_pack_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_full_scan_pack_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1711,7 +1711,7 @@ int delta_full_scan_packed_device(
         static_cast<size_t>(batch_heads) * static_cast<size_t>(v_head_dim);
     const unsigned int grid = static_cast<unsigned int>((total_threads + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_delta_full_scan_packed_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_delta_full_scan_packed_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1743,7 +1743,7 @@ int l2norm_device(
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_l2norm_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_l2norm_kernel<T>),
         dim3(static_cast<unsigned int>(n_rows)),
         dim3(block),
         0,
@@ -1773,7 +1773,7 @@ int value_decay_device(
     const unsigned int grid =
         static_cast<unsigned int>((static_cast<size_t>(total_elems) + block - 1) / block);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_value_decay_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_value_decay_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -1802,7 +1802,7 @@ int rms_norm_device(
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_rms_norm_kernel<T, ADD_UNIT_OFFSET>),
+        HIP_KERNEL_NAME(supersonic_qwen35_rms_norm_kernel<T, ADD_UNIT_OFFSET>),
         dim3(static_cast<unsigned int>(n_rows)),
         dim3(block),
         0,
@@ -1834,7 +1834,7 @@ int fused_rms_norm_linear_device(
     const size_t shared_bytes =
         static_cast<size_t>(hidden_dim) * sizeof(float) + block * sizeof(float);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_fused_rms_norm_linear_kernel<T, ADD_UNIT_OFFSET>),
+        HIP_KERNEL_NAME(supersonic_qwen35_fused_rms_norm_linear_kernel<T, ADD_UNIT_OFFSET>),
         dim3(static_cast<unsigned int>(out_dim)),
         dim3(block),
         shared_bytes,
@@ -1865,7 +1865,7 @@ int rms_norm_gated_device(
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_rms_norm_gated_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_rms_norm_gated_kernel<T>),
         dim3(static_cast<unsigned int>(n_rows)),
         dim3(block),
         0,
@@ -1884,7 +1884,7 @@ int rms_norm_gated_device(
 
 } // namespace
 
-extern "C" int dotcache_qwen35_hip_full_attention_prefill(
+extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -1954,7 +1954,7 @@ extern "C" int dotcache_qwen35_hip_full_attention_prefill(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_prefill_conv_pack(
+extern "C" int supersonic_qwen35_hip_linear_prefill_conv_pack(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2004,7 +2004,7 @@ extern "C" int dotcache_qwen35_hip_linear_prefill_conv_pack(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_stateful_conv(
+extern "C" int supersonic_qwen35_hip_linear_stateful_conv(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2058,7 +2058,7 @@ extern "C" int dotcache_qwen35_hip_linear_stateful_conv(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_recurrent_prefill(
+extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2120,7 +2120,7 @@ extern "C" int dotcache_qwen35_hip_delta_recurrent_prefill(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_stateful_conv_value_decay(
+extern "C" int supersonic_qwen35_hip_linear_stateful_conv_value_decay(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2190,7 +2190,7 @@ extern "C" int dotcache_qwen35_hip_linear_stateful_conv_value_decay(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_stateful_conv_value_decay_with_state(
+extern "C" int supersonic_qwen35_hip_linear_stateful_conv_value_decay_with_state(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2260,7 +2260,7 @@ extern "C" int dotcache_qwen35_hip_linear_stateful_conv_value_decay_with_state(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_decode_prepare(
+extern "C" int supersonic_qwen35_hip_linear_decode_prepare(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2334,7 +2334,7 @@ extern "C" int dotcache_qwen35_hip_linear_decode_prepare(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_linear_decode_apply(
+extern "C" int supersonic_qwen35_hip_linear_decode_apply(
     size_t device_ordinal,
     size_t batch_size,
     size_t num_v_heads,
@@ -2354,7 +2354,7 @@ extern "C" int dotcache_qwen35_hip_linear_decode_apply(
         out);
 }
 
-extern "C" int dotcache_qwen35_hip_delta_chunk_single_prefill(
+extern "C" int supersonic_qwen35_hip_delta_chunk_single_prefill(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2412,7 +2412,7 @@ extern "C" int dotcache_qwen35_hip_delta_chunk_single_prefill(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_chunk_step(
+extern "C" int supersonic_qwen35_hip_delta_chunk_step(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2474,7 +2474,7 @@ extern "C" int dotcache_qwen35_hip_delta_chunk_step(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_chunk_scan_raw(
+extern "C" int supersonic_qwen35_hip_delta_chunk_scan_raw(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2540,7 +2540,7 @@ extern "C" int dotcache_qwen35_hip_delta_chunk_scan_raw(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_state_scan(
+extern "C" int supersonic_qwen35_hip_delta_state_scan(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2594,7 +2594,7 @@ extern "C" int dotcache_qwen35_hip_delta_state_scan(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_chunk_fused(
+extern "C" int supersonic_qwen35_hip_delta_chunk_fused(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2644,7 +2644,7 @@ extern "C" int dotcache_qwen35_hip_delta_chunk_fused(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_full_scan(
+extern "C" int supersonic_qwen35_hip_delta_full_scan(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2714,7 +2714,7 @@ extern "C" int dotcache_qwen35_hip_delta_full_scan(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_full_scan_pack(
+extern "C" int supersonic_qwen35_hip_delta_full_scan_pack(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2768,7 +2768,7 @@ extern "C" int dotcache_qwen35_hip_delta_full_scan_pack(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_local_attn_scan(
+extern "C" int supersonic_qwen35_hip_delta_local_attn_scan(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2818,7 +2818,7 @@ extern "C" int dotcache_qwen35_hip_delta_local_attn_scan(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_base_attn_scan(
+extern "C" int supersonic_qwen35_hip_delta_base_attn_scan(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2868,7 +2868,7 @@ extern "C" int dotcache_qwen35_hip_delta_base_attn_scan(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_attn_solve_scan(
+extern "C" int supersonic_qwen35_hip_delta_attn_solve_scan(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2906,7 +2906,7 @@ extern "C" int dotcache_qwen35_hip_delta_attn_solve_scan(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_attn_solve_from_inputs(
+extern "C" int supersonic_qwen35_hip_delta_attn_solve_from_inputs(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -2956,7 +2956,7 @@ extern "C" int dotcache_qwen35_hip_delta_attn_solve_from_inputs(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_swiglu_mul(
+extern "C" int supersonic_qwen35_hip_swiglu_mul(
     int dtype,
     size_t device_ordinal,
     size_t elem_count,
@@ -2990,7 +2990,7 @@ extern "C" int dotcache_qwen35_hip_swiglu_mul(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_embedding_lookup(
+extern "C" int supersonic_qwen35_hip_embedding_lookup(
     int dtype,
     int index_dtype,
     size_t device_ordinal,
@@ -3116,7 +3116,7 @@ int output_projection_lookup_device(
     const int block = 256;
     const int grid = (total_elems + block - 1) / block;
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_output_projection_lookup_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_output_projection_lookup_kernel<T>),
         dim3(grid),
         dim3(block),
         0,
@@ -3131,7 +3131,7 @@ int output_projection_lookup_device(
     return 0;
 }
 
-extern "C" int dotcache_qwen35_hip_output_projection_lookup(
+extern "C" int supersonic_qwen35_hip_output_projection_lookup(
     int dtype,
     size_t device_ordinal,
     size_t rows,
@@ -3173,7 +3173,7 @@ extern "C" int dotcache_qwen35_hip_output_projection_lookup(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_causal_mask(
+extern "C" int supersonic_qwen35_hip_causal_mask(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -3207,7 +3207,7 @@ extern "C" int dotcache_qwen35_hip_causal_mask(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_cumsum_last_dim(
+extern "C" int supersonic_qwen35_hip_cumsum_last_dim(
     int dtype,
     size_t device_ordinal,
     size_t rows,
@@ -3241,7 +3241,7 @@ extern "C" int dotcache_qwen35_hip_cumsum_last_dim(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_delta_full_scan_packed(
+extern "C" int supersonic_qwen35_hip_delta_full_scan_packed(
     int dtype,
     size_t device_ordinal,
     size_t batch_heads,
@@ -3299,7 +3299,7 @@ extern "C" int dotcache_qwen35_hip_delta_full_scan_packed(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_exp(
+extern "C" int supersonic_qwen35_hip_exp(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3329,7 +3329,7 @@ extern "C" int dotcache_qwen35_hip_exp(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_recip(
+extern "C" int supersonic_qwen35_hip_recip(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3359,7 +3359,7 @@ extern "C" int dotcache_qwen35_hip_recip(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_sigmoid(
+extern "C" int supersonic_qwen35_hip_sigmoid(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3389,7 +3389,7 @@ extern "C" int dotcache_qwen35_hip_sigmoid(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_log(
+extern "C" int supersonic_qwen35_hip_log(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3419,7 +3419,7 @@ extern "C" int dotcache_qwen35_hip_log(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_unary_view(
+extern "C" int supersonic_qwen35_hip_unary_view(
     int op,
     int dtype,
     size_t device_ordinal,
@@ -3445,7 +3445,7 @@ extern "C" int dotcache_qwen35_hip_unary_view(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_cast_view(
+extern "C" int supersonic_qwen35_hip_cast_view(
     int input_dtype,
     int output_dtype,
     size_t device_ordinal,
@@ -3494,7 +3494,7 @@ extern "C" int dotcache_qwen35_hip_cast_view(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_reduce_keepdim_view(
+extern "C" int supersonic_qwen35_hip_reduce_keepdim_view(
     int dtype,
     size_t device_ordinal,
     int rank,
@@ -3521,7 +3521,7 @@ extern "C" int dotcache_qwen35_hip_reduce_keepdim_view(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_batched_matmul_view(
+extern "C" int supersonic_qwen35_hip_batched_matmul_view(
     int dtype,
     size_t device_ordinal,
     int batch_rank,
@@ -3560,7 +3560,7 @@ extern "C" int dotcache_qwen35_hip_batched_matmul_view(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_cast(
+extern "C" int supersonic_qwen35_hip_cast(
     int input_dtype,
     int output_dtype,
     size_t device_ordinal,
@@ -3606,7 +3606,7 @@ extern "C" int dotcache_qwen35_hip_cast(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_binary_broadcast(
+extern "C" int supersonic_qwen35_hip_binary_broadcast(
     int op,
     int dtype,
     size_t device_ordinal,
@@ -3660,7 +3660,7 @@ extern "C" int dotcache_qwen35_hip_binary_broadcast(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_batched_matmul(
+extern "C" int supersonic_qwen35_hip_batched_matmul(
     int dtype,
     size_t device_ordinal,
     int batch_rank,
@@ -3723,7 +3723,7 @@ extern "C" int dotcache_qwen35_hip_batched_matmul(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_mul_scalar(
+extern "C" int supersonic_qwen35_hip_mul_scalar(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3757,7 +3757,7 @@ extern "C" int dotcache_qwen35_hip_mul_scalar(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_reduce_keepdim(
+extern "C" int supersonic_qwen35_hip_reduce_keepdim(
     int dtype,
     size_t device_ordinal,
     size_t outer,
@@ -3799,7 +3799,7 @@ extern "C" int dotcache_qwen35_hip_reduce_keepdim(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_add_scalar(
+extern "C" int supersonic_qwen35_hip_add_scalar(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3833,7 +3833,7 @@ extern "C" int dotcache_qwen35_hip_add_scalar(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_sqrt(
+extern "C" int supersonic_qwen35_hip_sqrt(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3863,7 +3863,7 @@ extern "C" int dotcache_qwen35_hip_sqrt(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_l2norm(
+extern "C" int supersonic_qwen35_hip_l2norm(
     int dtype,
     size_t device_ordinal,
     size_t n_rows,
@@ -3901,7 +3901,7 @@ extern "C" int dotcache_qwen35_hip_l2norm(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_value_decay(
+extern "C" int supersonic_qwen35_hip_value_decay(
     int dtype,
     size_t device_ordinal,
     size_t total_elems,
@@ -3943,7 +3943,7 @@ extern "C" int dotcache_qwen35_hip_value_decay(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_rms_norm(
+extern "C" int supersonic_qwen35_hip_rms_norm(
     int dtype,
     size_t device_ordinal,
     size_t n_rows,
@@ -4013,7 +4013,7 @@ extern "C" int dotcache_qwen35_hip_rms_norm(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_fused_rms_norm_linear(
+extern "C" int supersonic_qwen35_hip_fused_rms_norm_linear(
     int dtype,
     size_t device_ordinal,
     size_t hidden_dim,
@@ -4090,7 +4090,7 @@ extern "C" int dotcache_qwen35_hip_fused_rms_norm_linear(
     }
 }
 
-extern "C" int dotcache_qwen35_hip_rms_norm_gated(
+extern "C" int supersonic_qwen35_hip_rms_norm_gated(
     int dtype,
     size_t device_ordinal,
     size_t n_rows,
@@ -4169,7 +4169,7 @@ int mlp_decode_megakernel_device(
     if (hipDeviceSynchronize() != hipSuccess) return 202;
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_mlp_decode_megakernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_mlp_decode_megakernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         shared_bytes,
@@ -4194,7 +4194,7 @@ int mlp_decode_megakernel_device(
         const unsigned int swiglu_grid =
             static_cast<unsigned int>((intermediate_size + swiglu_block - 1) / swiglu_block);
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(dotcache_qwen35_mlp_swiglu_kernel<T>),
+            HIP_KERNEL_NAME(supersonic_qwen35_mlp_swiglu_kernel<T>),
             dim3(swiglu_grid),
             dim3(swiglu_block),
             0, 0,
@@ -4210,7 +4210,7 @@ int mlp_decode_megakernel_device(
     if (hipDeviceSynchronize() != hipSuccess) return 208;
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_mlp_down_proj_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_mlp_down_proj_kernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         block_size * sizeof(float),
@@ -4226,7 +4226,7 @@ int mlp_decode_megakernel_device(
     return 0;
 }
 
-extern "C" int dotcache_qwen35_hip_mlp_decode_megakernel(
+extern "C" int supersonic_qwen35_hip_mlp_decode_megakernel(
     int dtype,
     size_t device_ordinal,
     size_t hidden_dim,
@@ -4285,7 +4285,7 @@ int norm_multi_proj_device(
     if (hipDeviceSynchronize() != hipSuccess) return 222;
 
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_norm_multi_proj_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_norm_multi_proj_kernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         shared_bytes,
@@ -4304,7 +4304,7 @@ int norm_multi_proj_device(
     return 0;
 }
 
-extern "C" int dotcache_qwen35_hip_norm_multi_proj(
+extern "C" int supersonic_qwen35_hip_norm_multi_proj(
     int dtype,
     size_t device_ordinal,
     size_t hidden_dim,
@@ -4361,7 +4361,7 @@ int standalone_matvec_device(
 
     const size_t shared_bytes = block_size * sizeof(float);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(dotcache_qwen35_standalone_matvec_kernel<T>),
+        HIP_KERNEL_NAME(supersonic_qwen35_standalone_matvec_kernel<T>),
         dim3(static_cast<unsigned int>(num_blocks)),
         dim3(block_size),
         shared_bytes,
@@ -4377,7 +4377,7 @@ int standalone_matvec_device(
     return 0;
 }
 
-extern "C" int dotcache_qwen35_hip_standalone_matvec(
+extern "C" int supersonic_qwen35_hip_standalone_matvec(
     int dtype,
     size_t device_ordinal,
     size_t in_dim,
@@ -4408,7 +4408,7 @@ extern "C" int dotcache_qwen35_hip_standalone_matvec(
 // linker-visible stub: the Rust FFI wrapper `kernel_ffi::persistent_decode`
 // is shared with CUDA (which still has a non-4B 0.8B path), so the HIP
 // build needs to resolve the reference even though it's unreachable.
-extern "C" int dotcache_qwen35_hip_persistent_decode(
+extern "C" int supersonic_qwen35_hip_persistent_decode(
     int /*dtype*/,
     size_t /*device_ordinal*/,
     size_t /*num_layers*/,
@@ -4431,7 +4431,7 @@ extern "C" int dotcache_qwen35_hip_persistent_decode(
     return 260;
 }
 
-extern "C" int dotcache_query_gpu_info(
+extern "C" int supersonic_query_gpu_info(
     int device_ordinal,
     char* arch_name_out,
     size_t arch_name_len,
@@ -4446,7 +4446,7 @@ extern "C" int dotcache_query_gpu_info(
     return 0;
 }
 
-extern "C" int dotcache_hip_device_clock_khz(
+extern "C" int supersonic_hip_device_clock_khz(
     int device_ordinal,
     uint32_t* clock_rate_khz_out) {
     hipDeviceProp_t props;

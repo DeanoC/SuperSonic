@@ -4,15 +4,15 @@ use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 fn certified_kv_error(backend: Backend, msg: String) -> GpuError {
     match backend {
-        Backend::Hip => GpuError::Hip(msg),
-        Backend::Cuda => GpuError::Cuda(msg),
-        Backend::Metal => GpuError::Metal(msg),
+        Backend::Hip => GpuError::backend(Backend::Hip, msg),
+        Backend::Cuda => GpuError::backend(Backend::Cuda, msg),
+        Backend::Metal => GpuError::backend(Backend::Metal, msg),
     }
 }
 
 #[cfg(supersonic_backend_cuda)]
 unsafe extern "C" {
-    fn dotcache_llama31_certified_kv_copy_step_bf16(
+    fn supersonic_llama31_certified_kv_copy_step_bf16(
         device_ordinal: usize,
         src_key_bf16: *const c_void,
         src_value_bf16: *const c_void,
@@ -23,7 +23,7 @@ unsafe extern "C" {
         dst_token: c_int,
         head_dim: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_copy_token_range_bf16(
+    fn supersonic_llama31_certified_kv_copy_token_range_bf16(
         device_ordinal: usize,
         src_key_bf16: *const c_void,
         src_value_bf16: *const c_void,
@@ -38,7 +38,7 @@ unsafe extern "C" {
         head_dim: c_int,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_quantize_bf16(
+    fn supersonic_llama31_certified_kv_quantize_bf16(
         device_ordinal: usize,
         key_bf16: *const c_void,
         value_bf16: *const c_void,
@@ -58,7 +58,7 @@ unsafe extern "C" {
         value_group_size: c_int,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_quantize_keys_bf16(
+    fn supersonic_llama31_certified_kv_quantize_keys_bf16(
         device_ordinal: usize,
         key_bf16: *const c_void,
         key_int8: *mut c_void,
@@ -70,7 +70,7 @@ unsafe extern "C" {
         head_dim: c_int,
         block_size: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+    fn supersonic_llama31_certified_kv_quantize_keys_bf16_range(
         device_ordinal: usize,
         key_bf16: *const c_void,
         key_int8: *mut c_void,
@@ -85,7 +85,7 @@ unsafe extern "C" {
         head_dim: c_int,
         block_size: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_quantize_values_bf16_range(
+    fn supersonic_llama31_certified_kv_quantize_values_bf16_range(
         device_ordinal: usize,
         value_bf16: *const c_void,
         value_int4: *mut c_void,
@@ -104,7 +104,7 @@ unsafe extern "C" {
         value_group_size: c_int,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_score_blocks_int8(
+    fn supersonic_llama31_certified_kv_score_blocks_int8(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -122,7 +122,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_key_scale_norms(
+    fn supersonic_llama31_certified_kv_key_scale_norms(
         device_ordinal: usize,
         key_scale: *const c_void,
         key_scale_norm: *mut c_void,
@@ -132,7 +132,7 @@ unsafe extern "C" {
         head_dim: c_int,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_score_consistency(
+    fn supersonic_llama31_certified_kv_score_consistency(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -154,7 +154,7 @@ unsafe extern "C" {
         eps_guard: f32,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_gather_promoted_bf16(
+    fn supersonic_llama31_certified_kv_gather_promoted_bf16(
         device_ordinal: usize,
         tier2_key_bf16: *const c_void,
         tier2_value_bf16: *const c_void,
@@ -173,14 +173,14 @@ unsafe extern "C" {
         head_dim: c_int,
         gqa_group: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_init_key_cache(
+    fn supersonic_llama31_certified_kv_init_key_cache(
         device_ordinal: usize,
         cache_tags: *mut c_void,
         cache_lru: *mut c_void,
         q_heads: c_int,
         cache_blocks: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_resolve_key_cache(
+    fn supersonic_llama31_certified_kv_resolve_key_cache(
         device_ordinal: usize,
         selected_blocks: *const c_void,
         selected_counts: *const c_void,
@@ -195,7 +195,7 @@ unsafe extern "C" {
         cache_blocks: c_int,
         tick_base: u32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+    fn supersonic_llama31_certified_kv_gather_promoted_values_bf16(
         device_ordinal: usize,
         tier2_value_bf16: *const c_void,
         value_promote_index: *const c_void,
@@ -209,7 +209,7 @@ unsafe extern "C" {
         run_flag: *const c_void,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_selected_fp16_log_masses(
+    fn supersonic_llama31_certified_kv_selected_fp16_log_masses(
         device_ordinal: usize,
         query_bf16: *const c_void,
         promoted_key_bf16: *const c_void,
@@ -222,7 +222,7 @@ unsafe extern "C" {
         head_dim: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_select_blocks(
+    fn supersonic_llama31_certified_kv_select_blocks(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_scale: *const c_void,
@@ -257,7 +257,7 @@ unsafe extern "C" {
         score_exploration_rate: f32,
         require_certified_tail_bound: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_ranking_flags(
+    fn supersonic_llama31_certified_kv_ranking_flags(
         device_ordinal: usize,
         block_max: *const c_void,
         block_sum: *const c_void,
@@ -270,7 +270,7 @@ unsafe extern "C" {
         max_promoted_blocks: c_int,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_attend_int8_int4(
+    fn supersonic_llama31_certified_kv_attend_int8_int4(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -291,7 +291,7 @@ unsafe extern "C" {
         q_scale: f32,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail(
+    fn supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -314,7 +314,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+    fn supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -345,7 +345,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
+    fn supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -376,7 +376,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
+    fn supersonic_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -415,7 +415,7 @@ unsafe extern "C" {
         q_scale: f32,
         run_flag: *const c_void,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
+    fn supersonic_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         promoted_key_bf16: *const c_void,
@@ -447,7 +447,7 @@ unsafe extern "C" {
         q_scale: f32,
         run_flag: *const c_void,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
+    fn supersonic_llama31_certified_kv_score_all_promoted_bf16_keys(
         device_ordinal: usize,
         query_bf16: *const c_void,
         promoted_key_bf16: *const c_void,
@@ -466,7 +466,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_apply_all_promoted_values_from_probs(
+    fn supersonic_llama31_certified_kv_apply_all_promoted_values_from_probs(
         device_ordinal: usize,
         score_scratch: *const c_void,
         promoted_value_bf16: *const c_void,
@@ -490,7 +490,7 @@ unsafe extern "C" {
         value_group_size: c_int,
         gqa_group: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_block_masses_from_probs(
+    fn supersonic_llama31_certified_kv_block_masses_from_probs(
         device_ordinal: usize,
         score_scratch: *const c_void,
         block_mass: *mut c_void,
@@ -500,7 +500,7 @@ unsafe extern "C" {
         score_stride_tokens: c_int,
         run_flag: *const c_void,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_value_promotions_from_block_masses(
+    fn supersonic_llama31_certified_kv_value_promotions_from_block_masses(
         device_ordinal: usize,
         block_mass: *const c_void,
         value_error: *const c_void,
@@ -518,7 +518,7 @@ unsafe extern "C" {
         v_tol: f32,
         run_flag: *const c_void,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_init_all_promoted_indices(
+    fn supersonic_llama31_certified_kv_init_all_promoted_indices(
         device_ordinal: usize,
         promote_index: *mut c_void,
         value_promote_index: *mut c_void,
@@ -526,7 +526,7 @@ unsafe extern "C" {
         kv_heads: c_int,
         num_blocks: c_int,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
+    fn supersonic_llama31_certified_kv_dense_selected_heads_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         fallback_heads: *const c_void,
@@ -551,7 +551,7 @@ unsafe extern "C" {
         head_dim: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
+    fn supersonic_llama31_certified_kv_dense_flagged_heads_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         fallback_flags: *const c_void,
@@ -576,7 +576,7 @@ unsafe extern "C" {
         q_scale: f32,
     ) -> c_int;
 
-    fn dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
+    fn supersonic_llama31_certified_kv_attend_int8_bf16_values_strided(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -601,7 +601,7 @@ unsafe extern "C" {
         gqa_group: c_int,
         q_scale: f32,
     ) -> c_int;
-    fn dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
+    fn supersonic_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
         device_ordinal: usize,
         query_bf16: *const c_void,
         key_int8: *const c_void,
@@ -693,7 +693,7 @@ pub fn copy_step_bf16(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_copy_step_bf16(
+        let status = supersonic_llama31_certified_kv_copy_step_bf16(
             ordinal,
             src_key_bf16.as_ptr(),
             src_value_bf16.as_ptr(),
@@ -787,7 +787,7 @@ pub fn copy_token_range_bf16(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_copy_token_range_bf16(
+        let status = supersonic_llama31_certified_kv_copy_token_range_bf16(
             ordinal,
             src_key_bf16.as_ptr(),
             src_value_bf16.as_ptr(),
@@ -977,7 +977,7 @@ pub fn quantize_bf16_cache(
             #[cfg(supersonic_backend_cuda)]
             {
                 let status = unsafe {
-                    dotcache_llama31_certified_kv_quantize_bf16(
+                    supersonic_llama31_certified_kv_quantize_bf16(
                         ordinal,
                         key_bf16.as_ptr(),
                         value_bf16.as_ptr(),
@@ -1087,7 +1087,7 @@ pub fn quantize_bf16_keys(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                let status = dotcache_llama31_certified_kv_quantize_keys_bf16(
+                let status = supersonic_llama31_certified_kv_quantize_keys_bf16(
                     ordinal,
                     key_bf16.as_ptr(),
                     key_int8.as_mut_ptr(),
@@ -1204,7 +1204,7 @@ pub fn quantize_bf16_keys_range(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                let status = dotcache_llama31_certified_kv_quantize_keys_bf16_range(
+                let status = supersonic_llama31_certified_kv_quantize_keys_bf16_range(
                     ordinal,
                     key_bf16.as_ptr(),
                     key_int8.as_mut_ptr(),
@@ -1353,7 +1353,7 @@ pub fn quantize_bf16_values_range(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                let status = dotcache_llama31_certified_kv_quantize_values_bf16_range(
+                let status = supersonic_llama31_certified_kv_quantize_values_bf16_range(
                     ordinal,
                     value_bf16.as_ptr(),
                     value_int4.as_mut_ptr(),
@@ -1521,7 +1521,7 @@ pub fn score_blocks_int8(
             #[cfg(supersonic_backend_cuda)]
             {
                 let status = unsafe {
-                    dotcache_llama31_certified_kv_score_blocks_int8(
+                    supersonic_llama31_certified_kv_score_blocks_int8(
                         ordinal,
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
@@ -1600,7 +1600,7 @@ pub fn key_scale_norms(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_key_scale_norms(
+        let status = supersonic_llama31_certified_kv_key_scale_norms(
             ordinal,
             key_scale.as_ptr(),
             key_scale_norm.as_mut_ptr(),
@@ -1706,7 +1706,7 @@ pub fn score_consistency(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_score_consistency(
+        let status = supersonic_llama31_certified_kv_score_consistency(
             ordinal,
             query_bf16.as_ptr(),
             key_int8.as_ptr(),
@@ -1834,7 +1834,7 @@ pub fn gather_promoted_bf16_from_tier2(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_gather_promoted_bf16(
+        let status = supersonic_llama31_certified_kv_gather_promoted_bf16(
             ordinal,
             tier2_key_bf16_device_ptr,
             tier2_value_bf16_device_ptr,
@@ -1906,7 +1906,7 @@ pub fn init_key_page_cache(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_init_key_cache(
+        let status = supersonic_llama31_certified_kv_init_key_cache(
             ordinal,
             cache_tags.as_mut_ptr(),
             cache_lru.as_mut_ptr(),
@@ -1983,7 +1983,7 @@ pub fn resolve_key_page_cache(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_resolve_key_cache(
+        let status = supersonic_llama31_certified_kv_resolve_key_cache(
             ordinal,
             selected_blocks.as_ptr(),
             selected_counts.as_ptr(),
@@ -2082,7 +2082,7 @@ pub fn gather_promoted_values_bf16_from_tier2(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_gather_promoted_values_bf16(
+        let status = supersonic_llama31_certified_kv_gather_promoted_values_bf16(
             ordinal,
             tier2_value_bf16_device_ptr,
             value_promote_index.as_ptr(),
@@ -2175,7 +2175,7 @@ pub fn selected_fp16_log_masses(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_selected_fp16_log_masses(
+        let status = supersonic_llama31_certified_kv_selected_fp16_log_masses(
             ordinal,
             query_bf16.as_ptr(),
             promoted_key_bf16.as_ptr(),
@@ -2314,7 +2314,7 @@ pub fn attend_int8_int4(
             #[cfg(supersonic_backend_cuda)]
             {
                 let status = unsafe {
-                    dotcache_llama31_certified_kv_attend_int8_int4(
+                    supersonic_llama31_certified_kv_attend_int8_int4(
                         ordinal,
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
@@ -2493,7 +2493,7 @@ pub fn attend_int8_int4_with_bf16_tail(
             #[cfg(supersonic_backend_cuda)]
             {
                 let status = unsafe {
-                    dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail(
+                    supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail(
                         ordinal,
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
@@ -2711,7 +2711,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
             #[cfg(supersonic_backend_cuda)]
             unsafe {
                 let status = if output_f32.dtype() == ScalarType::BF16 {
-                    dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
+                    supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided_out_bf16(
                         ordinal,
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
@@ -2743,7 +2743,7 @@ pub fn attend_int8_int4_with_bf16_tail_strided(
                         q_scale,
                     )
                 } else {
-                    dotcache_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
+                    supersonic_llama31_certified_kv_attend_int8_int4_bf16_tail_strided(
                         ordinal,
                         query_bf16.as_ptr(),
                         key_int8.as_ptr(),
@@ -3014,7 +3014,7 @@ pub fn attend_mixed_key_int4_with_bf16_tail_strided(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
+        let status = supersonic_llama31_certified_kv_attend_mixed_key_int4_bf16_tail_strided_out_bf16(
             ordinal,
             query_bf16.as_ptr(),
             key_int8.as_ptr(),
@@ -3240,7 +3240,7 @@ pub fn attend_all_promoted_int4_with_bf16_tail(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
+        let status = supersonic_llama31_certified_kv_attend_all_promoted_int4_bf16_tail_out_bf16(
             ordinal,
             query_bf16.as_ptr(),
             promoted_key_bf16.as_ptr(),
@@ -3414,7 +3414,7 @@ pub fn score_all_promoted_bf16_keys(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_score_all_promoted_bf16_keys(
+        let status = supersonic_llama31_certified_kv_score_all_promoted_bf16_keys(
             ordinal,
             query_bf16.as_ptr(),
             promoted_key_bf16.as_ptr(),
@@ -3591,7 +3591,7 @@ pub fn apply_all_promoted_values_from_probs(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_apply_all_promoted_values_from_probs(
+        let status = supersonic_llama31_certified_kv_apply_all_promoted_values_from_probs(
             ordinal,
             score_scratch.as_ptr(),
             promoted_value_bf16.as_ptr(),
@@ -3724,7 +3724,7 @@ pub fn block_masses_from_token_probs(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_block_masses_from_probs(
+        let status = supersonic_llama31_certified_kv_block_masses_from_probs(
             ordinal,
             score_scratch.as_ptr(),
             block_mass.as_mut_ptr(),
@@ -3860,7 +3860,7 @@ pub fn select_blocks_device(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_select_blocks(
+        let status = supersonic_llama31_certified_kv_select_blocks(
             ordinal,
             query_bf16.as_ptr(),
             key_scale_norm.as_ptr(),
@@ -3980,7 +3980,7 @@ pub fn ranking_flags_device(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_ranking_flags(
+        let status = supersonic_llama31_certified_kv_ranking_flags(
             ordinal,
             block_max.as_ptr(),
             block_sum.as_ptr(),
@@ -4106,7 +4106,7 @@ pub fn value_promotions_from_block_masses(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_value_promotions_from_block_masses(
+        let status = supersonic_llama31_certified_kv_value_promotions_from_block_masses(
             ordinal,
             block_mass.as_ptr(),
             value_error.as_ptr(),
@@ -4191,7 +4191,7 @@ pub fn init_all_promoted_indices(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_init_all_promoted_indices(
+        let status = supersonic_llama31_certified_kv_init_all_promoted_indices(
             ordinal,
             promote_index.as_mut_ptr(),
             value_promote_index.as_mut_ptr(),
@@ -4347,7 +4347,7 @@ pub fn dense_selected_heads_out_bf16(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_dense_selected_heads_out_bf16(
+        let status = supersonic_llama31_certified_kv_dense_selected_heads_out_bf16(
             ordinal,
             query_bf16.as_ptr(),
             fallback_heads.as_ptr(),
@@ -4523,7 +4523,7 @@ pub fn dense_flagged_heads_out_bf16(
 
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_llama31_certified_kv_dense_flagged_heads_out_bf16(
+        let status = supersonic_llama31_certified_kv_dense_flagged_heads_out_bf16(
             ordinal,
             query_bf16.as_ptr(),
             fallback_flags.as_ptr(),
@@ -4753,7 +4753,7 @@ pub fn attend_int8_bf16_values_strided(
                 let tail_key_ptr = tail_key_bf16.map_or(std::ptr::null(), GpuBuffer::as_ptr);
                 let status = unsafe {
                     if output_f32.dtype() == ScalarType::BF16 {
-                        dotcache_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
+                        supersonic_llama31_certified_kv_attend_int8_bf16_values_strided_out_bf16(
                             ordinal,
                             query_bf16.as_ptr(),
                             key_int8.as_ptr(),
@@ -4779,7 +4779,7 @@ pub fn attend_int8_bf16_values_strided(
                             q_scale,
                         )
                     } else {
-                        dotcache_llama31_certified_kv_attend_int8_bf16_values_strided(
+                        supersonic_llama31_certified_kv_attend_int8_bf16_values_strided(
                             ordinal,
                             query_bf16.as_ptr(),
                             key_int8.as_ptr(),

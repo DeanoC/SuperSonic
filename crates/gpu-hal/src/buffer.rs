@@ -8,6 +8,13 @@ use crate::scalar_type::ScalarType;
 
 /// Owned GPU device memory with shape and dtype metadata.
 /// Frees on drop via the active runtime's device free call.
+//
+// Allocation today is unconditionally `hipMalloc` / `cudaMalloc` (i.e. assumes
+// `MemoryArchitecture::Discrete`). For unified-memory arches (gfx1150 APU,
+// Apple M-series), the right call is host-coherent / managed memory so host
+// and device share the same physical pages. The branch point is here — see
+// `runner::registry::ArchProfile::for_arch(...).memory` for the dispatch
+// dimension.
 pub struct GpuBuffer {
     ptr: NonNull<c_void>,
     len_bytes: usize,
@@ -20,9 +27,9 @@ pub struct GpuBuffer {
 // GPU pointers are not thread-safe by default, but access is serialized by the
 // decode forward pass (CLI is single-threaded; the HTTP server guards every
 // session with a `tokio::sync::Mutex`). Mark Send so `GpuBuffer` can cross
-// `spawn_blocking` boundaries, and Sync so buffers wrapped in `Arc<_>` —
-// notably `Qwen35Weights::{embed_tokens, lm_head}` — can be carried through
-// an `Arc<Mutex<…>>` shared across axum handler tasks.
+// `spawn_blocking` boundaries, and Sync so buffers wrapped in `Arc<_>` — for
+// example shared embedding / lm_head tensors — can be carried through an
+// `Arc<Mutex<…>>` shared across axum handler tasks.
 unsafe impl Send for GpuBuffer {}
 unsafe impl Sync for GpuBuffer {}
 

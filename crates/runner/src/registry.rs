@@ -146,6 +146,65 @@ impl fmt::Display for GpuArch {
     }
 }
 
+/// How a GPU's memory is wired relative to host RAM.
+///
+/// This is the dimension that drives allocation/copy policy — it's coarser
+/// than `GpuArch` on purpose. Future code that wants "should I use pinned
+/// host memory / managed memory / zero-copy?" should branch on this rather
+/// than enumerating arches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryArchitecture {
+    /// Discrete GPU with dedicated VRAM, distinct from host RAM. `hipMalloc`
+    /// / `cudaMalloc` allocate device memory; H2D/D2H copies traverse PCIe.
+    Discrete,
+    /// APU / integrated GPU sharing system RAM with the host. Allocations
+    /// come out of system memory; H2D/D2H may be eligible for zero-copy or
+    /// host-coherent / managed paths.
+    Unified,
+}
+
+/// Per-arch policy bundle. Returned by [`ArchProfile::for_arch`] — one source
+/// of truth for "what does this arch look like" so registry entries don't
+/// have to restate it per-model.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchProfile {
+    pub memory: MemoryArchitecture,
+}
+
+impl ArchProfile {
+    pub fn for_arch(arch: &GpuArch) -> Self {
+        let memory = match arch {
+            GpuArch::Gfx1100 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
+            GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
+            GpuArch::Unknown(_) => MemoryArchitecture::Discrete,
+        };
+        Self { memory }
+    }
+}
+
+/// Per-(arch, model) override for the Qwen3.5 4B persistent decode kernel
+/// launch grid. `None` keeps the non-cooperative 2x multiProcessorCount
+/// grid — empirically safe across every tested variant. `Some((blocks,
+/// cooperative))` installs a different grid + cooperative-launch flag via
+/// `kernel_ffi::set_qwen35_4b_launch_preset`; this is how models opt into
+/// larger grids that only stay hang-free when co-residence is enforced by
+/// `hipLaunchCooperativeKernel`. User env vars `SUPERSONIC_QWEN4B_BLOCKS`
+/// / `_COOP` still override any preset inside the bridge.
+pub fn qwen35_4b_launch_preset(
+    arch: &GpuArch,
+    model: &ModelVariant,
+) -> Option<(i32, bool)> {
+    match (arch, model) {
+        // gfx1150 + 0.8B: cooperative launch at 32 blocks caps conservatively
+        // at 24 on 0.8B's 14 KB LDS and runs at 77 ms/tok vs. the non-coop
+        // 2x default's 91 ms/tok (measured 2026-04-20). Other variants on
+        // gfx1150 see no gain — their higher LDS usage caps the coop grid
+        // at or below 2x — so they stay on the default path.
+        (GpuArch::Gfx1150, ModelVariant::Qwen3_5_0_8B) => Some((32, true)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct Qwen35KernelParams {
     pub proj_buf_floats: usize,
@@ -153,15 +212,6 @@ pub struct Qwen35KernelParams {
     pub weight_prefix: &'static str,
     pub kv_chunk_size: usize,
     pub use_4b_kernel: bool,
-    /// Per-model launch preset for the HIP 4B persistent decode kernel.
-    /// `None` (default) keeps the non-cooperative 2x multiProcessorCount
-    /// grid — empirically safe across every tested variant. `Some((blocks,
-    /// cooperative))` installs a different grid size + cooperative-launch
-    /// flag via `kernel_ffi::set_qwen35_4b_launch_preset`; this is how
-    /// models opt into the larger grids that only stay hang-free when
-    /// co-residence is enforced by `hipLaunchCooperativeKernel`. User env
-    /// vars `SUPERSONIC_QWEN4B_BLOCKS` / `_COOP` still override any preset.
-    pub hip_launch_preset: Option<(i32, bool)>,
 }
 
 pub struct Gemma4KernelParams {
@@ -225,7 +275,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -242,7 +291,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -259,7 +307,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -276,7 +323,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -300,12 +346,6 @@ static REGISTRY: &[RegistryEntry] = &[
             // the BF16 page-fault + hipcc codegen sensitivity warnings were
             // both found stale in the 2026-04-20 diagnostic pass.
             use_4b_kernel: true,
-            // Cooperative launch at 32 blocks caps conservatively at 24 on
-            // 0.8B's 14 KB LDS and runs at 77 ms/tok vs. the non-coop 2x
-            // default's 91 ms/tok (measured 2026-04-20). Other variants
-            // see no gain because their higher LDS usage caps the coop
-            // grid at or below 2x — they stay on the default path.
-            hip_launch_preset: Some((32, true)),
         }),
     },
     RegistryEntry {
@@ -322,7 +362,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -339,7 +378,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -356,7 +394,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -373,7 +410,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -390,7 +426,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -407,7 +442,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -424,7 +458,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: false,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -441,7 +474,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -458,7 +490,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {
@@ -478,7 +509,6 @@ static REGISTRY: &[RegistryEntry] = &[
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
             use_4b_kernel: true,
-            hip_launch_preset: None,
         }),
     },
     RegistryEntry {

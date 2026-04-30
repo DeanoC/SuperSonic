@@ -67,42 +67,42 @@ struct Qwen35DecodeLayerDesc {
 };
 
 template <typename T>
-__device__ inline float dotcache_qwen35_to_float(T value);
+__device__ inline float supersonic_qwen35_to_float(T value);
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<__half>(__half value) {
+__device__ inline float supersonic_qwen35_to_float<__half>(__half value) {
     return __half2float(value);
 }
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<float>(float value) {
+__device__ inline float supersonic_qwen35_to_float<float>(float value) {
     return value;
 }
 
 template <>
-__device__ inline float dotcache_qwen35_to_float<hip_bfloat16>(hip_bfloat16 value) {
+__device__ inline float supersonic_qwen35_to_float<hip_bfloat16>(hip_bfloat16 value) {
     return static_cast<float>(value);
 }
 
 template <typename T>
-__device__ inline T dotcache_qwen35_from_float(float value);
+__device__ inline T supersonic_qwen35_from_float(float value);
 
 template <>
-__device__ inline __half dotcache_qwen35_from_float<__half>(float value) {
+__device__ inline __half supersonic_qwen35_from_float<__half>(float value) {
     return __float2half(value);
 }
 
 template <>
-__device__ inline float dotcache_qwen35_from_float<float>(float value) {
+__device__ inline float supersonic_qwen35_from_float<float>(float value) {
     return value;
 }
 
 template <>
-__device__ inline hip_bfloat16 dotcache_qwen35_from_float<hip_bfloat16>(float value) {
+__device__ inline hip_bfloat16 supersonic_qwen35_from_float<hip_bfloat16>(float value) {
     return hip_bfloat16(value);
 }
 
-__device__ inline float dotcache_qwen35_binary_op_apply(int op, float lhs, float rhs) {
+__device__ inline float supersonic_qwen35_binary_op_apply(int op, float lhs, float rhs) {
     switch (op) {
     case 0:
         return lhs + rhs;
@@ -117,7 +117,7 @@ __device__ inline float dotcache_qwen35_binary_op_apply(int op, float lhs, float
     }
 }
 
-__device__ inline size_t dotcache_qwen35_broadcast_elem_index(
+__device__ inline size_t supersonic_qwen35_broadcast_elem_index(
     size_t out_index,
     int rank,
     const int* out_dims,
@@ -140,20 +140,20 @@ __device__ inline size_t dotcache_qwen35_broadcast_elem_index(
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_dot_row(
+__device__ inline float supersonic_qwen35_dot_row(
     const T* lhs,
     const T* rhs,
     int size
 ) {
     float dot = 0.0f;
     for (int idx = 0; idx < size; ++idx) {
-        dot += dotcache_qwen35_to_float(lhs[idx]) * dotcache_qwen35_to_float(rhs[idx]);
+        dot += supersonic_qwen35_to_float(lhs[idx]) * supersonic_qwen35_to_float(rhs[idx]);
     }
     return dot;
 }
 
 template <>
-__device__ inline float dotcache_qwen35_dot_row<__half>(
+__device__ inline float supersonic_qwen35_dot_row<__half>(
     const __half* lhs,
     const __half* rhs,
     int size
@@ -172,46 +172,46 @@ __device__ inline float dotcache_qwen35_dot_row<__half>(
     return dot;
 }
 
-__device__ inline float dotcache_qwen35_exp_fast(float x) {
+__device__ inline float supersonic_qwen35_exp_fast(float x) {
     return __expf(x);
 }
 
-__device__ inline float dotcache_qwen35_sigmoid_fast(float x) {
+__device__ inline float supersonic_qwen35_sigmoid_fast(float x) {
     if (x >= 0.0f) {
-        const float e = dotcache_qwen35_exp_fast(-x);
+        const float e = supersonic_qwen35_exp_fast(-x);
         return 1.0f / (1.0f + e);
     }
-    const float e = dotcache_qwen35_exp_fast(x);
+    const float e = supersonic_qwen35_exp_fast(x);
     return e / (1.0f + e);
 }
 
-__device__ inline float dotcache_qwen35_softplus_fast(float x) {
+__device__ inline float supersonic_qwen35_softplus_fast(float x) {
     if (x > 20.0f) return x;
-    if (x < -20.0f) return dotcache_qwen35_exp_fast(x);
-    return log1pf(dotcache_qwen35_exp_fast(x));
+    if (x < -20.0f) return supersonic_qwen35_exp_fast(x);
+    return log1pf(supersonic_qwen35_exp_fast(x));
 }
 
 template <typename T>
-__device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3(
+__device__ inline float supersonic_qwen35_conv4_contiguous_t_ge3(
     const T* mixed_qkv,
     size_t mixed_c_offset,
     size_t t,
     const T* weights,
     size_t weight_offset
 ) {
-    const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-    const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-    const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-    const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-    const float x0 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 3)]);
-    const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 2)]);
-    const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 1)]);
-    const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + t]);
+    const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+    const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+    const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+    const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+    const float x0 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 3)]);
+    const float x1 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 2)]);
+    const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + (t - 1)]);
+    const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + t]);
     return ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
 }
 
 template <>
-__device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3<__half>(
+__device__ inline float supersonic_qwen35_conv4_contiguous_t_ge3<__half>(
     const __half* mixed_qkv,
     size_t mixed_c_offset,
     size_t t,
@@ -235,7 +235,7 @@ __device__ inline float dotcache_qwen35_conv4_contiguous_t_ge3<__half>(
     return (f01.x + f01.y) + (f23.x + f23.y);
 }
 
-__device__ inline float dotcache_qwen35_wave_sum(float value) {
+__device__ inline float supersonic_qwen35_wave_sum(float value) {
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         value += __shfl_down(value, offset);
     }
@@ -243,7 +243,7 @@ __device__ inline float dotcache_qwen35_wave_sum(float value) {
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_full_attention_prefill_kernel(
+__global__ void supersonic_qwen35_full_attention_prefill_kernel(
     int batch_size,
     int q_heads,
     int kv_heads,
@@ -308,9 +308,9 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 
             float partial = 0.0f;
             for (int d = lane; d < head_dim; d += warpSize) {
-                partial += dotcache_qwen35_to_float(q_row[d]) * dotcache_qwen35_to_float(k_row[d]);
+                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
             }
-            float score = dotcache_qwen35_wave_sum(partial) * scale;
+            float score = supersonic_qwen35_wave_sum(partial) * scale;
 
             if (lane == 0) {
                 if (score > shared_max) {
@@ -331,9 +331,9 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 
             float partial = 0.0f;
             for (int d = lane; d < head_dim; d += warpSize) {
-                partial += dotcache_qwen35_to_float(q_row[d]) * dotcache_qwen35_to_float(k_row[d]);
+                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
             }
-            float score = dotcache_qwen35_wave_sum(partial) * scale;
+            float score = supersonic_qwen35_wave_sum(partial) * scale;
 
             if (lane == 0) {
                 shared_weight = expf(score - shared_max);
@@ -342,7 +342,7 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
             __syncthreads();
 
             for (int i = 0; i < local_count; ++i) {
-                local_acc[i] += shared_weight * dotcache_qwen35_to_float(v_row[local_dims[i]]);
+                local_acc[i] += shared_weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
             }
             __syncthreads();
         }
@@ -359,7 +359,7 @@ __global__ void dotcache_qwen35_full_attention_prefill_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_prefill_conv_pack_kernel(
+__global__ void supersonic_qwen35_linear_prefill_conv_pack_kernel(
     int batch_size,
     int conv_dim,
     int total_len,
@@ -388,16 +388,16 @@ __global__ void dotcache_qwen35_linear_prefill_conv_pack_kernel(
 
     float acc = 0.0f;
     for (int tap = 0; tap < kernel_size; ++tap) {
-        acc += dotcache_qwen35_to_float(mixed_qkv[input_c_offset + t + static_cast<size_t>(tap)]) *
-            dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+        acc += supersonic_qwen35_to_float(mixed_qkv[input_c_offset + t + static_cast<size_t>(tap)]) *
+            supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
     }
 
-    const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-    out[tid] = dotcache_qwen35_from_float<T>(silu);
+    const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+    out[tid] = supersonic_qwen35_from_float<T>(silu);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_kernel(
+__global__ void supersonic_qwen35_linear_stateful_conv_kernel(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -434,22 +434,22 @@ __global__ void dotcache_qwen35_linear_stateful_conv_kernel(
         const int src = static_cast<int>(t) + tap - history;
         float x = 0.0f;
         if (src >= 0) {
-            x = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
+            x = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
         } else {
             const int state_idx = state_len + src;
             if (state_idx >= 0) {
-                x = dotcache_qwen35_to_float(prev_state[state_c_offset + static_cast<size_t>(state_idx)]);
+                x = supersonic_qwen35_to_float(prev_state[state_c_offset + static_cast<size_t>(state_idx)]);
             }
         }
-        acc += x * dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+        acc += x * supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
     }
 
-    const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-    out[tid] = dotcache_qwen35_from_float<T>(silu);
+    const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+    out[tid] = supersonic_qwen35_from_float<T>(silu);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
+__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_kernel(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -492,20 +492,20 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
             const int src = static_cast<int>(t) + tap - history;
             float x = 0.0f;
             if (src >= 0) {
-                x = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
+                x = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + static_cast<size_t>(src)]);
             } else {
                 const int state_idx = state_len + src;
                 if (state_idx >= 0) {
-                    x = dotcache_qwen35_to_float(
+                    x = supersonic_qwen35_to_float(
                         prev_state[state_c_offset + static_cast<size_t>(state_idx)]
                     );
                 }
             }
-            acc += x * dotcache_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+            acc += x * supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
         }
 
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+        out[tid] = supersonic_qwen35_from_float<T>(silu);
         return;
     }
 
@@ -513,15 +513,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel(
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
-    const float softplus = dotcache_qwen35_softplus_fast(a_val + bias);
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
+    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
+    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
+    const float softplus = supersonic_qwen35_softplus_fast(a_val + bias);
+    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
+__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -558,41 +558,41 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
 
         float acc;
         if (t >= 3) {
-            acc = dotcache_qwen35_conv4_contiguous_t_ge3(
+            acc = supersonic_qwen35_conv4_contiguous_t_ge3(
                 mixed_qkv, mixed_c_offset, t, weights, weight_offset);
         } else if (t == 2) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x1 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else if (t == 1) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
+            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 0]);
+            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
+            const float x2 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         }
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+        out[tid] = supersonic_qwen35_from_float<T>(silu);
         return;
     }
 
@@ -600,15 +600,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_kernel_k4s3(
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
-    const float softplus = dotcache_qwen35_softplus_fast(a_val + bias);
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
+    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
+    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
+    const float softplus = supersonic_qwen35_softplus_fast(a_val + bias);
+    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3(
+__global__ void supersonic_qwen35_linear_stateful_conv_value_decay_with_state_kernel_k4s3(
     int batch_size,
     int conv_dim,
     int seq_len,
@@ -656,41 +656,41 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kern
 
         float acc;
         if (t >= 3) {
-            acc = dotcache_qwen35_conv4_contiguous_t_ge3(
+            acc = supersonic_qwen35_conv4_contiguous_t_ge3(
                 mixed_qkv, mixed_c_offset, t, weights, weight_offset);
         } else if (t == 2) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x1 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x1 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 2]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else if (t == 1) {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x2 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
+            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x2 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 1]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         } else {
-            const float w0 = dotcache_qwen35_to_float(weights[weight_offset]);
-            const float w1 = dotcache_qwen35_to_float(weights[weight_offset + 1]);
-            const float w2 = dotcache_qwen35_to_float(weights[weight_offset + 2]);
-            const float w3 = dotcache_qwen35_to_float(weights[weight_offset + 3]);
-            const float x0 = dotcache_qwen35_to_float(prev_state[state_c_offset + 0]);
-            const float x1 = dotcache_qwen35_to_float(prev_state[state_c_offset + 1]);
-            const float x2 = dotcache_qwen35_to_float(prev_state[state_c_offset + 2]);
-            const float x3 = dotcache_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
+            const float w0 = supersonic_qwen35_to_float(weights[weight_offset]);
+            const float w1 = supersonic_qwen35_to_float(weights[weight_offset + 1]);
+            const float w2 = supersonic_qwen35_to_float(weights[weight_offset + 2]);
+            const float w3 = supersonic_qwen35_to_float(weights[weight_offset + 3]);
+            const float x0 = supersonic_qwen35_to_float(prev_state[state_c_offset + 0]);
+            const float x1 = supersonic_qwen35_to_float(prev_state[state_c_offset + 1]);
+            const float x2 = supersonic_qwen35_to_float(prev_state[state_c_offset + 2]);
+            const float x3 = supersonic_qwen35_to_float(mixed_qkv[mixed_c_offset + 0]);
             acc = ((x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3));
         }
-        const float silu = acc * dotcache_qwen35_sigmoid_fast(acc);
-        out[tid] = dotcache_qwen35_from_float<T>(silu);
+        const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+        out[tid] = supersonic_qwen35_from_float<T>(silu);
         return;
     }
 
@@ -698,15 +698,15 @@ __global__ void dotcache_qwen35_linear_stateful_conv_value_decay_with_state_kern
     const size_t a_base =
         b * static_cast<size_t>(seq_len) * static_cast<size_t>(num_heads) +
         t * static_cast<size_t>(num_heads);
-    const float a_val = dotcache_qwen35_to_float(a[a_base + head]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
-    const float softplus = dotcache_qwen35_softplus_fast(a_val + bias);
-    out[tid] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    const float a_val = supersonic_qwen35_to_float(a[a_base + head]);
+    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
+    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
+    const float softplus = supersonic_qwen35_softplus_fast(a_val + bias);
+    out[tid] = supersonic_qwen35_from_float<T>(-softplus * decay);
 }
 
 template <typename T, int MAX_K = 256>
-__global__ void dotcache_qwen35_linear_decode_prepare_kernel(
+__global__ void supersonic_qwen35_linear_decode_prepare_kernel(
     int batch_size,
     int num_v_heads,
     int head_k_dim,
@@ -748,13 +748,13 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
         for (int tap = 0; tap < kernel_size; ++tap) {
             float x = 0.0f;
             if (tap + 1 == kernel_size) {
-                x = dotcache_qwen35_to_float(mixed_qkv[mixed_batch_base + channel]);
+                x = supersonic_qwen35_to_float(mixed_qkv[mixed_batch_base + channel]);
             } else if (tap < state_len) {
-                x = dotcache_qwen35_to_float(prev_conv_state[state_base + tap]);
+                x = supersonic_qwen35_to_float(prev_conv_state[state_base + tap]);
             }
-            acc += x * dotcache_qwen35_to_float(weights[weight_base + tap]);
+            acc += x * supersonic_qwen35_to_float(weights[weight_base + tap]);
         }
-        return acc * dotcache_qwen35_sigmoid_fast(acc);
+        return acc * supersonic_qwen35_sigmoid_fast(acc);
     };
 
     __shared__ float shared_q[MAX_K];
@@ -781,13 +781,13 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
             out[pair_out_base + head_k_dim + k_idx] = shared_k[k_idx] * k_inv;
         }
         const int head_base = batch * (2 * num_v_heads) + v_head;
-        const float a_raw = dotcache_qwen35_to_float(a_beta_raw[head_base]);
-        const float beta_raw = dotcache_qwen35_to_float(a_beta_raw[head_base + num_v_heads]);
-        out[pair_out_base + 2 * head_k_dim + head_v_dim] = dotcache_qwen35_sigmoid_fast(beta_raw);
-        const float bias = dotcache_qwen35_to_float(dt_bias[v_head]);
-        const float decay = dotcache_qwen35_to_float(a_log_exp[v_head]);
-        const float g = -dotcache_qwen35_softplus_fast(a_raw + bias) * decay;
-        out[pair_out_base + 2 * head_k_dim + head_v_dim + 1] = dotcache_qwen35_exp_fast(g);
+        const float a_raw = supersonic_qwen35_to_float(a_beta_raw[head_base]);
+        const float beta_raw = supersonic_qwen35_to_float(a_beta_raw[head_base + num_v_heads]);
+        out[pair_out_base + 2 * head_k_dim + head_v_dim] = supersonic_qwen35_sigmoid_fast(beta_raw);
+        const float bias = supersonic_qwen35_to_float(dt_bias[v_head]);
+        const float decay = supersonic_qwen35_to_float(a_log_exp[v_head]);
+        const float g = -supersonic_qwen35_softplus_fast(a_raw + bias) * decay;
+        out[pair_out_base + 2 * head_k_dim + head_v_dim + 1] = supersonic_qwen35_exp_fast(g);
     }
     if (tid < head_v_dim) {
         const int value_channel = key_dim * 2 + v_head * head_v_dim + tid;
@@ -796,7 +796,7 @@ __global__ void dotcache_qwen35_linear_decode_prepare_kernel(
 }
 
 template <int MAX_K = 256>
-__global__ void dotcache_qwen35_linear_decode_apply_kernel(
+__global__ void supersonic_qwen35_linear_decode_apply_kernel(
     int batch_size,
     int num_v_heads,
     int head_k_dim,
@@ -852,7 +852,7 @@ __global__ void dotcache_qwen35_linear_decode_apply_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
+__device__ inline void supersonic_qwen35_delta_recurrent_prefill_impl(
     int batch_heads,
     int seq_len,
     int k_head_dim,
@@ -881,13 +881,13 @@ __device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < seq_len; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(supersonic_qwen35_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -898,32 +898,32 @@ __device__ inline void dotcache_qwen35_delta_recurrent_prefill_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * supersonic_qwen35_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (supersonic_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
+            supersonic_qwen35_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * supersonic_qwen35_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_t);
     }
 
     const int state_out = out_base + seq_len * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
+__global__ void supersonic_qwen35_delta_recurrent_prefill_kernel(
     int batch_heads,
     int seq_len,
     int k_head_dim,
@@ -937,7 +937,7 @@ __global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_recurrent_prefill_impl(
+    supersonic_qwen35_delta_recurrent_prefill_impl(
         batch_heads,
         seq_len,
         k_head_dim,
@@ -954,7 +954,7 @@ __global__ void dotcache_qwen35_delta_recurrent_prefill_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_step_impl(
+__device__ inline void supersonic_qwen35_delta_chunk_step_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -983,13 +983,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_step_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             prev_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < chunk_size; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(supersonic_qwen35_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -1000,32 +1000,32 @@ __device__ inline void dotcache_qwen35_delta_chunk_step_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * supersonic_qwen35_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (supersonic_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
+            supersonic_qwen35_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * supersonic_qwen35_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_t);
     }
 
     const int state_out = out_base + chunk_size * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_step_kernel(
+__global__ void supersonic_qwen35_delta_chunk_step_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1039,7 +1039,7 @@ __global__ void dotcache_qwen35_delta_chunk_step_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_step_impl(
+    supersonic_qwen35_delta_chunk_step_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -1056,7 +1056,7 @@ __global__ void dotcache_qwen35_delta_chunk_step_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
+__device__ inline void supersonic_qwen35_delta_chunk_scan_raw_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1087,13 +1087,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
 
     for (int t = 0; t < total_tokens; ++t) {
-        const float g_t = expf(dotcache_qwen35_to_float(g[bh * token_stride_s + t]));
+        const float g_t = expf(supersonic_qwen35_to_float(g[bh * token_stride_s + t]));
         const int key_row = bh * token_stride_k + t * k_head_dim;
         const int value_row = bh * token_stride_v + t * v_head_dim;
         const int beta_row = bh * token_stride_s + t;
@@ -1104,32 +1104,32 @@ __device__ inline void dotcache_qwen35_delta_chunk_scan_raw_impl(
 
         float kv_mem = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            kv_mem += state[k_idx] * dotcache_qwen35_to_float(key[key_row + k_idx]);
+            kv_mem += state[k_idx] * supersonic_qwen35_to_float(key[key_row + k_idx]);
         }
 
         const float delta =
-            (dotcache_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
-            dotcache_qwen35_to_float(beta[beta_row]);
+            (supersonic_qwen35_to_float(value[value_row + v_idx]) - kv_mem) *
+            supersonic_qwen35_to_float(beta[beta_row]);
 
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            state[k_idx] += dotcache_qwen35_to_float(key[key_row + k_idx]) * delta;
+            state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
         }
 
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-            out_t += state[k_idx] * dotcache_qwen35_to_float(query[key_row + k_idx]);
+            out_t += state[k_idx] * supersonic_qwen35_to_float(query[key_row + k_idx]);
         }
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_t);
+        out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_t);
     }
 
     const int state_out = out_base + total_tokens * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
+__global__ void supersonic_qwen35_delta_chunk_scan_raw_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1144,7 +1144,7 @@ __global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_scan_raw_impl(
+    supersonic_qwen35_delta_chunk_scan_raw_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -1162,7 +1162,7 @@ __global__ void dotcache_qwen35_delta_chunk_scan_raw_kernel(
 }
 
 template <typename T, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_state_scan_impl(
+__device__ inline void supersonic_qwen35_delta_state_scan_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1187,15 +1187,15 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         const int idx = bh * state_stride + k_idx * v_head_dim + v_idx;
-        state[k_idx] = dotcache_qwen35_to_float(initial_state[idx]);
-        out[idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        state[k_idx] = supersonic_qwen35_to_float(initial_state[idx]);
+        out[idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 
     for (int chunk = 0; chunk < num_chunks; ++chunk) {
         const int packed_chunk_base = ((bh * num_chunks) + chunk) * chunk_size * packed_width;
         const int value_chunk_base = ((bh * num_chunks) + chunk) * chunk_size * v_head_dim;
         const float state_decay =
-            dotcache_qwen35_to_float(packed_scan[packed_chunk_base + 2 * k_head_dim]);
+            supersonic_qwen35_to_float(packed_scan[packed_chunk_base + 2 * k_head_dim]);
         float update[MAX_K];
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             update[k_idx] = 0.0f;
@@ -1206,12 +1206,12 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
             const int value_row = value_chunk_base + t * v_head_dim;
             float v_prime = 0.0f;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(packed_scan[packed_row + k_head_dim + k_idx]) *
+                v_prime += supersonic_qwen35_to_float(packed_scan[packed_row + k_head_dim + k_idx]) *
                     state[k_idx];
             }
-            const float v_new = dotcache_qwen35_to_float(value[value_row + v_idx]) - v_prime;
+            const float v_new = supersonic_qwen35_to_float(value[value_row + v_idx]) - v_prime;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                update[k_idx] += dotcache_qwen35_to_float(packed_scan[packed_row + k_idx]) * v_new;
+                update[k_idx] += supersonic_qwen35_to_float(packed_scan[packed_row + k_idx]) * v_new;
             }
         }
 
@@ -1219,13 +1219,13 @@ __device__ inline void dotcache_qwen35_delta_state_scan_impl(
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             state[k_idx] = state_decay * state[k_idx] + update[k_idx];
             out[out_chunk_base + k_idx * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(state[k_idx]);
+                supersonic_qwen35_from_float<T>(state[k_idx]);
         }
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_state_scan_kernel(
+__global__ void supersonic_qwen35_delta_state_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1237,7 +1237,7 @@ __global__ void dotcache_qwen35_delta_state_scan_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_state_scan_impl(
+    supersonic_qwen35_delta_state_scan_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -1252,7 +1252,7 @@ __global__ void dotcache_qwen35_delta_state_scan_kernel(
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
+__device__ inline void supersonic_qwen35_delta_chunk_fused_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1279,7 +1279,7 @@ __device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             prev_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -1292,33 +1292,33 @@ __device__ inline void dotcache_qwen35_delta_chunk_fused_impl(
         float attn = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             v_prime +=
-                dotcache_qwen35_to_float(packed_chunk[packed_row + k_head_dim + k_idx]) *
+                supersonic_qwen35_to_float(packed_chunk[packed_row + k_head_dim + k_idx]) *
                 state[k_idx];
             attn +=
-                dotcache_qwen35_to_float(packed_chunk[packed_row + 2 * k_head_dim + k_idx]) *
+                supersonic_qwen35_to_float(packed_chunk[packed_row + 2 * k_head_dim + k_idx]) *
                 state[k_idx];
         }
-        v_new[t] = dotcache_qwen35_to_float(value[value_base + t * v_head_dim + v_idx]) - v_prime;
+        v_new[t] = supersonic_qwen35_to_float(value[value_base + t * v_head_dim + v_idx]) - v_prime;
         attn_inter[t] = attn;
-        out[out_base + t * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(v_new[t]);
+        out[out_base + t * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(v_new[t]);
         out[out_base + (chunk_size + t) * v_head_dim + v_idx] =
-            dotcache_qwen35_from_float<T>(attn_inter[t]);
+            supersonic_qwen35_from_float<T>(attn_inter[t]);
     }
 
-    const float state_decay = dotcache_qwen35_to_float(packed_chunk[packed_base + 3 * k_head_dim]);
+    const float state_decay = supersonic_qwen35_to_float(packed_chunk[packed_base + 3 * k_head_dim]);
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         float update = 0.0f;
         for (int t = 0; t < chunk_size; ++t) {
             const int packed_row = packed_base + t * packed_width;
-            update += dotcache_qwen35_to_float(packed_chunk[packed_row + k_idx]) * v_new[t];
+            update += supersonic_qwen35_to_float(packed_chunk[packed_row + k_idx]) * v_new[t];
         }
         out[out_base + (2 * chunk_size + k_idx) * v_head_dim + v_idx] =
-            dotcache_qwen35_from_float<T>(state_decay * state[k_idx] + update);
+            supersonic_qwen35_from_float<T>(state_decay * state[k_idx] + update);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_fused_kernel(
+__global__ void supersonic_qwen35_delta_chunk_fused_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -1329,7 +1329,7 @@ __global__ void dotcache_qwen35_delta_chunk_fused_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_fused_impl(
+    supersonic_qwen35_delta_chunk_fused_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -1343,7 +1343,7 @@ __global__ void dotcache_qwen35_delta_chunk_fused_kernel(
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_full_scan_impl(
+__device__ inline void supersonic_qwen35_delta_full_scan_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1376,7 +1376,7 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -1392,10 +1392,10 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
             float attn = 0.0f;
             const int row = chunk_scan + t * k_head_dim;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(k_cumdecay_scan[row + k_idx]) * state[k_idx];
-                attn += dotcache_qwen35_to_float(q_state_scan[row + k_idx]) * state[k_idx];
+                v_prime += supersonic_qwen35_to_float(k_cumdecay_scan[row + k_idx]) * state[k_idx];
+                attn += supersonic_qwen35_to_float(q_state_scan[row + k_idx]) * state[k_idx];
             }
-            v_new[t] = dotcache_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) -
+            v_new[t] = supersonic_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) -
                 v_prime;
             attn_inter[t] = attn;
         }
@@ -1404,18 +1404,18 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
             float local = 0.0f;
             const int row = chunk_local + t * chunk_size;
             for (int s = 0; s < chunk_size; ++s) {
-                local += dotcache_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
+                local += supersonic_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
             }
             out[out_base + (chunk * chunk_size + t) * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(attn_inter[t] + local);
+                supersonic_qwen35_from_float<T>(attn_inter[t] + local);
         }
 
-        const float state_decay = dotcache_qwen35_to_float(state_decay_scan[decay_base + chunk]);
+        const float state_decay = supersonic_qwen35_to_float(state_decay_scan[decay_base + chunk]);
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             float update = 0.0f;
             for (int t = 0; t < chunk_size; ++t) {
                 const int row = chunk_scan + t * k_head_dim;
-                update += dotcache_qwen35_to_float(weighted_key_scan[row + k_idx]) * v_new[t];
+                update += supersonic_qwen35_to_float(weighted_key_scan[row + k_idx]) * v_new[t];
             }
             state[k_idx] = state_decay * state[k_idx] + update;
         }
@@ -1423,12 +1423,12 @@ __device__ inline void dotcache_qwen35_delta_full_scan_impl(
 
     const int state_out = out_base + token_count * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_local_attn_scan_flat_kernel(
+__global__ void supersonic_qwen35_delta_local_attn_scan_flat_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1450,27 +1450,27 @@ __global__ void dotcache_qwen35_delta_local_attn_scan_flat_kernel(
     const int bh = tid / (num_chunks * chunk_size * chunk_size);
 
     if (col > row_in_chunk) {
-        out[tid] = dotcache_qwen35_from_float<T>(0.0f);
+        out[tid] = supersonic_qwen35_from_float<T>(0.0f);
         return;
     }
 
     const int row_base =
         ((bh * num_chunks + chunk) * chunk_size + row_in_chunk) * k_head_dim;
     const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
-    const float dot = dotcache_qwen35_dot_row(
+    const float dot = supersonic_qwen35_dot_row(
         query_scan + row_base,
         key_scan + col_base,
         k_head_dim);
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
-    const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+    const float exp_g_t = supersonic_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_s = supersonic_qwen35_to_float(exp_g_scan[exp_base + col]);
     const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-    out[tid] = dotcache_qwen35_from_float<T>(dot * decay);
+    out[tid] = supersonic_qwen35_from_float<T>(dot * decay);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_local_attn_scan_row_kernel(
+__global__ void supersonic_qwen35_delta_local_attn_scan_row_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1501,30 +1501,30 @@ __global__ void dotcache_qwen35_delta_local_attn_scan_row_kernel(
     __syncthreads();
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_t = supersonic_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
     const int out_base = (bh * num_chunks + chunk) * chunk_size * chunk_size;
 
     for (int col = lane; col < chunk_size; col += blockDim.x) {
         const int out_idx = out_base + row_in_chunk * chunk_size + col;
         if (col > row_in_chunk) {
-            out[out_idx] = dotcache_qwen35_from_float<T>(0.0f);
+            out[out_idx] = supersonic_qwen35_from_float<T>(0.0f);
             continue;
         }
 
         const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
-        const float dot = dotcache_qwen35_dot_row(
+        const float dot = supersonic_qwen35_dot_row(
             query_row,
             key_scan + col_base,
             k_head_dim);
 
-        const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+        const float exp_g_s = supersonic_qwen35_to_float(exp_g_scan[exp_base + col]);
         const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-        out[out_idx] = dotcache_qwen35_from_float<T>(dot * decay);
+        out[out_idx] = supersonic_qwen35_from_float<T>(dot * decay);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
+__global__ void supersonic_qwen35_delta_base_attn_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1546,7 +1546,7 @@ __global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
     const int bh = tid / (num_chunks * chunk_size * chunk_size);
 
     if (col >= row_in_chunk) {
-        out[tid] = dotcache_qwen35_from_float<T>(0.0f);
+        out[tid] = supersonic_qwen35_from_float<T>(0.0f);
         return;
     }
 
@@ -1555,19 +1555,19 @@ __global__ void dotcache_qwen35_delta_base_attn_scan_kernel(
     const int col_base = ((bh * num_chunks + chunk) * chunk_size + col) * k_head_dim;
     float dot = 0.0f;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        dot += dotcache_qwen35_to_float(k_beta_scan[row_base + k_idx]) *
-               dotcache_qwen35_to_float(key_scan[col_base + k_idx]);
+        dot += supersonic_qwen35_to_float(k_beta_scan[row_base + k_idx]) *
+               supersonic_qwen35_to_float(key_scan[col_base + k_idx]);
     }
 
     const int exp_base = (bh * num_chunks + chunk) * chunk_size;
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
-    const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[exp_base + col]);
+    const float exp_g_t = supersonic_qwen35_to_float(exp_g_scan[exp_base + row_in_chunk]);
+    const float exp_g_s = supersonic_qwen35_to_float(exp_g_scan[exp_base + col]);
     const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
-    out[tid] = dotcache_qwen35_from_float<T>(-dot * decay);
+    out[tid] = supersonic_qwen35_from_float<T>(-dot * decay);
 }
 
 template <typename T, int MAX_CHUNK = 64>
-__global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
+__global__ void supersonic_qwen35_delta_attn_solve_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1590,10 +1590,10 @@ __global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
 
     for (int i = 1; i < chunk_size; ++i) {
         for (int j = 0; j < i; ++j) {
-            const float row_val = dotcache_qwen35_to_float(base_attn_scan[base + i * chunk_size + j]);
+            const float row_val = supersonic_qwen35_to_float(base_attn_scan[base + i * chunk_size + j]);
             float correction = 0.0f;
             for (int k = 0; k < i; ++k) {
-                correction += dotcache_qwen35_to_float(base_attn_scan[base + i * chunk_size + k]) *
+                correction += supersonic_qwen35_to_float(base_attn_scan[base + i * chunk_size + k]) *
                     rows[k * chunk_size + j];
             }
             rows[i * chunk_size + j] = row_val + correction;
@@ -1606,13 +1606,13 @@ __global__ void dotcache_qwen35_delta_attn_solve_scan_kernel(
             if (i == j) {
                 value += 1.0f;
             }
-            out[base + i * chunk_size + j] = dotcache_qwen35_from_float<T>(value);
+            out[base + i * chunk_size + j] = supersonic_qwen35_from_float<T>(value);
         }
     }
 }
 
 template <typename T, int MAX_CHUNK = 64>
-__global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
+__global__ void supersonic_qwen35_delta_attn_solve_from_inputs_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -1639,16 +1639,16 @@ __global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
     }
 
     for (int i = 1; i < chunk_size; ++i) {
-        const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[chunk_base + i]);
+        const float exp_g_t = supersonic_qwen35_to_float(exp_g_scan[chunk_base + i]);
         for (int k = 0; k < i; ++k) {
             const int row_base = qk_base + i * k_head_dim;
             const int col_base = qk_base + k * k_head_dim;
             float dot = 0.0f;
             for (int d = 0; d < k_head_dim; ++d) {
-                dot += dotcache_qwen35_to_float(k_beta_scan[row_base + d]) *
-                    dotcache_qwen35_to_float(key_scan[col_base + d]);
+                dot += supersonic_qwen35_to_float(k_beta_scan[row_base + d]) *
+                    supersonic_qwen35_to_float(key_scan[col_base + d]);
             }
-            const float exp_g_s = dotcache_qwen35_to_float(exp_g_scan[chunk_base + k]);
+            const float exp_g_s = supersonic_qwen35_to_float(exp_g_scan[chunk_base + k]);
             const float decay = exp_g_s != 0.0f ? (exp_g_t / exp_g_s) : 0.0f;
             base_row[k] = -dot * decay;
         }
@@ -1667,13 +1667,13 @@ __global__ void dotcache_qwen35_delta_attn_solve_from_inputs_kernel(
             if (i == j) {
                 value += 1.0f;
             }
-            out[out_base + i * chunk_size + j] = dotcache_qwen35_from_float<T>(value);
+            out[out_base + i * chunk_size + j] = supersonic_qwen35_from_float<T>(value);
         }
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_swiglu_mul_kernel(
+__global__ void supersonic_qwen35_swiglu_mul_kernel(
     int elem_count,
     const T* gate,
     const T* up,
@@ -1683,14 +1683,14 @@ __global__ void dotcache_qwen35_swiglu_mul_kernel(
     if (idx >= elem_count) {
         return;
     }
-    const float gate_x = dotcache_qwen35_to_float(gate[idx]);
-    const float up_x = dotcache_qwen35_to_float(up[idx]);
+    const float gate_x = supersonic_qwen35_to_float(gate[idx]);
+    const float up_x = supersonic_qwen35_to_float(up[idx]);
     const float silu = gate_x / (1.0f + expf(-gate_x));
-    out[idx] = dotcache_qwen35_from_float<T>(silu * up_x);
+    out[idx] = supersonic_qwen35_from_float<T>(silu * up_x);
 }
 
 template <typename T, typename IndexT>
-__global__ void dotcache_qwen35_embedding_lookup_kernel(
+__global__ void supersonic_qwen35_embedding_lookup_kernel(
     int token_count,
     int vocab_size,
     int hidden_size,
@@ -1707,14 +1707,14 @@ __global__ void dotcache_qwen35_embedding_lookup_kernel(
     const int col = idx - token_idx * hidden_size;
     const int64_t row = static_cast<int64_t>(indexes[token_idx]);
     if (row < 0 || row >= static_cast<int64_t>(vocab_size)) {
-        out[idx] = dotcache_qwen35_from_float<T>(0.0f);
+        out[idx] = supersonic_qwen35_from_float<T>(0.0f);
         return;
     }
     out[idx] = embeddings[row * hidden_size + col];
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_output_projection_lookup_kernel(
+__global__ void supersonic_qwen35_output_projection_lookup_kernel(
     int rows,
     int hidden_size,
     int vocab_size,
@@ -1733,13 +1733,13 @@ __global__ void dotcache_qwen35_output_projection_lookup_kernel(
     const T* row_weight = weights + static_cast<size_t>(vocab) * static_cast<size_t>(hidden_size);
     float acc = 0.0f;
     for (int col = 0; col < hidden_size; ++col) {
-        acc += dotcache_qwen35_to_float(row_hidden[col]) * dotcache_qwen35_to_float(row_weight[col]);
+        acc += supersonic_qwen35_to_float(row_hidden[col]) * supersonic_qwen35_to_float(row_weight[col]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = supersonic_qwen35_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_causal_mask_kernel(
+__global__ void supersonic_qwen35_causal_mask_kernel(
     int batch_size,
     int tgt_len,
     int seqlen_offset,
@@ -1754,11 +1754,11 @@ __global__ void dotcache_qwen35_causal_mask_kernel(
     const int col = idx % kv_len;
     const int row = (idx / kv_len) % tgt_len;
     const bool allowed = col <= (seqlen_offset + row);
-    out[idx] = dotcache_qwen35_from_float<T>(allowed ? 0.0f : -INFINITY);
+    out[idx] = supersonic_qwen35_from_float<T>(allowed ? 0.0f : -INFINITY);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_cumsum_last_dim_kernel(
+__global__ void supersonic_qwen35_cumsum_last_dim_kernel(
     int rows,
     int cols,
     const T* xs,
@@ -1771,13 +1771,13 @@ __global__ void dotcache_qwen35_cumsum_last_dim_kernel(
     const int row_offset = row * cols;
     float acc = 0.0f;
     for (int col = 0; col < cols; ++col) {
-        acc += dotcache_qwen35_to_float(xs[row_offset + col]);
-        out[row_offset + col] = dotcache_qwen35_from_float<T>(acc);
+        acc += supersonic_qwen35_to_float(xs[row_offset + col]);
+        out[row_offset + col] = supersonic_qwen35_from_float<T>(acc);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_exp_kernel(
+__global__ void supersonic_qwen35_exp_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -1786,11 +1786,11 @@ __global__ void dotcache_qwen35_exp_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(expf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = supersonic_qwen35_from_float<T>(expf(supersonic_qwen35_to_float(xs[idx])));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_recip_kernel(
+__global__ void supersonic_qwen35_recip_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -1799,11 +1799,11 @@ __global__ void dotcache_qwen35_recip_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(1.0f / dotcache_qwen35_to_float(xs[idx]));
+    out[idx] = supersonic_qwen35_from_float<T>(1.0f / supersonic_qwen35_to_float(xs[idx]));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_sigmoid_kernel(
+__global__ void supersonic_qwen35_sigmoid_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -1812,13 +1812,13 @@ __global__ void dotcache_qwen35_sigmoid_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(
-        dotcache_qwen35_sigmoid_fast(dotcache_qwen35_to_float(xs[idx]))
+    out[idx] = supersonic_qwen35_from_float<T>(
+        supersonic_qwen35_sigmoid_fast(supersonic_qwen35_to_float(xs[idx]))
     );
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_log_kernel(
+__global__ void supersonic_qwen35_log_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -1827,11 +1827,11 @@ __global__ void dotcache_qwen35_log_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(logf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = supersonic_qwen35_from_float<T>(logf(supersonic_qwen35_to_float(xs[idx])));
 }
 
 template <typename In, typename Out>
-__global__ void dotcache_qwen35_cast_kernel(
+__global__ void supersonic_qwen35_cast_kernel(
     int total_elems,
     const In* xs,
     Out* out
@@ -1840,10 +1840,10 @@ __global__ void dotcache_qwen35_cast_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<Out>(dotcache_qwen35_to_float(xs[idx]));
+    out[idx] = supersonic_qwen35_from_float<Out>(supersonic_qwen35_to_float(xs[idx]));
 }
 
-__device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
+__device__ __forceinline__ float supersonic_qwen35_unary_op_apply(
     int op,
     float x,
     float scalar
@@ -1854,7 +1854,7 @@ __device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
     case 1:
         return 1.0f / x;
     case 2:
-        return dotcache_qwen35_sigmoid_fast(x);
+        return supersonic_qwen35_sigmoid_fast(x);
     case 3:
         return logf(x);
     case 4:
@@ -1869,7 +1869,7 @@ __device__ __forceinline__ float dotcache_qwen35_unary_op_apply(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_unary_view_kernel(
+__global__ void supersonic_qwen35_unary_view_kernel(
     int op,
     int rank,
     size_t total_elems,
@@ -1891,12 +1891,12 @@ __global__ void dotcache_qwen35_unary_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         in_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    const float x = dotcache_qwen35_to_float(xs[in_offset]);
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_unary_op_apply(op, x, scalar));
+    const float x = supersonic_qwen35_to_float(xs[in_offset]);
+    out[idx] = supersonic_qwen35_from_float<T>(supersonic_qwen35_unary_op_apply(op, x, scalar));
 }
 
 template <typename In, typename Out>
-__global__ void dotcache_qwen35_cast_view_kernel(
+__global__ void supersonic_qwen35_cast_view_kernel(
     int rank,
     size_t total_elems,
     const In* xs,
@@ -1916,11 +1916,11 @@ __global__ void dotcache_qwen35_cast_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         in_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    out[idx] = dotcache_qwen35_from_float<Out>(dotcache_qwen35_to_float(xs[in_offset]));
+    out[idx] = supersonic_qwen35_from_float<Out>(supersonic_qwen35_to_float(xs[in_offset]));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_binary_broadcast_kernel(
+__global__ void supersonic_qwen35_binary_broadcast_kernel(
     int op,
     int rank,
     size_t total_elems,
@@ -1947,13 +1947,13 @@ __global__ void dotcache_qwen35_binary_broadcast_kernel(
         rhs_offset += static_cast<size_t>(coord) * static_cast<size_t>(rhs_strides[dim]);
     }
 
-    const float lhs_f = dotcache_qwen35_to_float(lhs[lhs_offset]);
-    const float rhs_f = dotcache_qwen35_to_float(rhs[rhs_offset]);
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_binary_op_apply(op, lhs_f, rhs_f));
+    const float lhs_f = supersonic_qwen35_to_float(lhs[lhs_offset]);
+    const float rhs_f = supersonic_qwen35_to_float(rhs[rhs_offset]);
+    out[idx] = supersonic_qwen35_from_float<T>(supersonic_qwen35_binary_op_apply(op, lhs_f, rhs_f));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_mul_scalar_kernel(
+__global__ void supersonic_qwen35_mul_scalar_kernel(
     int total_elems,
     float scalar,
     const T* xs,
@@ -1963,11 +1963,11 @@ __global__ void dotcache_qwen35_mul_scalar_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_to_float(xs[idx]) * scalar);
+    out[idx] = supersonic_qwen35_from_float<T>(supersonic_qwen35_to_float(xs[idx]) * scalar);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_add_scalar_kernel(
+__global__ void supersonic_qwen35_add_scalar_kernel(
     int total_elems,
     float scalar,
     const T* xs,
@@ -1977,11 +1977,11 @@ __global__ void dotcache_qwen35_add_scalar_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(dotcache_qwen35_to_float(xs[idx]) + scalar);
+    out[idx] = supersonic_qwen35_from_float<T>(supersonic_qwen35_to_float(xs[idx]) + scalar);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_sqrt_kernel(
+__global__ void supersonic_qwen35_sqrt_kernel(
     int total_elems,
     const T* xs,
     T* out
@@ -1990,11 +1990,11 @@ __global__ void dotcache_qwen35_sqrt_kernel(
     if (idx >= total_elems) {
         return;
     }
-    out[idx] = dotcache_qwen35_from_float<T>(sqrtf(dotcache_qwen35_to_float(xs[idx])));
+    out[idx] = supersonic_qwen35_from_float<T>(sqrtf(supersonic_qwen35_to_float(xs[idx])));
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_reduce_keepdim_kernel(
+__global__ void supersonic_qwen35_reduce_keepdim_kernel(
     int outer,
     int reduce,
     int inner,
@@ -2010,20 +2010,20 @@ __global__ void dotcache_qwen35_reduce_keepdim_kernel(
     const int outer_idx = idx / inner;
     const int inner_idx = idx % inner;
     const int base = (outer_idx * reduce) * inner + inner_idx;
-    float acc = dotcache_qwen35_to_float(xs[base]);
+    float acc = supersonic_qwen35_to_float(xs[base]);
     for (int r = 1; r < reduce; ++r) {
-        const float value = dotcache_qwen35_to_float(xs[base + r * inner]);
+        const float value = supersonic_qwen35_to_float(xs[base + r * inner]);
         if (sum) {
             acc += value;
         } else {
             acc = value > acc ? value : acc;
         }
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = supersonic_qwen35_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
+__global__ void supersonic_qwen35_reduce_keepdim_view_kernel(
     int rank,
     int reduce_dim,
     size_t reduce_len,
@@ -2046,9 +2046,9 @@ __global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
         remaining /= static_cast<size_t>(out_dim);
         base_offset += static_cast<size_t>(coord) * static_cast<size_t>(in_strides[dim]);
     }
-    float acc = dotcache_qwen35_to_float(xs[base_offset]);
+    float acc = supersonic_qwen35_to_float(xs[base_offset]);
     for (size_t r = 1; r < reduce_len; ++r) {
-        const float value = dotcache_qwen35_to_float(
+        const float value = supersonic_qwen35_to_float(
             xs[base_offset + r * static_cast<size_t>(in_strides[reduce_dim])]);
         if (sum) {
             acc += value;
@@ -2056,11 +2056,11 @@ __global__ void dotcache_qwen35_reduce_keepdim_view_kernel(
             acc = value > acc ? value : acc;
         }
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = supersonic_qwen35_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_batched_matmul_kernel(
+__global__ void supersonic_qwen35_batched_matmul_kernel(
     int batch_rank,
     size_t batch_elems,
     int m,
@@ -2084,23 +2084,23 @@ __global__ void dotcache_qwen35_batched_matmul_kernel(
     const int row = static_cast<int>(matrix_idx / static_cast<size_t>(n));
     const int col = static_cast<int>(matrix_idx % static_cast<size_t>(n));
 
-    const size_t lhs_batch_idx = dotcache_qwen35_broadcast_elem_index(
+    const size_t lhs_batch_idx = supersonic_qwen35_broadcast_elem_index(
         batch_idx, batch_rank, out_batch_dims, lhs_batch_dims);
-    const size_t rhs_batch_idx = dotcache_qwen35_broadcast_elem_index(
+    const size_t rhs_batch_idx = supersonic_qwen35_broadcast_elem_index(
         batch_idx, batch_rank, out_batch_dims, rhs_batch_dims);
 
     const size_t lhs_base = lhs_batch_idx * static_cast<size_t>(m) * static_cast<size_t>(k);
     const size_t rhs_base = rhs_batch_idx * static_cast<size_t>(k) * static_cast<size_t>(n);
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        acc += dotcache_qwen35_to_float(lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(kk)]) *
-               dotcache_qwen35_to_float(rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(n) + static_cast<size_t>(col)]);
+        acc += supersonic_qwen35_to_float(lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(k) + static_cast<size_t>(kk)]) *
+               supersonic_qwen35_to_float(rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(n) + static_cast<size_t>(col)]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = supersonic_qwen35_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_batched_matmul_view_kernel(
+__global__ void supersonic_qwen35_batched_matmul_view_kernel(
     int batch_rank,
     size_t batch_elems,
     int m,
@@ -2141,18 +2141,18 @@ __global__ void dotcache_qwen35_batched_matmul_view_kernel(
 
     float acc = 0.0f;
     for (int kk = 0; kk < k; ++kk) {
-        acc += dotcache_qwen35_to_float(
+        acc += supersonic_qwen35_to_float(
                    lhs[lhs_base + static_cast<size_t>(row) * static_cast<size_t>(lhs_row_stride) +
                        static_cast<size_t>(kk) * static_cast<size_t>(lhs_k_stride)]) *
-               dotcache_qwen35_to_float(
+               supersonic_qwen35_to_float(
                    rhs[rhs_base + static_cast<size_t>(kk) * static_cast<size_t>(rhs_k_stride) +
                        static_cast<size_t>(col) * static_cast<size_t>(rhs_col_stride)]);
     }
-    out[idx] = dotcache_qwen35_from_float<T>(acc);
+    out[idx] = supersonic_qwen35_from_float<T>(acc);
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
+__global__ void supersonic_qwen35_delta_full_scan_pack_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2177,24 +2177,24 @@ __global__ void dotcache_qwen35_delta_full_scan_pack_kernel(
     const int scan_row = row * row_stride;
     const int packed_row = row * packed_width;
 
-    const float exp_g_t = dotcache_qwen35_to_float(exp_g_scan[row]);
-    const float exp_g_last = dotcache_qwen35_to_float(exp_g_scan[bh * num_chunks * chunk_size + chunk * chunk_size + (chunk_size - 1)]);
+    const float exp_g_t = supersonic_qwen35_to_float(exp_g_scan[row]);
+    const float exp_g_last = supersonic_qwen35_to_float(exp_g_scan[bh * num_chunks * chunk_size + chunk * chunk_size + (chunk_size - 1)]);
     const float chunk_decay = exp_g_t != 0.0f ? (exp_g_last / exp_g_t) : 0.0f;
 
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[packed_row + k_idx] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(key_scan[scan_row + k_idx]) * chunk_decay
+        out[packed_row + k_idx] = supersonic_qwen35_from_float<T>(
+            supersonic_qwen35_to_float(key_scan[scan_row + k_idx]) * chunk_decay
         );
         out[packed_row + k_head_dim + k_idx] = k_cumdecay_scan[scan_row + k_idx];
-        out[packed_row + 2 * k_head_dim + k_idx] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(query_scan[scan_row + k_idx]) * exp_g_t
+        out[packed_row + 2 * k_head_dim + k_idx] = supersonic_qwen35_from_float<T>(
+            supersonic_qwen35_to_float(query_scan[scan_row + k_idx]) * exp_g_t
         );
     }
-    out[packed_row + 3 * k_head_dim] = dotcache_qwen35_from_float<T>(exp_g_last);
+    out[packed_row + 3 * k_head_dim] = supersonic_qwen35_from_float<T>(exp_g_last);
 }
 
 template <typename T, int MAX_K = 256, int MAX_CHUNK = 64>
-__device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
+__device__ inline void supersonic_qwen35_delta_full_scan_packed_impl(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2224,7 +2224,7 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
 
     float state[MAX_K];
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        state[k_idx] = dotcache_qwen35_to_float(
+        state[k_idx] = supersonic_qwen35_to_float(
             initial_state[bh * state_stride + k_idx * v_head_dim + v_idx]
         );
     }
@@ -2240,10 +2240,10 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
             float attn = 0.0f;
             const int row = chunk_packed + t * packed_width;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                v_prime += dotcache_qwen35_to_float(packed_scan[row + k_head_dim + k_idx]) * state[k_idx];
-                attn += dotcache_qwen35_to_float(packed_scan[row + 2 * k_head_dim + k_idx]) * state[k_idx];
+                v_prime += supersonic_qwen35_to_float(packed_scan[row + k_head_dim + k_idx]) * state[k_idx];
+                attn += supersonic_qwen35_to_float(packed_scan[row + 2 * k_head_dim + k_idx]) * state[k_idx];
             }
-            v_new[t] = dotcache_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) - v_prime;
+            v_new[t] = supersonic_qwen35_to_float(value[chunk_value + t * v_head_dim + v_idx]) - v_prime;
             attn_inter[t] = attn;
         }
 
@@ -2251,18 +2251,18 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
             float local = 0.0f;
             const int row = chunk_local + t * chunk_size;
             for (int s = 0; s < chunk_size; ++s) {
-                local += dotcache_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
+                local += supersonic_qwen35_to_float(local_attn_scan[row + s]) * v_new[s];
             }
             out[out_base + (chunk * chunk_size + t) * v_head_dim + v_idx] =
-                dotcache_qwen35_from_float<T>(attn_inter[t] + local);
+                supersonic_qwen35_from_float<T>(attn_inter[t] + local);
         }
 
-        const float state_decay = dotcache_qwen35_to_float(packed_scan[chunk_packed + 3 * k_head_dim]);
+        const float state_decay = supersonic_qwen35_to_float(packed_scan[chunk_packed + 3 * k_head_dim]);
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             float update = 0.0f;
             for (int t = 0; t < chunk_size; ++t) {
                 const int row = chunk_packed + t * packed_width;
-                update += dotcache_qwen35_to_float(packed_scan[row + k_idx]) * v_new[t];
+                update += supersonic_qwen35_to_float(packed_scan[row + k_idx]) * v_new[t];
             }
             state[k_idx] = state_decay * state[k_idx] + update;
         }
@@ -2270,12 +2270,12 @@ __device__ inline void dotcache_qwen35_delta_full_scan_packed_impl(
 
     const int state_out = out_base + token_count * v_head_dim;
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state[k_idx]);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state[k_idx]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
+__global__ void supersonic_qwen35_delta_full_scan_packed_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2288,7 +2288,7 @@ __global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_full_scan_packed_impl(
+    supersonic_qwen35_delta_full_scan_packed_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -2304,7 +2304,7 @@ __global__ void dotcache_qwen35_delta_full_scan_packed_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_full_scan_kernel(
+__global__ void supersonic_qwen35_delta_full_scan_kernel(
     int batch_heads,
     int num_chunks,
     int chunk_size,
@@ -2320,7 +2320,7 @@ __global__ void dotcache_qwen35_delta_full_scan_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_full_scan_impl(
+    supersonic_qwen35_delta_full_scan_impl(
         batch_heads,
         num_chunks,
         chunk_size,
@@ -2339,7 +2339,7 @@ __global__ void dotcache_qwen35_delta_full_scan_kernel(
 }
 
 template <typename T, int MAX_CHUNK = 64, int MAX_K = 256>
-__device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
+__device__ inline void supersonic_qwen35_delta_chunk_single_prefill_impl(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -2369,7 +2369,7 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
 
     float g_acc = 0.0f;
     for (int t = 0; t < chunk_size; ++t) {
-        raw_g[t] = dotcache_qwen35_to_float(g_raw[bh * token_stride_s + t]);
+        raw_g[t] = supersonic_qwen35_to_float(g_raw[bh * token_stride_s + t]);
         g_acc += raw_g[t];
         prefix_g[t] = g_acc;
     }
@@ -2382,13 +2382,13 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
             const int row_j_k = bh * token_stride_k + j * k_head_dim;
             float dot = 0.0f;
             for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
-                dot += dotcache_qwen35_to_float(query[row_i_k + k_idx]) *
-                    dotcache_qwen35_to_float(key[row_j_k + k_idx]);
+                dot += supersonic_qwen35_to_float(query[row_i_k + k_idx]) *
+                    supersonic_qwen35_to_float(key[row_j_k + k_idx]);
             }
             const float local = dot * expf(prefix_g[i] - prefix_g[j]);
-            out_i += local * dotcache_qwen35_to_float(value[bh * token_stride_v + j * v_head_dim + v_idx]);
+            out_i += local * supersonic_qwen35_to_float(value[bh * token_stride_v + j * v_head_dim + v_idx]);
         }
-        out[out_base + i * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(out_i);
+        out[out_base + i * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(out_i);
     }
 
     const float g_last = raw_g[chunk_size - 1];
@@ -2396,17 +2396,17 @@ __device__ inline void dotcache_qwen35_delta_chunk_single_prefill_impl(
     for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
         float state = 0.0f;
         for (int t = 0; t < chunk_size; ++t) {
-            const float beta_t = dotcache_qwen35_to_float(beta[bh * token_stride_s + t]);
-            state += dotcache_qwen35_to_float(key[bh * token_stride_k + t * k_head_dim + k_idx]) *
+            const float beta_t = supersonic_qwen35_to_float(beta[bh * token_stride_s + t]);
+            state += supersonic_qwen35_to_float(key[bh * token_stride_k + t * k_head_dim + k_idx]) *
                 expf(g_last - raw_g[t]) *
-                dotcache_qwen35_to_float(value[bh * token_stride_v + t * v_head_dim + v_idx]);
+                supersonic_qwen35_to_float(value[bh * token_stride_v + t * v_head_dim + v_idx]);
         }
-        out[state_out + k_idx * v_head_dim + v_idx] = dotcache_qwen35_from_float<T>(state);
+        out[state_out + k_idx * v_head_dim + v_idx] = supersonic_qwen35_from_float<T>(state);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
+__global__ void supersonic_qwen35_delta_chunk_single_prefill_kernel(
     int batch_heads,
     int chunk_size,
     int k_head_dim,
@@ -2419,7 +2419,7 @@ __global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
     T* out
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    dotcache_qwen35_delta_chunk_single_prefill_impl(
+    supersonic_qwen35_delta_chunk_single_prefill_impl(
         batch_heads,
         chunk_size,
         k_head_dim,
@@ -2435,7 +2435,7 @@ __global__ void dotcache_qwen35_delta_chunk_single_prefill_kernel(
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_l2norm_kernel(
+__global__ void supersonic_qwen35_l2norm_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -2453,7 +2453,7 @@ __global__ void dotcache_qwen35_l2norm_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_in[col]);
+        const float x = supersonic_qwen35_to_float(row_in[col]);
         partial += x * x;
     }
 
@@ -2475,14 +2475,14 @@ __global__ void dotcache_qwen35_l2norm_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        row_out[col] = dotcache_qwen35_from_float<T>(
-            dotcache_qwen35_to_float(row_in[col]) * shared_inv_norm
+        row_out[col] = supersonic_qwen35_from_float<T>(
+            supersonic_qwen35_to_float(row_in[col]) * shared_inv_norm
         );
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_value_decay_kernel(
+__global__ void supersonic_qwen35_value_decay_kernel(
     int total_elems,
     int num_heads,
     const T* a,
@@ -2496,15 +2496,15 @@ __global__ void dotcache_qwen35_value_decay_kernel(
     }
 
     const int head = idx % num_heads;
-    const float a_val = dotcache_qwen35_to_float(a[idx]);
-    const float bias = dotcache_qwen35_to_float(dt_bias[head]);
-    const float decay = dotcache_qwen35_to_float(a_log_exp[head]);
-    const float softplus = dotcache_qwen35_softplus_fast(a_val + bias);
-    out[idx] = dotcache_qwen35_from_float<T>(-softplus * decay);
+    const float a_val = supersonic_qwen35_to_float(a[idx]);
+    const float bias = supersonic_qwen35_to_float(dt_bias[head]);
+    const float decay = supersonic_qwen35_to_float(a_log_exp[head]);
+    const float softplus = supersonic_qwen35_softplus_fast(a_val + bias);
+    out[idx] = supersonic_qwen35_from_float<T>(-softplus * decay);
 }
 
 template <typename T, bool ADD_UNIT_OFFSET>
-__global__ void dotcache_qwen35_rms_norm_kernel(
+__global__ void supersonic_qwen35_rms_norm_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -2523,7 +2523,7 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_in[col]);
+        const float x = supersonic_qwen35_to_float(row_in[col]);
         partial += x * x;
     }
 
@@ -2546,9 +2546,9 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float weight_val = dotcache_qwen35_to_float(weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
-        const float x = dotcache_qwen35_to_float(row_in[col]);
-        row_out[col] = dotcache_qwen35_from_float<T>(x * shared_inv_rms * weight_val);
+        const float weight_val = supersonic_qwen35_to_float(weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
+        const float x = supersonic_qwen35_to_float(row_in[col]);
+        row_out[col] = supersonic_qwen35_from_float<T>(x * shared_inv_rms * weight_val);
     }
 }
 
@@ -2570,7 +2570,7 @@ __global__ void dotcache_qwen35_rms_norm_kernel(
 //
 // Requires shared memory: hidden_dim * sizeof(float) + BLOCK_SIZE * sizeof(float)
 template <typename T, bool ADD_UNIT_OFFSET>
-__global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
+__global__ void supersonic_qwen35_fused_rms_norm_linear_kernel(
     int hidden_dim,
     int out_dim,
     float eps,
@@ -2599,7 +2599,7 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
     // 1a: Accumulate sum of squares
     float partial_sq = 0.0f;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float x = dotcache_qwen35_to_float(hidden[col]);
+        const float x = supersonic_qwen35_to_float(hidden[col]);
         partial_sq += x * x;
     }
     shared_scratch[tid] = partial_sq;
@@ -2622,8 +2622,8 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
 
     const float inv_rms = shared_inv_rms;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float x = dotcache_qwen35_to_float(hidden[col]);
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
+        const float x = supersonic_qwen35_to_float(hidden[col]);
+        const float w = supersonic_qwen35_to_float(norm_weight[col]) + (ADD_UNIT_OFFSET ? 1.0f : 0.0f);
         shared_normed[col] = x * inv_rms * w;
     }
     __syncthreads();
@@ -2633,7 +2633,7 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
 
     float partial_dot = 0.0f;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        partial_dot += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+        partial_dot += supersonic_qwen35_to_float(w_row[col]) * shared_normed[col];
     }
     shared_scratch[tid] = partial_dot;
     __syncthreads();
@@ -2646,12 +2646,12 @@ __global__ void dotcache_qwen35_fused_rms_norm_linear_kernel(
     }
 
     if (tid == 0) {
-        out[out_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+        out[out_row] = supersonic_qwen35_from_float<T>(shared_scratch[0]);
     }
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_rms_norm_gated_kernel(
+__global__ void supersonic_qwen35_rms_norm_gated_kernel(
     int n_rows,
     int n_cols,
     float eps,
@@ -2672,7 +2672,7 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
 
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_hidden[col]);
+        const float x = supersonic_qwen35_to_float(row_hidden[col]);
         partial += x * x;
     }
 
@@ -2695,12 +2695,12 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
-        const float x = dotcache_qwen35_to_float(row_hidden[col]);
-        const float gate_x = dotcache_qwen35_to_float(row_gate[col]);
-    const float gate_silu = gate_x * dotcache_qwen35_sigmoid_fast(gate_x);
-        const float weight_val = dotcache_qwen35_to_float(weight[col]);
+        const float x = supersonic_qwen35_to_float(row_hidden[col]);
+        const float gate_x = supersonic_qwen35_to_float(row_gate[col]);
+    const float gate_silu = gate_x * supersonic_qwen35_sigmoid_fast(gate_x);
+        const float weight_val = supersonic_qwen35_to_float(weight[col]);
         row_out[col] =
-            dotcache_qwen35_from_float<T>(x * shared_inv_rms * weight_val * gate_silu);
+            supersonic_qwen35_from_float<T>(x * shared_inv_rms * weight_val * gate_silu);
     }
 }
 
@@ -2727,7 +2727,7 @@ __global__ void dotcache_qwen35_rms_norm_gated_kernel(
 // =============================================================================
 
 // Device-side wave-level sum reduction (Wave32 on RDNA3.5)
-__device__ inline float dotcache_qwen35_wave_reduce_sum(float val) {
+__device__ inline float supersonic_qwen35_wave_reduce_sum(float val) {
     for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
         val += __shfl_down(val, offset);
     }
@@ -2735,7 +2735,7 @@ __device__ inline float dotcache_qwen35_wave_reduce_sum(float val) {
 }
 
 template <typename T>
-__global__ void dotcache_qwen35_mlp_decode_megakernel(
+__global__ void supersonic_qwen35_mlp_decode_megakernel(
     int hidden_dim,           // 1024
     int intermediate_size,    // 3584
     float norm_eps,
@@ -2767,7 +2767,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
     // Load hidden from global → LDS as F32
     for (int col = tid; col < hidden_dim; col += block_size) {
-        shared_hidden[col] = dotcache_qwen35_to_float(hidden_in[col]);
+        shared_hidden[col] = supersonic_qwen35_to_float(hidden_in[col]);
     }
     __syncthreads();
 
@@ -2795,7 +2795,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
     const float inv_rms = shared_inv_rms;
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + 1.0f;  // add_unit_offset
+        const float w = supersonic_qwen35_to_float(norm_weight[col]) + 1.0f;  // add_unit_offset
         shared_normed[col] = shared_hidden[col] * inv_rms * w;
     }
     __syncthreads();
@@ -2826,7 +2826,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
         float partial = 0.0f;
         for (int col = tid; col < hidden_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+            partial += supersonic_qwen35_to_float(w_row[col]) * shared_normed[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -2851,7 +2851,7 @@ __global__ void dotcache_qwen35_mlp_decode_megakernel(
 
 // SwiGLU activation kernel: silu(gate) * up, element-wise
 template <typename T>
-__global__ void dotcache_qwen35_mlp_swiglu_kernel(
+__global__ void supersonic_qwen35_mlp_swiglu_kernel(
     int intermediate_size,
     float* __restrict__ gate_up_scratch    // [intermediate_size * 2]
 ) {
@@ -2866,7 +2866,7 @@ __global__ void dotcache_qwen35_mlp_swiglu_kernel(
 // down_proj matvec kernel: [hidden_dim, intermediate_size] × SwiGLU[intermediate_size]
 // Block-level work-stealing with full-block reduction.
 template <typename T>
-__global__ void dotcache_qwen35_mlp_down_proj_kernel(
+__global__ void supersonic_qwen35_mlp_down_proj_kernel(
     int hidden_dim,
     int intermediate_size,
     const T* __restrict__ down_proj_w,
@@ -2891,7 +2891,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < intermediate_size; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * swiglu_scratch[col];
+            partial += supersonic_qwen35_to_float(w_row[col]) * swiglu_scratch[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -2904,7 +2904,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
         }
 
         if (tid == 0) {
-            hidden_out[my_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+            hidden_out[my_row] = supersonic_qwen35_from_float<T>(shared_scratch[0]);
         }
         __syncthreads();
     }
@@ -2917,7 +2917,7 @@ __global__ void dotcache_qwen35_mlp_down_proj_kernel(
 // All accumulation in F32 with block-level reduction.
 // =============================================================================
 template <typename T>
-__global__ void dotcache_qwen35_standalone_matvec_kernel(
+__global__ void supersonic_qwen35_standalone_matvec_kernel(
     int out_dim,
     int in_dim,
     const T* __restrict__ weight,      // [out_dim, in_dim]
@@ -2932,7 +2932,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
     // Load input into shared memory as F32
     __shared__ float shared_input[8192];  // max in_dim we support
     for (int col = tid; col < in_dim; col += block_size) {
-        shared_input[col] = dotcache_qwen35_to_float(input[col]);
+        shared_input[col] = supersonic_qwen35_to_float(input[col]);
     }
     __syncthreads();
 
@@ -2949,7 +2949,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < in_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_input[col];
+            partial += supersonic_qwen35_to_float(w_row[col]) * shared_input[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -2962,7 +2962,7 @@ __global__ void dotcache_qwen35_standalone_matvec_kernel(
         }
 
         if (tid == 0) {
-            output[my_row] = dotcache_qwen35_from_float<T>(shared_scratch[0]);
+            output[my_row] = supersonic_qwen35_from_float<T>(shared_scratch[0]);
         }
         __syncthreads();
     }
@@ -2988,7 +2988,7 @@ struct Qwen35ProjectionDesc {
 };
 
 template <typename T>
-__global__ void dotcache_qwen35_norm_multi_proj_kernel(
+__global__ void supersonic_qwen35_norm_multi_proj_kernel(
     int hidden_dim,
     int total_rows,                           // sum of all out_dims
     float norm_eps,
@@ -3009,7 +3009,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 
     // Step 1: Load hidden + RMSNorm
     for (int col = tid; col < hidden_dim; col += block_size) {
-        shared_hidden[col] = dotcache_qwen35_to_float(hidden_in[col]);
+        shared_hidden[col] = supersonic_qwen35_to_float(hidden_in[col]);
     }
     __syncthreads();
 
@@ -3030,7 +3030,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
     __syncthreads();
 
     for (int col = tid; col < hidden_dim; col += block_size) {
-        const float w = dotcache_qwen35_to_float(norm_weight[col]) + 1.0f;
+        const float w = supersonic_qwen35_to_float(norm_weight[col]) + 1.0f;
         shared_normed[col] = shared_hidden[col] * shared_inv_rms * w;
     }
     __syncthreads();
@@ -3061,7 +3061,7 @@ __global__ void dotcache_qwen35_norm_multi_proj_kernel(
 
         float partial = 0.0f;
         for (int col = tid; col < hidden_dim; col += block_size) {
-            partial += dotcache_qwen35_to_float(w_row[col]) * shared_normed[col];
+            partial += supersonic_qwen35_to_float(w_row[col]) * shared_normed[col];
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -3125,7 +3125,7 @@ __device__ inline void block_rms_norm_global(
     }
     float inv = rsqrtf(scratch[0] / static_cast<float>(dim) + eps);
     for (int c = tid; c < dim; c += bs) {
-        dst[c] = src[c] * inv * (dotcache_qwen35_to_float(weight[c]) + 1.0f);
+        dst[c] = src[c] * inv * (supersonic_qwen35_to_float(weight[c]) + 1.0f);
     }
     __syncthreads();
 }

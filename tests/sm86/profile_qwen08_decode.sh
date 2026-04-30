@@ -80,7 +80,7 @@ SUPERSONIC="$REPO_ROOT/target/release/supersonic"
 /usr/local/cuda/bin/ncu \
   --target-processes all \
   --kernel-name-base demangled \
-  --kernel-name 'regex:dotcache_qwen35_persistent_decode_kernel' \
+  --kernel-name 'regex:supersonic_qwen35_persistent_decode_kernel' \
   --launch-count 1 \
   --metrics "$NCU_METRICS" \
   "$SUPERSONIC" \
