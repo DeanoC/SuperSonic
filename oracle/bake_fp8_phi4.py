@@ -375,11 +375,20 @@ def main() -> None:
                     n_quant += 1
                     continue
                 if t.dtype == torch.float8_e4m3fn:
-                    # Future-proofing; Phi-4-mini upstream is BF16 today.
-                    fp8_bytes = t.contiguous().cpu().view(torch.uint8).numpy().tobytes()
-                    writer.add(name, fp8_bytes, list(shape), "f8_e4m3", LAYOUT_FP8_NATIVE)
-                    n_quant += 1
-                    continue
+                    # Phi-4-mini upstream is BF16 today; if a future checkpoint
+                    # ships pre-quantized FP8 projections we'd also need their
+                    # companion `*_scale_inv` tensors so the runtime FP8 path
+                    # has scales to dequantize against. Without them the
+                    # runtime would either silently fall back to BF16 matmul
+                    # against FP8-packed bytes (corrupt results / OOB reads)
+                    # or skip FP8 dispatch entirely. Fail fast until that
+                    # plumbing exists.
+                    raise SystemExit(
+                        f"Phi-4 FP8 baker: source {name} is already "
+                        f"float8_e4m3fn but no companion scale_inv tensor "
+                        f"is available — pre-quantized FP8 sources are not "
+                        f"yet supported. Re-export from a BF16 checkpoint."
+                    )
                 log(f"[bake-fp8-phi4] WARNING: quant target {name} has unexpected "
                     f"dtype {t.dtype}; storing raw")
 
