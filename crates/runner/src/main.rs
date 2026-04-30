@@ -1227,9 +1227,12 @@ fn main() -> Result<()> {
     // preset from a prior run, so switching models doesn't inherit the
     // previous one's grid. No-op on CUDA builds.
     {
-        let (blocks, coop) =
-            registry::qwen35_4b_launch_preset(&entry.arch, &entry.model).unwrap_or((0, false));
+        let preset = registry::qwen35_4b_launch_preset(&entry.arch, &entry.model);
+        let (blocks, coop) = preset.unwrap_or((0, false));
         kernel_ffi::set_qwen35_4b_launch_preset(blocks, coop);
+        if let Some((blocks, coop)) = preset {
+            eprintln!("[preset] qwen35_4b launch: blocks={blocks} cooperative={coop}");
+        }
     }
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
