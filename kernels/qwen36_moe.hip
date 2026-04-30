@@ -989,9 +989,84 @@ __global__ void qwen36_moe_linear_step_kernel(
              i += block_size * num_blocks) {
             output[i] = static_cast<T>(workspace[OFF_QKV_RAW + i]);
         }
+        return;
     }
 
-    // Stages 2..5 hook in here in follow-up commits.
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase C: depthwise conv1d + silu + state update -------------------
+    //
+    // For each output channel ch in [0, qkv_dim):
+    //   conv_in[t] = conv_state_before[ch, t]   for t in [0, kernel-1)
+    //   conv_in[kernel-1] = bf16-rounded qkv_raw[ch]   (already in workspace)
+    //   conv_out_bf = bf16(sum_t(conv_in[t] * conv1d_w[ch, t]) + bias[ch])
+    //   silu_out    = bf16(conv_out_bf * sigmoid(conv_out_bf))
+    //   conv_state_after[ch, 0..kernel-2] = conv_in[1..kernel-1]
+    //
+    // Output channels are independent and the per-channel arithmetic is
+    // small (kernel multiplies + one sigmoid), so we use a strided
+    // thread-per-channel loop instead of block-per-channel work-stealing —
+    // ~256 channels processed per block per stride, much less overhead.
+    //
+    // KERNEL_MAX bounds the local conv_in array; 8 fits 35B-A3B's
+    // conv_kernel_dim=4 with margin and avoids dynamic LDS for the tiny
+    // per-thread scratch. Bigger kernels would just need a bump here.
+    constexpr int KERNEL_MAX = 8;
+    const int kernel = conv_kernel_dim;
+    const int kstate = kernel - 1;
+    const int total_threads = num_blocks * block_size;
+    for (int ch = blockIdx.x * block_size + tid;
+         ch < qkv_dim;
+         ch += total_threads) {
+        // Load conv_state_before (BF16) into a per-thread F32 register window.
+        float conv_in[KERNEL_MAX];
+        for (int t = 0; t < kstate; ++t) {
+            conv_in[t] = static_cast<float>(conv_state[ch * kstate + t]);
+        }
+        // Tail slot is the freshly-projected qkv_raw[ch] (already
+        // BF16-rounded in workspace by Phase B).
+        const float new_qkv = workspace[OFF_QKV_RAW + ch];
+        conv_in[kstate] = new_qkv;
+
+        // Depthwise conv1d: per-channel dot product over the kernel window.
+        float sum = 0.0f;
+        for (int t = 0; t < kernel; ++t) {
+            sum += conv_in[t] * static_cast<float>(conv1d_w[ch * kernel + t]);
+        }
+        // Bias is optional (None on 35B-A3B; the oracle handles both).
+        if (conv1d_bias != nullptr) {
+            sum += static_cast<float>(conv1d_bias[ch]);
+        }
+        // Match PyTorch BF16 conv: the matmul-then-bias result lands in BF16
+        // before silu reads it.
+        const float conv_out_bf = bf16_round_rne_f32(sum);
+
+        // SiLU: x * sigmoid(x) in F32, then BF16-round at the dtype
+        // boundary, exactly as `silu()` in oracle/qwen36_moe_linear_oracle.py.
+        const float sig = 1.0f / (1.0f + expf(-conv_out_bf));
+        const float silu_out = bf16_round_rne_f32(conv_out_bf * sig);
+
+        // Overwrite QKV_RAW slot with SILU_OUT — qkv_raw is no longer
+        // needed after this phase, and the channel layout is identical.
+        workspace[OFF_QKV_RAW + ch] = silu_out;
+
+        // Shift conv_state_before left by one and append the new qkv_raw
+        // at position kstate-1, store back as BF16. Each thread owns its
+        // channel's row — no cross-thread races.
+        for (int t = 0; t < kstate - 1; ++t) {
+            conv_state[ch * kstate + t] =
+                static_cast<T>(conv_in[t + 1]);
+        }
+        conv_state[ch * kstate + (kstate - 1)] = static_cast<T>(new_qkv);
+
+        // Stage 2 publishes silu_out to the host-visible output buffer.
+        if (stage == 2) {
+            output[ch] = static_cast<T>(silu_out);
+        }
+    }
+
+    // Stages 3..5 hook in here in follow-up commits.
 }
 
 } // namespace qwen36_moe

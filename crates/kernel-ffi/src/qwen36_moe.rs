@@ -585,9 +585,9 @@ pub fn linear_step_launch(
             params.stage
         )));
     }
-    if params.stage > 1 {
+    if params.stage > 2 {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::linear_step_launch: stage {} not yet implemented (PR 4b3 step 2 lands stage 1 only)",
+            "qwen36_moe::linear_step_launch: stage {} not yet implemented (PR 4b3 stages 1-2 only)",
             params.stage
         )));
     }
@@ -1742,6 +1742,161 @@ mod tests {
             "linear step1 qkv_raw",
             &got_bytes,
             &qkv_raw_expected_bytes,
+            0.04,
+            0.9999,
+        );
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_linear_step_2_silu_out_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_linear_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON not set. \
+                 See `qwen36_moe_linear_step_1_qkv_raw_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 2 still walks the stage-1 prerequisite (qkv_raw is the
+        // conv1d input), so we need every weight stage 1 needed plus
+        // conv1d_w, the conv state, and (optionally) conv1d_bias.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let in_proj_qkv_w_bytes = b64_decode(weights["in_proj_qkv_w"].as_str().unwrap());
+        let in_proj_z_w_bytes = b64_decode(weights["in_proj_z_w"].as_str().unwrap());
+        let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
+        let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
+        let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
+        let conv1d_bias_bytes = weights.get("conv1d_bias")
+            .and_then(|v| v.as_str())
+            .map(b64_decode);
+        let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
+        let silu_out_expected_bytes = b64_decode(inters["silu_out"].as_str().unwrap());
+        let conv_state_after_expected_bytes =
+            b64_decode(inters["conv_state_after"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let k_us = geom.num_k_heads as usize;
+        let v_us = geom.num_v_heads as usize;
+        let kd_us = geom.head_k_dim as usize;
+        let vd_us = geom.head_v_dim as usize;
+        let kernel = geom.conv_kernel_dim as usize;
+        let kstate = kernel - 1;
+        let key_dim = k_us * kd_us;
+        let val_dim = v_us * vd_us;
+        let qkv_dim = 2 * key_dim + val_dim;
+
+        assert_eq!(conv1d_w_bytes.len(), qkv_dim * 1 * kernel * 2);
+        assert_eq!(conv_state_before_bytes.len(), qkv_dim * kstate * 2);
+        assert_eq!(silu_out_expected_bytes.len(), qkv_dim * 2);
+        assert_eq!(conv_state_after_expected_bytes.len(), qkv_dim * kstate * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let in_proj_qkv_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
+        ).expect("upload in_proj_qkv_w");
+        let in_proj_z_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
+        ).expect("upload in_proj_z_w");
+        let in_proj_a_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
+        ).expect("upload in_proj_a_w");
+        let in_proj_b_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
+        ).expect("upload in_proj_b_w");
+        let conv1d_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
+        ).expect("upload conv1d_w");
+        let conv1d_bias = match &conv1d_bias_bytes {
+            Some(bytes) => Some(
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
+                    .expect("upload conv1d_bias"),
+            ),
+            None => None,
+        };
+        let mut conv_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
+        ).expect("upload conv_state");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[qkv_dim],
+        ).expect("alloc output");
+        let workspace_floats = qkv_dim + val_dim + 2 * v_us;
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[workspace_floats],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 2,
+            hidden: geom.hidden,
+            num_k_heads: geom.num_k_heads,
+            num_v_heads: geom.num_v_heads,
+            head_k_dim: geom.head_k_dim,
+            head_v_dim: geom.head_v_dim,
+            conv_kernel_dim: geom.conv_kernel_dim,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            dt_bias: std::ptr::null(),
+            a_log: std::ptr::null(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: std::ptr::null_mut(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("linear_step_launch stage 2");
+
+        // Stage 2 publishes silu_out as the full output buffer.
+        let got_bytes = output.to_host_bytes().expect("download output");
+        assert_parity(
+            "linear step2 silu_out",
+            &got_bytes,
+            &silu_out_expected_bytes,
+            0.04,
+            0.9999,
+        );
+        // The kernel also updates conv_state in place; verify it matches
+        // the oracle's conv_state_after so the next decode step has the
+        // right starting state.
+        let conv_state_got = conv_state.to_host_bytes().expect("download conv_state");
+        assert_parity(
+            "linear step2 conv_state_after",
+            &conv_state_got,
+            &conv_state_after_expected_bytes,
             0.04,
             0.9999,
         );
