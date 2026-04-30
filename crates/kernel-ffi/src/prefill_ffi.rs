@@ -626,16 +626,16 @@ fn metal_force_host_split_qgate() -> bool {
 
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
-        Backend::Hip => GpuError::Hip(msg),
-        Backend::Cuda => GpuError::Cuda(msg),
-        Backend::Metal => GpuError::Metal(msg),
+        Backend::Hip => GpuError::backend(Backend::Hip, msg),
+        Backend::Cuda => GpuError::backend(Backend::Cuda, msg),
+        Backend::Metal => GpuError::backend(Backend::Metal, msg),
     }
 }
 
 unsafe extern "C" {
     // ---- Existing bridge functions (from full_attention_bridge.cpp) ----
 
-    fn dotcache_qwen35_hip_rms_norm(
+    fn supersonic_qwen35_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -647,7 +647,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_cast(
+    fn supersonic_qwen35_hip_cast(
         input_dtype: c_int,
         output_dtype: c_int,
         device_ordinal: usize,
@@ -658,7 +658,7 @@ unsafe extern "C" {
 
     // ---- Prefill helper bridge functions (from prefill_helpers_bridge.cpp) ----
 
-    fn dotcache_qwen35_hip_element_add(
+    fn supersonic_qwen35_hip_element_add(
         dtype: c_int,
         device_ordinal: usize,
         total_elems: usize,
@@ -667,7 +667,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_apply_rope_prefill(
+    fn supersonic_qwen35_hip_apply_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -679,7 +679,7 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_transpose_shd_hsd(
+    fn supersonic_qwen35_hip_transpose_shd_hsd(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -689,7 +689,7 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_sigmoid_mul(
+    fn supersonic_qwen35_hip_sigmoid_mul(
         dtype: c_int,
         device_ordinal: usize,
         total_elems: usize,
@@ -698,7 +698,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_compute_beta_g(
+    fn supersonic_qwen35_hip_compute_beta_g(
         dtype: c_int,
         device_ordinal: usize,
         seq_len: usize,
@@ -711,7 +711,7 @@ unsafe extern "C" {
         g: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_split_qgate(
+    fn supersonic_qwen35_hip_split_qgate(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -722,7 +722,7 @@ unsafe extern "C" {
         gate_out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_split_qkv(
+    fn supersonic_qwen35_hip_split_qkv(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -734,7 +734,7 @@ unsafe extern "C" {
         v: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_repeat_interleave_heads(
+    fn supersonic_qwen35_hip_repeat_interleave_heads(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -745,7 +745,7 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_transpose_pad_conv(
+    fn supersonic_qwen35_hip_transpose_pad_conv(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -755,7 +755,7 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_extract_conv_state(
+    fn supersonic_qwen35_hip_extract_conv_state(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -765,7 +765,7 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_fused_rms_norm_linear(
+    fn supersonic_qwen35_hip_fused_rms_norm_linear(
         dtype: c_int,
         device_ordinal: usize,
         hidden_dim: usize,
@@ -779,7 +779,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // Tiled BF16 matmul: out = lhs × rhs^T (rhs stored [n, k])
-    fn dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+    fn supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
         dtype: c_int,
         device_ordinal: usize,
         batch_elems: usize,
@@ -792,7 +792,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // FP8 dequant matmul: out = lhs (BF16) × dequant(rhs_fp8)^T
-    fn dotcache_qwen35_4b_hip_matmul_fp8_dequant(
+    fn supersonic_qwen35_4b_hip_matmul_fp8_dequant(
         dtype: c_int,
         device_ordinal: usize,
         batch_elems: usize,
@@ -807,7 +807,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // INT4 dequant matmul: out = lhs (BF16) × dequant(rhs_int4)^T
-    fn dotcache_qwen35_4b_hip_matmul_int4_dequant(
+    fn supersonic_qwen35_4b_hip_matmul_int4_dequant(
         dtype: c_int,
         device_ordinal: usize,
         batch_elems: usize,
@@ -824,7 +824,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[cfg(supersonic_backend_cuda)]
-    fn dotcache_qwen35_4b_hip_matmul_int8(
+    fn supersonic_qwen35_4b_hip_matmul_int8(
         dtype: c_int,
         device_ordinal: usize,
         batch_elems: usize,
@@ -838,7 +838,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[cfg(supersonic_backend_cuda)]
-    fn dotcache_qwen35_4b_hip_int8_outlier_add(
+    fn supersonic_qwen35_4b_hip_int8_outlier_add(
         dtype: c_int,
         device_ordinal: usize,
         rows: c_int,
@@ -853,7 +853,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // BF16 → FP8 KV cache quantization
-    fn dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
+    fn supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
         device_ordinal: usize,
         src: *const c_void,
@@ -868,7 +868,7 @@ unsafe extern "C" {
 
     // ---- Original prefill kernel declarations ----
 
-    fn dotcache_qwen35_hip_embedding_lookup(
+    fn supersonic_qwen35_hip_embedding_lookup(
         dtype: c_int,
         index_dtype: c_int,
         device_ordinal: usize,
@@ -880,7 +880,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_batched_matmul(
+    fn supersonic_qwen35_hip_batched_matmul(
         dtype: c_int,
         device_ordinal: usize,
         batch_rank: c_int,
@@ -896,7 +896,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_full_attention_prefill(
+    fn supersonic_qwen35_hip_full_attention_prefill(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -914,7 +914,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_full_attention_decode_flat(
+    fn supersonic_qwen35_hip_full_attention_decode_flat(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -931,7 +931,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     #[cfg(supersonic_backend_cuda)]
-    fn dotcache_qwen35_hip_full_attention_decode_flat_strided(
+    fn supersonic_qwen35_hip_full_attention_decode_flat_strided(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -948,7 +948,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_linear_prefill_conv_pack(
+    fn supersonic_qwen35_hip_linear_prefill_conv_pack(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -961,7 +961,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_linear_decode_prepare(
+    fn supersonic_qwen35_hip_linear_decode_prepare(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -980,7 +980,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_linear_decode_apply(
+    fn supersonic_qwen35_hip_linear_decode_apply(
         device_ordinal: usize,
         batch_size: usize,
         num_v_heads: usize,
@@ -991,7 +991,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_linear_decode_prepare(
+    fn supersonic_qwen35_4b_hip_linear_decode_prepare(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -1010,7 +1010,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_linear_decode_apply(
+    fn supersonic_qwen35_4b_hip_linear_decode_apply(
         device_ordinal: usize,
         batch_size: usize,
         num_v_heads: usize,
@@ -1021,7 +1021,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_linear_stateful_conv_value_decay(
+    fn supersonic_qwen35_4b_hip_linear_stateful_conv_value_decay(
         dtype: c_int,
         device_ordinal: usize,
         batch_size: usize,
@@ -1039,7 +1039,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_delta_recurrent_prefill(
+    fn supersonic_qwen35_hip_delta_recurrent_prefill(
         dtype: c_int,
         device_ordinal: usize,
         batch_heads: usize,
@@ -1055,7 +1055,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_l2norm(
+    fn supersonic_qwen35_hip_l2norm(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -1065,7 +1065,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_swiglu_mul(
+    fn supersonic_qwen35_hip_swiglu_mul(
         dtype: c_int,
         device_ordinal: usize,
         elem_count: usize,
@@ -1074,7 +1074,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_rms_norm_gated(
+    fn supersonic_qwen35_hip_rms_norm_gated(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -1086,7 +1086,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_mul_scalar(
+    fn supersonic_qwen35_hip_mul_scalar(
         dtype: c_int,
         device_ordinal: usize,
         total_elems: usize,
@@ -1140,7 +1140,7 @@ pub fn embedding_lookup(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_embedding_lookup(
+        supersonic_qwen35_hip_embedding_lookup(
             dtype.kernel_dtype_code(),
             1, // index_dtype=1 → uint32
             ordinal,
@@ -1180,7 +1180,7 @@ pub fn batched_matmul(
     // Simple rank-1 batch (no broadcasting)
     let batch_dims = [batch_elems as c_int];
     let status = unsafe {
-        dotcache_qwen35_hip_batched_matmul(
+        supersonic_qwen35_hip_batched_matmul(
             dtype.kernel_dtype_code(),
             ordinal,
             1, // batch_rank
@@ -1265,7 +1265,7 @@ pub fn full_attention_prefill(
     }
     let num_kv_groups = q_heads / kv_heads;
     let status = unsafe {
-        dotcache_qwen35_hip_full_attention_prefill(
+        supersonic_qwen35_hip_full_attention_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1366,7 +1366,7 @@ pub fn full_attention_decode_flat(
 ) -> Result<(), GpuError> {
     let num_kv_groups = q_heads / kv_heads;
     let status = unsafe {
-        dotcache_qwen35_hip_full_attention_decode_flat(
+        supersonic_qwen35_hip_full_attention_decode_flat(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1425,7 +1425,7 @@ pub fn full_attention_decode_flat_strided(
 
         let num_kv_groups = q_heads / kv_heads;
         let status = unsafe {
-            dotcache_qwen35_hip_full_attention_decode_flat_strided(
+            supersonic_qwen35_hip_full_attention_decode_flat_strided(
                 dtype.kernel_dtype_code(),
                 ordinal,
                 batch_size,
@@ -1501,7 +1501,7 @@ pub fn linear_prefill_conv_pack(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_linear_prefill_conv_pack(
+        supersonic_qwen35_hip_linear_prefill_conv_pack(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1542,7 +1542,7 @@ pub fn linear_decode_prepare(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_qwen35_hip_linear_decode_prepare(
+        supersonic_qwen35_hip_linear_decode_prepare(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1579,7 +1579,7 @@ pub fn linear_decode_apply(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_qwen35_hip_linear_decode_apply(
+        supersonic_qwen35_hip_linear_decode_apply(
             ordinal,
             batch_size,
             num_v_heads,
@@ -1616,7 +1616,7 @@ pub fn linear_decode_prepare_4b(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_qwen35_4b_hip_linear_decode_prepare(
+        supersonic_qwen35_4b_hip_linear_decode_prepare(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1669,7 +1669,7 @@ pub fn linear_decode_apply_4b(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_4b_hip_linear_decode_apply(
+        supersonic_qwen35_4b_hip_linear_decode_apply(
             ordinal,
             batch_size,
             num_v_heads,
@@ -1748,7 +1748,7 @@ pub fn linear_stateful_conv_value_decay_4b(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_4b_hip_linear_stateful_conv_value_decay(
+        supersonic_qwen35_4b_hip_linear_stateful_conv_value_decay(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_size,
@@ -1830,7 +1830,7 @@ pub fn delta_recurrent_prefill(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_delta_recurrent_prefill(
+        supersonic_qwen35_hip_delta_recurrent_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_heads,
@@ -1879,7 +1879,7 @@ pub fn l2norm(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_l2norm(
+        supersonic_qwen35_hip_l2norm(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -1919,7 +1919,7 @@ pub fn swiglu_mul(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_swiglu_mul(
+        supersonic_qwen35_hip_swiglu_mul(
             dtype.kernel_dtype_code(),
             ordinal,
             elem_count,
@@ -1975,7 +1975,7 @@ pub fn rms_norm_gated(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_rms_norm_gated(
+        supersonic_qwen35_hip_rms_norm_gated(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -2017,7 +2017,7 @@ pub fn mul_scalar(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_mul_scalar(
+        supersonic_qwen35_hip_mul_scalar(
             dtype.kernel_dtype_code(),
             ordinal,
             total_elems,
@@ -2074,7 +2074,7 @@ pub fn fused_rms_norm_linear_rows(
             (out.as_mut_ptr() as *mut u8).add(row * out_row_bytes) as *mut std::ffi::c_void
         };
         let status = unsafe {
-            dotcache_qwen35_hip_fused_rms_norm_linear(
+            supersonic_qwen35_hip_fused_rms_norm_linear(
                 dtype.kernel_dtype_code(),
                 ordinal,
                 hidden_dim,
@@ -2175,7 +2175,7 @@ pub fn matmul_rhs_transposed(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+        supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
             dtype.kernel_dtype_code(),
             ordinal,
             batch_elems,
@@ -2233,7 +2233,7 @@ pub fn matmul_rhs_transposed_fp8(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_qwen35_4b_hip_matmul_fp8_dequant(
+        supersonic_qwen35_4b_hip_matmul_fp8_dequant(
             ScalarType::BF16.kernel_dtype_code(),
             ordinal,
             batch_elems,
@@ -2327,7 +2327,7 @@ pub fn matmul_rhs_transposed_int4(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_4b_hip_matmul_int4_dequant(
+        supersonic_qwen35_4b_hip_matmul_int4_dequant(
             ScalarType::BF16.kernel_dtype_code(),
             ordinal,
             batch_elems,
@@ -2378,7 +2378,7 @@ pub fn matmul_rhs_transposed_int8(
         }
 
         let status = unsafe {
-            dotcache_qwen35_4b_hip_matmul_int8(
+            supersonic_qwen35_4b_hip_matmul_int8(
                 ScalarType::BF16.kernel_dtype_code(),
                 ordinal,
                 batch_elems,
@@ -2428,7 +2428,7 @@ pub fn int8_outlier_add(
         }
 
         let status = unsafe {
-            dotcache_qwen35_4b_hip_int8_outlier_add(
+            supersonic_qwen35_4b_hip_int8_outlier_add(
                 ScalarType::BF16.kernel_dtype_code(),
                 ordinal,
                 rows as c_int,
@@ -2492,7 +2492,7 @@ pub fn rms_norm_rows(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_rms_norm(
+        supersonic_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -2552,7 +2552,7 @@ pub fn rms_norm_rows_plain(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_rms_norm(
+        supersonic_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -2614,7 +2614,7 @@ pub fn rms_norm_rows_plain_inplace(
     }
     let ptr = data.as_mut_ptr();
     let status = unsafe {
-        dotcache_qwen35_hip_rms_norm(
+        supersonic_qwen35_hip_rms_norm(
             dtype.kernel_dtype_code(),
             ordinal,
             n_rows,
@@ -2666,7 +2666,7 @@ pub fn element_add_inplace(
     }
     let ptr = lhs_out.as_mut_ptr();
     let status = unsafe {
-        dotcache_qwen35_hip_element_add(
+        supersonic_qwen35_hip_element_add(
             dtype.kernel_dtype_code(),
             ordinal,
             total_elems,
@@ -2707,7 +2707,7 @@ pub fn cast(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_cast(
+        supersonic_qwen35_hip_cast(
             input_dtype.kernel_dtype_code(),
             output_dtype.kernel_dtype_code(),
             ordinal,
@@ -2748,7 +2748,7 @@ pub fn element_add(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_element_add(
+        supersonic_qwen35_hip_element_add(
             dtype.kernel_dtype_code(),
             ordinal,
             total_elems,
@@ -2809,7 +2809,7 @@ pub fn apply_rope_prefill(
     let cos_ptr = cos_table.offset_ptr(table_byte_offset);
     let sin_ptr = sin_table.offset_ptr(table_byte_offset);
     let status = unsafe {
-        dotcache_qwen35_hip_apply_rope_prefill(
+        supersonic_qwen35_hip_apply_rope_prefill(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -2854,7 +2854,7 @@ pub fn transpose_shd_hsd(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_transpose_shd_hsd(
+        supersonic_qwen35_hip_transpose_shd_hsd(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -2898,7 +2898,7 @@ pub fn transpose_pad_conv(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_transpose_pad_conv(
+        supersonic_qwen35_hip_transpose_pad_conv(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -2941,7 +2941,7 @@ pub fn extract_conv_state(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_extract_conv_state(
+        supersonic_qwen35_hip_extract_conv_state(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -2983,7 +2983,7 @@ pub fn sigmoid_mul(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_sigmoid_mul(
+        supersonic_qwen35_hip_sigmoid_mul(
             dtype.kernel_dtype_code(),
             ordinal,
             total_elems,
@@ -3030,7 +3030,7 @@ pub fn compute_beta_g(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_compute_beta_g(
+        supersonic_qwen35_hip_compute_beta_g(
             dtype.kernel_dtype_code(),
             ordinal,
             seq_len,
@@ -3077,7 +3077,7 @@ pub fn split_qgate(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_split_qgate(
+        supersonic_qwen35_hip_split_qgate(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -3124,7 +3124,7 @@ pub fn split_qkv(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_split_qkv(
+        supersonic_qwen35_hip_split_qkv(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -3173,7 +3173,7 @@ pub fn repeat_interleave_heads(
         });
     }
     let status = unsafe {
-        dotcache_qwen35_hip_repeat_interleave_heads(
+        supersonic_qwen35_hip_repeat_interleave_heads(
             dtype.kernel_dtype_code(),
             ordinal,
             s,
@@ -3209,7 +3209,7 @@ pub fn quantize_kv_to_fp8(
     pos_offset: usize,
 ) -> Result<(), GpuError> {
     let status = unsafe {
-        dotcache_qwen35_4b_hip_quantize_kv_to_fp8(
+        supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
             dtype.kernel_dtype_code(),
             ordinal,
             src.as_ptr(),

@@ -1,14 +1,14 @@
 pub mod certified_kv;
 pub mod dflash;
-mod ffi;
 pub mod gemma4;
+mod qwen35;
 mod layer_desc;
 mod metal_host;
 mod metal_native;
 pub mod phi4;
 pub mod prefill_ffi;
 
-pub use ffi::{
+pub use qwen35::{
     cuda_accumulate_target_nll_bf16, cuda_argmax_bf16, cuda_lm_head_argmax_bf16,
     cuda_lm_head_bf16_gemm_4b, cuda_target_nll_bf16, matmul_rhs_transposed_4b,
     metal_argmax_bf16_into, metal_lm_head_argmax_bf16, metal_lm_head_argmax_bf16_into,

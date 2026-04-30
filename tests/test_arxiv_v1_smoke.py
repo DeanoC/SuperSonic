@@ -78,7 +78,7 @@ class ArxivV1SmokeTests(unittest.TestCase):
         self.assertEqual(ref.value, 0.75)
         self.assertEqual(ref.subtask_values["niah_single_4K"], 0.75)
 
-    def test_prompt_seed_matches_dotcache_stable_md5_scheme(self):
+    def test_prompt_seed_matches_supersonic_stable_md5_scheme(self):
         seed_a = stable_seed(20260416, "niah_single", 4096, 0)
         seed_b = stable_seed(20260416, "niah_single", 4096, 0)
         seed_c = stable_seed(20260416, "niah_single", 4096, 1)

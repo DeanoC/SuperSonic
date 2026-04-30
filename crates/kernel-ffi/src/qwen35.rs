@@ -5,7 +5,7 @@ use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 unsafe extern "C" {
-    fn dotcache_qwen35_hip_persistent_decode(
+    fn supersonic_qwen35_hip_persistent_decode(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -23,7 +23,7 @@ unsafe extern "C" {
         rotary_dim: usize,
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
+    fn supersonic_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -41,7 +41,7 @@ unsafe extern "C" {
         rotary_dim: usize,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_rms_norm(
+    fn supersonic_qwen35_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -53,7 +53,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_hip_standalone_matvec(
+    fn supersonic_qwen35_hip_standalone_matvec(
         dtype: c_int,
         device_ordinal: usize,
         in_dim: usize,
@@ -65,7 +65,7 @@ unsafe extern "C" {
     ) -> c_int;
 
     // 4B kernel variant (separate compilation to avoid hipcc codegen issues)
-    fn dotcache_qwen35_4b_hip_persistent_decode(
+    fn supersonic_qwen35_4b_hip_persistent_decode(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -95,7 +95,7 @@ unsafe extern "C" {
         num_taps: usize,           // 0 when tap_workspace is nullptr
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
+    fn supersonic_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
         dtype: c_int,
         device_ordinal: usize,
         num_layers: usize,
@@ -122,7 +122,7 @@ unsafe extern "C" {
         int4_scales: *const c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_rms_norm(
+    fn supersonic_qwen35_4b_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
         n_rows: usize,
@@ -134,7 +134,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_standalone_matvec(
+    fn supersonic_qwen35_4b_hip_standalone_matvec(
         dtype: c_int,
         device_ordinal: usize,
         in_dim: usize,
@@ -145,7 +145,7 @@ unsafe extern "C" {
         row_counter: *mut c_uint,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+    fn supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
         dtype: c_int,
         device_ordinal: usize,
         batch_elems: usize,
@@ -157,7 +157,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_query_gpu_info(
+    fn supersonic_query_gpu_info(
         device_ordinal: c_int,
         arch_name_out: *mut u8,
         arch_name_len: usize,
@@ -170,26 +170,26 @@ unsafe extern "C" {
 // `cudaGetDeviceProperties` on the Rust side).
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn dotcache_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
+    fn supersonic_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
 
     // Per-model launch preset for the qwen4b persistent decode kernel.
     // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
     // default). `coop != 0` opts into `hipLaunchCooperativeKernel` for that
     // preset, which is safe at higher block counts but caps conservatively
     // based on `hipOccupancyMaxActiveBlocksPerMultiprocessor`.
-    fn dotcache_qwen35_4b_hip_set_launch_preset(blocks: c_int, coop: c_int);
+    fn supersonic_qwen35_4b_hip_set_launch_preset(blocks: c_int, coop: c_int);
 }
 
 #[cfg(supersonic_backend_cuda)]
 unsafe extern "C" {
-    fn dotcache_qwen35_cuda_argmax_bf16(
+    fn supersonic_qwen35_cuda_argmax_bf16(
         device_ordinal: usize,
         n: usize,
         logits: *const c_void,
         out_index: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_target_nll_bf16(
+    fn supersonic_qwen35_cuda_target_nll_bf16(
         device_ordinal: usize,
         rows: usize,
         vocab_size: usize,
@@ -198,7 +198,7 @@ unsafe extern "C" {
         out_nll: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+    fn supersonic_qwen35_cuda_accumulate_target_nll_bf16(
         device_ordinal: usize,
         vocab_size: usize,
         logits: *const c_void,
@@ -206,7 +206,7 @@ unsafe extern "C" {
         out_sum: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_cuda_lm_head_argmax_bf16(
+    fn supersonic_qwen35_cuda_lm_head_argmax_bf16(
         device_ordinal: usize,
         hidden_dim: usize,
         vocab_size: usize,
@@ -217,7 +217,7 @@ unsafe extern "C" {
         out_index: *mut c_void,
     ) -> c_int;
 
-    fn dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+    fn supersonic_qwen35_4b_cuda_lm_head_bf16_gemm(
         device_ordinal: usize,
         in_dim: usize,
         out_dim: usize,
@@ -229,17 +229,17 @@ unsafe extern "C" {
 
 fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
-        Backend::Hip => GpuError::Hip(format!("{what} failed with status {status}")),
-        Backend::Cuda => GpuError::Cuda(format!("{what} failed with status {status}")),
-        Backend::Metal => GpuError::Metal(format!("{what} failed with status {status}")),
+        Backend::Hip => GpuError::backend(Backend::Hip, format!("{what} failed with status {status}")),
+        Backend::Cuda => GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}")),
+        Backend::Metal => GpuError::backend(Backend::Metal, format!("{what} failed with status {status}")),
     }
 }
 
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
-        Backend::Hip => GpuError::Hip(msg),
-        Backend::Cuda => GpuError::Cuda(msg),
-        Backend::Metal => GpuError::Metal(msg),
+        Backend::Hip => GpuError::backend(Backend::Hip, msg),
+        Backend::Cuda => GpuError::backend(Backend::Cuda, msg),
+        Backend::Metal => GpuError::backend(Backend::Metal, msg),
     }
 }
 
@@ -268,7 +268,7 @@ pub fn persistent_decode(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_hip_persistent_decode(
+                supersonic_qwen35_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -294,7 +294,7 @@ pub fn persistent_decode(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_hip_persistent_decode(
+                supersonic_qwen35_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -353,7 +353,7 @@ pub fn persistent_decode_qwen08_sm86_specialized(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
+                supersonic_qwen35_cuda_persistent_decode_qwen08_sm86_specialized(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -477,7 +477,7 @@ pub fn persistent_decode_4b(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_4b_hip_persistent_decode(
+                supersonic_qwen35_4b_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -515,7 +515,7 @@ pub fn persistent_decode_4b(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_4b_hip_persistent_decode(
+                supersonic_qwen35_4b_hip_persistent_decode(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -620,7 +620,7 @@ pub fn persistent_decode_4b_qwen35_sm86_specialized(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
+                supersonic_qwen35_cuda_persistent_decode_qwen35_4b_sm86_specialized(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers,
@@ -699,9 +699,9 @@ pub fn cuda_argmax_bf16(
     #[cfg(supersonic_backend_cuda)]
     unsafe {
         let status =
-            dotcache_qwen35_cuda_argmax_bf16(ordinal, n, logits.as_ptr(), out_index.as_mut_ptr());
+            supersonic_qwen35_cuda_argmax_bf16(ordinal, n, logits.as_ptr(), out_index.as_mut_ptr());
         if status != 0 {
-            return Err(GpuError::Cuda(format!(
+            return Err(GpuError::backend(Backend::Cuda, format!(
                 "cuda_argmax_bf16 failed with status {status}"
             )));
         }
@@ -758,7 +758,7 @@ pub fn cuda_lm_head_argmax_bf16(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_qwen35_cuda_lm_head_argmax_bf16(
+        let status = supersonic_qwen35_cuda_lm_head_argmax_bf16(
             ordinal,
             hidden_dim,
             vocab_size,
@@ -769,7 +769,7 @@ pub fn cuda_lm_head_argmax_bf16(
             out_index.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::Cuda(format!(
+            return Err(GpuError::backend(Backend::Cuda, format!(
                 "cuda_lm_head_argmax_bf16 failed with status {status}"
             )));
         }
@@ -825,7 +825,7 @@ pub fn cuda_target_nll_bf16(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_qwen35_cuda_target_nll_bf16(
+        let status = supersonic_qwen35_cuda_target_nll_bf16(
             ordinal,
             rows,
             vocab_size,
@@ -834,7 +834,7 @@ pub fn cuda_target_nll_bf16(
             out_nll.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::Cuda(format!(
+            return Err(GpuError::backend(Backend::Cuda, format!(
                 "cuda_target_nll_bf16 failed with status {status}"
             )));
         }
@@ -877,7 +877,7 @@ pub fn cuda_accumulate_target_nll_bf16(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_qwen35_cuda_accumulate_target_nll_bf16(
+        let status = supersonic_qwen35_cuda_accumulate_target_nll_bf16(
             ordinal,
             vocab_size,
             logits.as_ptr(),
@@ -885,7 +885,7 @@ pub fn cuda_accumulate_target_nll_bf16(
             out_sum.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::Cuda(format!(
+            return Err(GpuError::backend(Backend::Cuda, format!(
                 "cuda_accumulate_target_nll_bf16 failed with status {status}"
             )));
         }
@@ -1084,7 +1084,7 @@ pub fn rms_norm_4b(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_4b_hip_rms_norm(
+                supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     1,
@@ -1104,7 +1104,7 @@ pub fn rms_norm_4b(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_4b_hip_rms_norm(
+                supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     1,
@@ -1165,7 +1165,7 @@ pub fn standalone_matvec_4b(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_4b_hip_standalone_matvec(
+                supersonic_qwen35_4b_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     in_dim,
@@ -1184,7 +1184,7 @@ pub fn standalone_matvec_4b(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_4b_hip_standalone_matvec(
+                supersonic_qwen35_4b_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     in_dim,
@@ -1258,7 +1258,7 @@ pub fn cuda_lm_head_bf16_gemm_4b(
     }
     #[cfg(supersonic_backend_cuda)]
     unsafe {
-        let status = dotcache_qwen35_4b_cuda_lm_head_bf16_gemm(
+        let status = supersonic_qwen35_4b_cuda_lm_head_bf16_gemm(
             ordinal,
             in_dim,
             out_dim,
@@ -1298,7 +1298,7 @@ pub fn rms_norm_4b_multirow(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_4b_hip_rms_norm(
+                supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     n_rows,
@@ -1318,7 +1318,7 @@ pub fn rms_norm_4b_multirow(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_4b_hip_rms_norm(
+                supersonic_qwen35_4b_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     n_rows,
@@ -1368,7 +1368,7 @@ pub fn matmul_rhs_transposed_4b(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+                supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     batch_elems,
@@ -1388,7 +1388,7 @@ pub fn matmul_rhs_transposed_4b(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+                supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     batch_elems,
@@ -1447,7 +1447,7 @@ pub fn rms_norm(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_hip_rms_norm(
+                supersonic_qwen35_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     1,
@@ -1467,7 +1467,7 @@ pub fn rms_norm(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_hip_rms_norm(
+                supersonic_qwen35_hip_rms_norm(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     1,
@@ -1604,7 +1604,7 @@ pub fn standalone_matvec(
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
-                dotcache_qwen35_hip_standalone_matvec(
+                supersonic_qwen35_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     in_dim,
@@ -1623,7 +1623,7 @@ pub fn standalone_matvec(
         Backend::Cuda => {
             #[cfg(supersonic_backend_cuda)]
             unsafe {
-                dotcache_qwen35_hip_standalone_matvec(
+                supersonic_qwen35_hip_standalone_matvec(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     in_dim,
@@ -1750,7 +1750,7 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
         let mut arch_name = vec![0u8; 64];
         let mut total_vram = 0u64;
         let status = unsafe {
-            dotcache_query_gpu_info(
+            supersonic_query_gpu_info(
                 ordinal as c_int,
                 arch_name.as_mut_ptr(),
                 arch_name.len(),
@@ -1759,7 +1759,7 @@ pub fn query_gpu_info(ordinal: usize) -> Result<(String, u64), GpuError> {
         };
         if status != 0 {
             return Err(ffi_error(format!(
-                "dotcache_query_gpu_info failed with status {status}"
+                "supersonic_query_gpu_info failed with status {status}"
             )));
         }
         let nul_pos = arch_name
@@ -1784,7 +1784,7 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
     #[cfg(supersonic_backend_hip)]
     {
         let mut clock_khz: u32 = 0;
-        let status = unsafe { dotcache_hip_device_clock_khz(ordinal as c_int, &mut clock_khz) };
+        let status = unsafe { supersonic_hip_device_clock_khz(ordinal as c_int, &mut clock_khz) };
         if status != 0 {
             return Err(ffi_error(format!(
                 "hip_device_clock_khz failed with status {status}"
@@ -1804,7 +1804,7 @@ pub fn query_hip_device_clock_khz(ordinal: usize) -> Result<u32, GpuError> {
 pub fn set_qwen35_4b_launch_preset(blocks: i32, coop: bool) {
     #[cfg(supersonic_backend_hip)]
     unsafe {
-        dotcache_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
+        supersonic_qwen35_4b_hip_set_launch_preset(blocks as c_int, if coop { 1 } else { 0 });
     }
     #[cfg(not(supersonic_backend_hip))]
     {

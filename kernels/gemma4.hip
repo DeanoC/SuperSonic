@@ -8,7 +8,7 @@
 // gemma4.hip / full_attention.hip is intentional and preferred over risking
 // Qwen kernels.
 //
-// Symbols use the `g4_` prefix (kernels) and `dotcache_gemma4_hip_` prefix
+// Symbols use the `g4_` prefix (kernels) and `supersonic_gemma4_hip_` prefix
 // (extern "C" bridge entry points) to avoid collisions with the Qwen
 // kernels linked into the same static library.
 
@@ -3188,7 +3188,7 @@ __global__ void g4_embed_gather_scaled_kernel(
 // Persistent decode megakernel — one launch runs the entire Gemma 4 forward
 // pass for a single decode token across all `num_layers` decoder layers.
 // Matches the layer-by-layer dispatch pattern of Qwen's
-// `dotcache_qwen35_persistent_decode_kernel` but with Gemma 4's dual attention
+// `supersonic_qwen35_persistent_decode_kernel` but with Gemma 4's dual attention
 // shapes (sliding vs. full) and the PLE branch after the MLP.
 //
 // Per-layer work copies the phase sequence from `g4_fused_attn_block_kernel`

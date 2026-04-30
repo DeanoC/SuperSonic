@@ -1221,14 +1221,18 @@ fn main() -> Result<()> {
     };
     let host_lm_head_rescorer = HostLmHeadRescorer::from_model_dir(&cli.model_dir)?;
 
-    // Install the per-model HIP launch preset (grid size + cooperative
-    // flag) if the registry specifies one. User env vars still override
-    // inside the bridge. Always called — `None` clears any stale preset
-    // from a prior run, so switching models doesn't inherit the previous
-    // one's grid. No-op on CUDA builds.
+    // Install the per-(arch, model) HIP launch preset (grid size +
+    // cooperative flag) if one is registered. User env vars still override
+    // inside the bridge. Always called — `(0, false)` clears any stale
+    // preset from a prior run, so switching models doesn't inherit the
+    // previous one's grid. No-op on CUDA builds.
     {
-        let (blocks, coop) = params.hip_launch_preset.unwrap_or((0, false));
+        let preset = registry::qwen35_4b_launch_preset(&entry.arch, &entry.model);
+        let (blocks, coop) = preset.unwrap_or((0, false));
         kernel_ffi::set_qwen35_4b_launch_preset(blocks, coop);
+        if let Some((blocks, coop)) = preset {
+            eprintln!("[preset] qwen35_4b launch: blocks={blocks} cooperative={coop}");
+        }
     }
 
     if cli.trace_kv_fp8_cache && !cli.kv_fp8 {
