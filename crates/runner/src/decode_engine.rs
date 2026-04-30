@@ -2236,18 +2236,24 @@ impl DecodeEngine {
             let cap_stride = cap * head_dim * elem_bytes;
             let contig_stride = prefix_len * head_dim * elem_bytes;
 
-            let tmp_k = GpuBuffer::from_host_bytes(
+            // One-shot scratch: written once via H2D, DMA'd into shadow_k/v
+            // exactly once, then dropped at end of this iteration. No
+            // re-read, so GPU L2 is irrelevant — Scratch lets gfx1150 skip
+            // the H2D driver call (host-mapped pointer = host data target).
+            let tmp_k = GpuBuffer::from_host_bytes_with_kind(
                 ordinal,
                 ScalarType::BF16,
                 &[num_kv_heads, prefix_len, head_dim],
                 &prefix_k_host,
+                gpu_hal::BufferKind::Scratch,
             )
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow K H2D: {e}"))?;
-            let tmp_v = GpuBuffer::from_host_bytes(
+            let tmp_v = GpuBuffer::from_host_bytes_with_kind(
                 ordinal,
                 ScalarType::BF16,
                 &[num_kv_heads, prefix_len, head_dim],
                 &prefix_v_host,
+                gpu_hal::BufferKind::Scratch,
             )
             .map_err(|e| anyhow::anyhow!("layer {layer_idx} shadow V H2D: {e}"))?;
 
