@@ -253,9 +253,10 @@ __global__ void qwen36_moe_descriptor_walk_stub(
 //     Q_ROT    = 2*H*d + 2*Hkv*d + H*d + Hkv*d    [H*d]     stage-3 result
 //     K_ROT    = 3*H*d + 2*Hkv*d + H*d + Hkv*d    [Hkv*d]   stage-3 result
 //     ATTN     = 4*H*d + 4*Hkv*d                  [H*d]     stage-4 result
-//   …o_proj scratch (stage 5) goes in its own commit.
-//   Total stage-4 footprint: 5*H*d + 4*Hkv*d F32 elements.
-//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 22,528 F32 = 88 KiB.
+//     GATED    = 5*H*d + 4*Hkv*d                  [H*d]     sigmoid(gate)*attn
+//     O_OUT    = 6*H*d + 4*Hkv*d                  [hidden]  o_proj output
+//   Total stage-5 footprint: 6*H*d + 4*Hkv*d + hidden F32 elements.
+//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 28,672 F32 = 112 KiB.
 //
 //   counters[0]: work-stealing index, reused across phases. Reset by
 //                grid_barrier_reset_counter at every phase boundary.
@@ -392,6 +393,8 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int OFF_Q_ROT    = 2 * H * d + 2 * Hkv * d + H * d + Hkv * d;
     const int OFF_K_ROT    = 3 * H * d + 2 * Hkv * d + H * d + Hkv * d;
     const int OFF_ATTN     = 4 * H * d + 4 * Hkv * d;
+    const int OFF_GATED    = 5 * H * d + 4 * Hkv * d;
+    const int OFF_O_OUT    = 6 * H * d + 4 * Hkv * d;
 
     // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
     // Each block grabs a head index, reduces across head_dim, writes BF16
@@ -692,7 +695,91 @@ __global__ void qwen36_moe_attn_step_kernel(
         }
     }
 
-    // Stage 5 hooks in here in its own commit.
+    if (stage < 5) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase H: gated_attn = bf16(sigmoid(out_gate)) * attn --------------
+    //
+    // out_gate is the upper half of q_raw stored at workspace[Q_RAW + H*d:].
+    // Each block grabs one Q head and produces gated_attn[h, :] in workspace.
+    // Oracle math (qwen36_moe_oracle.py line 215):
+    //   sigmoid_bf16 = bf16(sigmoid(f32(out_gate)))
+    //   gated_attn   = bf16(sigmoid_bf16 * attn)
+    {
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int h = static_cast<int>(head_s);
+            if (h >= H) break;
+
+            for (int i = tid; i < d; i += block_size) {
+                const float out_gate = workspace[OFF_Q_RAW + H * d + h * d + i];
+                const float attn_v   = workspace[OFF_ATTN + h * d + i];
+                const float sig      = 1.0f / (1.0f + expf(-out_gate));
+                const float sig_bf   = bf16_round_rne_f32(sig);
+                const float gated    = bf16_round_rne_f32(sig_bf * attn_v);
+                workspace[OFF_GATED + h * d + i] = gated;
+            }
+            __syncthreads();
+        }
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase I: o_proj matmul + residual ---------------------------------
+    //
+    // output_hidden[i] = bf16(input_hidden[i] +
+    //                        bf16(sum_j(o_proj_w[i, j] * gated_attn[j])))
+    //
+    // The o_proj output is BF16-rounded before adding the residual, then
+    // the sum itself is BF16-rounded. That's two RNE rounds — one at the
+    // matmul boundary (PyTorch's bf16 matmul), one at the add (bf16 + bf16).
+    // Skipping either drifts the test.
+    //
+    // Each block grabs one row of o_proj_w via work-stealing, reduces over
+    // qd = H*d in F32, and writes BF16 output_hidden to both workspace and
+    // (when stage == 5) the host-visible output buffer.
+    {
+        const int qd = H * d;
+
+        for (;;) {
+            __shared__ unsigned int my_row_s;
+            if (tid == 0) {
+                my_row_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_s);
+            if (my_row >= hidden) break;
+
+            const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
+            float partial = 0.0f;
+            for (int j = tid; j < qd; j += block_size) {
+                partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                const float o_out  = bf16_round_rne_f32(shared_scratch[0]);
+                const float in_f   = load_as_float<T>(input_hidden, my_row);
+                const float result = bf16_round_rne_f32(in_f + o_out);
+                workspace[OFF_O_OUT + my_row] = result;
+                if (stage == 5) {
+                    output[my_row] = static_cast<T>(result);
+                }
+            }
+            __syncthreads();
+        }
+    }
 }
 
 } // namespace qwen36_moe
