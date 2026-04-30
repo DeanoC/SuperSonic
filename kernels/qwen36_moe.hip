@@ -1066,7 +1066,131 @@ __global__ void qwen36_moe_linear_step_kernel(
         }
     }
 
-    // Stages 3..5 hook in here in follow-up commits.
+    if (stage < 3) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // Workspace offsets reserved by the layout comment for stages 3+.
+    const int OFF_Q_NORMED = qkv_dim + val_dim + 2 * V;
+    const int OFF_K_NORMED = OFF_Q_NORMED + K * k_dim;
+    const int OFF_Q_REP    = OFF_K_NORMED + K * k_dim;
+    const int OFF_K_REP    = OFF_Q_REP + V * k_dim;
+
+    // -- Phase D: L2-normalize Q and K per K-head --------------------------
+    //
+    // q_raw lives at workspace[OFF_QKV_RAW : OFF_QKV_RAW + key_dim] (the
+    // first slice of silu_out from Phase C); k_raw is the next key_dim
+    // slice. Each block grabs one head out of a 2*K work pool — first K
+    // heads are Q, next K are K.
+    //
+    // L2 norm matches `F.normalize(p=2, dim=-1, eps=1e-6)`:
+    //   norm = sqrt(sum(x^2))                    in F32
+    //   denom = max(bf16(norm), eps)             clamped, BF16-rounded
+    //   y[i]  = bf16(x[i] / bf16(denom))         BF16-rounded division
+    {
+        const int total_heads = 2 * K;
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int head_idx = static_cast<int>(head_s);
+            if (head_idx >= total_heads) break;
+
+            const bool is_k = head_idx >= K;
+            const int  h    = is_k ? (head_idx - K) : head_idx;
+            const int  src_off = (is_k ? OFF_QKV_RAW + key_dim
+                                       : OFF_QKV_RAW) + h * k_dim;
+            const int  dst_off = (is_k ? OFF_K_NORMED : OFF_Q_NORMED) + h * k_dim;
+
+            // Sum of squares (F32 — the reduction is the precision-critical
+            // part; doing it in BF16 would drift visibly).
+            float partial_ss = 0.0f;
+            for (int i = tid; i < k_dim; i += block_size) {
+                const float v = workspace[src_off + i];
+                partial_ss += v * v;
+            }
+            shared_scratch[tid] = partial_ss;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            __shared__ float head_denom;
+            if (tid == 0) {
+                const float norm  = bf16_round_rne_f32(sqrtf(shared_scratch[0]));
+                head_denom        = bf16_round_rne_f32(fmaxf(norm, 1e-6f));
+            }
+            __syncthreads();
+
+            for (int i = tid; i < k_dim; i += block_size) {
+                const float v = workspace[src_off + i];
+                workspace[dst_off + i] = bf16_round_rne_f32(v / head_denom);
+            }
+            __syncthreads();
+        }
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase E: GQA fan-out + Q scale ------------------------------------
+    //
+    // For each V-head v in [0, V):
+    //   src_kh = v // rep
+    //   q_rep[v, :]   = bf16(q_normed[src_kh, :] * 1/sqrt(k_dim))
+    //   k_rep[v, :]   =      k_normed[src_kh, :]            (just broadcast)
+    //
+    // Stage 3 publishes q_scaled || k_rep || v_heads concatenated:
+    //   output[0..V*k_dim)                            = q_scaled
+    //   output[V*k_dim..2*V*k_dim)                    = k_rep
+    //   output[2*V*k_dim..2*V*k_dim + V*v_dim)        = v_heads
+    {
+        const int rep = V / K;
+        const float q_scale = rsqrtf(static_cast<float>(k_dim));
+
+        for (;;) {
+            __shared__ unsigned int vhead_s;
+            if (tid == 0) {
+                vhead_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int vhead = static_cast<int>(vhead_s);
+            if (vhead >= V) break;
+
+            const int src_kh = vhead / rep;
+            const int q_src  = OFF_Q_NORMED + src_kh * k_dim;
+            const int k_src  = OFF_K_NORMED + src_kh * k_dim;
+            const int q_dst  = OFF_Q_REP    + vhead  * k_dim;
+            const int k_dst  = OFF_K_REP    + vhead  * k_dim;
+
+            for (int i = tid; i < k_dim; i += block_size) {
+                const float qn = workspace[q_src + i];
+                const float kn = workspace[k_src + i];
+                const float qs = bf16_round_rne_f32(qn * q_scale);
+                workspace[q_dst + i] = qs;
+                workspace[k_dst + i] = kn;
+                if (stage == 3) {
+                    output[vhead * k_dim + i]               = static_cast<T>(qs);
+                    output[V * k_dim + vhead * k_dim + i]   = static_cast<T>(kn);
+                }
+            }
+            // V is reshape-only of v_raw (silu_out's third partition); no
+            // arithmetic, just publish for stage 3 verification.
+            if (stage == 3) {
+                const int v_src = OFF_QKV_RAW + 2 * key_dim + vhead * v_dim;
+                for (int i = tid; i < v_dim; i += block_size) {
+                    const float vv = workspace[v_src + i];
+                    output[2 * V * k_dim + vhead * v_dim + i] = static_cast<T>(vv);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Stages 4..5 hook in here in follow-up commits.
 }
 
 } // namespace qwen36_moe
