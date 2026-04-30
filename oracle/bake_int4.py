@@ -26,6 +26,9 @@ GPTQ details:
 from __future__ import annotations
 
 import argparse
+import ctypes
+import ctypes.util
+import gc
 import json
 import math
 import os
@@ -37,6 +40,29 @@ from typing import Any, Callable
 import numpy as np
 import torch
 import torch.nn as nn
+
+
+def _malloc_trim() -> None:
+    """Return free()'d host pages to the OS — glibc's allocator otherwise
+    holds them in its arena cache, which made the per-layer GPTQ loop on
+    35B-A3B grow RSS by ~10 GiB across 40 layers and OOM at the lm_head
+    step. Best-effort: silently no-op on non-glibc platforms."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+        libc.malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _release_host_memory() -> None:
+    """Run between layers / heavy steps to reclaim host RAM. The pattern is:
+    drop unreferenced Python objects → empty CUDA caching pool → ask glibc
+    to release arena pages back to the OS. Without the malloc_trim call the
+    OS still sees the pages as resident even after PyTorch frees them."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    _malloc_trim()
 
 # -- constants mirrored from crates/model-store/src/manifest.rs --
 FORMAT_VERSION = 2
@@ -879,6 +905,11 @@ def quantize_model(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
+        # Hand free()d arena pages back to the OS. Without this the C
+        # runtime accumulates ~10 GiB of fragmentation across 40 layers
+        # of 35B-A3B and OOMs at the lm_head step.
+        _release_host_memory()
+
     # --- lm_head GPTQ pass ---
     # The transformer layer loop above hooks every nn.Linear inside the text
     # decoder, but lm_head sits outside. Capture its Hessian here (post-final-
@@ -895,17 +926,34 @@ def quantize_model(
         and is_int4_target("lm_head.weight")
     ):
         log(f"[gptq] lm_head: collecting Hessian over {nsamples} samples")
-        hook = HessianHook(lm_head)
+        # Compute the Hessian directly from `final_norm(hidden)` instead of
+        # invoking `lm_head(normed)` to fire a forward-pre hook. The hook
+        # version produced a [1, seqlen, vocab] BF16 output (~1 GiB at
+        # vocab=248320) per iteration; on a 40 GiB-cpu host that already
+        # holds 30+ GiB of offloaded weights, the transient pushed RSS over
+        # the OOM threshold near the end of the 128-sample loop.
+        H: torch.Tensor | None = None
+        H_N = 0
         with torch.no_grad():
             for s in range(nsamples):
                 hs = hidden_cpu[s].to(device)
                 normed = final_norm(hs)
-                _ = lm_head(normed)
-                del hs, normed
+                x = normed
+                if x.dim() > 2:
+                    x = x.reshape(-1, x.shape[-1])
+                x = x.to(torch.float32)
+                n = x.shape[0]
+                xx = (x.T @ x) * 2.0
+                if H is None:
+                    H = xx / n
+                    H_N = n
+                else:
+                    new_N = H_N + n
+                    H = H * (H_N / new_N) + xx / new_N
+                    H_N = new_N
+                del hs, normed, x, xx
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-        H = hook.H
-        hook.close()
         if H is None:
             log("[gptq]   lm_head: WARNING no activations captured, skipping")
         else:
@@ -945,9 +993,10 @@ def quantize_model(
             del nibbles_cpu, scale_cpu, zero_cpu
 
             log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
-                f"H_N={hook.N} took {elapsed:.1f}s"
+                f"H_N={H_N} took {elapsed:.1f}s"
                 + ("" if wrote else " [meta param: write-back skipped]"))
             del raw, W, Q_dq, nibbles, scale_t, zero_t, H
+            _release_host_memory()
 
     # --- Fused MoE expert pass ---
     # Qwen3.6-MoE stores all experts in two 3D nn.Parameters per layer rather
@@ -1000,6 +1049,11 @@ def quantize_model(
             del raw, W, packed, scale_t, zero_t
             if device.type == "cuda":
                 torch.cuda.empty_cache()
+            # Reclaim host pages between fused experts. Each tensor is a few
+            # hundred MiB on 35B-A3B (256 experts × MoE_intermediate); without
+            # malloc_trim, glibc keeps them in its arena cache and we drift
+            # ~10 GiB upward over the 80-tensor pass.
+            _release_host_memory()
 
     return stats
 
