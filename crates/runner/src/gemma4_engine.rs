@@ -650,6 +650,27 @@ impl Gemma4Engine {
                 kernel_ffi::MAX_BATCH_SIZE
             );
         }
+        // Engine-level FP8 guards. The CLI in `run_gemma4` rejects these
+        // combos with explanatory messages, but other callers of the
+        // public API (server crate, validators, integration tests) bypass
+        // that guard. The batched persistent-decode kernel has no FP8
+        // scale descriptor parameter, so running it with FP8 byte buffers
+        // would silently dispatch BF16 matmul against FP8-packed weights
+        // / KV bytes — corrupt logits, possible OOB reads. Reject here.
+        if fp8_runtime && batch_size > 1 {
+            bail!(
+                "Gemma4Engine: --fp8-runtime requires batch_size = 1 (FP8 \
+                 weight dequant is wired into the single-batch persistent \
+                 decode kernel only; got batch_size = {batch_size})"
+            );
+        }
+        if kv_fp8 && batch_size > 1 {
+            bail!(
+                "Gemma4Engine: --kv-fp8 requires batch_size = 1 (FP8 KV cache \
+                 path is wired into the single-batch persistent decode kernel \
+                 only; got batch_size = {batch_size})"
+            );
+        }
         gpu_hal::set_device(device).map_err(|e| anyhow!("set_device: {e}"))?;
         let config: Config =
             ::gemma4::config::load_config(model_dir).map_err(|e| anyhow!("load_config: {e}"))?;
