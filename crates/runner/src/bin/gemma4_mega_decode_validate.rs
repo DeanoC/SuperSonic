@@ -831,6 +831,7 @@ fn main() -> Result<()> {
             dtype,
             &layers_gpu,
             None,
+            None,
             &mut h_running,
             &pli_gpu,
             &mut mega_workspace,

@@ -401,6 +401,7 @@ unsafe extern "C" {
         scale: f32,
         layers: *const c_void,
         kv_fp8_descs: *const c_void,
+        fp8_scales: *const c_void,
         hidden_io: *mut c_void,
         per_layer_inputs: *const c_void,
         workspace: *mut c_void,
@@ -489,7 +490,7 @@ gemma4_stub! {
     fn dotcache_gemma4_hip_gather_layer_slice(dtype: c_int, device_ordinal: usize, seq_len: usize, num_layers: usize, ple_hidden: usize, layer_idx: usize, src: *const c_void, out: *mut c_void) -> c_int;
     fn dotcache_gemma4_hip_embed_gather_scaled(dtype: c_int, device_ordinal: usize, seq_len: usize, hidden_size: usize, vocab_size: usize, scale: f32, token_ids: *const c_uint, table: *const c_void, out: *mut c_void) -> c_int;
     fn dotcache_gemma4_hip_persistent_decode_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, int4_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
-    fn dotcache_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, kv_fp8_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
+    fn dotcache_gemma4_hip_persistent_decode(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, position: usize, eps: f32, scale: f32, layers: *const c_void, kv_fp8_descs: *const c_void, fp8_scales: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
     fn dotcache_gemma4_hip_persistent_decode_batch(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
     fn dotcache_gemma4_hip_persistent_decode_batch_int4(dtype: c_int, device_ordinal: usize, num_layers: usize, hidden_size: usize, ple_hidden: usize, eps: f32, scale: f32, batch_size: usize, ws_stride: usize, layers: *const c_void, int4_scales: *const c_void, batch_descs: *const c_void, hidden_io: *mut c_void, per_layer_inputs: *const c_void, workspace: *mut c_void, matvec_counter: *mut c_uint, barrier_counter: *mut c_uint, barrier_flag: *mut c_uint) -> c_int;
 }
@@ -1760,6 +1761,46 @@ impl Default for Gemma4KVCacheFp8Desc {
     }
 }
 
+/// Per-layer FP8-E4M3-FN weight scale-inv tensors for Gemma 4. Parallel-struct
+/// to [`Gemma4DecodeLayerDesc`] — when `--fp8-runtime` is active the main
+/// desc's projection slots (`q/k/v/o_proj_w`, `gate/up/down_proj_w`,
+/// `per_layer_input_gate_w`, `per_layer_projection_w`) hold u8-packed FP8
+/// bytes (reinterpreted at the kernel site) and this struct carries the
+/// matching BF16 per-block (typically 128×128) scale_inv tables.
+///
+/// Mirrors the Phi-4 layout (`Phi4FP8ScaleDesc`). Shared-KV layers do not
+/// need k/v scale entries (the `*_proj_w` slots themselves are null on those
+/// layers), but the kernel reads from this struct unconditionally — entries
+/// for skipped projections may be null.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Gemma4FP8ScaleDesc {
+    // --- Attention projections ---
+    pub q_proj_scale: *const c_void,
+    pub k_proj_scale: *const c_void, // null when shared_kv
+    pub v_proj_scale: *const c_void, // null when shared_kv
+    pub o_proj_scale: *const c_void,
+    // --- MLP projections ---
+    pub gate_proj_scale: *const c_void,
+    pub up_proj_scale: *const c_void,
+    pub down_proj_scale: *const c_void,
+    // --- PLE projections ---
+    pub per_layer_input_gate_scale: *const c_void,
+    pub per_layer_projection_scale: *const c_void,
+    /// Per-block scale tile dimension (typically 128). Same value across
+    /// all projections in a bake.
+    pub block_size: c_int,
+}
+
+unsafe impl Send for Gemma4FP8ScaleDesc {}
+unsafe impl Sync for Gemma4FP8ScaleDesc {}
+
+impl Default for Gemma4FP8ScaleDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Per-sequence state pointers for batched Gemma 4 decode.
 ///
 /// One `Gemma4BatchSeqDesc` per layer (parallel array to
@@ -1838,6 +1879,7 @@ pub fn persistent_decode(
     dtype: ScalarType,
     layers: &GpuBuffer,
     kv_fp8_descs: Option<&GpuBuffer>,
+    fp8_scales: Option<&GpuBuffer>,
     hidden_io: &mut GpuBuffer,
     per_layer_inputs: &GpuBuffer,
     workspace: &mut GpuBuffer,
@@ -1854,6 +1896,9 @@ pub fn persistent_decode(
     let kv_fp8_ptr = kv_fp8_descs
         .map(|b| b.as_ptr())
         .unwrap_or(std::ptr::null());
+    let fp8_scales_ptr = fp8_scales
+        .map(|b| b.as_ptr())
+        .unwrap_or(std::ptr::null());
     let status = unsafe {
         dotcache_gemma4_hip_persistent_decode(
             dtype.kernel_dtype_code(),
@@ -1866,6 +1911,7 @@ pub fn persistent_decode(
             scale,
             layers.as_ptr(),
             kv_fp8_ptr,
+            fp8_scales_ptr,
             hidden_io.as_mut_ptr(),
             per_layer_inputs.as_ptr(),
             workspace.as_mut_ptr(),

@@ -487,6 +487,12 @@ pub struct Gemma4Engine {
     /// Per-sequence GPU array of `Gemma4KVCacheFp8Desc` (one entry per layer).
     /// `None` when KV cache is BF16. Plumbed through to `persistent_decode`.
     kv_fp8_descs_gpu: Option<Vec<GpuBuffer>>,
+    /// Single GPU array of `Gemma4FP8ScaleDesc` (one entry per layer; same
+    /// across sequences since weights are shared). `None` when weights are
+    /// BF16. The kernel-side body that consumes this lands in the FP8-runtime
+    /// follow-up PR; for now the contract is plumbed but the buffer is None.
+    #[allow(dead_code)]
+    fp8_scale_descs_gpu: Option<GpuBuffer>,
 }
 
 impl Gemma4Engine {
@@ -863,6 +869,7 @@ impl Gemma4Engine {
             kv_scale_k: if kv_fp8 { Some(kv_scale_k_buf) } else { None },
             kv_scale_v: if kv_fp8 { Some(kv_scale_v_buf) } else { None },
             kv_fp8_descs_gpu,
+            fp8_scale_descs_gpu: None,
         })
     }
 
@@ -1540,6 +1547,7 @@ impl Gemma4Engine {
             self.kv_fp8_descs_gpu
                 .as_ref()
                 .map(|v| &v[seq_idx]),
+            self.fp8_scale_descs_gpu.as_ref(),
             &mut h_running,
             &pli_gpu,
             &mut self.mega_workspace,
