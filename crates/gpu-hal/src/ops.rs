@@ -325,6 +325,17 @@ pub(crate) enum AllocatorKind {
 /// system RAM via `hipHostMalloc(MAPPED)` so host and device see the same
 /// physical bytes; the device-side pointer is obtained via
 /// `hipHostGetDevicePointer` per HIP API contract.
+///
+/// **Known regression on gfx1150 (RDNA3.5)**: the `hipHostMalloc(MAPPED) +
+/// hipHostGetDevicePointer` path runs ~2.2x slower than `hipMalloc` for
+/// bandwidth-bound decode (measured 2026-04-30 on Qwen3.5-0.8B INT4 at
+/// peak clocks). Root cause is *not* coherence (already dropped) or the
+/// host-vs-device pointer (correct now); appears to be cache-attr /
+/// page-walk differences in how RDNA3.5 maps host-allocated memory. A
+/// `rocprof` perf dive is needed to pin it down. The split paths are
+/// retained because the design is sound for genuinely unified-memory
+/// arches (Apple silicon); the gfx1150 mapping in `ArchProfile::for_arch`
+/// will be revisited once the perf dive completes.
 pub(crate) fn alloc(
     ordinal: usize,
     len_bytes: usize,

@@ -156,6 +156,19 @@ pub struct ArchProfile {
 
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
+        // gfx1150 (RDNA3.5 APU) is structurally unified-memory, but the
+        // `hipHostMalloc(MAPPED) + hipHostGetDevicePointer` path used by
+        // gpu-hal's Unified branch currently regresses ~2.2x on Qwen3.5-0.8B
+        // and ~1.5x on Gemma4-E2B vs the classic `hipMalloc` path on this
+        // arch (measured 2026-04-30, peak clocks, alternated A/B). Root
+        // cause appears to be cache-attr / page-walk differences between
+        // host-mapped and device-allocated pages — not coherence (already
+        // dropped) and not the host-vs-device pointer (already fixed). A
+        // proper perf dive with `rocprof` is needed to pin it down.
+        // The mapping below is left structurally correct; the actual
+        // allocation regression is a known RDNA3.5 issue, not a design
+        // flaw in `MemoryArchitecture::Unified`. AppleM4 and any future
+        // unified-memory arch should still benefit.
         let memory = match arch {
             GpuArch::Gfx1100 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
             GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
