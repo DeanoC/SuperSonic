@@ -2669,8 +2669,21 @@ fn run_gemma4(
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
-    if cli.fp8_runtime || cli.kv_fp8 {
-        anyhow::bail!("Gemma 4 does not yet support --fp8-runtime / --kv-fp8");
+    if cli.fp8_runtime {
+        anyhow::bail!("Gemma 4 does not yet support --fp8-runtime");
+    }
+    if cli.kv_fp8 && cli.int4 {
+        anyhow::bail!(
+            "Gemma 4 --kv-fp8 cannot combine with --int4 yet (kernel FP8 KV \
+             path lives in the BF16 single-batch persistent decode kernel; \
+             INT4 + FP8-KV would need the INT4 kernel updated too)"
+        );
+    }
+    if cli.kv_fp8 && cli.batch_size != 1 {
+        anyhow::bail!(
+            "Gemma 4 --kv-fp8 currently requires --batch-size=1 (FP8 KV path \
+             only wired into the single-batch persistent decode kernel)"
+        );
     }
     if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
         anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
@@ -2739,22 +2752,39 @@ fn run_gemma4(
         );
     }
 
-    const BF16_BYTES: u64 = 2;
-    let mut kv_per_token: u64 = 0;
+    // Per-token KV element count (across owned layers; shared layers alias).
+    let mut kv_elems_per_token: u64 = 0;
+    let mut owned_layers: u64 = 0;
     for l in 0..t.num_hidden_layers {
         if t.kv_source_layer(l).is_none() {
             let kind = t
                 .attn_kind(l)
                 .ok_or_else(|| anyhow::anyhow!("layer {l}: no attention kind"))?;
             let hd = t.head_dim_for(kind);
-            kv_per_token += (t.num_key_value_heads * hd * 2) as u64;
+            // 2× because we count both K and V.
+            kv_elems_per_token += (t.num_key_value_heads * hd * 2) as u64;
+            owned_layers += 1;
         }
     }
+    // Element width: 2 B BF16, 1 B FP8. Under --kv-fp8 we also allocate
+    // F32 scale buffers `[num_kv_heads, max_t]` per (K, V) per owned layer
+    // — small but non-zero.
+    let kv_dtype_bytes: u64 = if cli.kv_fp8 { 1 } else { 2 };
+    let scale_bytes_per_seq: u64 = if cli.kv_fp8 {
+        // 2 (K + V) * num_kv_heads * max_t * 4 B per owned layer.
+        2 * (t.num_key_value_heads as u64)
+            * (context_tokens as u64)
+            * 4
+            * owned_layers
+    } else {
+        0
+    };
     // Both BF16 and INT4 engines allocate `batch_size` parallel KV cache sets
     // (one per decode sequence); scale accordingly so `--batch-size > 1` can't
     // pass the preflight check and then OOM during engine load.
     let batch_size_u64 = cli.batch_size as u64;
-    let kv_bytes_per_seq = kv_per_token * context_tokens as u64 * BF16_BYTES;
+    let kv_bytes_per_seq =
+        kv_elems_per_token * context_tokens as u64 * kv_dtype_bytes + scale_bytes_per_seq;
     let kv_bytes = kv_bytes_per_seq * batch_size_u64;
     let estimated_vram =
         ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
@@ -2829,12 +2859,13 @@ fn run_gemma4(
             cli.batch_size,
         )?)
     } else {
-        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_batch(
+        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_options(
             &cli.model_dir,
             params.weight_prefix,
             context_tokens,
             ordinal,
             cli.batch_size,
+            cli.kv_fp8,
         )?)
     };
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
