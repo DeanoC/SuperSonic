@@ -275,6 +275,62 @@ extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+
+    /// PR 4b3 staged single-layer linear-attention parity launcher. Same
+    /// staged-build-up discipline as `qwen36_moe_hip_attn_step_launch`,
+    /// but for the 3-of-4 hybrid layers that aren't full-attention.
+    /// `stage` selects how far to run; the matching staged intermediate
+    /// is published to `output` (BF16):
+    ///
+    /// | stage | output buffer contents (BF16)           |
+    /// |-------|------------------------------------------|
+    /// |   1   | `qkv_raw[qkv_dim]`                       |
+    /// |   2   | `silu_out[qkv_dim]`         (planned)    |
+    /// |   3   | `q_scaled || k_rep || v_heads` (planned) |
+    /// |   4   | `recurrent_out[V*v_dim]`    (planned)    |
+    /// |   5   | `output_hidden[hidden]`     (planned)    |
+    ///
+    /// PR 4b3 step 2 wires only `stage == 1`; the kernel ignores the conv
+    /// / dt / norm / out_proj / state pointers and the matching arguments
+    /// can be null. They're declared up front so subsequent staged commits
+    /// don't perturb the FFI ABI.
+    ///
+    /// `workspace` must be at least `qkv_dim + V*v_dim + 2*V` F32 entries
+    /// for stage 1 (later stages bump that up via the safe wrapper).
+    /// `output` must be at least `qkv_dim` BF16 entries on stage 1 (sized
+    /// for the largest staged intermediate by the safe wrapper). `sync_buf`
+    /// (counters/barrier_counter/barrier_flag) must be 32 zero bytes.
+    pub fn qwen36_moe_hip_linear_step_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        stage: c_int,
+        hidden: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        head_k_dim: c_int,
+        head_v_dim: c_int,
+        conv_kernel_dim: c_int,
+        rms_norm_eps: f32,
+        input_hidden: *const c_void,
+        input_norm_w: *const c_void,
+        in_proj_qkv_w: *const c_void,
+        in_proj_z_w: *const c_void,
+        in_proj_a_w: *const c_void,
+        in_proj_b_w: *const c_void,
+        conv1d_w: *const c_void,
+        conv1d_bias: *const c_void,
+        dt_bias: *const c_void,
+        a_log: *const c_void,
+        norm_w: *const c_void,
+        out_proj_w: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_state: *mut f32,
+        output: *mut c_void,
+        workspace: *mut f32,
+        counters: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -463,6 +519,142 @@ pub fn attn_step_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe attn_step launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Geometry for the staged linear-attention parity launcher. Mirrors
+/// `Qwen36MoeAttnStepParams`. Bundling these into a struct keeps the safe
+/// wrapper from sprouting a long scalar arglist.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeLinearStepParams {
+    pub stage: i32,
+    pub hidden: i32,
+    pub num_k_heads: i32,
+    pub num_v_heads: i32,
+    pub head_k_dim: i32,
+    pub head_v_dim: i32,
+    pub conv_kernel_dim: i32,
+    pub rms_norm_eps: f32,
+}
+
+/// Weight + state pointers for the staged linear-attention parity launcher.
+/// Pointers unused by the requested `stage` may be null; the kernel won't
+/// dereference them. See [`qwen36_moe_hip_linear_step_launch`] for the
+/// per-stage matrix.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeLinearStepWeights {
+    pub input_hidden: *const c_void,
+    pub input_norm_w: *const c_void,
+    pub in_proj_qkv_w: *const c_void,
+    pub in_proj_z_w: *const c_void,
+    pub in_proj_a_w: *const c_void,
+    pub in_proj_b_w: *const c_void,
+    pub conv1d_w: *const c_void,
+    pub conv1d_bias: *const c_void,
+    pub dt_bias: *const c_void,
+    pub a_log: *const c_void,
+    pub norm_w: *const c_void,
+    pub out_proj_w: *const c_void,
+    pub conv_state: *mut c_void,
+    pub recurrent_state: *mut f32,
+}
+
+/// Safe wrapper for the PR 4b3 staged linear-attention parity launcher.
+/// Same workspace / sync_buf layout as
+/// [`attn_step_launch`]: 32-byte zero scratch, F32 workspace sized for the
+/// stage's footprint, BF16 output sized for the largest staged intermediate.
+pub fn linear_step_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: only BF16 is wired, got {dtype:?}"
+        )));
+    }
+    if !(1..=5).contains(&params.stage) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: stage must be in 1..=5, got {}",
+            params.stage
+        )));
+    }
+    if params.stage > 1 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: stage {} not yet implemented (PR 4b3 step 2 lands stage 1 only)",
+            params.stage
+        )));
+    }
+
+    let backend = output.backend();
+    let counters = sync_buf.as_mut_ptr() as *mut c_uint;
+    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_linear_step_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    params.stage as c_int,
+                    params.hidden as c_int,
+                    params.num_k_heads as c_int,
+                    params.num_v_heads as c_int,
+                    params.head_k_dim as c_int,
+                    params.head_v_dim as c_int,
+                    params.conv_kernel_dim as c_int,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.input_norm_w,
+                    weights.in_proj_qkv_w,
+                    weights.in_proj_z_w,
+                    weights.in_proj_a_w,
+                    weights.in_proj_b_w,
+                    weights.conv1d_w,
+                    weights.conv1d_bias,
+                    weights.dt_bias,
+                    weights.a_log,
+                    weights.norm_w,
+                    weights.out_proj_w,
+                    weights.conv_state,
+                    weights.recurrent_state,
+                    output.as_mut_ptr(),
+                    workspace.as_mut_ptr() as *mut f32,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::linear_step_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::linear_step_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::linear_step_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe linear_step launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -1372,6 +1564,185 @@ mod tests {
             got_bytes,
             &output_hidden_expected_bytes,
             0.05,
+            0.9999,
+        );
+    }
+
+    // ---- PR 4b3 step 2: linear-attn stage 1 parity vs the oracle ---------
+    //
+    // Same env-var pattern as the full-attn parity tests, but pointed at a
+    // JSON produced by `oracle/qwen36_moe_linear_oracle.py`:
+    //
+    //   python oracle/qwen36_moe_linear_oracle.py --mode synthetic \
+    //       --state fresh --out /tmp/qwen36_lin_fresh.json
+    //   SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON=/tmp/qwen36_lin_fresh.json \
+    //       cargo test --release -p kernel-ffi qwen36_moe_linear_step
+    //
+    // Skipped with a clear message when the env var is unset so the FFI
+    // test stays runnable on Python-less hosts.
+
+    #[cfg(supersonic_backend_hip)]
+    struct LinearOracleGeom {
+        hidden: i32,
+        num_k_heads: i32,
+        num_v_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        conv_kernel_dim: i32,
+        rms_norm_eps: f32,
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    fn load_linear_oracle_json() -> Option<(serde_json::Value, LinearOracleGeom)> {
+        let json_path = std::env::var("SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON").ok()?;
+        let raw = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|e| panic!("read linear oracle json {json_path}: {e}"));
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("linear oracle json parse");
+        assert_eq!(
+            json["dtype"].as_str().unwrap_or(""),
+            "bf16",
+            "linear-attn parity tests require the oracle to be in bf16 mode"
+        );
+        let cfg = &json["config"];
+        let geom = LinearOracleGeom {
+            hidden: cfg["hidden"].as_i64().unwrap() as i32,
+            num_k_heads: cfg["num_k_heads"].as_i64().unwrap() as i32,
+            num_v_heads: cfg["num_v_heads"].as_i64().unwrap() as i32,
+            head_k_dim: cfg["head_k_dim"].as_i64().unwrap() as i32,
+            head_v_dim: cfg["head_v_dim"].as_i64().unwrap() as i32,
+            conv_kernel_dim: cfg["conv_kernel_dim"].as_i64().unwrap() as i32,
+            rms_norm_eps: cfg["rms_norm_eps"].as_f64().unwrap() as f32,
+        };
+        Some((json, geom))
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_linear_step_1_qkv_raw_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_linear_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON not set. \
+                 Generate a fixture with \
+                 `python oracle/qwen36_moe_linear_oracle.py --mode synthetic \
+                 --out /tmp/qwen36_lin.json` and re-run."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let in_proj_qkv_w_bytes = b64_decode(weights["in_proj_qkv_w"].as_str().unwrap());
+        let in_proj_z_w_bytes = b64_decode(weights["in_proj_z_w"].as_str().unwrap());
+        let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
+        let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
+        let qkv_raw_expected_bytes = b64_decode(inters["qkv_raw"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let k_us = geom.num_k_heads as usize;
+        let v_us = geom.num_v_heads as usize;
+        let kd_us = geom.head_k_dim as usize;
+        let vd_us = geom.head_v_dim as usize;
+        let key_dim = k_us * kd_us;
+        let val_dim = v_us * vd_us;
+        let qkv_dim = 2 * key_dim + val_dim;
+
+        assert_eq!(input_hidden_bytes.len(), hidden_us * 2);
+        assert_eq!(input_norm_w_bytes.len(), hidden_us * 2);
+        assert_eq!(in_proj_qkv_w_bytes.len(), qkv_dim * hidden_us * 2);
+        assert_eq!(in_proj_z_w_bytes.len(), val_dim * hidden_us * 2);
+        assert_eq!(in_proj_a_w_bytes.len(), v_us * hidden_us * 2);
+        assert_eq!(in_proj_b_w_bytes.len(), v_us * hidden_us * 2);
+        assert_eq!(qkv_raw_expected_bytes.len(), qkv_dim * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let in_proj_qkv_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
+        ).expect("upload in_proj_qkv_w");
+        let in_proj_z_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
+        ).expect("upload in_proj_z_w");
+        let in_proj_a_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
+        ).expect("upload in_proj_a_w");
+        let in_proj_b_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
+        ).expect("upload in_proj_b_w");
+
+        // Output sized for the largest staged intermediate (qkv_dim BF16
+        // is the biggest until later stages bump this).
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[qkv_dim],
+        ).expect("alloc output");
+        // Workspace sized for stage 1 (qkv_dim + V*v_dim + 2*V F32). Later
+        // stages will need more; keep this tight to fail loudly if a stage
+        // overruns.
+        let workspace_floats = qkv_dim + val_dim + 2 * v_us;
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[workspace_floats],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 1,
+            hidden: geom.hidden,
+            num_k_heads: geom.num_k_heads,
+            num_v_heads: geom.num_v_heads,
+            head_k_dim: geom.head_k_dim,
+            head_v_dim: geom.head_v_dim,
+            conv_kernel_dim: geom.conv_kernel_dim,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: std::ptr::null(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: std::ptr::null(),
+            a_log: std::ptr::null(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: std::ptr::null_mut(),
+            recurrent_state: std::ptr::null_mut(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("linear_step_launch stage 1");
+
+        // Stage 1 publishes qkv_raw as the full output buffer.
+        let got_bytes = output.to_host_bytes().expect("download output");
+        // 2048-wide F32 reduction; same envelope as PR 4b2 step 1's q_proj.
+        assert_parity(
+            "linear step1 qkv_raw",
+            &got_bytes,
+            &qkv_raw_expected_bytes,
+            0.04,
             0.9999,
         );
     }

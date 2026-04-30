@@ -188,3 +188,106 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// PR 4b3 staged linear-attention parity launcher.
+// `dtype` follows the project convention: 2 = bf16. Other values are
+// rejected so the matching kernel template is unambiguous.
+extern "C" int qwen36_moe_hip_linear_step_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           stage,
+    int           hidden,
+    int           num_k_heads,
+    int           num_v_heads,
+    int           head_k_dim,
+    int           head_v_dim,
+    int           conv_kernel_dim,
+    float         rms_norm_eps,
+    const void*   input_hidden,
+    const void*   input_norm_w,
+    const void*   in_proj_qkv_w,
+    const void*   in_proj_z_w,
+    const void*   in_proj_a_w,
+    const void*   in_proj_b_w,
+    const void*   conv1d_w,
+    const void*   conv1d_bias,
+    const void*   dt_bias,
+    const void*   a_log,
+    const void*   norm_w,
+    const void*   out_proj_w,
+    void*         conv_state,
+    float*        recurrent_state,
+    void*         output,
+    float*        workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag) {
+    if (dtype != 2) return 120;
+    if (stage < 1 || stage > 5) return 121;
+    if (hidden <= 0 || num_k_heads <= 0 || num_v_heads <= 0 ||
+        head_k_dim <= 0 || head_v_dim <= 0 || conv_kernel_dim <= 0) {
+        return 122;
+    }
+    if (input_hidden == nullptr || input_norm_w == nullptr ||
+        in_proj_qkv_w == nullptr || in_proj_z_w == nullptr ||
+        in_proj_a_w == nullptr || in_proj_b_w == nullptr ||
+        output == nullptr || workspace == nullptr ||
+        counters == nullptr || barrier_counter == nullptr ||
+        barrier_flag == nullptr) {
+        return 123;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    constexpr int block_size = 256;
+
+    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
+        return 200;
+    }
+
+    const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
+
+    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_linear_step_kernel<hip_bfloat16>,
+                       dim3(static_cast<unsigned int>(num_blocks)),
+                       dim3(block_size),
+                       lds_bytes, 0,
+                       stage,
+                       hidden,
+                       num_k_heads,
+                       num_v_heads,
+                       head_k_dim,
+                       head_v_dim,
+                       conv_kernel_dim,
+                       rms_norm_eps,
+                       static_cast<const hip_bfloat16*>(input_hidden),
+                       static_cast<const hip_bfloat16*>(input_norm_w),
+                       static_cast<const hip_bfloat16*>(in_proj_qkv_w),
+                       static_cast<const hip_bfloat16*>(in_proj_z_w),
+                       static_cast<const hip_bfloat16*>(in_proj_a_w),
+                       static_cast<const hip_bfloat16*>(in_proj_b_w),
+                       static_cast<const hip_bfloat16*>(conv1d_w),
+                       static_cast<const hip_bfloat16*>(conv1d_bias),
+                       static_cast<const hip_bfloat16*>(dt_bias),
+                       static_cast<const hip_bfloat16*>(a_log),
+                       static_cast<const hip_bfloat16*>(norm_w),
+                       static_cast<const hip_bfloat16*>(out_proj_w),
+                       static_cast<hip_bfloat16*>(conv_state),
+                       recurrent_state,
+                       static_cast<hip_bfloat16*>(output),
+                       workspace,
+                       counters,
+                       barrier_counter,
+                       barrier_flag);
+    hipError_t launch_err_lin = hipGetLastError();
+    hipError_t sync_err_lin   = hipDeviceSynchronize();
+    if (launch_err_lin != hipSuccess) return 254;
+    if (sync_err_lin != hipSuccess) return 255;
+    return 0;
+}

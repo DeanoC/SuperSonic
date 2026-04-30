@@ -782,4 +782,216 @@ __global__ void qwen36_moe_attn_step_kernel(
     }
 }
 
+// =============================================================================
+// Single-layer LINEAR-attention parity kernel (PR 4b3)
+//
+// Mirrors the staged build-up pattern from PR 4b2's full-attention kernel:
+// each stage adds one slice of compute, the host parity test downloads the
+// matching intermediate buffer and compares it to the linear-attn oracle
+// (oracle/qwen36_moe_linear_oracle.py).
+//
+//   stage 1: x_norm + in_proj_qkv + in_proj_z + in_proj_a + in_proj_b
+//            → publish qkv_raw [qkv_dim] BF16
+//   stage 2: ... + depthwise conv1d + silu
+//            → publish silu_out [qkv_dim] BF16  (planned)
+//   stage 3: ... + L2-norm Q/K + GQA repeat + Q scale
+//            → publish q_scaled || k_rep || v_heads (planned)
+//   stage 4: ... + delta-rule recurrent state update
+//            → publish recurrent_out [V*v_dim] BF16  (planned)
+//   stage 5: ... + per-head RMS norm + z-gate + out_proj + residual
+//            → publish output_hidden [hidden] BF16  (planned)
+//
+// PR 4b3 step 2 lands stage 1. Stages 2-5 follow in their own commits.
+//
+// Workspace layout (F32 elements, offsets) — pinned now even though only
+// the first four slots are written in stage 1, so later stages don't have
+// to reshuffle the layout:
+//
+//   QKV_RAW    = 0                                        [qkv_dim]
+//   Z_RAW      = qkv_dim                                  [V*v_dim]
+//   A_RAW      = qkv_dim + V*v_dim                        [V]
+//   B_RAW      = qkv_dim + V*v_dim + V                    [V]
+//   Q_NORMED   = qkv_dim + V*v_dim + 2*V                  [K*k_dim]
+//   K_NORMED   = ... + K*k_dim                            [K*k_dim]
+//   Q_REP      = ... + K*k_dim                            [V*k_dim]
+//   K_REP      = ... + V*k_dim                            [V*k_dim]
+//   BETA       = ... + V*k_dim                            [V]
+//   G          = ... + V                                  [V]
+//   REC_OUT    = ... + V                                  [V*v_dim]
+//   O_OUT      = ... + V*v_dim                            [hidden]
+//
+// For 35B-A3B (qkv_dim=8192, V=32, v_dim=128, K=16, k_dim=128, hidden=2048):
+//   stage-1 footprint = 8192 + 4096 + 32 + 32 = 12,352 F32 = 48 KiB
+//   stage-5 footprint = ~30,848 F32 = 120 KiB (still well under sane limits)
+//
+// Conv state and recurrent state live in dedicated state buffers (state
+// is up to 2 MiB per layer at F32) — those are NOT in `workspace`.
+
+template <typename T>
+__global__ void qwen36_moe_linear_step_kernel(
+    int                            stage,
+    int                            hidden,
+    int                            num_k_heads,         // K
+    int                            num_v_heads,         // V
+    int                            head_k_dim,          // k_dim
+    int                            head_v_dim,          // v_dim
+    int                            conv_kernel_dim,
+    float                          rms_norm_eps,
+    const T* __restrict__          input_hidden,        // [hidden]
+    const T* __restrict__          input_norm_w,        // [hidden]
+    const T* __restrict__          in_proj_qkv_w,       // [qkv_dim, hidden]
+    const T* __restrict__          in_proj_z_w,         // [V*v_dim, hidden]
+    const T* __restrict__          in_proj_a_w,         // [V, hidden]
+    const T* __restrict__          in_proj_b_w,         // [V, hidden]
+    const T* __restrict__          conv1d_w,            // unused at stage 1
+    const T* __restrict__          conv1d_bias,         // unused at stage 1
+    const T* __restrict__          dt_bias,             // unused at stage 1
+    const T* __restrict__          a_log,               // unused at stage 1
+    const T* __restrict__          norm_w,              // unused at stage 1
+    const T* __restrict__          out_proj_w,          // unused at stage 1
+    T* __restrict__                conv_state,          // unused at stage 1
+    float* __restrict__            recurrent_state,     // unused at stage 1
+    T* __restrict__                output,
+    float* __restrict__            workspace,
+    unsigned int* __restrict__     counters,
+    unsigned int* __restrict__     barrier_counter,
+    unsigned int* __restrict__     barrier_flag) {
+    (void)conv1d_w;
+    (void)conv1d_bias;
+    (void)dt_bias;
+    (void)a_log;
+    (void)norm_w;
+    (void)out_proj_w;
+    (void)conv_state;
+    (void)recurrent_state;
+
+    const int num_blocks = static_cast<int>(gridDim.x);
+    const int tid        = threadIdx.x;
+    const int block_size = static_cast<int>(blockDim.x);
+
+    extern __shared__ float lds[];
+    float* x_norm_lds    = lds;             // [hidden]
+    float* shared_scratch = lds + hidden;   // [block_size]
+
+    // Workspace offsets (computed once; same convention as the full-attn
+    // kernel's OFF_* locals).
+    const int K       = num_k_heads;
+    const int V       = num_v_heads;
+    const int k_dim   = head_k_dim;
+    const int v_dim   = head_v_dim;
+    const int key_dim = K * k_dim;
+    const int val_dim = V * v_dim;
+    const int qkv_dim = 2 * key_dim + val_dim;
+    const int OFF_QKV_RAW = 0;
+    const int OFF_Z_RAW   = qkv_dim;
+    const int OFF_A_RAW   = qkv_dim + val_dim;
+    const int OFF_B_RAW   = qkv_dim + val_dim + V;
+
+    // -- Phase A: load input_hidden + RMS norm into LDS --------------------
+    // Same idiom as the full-attn kernel's Phase A.
+    for (int col = tid; col < hidden; col += block_size) {
+        x_norm_lds[col] = static_cast<float>(input_hidden[col]);
+    }
+    __syncthreads();
+
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        partial_sq += x_norm_lds[col] * x_norm_lds[col];
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float inv_rms_input;
+    if (tid == 0) {
+        inv_rms_input = rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = static_cast<float>(input_norm_w[col]);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * w);
+    }
+    __syncthreads();
+
+    // -- Phase B: four in-projections in one fused work pool ---------------
+    //
+    // qkv_raw, z_raw, a_raw, b_raw all read the same x_norm and have
+    // independent output rows, so we union them into one row-stealing pool
+    // of (qkv_dim + V*v_dim + 2*V) rows. Each block claims the next row,
+    // figures out which projection it belongs to, computes the dot
+    // product, and writes BF16-rounded F32 to the workspace at the right
+    // offset.
+    //
+    // Row-id range layout (in the order matching the workspace offsets):
+    //   [0,                       qkv_dim):                qkv (in_proj_qkv)
+    //   [qkv_dim,                 qkv_dim + V*v_dim):      z   (in_proj_z)
+    //   [qkv_dim + V*v_dim,       qkv_dim + V*v_dim + V):  a   (in_proj_a)
+    //   [qkv_dim + V*v_dim + V,   qkv_dim + V*v_dim + 2V): b   (in_proj_b)
+    const int total_rows = qkv_dim + val_dim + 2 * V;
+
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= total_rows) break;
+
+        // Pick projection + per-projection row-index + workspace dst.
+        const T* w_row;
+        int dst_off;
+        if (my_row < qkv_dim) {
+            w_row   = in_proj_qkv_w + static_cast<size_t>(my_row) * hidden;
+            dst_off = OFF_QKV_RAW + my_row;
+        } else if (my_row < qkv_dim + val_dim) {
+            const int r = my_row - qkv_dim;
+            w_row   = in_proj_z_w + static_cast<size_t>(r) * hidden;
+            dst_off = OFF_Z_RAW + r;
+        } else if (my_row < qkv_dim + val_dim + V) {
+            const int r = my_row - (qkv_dim + val_dim);
+            w_row   = in_proj_a_w + static_cast<size_t>(r) * hidden;
+            dst_off = OFF_A_RAW + r;
+        } else {
+            const int r = my_row - (qkv_dim + val_dim + V);
+            w_row   = in_proj_b_w + static_cast<size_t>(r) * hidden;
+            dst_off = OFF_B_RAW + r;
+        }
+
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            workspace[dst_off] = bf16_round_rne_f32(shared_scratch[0]);
+        }
+        __syncthreads();
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // Stage 1 publishes qkv_raw to the host-visible output buffer. Later
+    // stages publish their own intermediates and keep qkv_raw in workspace
+    // (where Phase C — depthwise conv1d — will read it).
+    if (stage == 1) {
+        for (int i = tid + blockIdx.x * block_size;
+             i < qkv_dim;
+             i += block_size * num_blocks) {
+            output[i] = static_cast<T>(workspace[OFF_QKV_RAW + i]);
+        }
+    }
+
+    // Stages 2..5 hook in here in follow-up commits.
+}
+
 } // namespace qwen36_moe
