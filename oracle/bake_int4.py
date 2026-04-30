@@ -69,7 +69,26 @@ def copy_weight_in_row_chunks(dst: torch.Tensor, src: torch.Tensor, rows_per_chu
 # ---------------------------------------------------------------------------
 # Target-tensor selection (mirrors crates/model-store/src/baker.rs::is_int4_target)
 # ---------------------------------------------------------------------------
+# Fused 3D MoE expert tensors in Qwen3.6-MoE store all experts in one slab and
+# do NOT use the `.weight` suffix:
+#     mlp.experts.gate_up_proj    [E, 2*moe_int, hidden]
+#     mlp.experts.down_proj       [E, hidden,    moe_int]
+# They quantize via a separate fused-MoE driver (see fused_expert_minmax_int4),
+# but `is_int4_target` still classifies them as INT4 targets so the planner /
+# manifest accounting line up.
+FUSED_EXPERT_SUFFIXES = (
+    ".mlp.experts.gate_up_proj",
+    ".mlp.experts.down_proj",
+)
+
+
+def is_fused_expert_target(name: str) -> bool:
+    return any(name.endswith(s) for s in FUSED_EXPERT_SUFFIXES)
+
+
 def is_int4_target(name: str) -> bool:
+    if is_fused_expert_target(name):
+        return True
     if not name.endswith(".weight"):
         return False
     if ("layernorm" in name
@@ -303,12 +322,163 @@ def gptq_quantize(
 
 
 def pack_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
-    """[rows, cols] uint8 0..15 -> [rows, cols/2] uint8 packed 2/byte."""
-    rows, cols = nibbles.shape
+    """Pack 4-bit nibbles 2/byte along the last axis.
+
+    Accepts 2D `[rows, cols]` (dense projections) or 3D `[E, rows, cols]`
+    (fused MoE experts). Output keeps all leading axes and halves the last:
+    `[..., cols]` -> `[..., cols/2]`.
+    """
+    if nibbles.dim() < 2:
+        raise ValueError(f"expected >=2D nibble tensor, got shape {tuple(nibbles.shape)}")
+    cols = nibbles.shape[-1]
     if cols % 2 != 0:
-        raise ValueError(f"cols must be even, got {cols}")
-    r = nibbles.reshape(rows, cols // 2, 2).to(torch.uint8)
+        raise ValueError(f"last dim must be even, got {cols}")
+    leading = nibbles.shape[:-1]
+    r = nibbles.reshape(*leading, cols // 2, 2).to(torch.uint8)
     return (r[..., 0] | (r[..., 1] << 4)).contiguous()
+
+
+# ---------------------------------------------------------------------------
+# Fused MoE expert quantization (no GPTQ — min/max group-quant per expert).
+#
+# Qwen3.6-MoE stores each layer's experts as fused 3D tensors:
+#     mlp.experts.gate_up_proj    [E, 2*moe_int, hidden]   bf16
+#     mlp.experts.down_proj       [E, hidden,    moe_int]  bf16
+# These are nn.Parameters under a custom MoE module, NOT a list of nn.Linear,
+# so the GPTQ driver above (which walks nn.Linear) skips them. Running them
+# through full Hessian-aware GPTQ on the producer host is also impractical for
+# 256 experts × 40 layers × 2 projections.
+#
+# Plan §15 option (c): keep GPTQ for the dense projections, give the experts a
+# straight min/max INT4 group-quant per expert. Each expert gets its own
+# `[out/gs, in/gs]` BF16 scale+zero tile, fused along axis 0 with the other
+# experts in the layer. The runtime accounting in
+# `crates/qwen36_moe/src/weights.rs` (search `int4_bytes`) already sizes for
+# this layout.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def fused_expert_minmax_int4(
+    W: torch.Tensor,
+    group_size: int,
+    work_device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-expert min/max INT4 group-quant for a fused MoE weight slab.
+
+    Parameters
+    ----------
+    W : [E, out, in] tensor (any float dtype). Treated as `E` parallel
+        `[out, in]` matrices; each is independently quantized.
+    group_size : tile dim (must divide both `out` and `in`; `in` must be even).
+    work_device : optional device for the per-expert reductions; defaults to
+        `W.device` (avoids an unnecessary copy when the model is already on GPU).
+
+    Returns
+    -------
+    nibbles : [E, out, in]            uint8, values 0..15  (CPU)
+    scales  : [E, out/gs, in/gs]      float32 (BF16-rounded, CPU)
+    zeros   : [E, out/gs, in/gs]      float32 (BF16-rounded, CPU)
+    """
+    if W.dim() != 3:
+        raise ValueError(f"fused expert tensor must be 3D, got shape {tuple(W.shape)}")
+    E, out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(f"out_features {out_f} must be divisible by group_size={gs}")
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    nibbles_out = torch.empty((E, out_f, in_f), dtype=torch.uint8)
+    scale_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    zero_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    dev = work_device if work_device is not None else W.device
+
+    for e in range(E):
+        slab = W[e].to(device=dev, dtype=torch.float32)
+        # Reduce per-tile min/max in one reshape — vectorised inside the slab.
+        tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
+        tmax = tiles.amax(dim=(1, 3))
+        tmin = tiles.amin(dim=(1, 3))
+        rng = tmax - tmin
+        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
+        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
+        # Round through BF16 so reconstruction matches what the runtime kernel
+        # will read from the BF16 sidecar tensors.
+        sc = sc.to(torch.bfloat16).to(torch.float32)
+        zf = zf.to(torch.bfloat16).to(torch.float32)
+        sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        q = torch.clamp(torch.round(slab / sc_full + zf_full), 0.0, 15.0).to(torch.uint8)
+        nibbles_out[e] = q.cpu()
+        scale_out[e] = sc.cpu()
+        zero_out[e] = zf.cpu()
+        del slab, tiles, sc_full, zf_full, q
+
+    return nibbles_out, scale_out, zero_out
+
+
+@torch.no_grad()
+def fused_expert_minmax_int4_packed(
+    W: torch.Tensor,
+    group_size: int,
+    work_device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """As `fused_expert_minmax_int4`, but pack nibbles per-expert as we go.
+
+    The 35B-A3B fused-expert nibble buffer is ~32 GiB unpacked vs ~16 GiB
+    packed. Packing each expert's slab into the output buffer immediately
+    (rather than calling the unpacked variant and packing afterward) keeps
+    peak host RAM at the packed size — the unpacked builder allocates the
+    full `[E, out, in]` uint8 tensor, which on 35B-A3B alone is ~32 GiB and
+    won't co-exist with an Accelerate-offloaded BF16 model on a 64 GiB host.
+
+    Returns
+    -------
+    packed_nibbles : [E, out, in/2]      uint8 (CPU)
+    scales         : [E, out/gs, in/gs]  float32 (BF16-rounded, CPU)
+    zeros          : [E, out/gs, in/gs]  float32 (BF16-rounded, CPU)
+    """
+    if W.dim() != 3:
+        raise ValueError(f"fused expert tensor must be 3D, got shape {tuple(W.shape)}")
+    E, out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(f"out_features {out_f} must be divisible by group_size={gs}")
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    packed_out = torch.empty((E, out_f, in_f // 2), dtype=torch.uint8)
+    scale_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    zero_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    dev = work_device if work_device is not None else W.device
+
+    for e in range(E):
+        slab = W[e].to(device=dev, dtype=torch.float32)
+        tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
+        tmax = tiles.amax(dim=(1, 3))
+        tmin = tiles.amin(dim=(1, 3))
+        rng = tmax - tmin
+        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
+        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
+        sc = sc.to(torch.bfloat16).to(torch.float32)
+        zf = zf.to(torch.bfloat16).to(torch.float32)
+        sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        q = torch.clamp(torch.round(slab / sc_full + zf_full), 0.0, 15.0).to(torch.uint8)
+        # Pack 2 nibbles/byte before leaving the device — this is the inner-most
+        # cost on the host RAM budget.
+        packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous().cpu()
+        packed_out[e] = packed
+        scale_out[e] = sc.cpu()
+        zero_out[e] = zf.cpu()
+        del slab, tiles, sc_full, zf_full, q, packed
+
+    return packed_out, scale_out, zero_out
 
 
 # ---------------------------------------------------------------------------
@@ -419,20 +589,189 @@ def move_kwargs_to(kwargs: dict[str, Any], device: torch.device) -> dict[str, An
 # ---------------------------------------------------------------------------
 # Sequential per-layer GPTQ driver
 # ---------------------------------------------------------------------------
+def _materialize_param(
+    param: torch.Tensor,
+    hf_name: str,
+    safetensors_loader: Callable[[str], torch.Tensor | None] | None,
+) -> torch.Tensor:
+    """Return the parameter's actual data, even if Accelerate offloaded it.
+
+    Under `device_map="auto"`, offloaded parameters appear as `meta`-device
+    placeholders after a forward pass — `param.data` then yields a meta
+    tensor and any subsequent op on it crashes mid-GPTQ with a device
+    mismatch. When that happens, fall back to reading the raw bytes
+    straight from the source safetensors files (the loader callback knows
+    the prefix-mapping logic that resolves HF flattened names to raw
+    safetensors keys).
+    """
+    if param.device.type != "meta":
+        return param.detach()
+    if safetensors_loader is None:
+        raise RuntimeError(
+            f"{hf_name} is on meta device and no safetensors fallback was given"
+        )
+    t = safetensors_loader(hf_name)
+    if t is None:
+        raise RuntimeError(
+            f"{hf_name} is on meta device and could not be loaded from safetensors"
+        )
+    return t.detach()
+
+
+def _writeback_param(
+    mod: nn.Module,
+    Q_dq: torch.Tensor,
+) -> bool:
+    """Try to copy the dequantised quantised weight back into `mod.weight`.
+
+    Returns True when the write succeeded. Under Accelerate offloading the
+    parameter's `.data` may be on `meta`, in which case `.copy_()` would
+    silently no-op into a non-existent tensor; rather than masking that
+    failure, return False so the caller can adjust expectations (the
+    per-layer re-run will then see the BF16 original instead of Q_dq —
+    weakens GPTQ error propagation but does not corrupt anything).
+    """
+    p = mod.weight
+    if p.device.type == "meta":
+        return False
+    p.data.copy_(Q_dq.to(p.dtype))
+    return True
+
+
+def _stream_quantized_tensor(
+    writer: "StreamingPackageWriter",
+    raw_name: str,
+    nibbles: torch.Tensor,           # [out, in] u8 (unpacked) or [E, out, in/2] u8 (already packed)
+    scale_t: torch.Tensor,           # f32, BF16-rounded
+    zero_t: torch.Tensor,            # f32, BF16-rounded
+) -> None:
+    """Pack (if needed) and stream a quantized tensor + sidecars to `writer`.
+    Mirrors the per-tensor block from the old in-RAM `tensors_out`-building
+    loop in `main`, kept in one place so dense GPTQ / lm_head / fused
+    experts all share the same on-disk layout."""
+    if nibbles.dim() == 3:
+        # Fused MoE experts arrive already packed.
+        packed = nibbles
+    else:
+        packed = pack_nibbles(nibbles)
+    writer.write_tensor(
+        raw_name, packed.numpy().tobytes(),
+        list(packed.shape), "u8", LAYOUT_INT4,
+    )
+    writer.write_tensor(
+        f"{raw_name}_int4_scale", bf16_to_bytes(scale_t),
+        list(scale_t.shape), "bf16", LAYOUT_RAW,
+    )
+    writer.write_tensor(
+        f"{raw_name}_int4_zero", bf16_to_bytes(zero_t),
+        list(zero_t.shape), "bf16", LAYOUT_RAW,
+    )
+
+
+def _selfcheck_dense(
+    nibbles: torch.Tensor,
+    scale_t: torch.Tensor,
+    zero_t: torch.Tensor,
+    live: torch.Tensor,
+    group_size: int,
+) -> tuple[bool, float]:
+    """Reconstruct a dense GPTQ tensor from (nibbles, scale, zero) and
+    compare against the live `mod.weight.data`. Returns (matched, linf).
+    A mismatch indicates a bake-vs-runtime format bug (not quantization
+    quality), so we want this loud and immediate."""
+    rows, cols = nibbles.shape
+    row_gr = torch.arange(rows) // group_size
+    col_gc = torch.arange(cols) // group_size
+    sc_full = scale_t[row_gr][:, col_gc]
+    zf_full = zero_t[row_gr][:, col_gc]
+    recon = nibbles.float() * sc_full - zf_full * sc_full
+    recon = recon.to(torch.bfloat16).to(torch.float32)
+    matched = torch.equal(recon, live)
+    linf = (recon - live).abs().max().item() if not matched else 0.0
+    return matched, linf
+
+
+def _selfcheck_fused(
+    packed: torch.Tensor,             # [E, out, in/2] u8
+    scale_t: torch.Tensor,            # [E, out/gs, in/gs] f32
+    zero_t: torch.Tensor,
+    orig_bf16: torch.Tensor | None,   # [E, out, in] BF16 (may be None if unavailable)
+    group_size: int,
+) -> tuple[bool, float]:
+    """Reconstruct a fused MoE expert tensor from packed nibbles + sidecars
+    and compare against the BF16 original. Returns (nibble_range_ok, linf).
+    Linf is reported as a quality signal — fused experts use min/max
+    quant, so non-zero Linf is expected; we only fail loudly on the
+    nibble-range invariant."""
+    E, rows, packed_cols = packed.shape
+    cols = packed_cols * 2
+    lo = (packed & 0x0F).to(torch.uint8)
+    hi = (packed >> 4).to(torch.uint8)
+    unpacked = torch.empty((E, rows, cols), dtype=torch.uint8)
+    unpacked[:, :, 0::2] = lo
+    unpacked[:, :, 1::2] = hi
+    nibble_range_ok = int(unpacked.max().item()) <= 15
+    linf = 0.0
+    if orig_bf16 is not None:
+        row_gr = torch.arange(rows) // group_size
+        col_gc = torch.arange(cols) // group_size
+        sc_full = scale_t.index_select(1, row_gr).index_select(2, col_gc)
+        zf_full = zero_t.index_select(1, row_gr).index_select(2, col_gc)
+        recon = unpacked.float() * sc_full - zf_full * sc_full
+        recon = recon.to(torch.bfloat16).to(torch.float32)
+        orig_f32 = orig_bf16.detach().to(device="cpu", dtype=torch.float32)
+        linf = (recon - orig_f32).abs().max().item()
+        del recon, sc_full, zf_full, orig_f32
+    del lo, hi, unpacked
+    return nibble_range_ok, linf
+
+
 def quantize_model(
     model: nn.Module,
     calib_ids: torch.Tensor,
     device: torch.device,
     group_size: int,
     damp: float,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    writer: "StreamingPackageWriter",
+    hf_to_raw: dict[str, str],
+    safetensors_loader: Callable[[str], torch.Tensor | None] | None = None,
+) -> dict[str, Any]:
     """
-    Run sequential GPTQ. Returns {tensor_name: (nibbles, scale_f32, zero_f32)}
-    where nibbles is [out, in] uint8 and scale/zero are [out/gs, in/gs] f32.
+    Run sequential GPTQ, **streaming** each quantized tensor to `writer` as
+    it's produced (rather than accumulating in a host-RAM dict). Returns a
+    self-check stats dict:
+
+        {
+          "quantized_names": set[str],         # HF state-dict names that were quantized
+          "dense_total":     int,
+          "dense_mismatch":  int,
+          "dense_worst":     (name, linf),
+          "fused_total":     int,
+          "fused_worst":     (name, linf),
+          "nibble_range_ok": bool,
+        }
+
+    `hf_to_raw` maps HF state-dict names to safetensors keys so the writer
+    can use raw names (the runtime-visible layout). `safetensors_loader(hf_name)`
+    is consulted only when a parameter is on the `meta` device (Accelerate
+    offloading); the dense paths still prefer the live `mod.weight` when
+    it's on a real device.
     """
     model.eval()
+    # Locate the transformer-decoder block list. Qwen3.5 (non-MM) stores it at
+    # `model.model.layers`; Qwen3.6-MoE uses the multimodal class
+    # `Qwen3_5MoeForConditionalGeneration` and nests under
+    # `model.model.language_model.layers` alongside `.visual.*`.
     inner = model.model
-    layers = inner.layers
+    if hasattr(inner, "layers"):
+        text_root = inner
+    elif hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+        text_root = inner.language_model
+    else:
+        raise SystemExit(
+            "could not locate transformer layers under model.model[.language_model]"
+        )
+    layers = text_root.layers
     num_layers = len(layers)
 
     # Map nn.Linear -> state-dict weight name (for naming output tensors)
@@ -445,7 +784,15 @@ def quantize_model(
     hidden_cpu, layer_kwargs = capture_layer0_inputs(model, layers, calib_ids, device)
     layer_kwargs_dev = move_kwargs_to(layer_kwargs, device)
 
-    quantized: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    stats: dict[str, Any] = {
+        "quantized_names": set(),     # HF state-dict names successfully streamed
+        "dense_total": 0,
+        "dense_mismatch": 0,
+        "dense_worst": ("", 0.0),
+        "fused_total": 0,
+        "fused_worst": ("", 0.0),
+        "nibble_range_ok": True,
+    }
     nsamples = len(hidden_cpu)
 
     for layer_idx in range(num_layers):
@@ -480,16 +827,44 @@ def quantize_model(
                 log(f"[gptq]   {name}: WARNING no activations captured, skipping")
                 continue
             t0 = time.perf_counter()
-            W = mod.weight.data.to(torch.float32)
+            # Bypass Accelerate's `meta`-device placeholder by reading from
+            # safetensors when needed. The fallback is silent on layers whose
+            # weights happen to be on a real device after forward.
+            raw = _materialize_param(mod.weight, name, safetensors_loader)
+            W = raw.to(device=device, dtype=torch.float32)
             Q_dq, nibbles, scale_t, zero_t = gptq_quantize(W, H, group_size, damp)
             elapsed = time.perf_counter() - t0
+            wrote = _writeback_param(mod, Q_dq)
+
+            raw_name = hf_to_raw.get(name)
+            if raw_name is None:
+                log(f"[gptq]   {name}: WARN no safetensors raw name; skipping write")
+            else:
+                nibbles_cpu = nibbles.cpu()
+                scale_cpu   = scale_t.cpu()
+                zero_cpu    = zero_t.cpu()
+                _stream_quantized_tensor(writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu)
+                stats["quantized_names"].add(name)
+                # Inline self-check: recon should byte-match `mod.weight.data`
+                # after the writeback above. Only meaningful when the writeback
+                # actually landed (meta-device params skip writeback).
+                if wrote:
+                    stats["dense_total"] += 1
+                    live = mod.weight.data.to(torch.float32).cpu()
+                    matched, linf = _selfcheck_dense(
+                        nibbles_cpu, scale_cpu, zero_cpu, live, group_size,
+                    )
+                    if not matched:
+                        stats["dense_mismatch"] += 1
+                        if linf > stats["dense_worst"][1]:
+                            stats["dense_worst"] = (name, linf)
+                    del live
+                del nibbles_cpu, scale_cpu, zero_cpu
+
             log(f"[gptq]   {name}: shape={tuple(W.shape)} "
-                f"H_N={hook.N} took {elapsed:.1f}s")
-            # Swap in dequantized weights so subsequent forwards see the quantized
-            # version of this module.
-            mod.weight.data.copy_(Q_dq.to(mod.weight.dtype))
-            quantized[name] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
-            del W, Q_dq, nibbles, scale_t, zero_t, H
+                f"H_N={hook.N} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: re-run will use BF16]"))
+            del raw, W, Q_dq, nibbles, scale_t, zero_t, H
 
         # Re-run the (now partially-quantized) layer so the next layer sees
         # post-quantization activations.
@@ -505,11 +880,14 @@ def quantize_model(
                 torch.cuda.empty_cache()
 
     # --- lm_head GPTQ pass ---
-    # The transformer layer loop above hooks every nn.Linear inside `inner.layers`,
-    # but lm_head sits outside. Capture its Hessian here (post-final-norm hidden
-    # state) and run the same column-wise GPTQ. This lets the runtime skip the
-    # 250k×hidden BF16 read on the dominant decode-side matmul.
-    final_norm = getattr(inner, "norm", None)
+    # The transformer layer loop above hooks every nn.Linear inside the text
+    # decoder, but lm_head sits outside. Capture its Hessian here (post-final-
+    # norm hidden state) and run the same column-wise GPTQ. This lets the
+    # runtime skip the 250k×hidden BF16 read on the dominant decode-side
+    # matmul. `final_norm` lives on the same submodule as the layer list
+    # (text_root), which is `model.model` for Qwen3.5 and
+    # `model.model.language_model` for Qwen3.6-MoE.
+    final_norm = getattr(text_root, "norm", None)
     lm_head = getattr(model, "lm_head", None)
     if (
         isinstance(lm_head, nn.Linear)
@@ -534,18 +912,96 @@ def quantize_model(
             t0 = time.perf_counter()
             # The output head is huge on 9B-class checkpoints. Quantize it on
             # CPU to avoid requiring an extra multi-GiB clone on an already-full
-            # producer GPU after the layer sweep.
-            W = lm_head.weight.data.detach().to(device="cpu", dtype=torch.float32)
+            # producer GPU after the layer sweep. Fall back to safetensors if
+            # Accelerate has the lm_head weight on `meta`.
+            raw = _materialize_param(lm_head.weight, "lm_head.weight", safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.float32)
             H = H.detach().to(device="cpu", dtype=torch.float32)
             Q_dq, nibbles, scale_t, zero_t = gptq_quantize(W, H, group_size, damp)
             elapsed = time.perf_counter() - t0
-            log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
-                f"H_N={hook.N} took {elapsed:.1f}s")
-            copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
-            quantized["lm_head.weight"] = (nibbles.cpu(), scale_t.cpu(), zero_t.cpu())
-            del W, Q_dq, nibbles, scale_t, zero_t, H
+            wrote = lm_head.weight.device.type != "meta"
+            if wrote:
+                copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
 
-    return quantized
+            # lm_head.weight is always `lm_head.weight` raw — outside the
+            # `model.language_model.*` prefix so `hf_to_raw` may not have it.
+            raw_name = hf_to_raw.get("lm_head.weight", "lm_head.weight")
+            nibbles_cpu = nibbles.cpu()
+            scale_cpu   = scale_t.cpu()
+            zero_cpu    = zero_t.cpu()
+            _stream_quantized_tensor(writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu)
+            stats["quantized_names"].add("lm_head.weight")
+            if wrote:
+                stats["dense_total"] += 1
+                live = lm_head.weight.data.to(torch.float32).cpu()
+                matched, linf = _selfcheck_dense(
+                    nibbles_cpu, scale_cpu, zero_cpu, live, group_size,
+                )
+                if not matched:
+                    stats["dense_mismatch"] += 1
+                    if linf > stats["dense_worst"][1]:
+                        stats["dense_worst"] = ("lm_head.weight", linf)
+                del live
+            del nibbles_cpu, scale_cpu, zero_cpu
+
+            log(f"[gptq]   lm_head: shape={tuple(W.shape)} "
+                f"H_N={hook.N} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: write-back skipped]"))
+            del raw, W, Q_dq, nibbles, scale_t, zero_t, H
+
+    # --- Fused MoE expert pass ---
+    # Qwen3.6-MoE stores all experts in two 3D nn.Parameters per layer rather
+    # than as a list of nn.Linear, so the per-layer GPTQ loop above never sees
+    # them. Also: a Hessian-aware GPTQ over the fused layout doesn't really fit
+    # (see docs/qwen36-moe-plan.md §15). Plan §15 option (c) — plain min/max
+    # INT4 group-quant per expert, gs=128, BF16 scale/zero — covers the runtime
+    # VRAM gap (~60 GiB BF16 → ~15 GiB INT4 at 35B) cheaply.
+    #
+    # Memory model: under `device_map="auto"` the fused experts are mostly on
+    # CPU (or partially disk-offloaded). We iterate `named_parameters()` to
+    # avoid materialising a whole state_dict, materialise one fused tensor at
+    # a time on `device`, pack nibbles immediately to halve RAM use vs the
+    # unpacked layout, then free the BF16 source. Writing path detects packed
+    # 3D shapes via `dim() == 3` (dense GPTQ stays 2D + unpacked).
+    fused_param_names = sorted(
+        n for n, _ in model.named_parameters() if is_fused_expert_target(n)
+    )
+    if fused_param_names:
+        log(f"[gptq] fused MoE experts: quantizing {len(fused_param_names)} "
+            f"3D tensors (min/max group-quant, streaming packed nibbles to disk)")
+        named_params = dict(model.named_parameters())
+        for name in fused_param_names:
+            t0 = time.perf_counter()
+            param = named_params[name]
+            # Same Accelerate `meta` problem: fall back to safetensors when
+            # the fused tensor is offloaded.
+            raw = _materialize_param(param, name, safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.bfloat16)
+            packed, scale_t, zero_t = fused_expert_minmax_int4_packed(
+                W, group_size=group_size, work_device=device,
+            )
+            elapsed = time.perf_counter() - t0
+            log(f"[gptq]   {name}: shape={tuple(W.shape)} -> "
+                f"packed={tuple(packed.shape)} took {elapsed:.1f}s")
+
+            raw_name = hf_to_raw.get(name, name)
+            _stream_quantized_tensor(writer, raw_name, packed, scale_t, zero_t)
+            stats["quantized_names"].add(name)
+            stats["fused_total"] += 1
+            # Inline self-check while `W` is still on CPU. Linf is purely a
+            # quality signal (min/max quant always shows non-zero error);
+            # the nibble-range invariant is the structural pin.
+            range_ok, linf = _selfcheck_fused(packed, scale_t, zero_t, W, group_size)
+            if not range_ok:
+                stats["nibble_range_ok"] = False
+            if linf > stats["fused_worst"][1]:
+                stats["fused_worst"] = (name, linf)
+
+            del raw, W, packed, scale_t, zero_t
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -649,40 +1105,102 @@ def _build_name_map(hf_keys: list[str], raw_keys: set[str]) -> dict[str, str]:
     return out
 
 
+class StreamingPackageWriter:
+    """Streaming sink for the bake's `weights.bin` + `manifest.json`.
+
+    The original in-RAM `tensors_out` list held every quantized tensor's
+    bytes (~17 GiB on 35B-A3B: ~15 GiB packed expert nibbles + ~1 GiB BF16
+    embeds + ~1 GiB scale/zero sidecars) until the final `write_package`
+    flushed them out. On a 64 GiB host, that list plus the still-loaded
+    BF16 model plus the GPTQ working set blew through host RAM and OOM'd
+    near the end of the run.
+    Mirrors `BakePackageWriter` in `bake_q4km.py`. The on-disk format
+    (4096-byte alignment, `manifest.json` schema) is identical to the old
+    `write_package`; only the producer side becomes streaming.
+    """
+
+    def __init__(self, out_dir: Path, model_family: str = "qwen35"):
+        self.out_dir = out_dir
+        self.model_family = model_family
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.weights_path = out_dir / "weights.bin"
+        self._fh = open(self.weights_path, "wb")
+        self._cursor = 0
+        self._entries: list[dict[str, Any]] = []
+        self._names: set[str] = set()
+
+    def write_tensor(
+        self,
+        name: str,
+        data: bytes,
+        shape: list[int],
+        dtype_str: str,
+        layout: str,
+    ) -> int:
+        """Append a tensor; return its 4096-aligned byte offset."""
+        if name in self._names:
+            raise ValueError(f"duplicate tensor name {name!r} written to bake")
+        offset = align_up(self._cursor, 4096)
+        if offset > self._cursor:
+            self._fh.write(b"\x00" * (offset - self._cursor))
+        self._fh.write(data)
+        byte_len = len(data)
+        self._entries.append({
+            "name": name,
+            "shape": list(shape),
+            "dtype": dtype_str,
+            "layout": layout,
+            "offset": offset,
+            "byte_len": byte_len,
+        })
+        self._names.add(name)
+        self._cursor = offset + byte_len
+        return offset
+
+    def has(self, name: str) -> bool:
+        return name in self._names
+
+    def finalize(self) -> None:
+        """Flush weights.bin and emit manifest.json. Sorts manifest entries
+        alphabetically for stable diffs — runtime keys by name into a
+        HashMap so on-disk ordering doesn't matter, but a sorted manifest
+        makes diffing two bake outputs sane."""
+        self._fh.flush()
+        self._fh.close()
+        sorted_entries = sorted(self._entries, key=lambda e: e["name"])
+        manifest = {
+            "format_version": FORMAT_VERSION,
+            "converter_version": CONVERTER_VERSION,
+            "model_family": self.model_family,
+            "tensors": sorted_entries,
+        }
+        with open(self.out_dir / "manifest.json", "w") as f:
+            json.dump(manifest, f, indent=2)
+        log(f"[bake-int4] wrote {self._cursor / (1024 * 1024):.1f} MiB to {self.weights_path}")
+        log(f"[bake-int4] manifest: {self.out_dir / 'manifest.json'}")
+
+    def __enter__(self) -> "StreamingPackageWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None:
+            self.finalize()
+        else:
+            # On error: close the file handle but skip manifest emission so
+            # downstream code can't accidentally consume a partial bake.
+            self._fh.close()
+
+
 def write_package(
     out_dir: Path,
     tensors: list[tuple[str, bytes, list[int], str, str]],
 ) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    entries: list[dict[str, Any]] = []
-    cursor = 0
-    weights_path = out_dir / "weights.bin"
-    with open(weights_path, "wb") as f:
+    """Compat wrapper for callers that still want the in-RAM list API.
+    All new code should construct a `StreamingPackageWriter` directly so
+    peak host RAM stays bounded by the largest single tensor."""
+    with StreamingPackageWriter(out_dir) as writer:
         for (name, data, shape, dtype_str, layout) in tensors:
-            offset = align_up(cursor, 4096)
-            if offset > cursor:
-                f.write(b"\x00" * (offset - cursor))
-            f.write(data)
-            byte_len = len(data)
-            entries.append({
-                "name": name,
-                "shape": shape,
-                "dtype": dtype_str,
-                "layout": layout,
-                "offset": offset,
-                "byte_len": byte_len,
-            })
-            cursor = offset + byte_len
-    manifest = {
-        "format_version": FORMAT_VERSION,
-        "converter_version": CONVERTER_VERSION,
-        "model_family": "qwen35",
-        "tensors": entries,
-    }
-    with open(out_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    log(f"[bake-int4] wrote {cursor / (1024 * 1024):.1f} MiB to {weights_path}")
-    log(f"[bake-int4] manifest: {out_dir / 'manifest.json'}")
+            writer.write_tensor(name, data, shape, dtype_str, layout)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +1228,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default=None, type=Path,
                    help="Override output directory (default: "
                         "{model-dir}/.supersonic/v{FORMAT_VERSION}-int4-gptq)")
+    # Streaming offload — needed when BF16 weights don't fit a single GPU
+    # (35B-A3B is ~67 GiB, never fits 24 GiB VRAM). Same pattern as
+    # oracle/q4km_stream_gptq_bake.py: pass through to from_pretrained and
+    # skip the unconditional .to(device) so HF Accelerate manages placement.
+    p.add_argument("--device-map", default=None,
+                   help="Optional Transformers device_map, e.g. 'auto'. When set, "
+                        "the model is NOT explicitly moved with .to(device); "
+                        "HF Accelerate spreads layers across GPU/CPU/disk.")
+    p.add_argument("--max-memory", default=None,
+                   help="Optional JSON max_memory for HF Accelerate, e.g. "
+                        "'{\"0\":\"20GiB\",\"cpu\":\"50GiB\"}' (24 GiB GPU + 64 GiB host).")
+    p.add_argument("--offload-folder", default=None, type=Path,
+                   help="Disk-offload folder for params that don't fit GPU+CPU "
+                        "(needed for ~3 GiB shortfall on 35B-A3B with 24+50 GiB).")
     return p.parse_args()
 
 
@@ -734,11 +1266,30 @@ def main() -> None:
     log(f"[bake-int4] loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     log(f"[bake-int4] loading model (bf16) from {model_dir}")
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_dir),
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(device)
+
+    load_kwargs: dict[str, Any] = {
+        "torch_dtype": torch.bfloat16,
+        "trust_remote_code": True,
+    }
+    if args.device_map:
+        load_kwargs["device_map"] = args.device_map
+        log(f"[bake-int4] device_map={args.device_map!r}")
+    if args.max_memory:
+        raw_max_memory = json.loads(args.max_memory)
+        # Accelerate accepts ints (GPU index) or "cpu"/"disk" string keys.
+        load_kwargs["max_memory"] = {
+            (int(k) if isinstance(k, str) and k.isdigit() else k): v
+            for k, v in raw_max_memory.items()
+        }
+        log(f"[bake-int4] max_memory={load_kwargs['max_memory']}")
+    if args.offload_folder:
+        args.offload_folder.mkdir(parents=True, exist_ok=True)
+        load_kwargs["offload_folder"] = str(args.offload_folder)
+        log(f"[bake-int4] offload_folder={args.offload_folder}")
+
+    model = AutoModelForCausalLM.from_pretrained(str(model_dir), **load_kwargs)
+    if args.device_map is None:
+        model = model.to(device)
     model.eval()
 
     # --- Determine the canonical tensor-name prefix by reading the raw
@@ -764,7 +1315,17 @@ def main() -> None:
         raise SystemExit("could not infer weight prefix from safetensors keys")
     log(f"[bake-int4] canonical weight prefix (from safetensors): {weight_prefix!r}")
 
-    sd_keys = list(model.state_dict().keys())
+    # Avoid `model.state_dict()` here — under `device_map="auto"` it gathers
+    # every offloaded param onto CPU at once, which on a 35B model easily
+    # exceeds host RAM. `named_parameters()` + `named_buffers()` give the same
+    # name set without materialising data; we materialise per-tensor on demand
+    # in the writing loop below.
+    named_lookup: dict[str, torch.Tensor] = {}
+    for n, p in model.named_parameters():
+        named_lookup[n] = p
+    for n, b in model.named_buffers():
+        named_lookup.setdefault(n, b)
+    sd_keys = list(named_lookup.keys())
     hf_to_raw = _build_name_map(sd_keys, raw_keys)
     missing_in_raw = [k for k in sd_keys if k not in hf_to_raw]
     if missing_in_raw:
@@ -782,6 +1343,31 @@ def main() -> None:
         ]
     log(f"[bake-int4] num_layers={num_layers} "
         f"full_layers={sum(1 for t in layer_types if t == 'full_attention')}")
+
+    # `safetensors_loader` is the meta-device escape hatch for `quantize_model`.
+    # When Accelerate offloads a parameter, its `.data` becomes a meta tensor
+    # after the per-layer forward and any subsequent op crashes with a
+    # device-mismatch. The loader resolves the HF flattened name to a raw
+    # safetensors key (using `hf_to_raw`) and reads the bytes directly.
+    def safetensors_loader(hf_name: str) -> torch.Tensor | None:
+        raw_name = hf_to_raw.get(hf_name)
+        if raw_name is None:
+            # Try the live mapping candidates as a last resort — covers
+            # parameters that aren't in the state-dict-derived sd_keys (e.g.
+            # untied lm_head when the safetensors prefix differs).
+            for cand in (
+                hf_name,
+                hf_name.replace("model.", "model.language_model.", 1)
+                if hf_name.startswith("model.")
+                and not hf_name.startswith("model.language_model.")
+                else hf_name,
+            ):
+                if cand in raw_keys:
+                    raw_name = cand
+                    break
+        if raw_name is None:
+            return None
+        return load_raw_tensor(model_dir, raw_name)
 
     # --- Load calibration data ---
     log("[bake-int4] loading WikiText-2 train split via `datasets`...")
@@ -803,124 +1389,125 @@ def main() -> None:
     calib = torch.stack([ids[s:s + args.seqlen] for s in starts])
     log(f"[bake-int4] calibration batch: {tuple(calib.shape)}")
 
-    # --- GPTQ ---
-    t0 = time.perf_counter()
-    quantized = quantize_model(
-        model, calib, device,
-        group_size=args.group_size,
-        damp=args.damp,
+    # --- Open the streaming writer up front so quantized tensors flow to
+    # disk as soon as they're produced. The producer side never holds more
+    # than one (nibbles, scale, zero) triple in RAM at a time; on 35B-A3B
+    # that's ~1 GiB peak (largest fused expert slab) instead of the ~17 GiB
+    # the in-RAM `tensors_out` list reached before this refactor.
+    out_dir = args.out_dir or (
+        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
     )
-    gptq_elapsed = time.perf_counter() - t0
-    log(f"[bake-int4] GPTQ done in {gptq_elapsed / 60.0:.1f} min "
-        f"({len(quantized)} tensors quantized)")
-
-    # --- Sample generation sanity check (quantized weights live in the model) ---
-    try:
-        sample_ids = tokenizer("The quick brown fox", return_tensors="pt"
-                               ).input_ids.to(device)
-        with torch.no_grad():
-            gen = model.generate(sample_ids, max_new_tokens=12,
-                                 do_sample=False, use_cache=True)
-        log(f"[bake-int4] sample gen (post-quant, python-side): "
-            f"{tokenizer.decode(gen[0], skip_special_tokens=True)!r}")
-    except Exception as ex:
-        log(f"[bake-int4] sample gen failed: {ex}")
-
-    # --- Self-consistency check: reconstruct EVERY INT4 tensor from the
-    # just-computed (nibbles, scale, zero) and verify it matches the value
-    # copied into the live model's Linear weight. Any mismatch indicates a
-    # bake-vs-runtime format bug (not a quantization quality issue).
-    try:
-        gs = args.group_size
-        hf_modules = dict(model.named_modules())
-        mismatch = 0
-        worst: tuple[str, float] = ("", 0.0)
-        for hf_name, (nibbles_s, scale_s, zero_s) in quantized.items():
-            rows, cols = nibbles_s.shape
-            row_gr = torch.arange(rows) // gs
-            col_gc = torch.arange(cols) // gs
-            sc_full = scale_s[row_gr][:, col_gc]
-            zf_full = zero_s[row_gr][:, col_gc]
-            recon = nibbles_s.float() * sc_full - zf_full * sc_full
-            recon = recon.to(torch.bfloat16).to(torch.float32)
-            mod = hf_modules.get(hf_name[: -len(".weight")])
-            if mod is None:
-                continue
-            live = mod.weight.data.to(torch.float32).cpu()
-            if not torch.equal(recon, live):
-                mismatch += 1
-                linf = (recon - live).abs().max().item()
-                if linf > worst[1]:
-                    worst = (hf_name, linf)
-        log(f"[self-check] INT4 tensors: {mismatch}/{len(quantized)} mismatch"
-            + (f" (worst: {worst[0]} Linf={worst[1]:.2e})" if mismatch else ""))
-    except Exception as ex:
-        log(f"[self-check] failed: {ex}")
-
-    # --- Perplexity sanity check (with quantized weights live in the model) ---
-    if not args.skip_ppl:
-        log("[bake-int4] running perplexity sanity check on WikiText-2 test...")
-        try:
-            ppl = compute_ppl(model, tokenizer, device,
-                              seqlen=args.seqlen, n_chunks=args.ppl_chunks)
-            log(f"[bake-int4] PPL (WikiText-2 test, {args.ppl_chunks} chunks): "
-                f"{ppl:.2f}")
-        except Exception as ex:
-            log(f"[bake-int4] PPL check failed: {ex}")
-
-    # --- Assemble tensors for writing ---
-    log("[bake-int4] serialising tensors...")
-    # Walk the HF state dict but emit under raw-safetensors names so the Rust
-    # loader (which expects the raw layout, e.g. "model.language_model.X")
-    # finds every tensor.
-    eligible = [
-        hf_name for hf_name in sd_keys
-        if hf_name in hf_to_raw
-        and not hf_to_raw[hf_name].endswith("_scale_inv")
-        and (
-            hf_to_raw[hf_name].startswith(f"{weight_prefix}.")
-            or hf_to_raw[hf_name] == "lm_head.weight"
+    # Context-manager form: on a partial run (exception propagating out),
+    # `__exit__` closes the file handle but skips manifest emission so a
+    # downstream bake-consumer can't accidentally read a half-written package
+    # as if it were complete.
+    with StreamingPackageWriter(out_dir, model_family="qwen35") as writer:
+        # --- GPTQ ---
+        t0 = time.perf_counter()
+        stats = quantize_model(
+            model, calib, device,
+            group_size=args.group_size,
+            damp=args.damp,
+            writer=writer,
+            hf_to_raw=hf_to_raw,
+            safetensors_loader=safetensors_loader,
         )
-    ]
-    eligible.sort()
+        gptq_elapsed = time.perf_counter() - t0
+        log(f"[bake-int4] GPTQ done in {gptq_elapsed / 60.0:.1f} min "
+            f"({len(stats['quantized_names'])} tensors quantized + streamed)")
 
-    sd = model.state_dict()
-    # When `lm_head.weight` is tied to `embed_tokens.weight`, the HF state dict
-    # entry usually has no safetensors counterpart and the eligible loop above
-    # skips it. But if we just ran GPTQ on `model.lm_head` and produced a
-    # quantized tensor for it, force-include `lm_head.weight` so the runtime
-    # loads the INT4 version instead of falling back to the BF16 embed alias.
-    if "lm_head.weight" in quantized and "lm_head.weight" not in eligible:
-        eligible.append("lm_head.weight")
-        if "lm_head.weight" not in hf_to_raw:
-            hf_to_raw["lm_head.weight"] = "lm_head.weight"
-        if "lm_head.weight" not in sd and hasattr(model, "lm_head"):
-            sd["lm_head.weight"] = model.lm_head.weight.data
-    tensors_out: list[tuple[str, bytes, list[int], str, str]] = []
-    for hf_name in eligible:
-        raw_name = hf_to_raw[hf_name]
-        t = sd[hf_name]
-        shape = list(t.shape)
-        if hf_name in quantized:
-            nibbles, scale_t, zero_t = quantized[hf_name]
-            packed = pack_nibbles(nibbles)
-            packed_bytes = packed.numpy().tobytes()
-            tensors_out.append((
-                raw_name, packed_bytes,
-                [packed.shape[0], packed.shape[1]],
-                "u8", LAYOUT_INT4,
-            ))
-            tensors_out.append((
-                f"{raw_name}_int4_scale",
-                bf16_to_bytes(scale_t),
-                list(scale_t.shape), "bf16", LAYOUT_RAW,
-            ))
-            tensors_out.append((
-                f"{raw_name}_int4_zero",
-                bf16_to_bytes(zero_t),
-                list(zero_t.shape), "bf16", LAYOUT_RAW,
-            ))
-        else:
+        # --- Sample generation sanity check (quantized weights live in the model) ---
+        try:
+            sample_ids = tokenizer("The quick brown fox", return_tensors="pt"
+                                   ).input_ids.to(device)
+            with torch.no_grad():
+                gen = model.generate(sample_ids, max_new_tokens=12,
+                                     do_sample=False, use_cache=True)
+            log(f"[bake-int4] sample gen (post-quant, python-side): "
+                f"{tokenizer.decode(gen[0], skip_special_tokens=True)!r}")
+        except Exception as ex:
+            log(f"[bake-int4] sample gen failed: {ex}")
+
+        # Self-check stats — already collected inline during quantize_model
+        # so no second pass is needed (the old standalone pass had to
+        # re-walk the entire `quantized` dict and held every tensor's bytes
+        # in RAM until it finished).
+        log(f"[self-check] dense INT4: "
+            f"{stats['dense_mismatch']}/{stats['dense_total']} mismatch"
+            + (f" (worst: {stats['dense_worst'][0]} "
+               f"Linf={stats['dense_worst'][1]:.2e})"
+               if stats['dense_mismatch'] else ""))
+        if stats['fused_total']:
+            log(f"[self-check] fused MoE INT4: {stats['fused_total']} tensors, "
+                f"nibble_range_ok={stats['nibble_range_ok']}, "
+                f"worst-Linf-vs-bf16={stats['fused_worst'][0]} "
+                f"({stats['fused_worst'][1]:.2e})")
+
+        # --- Perplexity sanity check (with quantized weights live in the model) ---
+        if not args.skip_ppl:
+            log("[bake-int4] running perplexity sanity check on WikiText-2 test...")
+            try:
+                ppl = compute_ppl(model, tokenizer, device,
+                                  seqlen=args.seqlen, n_chunks=args.ppl_chunks)
+                log(f"[bake-int4] PPL (WikiText-2 test, {args.ppl_chunks} chunks): "
+                    f"{ppl:.2f}")
+            except Exception as ex:
+                log(f"[bake-int4] PPL check failed: {ex}")
+
+        # --- Stream non-quantized tensors ---
+        log("[bake-int4] streaming non-quantized tensors...")
+        # Walk the HF state dict but emit under raw-safetensors names so the
+        # Rust loader (which expects the raw layout, e.g.
+        # "model.language_model.X") finds every tensor.
+        eligible = [
+            hf_name for hf_name in sd_keys
+            if hf_name in hf_to_raw
+            and not hf_to_raw[hf_name].endswith("_scale_inv")
+            and (
+                hf_to_raw[hf_name].startswith(f"{weight_prefix}.")
+                or hf_to_raw[hf_name] == "lm_head.weight"
+            )
+        ]
+        eligible.sort()
+
+        # When `lm_head.weight` is tied to `embed_tokens.weight`, the HF state
+        # dict entry usually has no safetensors counterpart and the eligible
+        # loop above skips it. But if quantize_model just ran GPTQ on
+        # `model.lm_head` and streamed an INT4 tensor for it, that tensor is
+        # already in the writer — `writer.has(...)` skips it and the runtime
+        # loads the INT4 version instead of falling back to the BF16 embed alias.
+        if ("lm_head.weight" in stats["quantized_names"]
+                and "lm_head.weight" not in eligible):
+            eligible.append("lm_head.weight")
+            if "lm_head.weight" not in hf_to_raw:
+                hf_to_raw["lm_head.weight"] = "lm_head.weight"
+            if "lm_head.weight" not in named_lookup and hasattr(model, "lm_head"):
+                named_lookup["lm_head.weight"] = model.lm_head.weight
+
+        for hf_name in eligible:
+            raw_name = hf_to_raw[hf_name]
+            # Quantized tensors were streamed during quantize_model already;
+            # the writer's name set is the source of truth.
+            if writer.has(raw_name):
+                continue
+            # Materialise one tensor at a time onto host RAM — under
+            # device_map="auto" this is what triggers Accelerate to fetch the
+            # offloaded slice. If the param is on `meta` (post-forward
+            # placeholder), fall back to safetensors via the loader so we
+            # never write a meta tensor's bytes into the bake.
+            param_ref = named_lookup.get(hf_name)
+            if param_ref is None:
+                continue
+            if param_ref.device.type == "meta":
+                t = safetensors_loader(hf_name)
+                if t is None:
+                    log(f"[bake-int4] WARNING {hf_name}: meta param + no "
+                        f"safetensors fallback — skipping")
+                    continue
+                t = t.detach().to(device="cpu")
+            else:
+                t = param_ref.detach().to(device="cpu")
+            shape = list(t.shape)
             layout = classify_tensor(raw_name, shape, weight_prefix, layer_types)
             # For A_log (HeadExpReshaped): the HF model stores bf16(raw_A_log)
             # and computes exp() at runtime as exp(bf16(raw)). Keep that —
@@ -928,14 +1515,8 @@ def main() -> None:
             # live HF model uses, which breaks Python-vs-Rust equivalence.
             dtype_str = torch_dtype_to_str(t.dtype)
             b, final_shape, final_dtype = apply_layout(t, shape, layout, dtype_str)
-            tensors_out.append((raw_name, b, final_shape, final_dtype, layout))
-
-    tensors_out.sort(key=lambda x: x[0])
-
-    out_dir = args.out_dir or (
-        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
-    )
-    write_package(out_dir, tensors_out)
+            writer.write_tensor(raw_name, b, final_shape, final_dtype, layout)
+            del t, b
     log(f"[bake-int4] done. Output: {out_dir}")
 
 

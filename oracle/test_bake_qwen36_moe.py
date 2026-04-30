@@ -9,7 +9,7 @@ weight is `Int4Quantized`, every gate is `Raw`". The decision is made by
 ACTUAL Qwen3.6-MoE tensor naming, as discovered post-PR 3 by enumerating
 the published Qwen/Qwen3.6-35B-A3B safetensors.
 
-Two surprises landed during PR 3 that shape this file:
+Two facts the published checkpoint forces on us:
 
 1. **Experts are fused, not per-expert.** The real checkpoint stores ONE
    tensor per layer for gate+up across all 256 experts:
@@ -19,16 +19,13 @@ Two surprises landed during PR 3 that shape this file:
    `mlp.experts.{E}.{gate,up,down}_proj.weight` (768 tensors per layer);
    that layout does not exist on disk for this model.
 
-2. **Current bake predicates do not pick up the fused tensors.** Both
-   `is_int4_target` and `is_q4km_target` require `name.endswith(".weight")`
-   and `is_q4km_target` additionally requires a 2D shape. The fused
-   tensors fail both gates, so under today's bake_int4.py / bake_q4km.py
-   they would be left BF16. This is a gap that PR 7 (calibration) must
-   fix — either by extending the predicates, by unfusing the slabs at
-   bake time, or by adding a separate fused-MoE pathway.
-
-This test file pins both points so a later refactor can't quietly drop
-the manifest contract.
+2. **Bake predicates pick up the fused tensors as INT4 targets** so the
+   experts get quantized into the runtime's expected layout. Plan §15
+   option (c) drove this: predicates accept the bare `mlp.experts.*` names
+   (no `.weight` suffix, 3D shape), and a separate fused-experts driver in
+   `bake_int4.py` / `bake_q4km.py` packs each expert's `[out, in]` slab
+   independently with `group_size=128` BF16 scale+zero — min/max group-quant,
+   no Hessian/GPTQ for the experts (GPTQ stays on the dense projections).
 """
 
 from __future__ import annotations
@@ -193,50 +190,50 @@ class Qwen36MoeBakeClassificationTest(unittest.TestCase):
             self.assertTrue(is_int4_target(name), name)
             self.assertTrue(is_q4km_target(name, shape, GROUP_SIZE), name)
 
-    def test_fused_experts_are_not_yet_quantized(self) -> None:
+    def test_fused_experts_are_quantized(self) -> None:
         """
-        Document — and pin — the gap that PR 7 (calibration) has to close.
+        Pin the post-PR 7-option-(c) reality: both bake paths classify the
+        fused MoE expert tensors as INT4 targets, so the runtime sees a
+        manifest with `Int4Quantized` packed nibbles + BF16 scale/zero
+        sidecars instead of ~60 GiB of BF16 expert weight.
 
-        The real Qwen3.6-MoE checkpoint stores experts as fused-batched
-        tensors with names that lack a `.weight` suffix and 3D shapes:
-
-            mlp.experts.gate_up_proj  [E, 2*moe_int, hidden]
-            mlp.experts.down_proj     [E, hidden, moe_int]
-
-        Both of `is_int4_target` (requires `.weight` suffix) and
-        `is_q4km_target` (also requires 2D shape) reject these. Therefore,
-        a naive `python oracle/bake_int4.py --model qwen3.6-35b-a3b ...`
-        run today would leave the experts BF16, producing a manifest with
-        ~60 GiB of unquantized expert weight — too big for any ROCm GPU
-        we target.
-
-        PR 7 must change one of:
-          (a) Update the predicates to recognise fused expert names AND
-              update bake_int4.py to handle 3D batched tensors.
-          (b) Add an unfuse-then-quantize-then-pack pass before GPTQ.
-          (c) Add a separate fused-MoE quantization driver.
-
-        If you're touching the bake code: make this test fail loudly,
-        update the assertions to assert `True` for the fused names, and
-        bump `FUSED_EXPERTS_QUANTIZED` below.
+        Predicates accept the bare names (no `.weight` suffix). For
+        `is_q4km_target` the 2D-only constraint is relaxed for fused names:
+        3D shapes `[E, out, in]` are accepted as long as the per-expert
+        `(out, in)` axes match the group_size / evenness rules. The actual
+        quantization runs through `fused_expert_minmax_int4` (bake_int4.py)
+        / `quantize_minmax_fused_experts` (bake_q4km.py) — plain min/max
+        group-quant per expert, no Hessian / GPTQ.
         """
-        FUSED_EXPERTS_QUANTIZED = False  # flip to True when PR 7 lands
         for name in FUSED_EXPERT_NAMES:
             shape = shape_for(name)
-            i4 = is_int4_target(name)
-            q4 = is_q4km_target(name, shape, GROUP_SIZE)
-            self.assertEqual(
-                i4,
-                FUSED_EXPERTS_QUANTIZED,
-                f"is_int4_target({name!r}) = {i4}; "
-                f"flip FUSED_EXPERTS_QUANTIZED if PR 7 has landed",
+            self.assertTrue(
+                is_int4_target(name),
+                f"is_int4_target({name!r}) must classify fused experts as INT4",
             )
-            self.assertEqual(
-                q4,
-                FUSED_EXPERTS_QUANTIZED,
-                f"is_q4km_target({name!r}, shape={shape}) = {q4}; "
-                f"flip FUSED_EXPERTS_QUANTIZED if PR 7 has landed",
+            self.assertTrue(
+                is_q4km_target(name, shape, GROUP_SIZE),
+                f"is_q4km_target({name!r}, shape={shape}) must accept "
+                f"3D fused expert tensors",
             )
+
+    def test_fused_expert_predicate_rejects_bad_shapes(self) -> None:
+        """
+        Sanity-pin the divisibility gates that `is_q4km_target` enforces on
+        fused experts. The runtime layout requires per-expert `(out, in)`
+        axes to be divisible by `group_size`, with `in` even (for nibble
+        packing). Catching mis-shaped fused tensors here prevents a silent
+        partial-tile bake that would diverge from the runtime kernel.
+        """
+        bad_in_dim = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+        # `in` not divisible by group_size -> reject.
+        self.assertFalse(is_q4km_target(bad_in_dim, [4, 1024, 100], GROUP_SIZE))
+        # `out` not divisible by group_size -> reject.
+        self.assertFalse(is_q4km_target(bad_in_dim, [4, 100, 2048], GROUP_SIZE))
+        # 2D shape on a fused-expert name -> reject (must be 3D).
+        self.assertFalse(is_q4km_target(bad_in_dim, [1024, 2048], GROUP_SIZE))
+        # `is_int4_target` doesn't see shape, but it must still accept the name.
+        self.assertTrue(is_int4_target(bad_in_dim))
 
     def test_fused_expert_naming_invariants(self) -> None:
         """
