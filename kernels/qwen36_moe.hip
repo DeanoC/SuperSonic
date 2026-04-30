@@ -1556,6 +1556,7 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const int OFF_EXPERT_GU     = OFF_SHARED_OUT + hidden;
     const int OFF_EXPERT_MID    = OFF_EXPERT_GU + 2 * moe_intermediate;
     const int OFF_EXPERT_STACK  = OFF_EXPERT_MID + moe_intermediate;
+    const int OFF_MOE_OUT       = OFF_EXPERT_STACK + top_k * hidden;
 
     // -- Phase A: load input + post_attn RMS norm --------------------------
     // Same idiom as the attn kernel's Phase A. Every block computes h_norm
@@ -1895,122 +1896,169 @@ __global__ void qwen36_moe_ffn_step_kernel(
         return;
     }
 
-    // -- Phase G/H/I: per-expert FFN — top-1 dispatch (stage 3 only)  ------
-    // Stage 3 exercises the read pattern that stage 4 will sweep over k
-    // experts. We pick `e = topk_idx[0]` (the highest-scoring expert) and
-    // run its full FFN end-to-end:
-    //   gu      = gate_up_proj_w[e] @ h_norm                        [2*I]
-    //   mid     = silu(gu[:I]) * gu[I:]                             [I]
-    //   eo      = down_proj_w[e].T @ mid                            [hidden]
+    // -- Phase G/H/I: per-expert FFN — k-iteration loop  -------------------
+    // Stage 3 dispatches just topk_idx[0]; stage 4+ sweeps all k experts.
+    // The per-iteration body is the same; the difference is what we do
+    // after the loop:
+    //   stage 3 → expose EXPERT_STACK[0] BF16-cast as the parity output
+    //   stage 4 → sum topk_w[j] * EXPERT_STACK[j] across j, BF16-round once
     //
-    // All F32 internally; the only BF16 round in this path is when stage 3
-    // writes the test output (or, in stage 4, when the topk-weighted sum is
-    // finalised). EXPERT_STACK[0..hidden] keeps `eo` in F32 so stage 4 can
-    // multiply by topk_w without losing precision through a BF16 detour.
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-
-    // Every block reads the chosen expert index from workspace once. The
-    // value was written by block 0 in Phase C and is visible after the
-    // grid barriers above.
-    __shared__ int s_expert_idx;
-    if (tid == 0) {
-        s_expert_idx = __float_as_int(workspace[OFF_TOPK_IDX + 0]);
-    }
-    __syncthreads();
-    const int e = s_expert_idx;
+    // Within each iteration:
+    //   gu  = gate_up_proj_w[e] @ h_norm                            [2*I]
+    //   mid = silu(gu[:I]) * gu[I:]                                 [I]
+    //   eo  = down_proj_w[e].T @ mid                                [hidden]
+    // EXPERT_STACK keeps `eo` raw F32 so stage 4 doesn't lose precision
+    // through a BF16 round-trip in the weighted sum.
 
     const int I_ = moe_intermediate;
     const int two_I = 2 * I_;
+    const int k_iters = (stage == 3) ? 1 : top_k;
 
-    // Phase G: matvec gate_up_proj_w[e] @ h_norm → EXPERT_GU[2*I].
-    // Layout: gate_up_proj_w[E, 2*I, hidden] — base for slab `e` is
-    // `e * 2*I * hidden`; row `r` within the slab is then `+ r * hidden`.
-    {
-        const T* gu_slab =
-            gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
-        for (;;) {
-            __shared__ unsigned int my_row_g_s;
-            if (tid == 0) {
-                my_row_g_s = atomicAdd(&counters[0], 1u);
-            }
-            __syncthreads();
-            const int my_row = static_cast<int>(my_row_g_s);
-            if (my_row >= two_I) break;
+    for (int j = 0; j < k_iters; j++) {
+        // Per-iteration: every block reads the chosen expert index for
+        // this slot from workspace. Visible across blocks because the
+        // last grid barrier (Phase F's reset, plus any from the
+        // previous iteration's Phase I) ordered the writes.
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
 
-            const T* w_row = gu_slab + static_cast<size_t>(my_row) * hidden;
-            float partial = 0.0f;
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
-            }
-            shared_scratch[tid] = partial;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                __syncthreads();
-            }
-            if (tid == 0) {
-                // Raw F32 — oracle keeps the gate/up halves in F32 across
-                // the silu*mul step.
-                workspace[OFF_EXPERT_GU + my_row] = shared_scratch[0];
-            }
-            __syncthreads();
-        }
-    }
-
-    // Phase H: smid = silu(gu[:I]) * gu[I:] (block-0 only, F32 throughout).
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-    if (blockIdx.x == 0) {
-        for (int i = tid; i < I_; i += block_size) {
-            const float gp = workspace[OFF_EXPERT_GU + i];
-            const float up = workspace[OFF_EXPERT_GU + I_ + i];
-            const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
-            const float silu_gp    = gp * sigmoid_gp;
-            workspace[OFF_EXPERT_MID + i] = silu_gp * up;
+        __shared__ int s_expert_idx;
+        if (tid == 0) {
+            s_expert_idx = __float_as_int(workspace[OFF_TOPK_IDX + j]);
         }
         __syncthreads();
+        const int e = s_expert_idx;
+
+        // Phase G: matvec gate_up_proj_w[e] @ h_norm → EXPERT_GU[2*I].
+        // Layout: gate_up_proj_w[E, 2*I, hidden] — slab `e` base is
+        // `e * 2*I * hidden`; row `r` adds `r * hidden`.
+        {
+            const T* gu_slab =
+                gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
+            for (;;) {
+                __shared__ unsigned int my_row_g_s;
+                if (tid == 0) {
+                    my_row_g_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_g_s);
+                if (my_row >= two_I) break;
+
+                const T* w_row = gu_slab + static_cast<size_t>(my_row) * hidden;
+                float partial = 0.0f;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    workspace[OFF_EXPERT_GU + my_row] = shared_scratch[0];
+                }
+                __syncthreads();
+            }
+        }
+
+        // Phase H: smid = silu(gu[:I]) * gu[I:] (block-0 only, F32 throughout).
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+        if (blockIdx.x == 0) {
+            for (int i = tid; i < I_; i += block_size) {
+                const float gp = workspace[OFF_EXPERT_GU + i];
+                const float up = workspace[OFF_EXPERT_GU + I_ + i];
+                const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                const float silu_gp    = gp * sigmoid_gp;
+                workspace[OFF_EXPERT_MID + i] = silu_gp * up;
+            }
+            __syncthreads();
+        }
+
+        // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[j*hidden..].
+        // Layout: down_proj_w[E, hidden, I]; slab `e` base is `e * hidden * I`,
+        // row `r` adds `r * I`. Contracts over I → one F32 per output row.
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+        {
+            const T* dp_slab =
+                down_proj_w + static_cast<size_t>(e) * hidden * I_;
+            const int slot_off = OFF_EXPERT_STACK + j * hidden;
+            for (;;) {
+                __shared__ unsigned int my_row_i_s;
+                if (tid == 0) {
+                    my_row_i_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_i_s);
+                if (my_row >= hidden) break;
+
+                const T* w_row = dp_slab + static_cast<size_t>(my_row) * I_;
+                float partial = 0.0f;
+                for (int col = tid; col < I_; col += block_size) {
+                    partial += static_cast<float>(w_row[col])
+                               * workspace[OFF_EXPERT_MID + col];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    const float val = shared_scratch[0];
+                    workspace[slot_off + my_row] = val;
+                    if (stage == 3 && j == 0) {
+                        // Match oracle's `expert_stack.to(dtype)` exposure.
+                        output[my_row] = static_cast<T>(bf16_round_rne_f32(val));
+                    }
+                }
+                __syncthreads();
+            }
+        }
     }
 
-    // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[0..hidden].
-    // Layout: down_proj_w[E, hidden, I] — base for slab `e` is
-    // `e * hidden * I`; row `r` within the slab is `+ r * I`. The matmul
-    // contracts over I, producing one F32 element per output row.
+    if (stage < 4) {
+        return;
+    }
+
+    // -- Phase J: moe_out = sum_j (topk_w[j] * expert_stack[j])  -----------
+    // Single weighted reduction across `k` experts. Each output row `r` is
+    // independent → trivial work-stealing across hidden rows. The k loop
+    // inside the per-row work is short (k=8 on 35B-A3B); reading topk_w[j]
+    // and expert_stack[j*hidden + r] from workspace is cheap.
+    //
+    // Numerics: F32 accumulation, BF16-round once at the store. Matches
+    // `(topk_w_renorm.unsqueeze(-1) * expert_stack).sum(0).to(dtype)` in
+    // the oracle.
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
     {
-        const T* dp_slab =
-            down_proj_w + static_cast<size_t>(e) * hidden * I_;
+        const int K_ = top_k;
         for (;;) {
-            __shared__ unsigned int my_row_i_s;
+            __shared__ unsigned int my_row_j_s;
             if (tid == 0) {
-                my_row_i_s = atomicAdd(&counters[0], 1u);
+                my_row_j_s = atomicAdd(&counters[0], 1u);
             }
             __syncthreads();
-            const int my_row = static_cast<int>(my_row_i_s);
+            const int my_row = static_cast<int>(my_row_j_s);
             if (my_row >= hidden) break;
 
-            const T* w_row = dp_slab + static_cast<size_t>(my_row) * I_;
-            float partial = 0.0f;
-            for (int col = tid; col < I_; col += block_size) {
-                partial += static_cast<float>(w_row[col])
-                           * workspace[OFF_EXPERT_MID + col];
-            }
-            shared_scratch[tid] = partial;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                __syncthreads();
-            }
+            // Sequential per-row sum on a single thread (k=8). The row's
+            // 8 reads are coalesced across threads only if we parallelise
+            // by k — not worth the LDS shuffle for a tiny per-row sum.
             if (tid == 0) {
-                // Store raw F32 in EXPERT_STACK[0..hidden]. Stage 4 will
-                // weight-sum these (still F32) and BF16-round once at moe_out.
-                const float val = shared_scratch[0];
-                workspace[OFF_EXPERT_STACK + my_row] = val;
-                if (stage == 3) {
-                    // Oracle exposes `expert_stack` BF16-cast: match that
-                    // for the parity write.
-                    output[my_row] = static_cast<T>(bf16_round_rne_f32(val));
+                float acc = 0.0f;
+                for (int j = 0; j < K_; j++) {
+                    const float w = workspace[OFF_TOPK_VAL + j];
+                    const float v = workspace[OFF_EXPERT_STACK + j * hidden + my_row];
+                    acc += w * v;
+                }
+                const float val = bf16_round_rne_f32(acc);
+                workspace[OFF_MOE_OUT + my_row] = val;
+                if (stage == 4) {
+                    output[my_row] = static_cast<T>(val);
                 }
             }
             __syncthreads();
