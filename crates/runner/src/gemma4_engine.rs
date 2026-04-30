@@ -363,6 +363,7 @@ struct LayerWeights {
 
 fn load_layer_weights(
     loader: &UnbakedLoader,
+    fp8_store: Option<&model_store::BakedStore>,
     device: usize,
     tcfg: &TextConfig,
     weight_prefix: &str,
@@ -386,6 +387,27 @@ fn load_layer_weights(
             .ok_or_else(|| anyhow!("no tensor spec matching *.{short}"))
     };
 
+    // Helper: load a quantizable projection. Under `fp8_store`, returns
+    // (FP8 byte buffer, Some(scale_inv buffer)); otherwise returns the
+    // raw BF16 buffer with no scale. This is the key invariant for the
+    // VRAM admission match — under `--fp8-runtime` we MUST NOT first
+    // allocate the BF16 weights and then swap, because preflight has
+    // already lowered the budget to FP8-scaled.
+    let load_proj = |name: &str| -> Result<(GpuBuffer, Option<GpuBuffer>)> {
+        if let Some(store) = fp8_store {
+            let w = store
+                .load_to_gpu(name, device)
+                .map_err(|e| anyhow!("load FP8 weight {name}: {e}"))?;
+            let scale_name = format!("{name}_scale_inv");
+            let s = store
+                .load_to_gpu(&scale_name, device)
+                .map_err(|e| anyhow!("load FP8 scale {scale_name}: {e}"))?;
+            Ok((w, Some(s)))
+        } else {
+            Ok((loader.load_bf16_to_gpu(device, name)?, None))
+        }
+    };
+
     let layer_scalar_value: f32 = {
         let (shape, bytes) = loader.tensor_bytes(&want("layer_scalar")?)?;
         if shape != [1] {
@@ -394,14 +416,25 @@ fn load_layer_weights(
         bf16_bytes_to_f32(bytes)[0]
     };
 
-    let (k_proj, v_proj, k_norm) = if shared_kv {
-        (None, None, None)
+    let (q_proj, q_proj_fp8_scale) = load_proj(&want("self_attn.q_proj.weight")?)?;
+    let (o_proj, o_proj_fp8_scale) = load_proj(&want("self_attn.o_proj.weight")?)?;
+    let (gate_proj, gate_proj_fp8_scale) = load_proj(&want("mlp.gate_proj.weight")?)?;
+    let (up_proj, up_proj_fp8_scale) = load_proj(&want("mlp.up_proj.weight")?)?;
+    let (down_proj, down_proj_fp8_scale) = load_proj(&want("mlp.down_proj.weight")?)?;
+    let (per_layer_input_gate_w, per_layer_input_gate_fp8_scale) =
+        load_proj(&want("per_layer_input_gate.weight")?)?;
+    let (per_layer_projection_w, per_layer_projection_fp8_scale) =
+        load_proj(&want("per_layer_projection.weight")?)?;
+
+    let (k_proj, v_proj, k_norm, k_proj_fp8_scale, v_proj_fp8_scale) = if shared_kv {
+        (None, None, None, None, None)
     } else {
-        (
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.v_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_norm.weight")?)?),
-        )
+        let (kp, kps) = load_proj(&want("self_attn.k_proj.weight")?)?;
+        let (vp, vps) = load_proj(&want("self_attn.v_proj.weight")?)?;
+        // k_norm is BF16 in both modes (it's a [head_dim] vector, not a
+        // matmul-input projection — not quantized in the bake).
+        let kn = loader.load_bf16_to_gpu(device, &want("self_attn.k_norm.weight")?)?;
+        (Some(kp), Some(vp), Some(kn), kps, vps)
     };
 
     Ok(LayerWeights {
@@ -411,106 +444,61 @@ fn load_layer_weights(
         shared_kv,
         kv_source,
         layer_scalar: layer_scalar_value,
+        // Norms / scalars are unquantized in the FP8 bake — always BF16.
         input_norm: loader.load_bf16_to_gpu(device, &want("input_layernorm.weight")?)?,
-        q_proj: loader.load_bf16_to_gpu(device, &want("self_attn.q_proj.weight")?)?,
+        q_proj,
         q_norm: loader.load_bf16_to_gpu(device, &want("self_attn.q_norm.weight")?)?,
         k_proj,
         v_proj,
         k_norm,
-        o_proj: loader.load_bf16_to_gpu(device, &want("self_attn.o_proj.weight")?)?,
+        o_proj,
         post_attn_norm: loader
             .load_bf16_to_gpu(device, &want("post_attention_layernorm.weight")?)?,
         pre_ff_norm: loader.load_bf16_to_gpu(device, &want("pre_feedforward_layernorm.weight")?)?,
         post_ff_norm: loader
             .load_bf16_to_gpu(device, &want("post_feedforward_layernorm.weight")?)?,
-        gate_proj: loader.load_bf16_to_gpu(device, &want("mlp.gate_proj.weight")?)?,
-        up_proj: loader.load_bf16_to_gpu(device, &want("mlp.up_proj.weight")?)?,
-        down_proj: loader.load_bf16_to_gpu(device, &want("mlp.down_proj.weight")?)?,
-        per_layer_input_gate_w: loader
-            .load_bf16_to_gpu(device, &want("per_layer_input_gate.weight")?)?,
-        per_layer_projection_w: loader
-            .load_bf16_to_gpu(device, &want("per_layer_projection.weight")?)?,
+        gate_proj,
+        up_proj,
+        down_proj,
+        per_layer_input_gate_w,
+        per_layer_projection_w,
         post_per_layer_input_norm_w: loader
             .load_bf16_to_gpu(device, &want("post_per_layer_input_norm.weight")?)?,
-        // FP8 scales — populated only by `apply_fp8_overlay` post-load.
-        q_proj_fp8_scale: None,
-        k_proj_fp8_scale: None,
-        v_proj_fp8_scale: None,
-        o_proj_fp8_scale: None,
-        gate_proj_fp8_scale: None,
-        up_proj_fp8_scale: None,
-        down_proj_fp8_scale: None,
-        per_layer_input_gate_fp8_scale: None,
-        per_layer_projection_fp8_scale: None,
+        q_proj_fp8_scale,
+        k_proj_fp8_scale,
+        v_proj_fp8_scale,
+        o_proj_fp8_scale,
+        gate_proj_fp8_scale,
+        up_proj_fp8_scale,
+        down_proj_fp8_scale,
+        per_layer_input_gate_fp8_scale,
+        per_layer_projection_fp8_scale,
     })
 }
 
-/// Replace each layer's projection BF16 buffers with their FP8 byte
-/// counterparts and load the matching `*_scale_inv` tensors. Run once
-/// after the BF16 load when `--fp8-runtime` is active. The peak memory
-/// is BF16 + FP8 briefly held across the swap, but each BF16 buffer is
-/// dropped immediately after its FP8 replacement is loaded so the steady
-/// state stays at ~half the BF16 footprint.
-fn apply_fp8_overlay(
-    layers: &mut [LayerWeights],
+/// Infer the per-block FP8 quantization tile dimension from the shape
+/// of any q_proj scale tensor (`weight_cols / scale_cols`). Same value
+/// across all projections in a bake (bake_fp8_gemma4.py uses 128).
+fn infer_fp8_block_size(
     store: &model_store::BakedStore,
     weight_prefix: &str,
-    ordinal: usize,
 ) -> Result<usize> {
-    let mut block_size: usize = 0;
-    let infer_block = |store: &model_store::BakedStore, scale_name: &str, weight_cols: usize| -> Result<usize> {
-        let s = store
-            .shape(scale_name)
-            .ok_or_else(|| anyhow!("missing scale tensor {scale_name}"))?;
-        if s.len() != 2 {
-            bail!("{scale_name} shape {:?} not 2D", s);
-        }
-        Ok(weight_cols / s[1])
-    };
-
-    for (idx, w) in layers.iter_mut().enumerate() {
-        let lp = format!("{weight_prefix}.layers.{idx}");
-        // Helper closure shorthand to swap BF16 → FP8 + load scale_inv.
-        let mut swap = |buf: &mut GpuBuffer, name: &str| -> Result<GpuBuffer> {
-            let scale_name = format!("{name}_scale_inv");
-            let new_w = store.load_to_gpu(name, ordinal)?;
-            let scale = store.load_to_gpu(&scale_name, ordinal)?;
-            *buf = new_w;
-            Ok(scale)
-        };
-
-        w.q_proj_fp8_scale = Some(swap(&mut w.q_proj, &format!("{lp}.self_attn.q_proj.weight"))?);
-        w.o_proj_fp8_scale = Some(swap(&mut w.o_proj, &format!("{lp}.self_attn.o_proj.weight"))?);
-        if !w.shared_kv {
-            // k/v_proj exist on owned layers only.
-            let kp = w.k_proj.as_mut().ok_or_else(|| anyhow!("layer {idx}: missing k_proj"))?;
-            let vp = w.v_proj.as_mut().ok_or_else(|| anyhow!("layer {idx}: missing v_proj"))?;
-            w.k_proj_fp8_scale = Some(swap(kp, &format!("{lp}.self_attn.k_proj.weight"))?);
-            w.v_proj_fp8_scale = Some(swap(vp, &format!("{lp}.self_attn.v_proj.weight"))?);
-        }
-        w.gate_proj_fp8_scale = Some(swap(&mut w.gate_proj, &format!("{lp}.mlp.gate_proj.weight"))?);
-        w.up_proj_fp8_scale = Some(swap(&mut w.up_proj, &format!("{lp}.mlp.up_proj.weight"))?);
-        w.down_proj_fp8_scale = Some(swap(&mut w.down_proj, &format!("{lp}.mlp.down_proj.weight"))?);
-        w.per_layer_input_gate_fp8_scale = Some(swap(
-            &mut w.per_layer_input_gate_w,
-            &format!("{lp}.per_layer_input_gate.weight"),
-        )?);
-        w.per_layer_projection_fp8_scale = Some(swap(
-            &mut w.per_layer_projection_w,
-            &format!("{lp}.per_layer_projection.weight"),
-        )?);
-
-        if block_size == 0 {
-            // Infer block_size from the q_proj scale shape (cols / scale_cols).
-            let q_w_cols = w.q_proj.shape()[1];
-            block_size = infer_block(
-                store,
-                &format!("{lp}.self_attn.q_proj.weight_scale_inv"),
-                q_w_cols,
-            )?;
-        }
+    let q_name = format!("{weight_prefix}.layers.0.self_attn.q_proj.weight");
+    let scale_name = format!("{q_name}_scale_inv");
+    let w_shape = store
+        .shape(&q_name)
+        .ok_or_else(|| anyhow!("FP8 bake missing {q_name}"))?;
+    let s_shape = store
+        .shape(&scale_name)
+        .ok_or_else(|| anyhow!("FP8 bake missing {scale_name}"))?;
+    if w_shape.len() != 2 || s_shape.len() != 2 {
+        bail!(
+            "FP8 bake q_proj shapes not 2D: weight {:?}, scale {:?}",
+            w_shape,
+            s_shape
+        );
     }
-    Ok(block_size)
+    Ok(w_shape[1] / s_shape[1])
 }
 
 pub struct Gemma4Engine {
@@ -671,10 +659,45 @@ impl Gemma4Engine {
         let num_layers = tcfg.num_hidden_layers;
         let dtype = ScalarType::BF16;
 
+        // Open the v2-fp8 BakedStore upfront under `--fp8-runtime` so each
+        // layer can load its FP8 projections directly from the bake — never
+        // allocating BF16 projection buffers. This keeps the GPU memory
+        // peak in line with the FP8-scaled VRAM admission budget set in
+        // `run_gemma4`. Without this, preflight would lower the budget for
+        // FP8 but the constructor would still allocate BF16 weights and
+        // OOM mid-load on memory-constrained cards. (Codex review #51.)
+        let fp8_store: Option<model_store::BakedStore> = if fp8_runtime {
+            let bake_dir = model_store::fetch::BakeVariant::Fp8Native.bake_dir(model_dir);
+            if !model_store::version_ok(&bake_dir) {
+                bail!(
+                    "Gemma 4 FP8 bake not found at {} — run: \
+                     python3 oracle/bake_fp8_gemma4.py --model-dir {}",
+                    bake_dir.display(),
+                    model_dir.display(),
+                );
+            }
+            eprintln!(
+                "[gemma4] loading FP8 baked package from {}",
+                bake_dir.display()
+            );
+            Some(
+                model_store::BakedStore::open(&bake_dir)
+                    .map_err(|e| anyhow!("open Gemma 4 FP8 bake: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let fp8_block_size: usize = if let Some(store) = fp8_store.as_ref() {
+            infer_fp8_block_size(store, weight_prefix)?
+        } else {
+            0
+        };
+
         let mut layers: Vec<LayerWeights> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(load_layer_weights(
                 &loader,
+                fp8_store.as_ref(),
                 device,
                 &tcfg,
                 weight_prefix,
@@ -694,30 +717,6 @@ impl Gemma4Engine {
             device,
             &format!("{weight_prefix}.per_layer_projection_norm.weight"),
         )?;
-
-        // FP8-runtime overlay — swap projection BF16 buffers for FP8 bytes
-        // and load the matching scale_inv tiles. Engines that pass
-        // `fp8_runtime = false` keep the BF16 buffers loaded above.
-        let fp8_block_size: usize = if fp8_runtime {
-            let bake_dir = model_store::fetch::BakeVariant::Fp8Native.bake_dir(model_dir);
-            if !model_store::version_ok(&bake_dir) {
-                bail!(
-                    "Gemma 4 FP8 bake not found at {} — run: \
-                     python3 oracle/bake_fp8_gemma4.py --model-dir {}",
-                    bake_dir.display(),
-                    model_dir.display(),
-                );
-            }
-            eprintln!(
-                "[gemma4] loading FP8 baked package from {}",
-                bake_dir.display()
-            );
-            let store = model_store::BakedStore::open(&bake_dir)
-                .map_err(|e| anyhow!("open Gemma 4 FP8 bake: {e}"))?;
-            apply_fp8_overlay(&mut layers, &store, weight_prefix, device)?
-        } else {
-            0
-        };
 
         let num_kv_heads = tcfg.num_key_value_heads;
         let num_q_heads = tcfg.num_attention_heads;
