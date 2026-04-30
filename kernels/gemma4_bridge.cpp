@@ -852,7 +852,12 @@ int persistent_decode_device(int device_ordinal,
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
     constexpr int BLOCK = 256;
-    const size_t lds_bytes = BLOCK * sizeof(float);
+    // Allocate `BLOCK` floats for block-wide reductions plus `256` floats for
+    // the FP8-runtime LUT (`fp8_lut[256]` populated at kernel entry only when
+    // `fp8_scales` is non-null). The extra LDS is wasted in BF16 mode (1 KiB)
+    // but stays a constant across modes — keeping the launch parameters
+    // mode-agnostic avoids cross-contamination between BF16 and FP8 codegen.
+    const size_t lds_bytes = (BLOCK + 256) * sizeof(float);
 
     if (hipMemset(barrier_counter, 0, sizeof(unsigned int)) != hipSuccess) return 702;
     if (hipMemset(barrier_flag, 0, sizeof(unsigned int)) != hipSuccess) return 703;

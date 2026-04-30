@@ -2669,8 +2669,17 @@ fn run_gemma4(
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
-    if cli.fp8_runtime {
-        anyhow::bail!("Gemma 4 does not yet support --fp8-runtime");
+    if cli.fp8_runtime && cli.int4 {
+        anyhow::bail!(
+            "Gemma 4 --fp8-runtime cannot combine with --int4 (the INT4 kernel \
+             does not yet route the FP8 weight-dequant path)"
+        );
+    }
+    if cli.fp8_runtime && cli.batch_size != 1 {
+        anyhow::bail!(
+            "Gemma 4 --fp8-runtime currently requires --batch-size=1 (FP8 weight \
+             dequant is wired into the single-batch persistent decode kernel only)"
+        );
     }
     if cli.kv_fp8 && cli.int4 {
         anyhow::bail!(
@@ -2786,13 +2795,33 @@ fn run_gemma4(
     let kv_bytes_per_seq =
         kv_elems_per_token * context_tokens as u64 * kv_dtype_bytes + scale_bytes_per_seq;
     let kv_bytes = kv_bytes_per_seq * batch_size_u64;
+    // The registry's `fixed_bytes` budget is sized for BF16 weights + scratch.
+    // Under `--int4` the weight footprint drops to ~1/4 BF16; under
+    // `--fp8-runtime` to ~1/2 (plus a tiny scale_inv overhead). Mirror the
+    // 0.37× / 0.6× scaling used in phi4_engine.rs so memory-constrained cards
+    // can actually run these flags.
+    let quant_fixed_bytes: u64 = if cli.int4 {
+        (entry.vram.fixed_bytes as f64 * 0.37) as u64
+    } else if cli.fp8_runtime {
+        (entry.vram.fixed_bytes as f64 * 0.6) as u64
+    } else {
+        entry.vram.fixed_bytes
+    };
     let estimated_vram =
-        ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
+        ((quant_fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let weight_label = if cli.int4 {
+        "weights+scratch (INT4-scaled)"
+    } else if cli.fp8_runtime {
+        "weights+scratch (FP8-scaled)"
+    } else {
+        "weights+scratch"
+    };
     eprintln!(
-        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok x B={}) available={:.1}GiB",
+        "[vram] estimated={:.2}GiB ({}={:.2}GiB + kv_cache={:.2}GiB for {}tok x B={}) available={:.1}GiB",
         gib(estimated_vram),
-        gib(entry.vram.fixed_bytes),
+        weight_label,
+        gib(quant_fixed_bytes),
         gib(kv_bytes),
         context_tokens,
         cli.batch_size,
@@ -2859,13 +2888,14 @@ fn run_gemma4(
             cli.batch_size,
         )?)
     } else {
-        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_options(
+        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_quant(
             &cli.model_dir,
             params.weight_prefix,
             context_tokens,
             ordinal,
             cli.batch_size,
             cli.kv_fp8,
+            cli.fp8_runtime,
         )?)
     };
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());

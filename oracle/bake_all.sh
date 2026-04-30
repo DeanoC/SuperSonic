@@ -346,11 +346,6 @@ bake_bf16() {
 
 bake_fp8_native() {
     local cli_name="$1" model_dir="$2" family="$3"
-    if [[ "$family" == "gemma" ]]; then
-        echo "[skip] $cli_name fp8-native — Gemma 4 has no FP8-native bake format"
-        SKIPPED+=("$cli_name fp8-native")
-        return 0
-    fi
     local dir ; dir="$(bake_dir_for "$model_dir" fp8-native)" || return 2
     local label="$cli_name fp8-native"
     if [[ $FORCE -eq 0 ]] && bake_exists_and_valid "$dir"; then
@@ -370,6 +365,10 @@ bake_fp8_native() {
             ;;
         phi4)
             run_or_record "$label" python3 "$SCRIPT_DIR/bake_fp8_phi4.py" \
+                --model-dir "$model_dir" || return $?
+            ;;
+        gemma)
+            run_or_record "$label" python3 "$SCRIPT_DIR/bake_fp8_gemma4.py" \
                 --model-dir "$model_dir" || return $?
             ;;
         *)
