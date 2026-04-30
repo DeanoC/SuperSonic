@@ -113,6 +113,29 @@ __device__ inline float g4_fp8_e4m3_to_float(uint8_t byte) {
     return sign ? -val : val;
 }
 
+// Per-block FP8 weight dequant via an LDS lookup table. `lut[i]` precomputes
+// `g4_fp8_e4m3_to_float(i)` for i in 0..256, eliminating the branchy decoder
+// from the matmul hot loop. Caller fills the LUT once at kernel entry (one
+// thread per byte). `block_size` is typically 128 (matches the bake script).
+//
+// Returns the BF16-rounded F32 weight matching what `bake_fp8_gemma4.py`
+// emits — preserving the round trip `bf16 → fp8 → bf16` so dequant agrees
+// with PyTorch's reference. Mirrors `phi4.hip`'s `fp8_dequant_weight_lut`.
+__device__ inline float g4_fp8_dequant_weight_lut(
+    const void* w_ptr, const void* scale_ptr,
+    int row, int col, int cols, int block_size,
+    const float* __restrict__ lut
+) {
+    const uint8_t* fp8 = static_cast<const uint8_t*>(w_ptr);
+    const float val = lut[fp8[static_cast<size_t>(row) * cols + col]];
+    const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    const int scale_row = row / block_size;
+    const int scale_col = col / block_size;
+    const int scale_cols = (cols + block_size - 1) / block_size;
+    const float scale = static_cast<float>(scales[scale_row * scale_cols + scale_col]);
+    return g4_bf16_round_rne_f32_finite(val * scale);
+}
+
 __device__ inline uint8_t g4_float_to_fp8_e4m3(float val) {
     uint8_t sign = 0;
     if (val < 0.0f) { sign = 0x80; val = -val; }
@@ -3263,6 +3286,23 @@ struct Gemma4KVCacheFp8Desc {
     void* kv_scale_v;  // [num_kv_heads, max_T] F32, or nullptr for BF16 KV
 };
 
+// Mirror of `Gemma4FP8ScaleDesc` in `crates/kernel-ffi/src/gemma4.rs`.
+// Parallel-struct to `Gemma4DecodeLayerDesc` — under --fp8-runtime the main
+// desc's projection slots hold u8-packed FP8 bytes (reinterpreted at the
+// matmul site) and this struct carries the matching BF16 scale_inv tiles.
+struct Gemma4FP8ScaleDesc {
+    const void* q_proj_scale;
+    const void* k_proj_scale;  // null when shared_kv
+    const void* v_proj_scale;  // null when shared_kv
+    const void* o_proj_scale;
+    const void* gate_proj_scale;
+    const void* up_proj_scale;
+    const void* down_proj_scale;
+    const void* per_layer_input_gate_scale;
+    const void* per_layer_projection_scale;
+    int         block_size;
+};
+
 template <typename T>
 __global__ void g4_persistent_decode_kernel(
     int num_layers,
@@ -3273,6 +3313,7 @@ __global__ void g4_persistent_decode_kernel(
     float scale,
     const Gemma4DecodeLayerDesc* __restrict__ layers,
     const Gemma4KVCacheFp8Desc* __restrict__ kv_fp8_descs, // null = BF16 KV
+    const Gemma4FP8ScaleDesc* __restrict__ fp8_scales,     // null = BF16 weights
     T* __restrict__ hidden_io,                          // [hidden_size] BF16 in/out
     const T* __restrict__ per_layer_inputs,              // [num_layers, ple_hidden] BF16
     float* __restrict__ workspace,
@@ -3280,6 +3321,11 @@ __global__ void g4_persistent_decode_kernel(
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag
 ) __attribute__((launch_bounds(256, 1))) {
+    // FP8-runtime weight dequant LUT — populated once per launch when active.
+    // Body wiring in PR-B; for now `fp8_scales` is parameter-only so the
+    // binary contract is stable and the engine PR can flip the flag without
+    // another bridge/FFI change. Reads of `fp8_scales` are no-ops here.
+    (void)fp8_scales;
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
     const int nb = gridDim.x;
