@@ -78,6 +78,7 @@ kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }
 qwen35 = { path = "../qwen35" }
 qwen35_dflash = { path = "../qwen35_dflash" }
+qwen36_moe = { path = "../qwen36_moe" }
 gemma4 = { path = "../gemma4" }
 phi4 = { path = "../phi4" }
 anyhow = "1"

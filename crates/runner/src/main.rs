@@ -9,6 +9,7 @@ mod oracle;
 mod phi4_engine;
 mod prefill_engine;
 mod qwen35_dflash_engine;
+mod qwen36_moe_engine;
 mod registry;
 mod validate;
 
@@ -317,8 +318,8 @@ pub(crate) struct Cli {
     #[arg(long)]
     model_dir: PathBuf,
 
-    /// Text prompt (will be tokenized)
-    #[arg(long)]
+    /// Text prompt (will be tokenized). Required unless --dry-run is set.
+    #[arg(long, default_value = "")]
     prompt: String,
 
     /// Do not add tokenizer special tokens when encoding --prompt.
@@ -620,6 +621,12 @@ pub(crate) struct Cli {
     /// been explicitly tuned.
     #[arg(long)]
     allow_untested_gpu: Option<String>,
+
+    /// Enumerate the model checkpoint, compute analytic + on-disk VRAM
+    /// accounting, and exit. Currently only honored on `qwen3.6-35b-a3b`
+    /// (the runtime is still being built up; see PR 3 of the MoE plan).
+    #[arg(long)]
+    dry_run: bool,
 
     /// Disable downloading pre-baked weights from GitHub releases when the
     /// local bake is missing. Prints the manual bake guidance instead.
@@ -1064,12 +1071,11 @@ fn main() -> Result<()> {
     } else if cli.certified_kv_shadow_validate {
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
-    if model_variant.family() == ModelFamily::Qwen36Moe {
+    if model_variant.family() == ModelFamily::Qwen36Moe && !cli.dry_run {
         anyhow::bail!(
-            "qwen3.6-35b-a3b is recognized, but the MoE runtime is not implemented yet. \
-             Build a q4km bake with `python oracle/bake_q4km.py --model qwen3.6-35b-a3b --model-dir {}` first; \
-             runtime support needs the separate Qwen MoE engine/kernels.",
-            cli.model_dir.display(),
+            "qwen3.6-35b-a3b decode runtime is not yet implemented. \
+             Re-run with --dry-run to enumerate the checkpoint and report VRAM accounting; \
+             the kernel lands in PR 4 (CUDA) and PR 6 (HIP) of docs/qwen36-moe-plan.md."
         );
     }
 
@@ -1178,7 +1184,9 @@ fn main() -> Result<()> {
         ModelFamily::Llama31 => {
             return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
         }
-        ModelFamily::Qwen36Moe => unreachable!("qwen3.6 MoE is rejected before registry lookup"),
+        ModelFamily::Qwen36Moe => {
+            return qwen36_moe_engine::run(&cli, entry, total_vram);
+        }
         ModelFamily::Qwen35 => {}
     }
 
@@ -1232,6 +1240,7 @@ fn main() -> Result<()> {
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => p,
+        FamilyParams::Qwen36Moe(_) => unreachable!("qwen3.6-moe handled above"),
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),
         FamilyParams::Llama31(_) => unreachable!("llama3.1 handled above"),
@@ -2686,6 +2695,7 @@ fn run_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Qwen36Moe(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
