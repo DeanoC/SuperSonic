@@ -116,13 +116,36 @@ pub fn run_phi4(
         kv_per_token += scale_bytes_per_layer * config.num_hidden_layers as u64;
     }
     let kv_bytes = kv_per_token * context_tokens as u64;
+    // The registry's `fixed_bytes` budget is sized for BF16 weights + scratch.
+    // Under --int4 / --fp8-runtime the weight footprint shrinks to ~1/4 / ~1/2
+    // (plus a tiny scale/zero overhead), so applying the BF16 budget verbatim
+    // would reject valid runs on memory-constrained cards — the exact scenario
+    // these flags are meant to unlock. Mirror the 0.37× scaling that
+    // qwen35_dflash_engine.rs already uses for INT4 targets, and pick a
+    // conservative 0.6× for FP8 (≈ half-bytes weights + small scale_inv +
+    // unchanged scratch).
+    let quant_fixed_bytes = if cli.int4 {
+        (entry.vram.fixed_bytes as f64 * 0.37) as u64
+    } else if cli.fp8_runtime {
+        (entry.vram.fixed_bytes as f64 * 0.6) as u64
+    } else {
+        entry.vram.fixed_bytes
+    };
     let estimated_vram =
-        ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
+        ((quant_fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let weight_label = if cli.int4 {
+        "weights+scratch (INT4-scaled)"
+    } else if cli.fp8_runtime {
+        "weights+scratch (FP8-scaled)"
+    } else {
+        "weights+scratch"
+    };
     eprintln!(
-        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        "[vram] estimated={:.2}GiB ({}={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
         gib(estimated_vram),
-        gib(entry.vram.fixed_bytes),
+        weight_label,
+        gib(quant_fixed_bytes),
         gib(kv_bytes),
         context_tokens,
         gib(total_vram),
