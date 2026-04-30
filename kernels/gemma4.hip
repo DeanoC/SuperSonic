@@ -1862,14 +1862,21 @@ __device__ inline void g4_block_kv_append_f32_to_fp8(
         // Per-head absmax over [head_dim] — bf16-rounded values match the
         // BF16-round in the existing append path, keeping the FP8 dequant
         // numerically aligned with the BF16 reference.
+        //
+        // Strided local max FIRST, then block reduce. Gemma 4 full-attention
+        // layers have head_dim=512 with blockDim.x=256, so each thread must
+        // walk all its lanes before reducing — otherwise dimensions >= bs
+        // (i.e. half the head on full-attn) silently drop out of the absmax
+        // and the chosen scale undershoots, causing widespread FP8
+        // saturation/clamping. (Reported by Codex review on PR #48.)
         float my_k = 0.0f, my_v = 0.0f;
-        if (tid < head_dim) {
+        for (int d = tid; d < head_dim; d += bs) {
             const float k_bf16 =
-                g4_bf16_round_rne_f32_finite(k_f32[h * head_dim + tid]);
+                g4_bf16_round_rne_f32_finite(k_f32[h * head_dim + d]);
             const float v_bf16 =
-                g4_bf16_round_rne_f32_finite(v_f32[h * head_dim + tid]);
-            my_k = fabsf(k_bf16);
-            my_v = fabsf(v_bf16);
+                g4_bf16_round_rne_f32_finite(v_f32[h * head_dim + d]);
+            my_k = fmaxf(my_k, fabsf(k_bf16));
+            my_v = fmaxf(my_v, fabsf(v_bf16));
         }
         lds[tid] = my_k;
         __syncthreads();
