@@ -45,12 +45,13 @@ Four backend surfaces are validated today:
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅¹ |      ✅     |   ✅   |
 | gemma4-e2b       |  ✅  |  ✅  |      —      |    —   |
-| gemma4-e4b       |  ✅  |  —²  |      —      |    —   |
-| phi4-mini        |  ✅  |  ✅  |      —      |    —   |
+| gemma4-e4b       |  ✅  |  ✅² |      —      |    —   |
+| phi4-mini        |  ✅  |  ✅  |      ✅     |   ✅   |
 
 ¹ GPTQ calibration for 9B INT4 needs ≥24 GiB; consumers pull the released
   bake from GitHub releases. See [docs/bake-distribution.md](docs/bake-distribution.md).
-² Gemma E4B INT4 calibration is parked.
+² E4B INT4 uses the published gs=64 bake (see footnote ¹ in the gfx1100
+  matrix above); on gfx1150 it decodes at ~280 ms/step.
 
 DFlash speculative decode is available for `qwen3.5-9b` INT4 on HIP —
 see [docs/dflash.md](docs/dflash.md).
