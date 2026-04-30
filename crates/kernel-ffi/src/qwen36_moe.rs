@@ -225,6 +225,56 @@ extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+
+    /// PR 4b2 staged single-layer attention parity launcher. Runs the
+    /// full-attention path through `stage` (1..=5) and writes the matching
+    /// intermediate to `output`:
+    ///
+    /// | stage | output buffer contents (BF16)                      |
+    /// |-------|----------------------------------------------------|
+    /// |   1   | `q_normed[H*d]`                                    |
+    /// |   2   | `k_normed[Hkv*d]`         (`q_normed` recomputed)  |
+    /// |   3   | `q_rot[H*d] || k_rot[Hkv*d]` (planned)             |
+    /// |   4   | `attn[H*d]`                                        |
+    /// |   5   | `output_hidden[hidden]`                            |
+    ///
+    /// At PR 4b2 step 1 only `stage == 1` is wired; the kernel returns the
+    /// q-path intermediate and ignores the k_*/v_*/o_proj/RoPE/position
+    /// arguments. They're declared up front so the FFI ABI doesn't change
+    /// between staged commits.
+    ///
+    /// `workspace` must be at least `2 * num_heads * head_dim` F32 entries
+    /// (used to hold the BF16-rounded F32 view of `q_raw` between phases).
+    /// `output` must be at least `num_heads * head_dim` BF16 entries on
+    /// stage 1 — sized for the largest staged intermediate, BF16.
+    /// `sync_buf` (counters/barrier_counter/barrier_flag) must be 32 zero
+    /// bytes — see [`stub_launch`] for the layout convention.
+    pub fn qwen36_moe_hip_attn_step_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        stage: c_int,
+        hidden: c_int,
+        num_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        rope_theta: f32,
+        rms_norm_eps: f32,
+        position: c_int,
+        input_hidden: *const c_void,
+        input_norm_w: *const c_void,
+        q_proj_w: *const c_void,
+        k_proj_w: *const c_void,
+        v_proj_w: *const c_void,
+        q_norm_w: *const c_void,
+        k_norm_w: *const c_void,
+        o_proj_w: *const c_void,
+        output: *mut c_void,
+        workspace: *mut f32,
+        counters: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -290,6 +340,134 @@ pub fn stub_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe stub launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Geometry + position state for the staged-attention parity launcher.
+/// These are constants of the layer being tested; bundling them into a
+/// struct keeps the safe wrapper below from sprouting eight scalar args.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeAttnStepParams {
+    pub stage: i32,
+    pub hidden: i32,
+    pub num_heads: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub rotary_dim: i32,
+    pub rope_theta: f32,
+    pub rms_norm_eps: f32,
+    pub position: i32,
+}
+
+/// Weight pointers for the staged-attention parity launcher. Pointers
+/// unused by the requested `stage` may be null; the kernel won't dereference
+/// them. See [`qwen36_moe_hip_attn_step_launch`] for the per-stage matrix.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeAttnStepWeights {
+    pub input_hidden: *const c_void,
+    pub input_norm_w: *const c_void,
+    pub q_proj_w: *const c_void,
+    pub k_proj_w: *const c_void,
+    pub v_proj_w: *const c_void,
+    pub q_norm_w: *const c_void,
+    pub k_norm_w: *const c_void,
+    pub o_proj_w: *const c_void,
+}
+
+/// Safe wrapper for the PR 4b2 staged-attention parity launcher.
+///
+/// `output` must be a BF16 buffer with at least `num_heads * head_dim`
+/// elements (the size of the largest staged intermediate). `workspace` must
+/// be an F32 buffer with at least `2 * num_heads * head_dim` elements.
+/// `sync_buf` must be a 32-byte zero buffer (counter @ +0, barrier counter
+/// @ +16, barrier flag @ +20).
+pub fn attn_step_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: only BF16 is wired, got {dtype:?}"
+        )));
+    }
+    if !(1..=5).contains(&params.stage) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: stage must be in 1..=5, got {}",
+            params.stage
+        )));
+    }
+    if params.stage > 1 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 step 1 only)",
+            params.stage
+        )));
+    }
+
+    let backend = output.backend();
+    let counters = sync_buf.as_mut_ptr() as *mut c_uint;
+    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_attn_step_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    params.stage as c_int,
+                    params.hidden as c_int,
+                    params.num_heads as c_int,
+                    params.num_kv_heads as c_int,
+                    params.head_dim as c_int,
+                    params.rotary_dim as c_int,
+                    params.rope_theta,
+                    params.rms_norm_eps,
+                    params.position as c_int,
+                    weights.input_hidden,
+                    weights.input_norm_w,
+                    weights.q_proj_w,
+                    weights.k_proj_w,
+                    weights.v_proj_w,
+                    weights.q_norm_w,
+                    weights.k_norm_w,
+                    weights.o_proj_w,
+                    output.as_mut_ptr(),
+                    workspace.as_mut_ptr() as *mut f32,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::attn_step_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::attn_step_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::attn_step_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe attn_step launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -432,6 +610,236 @@ mod tests {
         assert_eq!(
             workspace_f32[4], 1.0,
             "[4] attn_output_gate consistency on full layers"
+        );
+    }
+
+    // ---- PR 4b2 step 1: q-path parity vs the PyTorch oracle --------------
+    //
+    // The test reads a JSON produced by `oracle/qwen36_moe_oracle.py`
+    // (synthetic or checkpoint mode), uploads the four input tensors needed
+    // for stage 1 (input_hidden, input_norm_w, q_proj_w, q_norm_w), runs
+    // the staged kernel, downloads the BF16 q_normed output, and compares
+    // against `intermediates.q_normed` from the oracle.
+    //
+    // To run: produce a JSON, then point the test at it via env var:
+    //
+    //   python oracle/qwen36_moe_oracle.py --mode synthetic \
+    //       --hidden 2048 --num-attention-heads 16 --num-kv-heads 2 \
+    //       --head-dim 256 --out /tmp/qwen36_syn.json
+    //   SUPERSONIC_QWEN36_ORACLE_JSON=/tmp/qwen36_syn.json \
+    //       cargo test --release -p kernel-ffi qwen36_moe_attn_step_1
+    //
+    // Without the env var the test prints a clear skip message and exits.
+    // We don't fail-on-missing because the FFI test must remain runnable
+    // on hosts without Python/PyTorch (CI without GPU, header-only checks).
+
+    /// Decode a base64 string to bytes. Inline so the test stays
+    /// dependency-free aside from serde_json. RFC 4648 alphabet, no padding
+    /// tolerance shortcuts (we know the oracle always emits valid BF16
+    /// payloads ≡ even-length byte streams ≡ 4n base64 chars after padding).
+    #[cfg(supersonic_backend_hip)]
+    fn b64_decode(input: &str) -> Vec<u8> {
+        const TABLE: &[u8; 256] = &{
+            let mut t = [255u8; 256];
+            let mut i = 0;
+            let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            while i < charset.len() {
+                t[charset[i] as usize] = i as u8;
+                i += 1;
+            }
+            t
+        };
+        let mut out = Vec::with_capacity(input.len() * 3 / 4);
+        let mut buf = 0u32;
+        let mut bits = 0;
+        for &b in input.as_bytes() {
+            if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' {
+                continue;
+            }
+            let v = TABLE[b as usize];
+            assert!(v != 255, "qwen36_moe parity: invalid base64 byte {b:#x}");
+            buf = (buf << 6) | v as u32;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xFF) as u8);
+            }
+        }
+        out
+    }
+
+    /// Convert a stream of BF16 little-endian bytes to F32. The oracle
+    /// stores BF16 as raw int16 → bytes, matching the kernel's ABI.
+    #[cfg(supersonic_backend_hip)]
+    fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+        assert!(bytes.len() % 2 == 0, "qwen36_moe parity: BF16 bytes must be even");
+        bytes
+            .chunks_exact(2)
+            .map(|c| {
+                // BF16 = top 16 bits of an F32. Reconstruct by zero-extending.
+                let bits = u32::from(c[0]) | (u32::from(c[1]) << 8);
+                f32::from_bits(bits << 16)
+            })
+            .collect()
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_attn_step_1_q_normed_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let json_path = match std::env::var("SUPERSONIC_QWEN36_ORACLE_JSON") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
+                     Generate a fixture with \
+                     `python oracle/qwen36_moe_oracle.py --mode synthetic --out /tmp/syn.json` \
+                     and re-run."
+                );
+                return;
+            }
+        };
+
+        let raw = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|e| panic!("read oracle json {json_path}: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&raw)
+            .expect("oracle json parse");
+        let cfg = &json["config"];
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+        assert_eq!(json["dtype"].as_str().unwrap_or(""), "bf16",
+                   "PR 4b2 step 1 requires the oracle to be in bf16 mode");
+
+        let hidden = cfg["hidden"].as_i64().unwrap() as i32;
+        let num_heads = cfg["num_attention_heads"].as_i64().unwrap() as i32;
+        let num_kv_heads = cfg["num_kv_heads"].as_i64().unwrap() as i32;
+        let head_dim = cfg["head_dim"].as_i64().unwrap() as i32;
+        let rms_norm_eps = cfg["rms_norm_eps"].as_f64().unwrap() as f32;
+
+        // Decode the four BF16 inputs we need for stage 1.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let q_proj_w_bytes = b64_decode(weights["q_proj_w"].as_str().unwrap());
+        let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
+        let q_normed_expected_bytes = b64_decode(inters["q_normed"].as_str().unwrap());
+
+        // Sanity-check sizes against config-derived shapes.
+        let hidden_us = hidden as usize;
+        let h_us = num_heads as usize;
+        let d_us = head_dim as usize;
+        assert_eq!(input_hidden_bytes.len(), hidden_us * 2);
+        assert_eq!(input_norm_w_bytes.len(), hidden_us * 2);
+        assert_eq!(q_proj_w_bytes.len(), 2 * h_us * d_us * hidden_us * 2);
+        assert_eq!(q_norm_w_bytes.len(), d_us * 2);
+        assert_eq!(q_normed_expected_bytes.len(), h_us * d_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        // Upload all four inputs as BF16 buffers. The kernel reads them
+        // through `*const c_void` so the gpu-hal shape just needs to match
+        // element count.
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let q_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
+        ).expect("upload q_proj_w");
+        let q_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
+        ).expect("upload q_norm_w");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[h_us * d_us],
+        ).expect("alloc output");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[2 * h_us * d_us],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 1,
+            hidden,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim: 0,
+            rope_theta: 0.0,
+            rms_norm_eps,
+            position: 0,
+        };
+        let weight_ptrs = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: std::ptr::null(),
+            v_proj_w: std::ptr::null(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: std::ptr::null(),
+            o_proj_w: std::ptr::null(),
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("attn_step_launch stage 1");
+
+        let got_bytes = output.to_host_bytes().expect("download output");
+        assert_eq!(got_bytes.len(), q_normed_expected_bytes.len());
+
+        let got = bf16_bytes_to_f32(&got_bytes);
+        let want = bf16_bytes_to_f32(&q_normed_expected_bytes);
+
+        // BF16 q_normed parity: kernel and oracle both round to BF16 at
+        // every store boundary, so most elements should be exact. The
+        // F32-accumulation order in the matmul can cause rare 1-ULP
+        // BF16 disagreements in the lower bits; tolerate that with a tight
+        // absolute threshold and require cosine similarity ≥ 0.9999.
+        let n = got.len();
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut got_sq = 0.0f64;
+        let mut want_sq = 0.0f64;
+        let mut exact = 0usize;
+        for i in 0..n {
+            let d = (got[i] - want[i]).abs();
+            if d == 0.0 { exact += 1; }
+            max_abs_diff = max_abs_diff.max(d);
+            sum_abs_diff += d;
+            dot += got[i] as f64 * want[i] as f64;
+            got_sq += (got[i] as f64).powi(2);
+            want_sq += (want[i] as f64).powi(2);
+        }
+        let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
+        let mean_abs_diff = sum_abs_diff / n as f32;
+        eprintln!(
+            "[parity step1] n={n} exact={exact} max_abs={max_abs_diff:.5e} \
+             mean_abs={mean_abs_diff:.5e} cos_sim={cos_sim:.7}"
+        );
+
+        // Tolerances: synth-mode q_normed values land in roughly [-2, 2].
+        // BF16 ULP at magnitude 1 is ~7.8e-3; allow 4× that for matmul
+        // accumulation order drift.
+        assert!(
+            max_abs_diff <= 0.04,
+            "kernel q_normed diverges from oracle: max_abs={max_abs_diff} (>0.04)"
+        );
+        assert!(
+            cos_sim >= 0.9999,
+            "kernel q_normed cosine similarity {cos_sim:.7} below 0.9999"
         );
     }
 }

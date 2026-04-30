@@ -93,3 +93,98 @@ extern "C" int qwen36_moe_hip_stub_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// PR 4b2 staged-attention parity launcher.
+// `dtype` follows the project convention: 2 = bf16. Other values are
+// rejected so the matching kernel template is unambiguous.
+extern "C" int qwen36_moe_hip_attn_step_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           stage,
+    int           hidden,
+    int           num_heads,
+    int           num_kv_heads,
+    int           head_dim,
+    int           rotary_dim,
+    float         rope_theta,
+    float         rms_norm_eps,
+    int           position,
+    const void*   input_hidden,
+    const void*   input_norm_w,
+    const void*   q_proj_w,
+    const void*   k_proj_w,
+    const void*   v_proj_w,
+    const void*   q_norm_w,
+    const void*   k_norm_w,
+    const void*   o_proj_w,
+    void*         output,
+    float*        workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag) {
+    if (dtype != 2) return 110;            // only bf16 supported on stage 1
+    if (stage < 1 || stage > 5) return 111;
+    if (hidden <= 0 || num_heads <= 0 || num_kv_heads <= 0 || head_dim <= 0) {
+        return 112;
+    }
+    if (input_hidden == nullptr || input_norm_w == nullptr ||
+        q_proj_w == nullptr || q_norm_w == nullptr ||
+        output == nullptr || workspace == nullptr ||
+        counters == nullptr || barrier_counter == nullptr ||
+        barrier_flag == nullptr) {
+        return 113;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    constexpr int block_size = 256;
+
+    // Zero the cooperative counter + barrier state before launch. The kernel
+    // expects all three to start at 0; sync_buf is documented as 32 zero
+    // bytes by the Rust-side wrapper but a defence-in-depth memset here
+    // keeps a misuse from corrupting the launch.
+    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
+        return 200;
+    }
+
+    const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
+
+    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_attn_step_kernel<hip_bfloat16>,
+                       dim3(static_cast<unsigned int>(num_blocks)),
+                       dim3(block_size),
+                       lds_bytes, 0,
+                       stage,
+                       hidden,
+                       num_heads,
+                       num_kv_heads,
+                       head_dim,
+                       rotary_dim,
+                       rope_theta,
+                       rms_norm_eps,
+                       position,
+                       static_cast<const hip_bfloat16*>(input_hidden),
+                       static_cast<const hip_bfloat16*>(input_norm_w),
+                       static_cast<const hip_bfloat16*>(q_proj_w),
+                       static_cast<const hip_bfloat16*>(k_proj_w),
+                       static_cast<const hip_bfloat16*>(v_proj_w),
+                       static_cast<const hip_bfloat16*>(q_norm_w),
+                       static_cast<const hip_bfloat16*>(k_norm_w),
+                       static_cast<const hip_bfloat16*>(o_proj_w),
+                       static_cast<hip_bfloat16*>(output),
+                       workspace,
+                       counters,
+                       barrier_counter,
+                       barrier_flag);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}

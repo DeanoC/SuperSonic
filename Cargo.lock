@@ -1100,6 +1100,7 @@ dependencies = [
  "cc",
  "gpu-hal",
  "half",
+ "serde_json",
  "thiserror",
 ]
 

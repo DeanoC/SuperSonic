@@ -21,10 +21,28 @@
 // regressions in the past. Keep this file standalone.
 
 #include <hip/hip_bf16.h>
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <math.h>
 #include <stdint.h>
 
 namespace qwen36_moe {
+
+// Round an F32 value to BF16 precision (round-to-nearest-even) and widen
+// back to F32. Used at every "BF16 store" point so that intermediate F32
+// computation matches the BF16-quantised values PyTorch produces. Finite
+// inputs only — qwen36_moe is downstream of upcasted-from-BF16 weights and
+// inputs, so NaN preservation is not needed here.
+__device__ __forceinline__ float bf16_round_rne_f32(float x) {
+    uint32_t bits;
+    __builtin_memcpy(&bits, &x, 4);
+    uint32_t rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    float y;
+    __builtin_memcpy(&y, &bits, 4);
+    return y;
+}
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------
 
@@ -202,6 +220,206 @@ __global__ void qwen36_moe_descriptor_walk_stub(
     // Reset the work counter for any future barriers (idempotent here).
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
+}
+
+// =============================================================================
+// Single-layer full-attention parity kernel (PR 4b2)
+//
+// This is the staged build-up of the real megakernel's attention path. Each
+// stage adds one slice of compute — the host parity test downloads the
+// matching intermediate buffer and compares it to the PyTorch oracle.
+//
+//   stage 1: x_norm + q_proj + q-gate split + per-head q_norm  → write q_normed
+//   stage 2: ... + k_proj + v_proj + per-head k_norm           → write k_normed
+//   stage 3: ... + partial-RoPE on q & k                       → write q_rot/k_rot
+//   stage 4: ... + GQA self-attention (kv_len=1)               → write attn
+//   stage 5: ... + sigmoid(out_gate)*attn + o_proj + residual  → write out
+//
+// PR 4b2 step 1 lands stage 1. Stages 2–5 ship in follow-up commits and add
+// to this same kernel; the launcher's `stage` argument decides where to stop.
+//
+// Layout choices fixed up-front so later stages don't reshuffle:
+//   block_size = 256  (4 waves on gfx1100; matches head_dim and divides
+//                     hidden=2048 evenly)
+//   grid_size  = num_cus  (one block per CU, all guaranteed concurrent on
+//                          RDNA3 → grid_barrier safe without coop launch)
+//
+//   workspace[F32], at least 2*H*d + 2*Hkv*d entries:
+//     [0,           2*H*d):           q_raw   (BF16-rounded F32 to mirror
+//                                              PyTorch's BF16 q_raw matmul)
+//     reserved for stage 2+:
+//     [2*H*d,       2*H*d + Hkv*d):   k_raw
+//     [2*H*d + Hkv*d, 2*H*d + 2*Hkv*d): v_raw
+//
+//   counters[0]: work-stealing index, reused across phases. Reset by
+//                grid_barrier_reset_counter at every phase boundary.
+//
+//   LDS layout (extern __shared__):
+//     lds[0,        hidden):           x_norm_lds (BF16-rounded F32 view)
+//     lds[hidden,   hidden+block_size): scratch (block reduction)
+//   Total: (hidden + block_size) * 4 bytes = (2048+256)*4 = 9 KiB on 35B-A3B.
+//   Comfortably under gfx1100's 64 KiB LDS/WG cap; ≥2 WGs/CU possible.
+
+template <typename T>
+__device__ inline float load_as_float(const T* p, int idx) {
+    return static_cast<float>(p[idx]);
+}
+
+template <typename T>
+__global__ void qwen36_moe_attn_step_kernel(
+    int                            stage,
+    int                            hidden,
+    int                            num_heads,
+    int                            num_kv_heads,
+    int                            head_dim,
+    int                            rotary_dim,    // unused at stage 1, parsed at stage 3+
+    float                          rope_theta,    // unused at stage 1
+    float                          rms_norm_eps,
+    int                            position,      // unused at stage 1
+    const T* __restrict__          input_hidden,  // [hidden]
+    const T* __restrict__          input_norm_w,  // [hidden]
+    const T* __restrict__          q_proj_w,      // [2*H*d, hidden]
+    const T* __restrict__          k_proj_w,      // [Hkv*d, hidden]   (nullable for stage<2)
+    const T* __restrict__          v_proj_w,      // [Hkv*d, hidden]   (nullable for stage<2)
+    const T* __restrict__          q_norm_w,      // [d]
+    const T* __restrict__          k_norm_w,      // [d]               (nullable for stage<2)
+    const T* __restrict__          o_proj_w,      // [hidden, H*d]     (nullable for stage<5)
+    T* __restrict__                output,        // BF16, sized for the largest staged intermediate
+    float* __restrict__             workspace,    // F32 scratch, see header comment
+    unsigned int* __restrict__     counters,
+    unsigned int* __restrict__     barrier_counter,
+    unsigned int* __restrict__     barrier_flag) {
+    (void)k_proj_w;
+    (void)v_proj_w;
+    (void)k_norm_w;
+    (void)o_proj_w;
+    (void)rotary_dim;
+    (void)rope_theta;
+    (void)position;
+
+    const int num_blocks = static_cast<int>(gridDim.x);
+    const int tid        = threadIdx.x;
+    const int block_size = static_cast<int>(blockDim.x);
+
+    extern __shared__ float lds[];
+    float* x_norm_lds    = lds;             // [hidden]
+    float* shared_scratch = lds + hidden;   // [block_size]
+
+    // -- Phase A: load input + RMS norm ------------------------------------
+    // Every block computes x_norm into its own LDS. Redundant compute, but
+    // avoids a pre-stage cross-block sync; the RMS reduction is cheap
+    // compared to the matmul that follows.
+    for (int col = tid; col < hidden; col += block_size) {
+        x_norm_lds[col] = load_as_float<T>(input_hidden, col);
+    }
+    __syncthreads();
+
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        partial_sq += x_norm_lds[col] * x_norm_lds[col];
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float inv_rms_input;
+    if (tid == 0) {
+        inv_rms_input = rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // BF16-round each x_norm element so the matmul reads what PyTorch reads
+    // (its `out.to(in_dtype)` step in rms_norm).
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = load_as_float<T>(input_norm_w, col);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * w);
+    }
+    __syncthreads();
+
+    // -- Phase B: q_raw = q_proj_w @ x_norm  (work-stealing matvec) --------
+    // Output rows of q_raw are written BF16-rounded into workspace[0..2*H*d]
+    // so that the per-head RMS norm in Phase C reads the same F32-of-BF16
+    // values PyTorch's BF16 q_raw represents.
+    const int q_out_dim = 2 * num_heads * head_dim;
+
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= q_out_dim) break;
+
+        const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            workspace[my_row] = bf16_round_rne_f32(shared_scratch[0]);
+        }
+        __syncthreads();
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase C: per-head RMS norm of q_lanes = workspace[0..H*d] ---------
+    // Each block grabs a head index and reduces across head_dim, writing
+    // BF16 q_normed[h*d : (h+1)*d] to `output`.
+    if (stage >= 1) {
+        const int H = num_heads;
+        const int d = head_dim;
+
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int h = static_cast<int>(head_s);
+            if (h >= H) break;
+
+            const int base = h * d;
+            float partial = 0.0f;
+            for (int i = tid; i < d; i += block_size) {
+                const float v = workspace[base + i];
+                partial += v * v;
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            __shared__ float head_inv_rms;
+            if (tid == 0) {
+                head_inv_rms = rsqrtf(shared_scratch[0] / static_cast<float>(d) + rms_norm_eps);
+            }
+            __syncthreads();
+
+            for (int i = tid; i < d; i += block_size) {
+                const float v = workspace[base + i];
+                const float wv = load_as_float<T>(q_norm_w, i);
+                const float normed = bf16_round_rne_f32(v * head_inv_rms * wv);
+                output[base + i] = static_cast<T>(normed);
+            }
+            __syncthreads();
+        }
+    }
+
+    // Stages 2..5 hook in here in follow-up commits. Each starts with a
+    // grid_barrier_reset_counter and reuses `counters[0]` for its own
+    // work-stealing.
 }
 
 } // namespace qwen36_moe
