@@ -1135,9 +1135,10 @@ fn main() -> Result<()> {
 
     // Install the memory architecture so gpu_hal::alloc routes correctly.
     // On Unified arches (gfx1150 APU), HIP allocations come out of system
-    // RAM via hipHostMalloc(MAPPED|COHERENT) so host and device share the
-    // same physical pages — no PCIe, no copy. Must be set before any
-    // GpuBuffer::alloc, which starts during weight loading below.
+    // RAM via hipHostMalloc(MAPPED) + hipHostGetDevicePointer so host and
+    // device share the same physical pages with no coherence-protocol cost.
+    // Must be set before any GpuBuffer::alloc, which starts during weight
+    // loading below.
     let arch_profile = registry::ArchProfile::for_arch(&entry.arch);
     gpu_hal::set_memory_architecture(arch_profile.memory);
     eprintln!(
@@ -1145,7 +1146,7 @@ fn main() -> Result<()> {
         arch_profile.memory,
         match arch_profile.memory {
             gpu_hal::MemoryArchitecture::Discrete => "hipMalloc / cudaMalloc",
-            gpu_hal::MemoryArchitecture::Unified => "hipHostMalloc(MAPPED|COHERENT)",
+            gpu_hal::MemoryArchitecture::Unified => "hipHostMalloc(MAPPED) + GetDevicePointer",
         }
     );
 

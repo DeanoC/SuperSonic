@@ -11,9 +11,11 @@ use crate::scalar_type::ScalarType;
 /// Allocation routes through `ops::alloc`, which branches on the active
 /// `MemoryArchitecture`: `Discrete` arches use `hipMalloc` / `cudaMalloc` /
 /// metal device memory; `Unified` HIP arches (gfx1150 APU) use
-/// `hipHostMalloc(MAPPED | COHERENT)` so host and device share the same
-/// physical pages. Each buffer remembers which allocator produced it so
-/// `Drop` issues the matching free call.
+/// `hipHostMalloc(MAPPED)` + `hipHostGetDevicePointer` so host and device
+/// share the same physical pages without coherence-protocol traffic. Each
+/// buffer remembers which allocator produced it (and, for `UnifiedHost`,
+/// the original host pointer needed by `hipHostFree`) so `Drop` issues
+/// the matching free call.
 pub struct GpuBuffer {
     ptr: NonNull<c_void>,
     len_bytes: usize,

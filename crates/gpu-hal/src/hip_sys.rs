@@ -7,7 +7,6 @@ pub(crate) const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 pub(crate) const HIP_HOST_REGISTER_MAPPED: c_uint = 0x2;
 // hipHostMalloc flag bits (matching hip_runtime_api.h).
 pub(crate) const HIP_HOST_MALLOC_MAPPED: c_uint = 0x2;
-pub(crate) const HIP_HOST_MALLOC_COHERENT: c_uint = 0x4000_0000;
 
 #[link(name = "amdhip64")]
 unsafe extern "C" {
@@ -17,6 +16,11 @@ unsafe extern "C" {
     pub(crate) fn hipFree(ptr: *mut c_void) -> c_int;
     pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
     pub(crate) fn hipHostFree(ptr: *mut c_void) -> c_int;
+    pub(crate) fn hipHostGetDevicePointer(
+        dev_ptr: *mut *mut c_void,
+        host_ptr: *mut c_void,
+        flags: c_uint,
+    ) -> c_int;
     pub(crate) fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,

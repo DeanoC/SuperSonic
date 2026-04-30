@@ -298,23 +298,33 @@ pub fn set_device(ordinal: usize) -> Result<()> {
 /// Distinguishes which underlying allocator produced a buffer pointer, so the
 /// matching `free` call can be issued at drop time. Internal coordination
 /// type between [`alloc`] and [`free`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `UnifiedHost` carries the original host pointer separately from the
+/// device-mapped pointer: `hipHostMalloc` returns a host pointer, then
+/// `hipHostGetDevicePointer` produces a device-addressable pointer that may
+/// or may not equal the host one. The buffer stores the device pointer for
+/// kernel ops; the host pointer is what `hipHostFree` needs at drop time.
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum AllocatorKind {
     /// Classic device-pointer allocation: `hipMalloc` / `cudaMalloc` /
-    /// `supersonic_metal_alloc`. Free with the matching `*Free`.
+    /// `supersonic_metal_alloc`. Free with the matching `*Free` on the
+    /// device pointer.
     Discrete,
-    /// HIP host-mapped+coherent allocation (`hipHostMalloc` with
-    /// `HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT`). The pointer
-    /// addresses system RAM directly and is usable from both host and device
-    /// on RDNA3 integrated / unified-memory arches. Free with `hipHostFree`.
-    UnifiedHost,
+    /// HIP host-mapped allocation (`hipHostMalloc` with
+    /// `HIP_HOST_MALLOC_MAPPED`, *no* coherent flag — coherence-protocol
+    /// traffic is the bottleneck on RDNA3.5 APU's bandwidth-bound decode
+    /// path, and weights are write-once-from-baker / read-many-from-decode
+    /// so coherence buys nothing). The pointer addresses system RAM directly.
+    /// Free with `hipHostFree(host_ptr)`.
+    UnifiedHost { host_ptr: NonNull<c_void> },
 }
 
 /// Allocate `len_bytes` of device-addressable memory, returning a non-null
 /// pointer plus the allocator kind that produced it. On HIP arches with
 /// `MemoryArchitecture::Unified` (gfx1150 APU), the allocation comes out of
-/// system RAM via `hipHostMalloc(MAPPED | COHERENT)` so host and device see
-/// the same physical bytes.
+/// system RAM via `hipHostMalloc(MAPPED)` so host and device see the same
+/// physical bytes; the device-side pointer is obtained via
+/// `hipHostGetDevicePointer` per HIP API contract.
 pub(crate) fn alloc(
     ordinal: usize,
     len_bytes: usize,
@@ -324,69 +334,93 @@ pub(crate) fn alloc(
     }
     hal_profile_time("alloc", len_bytes, || {
         let backend = current_backend();
-        with_device_impl(backend, ordinal, || {
-            let mut ptr = std::ptr::null_mut();
-            let mut kind = AllocatorKind::Discrete;
-            let status = match backend {
-                Backend::Hip => {
-                    #[cfg(supersonic_backend_hip)]
-                    unsafe {
-                        if current_memory_architecture() == MemoryArchitecture::Unified {
-                            kind = AllocatorKind::UnifiedHost;
-                            hipHostMalloc(
-                                &mut ptr,
-                                len_bytes,
-                                HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT,
-                            )
-                        } else {
-                            hipMalloc(&mut ptr, len_bytes)
+        with_device_impl(backend, ordinal, || match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                unsafe {
+                    if current_memory_architecture() == MemoryArchitecture::Unified {
+                        let mut host_ptr = std::ptr::null_mut();
+                        let status =
+                            hipHostMalloc(&mut host_ptr, len_bytes, HIP_HOST_MALLOC_MAPPED);
+                        if status != 0 {
+                            return Err(backend_error(
+                                Backend::Hip,
+                                "hipHostMalloc(unified)",
+                                status,
+                            ));
                         }
+                        let host_nn = NonNull::new(host_ptr).ok_or_else(|| {
+                            GpuError::backend(
+                                Backend::Hip,
+                                "hipHostMalloc returned null".into(),
+                            )
+                        })?;
+                        let mut dev_ptr = std::ptr::null_mut();
+                        let status = hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0);
+                        if status != 0 {
+                            // Roll back the host alloc so we don't leak.
+                            let _ = hipHostFree(host_ptr);
+                            return Err(backend_error(
+                                Backend::Hip,
+                                "hipHostGetDevicePointer",
+                                status,
+                            ));
+                        }
+                        let dev_nn = NonNull::new(dev_ptr).ok_or_else(|| {
+                            // Same rollback on the unlikely null device ptr.
+                            let _ = hipHostFree(host_ptr);
+                            GpuError::backend(
+                                Backend::Hip,
+                                "hipHostGetDevicePointer returned null".into(),
+                            )
+                        })?;
+                        return Ok((dev_nn, AllocatorKind::UnifiedHost { host_ptr: host_nn }));
                     }
-                    #[cfg(not(supersonic_backend_hip))]
-                    1
+                    let mut ptr = std::ptr::null_mut();
+                    let status = hipMalloc(&mut ptr, len_bytes);
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipMalloc", status));
+                    }
+                    let nn = NonNull::new(ptr).ok_or_else(|| {
+                        GpuError::backend(Backend::Hip, "hipMalloc returned null".into())
+                    })?;
+                    Ok((nn, AllocatorKind::Discrete))
                 }
-                Backend::Cuda => {
-                    #[cfg(supersonic_backend_cuda)]
-                    unsafe {
-                        cudaMalloc(&mut ptr, len_bytes)
-                    }
-                    #[cfg(not(supersonic_backend_cuda))]
-                    1
-                }
-                Backend::Metal => {
-                    #[cfg(supersonic_backend_metal)]
-                    unsafe {
-                        supersonic_metal_alloc(len_bytes, &mut ptr)
-                    }
-                    #[cfg(not(supersonic_backend_metal))]
-                    1
-                }
-            };
-            if status != 0 {
-                return Err(match (backend, kind) {
-                    (Backend::Hip, AllocatorKind::UnifiedHost) => {
-                        backend_error(Backend::Hip, "hipHostMalloc(unified)", status)
-                    }
-                    (Backend::Hip, _) => backend_error(Backend::Hip, "hipMalloc", status),
-                    (Backend::Cuda, _) => backend_error(Backend::Cuda, "cudaMalloc", status),
-                    (Backend::Metal, _) => backend_error(Backend::Metal, "metalAlloc", status),
-                });
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
             }
-            let nn = NonNull::new(ptr).ok_or_else(|| match (backend, kind) {
-                (Backend::Hip, AllocatorKind::UnifiedHost) => {
-                    GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
+            Backend::Cuda => {
+                #[cfg(supersonic_backend_cuda)]
+                unsafe {
+                    let mut ptr = std::ptr::null_mut();
+                    let status = cudaMalloc(&mut ptr, len_bytes);
+                    if status != 0 {
+                        return Err(backend_error(Backend::Cuda, "cudaMalloc", status));
+                    }
+                    let nn = NonNull::new(ptr).ok_or_else(|| {
+                        GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into())
+                    })?;
+                    Ok((nn, AllocatorKind::Discrete))
                 }
-                (Backend::Hip, _) => {
-                    GpuError::backend(Backend::Hip, "hipMalloc returned null".into())
+                #[cfg(not(supersonic_backend_cuda))]
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
+            Backend::Metal => {
+                #[cfg(supersonic_backend_metal)]
+                unsafe {
+                    let mut ptr = std::ptr::null_mut();
+                    let status = supersonic_metal_alloc(len_bytes, &mut ptr);
+                    if status != 0 {
+                        return Err(backend_error(Backend::Metal, "metalAlloc", status));
+                    }
+                    let nn = NonNull::new(ptr).ok_or_else(|| {
+                        GpuError::backend(Backend::Metal, "metalAlloc returned null".into())
+                    })?;
+                    Ok((nn, AllocatorKind::Discrete))
                 }
-                (Backend::Cuda, _) => {
-                    GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into())
-                }
-                (Backend::Metal, _) => {
-                    GpuError::backend(Backend::Metal, "metalAlloc returned null".into())
-                }
-            })?;
-            Ok((nn, kind))
+                #[cfg(not(supersonic_backend_metal))]
+                Err(GpuError::InvalidArg("Metal backend not compiled".into()))
+            }
         })
     })
 }
@@ -521,32 +555,38 @@ pub(crate) fn alloc_zeros(
     Ok((ptr, kind))
 }
 
-/// Free a buffer allocated by [`alloc`]. Dispatches `hipFree` vs `hipHostFree`
-/// based on the recorded allocator kind. No-op on null.
+/// Free a buffer allocated by [`alloc`]. Dispatches based on the recorded
+/// allocator kind: `Discrete` frees the device pointer with `hipFree` /
+/// `cudaFree` / metal-free; `UnifiedHost` frees the original host pointer
+/// (carried in the kind) with `hipHostFree` and ignores the device-mapped
+/// pointer. No-op on null.
 pub(crate) fn free(
     backend: Backend,
     ordinal: usize,
-    ptr: *mut c_void,
+    dev_ptr: *mut c_void,
     allocator: AllocatorKind,
 ) {
-    if ptr.is_null() {
+    if dev_ptr.is_null() {
         return;
     }
     hal_profile_time("free", 0, || {
         let _ = with_device_impl(backend, ordinal, || {
             let status = match (backend, allocator) {
-                (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                (Backend::Hip, AllocatorKind::UnifiedHost { host_ptr }) => {
                     #[cfg(supersonic_backend_hip)]
                     unsafe {
-                        hipHostFree(ptr)
+                        hipHostFree(host_ptr.as_ptr())
                     }
                     #[cfg(not(supersonic_backend_hip))]
-                    1
+                    {
+                        let _ = host_ptr;
+                        1
+                    }
                 }
-                (Backend::Hip, _) => {
+                (Backend::Hip, AllocatorKind::Discrete) => {
                     #[cfg(supersonic_backend_hip)]
                     unsafe {
-                        hipFree(ptr)
+                        hipFree(dev_ptr)
                     }
                     #[cfg(not(supersonic_backend_hip))]
                     1
@@ -554,7 +594,7 @@ pub(crate) fn free(
                 (Backend::Cuda, _) => {
                     #[cfg(supersonic_backend_cuda)]
                     unsafe {
-                        cudaFree(ptr)
+                        cudaFree(dev_ptr)
                     }
                     #[cfg(not(supersonic_backend_cuda))]
                     1
@@ -562,7 +602,7 @@ pub(crate) fn free(
                 (Backend::Metal, _) => {
                     #[cfg(supersonic_backend_metal)]
                     unsafe {
-                        supersonic_metal_free(ptr)
+                        supersonic_metal_free(dev_ptr)
                     }
                     #[cfg(not(supersonic_backend_metal))]
                     1
@@ -570,10 +610,12 @@ pub(crate) fn free(
             };
             if status != 0 {
                 return Err(match (backend, allocator) {
-                    (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                    (Backend::Hip, AllocatorKind::UnifiedHost { .. }) => {
                         backend_error(Backend::Hip, "hipHostFree", status)
                     }
-                    (Backend::Hip, _) => backend_error(Backend::Hip, "hipFree", status),
+                    (Backend::Hip, AllocatorKind::Discrete) => {
+                        backend_error(Backend::Hip, "hipFree", status)
+                    }
                     (Backend::Cuda, _) => backend_error(Backend::Cuda, "cudaFree", status),
                     (Backend::Metal, _) => backend_error(Backend::Metal, "metalFree", status),
                 });
