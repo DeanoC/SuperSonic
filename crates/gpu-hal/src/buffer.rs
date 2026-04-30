@@ -3,18 +3,19 @@ use std::ptr::NonNull;
 
 use crate::backend::Backend;
 use crate::error::{GpuError, Result};
-use crate::ops;
+use crate::ops::{self, AllocatorKind};
 use crate::scalar_type::ScalarType;
 
 /// Owned GPU device memory with shape and dtype metadata.
-/// Frees on drop via the active runtime's device free call.
-//
-// Allocation today is unconditionally `hipMalloc` / `cudaMalloc` (i.e. assumes
-// `MemoryArchitecture::Discrete`). For unified-memory arches (gfx1150 APU,
-// Apple M-series), the right call is host-coherent / managed memory so host
-// and device share the same physical pages. The branch point is here — see
-// `runner::registry::ArchProfile::for_arch(...).memory` for the dispatch
-// dimension.
+///
+/// Allocation routes through `ops::alloc`, which branches on the active
+/// `MemoryArchitecture`: `Discrete` arches use `hipMalloc` / `cudaMalloc` /
+/// metal device memory; `Unified` HIP arches (gfx1150 APU) use
+/// `hipHostMalloc(MAPPED)` + `hipHostGetDevicePointer` so host and device
+/// share the same physical pages without coherence-protocol traffic. Each
+/// buffer remembers which allocator produced it (and, for `UnifiedHost`,
+/// the original host pointer needed by `hipHostFree`) so `Drop` issues
+/// the matching free call.
 pub struct GpuBuffer {
     ptr: NonNull<c_void>,
     len_bytes: usize,
@@ -22,6 +23,7 @@ pub struct GpuBuffer {
     shape: Vec<usize>,
     device_ordinal: usize,
     backend: Backend,
+    allocator: AllocatorKind,
 }
 
 // GPU pointers are not thread-safe by default, but access is serialized by the
@@ -139,7 +141,12 @@ impl HostBuffer {
 
 impl Drop for GpuBuffer {
     fn drop(&mut self) {
-        ops::free(self.backend, self.device_ordinal, self.ptr.as_ptr());
+        ops::free(
+            self.backend,
+            self.device_ordinal,
+            self.ptr.as_ptr(),
+            self.allocator,
+        );
     }
 }
 
@@ -148,7 +155,7 @@ impl GpuBuffer {
     pub fn alloc(ordinal: usize, dtype: ScalarType, shape: &[usize]) -> Result<Self> {
         let elems = ops::elem_count(shape);
         let len_bytes = ops::byte_len(dtype, elems);
-        let ptr = ops::alloc(ordinal, len_bytes)?;
+        let (ptr, allocator) = ops::alloc(ordinal, len_bytes)?;
         Ok(Self {
             ptr,
             len_bytes,
@@ -156,6 +163,7 @@ impl GpuBuffer {
             shape: shape.to_vec(),
             device_ordinal: ordinal,
             backend: crate::current_backend(),
+            allocator,
         })
     }
 
@@ -163,7 +171,7 @@ impl GpuBuffer {
     pub fn zeros(ordinal: usize, dtype: ScalarType, shape: &[usize]) -> Result<Self> {
         let elems = ops::elem_count(shape);
         let len_bytes = ops::byte_len(dtype, elems);
-        let ptr = ops::alloc_zeros(ordinal, len_bytes)?;
+        let (ptr, allocator) = ops::alloc_zeros(ordinal, len_bytes)?;
         Ok(Self {
             ptr,
             len_bytes,
@@ -171,6 +179,7 @@ impl GpuBuffer {
             shape: shape.to_vec(),
             device_ordinal: ordinal,
             backend: crate::current_backend(),
+            allocator,
         })
     }
 
@@ -189,7 +198,7 @@ impl GpuBuffer {
                 data.len()
             )));
         }
-        let ptr = ops::alloc(ordinal, expected)?;
+        let (ptr, allocator) = ops::alloc(ordinal, expected)?;
         ops::copy_h2d(
             ordinal,
             ptr.as_ptr(),
@@ -203,6 +212,7 @@ impl GpuBuffer {
             shape: shape.to_vec(),
             device_ordinal: ordinal,
             backend: crate::current_backend(),
+            allocator,
         })
     }
 

@@ -1133,6 +1133,23 @@ fn main() -> Result<()> {
         }
     };
 
+    // Install the memory architecture so gpu_hal::alloc routes correctly.
+    // On Unified arches (gfx1150 APU), HIP allocations come out of system
+    // RAM via hipHostMalloc(MAPPED) + hipHostGetDevicePointer so host and
+    // device share the same physical pages with no coherence-protocol cost.
+    // Must be set before any GpuBuffer::alloc, which starts during weight
+    // loading below.
+    let arch_profile = registry::ArchProfile::for_arch(&entry.arch);
+    gpu_hal::set_memory_architecture(arch_profile.memory);
+    eprintln!(
+        "[gpu] memory_architecture={:?} (allocator: {})",
+        arch_profile.memory,
+        match arch_profile.memory {
+            gpu_hal::MemoryArchitecture::Discrete => "hipMalloc / cudaMalloc",
+            gpu_hal::MemoryArchitecture::Unified => "hipHostMalloc(MAPPED) + GetDevicePointer",
+        }
+    );
+
     // DFlash validation runs BEFORE the family dispatch so a misconfig on
     // non-Qwen families fails fast. The dispatch below returns for Gemma4/
     // Phi4 — if we deferred these checks until the Qwen branch, callers

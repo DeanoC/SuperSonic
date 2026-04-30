@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub use gpu_hal::Backend;
+pub use gpu_hal::{Backend, MemoryArchitecture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
@@ -146,23 +146,6 @@ impl fmt::Display for GpuArch {
     }
 }
 
-/// How a GPU's memory is wired relative to host RAM.
-///
-/// This is the dimension that drives allocation/copy policy — it's coarser
-/// than `GpuArch` on purpose. Future code that wants "should I use pinned
-/// host memory / managed memory / zero-copy?" should branch on this rather
-/// than enumerating arches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryArchitecture {
-    /// Discrete GPU with dedicated VRAM, distinct from host RAM. `hipMalloc`
-    /// / `cudaMalloc` allocate device memory; H2D/D2H copies traverse PCIe.
-    Discrete,
-    /// APU / integrated GPU sharing system RAM with the host. Allocations
-    /// come out of system memory; H2D/D2H may be eligible for zero-copy or
-    /// host-coherent / managed paths.
-    Unified,
-}
-
 /// Per-arch policy bundle. Returned by [`ArchProfile::for_arch`] — one source
 /// of truth for "what does this arch look like" so registry entries don't
 /// have to restate it per-model.
@@ -173,6 +156,19 @@ pub struct ArchProfile {
 
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
+        // gfx1150 (RDNA3.5 APU) is structurally unified-memory, but the
+        // `hipHostMalloc(MAPPED) + hipHostGetDevicePointer` path used by
+        // gpu-hal's Unified branch currently regresses ~2.2x on Qwen3.5-0.8B
+        // and ~1.5x on Gemma4-E2B vs the classic `hipMalloc` path on this
+        // arch (measured 2026-04-30, peak clocks, alternated A/B). Root
+        // cause appears to be cache-attr / page-walk differences between
+        // host-mapped and device-allocated pages — not coherence (already
+        // dropped) and not the host-vs-device pointer (already fixed). A
+        // proper perf dive with `rocprof` is needed to pin it down.
+        // The mapping below is left structurally correct; the actual
+        // allocation regression is a known RDNA3.5 issue, not a design
+        // flaw in `MemoryArchitecture::Unified`. AppleM4 and any future
+        // unified-memory arch should still benefit.
         let memory = match arch {
             GpuArch::Gfx1100 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
             GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
