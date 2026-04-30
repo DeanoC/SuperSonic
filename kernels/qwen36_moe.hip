@@ -1451,4 +1451,299 @@ __global__ void qwen36_moe_linear_step_kernel(
     }
 }
 
+// =============================================================================
+// Single-block MoE FFN parity kernel (PR 4b4)
+//
+// Lives alongside the attn step kernel; together they cover the two halves
+// of one Qwen3.6-MoE layer (attn = pre-residual, FFN = post-residual).
+// Same staged build-up convention as PR 4b2/4b3 — each stage adds one slice
+// of compute and the host parity test reads the matching intermediate.
+//
+//   stage 1: post_attn rmsnorm + router gate + softmax + topk + renorm → write topk_weights, topk_idx
+//   stage 2: ... + shared expert (gate/up/silu/down + sigmoid_gate)    → write shared_out
+//   stage 3: ... + ONE expert FFN (top-1 dispatch via topk_idx[0])     → write expert_0_out
+//   stage 4: ... + topk-weighted sum across all k experts              → write moe_out
+//   stage 5: ... + residual add (input_hidden + moe_out + shared_out)  → write output_hidden
+//
+// PR 4b4 step 1 lands stage 1. Stages 2–5 add to this kernel; the launcher's
+// `stage` argument decides where to stop.
+//
+// Layout choices fixed up-front:
+//   block_size = 256  (4 waves on gfx1100; matches the attn kernel for symmetry)
+//   grid_size  = num_cus  (one block per CU, all guaranteed concurrent on RDNA3
+//                          → grid_barrier safe without coop launch — same as
+//                          the attn kernel and full_attention_4b.hip)
+//
+//   workspace[F32], staged-FFN scratch (offsets in F32 elements):
+//     H_NORM        = 0                                  [hidden]    rms-normed input
+//     ROUTER_LOGITS = hidden                             [E]
+//     ROUTER_PROBS  = hidden + E                         [E]
+//     TOPK_VAL      = hidden + 2*E                       [k]   renormed
+//     TOPK_IDX      = hidden + 2*E + k                   [k]   bit-cast u32 in float slot
+//     SHARED_MID    = hidden + 2*E + 2*k                 [Is]  shared-expert silu(g)*u
+//     SHARED_OUT    = hidden + 2*E + 2*k + Is            [hidden]
+//     EXPERT_STACK  = hidden + 2*E + 2*k + Is + hidden   [k * hidden] per-expert outs
+//     MOE_OUT       = ... + k*hidden                     [hidden]
+//     OUTPUT_HIDDEN = ... + hidden                       [hidden]
+//   For 35B-A3B (hidden=2048, E=256, k=8, Is=512) stage-5 footprint is
+//   ~23,568 F32 = ~92 KiB. Well within the persistent-decode budget.
+//
+// Parity output convention (BF16, sized for the largest staged intermediate):
+//   stage 1: output[0..k] = topk_weights  (BF16-rounded; renormed across k)
+//            output_idx[0..k] = topk_idx  (int32, separate buffer)
+//   stage 2..5: output written by the matching final phase (see comments
+//   on each stage in subsequent commits).
+
+template <typename T>
+__global__ void qwen36_moe_ffn_step_kernel(
+    int                            stage,
+    int                            hidden,
+    int                            num_experts,                  // E (256 on 35B-A3B)
+    int                            moe_intermediate,             // I (512 on 35B-A3B)
+    int                            shared_intermediate,          // Is (512 on 35B-A3B)
+    int                            top_k,                        // k (8 on 35B-A3B)
+    float                          rms_norm_eps,
+    const T* __restrict__          input_hidden,                 // [hidden] post-attn
+    const T* __restrict__          post_attn_norm_w,             // [hidden]
+    const T* __restrict__          gate_w,                       // [E, hidden]
+    const T* __restrict__          gate_up_proj_w,               // [E, 2*I, hidden]   (nullable for stage<3)
+    const T* __restrict__          down_proj_w,                  // [E, hidden, I]     (nullable for stage<3)
+    const T* __restrict__          shared_gate_proj_w,           // [Is, hidden]       (nullable for stage<2)
+    const T* __restrict__          shared_up_proj_w,             // [Is, hidden]       (nullable for stage<2)
+    const T* __restrict__          shared_down_proj_w,           // [hidden, Is]       (nullable for stage<2)
+    const T* __restrict__          shared_expert_gate_w,         // [1, hidden]        (nullable for stage<2)
+    T* __restrict__                output,                       // BF16, sized for the largest staged intermediate
+    int* __restrict__              output_idx,                   // [k] topk indices (stage 1+)
+    float* __restrict__            workspace,
+    unsigned int* __restrict__     counters,
+    unsigned int* __restrict__     barrier_counter,
+    unsigned int* __restrict__     barrier_flag) {
+    (void)gate_up_proj_w;
+    (void)down_proj_w;
+    (void)shared_gate_proj_w;
+    (void)shared_up_proj_w;
+    (void)shared_down_proj_w;
+    (void)shared_expert_gate_w;
+
+    const int num_blocks = static_cast<int>(gridDim.x);
+    const int tid        = threadIdx.x;
+    const int block_size = static_cast<int>(blockDim.x);
+
+    extern __shared__ float lds[];
+    float* h_norm_lds     = lds;             // [hidden]
+    float* shared_scratch = lds + hidden;    // [block_size]
+
+    const int OFF_H_NORM        = 0;
+    const int OFF_ROUTER_LOGITS = hidden;
+    const int OFF_ROUTER_PROBS  = hidden + num_experts;
+    const int OFF_TOPK_VAL      = hidden + 2 * num_experts;
+    const int OFF_TOPK_IDX      = hidden + 2 * num_experts + top_k;
+
+    // -- Phase A: load input + post_attn RMS norm --------------------------
+    // Same idiom as the attn kernel's Phase A. Every block computes h_norm
+    // into its own LDS (cheap reduction; cross-block sync would cost more).
+    for (int col = tid; col < hidden; col += block_size) {
+        h_norm_lds[col] = static_cast<float>(input_hidden[col]);
+    }
+    __syncthreads();
+
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        partial_sq += h_norm_lds[col] * h_norm_lds[col];
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float inv_rms_input;
+    if (tid == 0) {
+        inv_rms_input = rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // BF16-round each h_norm element so the matmul reads what PyTorch reads.
+    // Block 0 is also responsible for staging the F32 of-BF16 view into
+    // workspace[OFF_H_NORM] for any later stages that prefer global memory.
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = static_cast<float>(post_attn_norm_w[col]);
+        const float v = bf16_round_rne_f32(h_norm_lds[col] * inv_rms_input * w);
+        h_norm_lds[col] = v;
+        if (blockIdx.x == 0) {
+            workspace[OFF_H_NORM + col] = v;
+        }
+    }
+    __syncthreads();
+
+    // -- Phase B: router_logits = gate_w @ h_norm  (work-stealing matvec) --
+    // 256 output rows on 35B-A3B; with hidden=2048 that's a small mat-vec.
+    // Each block claims rows from `counters[0]` and reduces across its
+    // threads. Same primitive as the attn kernel's q_proj phase.
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= num_experts) break;
+
+        const T* w_row = gate_w + static_cast<size_t>(my_row) * hidden;
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            // Match the oracle's `(h_norm.f32 @ gate_w.f32.T).to(dtype)`:
+            // F32 internals, BF16-rounded on store.
+            workspace[OFF_ROUTER_LOGITS + my_row] = bf16_round_rne_f32(shared_scratch[0]);
+        }
+        __syncthreads();
+    }
+
+    // Cross-block barrier: all router logits finalised before block 0 reduces.
+    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+
+    // -- Phase C: softmax + topk + renorm (block 0 only) -------------------
+    // 256 logits softmax fits in a single block trivially. We:
+    //   1. Find max for numerical stability.
+    //   2. exp(logit - max), sum.
+    //   3. Divide → router_probs[E] (F32, BF16-rounded for parity).
+    //   4. Top-k via k iterations of "find argmax, mark used".
+    //   5. Sum the top-k probs, divide each by the sum → renormed weights.
+    if (blockIdx.x == 0) {
+        const int E = num_experts;
+        const int K = top_k;
+
+        // Step 1: max reduction. Threads read logits and produce a per-thread
+        // max; tree-reduce in shared_scratch.
+        float local_max = -INFINITY;
+        for (int i = tid; i < E; i += block_size) {
+            const float v = workspace[OFF_ROUTER_LOGITS + i];
+            if (v > local_max) local_max = v;
+        }
+        shared_scratch[tid] = local_max;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                const float a = shared_scratch[tid];
+                const float b = shared_scratch[tid + s];
+                shared_scratch[tid] = (a > b) ? a : b;
+            }
+            __syncthreads();
+        }
+        __shared__ float row_max;
+        if (tid == 0) row_max = shared_scratch[0];
+        __syncthreads();
+
+        // Step 2: exp(logit - max), partial sum.
+        float local_sum = 0.0f;
+        for (int i = tid; i < E; i += block_size) {
+            const float e = expf(workspace[OFF_ROUTER_LOGITS + i] - row_max);
+            workspace[OFF_ROUTER_PROBS + i] = e;
+            local_sum += e;
+        }
+        shared_scratch[tid] = local_sum;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        __shared__ float row_sum;
+        if (tid == 0) row_sum = shared_scratch[0];
+        __syncthreads();
+
+        // Step 3: divide. Store BF16-rounded F32 (matches oracle's `.to(dtype)`).
+        const float inv_row_sum = 1.0f / row_sum;
+        for (int i = tid; i < E; i += block_size) {
+            const float p = bf16_round_rne_f32(workspace[OFF_ROUTER_PROBS + i] * inv_row_sum);
+            workspace[OFF_ROUTER_PROBS + i] = p;
+        }
+        __syncthreads();
+
+        // Step 4: top-k via k iterations. Each iter does a 256-wide argmax
+        // reduction on `router_probs`, then masks the winner. With K=8 this
+        // is 8 cycles → fine for a megakernel; a heap would beat it for
+        // larger k but k=8 is fixed in the model card.
+        //
+        // Tie-breaking: torch.topk returns the lowest index on ties; we
+        // match by carrying both (value, index) through the tree-reduce
+        // and preferring the lower index when values are equal.
+        //
+        // Static __shared__ buffers for the (val, idx) reduction. Sized to
+        // the fixed block_size=256; if block_size ever grows, increase
+        // these in lockstep. Allocated once at kernel entry to avoid the
+        // re-declare-inside-loop pitfall some compilers handle oddly.
+        __shared__ int   idx_buf[256];
+        __shared__ float val_buf[256];
+        for (int kk = 0; kk < K; kk++) {
+            // Per-thread argmax over the strided slice.
+            int   local_idx = -1;
+            float local_val = -INFINITY;
+            for (int i = tid; i < E; i += block_size) {
+                const float v = workspace[OFF_ROUTER_PROBS + i];
+                if (v > local_val ||
+                    (v == local_val && local_idx >= 0 && i < local_idx)) {
+                    local_val = v;
+                    local_idx = i;
+                }
+            }
+            idx_buf[tid] = local_idx;
+            val_buf[tid] = local_val;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    const float a  = val_buf[tid];
+                    const float b  = val_buf[tid + s];
+                    const int   ia = idx_buf[tid];
+                    const int   ib = idx_buf[tid + s];
+                    bool take_b = false;
+                    if (b > a) take_b = true;
+                    else if (b == a && ib >= 0 &&
+                             (ia < 0 || ib < ia)) take_b = true;
+                    if (take_b) {
+                        val_buf[tid] = b;
+                        idx_buf[tid] = ib;
+                    }
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                const int   winner_idx = idx_buf[0];
+                const float winner_val = val_buf[0];
+                workspace[OFF_TOPK_IDX + kk] = __int_as_float(winner_idx);
+                workspace[OFF_TOPK_VAL + kk] = winner_val;
+                // Mask the winner so the next iter picks the next-largest.
+                workspace[OFF_ROUTER_PROBS + winner_idx] = -INFINITY;
+            }
+            __syncthreads();
+        }
+
+        // Step 5: renormalise the top-k probs to sum to 1.
+        // Sequential on tid==0 — k is tiny (8); a parallel reduction would
+        // be code-bulk for no measurable win.
+        if (tid == 0) {
+            float sum = 0.0f;
+            for (int i = 0; i < K; i++) sum += workspace[OFF_TOPK_VAL + i];
+            const float inv = 1.0f / sum;
+            for (int i = 0; i < K; i++) {
+                const float w = bf16_round_rne_f32(workspace[OFF_TOPK_VAL + i] * inv);
+                workspace[OFF_TOPK_VAL + i] = w;
+                if (stage == 1) {
+                    output[i]      = static_cast<T>(w);
+                    output_idx[i]  = __float_as_int(workspace[OFF_TOPK_IDX + i]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace qwen36_moe

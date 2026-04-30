@@ -291,3 +291,94 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     if (sync_err_lin != hipSuccess) return 255;
     return 0;
 }
+
+// PR 4b4 staged MoE FFN parity launcher.
+// `dtype` follows the project convention: 2 = bf16. Other values are
+// rejected so the matching kernel template is unambiguous.
+extern "C" int qwen36_moe_hip_ffn_step_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           stage,
+    int           hidden,
+    int           num_experts,
+    int           moe_intermediate,
+    int           shared_intermediate,
+    int           top_k,
+    float         rms_norm_eps,
+    const void*   input_hidden,
+    const void*   post_attn_norm_w,
+    const void*   gate_w,
+    const void*   gate_up_proj_w,
+    const void*   down_proj_w,
+    const void*   shared_gate_proj_w,
+    const void*   shared_up_proj_w,
+    const void*   shared_down_proj_w,
+    const void*   shared_expert_gate_w,
+    void*         output,
+    int*          output_idx,
+    float*        workspace,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag) {
+    if (dtype != 2) return 130;            // only bf16 supported
+    if (stage < 1 || stage > 5) return 131;
+    if (hidden <= 0 || num_experts <= 0 || moe_intermediate <= 0 ||
+        shared_intermediate <= 0 || top_k <= 0 || top_k > num_experts) {
+        return 132;
+    }
+    if (input_hidden == nullptr || post_attn_norm_w == nullptr ||
+        gate_w == nullptr || output == nullptr || output_idx == nullptr ||
+        workspace == nullptr || counters == nullptr ||
+        barrier_counter == nullptr || barrier_flag == nullptr) {
+        return 133;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    constexpr int block_size = 256;
+
+    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
+        return 200;
+    }
+
+    const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
+
+    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_ffn_step_kernel<hip_bfloat16>,
+                       dim3(static_cast<unsigned int>(num_blocks)),
+                       dim3(block_size),
+                       lds_bytes, 0,
+                       stage,
+                       hidden,
+                       num_experts,
+                       moe_intermediate,
+                       shared_intermediate,
+                       top_k,
+                       rms_norm_eps,
+                       static_cast<const hip_bfloat16*>(input_hidden),
+                       static_cast<const hip_bfloat16*>(post_attn_norm_w),
+                       static_cast<const hip_bfloat16*>(gate_w),
+                       static_cast<const hip_bfloat16*>(gate_up_proj_w),
+                       static_cast<const hip_bfloat16*>(down_proj_w),
+                       static_cast<const hip_bfloat16*>(shared_gate_proj_w),
+                       static_cast<const hip_bfloat16*>(shared_up_proj_w),
+                       static_cast<const hip_bfloat16*>(shared_down_proj_w),
+                       static_cast<const hip_bfloat16*>(shared_expert_gate_w),
+                       static_cast<hip_bfloat16*>(output),
+                       output_idx,
+                       workspace,
+                       counters,
+                       barrier_counter,
+                       barrier_flag);
+    hipError_t launch_err_ffn = hipGetLastError();
+    hipError_t sync_err_ffn   = hipDeviceSynchronize();
+    if (launch_err_ffn != hipSuccess) return 254;
+    if (sync_err_ffn != hipSuccess) return 255;
+    return 0;
+}

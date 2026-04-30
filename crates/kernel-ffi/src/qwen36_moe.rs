@@ -331,6 +331,58 @@ extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+
+    /// PR 4b4 staged single-block MoE FFN parity launcher. Same staged-build-up
+    /// discipline as `qwen36_moe_hip_attn_step_launch` and
+    /// `qwen36_moe_hip_linear_step_launch`, but for the post-attention half
+    /// of one Qwen3.6-MoE layer. `stage` selects how far to run; the matching
+    /// staged intermediate is published to `output` (BF16) and `output_idx`
+    /// (i32, top-k indices for stages 1+):
+    ///
+    /// | stage | output buffer contents (BF16)                    |
+    /// |-------|--------------------------------------------------|
+    /// |   1   | `topk_weights[k]`           (idx via `output_idx`) |
+    /// |   2   | `shared_out[hidden]`                             |
+    /// |   3   | `expert_0_out[hidden]`      (top-1 dispatch)     |
+    /// |   4   | `moe_out[hidden]`                                |
+    /// |   5   | `output_hidden[hidden]`     (final residual)     |
+    ///
+    /// PR 4b4 step 1 wires only `stage == 1`; the kernel ignores the
+    /// gate_up_proj / down_proj / shared_expert_* pointers and the matching
+    /// arguments can be null. They're declared up front so subsequent staged
+    /// commits don't perturb the FFI ABI.
+    ///
+    /// `workspace` must be at least `hidden + 2*num_experts + 2*top_k` F32
+    /// entries for stage 1 (later stages bump that up). `output` must be at
+    /// least `top_k` BF16 entries on stage 1 and `output_idx` must be at
+    /// least `top_k` i32 entries. `sync_buf` (counters/barrier_counter/
+    /// barrier_flag) must be 32 zero bytes.
+    pub fn qwen36_moe_hip_ffn_step_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        stage: c_int,
+        hidden: c_int,
+        num_experts: c_int,
+        moe_intermediate: c_int,
+        shared_intermediate: c_int,
+        top_k: c_int,
+        rms_norm_eps: f32,
+        input_hidden: *const c_void,
+        post_attn_norm_w: *const c_void,
+        gate_w: *const c_void,
+        gate_up_proj_w: *const c_void,
+        down_proj_w: *const c_void,
+        shared_gate_proj_w: *const c_void,
+        shared_up_proj_w: *const c_void,
+        shared_down_proj_w: *const c_void,
+        shared_expert_gate_w: *const c_void,
+        output: *mut c_void,
+        output_idx: *mut c_int,
+        workspace: *mut f32,
+        counters: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -650,6 +702,137 @@ pub fn linear_step_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe linear_step launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Geometry for the staged MoE FFN parity launcher. Mirrors
+/// `Qwen36MoeAttnStepParams` / `Qwen36MoeLinearStepParams`. Bundling these
+/// keeps the safe wrapper's signature short.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeFfnStepParams {
+    pub stage: i32,
+    pub hidden: i32,
+    pub num_experts: i32,
+    pub moe_intermediate: i32,
+    pub shared_intermediate: i32,
+    pub top_k: i32,
+    pub rms_norm_eps: f32,
+}
+
+/// Weight pointers for the staged MoE FFN parity launcher. Pointers unused
+/// by the requested `stage` may be null; the kernel won't dereference them.
+/// See [`qwen36_moe_hip_ffn_step_launch`] for the per-stage matrix.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeFfnStepWeights {
+    pub input_hidden: *const c_void,
+    pub post_attn_norm_w: *const c_void,
+    pub gate_w: *const c_void,
+    pub gate_up_proj_w: *const c_void,
+    pub down_proj_w: *const c_void,
+    pub shared_gate_proj_w: *const c_void,
+    pub shared_up_proj_w: *const c_void,
+    pub shared_down_proj_w: *const c_void,
+    pub shared_expert_gate_w: *const c_void,
+}
+
+/// Safe wrapper for the PR 4b4 staged MoE FFN parity launcher.
+///
+/// `output` must be a BF16 buffer with at least `max(top_k, hidden)` elements
+/// (the size of the largest staged intermediate). `output_idx` must be an
+/// i32 buffer with at least `top_k` elements. `workspace` must be an F32
+/// buffer sized for the requested stage's footprint (see the layout comment
+/// in `kernels/qwen36_moe.hip`). `sync_buf` must be a 32-byte zero buffer
+/// (counter @ +0, barrier counter @ +16, barrier flag @ +20).
+pub fn ffn_step_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    output: &mut GpuBuffer,
+    output_idx: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: only BF16 is wired, got {dtype:?}"
+        )));
+    }
+    if !(1..=5).contains(&params.stage) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: stage must be in 1..=5, got {}",
+            params.stage
+        )));
+    }
+    if params.top_k > params.num_experts {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: top_k ({}) > num_experts ({})",
+            params.top_k, params.num_experts,
+        )));
+    }
+    // Only stage 1 is wired through PR 4b4 step 2; stage 2..=5 will land in
+    // follow-up commits to this PR.
+
+    let backend = output.backend();
+    let counters = sync_buf.as_mut_ptr() as *mut c_uint;
+    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_ffn_step_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    params.stage as c_int,
+                    params.hidden as c_int,
+                    params.num_experts as c_int,
+                    params.moe_intermediate as c_int,
+                    params.shared_intermediate as c_int,
+                    params.top_k as c_int,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.post_attn_norm_w,
+                    weights.gate_w,
+                    weights.gate_up_proj_w,
+                    weights.down_proj_w,
+                    weights.shared_gate_proj_w,
+                    weights.shared_up_proj_w,
+                    weights.shared_down_proj_w,
+                    weights.shared_expert_gate_w,
+                    output.as_mut_ptr(),
+                    output_idx.as_mut_ptr() as *mut c_int,
+                    workspace.as_mut_ptr() as *mut f32,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::ffn_step_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::ffn_step_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::ffn_step_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe ffn_step launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -2461,6 +2644,204 @@ mod tests {
             got_bytes,
             &output_hidden_expected,
             0.05,
+            0.9999,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PR 4b4 — staged MoE FFN parity tests against the Python oracle
+    // -------------------------------------------------------------------
+
+    #[cfg(supersonic_backend_hip)]
+    struct FfnOracleGeom {
+        hidden: i32,
+        num_experts: i32,
+        moe_intermediate: i32,
+        shared_intermediate: i32,
+        top_k: i32,
+        rms_norm_eps: f32,
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    fn load_ffn_oracle_json() -> Option<(serde_json::Value, FfnOracleGeom)> {
+        let json_path = std::env::var("SUPERSONIC_QWEN36_FFN_ORACLE_JSON").ok()?;
+        let raw = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|e| panic!("read ffn oracle json {json_path}: {e}"));
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("ffn oracle json parse");
+        assert_eq!(
+            json["dtype"].as_str().unwrap_or(""),
+            "bf16",
+            "MoE FFN parity tests require the oracle to be in bf16 mode"
+        );
+        let cfg = &json["config"];
+        let geom = FfnOracleGeom {
+            hidden: cfg["hidden"].as_i64().unwrap() as i32,
+            num_experts: cfg["num_experts"].as_i64().unwrap() as i32,
+            moe_intermediate: cfg["moe_intermediate"].as_i64().unwrap() as i32,
+            shared_intermediate: cfg["shared_intermediate"].as_i64().unwrap() as i32,
+            top_k: cfg["top_k"].as_i64().unwrap() as i32,
+            rms_norm_eps: cfg["rms_norm_eps"].as_f64().unwrap() as f32,
+        };
+        Some((json, geom))
+    }
+
+    /// Decode a base64 i32 buffer (oracle uses int32 for `topk_idx`).
+    #[cfg(supersonic_backend_hip)]
+    fn i32_bytes_to_vec(bytes: &[u8]) -> Vec<i32> {
+        bytes
+            .chunks_exact(4)
+            .map(|c| {
+                let mut a = [0u8; 4];
+                a.copy_from_slice(c);
+                i32::from_le_bytes(a)
+            })
+            .collect()
+    }
+
+    /// Workspace floats sufficient for the largest staged FFN intermediate
+    /// (stage 5). Same convention as `parity_workspace_floats` for the attn
+    /// kernel — keep tight so a stage that overruns fails loudly.
+    #[cfg(supersonic_backend_hip)]
+    fn ffn_parity_workspace_floats(geom: &FfnOracleGeom) -> usize {
+        let hidden = geom.hidden as usize;
+        let e = geom.num_experts as usize;
+        let k = geom.top_k as usize;
+        let is_dim = geom.shared_intermediate as usize;
+        // hidden + 2*E + 2*k (router pieces)
+        // + is_dim (shared_mid) + hidden (shared_out)
+        // + k*hidden (expert_stack) + hidden (moe_out) + hidden (output)
+        hidden + 2 * e + 2 * k + is_dim + 3 * hidden + k * hidden
+    }
+
+    /// Output BF16 elements sufficient for the largest staged FFN
+    /// intermediate. Stages 2..=5 publish a `[hidden]` buffer; stage 1
+    /// publishes `[k]`. Sized for `hidden`.
+    #[cfg(supersonic_backend_hip)]
+    fn ffn_parity_output_elems(geom: &FfnOracleGeom) -> usize {
+        geom.hidden as usize
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_ffn_step_1_topk_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_ffn_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_FFN_ORACLE_JSON not set. \
+                 Generate a fixture with \
+                 `python oracle/qwen36_moe_ffn_oracle.py --mode synthetic \
+                 --out /tmp/qwen36_ffn.json` and re-run."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
+        let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
+        let topk_idx_expected = i32_bytes_to_vec(
+            &b64_decode(inters["topk_idx"].as_str().unwrap())
+        );
+        let topk_weights_expected_bytes =
+            b64_decode(inters["topk_weights"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let e_us = geom.num_experts as usize;
+        let k_us = geom.top_k as usize;
+
+        assert_eq!(input_hidden_bytes.len(), hidden_us * 2);
+        assert_eq!(post_attn_norm_w_bytes.len(), hidden_us * 2);
+        assert_eq!(gate_w_bytes.len(), e_us * hidden_us * 2);
+        assert_eq!(topk_idx_expected.len(), k_us);
+        assert_eq!(topk_weights_expected_bytes.len(), k_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let post_attn_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
+        ).expect("upload post_attn_norm_w");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
+        ).expect("upload gate_w");
+
+        // Output sized for the largest staged intermediate (hidden BF16).
+        // Stage 1 publishes only `topk_weights[k]` into `output[0..k]`,
+        // and `topk_idx[k]` into the separate `output_idx` buffer.
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
+        ).expect("alloc output");
+        // No I32 variant in `ScalarType`; U32 has the same 4-byte storage
+        // and the kernel reinterprets via the FFI signature's `*mut c_int`.
+        let mut output_idx = GpuBuffer::zeros(
+            ordinal, ScalarType::U32, &[k_us],
+        ).expect("alloc output_idx");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 1,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: post_attn_norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: std::ptr::null(),
+            down_proj_w: std::ptr::null(),
+            shared_gate_proj_w: std::ptr::null(),
+            shared_up_proj_w: std::ptr::null(),
+            shared_down_proj_w: std::ptr::null(),
+            shared_expert_gate_w: std::ptr::null(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("ffn_step_launch stage 1");
+
+        // Verify topk_idx (int32) — must match oracle exactly. Routing
+        // decisions are categorical; any disagreement is a real bug, no
+        // tolerance.
+        let got_idx_bytes = output_idx.to_host_bytes().expect("download output_idx");
+        let got_idx = i32_bytes_to_vec(&got_idx_bytes);
+        assert_eq!(
+            got_idx, topk_idx_expected,
+            "ffn step1 topk_idx mismatch: got {got_idx:?}, want {topk_idx_expected:?}"
+        );
+
+        // Verify topk_weights (BF16) — these come from softmax + renorm,
+        // so we expect bit-exactness for most elements with rare 1-ULP
+        // drift from F32 accumulation order.
+        let got_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_full[..k_us * 2];
+        assert_parity(
+            "ffn step1 topk_weights",
+            got_bytes,
+            &topk_weights_expected_bytes,
+            0.01,
             0.9999,
         );
     }
