@@ -1475,18 +1475,25 @@ __global__ void qwen36_moe_linear_step_kernel(
 //                          the attn kernel and full_attention_4b.hip)
 //
 //   workspace[F32], staged-FFN scratch (offsets in F32 elements):
-//     H_NORM        = 0                                  [hidden]    rms-normed input
-//     ROUTER_LOGITS = hidden                             [E]
-//     ROUTER_PROBS  = hidden + E                         [E]
-//     TOPK_VAL      = hidden + 2*E                       [k]   renormed
-//     TOPK_IDX      = hidden + 2*E + k                   [k]   bit-cast u32 in float slot
-//     SHARED_MID    = hidden + 2*E + 2*k                 [Is]  shared-expert silu(g)*u
-//     SHARED_OUT    = hidden + 2*E + 2*k + Is            [hidden]
-//     EXPERT_STACK  = hidden + 2*E + 2*k + Is + hidden   [k * hidden] per-expert outs
-//     MOE_OUT       = ... + k*hidden                     [hidden]
-//     OUTPUT_HIDDEN = ... + hidden                       [hidden]
+//     H_NORM        = 0                                              [hidden]    rms-normed input
+//     ROUTER_LOGITS = hidden                                         [E]
+//     ROUTER_PROBS  = hidden + E                                     [E]
+//     TOPK_VAL      = hidden + 2*E                                   [k]   renormed
+//     TOPK_IDX      = hidden + 2*E + k                               [k]   bit-cast u32 in float slot
+//     SG_SCALAR     = hidden + 2*E + 2*k                             [1]   sigmoid(shared_expert_gate @ h_norm)
+//     SGP           = hidden + 2*E + 2*k + 1                         [Is]  shared_gate_proj output (F32, no BF16 round)
+//     SUP           = hidden + 2*E + 2*k + 1 + Is                    [Is]  shared_up_proj output
+//     SHARED_MID    = hidden + 2*E + 2*k + 1 + 2*Is                  [Is]  silu(sgp) * sup (F32)
+//     SHARED_OUT    = hidden + 2*E + 2*k + 1 + 3*Is                  [hidden] shared expert path output (BF16-rounded F32)
+//     EXPERT_STACK  = hidden + 2*E + 2*k + 1 + 3*Is + hidden         [k * hidden] per-expert outs
+//     MOE_OUT       = ... + k*hidden                                 [hidden]
+//     OUTPUT_HIDDEN = ... + hidden                                   [hidden]
 //   For 35B-A3B (hidden=2048, E=256, k=8, Is=512) stage-5 footprint is
-//   ~23,568 F32 = ~92 KiB. Well within the persistent-decode budget.
+//   ~26,641 F32 = ~104 KiB. Well within the persistent-decode budget.
+//
+//   Note: SGP/SUP/SHARED_MID stay raw F32 (no BF16 round) to mirror the
+//   oracle's `silu(sgp) * sup` computed in F32 throughout. Only the final
+//   shared_out (= sg_scalar * (smid @ down_proj.T)) is BF16-rounded.
 //
 // Parity output convention (BF16, sized for the largest staged intermediate):
 //   stage 1: output[0..k] = topk_weights  (BF16-rounded; renormed across k)
@@ -1520,10 +1527,7 @@ __global__ void qwen36_moe_ffn_step_kernel(
     unsigned int* __restrict__     barrier_flag) {
     (void)gate_up_proj_w;
     (void)down_proj_w;
-    (void)shared_gate_proj_w;
-    (void)shared_up_proj_w;
-    (void)shared_down_proj_w;
-    (void)shared_expert_gate_w;
+    // shared_*_w are used at stage>=2.
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
@@ -1538,6 +1542,11 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const int OFF_ROUTER_PROBS  = hidden + num_experts;
     const int OFF_TOPK_VAL      = hidden + 2 * num_experts;
     const int OFF_TOPK_IDX      = hidden + 2 * num_experts + top_k;
+    const int OFF_SG_SCALAR     = hidden + 2 * num_experts + 2 * top_k;
+    const int OFF_SGP           = OFF_SG_SCALAR + 1;
+    const int OFF_SUP           = OFF_SGP + shared_intermediate;
+    const int OFF_SHARED_MID    = OFF_SUP + shared_intermediate;
+    const int OFF_SHARED_OUT    = OFF_SHARED_MID + shared_intermediate;
 
     // -- Phase A: load input + post_attn RMS norm --------------------------
     // Same idiom as the attn kernel's Phase A. Every block computes h_norm
@@ -1743,6 +1752,134 @@ __global__ void qwen36_moe_ffn_step_kernel(
             }
         }
         __syncthreads();
+    }
+
+    if (stage < 2) {
+        return;
+    }
+
+    // -- Phase D: shared-expert input projections (work-stealing matvec) ---
+    // Three matrices read out of one work-stealing loop. Row index space:
+    //   [0,             Is)            → sgp[r]    via shared_gate_proj_w
+    //   [Is,            2*Is)          → sup[r-Is] via shared_up_proj_w
+    //   [2*Is]                          → sg_scalar = sigmoid(shared_expert_gate_w @ h_norm)
+    // sgp and sup are stored as raw F32 (no BF16 round) so the silu*mul in
+    // Phase E matches the oracle's all-F32 path. sg_scalar likewise stays
+    // F32 — the only BF16 round in this stage is on the final shared_out.
+    //
+    // Block 0 finished topk; sync everyone before Phase D and reset the
+    // work-stealing counter (Phase B left it at >=E from the gate matmul).
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    const int Is_ = shared_intermediate;
+    const int total_rows_d = 2 * Is_ + 1;
+    for (;;) {
+        __shared__ unsigned int my_row_d_s;
+        if (tid == 0) {
+            my_row_d_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_d_s);
+        if (my_row >= total_rows_d) break;
+
+        const T* w_row;
+        int      write_offset;
+        bool     is_gate_row = false;
+        if (my_row < Is_) {
+            w_row        = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+            write_offset = OFF_SGP + my_row;
+        } else if (my_row < 2 * Is_) {
+            const int local = my_row - Is_;
+            w_row        = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+            write_offset = OFF_SUP + local;
+        } else {
+            // Single-row "[1, hidden]" weight; dot it with h_norm and apply
+            // sigmoid() before storing into SG_SCALAR.
+            w_row        = shared_expert_gate_w;
+            write_offset = OFF_SG_SCALAR;
+            is_gate_row  = true;
+        }
+
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            float val = shared_scratch[0];
+            if (is_gate_row) {
+                // sigmoid in F32 (matches oracle's `torch.sigmoid(sg_logit)`).
+                val = 1.0f / (1.0f + expf(-val));
+            }
+            workspace[write_offset] = val;
+        }
+        __syncthreads();
+    }
+
+    // -- Phase E: smid = silu(sgp) * sup  (block-0 only, F32 throughout) ---
+    // Block 0 owns the write so we don't have multiple blocks racing on
+    // `workspace[OFF_SHARED_MID..]`. The grid_barrier below makes the
+    // writes visible to every block before Phase F starts.
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+    if (blockIdx.x == 0) {
+        for (int i = tid; i < Is_; i += block_size) {
+            const float gp     = workspace[OFF_SGP + i];
+            const float up     = workspace[OFF_SUP + i];
+            const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+            const float silu_gp    = gp * sigmoid_gp;
+            // No BF16 round — oracle keeps this F32 until the final cast.
+            workspace[OFF_SHARED_MID + i] = silu_gp * up;
+        }
+        __syncthreads();
+    }
+
+    // -- Phase F: shared_out = sg_scalar * (smid @ down_proj.T) ------------
+    // Work-stealing matvec across `hidden` rows. The sg_scalar multiply is
+    // folded into the per-row write; BF16-round happens once at the end
+    // (matches `(sg_scalar * sdown).to(dtype)` in the oracle).
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+    {
+        // Read sg_scalar once per block; stays in registers.
+        const float sg_scalar = workspace[OFF_SG_SCALAR];
+        for (;;) {
+            __shared__ unsigned int my_row_f_s;
+            if (tid == 0) {
+                my_row_f_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_f_s);
+            if (my_row >= hidden) break;
+
+            const T* w_row =
+                shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
+            float partial = 0.0f;
+            for (int col = tid; col < Is_; col += block_size) {
+                partial += static_cast<float>(w_row[col])
+                           * workspace[OFF_SHARED_MID + col];
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                const float val = bf16_round_rne_f32(sg_scalar * shared_scratch[0]);
+                workspace[OFF_SHARED_OUT + my_row] = val;
+                if (stage == 2) {
+                    output[my_row] = static_cast<T>(val);
+                }
+            }
+            __syncthreads();
+        }
     }
 }
 

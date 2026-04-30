@@ -2845,4 +2845,138 @@ mod tests {
             0.9999,
         );
     }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_ffn_step_2_shared_out_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_ffn_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_FFN_ORACLE_JSON not set. \
+                 See `qwen36_moe_ffn_step_1_topk_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 2 still runs the stage-1 prerequisites (rmsnorm + router
+        // gate), so the gate weight is still required. The new tensors
+        // are the four shared-expert weights; the per-expert
+        // gate_up_proj / down_proj stay null until stage 3.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
+        let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes =
+            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes =
+            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes =
+            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_expert_gate_w_bytes =
+            b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
+        let shared_out_expected_bytes =
+            b64_decode(inters["shared_out"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let e_us = geom.num_experts as usize;
+        let is_us = geom.shared_intermediate as usize;
+        let k_us = geom.top_k as usize;
+
+        assert_eq!(input_hidden_bytes.len(), hidden_us * 2);
+        assert_eq!(post_attn_norm_w_bytes.len(), hidden_us * 2);
+        assert_eq!(gate_w_bytes.len(), e_us * hidden_us * 2);
+        assert_eq!(shared_gate_proj_w_bytes.len(), is_us * hidden_us * 2);
+        assert_eq!(shared_up_proj_w_bytes.len(), is_us * hidden_us * 2);
+        assert_eq!(shared_down_proj_w_bytes.len(), hidden_us * is_us * 2);
+        assert_eq!(shared_expert_gate_w_bytes.len(), 1 * hidden_us * 2);
+        assert_eq!(shared_out_expected_bytes.len(), hidden_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let post_attn_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
+        ).expect("upload post_attn_norm_w");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
+        ).expect("upload gate_w");
+        let shared_gate_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
+        ).expect("upload shared_gate_proj_w");
+        let shared_up_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
+        ).expect("upload shared_up_proj_w");
+        let shared_down_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
+        ).expect("upload shared_down_proj_w");
+        let shared_expert_gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
+        ).expect("upload shared_expert_gate_w");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
+        ).expect("alloc output");
+        let mut output_idx = GpuBuffer::zeros(
+            ordinal, ScalarType::U32, &[k_us],
+        ).expect("alloc output_idx");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 2,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: post_attn_norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: std::ptr::null(),
+            down_proj_w: std::ptr::null(),
+            shared_gate_proj_w: shared_gate_proj_w.as_ptr(),
+            shared_up_proj_w: shared_up_proj_w.as_ptr(),
+            shared_down_proj_w: shared_down_proj_w.as_ptr(),
+            shared_expert_gate_w: shared_expert_gate_w.as_ptr(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("ffn_step_launch stage 2");
+
+        // Stage 2 publishes shared_out into output[0..hidden] BF16. Tolerance
+        // is looser than stage 1 because the shared expert path stacks four
+        // matmuls (gate, up, down, plus the 1-row sigmoid gate); each one
+        // accumulates F32 reduction-order drift. Cos_sim ≥ 0.999 on a deep
+        // chain like this is the same envelope linear-attn stage 5 uses.
+        let got_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_full[..hidden_us * 2];
+        assert_parity(
+            "ffn step2 shared_out",
+            got_bytes,
+            &shared_out_expected_bytes,
+            0.05,
+            0.999,
+        );
+    }
 }
