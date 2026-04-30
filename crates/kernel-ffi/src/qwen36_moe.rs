@@ -403,9 +403,9 @@ pub fn attn_step_launch(
             params.stage
         )));
     }
-    if params.stage > 3 {
+    if params.stage > 4 {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 stages 1-3 only)",
+            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 stages 1-4 only)",
             params.stage
         )));
     }
@@ -767,14 +767,14 @@ mod tests {
     }
 
     /// Returns workspace size sufficient for the largest staged
-    /// intermediate (currently stage 3: 4*H*d + 4*Hkv*d F32).
-    /// Bumped by future stages as attn / o_proj buffers get added.
+    /// intermediate (currently stage 4: 5*H*d + 4*Hkv*d F32).
+    /// Bumped by future stages as o_proj scratch gets added.
     #[cfg(supersonic_backend_hip)]
     fn parity_workspace_floats(num_heads: i32, num_kv_heads: i32, head_dim: i32) -> usize {
         let h = num_heads as usize;
         let hkv = num_kv_heads as usize;
         let d = head_dim as usize;
-        4 * h * d + 4 * hkv * d
+        5 * h * d + 4 * hkv * d
     }
 
     /// Output buffer size sufficient for the largest staged intermediate.
@@ -1132,5 +1132,121 @@ mod tests {
                       &q_rot_expected_bytes, 0.04, 0.9999);
         assert_parity("step3 k_rot", &got_bytes_full[q_end..k_end],
                       &k_rot_expected_bytes, 0.04, 0.9999);
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_attn_step_4_attn_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
+                 See `qwen36_moe_attn_step_1_q_normed_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+        let cfg = &json["config"];
+
+        // Stage 4 still walks the stage-3 RoPE prerequisite, so we need
+        // the same RoPE config + non-trivial position discipline as step 3.
+        let position = json["position"].as_i64().unwrap_or(0) as i32;
+        let rotary_dim = cfg["rotary_dim"].as_i64().unwrap() as i32;
+        let rope_theta = cfg["rope_theta"].as_f64().unwrap() as f32;
+
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let q_proj_w_bytes = b64_decode(weights["q_proj_w"].as_str().unwrap());
+        let k_proj_w_bytes = b64_decode(weights["k_proj_w"].as_str().unwrap());
+        let v_proj_w_bytes = b64_decode(weights["v_proj_w"].as_str().unwrap());
+        let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
+        let k_norm_w_bytes = b64_decode(weights["k_norm_w"].as_str().unwrap());
+        let attn_expected_bytes = b64_decode(inters["attn"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let h_us = geom.num_heads as usize;
+        let hkv_us = geom.num_kv_heads as usize;
+        let d_us = geom.head_dim as usize;
+        assert_eq!(attn_expected_bytes.len(), h_us * d_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let q_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
+        ).expect("upload q_proj_w");
+        let k_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
+        ).expect("upload k_proj_w");
+        let v_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
+        ).expect("upload v_proj_w");
+        let q_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
+        ).expect("upload q_norm_w");
+        let k_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
+        ).expect("upload k_norm_w");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16,
+            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
+        ).expect("alloc output");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32,
+            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 4,
+            hidden: geom.hidden,
+            num_heads: geom.num_heads,
+            num_kv_heads: geom.num_kv_heads,
+            head_dim: geom.head_dim,
+            rotary_dim,
+            rope_theta,
+            rms_norm_eps: geom.rms_norm_eps,
+            position,
+        };
+        let weight_ptrs = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: k_proj_w.as_ptr(),
+            v_proj_w: v_proj_w.as_ptr(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: k_norm_w.as_ptr(),
+            o_proj_w: std::ptr::null(),
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("attn_step_launch stage 4");
+
+        // Stage 4 publishes attn into output[0..H*d) BF16.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_bytes_full[..h_us * d_us * 2];
+        // kv_len=1 makes softmax trivially 1.0, so attn = v_full and the
+        // parity should be effectively bit-exact (both kernel and oracle
+        // skip any precision-losing accumulation here).
+        assert_parity("step4 attn", got_bytes, &attn_expected_bytes, 0.04, 0.9999);
     }
 }

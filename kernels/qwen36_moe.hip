@@ -252,9 +252,10 @@ __global__ void qwen36_moe_descriptor_walk_stub(
 //     K_NORMED = 2*H*d + 2*Hkv*d + H*d            [Hkv*d]   stage-2 result
 //     Q_ROT    = 2*H*d + 2*Hkv*d + H*d + Hkv*d    [H*d]     stage-3 result
 //     K_ROT    = 3*H*d + 2*Hkv*d + H*d + Hkv*d    [Hkv*d]   stage-3 result
-//   …attn slot (stage 4+) gets appended in its own commit.
-//   Total stage-3 footprint: 4*H*d + 4*Hkv*d F32 elements.
-//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 18,432 F32 = 72 KiB.
+//     ATTN     = 4*H*d + 4*Hkv*d                  [H*d]     stage-4 result
+//   …o_proj scratch (stage 5) goes in its own commit.
+//   Total stage-4 footprint: 5*H*d + 4*Hkv*d F32 elements.
+//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 22,528 F32 = 88 KiB.
 //
 //   counters[0]: work-stealing index, reused across phases. Reset by
 //                grid_barrier_reset_counter at every phase boundary.
@@ -390,6 +391,7 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int OFF_K_NORMED = 2 * H * d + 2 * Hkv * d + H * d;
     const int OFF_Q_ROT    = 2 * H * d + 2 * Hkv * d + H * d + Hkv * d;
     const int OFF_K_ROT    = 3 * H * d + 2 * Hkv * d + H * d + Hkv * d;
+    const int OFF_ATTN     = 4 * H * d + 4 * Hkv * d;
 
     // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
     // Each block grabs a head index, reduces across head_dim, writes BF16
@@ -619,7 +621,78 @@ __global__ void qwen36_moe_attn_step_kernel(
         }
     }
 
-    // Stages 4..5 hook in here in follow-up commits.
+    if (stage < 4) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase G: GQA self-attention, kv_len = 1 ----------------------------
+    //
+    // The PR-4b2 oracle runs without a KV cache, so the only K/V token is
+    // the just-emitted one. With a single-token K, softmax over the score
+    // vector reduces to a single element ≡ 1.0 regardless of the score.
+    // The output therefore collapses to:
+    //
+    //   attn[h, :] = bf16(1.0) * v_full[h, :]
+    //              = v_raw[h // rep, :]      (already BF16-rounded F32)
+    //
+    // We still compute the QK score (skipped for the output) so the path
+    // exercises q_rot / k_rot loads — that's the slice of compute the
+    // future kv_len > 1 extension will reuse, with the softmax becoming
+    // non-trivial. For now the score is intentionally unused.
+    //
+    // Each block grabs one Q head, broadcasts the matching KV head's V row
+    // into workspace[ATTN + h*d : ...] and (when stage == 4) into output.
+    {
+        const int rep   = H / Hkv;
+        const float scale = rsqrtf(static_cast<float>(d));
+
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int hq = static_cast<int>(head_s);
+            if (hq >= H) break;
+
+            const int h_kv = hq / rep;
+
+            // Score (q · k) * scale — computed for path-coverage only at
+            // kv_len=1. Single-block reduction over head_dim=256.
+            float partial = 0.0f;
+            for (int i = tid; i < d; i += block_size) {
+                const float q = workspace[OFF_Q_ROT + hq   * d + i];
+                const float k = workspace[OFF_K_ROT + h_kv * d + i];
+                partial += q * k;
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            __shared__ float head_score;
+            if (tid == 0) {
+                head_score = shared_scratch[0] * scale;
+            }
+            __syncthreads();
+            (void)head_score;
+
+            // softmax([s]) = [1.0]; bf16(1.0 * v) = v. v_raw is already
+            // BF16-rounded F32 from Phase D so no extra rounding needed.
+            for (int i = tid; i < d; i += block_size) {
+                const float v = workspace[OFF_V_RAW + h_kv * d + i];
+                workspace[OFF_ATTN + hq * d + i] = v;
+                if (stage == 4) {
+                    output[hq * d + i] = static_cast<T>(v);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Stage 5 hooks in here in its own commit.
 }
 
 } // namespace qwen36_moe
