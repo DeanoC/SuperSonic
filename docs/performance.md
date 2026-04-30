@@ -7,6 +7,95 @@ a 16-token generation on the 6-token `"The quick brown fox jumps over"` prompt.
 If you reproduce these and get materially different results, please open an
 issue with your GPU arch, ROCm/CUDA versions, and the exact command line.
 
+## HIP — `gfx1100` (AMD Radeon RX 7900 XTX, 24 GiB)
+
+Discrete dGPU; 96 CUs, RDNA3 WMMA. The full quant matrix (BF16, INT4 GPTQ,
+FP8 runtime, FP8 KV cache) is supported across every shipping model on
+this arch. Measurements recorded 2026-04-30 at the
+[`gemma4-fp8-runtime`](https://github.com/DeanoC/SuperSonic/pull/51) merge,
+6-token prompt, 16-token generation, single sequence, `--batch-size 1`.
+Each cell is `ms/step` from the runner's `[result] ms_per_step=N` /
+`ms_per_tok=N` line after one warm-up run; reproduce with
+`tests/gfx1100/bench_matrix.sh`.
+
+| Model           | BF16  | INT4  | FP8r  | KV-FP8 |
+|-----------------|------:|------:|------:|-------:|
+| qwen3.5-0.8b    |   8   |  10   |  10   |   85¹  |
+| qwen3.5-2b      |  11   |  11   |  15   |  126¹  |
+| qwen3.5-4b      |  21   |  15   |  30   |  223¹  |
+| qwen3.5-9b      |  32   |  26   |  48   |  347¹  |
+| gemma4-e2b      |  33   |  36   |  40   |   33   |
+| gemma4-e4b      |  54   |  51   |  66   |   52   |
+| phi4-mini       |  38.5 |  40.2 |  45.9 |   78.0 |
+
+¹ Qwen 3.5 `--kv-fp8` falls back to a *replayed-prefill* decode path
+("`single-sequence CUDA KV-FP8 uses replayed GPU prefill for
+correctness`"). The decode kernel itself is fine; the slow column is
+the per-step prefill replay needed to keep the FP8 KV cache
+self-consistent. KV-FP8 on Qwen is currently a memory feature
+(headroom for longer contexts), not a throughput feature. Gemma 4 's
+`--kv-fp8` is wired into the persistent kernel directly and is
+~free vs BF16.
+
+### Translated to tokens/sec
+
+| Model           | BF16   | INT4   | FP8r   | KV-FP8 |
+|-----------------|-------:|-------:|-------:|-------:|
+| qwen3.5-0.8b    | 125.0  | 100.0  | 100.0  |  11.8  |
+| qwen3.5-2b      |  90.9  |  90.9  |  66.7  |   7.9  |
+| qwen3.5-4b      |  47.6  |  66.7  |  33.3  |   4.5  |
+| qwen3.5-9b      |  31.3  |  38.5  |  20.8  |   2.9  |
+| gemma4-e2b      |  30.3  |  27.8  |  25.0  |  30.3  |
+| gemma4-e4b      |  18.5  |  19.6  |  15.2  |  19.2  |
+| phi4-mini       |  26.0  |  24.9  |  21.8  |  12.8  |
+
+### Cross-row notes
+
+- **INT4 vs BF16** — INT4 wins on the larger Qwen variants
+  (`qwen3.5-4b`: 1.4×, `qwen3.5-9b`: 1.23×) because they're
+  memory-bandwidth-bound on 7900 XTX and INT4 halves the weight bytes
+  read per step. INT4 is roughly neutral or slightly slower on small
+  models (Qwen 0.8B/2B, Gemma E2B, Phi-4-mini) where the per-step
+  dequant overhead matches the bandwidth savings.
+- **FP8 runtime overhead** — FP8r runs 1.0–1.4× the BF16 ms/step on
+  every model. The slowdown is the LDS-LUT-driven per-element FP8
+  dequant in the matmul inner loops (`g4_fp8_dequant_weight_lut` /
+  `fp8_dequant_weight_lut`); on bandwidth-saturated configs this is
+  partly hidden by the 2× weight-bytes-saved, but on compute-tight
+  Qwen 0.8B / Gemma E2B the dequant cost wins. FP8 runtime is a
+  memory feature first (~half the weight footprint, see VRAM table
+  below) and a throughput feature only when paired with KV-FP8 on
+  Gemma 4 to free up KV headroom.
+- **`--fp8-runtime` cannot combine with `--int4`** on any model
+  (separate kernel families). Gemma 4 `--fp8-runtime` and `--kv-fp8`
+  additionally require `--batch-size=1` because the FP8 paths are
+  wired into the single-batch persistent decode kernel only; the
+  batched and INT4 Gemma kernels stay BF16-weights / BF16-KV.
+
+### VRAM footprint (gfx1100, weights+scratch only)
+
+Approximate steady-state device memory for the weights+scratch portion of
+the engine, before any KV cache. KV cache adds linearly with context
+length (`num_kv_heads × head_dim × max_t × 2 bytes/elem` BF16, halved
+under `--kv-fp8` plus a small per-(head, position) F32 scale overhead).
+
+| Model           | BF16    | INT4      | FP8r      |
+|-----------------|--------:|----------:|----------:|
+| qwen3.5-0.8b    |   2 GiB |  ~0.7 GiB |  ~1.2 GiB |
+| qwen3.5-2b      |   5 GiB |  ~1.9 GiB |  ~3.0 GiB |
+| qwen3.5-4b      |  10 GiB |  ~3.7 GiB |  ~6.0 GiB |
+| qwen3.5-9b      |  18 GiB |  ~6.7 GiB |  ~10.8 GiB|
+| gemma4-e2b      |  11 GiB |  ~4.1 GiB |  ~6.6 GiB |
+| gemma4-e4b      |  10 GiB |  ~3.7 GiB |  ~6.0 GiB |
+| phi4-mini       |   8 GiB |  ~3.0 GiB |  ~4.8 GiB |
+
+The `INT4` and `FP8r` columns are derived from the registry's
+BF16 `fixed_bytes` × the engine's quant scale factor (0.37× for INT4,
+0.6× for FP8 — see `crates/runner/src/main.rs` and
+`crates/runner/src/phi4_engine.rs`). The same scaling is applied to
+the VRAM admission preflight, so memory-constrained cards that pass
+preflight will fit at runtime.
+
 ## HIP — `gfx1150` (AMD Radeon 890M iGPU)
 
 16 CUs, 2.9 GHz core, shared with system memory. Measurements on
@@ -320,6 +409,17 @@ What still dominates:
 ## How to reproduce
 
 ```bash
+# HIP / gfx1100 — full quant matrix sweep
+cargo build --release --bin supersonic
+MODEL_DIR_08B=/path/to/Qwen3.5-0.8B \
+MODEL_DIR_2B=/path/to/Qwen3.5-2B \
+MODEL_DIR_4B=/path/to/Qwen3.5-4B \
+MODEL_DIR_9B=/path/to/Qwen3.5-9B \
+MODEL_DIR_GEMMA_E2B=/path/to/gemma-4-E2B \
+MODEL_DIR_GEMMA_E4B=/path/to/gemma-4-E4B \
+MODEL_DIR_PHI4=/path/to/Phi-4-mini-instruct \
+  tests/gfx1100/bench_matrix.sh
+
 # HIP / gfx1150
 cargo build --release --bin supersonic
 ./target/release/supersonic --model qwen3.5-0.8b \
