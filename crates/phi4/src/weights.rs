@@ -216,6 +216,15 @@ impl Phi4Weights {
         let mut int4_group_size: usize = 0;
         let mut is_fp8 = false;
         let mut fp8_block_size: usize = 0;
+        // Track FP8 completeness across the full bake. The kernel keys FP8
+        // dispatch off non-null scale pointers per projection, so a partial
+        // bake (some projections missing `*_scale_inv`) would silently send
+        // FP8-packed bytes through the BF16 matmul path → corrupt logits /
+        // OOB reads. We require all-or-nothing: 7 scales per layer (q, k,
+        // v, o, gate, up, down) × num_hidden_layers, or zero.
+        let mut fp8_scale_found: usize = 0;
+        let mut fp8_scale_missing: Vec<String> = Vec::new();
+        let expected_fp8_scales_per_layer: usize = 7;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for idx in 0..config.num_hidden_layers {
@@ -256,6 +265,21 @@ impl Phi4Weights {
             let gate_fp8_s = load_fp8_scale(&gate_name)?;
             let up_fp8_s = load_fp8_scale(&up_name)?;
             let down_fp8_s = load_fp8_scale(&down_name)?;
+            for (proj_name, scale_opt) in [
+                (&q_name, &q_fp8_s),
+                (&k_name, &k_fp8_s),
+                (&v_name, &v_fp8_s),
+                (&o_name, &o_fp8_s),
+                (&gate_name, &gate_fp8_s),
+                (&up_name, &up_fp8_s),
+                (&down_name, &down_fp8_s),
+            ] {
+                if scale_opt.is_some() {
+                    fp8_scale_found += 1;
+                } else {
+                    fp8_scale_missing.push(proj_name.clone());
+                }
+            }
 
             if !is_int4 {
                 if let Some(ref i4_scale) = q_i4s {
@@ -318,6 +342,24 @@ impl Phi4Weights {
                 up_proj_fp8_scale: up_fp8_s,
                 down_proj_fp8_scale: down_fp8_s,
             });
+        }
+
+        let expected_fp8_total = config.num_hidden_layers * expected_fp8_scales_per_layer;
+        if fp8_scale_found != 0 && fp8_scale_found != expected_fp8_total {
+            // Partial / mixed FP8 bake — refuse to load. Without all scales,
+            // the kernel's per-projection null-pointer fallback would dispatch
+            // BF16 matmul against FP8-packed bytes for the missing projections.
+            let sample: Vec<&String> = fp8_scale_missing.iter().take(5).collect();
+            let extra = if fp8_scale_missing.len() > 5 {
+                format!(" (and {} more)", fp8_scale_missing.len() - 5)
+            } else {
+                String::new()
+            };
+            return Err(model_store::Error::Other(format!(
+                "Phi-4 FP8 bake is incomplete: found {fp8_scale_found}/{expected_fp8_total} \
+                 *_scale_inv tensors. Missing examples: {sample:?}{extra}. \
+                 Re-bake with: python3 oracle/bake_fp8_phi4.py --model-dir <model-dir>",
+            )));
         }
 
         Ok(Self {
