@@ -1152,7 +1152,7 @@ mod tests {
     #[test]
     fn metal_rejects_nonzero_ordinal() {
         use_metal_backend();
-        let err = alloc(1, 16).expect_err("metal ordinal 1 should be rejected");
+        let err = alloc(1, 16, BufferKind::Persistent).expect_err("metal ordinal 1 should be rejected");
         assert!(
             err.to_string().contains("ordinal 0"),
             "unexpected error: {err}"
