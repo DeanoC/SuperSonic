@@ -45,12 +45,17 @@ Four backend surfaces are validated today:
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅¹ |      ✅     |   ✅   |
 | gemma4-e2b       |  ✅  |  ✅  |      —      |    —   |
-| gemma4-e4b       |  ✅  |  —²  |      —      |    —   |
-| phi4-mini        |  ✅  |  ✅  |      —      |    —   |
+| gemma4-e4b       |  ✅  |  ✅² |      —      |    —   |
+| phi4-mini        |  ✅  |  ✅  |     ✅³    |   ✅   |
 
 ¹ GPTQ calibration for 9B INT4 needs ≥24 GiB; consumers pull the released
   bake from GitHub releases. See [docs/bake-distribution.md](docs/bake-distribution.md).
-² Gemma E4B INT4 calibration is parked.
+² E4B INT4 runs through the primitive-chain decode path (~280 ms/step on
+  gfx1150 at the published gs=128 bake); the persistent megakernel path is
+  still parked pending a gs=64 calibration re-bake.
+³ Phi-4 FP8 runtime/KV are wired but the FP8 bake is not yet published to
+  the release; consumers re-bake locally via `oracle/bake_fp8_phi4.py`
+  (12s on a 5800X-class CPU + safetensors).
 
 DFlash speculative decode is available for `qwen3.5-9b` INT4 on HIP —
 see [docs/dflash.md](docs/dflash.md).
