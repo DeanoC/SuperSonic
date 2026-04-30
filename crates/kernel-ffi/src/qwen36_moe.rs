@@ -403,9 +403,9 @@ pub fn attn_step_launch(
             params.stage
         )));
     }
-    if params.stage > 2 {
+    if params.stage > 3 {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 stages 1-2 only)",
+            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 stages 1-3 only)",
             params.stage
         )));
     }
@@ -767,14 +767,25 @@ mod tests {
     }
 
     /// Returns workspace size sufficient for the largest staged
-    /// intermediate (currently stage 2: 2*H*d + 2*Hkv*d + H*d + Hkv*d F32).
-    /// Bumped by future stages as RoPE / attn buffers get added.
+    /// intermediate (currently stage 3: 4*H*d + 4*Hkv*d F32).
+    /// Bumped by future stages as attn / o_proj buffers get added.
     #[cfg(supersonic_backend_hip)]
     fn parity_workspace_floats(num_heads: i32, num_kv_heads: i32, head_dim: i32) -> usize {
         let h = num_heads as usize;
         let hkv = num_kv_heads as usize;
         let d = head_dim as usize;
-        2 * h * d + 2 * hkv * d + h * d + hkv * d
+        4 * h * d + 4 * hkv * d
+    }
+
+    /// Output buffer size sufficient for the largest staged intermediate.
+    /// Stage 3 publishes q_rot || k_rot, so the buffer must hold (H + Hkv)*d
+    /// BF16 elements; stages 1, 2, 4, 5 fit in a strict subset of that.
+    #[cfg(supersonic_backend_hip)]
+    fn parity_output_elems(num_heads: i32, num_kv_heads: i32, head_dim: i32) -> usize {
+        let h = num_heads as usize;
+        let hkv = num_kv_heads as usize;
+        let d = head_dim as usize;
+        h * d + hkv * d
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -826,7 +837,8 @@ mod tests {
         ).expect("upload q_norm_w");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[h_us * d_us],
+            ordinal, ScalarType::BF16,
+            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
         ).expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
             ordinal, ScalarType::F32,
@@ -869,10 +881,13 @@ mod tests {
         )
         .expect("attn_step_launch stage 1");
 
-        let got_bytes = output.to_host_bytes().expect("download output");
-        // BF16 ULP at magnitude 1 is ~7.8e-3; allow 4× that for matmul
-        // accumulation order drift across the 2048-wide reduction.
-        assert_parity("step1 q_normed", &got_bytes, &q_normed_expected_bytes, 0.04, 0.9999);
+        // Stage 1 publishes q_normed into the first H*d BF16 elements of
+        // the (now stage-3-sized) output buffer. Slice down to just those
+        // bytes for parity. BF16 ULP at magnitude 1 is ~7.8e-3; allow 4×
+        // that for matmul accumulation order drift over the 2048 reduction.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_bytes_full[..h_us * d_us * 2];
+        assert_parity("step1 q_normed", got_bytes, &q_normed_expected_bytes, 0.04, 0.9999);
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -939,7 +954,8 @@ mod tests {
         // Output is sized for the largest staged intermediate (H*d). Stage 2
         // writes Hkv*d BF16 elements at the start of the buffer.
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[h_us * d_us],
+            ordinal, ScalarType::BF16,
+            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
         ).expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
             ordinal, ScalarType::F32,
@@ -987,5 +1003,134 @@ mod tests {
         let got_bytes_full = output.to_host_bytes().expect("download output");
         let got_bytes = &got_bytes_full[..hkv_us * d_us * 2];
         assert_parity("step2 k_normed", got_bytes, &k_normed_expected_bytes, 0.04, 0.9999);
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_attn_step_3_qk_rot_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
+                 Generate at a non-zero position so RoPE is non-identity \
+                 (e.g. `python oracle/qwen36_moe_oracle.py --mode synthetic \
+                 --position 7 --out /tmp/qwen36_syn_pos7.json`)."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+        let cfg = &json["config"];
+
+        let position = json["position"].as_i64().unwrap_or(0) as i32;
+        if position == 0 {
+            // RoPE at position 0 is the identity rotation — the parity
+            // test would pass even with a no-op kernel, which defeats the
+            // purpose. Refuse and tell the caller how to fix it.
+            panic!(
+                "step3 RoPE parity requires position > 0, got 0. \
+                 Re-run the oracle with `--position 7` (or any non-zero value)."
+            );
+        }
+
+        let rotary_dim = cfg["rotary_dim"].as_i64().unwrap() as i32;
+        let rope_theta = cfg["rope_theta"].as_f64().unwrap() as f32;
+
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let q_proj_w_bytes = b64_decode(weights["q_proj_w"].as_str().unwrap());
+        let k_proj_w_bytes = b64_decode(weights["k_proj_w"].as_str().unwrap());
+        let v_proj_w_bytes = b64_decode(weights["v_proj_w"].as_str().unwrap());
+        let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
+        let k_norm_w_bytes = b64_decode(weights["k_norm_w"].as_str().unwrap());
+        let q_rot_expected_bytes = b64_decode(inters["q_rot"].as_str().unwrap());
+        let k_rot_expected_bytes = b64_decode(inters["k_rot"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let h_us = geom.num_heads as usize;
+        let hkv_us = geom.num_kv_heads as usize;
+        let d_us = geom.head_dim as usize;
+        assert_eq!(q_rot_expected_bytes.len(), h_us * d_us * 2);
+        assert_eq!(k_rot_expected_bytes.len(), hkv_us * d_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let q_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
+        ).expect("upload q_proj_w");
+        let k_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
+        ).expect("upload k_proj_w");
+        let v_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
+        ).expect("upload v_proj_w");
+        let q_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
+        ).expect("upload q_norm_w");
+        let k_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
+        ).expect("upload k_norm_w");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16,
+            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
+        ).expect("alloc output");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32,
+            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 3,
+            hidden: geom.hidden,
+            num_heads: geom.num_heads,
+            num_kv_heads: geom.num_kv_heads,
+            head_dim: geom.head_dim,
+            rotary_dim,
+            rope_theta,
+            rms_norm_eps: geom.rms_norm_eps,
+            position,
+        };
+        let weight_ptrs = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: k_proj_w.as_ptr(),
+            v_proj_w: v_proj_w.as_ptr(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: k_norm_w.as_ptr(),
+            o_proj_w: std::ptr::null(),
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("attn_step_launch stage 3");
+
+        // Output layout: [q_rot (H*d) | k_rot (Hkv*d)] in BF16.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let q_end = h_us * d_us * 2;
+        let k_end = q_end + hkv_us * d_us * 2;
+        assert_parity("step3 q_rot", &got_bytes_full[..q_end],
+                      &q_rot_expected_bytes, 0.04, 0.9999);
+        assert_parity("step3 k_rot", &got_bytes_full[q_end..k_end],
+                      &k_rot_expected_bytes, 0.04, 0.9999);
     }
 }

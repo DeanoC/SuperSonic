@@ -245,14 +245,16 @@ __global__ void qwen36_moe_descriptor_walk_stub(
 //                          RDNA3 → grid_barrier safe without coop launch)
 //
 //   workspace[F32], staged-attention scratch (offsets in F32 elements):
-//     Q_RAW    = 0                             [2*H*d]   q_proj output
-//     K_RAW    = 2*H*d                         [Hkv*d]   k_proj output
-//     V_RAW    = 2*H*d + Hkv*d                 [Hkv*d]   v_proj output
-//     Q_NORMED = 2*H*d + 2*Hkv*d               [H*d]     stage-1 result
-//     K_NORMED = 2*H*d + 2*Hkv*d + H*d         [Hkv*d]   stage-2 result
-//   …RoPE / attn slots (stages 3+) get appended in their own commits.
-//   Total stage-2 footprint: 2*H*d + 2*Hkv*d + H*d + Hkv*d F32 elements.
-//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 13,824 F32 = 54 KiB.
+//     Q_RAW    = 0                                [2*H*d]   q_proj output
+//     K_RAW    = 2*H*d                            [Hkv*d]   k_proj output
+//     V_RAW    = 2*H*d + Hkv*d                    [Hkv*d]   v_proj output
+//     Q_NORMED = 2*H*d + 2*Hkv*d                  [H*d]     stage-1 result
+//     K_NORMED = 2*H*d + 2*Hkv*d + H*d            [Hkv*d]   stage-2 result
+//     Q_ROT    = 2*H*d + 2*Hkv*d + H*d + Hkv*d    [H*d]     stage-3 result
+//     K_ROT    = 3*H*d + 2*Hkv*d + H*d + Hkv*d    [Hkv*d]   stage-3 result
+//   …attn slot (stage 4+) gets appended in its own commit.
+//   Total stage-3 footprint: 4*H*d + 4*Hkv*d F32 elements.
+//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 18,432 F32 = 72 KiB.
 //
 //   counters[0]: work-stealing index, reused across phases. Reset by
 //                grid_barrier_reset_counter at every phase boundary.
@@ -386,6 +388,8 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int OFF_V_RAW    = 2 * H * d + Hkv * d;
     const int OFF_Q_NORMED = 2 * H * d + 2 * Hkv * d;
     const int OFF_K_NORMED = 2 * H * d + 2 * Hkv * d + H * d;
+    const int OFF_Q_ROT    = 2 * H * d + 2 * Hkv * d + H * d + Hkv * d;
+    const int OFF_K_ROT    = 3 * H * d + 2 * Hkv * d + H * d + Hkv * d;
 
     // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
     // Each block grabs a head index, reduces across head_dim, writes BF16
@@ -531,9 +535,91 @@ __global__ void qwen36_moe_attn_step_kernel(
         }
     }
 
-    // Stages 3..5 hook in here in follow-up commits. Each starts with a
-    // grid_barrier_reset_counter and reuses `counters[0]` for its own
-    // work-stealing.
+    if (stage < 3) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase F: partial RoPE on Q and K ----------------------------------
+    //
+    // For each head, rotate the first `rotary_dim` channels using the
+    // half-pair convention from oracle/qwen36_moe_oracle.py:
+    //
+    //   for i in [0, half):
+    //     a, b = x[i], x[half + i]
+    //     freq = position * theta^(-i/half)
+    //     c = bf16(cos(freq))      s = bf16(sin(freq))
+    //     out[i]        = bf16(bf16(a*c) - bf16(b*s))
+    //     out[half + i] = bf16(bf16(b*c) + bf16(a*s))
+    //   for i in [rotary_dim, d): out[i] = x[i]    (pass-through)
+    //
+    // Each "BF16-round" mirrors the BF16 dtype boundary in PyTorch — the
+    // multiplication, the subtraction, and the cos/sin cast all happen in
+    // BF16 in the oracle. Skipping any of these RNE rounds drifts the test.
+    //
+    // Work units = H + Hkv (one per attention head, Q and K combined).
+    // Stage 3 publishes q_rot || k_rot to the host-visible output buffer:
+    //   output[0..H*d)         = q_rot (BF16)
+    //   output[H*d..H*d+Hkv*d) = k_rot (BF16)
+    {
+        const int half = rotary_dim / 2;
+        const float theta_log = logf(rope_theta);
+        const int total_heads = H + Hkv;
+
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int head_idx = static_cast<int>(head_s);
+            if (head_idx >= total_heads) break;
+
+            const bool is_k = head_idx >= H;
+            const int  h    = is_k ? (head_idx - H) : head_idx;
+            const int  src_off = is_k ? OFF_K_NORMED : OFF_Q_NORMED;
+            const int  dst_off = is_k ? OFF_K_ROT    : OFF_Q_ROT;
+            // q_rot lives at output[0..H*d), k_rot at output[H*d..H*d+Hkv*d).
+            const int  pub_off = head_idx * d;
+
+            // Rotated half-pairs.
+            for (int i = tid; i < half; i += block_size) {
+                const float a = workspace[src_off + h * d + i];
+                const float b = workspace[src_off + h * d + half + i];
+                // freq = position * theta^(-i/half) = position / theta^(i/half).
+                // Match PyTorch's `theta ** (i/half)` ≡ exp((i/half) * log(theta)).
+                const float exponent = (static_cast<float>(i) / static_cast<float>(half)) * theta_log;
+                const float inv_freq = expf(-exponent);
+                const float freq = static_cast<float>(position) * inv_freq;
+                const float c = bf16_round_rne_f32(cosf(freq));
+                const float s = bf16_round_rne_f32(sinf(freq));
+                const float ac = bf16_round_rne_f32(a * c);
+                const float bs = bf16_round_rne_f32(b * s);
+                const float bc = bf16_round_rne_f32(b * c);
+                const float as_ = bf16_round_rne_f32(a * s);
+                const float rot_a = bf16_round_rne_f32(ac - bs);
+                const float rot_b = bf16_round_rne_f32(bc + as_);
+                workspace[dst_off + h * d + i]        = rot_a;
+                workspace[dst_off + h * d + half + i] = rot_b;
+                if (stage == 3) {
+                    output[pub_off + i]        = static_cast<T>(rot_a);
+                    output[pub_off + half + i] = static_cast<T>(rot_b);
+                }
+            }
+
+            // Pass-through tail [rotary_dim, head_dim).
+            for (int i = rotary_dim + tid; i < d; i += block_size) {
+                const float x = workspace[src_off + h * d + i];
+                workspace[dst_off + h * d + i] = x;
+                if (stage == 3) {
+                    output[pub_off + i] = static_cast<T>(x);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Stages 4..5 hook in here in follow-up commits.
 }
 
 } // namespace qwen36_moe
