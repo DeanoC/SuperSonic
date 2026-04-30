@@ -22,7 +22,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
-use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc};
+use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4KVCacheFp8Desc};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
@@ -516,6 +516,24 @@ impl Gemma4Engine {
         device: usize,
         batch_size: usize,
     ) -> Result<Self> {
+        Self::load_with_options(model_dir, weight_prefix, max_t, device, batch_size, false)
+    }
+
+    /// Like `load_with_batch`, plus an explicit FP8 KV cache toggle. Set
+    /// `kv_fp8 = true` to allocate u8 K/V caches with per-(head, position)
+    /// F32 absmax scales — half the bytes of BF16 + ~0.4% scale overhead.
+    /// Currently only the single-batch persistent decode kernel routes
+    /// through the FP8 dequant path; pair this with `batch_size = 1` and
+    /// no-INT4 weights.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_options(
+        model_dir: &Path,
+        weight_prefix: &'static str,
+        max_t: usize,
+        device: usize,
+        batch_size: usize,
+        kv_fp8: bool,
+    ) -> Result<Self> {
         if batch_size == 0 {
             bail!("Gemma4Engine: batch_size must be >= 1");
         }
@@ -566,18 +584,42 @@ impl Gemma4Engine {
         // cache so decode steps are fully decoupled. Shared-KV layers within
         // a sequence still alias the source layer's buffer (handled below in
         // descriptor construction).
+        //
+        // Under --kv-fp8 the cache buffers are u8 (FP8-E4M3-FN bytes, 1 per
+        // element vs. 2 for BF16); a parallel set of F32 scale buffers
+        // `[num_kv_heads, max_t]` carries per-(head, position) absmax scales
+        // and is consumed by the kernel's A3/A4/A6 FP8 path.
+        let kv_dtype = if kv_fp8 { ScalarType::U8 } else { dtype };
         let mut k_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
         let mut v_caches: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
+        let mut kv_scale_k_buf: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
+        let mut kv_scale_v_buf: Vec<Vec<GpuBuffer>> = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
             let mut ks: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
             let mut vs: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            let mut sks: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
+            let mut svs: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
             for l in 0..num_layers {
                 let hd = layers[l].head_dim;
-                ks.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
-                vs.push(GpuBuffer::zeros(device, dtype, &[num_kv_heads, max_t, hd])?);
+                ks.push(GpuBuffer::zeros(device, kv_dtype, &[num_kv_heads, max_t, hd])?);
+                vs.push(GpuBuffer::zeros(device, kv_dtype, &[num_kv_heads, max_t, hd])?);
+                if kv_fp8 {
+                    sks.push(GpuBuffer::zeros(
+                        device,
+                        ScalarType::F32,
+                        &[num_kv_heads, max_t],
+                    )?);
+                    svs.push(GpuBuffer::zeros(
+                        device,
+                        ScalarType::F32,
+                        &[num_kv_heads, max_t],
+                    )?);
+                }
             }
             k_caches.push(ks);
             v_caches.push(vs);
+            kv_scale_k_buf.push(sks);
+            kv_scale_v_buf.push(svs);
         }
 
         let sliding_head_dim = tcfg.head_dim_for(AttnKind::Sliding);
@@ -690,6 +732,42 @@ impl Gemma4Engine {
             let _ = seq; // kept for clarity at the outer index
         }
 
+        // Per-seq KV-FP8 descriptor array — `[num_layers]` of
+        // `Gemma4KVCacheFp8Desc` on GPU. Shared-KV layers alias the source
+        // layer's scale buffers (matching how kv_cache_k/v aliases work in
+        // the main desc), so the kernel's read sites never need to look up
+        // the mapping.
+        let kv_fp8_descs_gpu: Option<Vec<GpuBuffer>> = if kv_fp8 {
+            let mut bufs: Vec<GpuBuffer> = Vec::with_capacity(batch_size);
+            for seq in 0..batch_size {
+                let mut layer_descs: Vec<Gemma4KVCacheFp8Desc> =
+                    Vec::with_capacity(num_layers);
+                for l in 0..num_layers {
+                    let w = &layers[l];
+                    let src_idx = if w.shared_kv { w.kv_source } else { l };
+                    layer_descs.push(Gemma4KVCacheFp8Desc {
+                        kv_scale_k: kv_scale_k_buf[seq][src_idx].as_ptr() as *mut c_void,
+                        kv_scale_v: kv_scale_v_buf[seq][src_idx].as_ptr() as *mut c_void,
+                    });
+                }
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        layer_descs.as_ptr() as *const u8,
+                        layer_descs.len() * std::mem::size_of::<Gemma4KVCacheFp8Desc>(),
+                    )
+                };
+                bufs.push(GpuBuffer::from_host_bytes(
+                    device,
+                    ScalarType::U8,
+                    &[bytes.len()],
+                    bytes,
+                )?);
+            }
+            Some(bufs)
+        } else {
+            None
+        };
+
         let ple_hidden = tcfg.hidden_size_per_layer_input;
         let max_intermediate = (0..num_layers)
             .map(|l| g4_spec::mlp_intermediate(&tcfg, l))
@@ -782,9 +860,9 @@ impl Gemma4Engine {
             mega_barrier_counter,
             mega_barrier_flag,
             counter,
-            kv_scale_k: None,
-            kv_scale_v: None,
-            kv_fp8_descs_gpu: None,
+            kv_scale_k: if kv_fp8 { Some(kv_scale_k_buf) } else { None },
+            kv_scale_v: if kv_fp8 { Some(kv_scale_v_buf) } else { None },
+            kv_fp8_descs_gpu,
         })
     }
 
@@ -891,6 +969,32 @@ impl Gemma4Engine {
         }
         if seq_len > self.max_t {
             bail!("prefill: prompt_len {seq_len} > max_t {}", self.max_t);
+        }
+        // Under --kv-fp8 the K/V cache buffers are u8 (FP8-E4M3), so the
+        // BF16-typed prefill primitive chain (`kv_append_prefill`,
+        // `attn_prefill`, `copy_kv_slots_range`) can't write into them
+        // correctly. Route prefill through the same persistent decode
+        // kernel that decode uses — one call per prompt token. Slower than
+        // batched prefill but the FP8 path is only wired into the
+        // single-batch persistent kernel today, so this stays consistent
+        // with the kernel's contract.
+        //
+        // `capture` (per-layer activation capture for diagnostic tooling)
+        // is intentionally rejected here: the per-token persistent decode
+        // path doesn't expose the prefill primitive intermediates the
+        // capture struct needs.
+        if self.kv_fp8_descs_gpu.is_some() {
+            if capture {
+                bail!(
+                    "Gemma 4 --kv-fp8 prefill cannot also capture per-layer \
+                     activations (no FP8-aware capture path yet)"
+                );
+            }
+            let mut last_logits: Vec<f32> = Vec::new();
+            for (pos, &tok) in prompt_token_ids.iter().enumerate() {
+                last_logits = self.decode_step_seq(seq_idx, tok, pos)?;
+            }
+            return Ok((last_logits, None));
         }
         let device = self.device;
         let dtype = ScalarType::BF16;
