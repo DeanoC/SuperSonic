@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub use gpu_hal::{Backend, MemoryArchitecture};
+pub use gpu_hal::{AllocStrategy, Backend, BufferPolicy, MemoryArchitecture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
@@ -149,32 +149,56 @@ impl fmt::Display for GpuArch {
 /// Per-arch policy bundle. Returned by [`ArchProfile::for_arch`] — one source
 /// of truth for "what does this arch look like" so registry entries don't
 /// have to restate it per-model.
+///
+/// `memory` describes the physical wiring (Discrete dGPU vs Unified APU)
+/// and is used today only for VRAM-budget reporting. `buffer_policy` maps
+/// caller-side `BufferKind` intent to the `AllocStrategy` `gpu-hal` should
+/// use — see `docs/gfx1150-l2-bypass.md` for why this isn't a single
+/// global toggle.
 #[derive(Debug, Clone, Copy)]
 pub struct ArchProfile {
     pub memory: MemoryArchitecture,
+    pub buffer_policy: BufferPolicy,
 }
 
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
-        // gfx1150 (RDNA3.5 APU) is structurally unified-memory, but the
-        // `hipHostMalloc(MAPPED) + hipHostGetDevicePointer` path used by
-        // gpu-hal's Unified branch currently regresses ~2.2x on Qwen3.5-0.8B
-        // and ~1.5x on Gemma4-E2B vs the classic `hipMalloc` path on this
-        // arch (measured 2026-04-30, peak clocks, alternated A/B). Root
-        // cause appears to be cache-attr / page-walk differences between
-        // host-mapped and device-allocated pages — not coherence (already
-        // dropped) and not the host-vs-device pointer (already fixed). A
-        // proper perf dive with `rocprof` is needed to pin it down.
-        // The mapping below is left structurally correct; the actual
-        // allocation regression is a known RDNA3.5 issue, not a design
-        // flaw in `MemoryArchitecture::Unified`. AppleM4 and any future
-        // unified-memory arch should still benefit.
         let memory = match arch {
             GpuArch::Gfx1100 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
             GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
             GpuArch::Unknown(_) => MemoryArchitecture::Discrete,
         };
-        Self { memory }
+        // Per-arch (BufferKind → AllocStrategy) table. `Persistent` always
+        // wants GPU-cacheable memory; `Scratch` can opt into host-mapped on
+        // platforms where the H2D copy is the bottleneck and the L2 reuse
+        // loss doesn't matter.
+        //
+        // gfx1150 (RDNA3.5 APU) is the only platform today where the
+        // host-mapped path is even useful for `Scratch`: the Phoenix2/890M
+        // GPU bypasses L2 on `hipHostMalloc(MAPPED)` allocations (see
+        // microbench at tests/gfx1150/membench_l2_bypass.hip), so we keep
+        // `Persistent` on `Default` and only opt `Scratch` into HostMapped.
+        //
+        // Apple silicon is "unified" from a VRAM-budget standpoint, but
+        // Metal owns its own allocator and the HIP `AllocStrategy` enum
+        // doesn't apply — both kinds map to `Default`.
+        //
+        // RDNA4 laptops (whenever they show up) are unmeasured; default to
+        // `Default/Default` and re-test before flipping.
+        let buffer_policy = match arch {
+            GpuArch::Gfx1150 => BufferPolicy {
+                persistent: AllocStrategy::Default,
+                scratch: AllocStrategy::HostMapped,
+            },
+            // Discrete dGPUs have no host-mapped path benefit; CUDA path
+            // doesn't implement HostMapped at all today; Metal owns its
+            // own backing memory model.
+            _ => BufferPolicy::all_default(),
+        };
+        Self {
+            memory,
+            buffer_policy,
+        }
     }
 }
 

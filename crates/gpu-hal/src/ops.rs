@@ -7,7 +7,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use crate::backend::{
-    current_backend, current_memory_architecture, Backend, DeviceInfo, MemoryArchitecture,
+    current_backend, current_strategy_for, AllocStrategy, Backend, BufferKind, DeviceInfo,
 };
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
@@ -320,36 +320,36 @@ pub(crate) enum AllocatorKind {
 }
 
 /// Allocate `len_bytes` of device-addressable memory, returning a non-null
-/// pointer plus the allocator kind that produced it. On HIP arches with
-/// `MemoryArchitecture::Unified` (gfx1150 APU), the allocation comes out of
-/// system RAM via `hipHostMalloc(MAPPED)` so host and device see the same
-/// physical bytes; the device-side pointer is obtained via
-/// `hipHostGetDevicePointer` per HIP API contract.
+/// pointer plus the allocator kind that produced it. The active
+/// `BufferPolicy` resolves the supplied `BufferKind` to an `AllocStrategy`:
 ///
-/// **Known regression on gfx1150 (RDNA3.5)**: the `hipHostMalloc(MAPPED) +
-/// hipHostGetDevicePointer` path runs ~2.2x slower than `hipMalloc` for
-/// bandwidth-bound decode (measured 2026-04-30 on Qwen3.5-0.8B INT4 at
-/// peak clocks). Root cause is *not* coherence (already dropped) or the
-/// host-vs-device pointer (correct now); appears to be cache-attr /
-/// page-walk differences in how RDNA3.5 maps host-allocated memory. A
-/// `rocprof` perf dive is needed to pin it down. The split paths are
-/// retained because the design is sound for genuinely unified-memory
-/// arches (Apple silicon); the gfx1150 mapping in `ArchProfile::for_arch`
-/// will be revisited once the perf dive completes.
+/// - `AllocStrategy::Default` → `hipMalloc` / `cudaMalloc` /
+///   `supersonic_metal_alloc`. Device-resident, GPU-cacheable, classic.
+/// - `AllocStrategy::HostMapped` (HIP only) → `hipHostMalloc(MAPPED) +
+///   hipHostGetDevicePointer`. System-RAM-resident, zero-copy from host,
+///   but **bypasses GPU L2 on RDNA3.5 APUs** — only choose this for
+///   one-shot scratch buffers with no cache reuse. See
+///   `docs/gfx1150-l2-bypass.md` for the measurement.
+///
+/// Default policy is `{Persistent: Default, Scratch: Default}` until
+/// startup wiring installs the per-arch table; this preserves classic
+/// alloc behavior for any code path that runs early.
 pub(crate) fn alloc(
     ordinal: usize,
     len_bytes: usize,
+    kind: BufferKind,
 ) -> Result<(NonNull<c_void>, AllocatorKind)> {
     if len_bytes == 0 {
         return Err(GpuError::InvalidArg("allocation size must be > 0".into()));
     }
+    let strategy = current_strategy_for(kind);
     hal_profile_time("alloc", len_bytes, || {
         let backend = current_backend();
         with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
                 #[cfg(supersonic_backend_hip)]
                 unsafe {
-                    if current_memory_architecture() == MemoryArchitecture::Unified {
+                    if strategy == AllocStrategy::HostMapped {
                         let mut host_ptr = std::ptr::null_mut();
                         let status =
                             hipHostMalloc(&mut host_ptr, len_bytes, HIP_HOST_MALLOC_MAPPED);
@@ -560,10 +560,11 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
 pub(crate) fn alloc_zeros(
     ordinal: usize,
     len_bytes: usize,
+    kind: BufferKind,
 ) -> Result<(NonNull<c_void>, AllocatorKind)> {
-    let (ptr, kind) = alloc(ordinal, len_bytes)?;
+    let (ptr, allocator) = alloc(ordinal, len_bytes, kind)?;
     memset_zeros(ordinal, ptr.as_ptr(), len_bytes)?;
-    Ok((ptr, kind))
+    Ok((ptr, allocator))
 }
 
 /// Free a buffer allocated by [`alloc`]. Dispatches based on the recorded
@@ -1151,7 +1152,7 @@ mod tests {
     #[test]
     fn metal_rejects_nonzero_ordinal() {
         use_metal_backend();
-        let err = alloc(1, 16).expect_err("metal ordinal 1 should be rejected");
+        let err = alloc(1, 16, BufferKind::Persistent).expect_err("metal ordinal 1 should be rejected");
         assert!(
             err.to_string().contains("ordinal 0"),
             "unexpected error: {err}"

@@ -1133,21 +1133,28 @@ fn main() -> Result<()> {
         }
     };
 
-    // Install the memory architecture so gpu_hal::alloc routes correctly.
-    // On Unified arches (gfx1150 APU), HIP allocations come out of system
-    // RAM via hipHostMalloc(MAPPED) + hipHostGetDevicePointer so host and
-    // device share the same physical pages with no coherence-protocol cost.
+    // Install per-arch policy so gpu_hal::alloc dispatches correctly.
+    // `MemoryArchitecture` is informational (used downstream for VRAM
+    // budgeting on APUs); `BufferPolicy` maps caller-side `BufferKind`
+    // intent to the actual `AllocStrategy`. Persistent always uses the
+    // classic device allocator (GPU-cacheable); Scratch may opt into
+    // host-mapped on arches where that's a win — today only gfx1150.
     // Must be set before any GpuBuffer::alloc, which starts during weight
     // loading below.
     let arch_profile = registry::ArchProfile::for_arch(&entry.arch);
     gpu_hal::set_memory_architecture(arch_profile.memory);
-    eprintln!(
-        "[gpu] memory_architecture={:?} (allocator: {})",
-        arch_profile.memory,
-        match arch_profile.memory {
-            gpu_hal::MemoryArchitecture::Discrete => "hipMalloc / cudaMalloc",
-            gpu_hal::MemoryArchitecture::Unified => "hipHostMalloc(MAPPED) + GetDevicePointer",
+    gpu_hal::set_buffer_policy(arch_profile.buffer_policy);
+    fn strategy_label(s: gpu_hal::AllocStrategy) -> &'static str {
+        match s {
+            gpu_hal::AllocStrategy::Default => "hipMalloc / cudaMalloc / metal",
+            gpu_hal::AllocStrategy::HostMapped => "hipHostMalloc(MAPPED) + GetDevicePointer",
         }
+    }
+    eprintln!(
+        "[gpu] memory={:?}, buffer_policy: persistent={} scratch={}",
+        arch_profile.memory,
+        strategy_label(arch_profile.buffer_policy.persistent),
+        strategy_label(arch_profile.buffer_policy.scratch),
     );
 
     // DFlash validation runs BEFORE the family dispatch so a misconfig on

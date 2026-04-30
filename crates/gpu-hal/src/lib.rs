@@ -11,8 +11,10 @@ mod ops;
 mod scalar_type;
 
 pub use backend::{
-    compiled_backends, current_backend, current_memory_architecture, is_backend_compiled,
-    set_backend, set_memory_architecture, Backend, DeviceInfo, MemoryArchitecture,
+    compiled_backends, current_backend, current_buffer_policy, current_memory_architecture,
+    current_strategy_for, is_backend_compiled, set_backend, set_buffer_policy,
+    set_memory_architecture, AllocStrategy, Backend, BufferKind, BufferPolicy, DeviceInfo,
+    MemoryArchitecture,
 };
 pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::GpuError;

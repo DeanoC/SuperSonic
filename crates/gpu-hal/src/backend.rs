@@ -84,8 +84,100 @@ impl MemoryArchitecture {
     }
 }
 
+/// Caller intent passed to `GpuBuffer::*_with_kind` constructors.
+///
+/// `Persistent` covers anything the GPU re-reads across kernel launches —
+/// weights, KV cache, activations, layer descriptor arrays, etc. These need
+/// GPU L2 cache to engage; the active `BufferPolicy` resolves them to a
+/// strategy that preserves cacheability (always `Default` today, on every
+/// platform).
+///
+/// `Scratch` covers one-shot staging memory the GPU touches once and
+/// discards. On platforms where the GPU genuinely caches host-mapped memory
+/// (Apple silicon, possibly future RDNA4 laptops), the policy may map both
+/// kinds to the same strategy. On gfx1150 (RDNA3.5 APU), `Scratch` maps to
+/// `HostMapped` to skip the H2D copy — the L2 bypass cost doesn't matter
+/// when there's no reuse to lose. See `docs/gfx1150-l2-bypass.md`.
+///
+/// Default for any caller that doesn't care: `Persistent`. Mis-tagging a
+/// re-read buffer as `Scratch` is a perf foot-gun on gfx1150 and a no-op
+/// elsewhere; mis-tagging a write-once buffer as `Persistent` is correct
+/// but slightly wasteful.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BufferKind {
+    #[default]
+    Persistent,
+    Scratch,
+}
+
+/// Mechanism a `BufferPolicy` resolves a `BufferKind` to.
+///
+/// `Default` is always-safe: classic `hipMalloc` / `cudaMalloc` / metal
+/// device memory. `HostMapped` is HIP-only and means
+/// `hipHostMalloc(MAPPED) + hipHostGetDevicePointer` — saves the H2D copy
+/// on APUs but bypasses GPU L2 on RDNA3.5 (see investigation doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AllocStrategy {
+    #[default]
+    Default,
+    HostMapped,
+}
+
+impl AllocStrategy {
+    fn code(self) -> u8 {
+        match self {
+            Self::Default => 1,
+            Self::HostMapped => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            2 => Self::HostMapped,
+            // 0 (unset) and 1 both map to Default. Preserves classic alloc
+            // behavior for any path that runs before startup wiring.
+            _ => Self::Default,
+        }
+    }
+}
+
+/// Per-platform table mapping `BufferKind` to `AllocStrategy`.
+///
+/// Owned by the runner registry's `ArchProfile` and installed once at
+/// startup via `set_buffer_policy`. Default is `{Default, Default}` — every
+/// kind routes through the classic allocator. Platforms where a non-default
+/// strategy actually wins flip the relevant entry.
+///
+/// Today's table:
+///   - gfx1150 (RDNA3.5 APU)            : `{Persistent: Default, Scratch: HostMapped}`
+///   - gfx1100 (RDNA3 dGPU), sm86       : `{Default, Default}` — no host-mapped path benefit
+///   - apple-m4 (Metal)                 : `{Default, Default}` — Metal owns the unified-memory wiring; HIP enums don't apply
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BufferPolicy {
+    pub persistent: AllocStrategy,
+    pub scratch: AllocStrategy,
+}
+
+impl BufferPolicy {
+    pub const fn all_default() -> Self {
+        Self {
+            persistent: AllocStrategy::Default,
+            scratch: AllocStrategy::Default,
+        }
+    }
+
+    pub fn strategy_for(self, kind: BufferKind) -> AllocStrategy {
+        match kind {
+            BufferKind::Persistent => self.persistent,
+            BufferKind::Scratch => self.scratch,
+        }
+    }
+}
+
 static DEFAULT_BACKEND: AtomicU8 = AtomicU8::new(0);
 static DEFAULT_MEMORY_ARCHITECTURE: AtomicU8 = AtomicU8::new(0);
+static POLICY_PERSISTENT: AtomicU8 = AtomicU8::new(0);
+static POLICY_SCRATCH: AtomicU8 = AtomicU8::new(0);
 
 pub fn compiled_backends() -> Vec<Backend> {
     let mut backends = Vec::new();
@@ -127,4 +219,26 @@ pub fn set_memory_architecture(arch: MemoryArchitecture) {
 /// for any code path that runs before startup wiring.
 pub fn current_memory_architecture() -> MemoryArchitecture {
     MemoryArchitecture::from_code(DEFAULT_MEMORY_ARCHITECTURE.load(Ordering::Relaxed))
+}
+
+/// Install the active `BufferPolicy`. Called once at startup from the runner
+/// after `ArchProfile::for_arch(...)` has resolved the per-arch table.
+pub fn set_buffer_policy(policy: BufferPolicy) {
+    POLICY_PERSISTENT.store(policy.persistent.code(), Ordering::Relaxed);
+    POLICY_SCRATCH.store(policy.scratch.code(), Ordering::Relaxed);
+}
+
+/// Read the active `BufferPolicy`. Defaults to `BufferPolicy::all_default()`
+/// (every kind → `Default`) until `set_buffer_policy` has been called.
+pub fn current_buffer_policy() -> BufferPolicy {
+    BufferPolicy {
+        persistent: AllocStrategy::from_code(POLICY_PERSISTENT.load(Ordering::Relaxed)),
+        scratch: AllocStrategy::from_code(POLICY_SCRATCH.load(Ordering::Relaxed)),
+    }
+}
+
+/// Resolve a `BufferKind` to its `AllocStrategy` using the currently
+/// installed policy. Convenience for hot-path callers in `ops::alloc`.
+pub fn current_strategy_for(kind: BufferKind) -> AllocStrategy {
+    current_buffer_policy().strategy_for(kind)
 }
