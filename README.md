@@ -23,18 +23,18 @@ Four backend surfaces are validated today:
 | qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
-| gemma4-e2b       |  ✅  |  ✅  |      —      |   ✅²  |
-| gemma4-e4b       |  ✅  |  ✅¹ |      —      |   ✅²  |
+| gemma4-e2b       |  ✅  |  ✅  |     ✅²    |   ✅²  |
+| gemma4-e4b       |  ✅  |  ✅¹ |     ✅²    |   ✅²  |
 | phi4-mini        |  ✅  |  ✅  |      ✅     |   ✅   |
 
 ¹ Gemma E4B INT4 needs `--group-size 64` at calibration time (the default
   128 produces gibberish — see fix in `oracle/bake_all.sh`). The published
   release bake is the gs=64 version; consumers fetch it automatically.
-² Gemma 4 `--kv-fp8` is wired into the single-batch persistent decode
-  kernel only — it requires `--batch-size=1` and cannot combine with
-  `--int4` (the INT4 kernel doesn't yet route the FP8-KV path). Prefill
-  for FP8-KV runs per-token through the same persistent kernel rather
-  than the BF16 prefill primitive chain.
+² Gemma 4 `--kv-fp8` and `--fp8-runtime` are wired into the single-batch
+  persistent decode kernel only — both require `--batch-size=1` and
+  cannot combine with `--int4` (the INT4 kernel doesn't yet route the
+  FP8 paths). Prefill under either FP8 mode runs per-token through the
+  same persistent kernel rather than the BF16 prefill primitive chain.
 
 ### HIP on `gfx1150`
 

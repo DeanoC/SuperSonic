@@ -22,7 +22,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
-use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4KVCacheFp8Desc};
+use kernel_ffi::gemma4::{
+    Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4FP8ScaleDesc, Gemma4KVCacheFp8Desc,
+};
 use memmap2::Mmap;
 use safetensors::SafeTensors;
 
@@ -343,10 +345,25 @@ struct LayerWeights {
     per_layer_input_gate_w: GpuBuffer,
     per_layer_projection_w: GpuBuffer,
     post_per_layer_input_norm_w: GpuBuffer,
+
+    // Per-block FP8 scale_inv tensors. None on BF16 layers; populated when
+    // the engine loaded this layer from a v2-fp8 bake. Each is BF16
+    // [rows/block, cols/block] matching the kernel's expected layout for
+    // `g4_fp8_dequant_weight_lut`.
+    q_proj_fp8_scale: Option<GpuBuffer>,
+    k_proj_fp8_scale: Option<GpuBuffer>,
+    v_proj_fp8_scale: Option<GpuBuffer>,
+    o_proj_fp8_scale: Option<GpuBuffer>,
+    gate_proj_fp8_scale: Option<GpuBuffer>,
+    up_proj_fp8_scale: Option<GpuBuffer>,
+    down_proj_fp8_scale: Option<GpuBuffer>,
+    per_layer_input_gate_fp8_scale: Option<GpuBuffer>,
+    per_layer_projection_fp8_scale: Option<GpuBuffer>,
 }
 
 fn load_layer_weights(
     loader: &UnbakedLoader,
+    fp8_store: Option<&model_store::BakedStore>,
     device: usize,
     tcfg: &TextConfig,
     weight_prefix: &str,
@@ -370,6 +387,27 @@ fn load_layer_weights(
             .ok_or_else(|| anyhow!("no tensor spec matching *.{short}"))
     };
 
+    // Helper: load a quantizable projection. Under `fp8_store`, returns
+    // (FP8 byte buffer, Some(scale_inv buffer)); otherwise returns the
+    // raw BF16 buffer with no scale. This is the key invariant for the
+    // VRAM admission match — under `--fp8-runtime` we MUST NOT first
+    // allocate the BF16 weights and then swap, because preflight has
+    // already lowered the budget to FP8-scaled.
+    let load_proj = |name: &str| -> Result<(GpuBuffer, Option<GpuBuffer>)> {
+        if let Some(store) = fp8_store {
+            let w = store
+                .load_to_gpu(name, device)
+                .map_err(|e| anyhow!("load FP8 weight {name}: {e}"))?;
+            let scale_name = format!("{name}_scale_inv");
+            let s = store
+                .load_to_gpu(&scale_name, device)
+                .map_err(|e| anyhow!("load FP8 scale {scale_name}: {e}"))?;
+            Ok((w, Some(s)))
+        } else {
+            Ok((loader.load_bf16_to_gpu(device, name)?, None))
+        }
+    };
+
     let layer_scalar_value: f32 = {
         let (shape, bytes) = loader.tensor_bytes(&want("layer_scalar")?)?;
         if shape != [1] {
@@ -378,14 +416,25 @@ fn load_layer_weights(
         bf16_bytes_to_f32(bytes)[0]
     };
 
-    let (k_proj, v_proj, k_norm) = if shared_kv {
-        (None, None, None)
+    let (q_proj, q_proj_fp8_scale) = load_proj(&want("self_attn.q_proj.weight")?)?;
+    let (o_proj, o_proj_fp8_scale) = load_proj(&want("self_attn.o_proj.weight")?)?;
+    let (gate_proj, gate_proj_fp8_scale) = load_proj(&want("mlp.gate_proj.weight")?)?;
+    let (up_proj, up_proj_fp8_scale) = load_proj(&want("mlp.up_proj.weight")?)?;
+    let (down_proj, down_proj_fp8_scale) = load_proj(&want("mlp.down_proj.weight")?)?;
+    let (per_layer_input_gate_w, per_layer_input_gate_fp8_scale) =
+        load_proj(&want("per_layer_input_gate.weight")?)?;
+    let (per_layer_projection_w, per_layer_projection_fp8_scale) =
+        load_proj(&want("per_layer_projection.weight")?)?;
+
+    let (k_proj, v_proj, k_norm, k_proj_fp8_scale, v_proj_fp8_scale) = if shared_kv {
+        (None, None, None, None, None)
     } else {
-        (
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.v_proj.weight")?)?),
-            Some(loader.load_bf16_to_gpu(device, &want("self_attn.k_norm.weight")?)?),
-        )
+        let (kp, kps) = load_proj(&want("self_attn.k_proj.weight")?)?;
+        let (vp, vps) = load_proj(&want("self_attn.v_proj.weight")?)?;
+        // k_norm is BF16 in both modes (it's a [head_dim] vector, not a
+        // matmul-input projection — not quantized in the bake).
+        let kn = loader.load_bf16_to_gpu(device, &want("self_attn.k_norm.weight")?)?;
+        (Some(kp), Some(vp), Some(kn), kps, vps)
     };
 
     Ok(LayerWeights {
@@ -395,28 +444,61 @@ fn load_layer_weights(
         shared_kv,
         kv_source,
         layer_scalar: layer_scalar_value,
+        // Norms / scalars are unquantized in the FP8 bake — always BF16.
         input_norm: loader.load_bf16_to_gpu(device, &want("input_layernorm.weight")?)?,
-        q_proj: loader.load_bf16_to_gpu(device, &want("self_attn.q_proj.weight")?)?,
+        q_proj,
         q_norm: loader.load_bf16_to_gpu(device, &want("self_attn.q_norm.weight")?)?,
         k_proj,
         v_proj,
         k_norm,
-        o_proj: loader.load_bf16_to_gpu(device, &want("self_attn.o_proj.weight")?)?,
+        o_proj,
         post_attn_norm: loader
             .load_bf16_to_gpu(device, &want("post_attention_layernorm.weight")?)?,
         pre_ff_norm: loader.load_bf16_to_gpu(device, &want("pre_feedforward_layernorm.weight")?)?,
         post_ff_norm: loader
             .load_bf16_to_gpu(device, &want("post_feedforward_layernorm.weight")?)?,
-        gate_proj: loader.load_bf16_to_gpu(device, &want("mlp.gate_proj.weight")?)?,
-        up_proj: loader.load_bf16_to_gpu(device, &want("mlp.up_proj.weight")?)?,
-        down_proj: loader.load_bf16_to_gpu(device, &want("mlp.down_proj.weight")?)?,
-        per_layer_input_gate_w: loader
-            .load_bf16_to_gpu(device, &want("per_layer_input_gate.weight")?)?,
-        per_layer_projection_w: loader
-            .load_bf16_to_gpu(device, &want("per_layer_projection.weight")?)?,
+        gate_proj,
+        up_proj,
+        down_proj,
+        per_layer_input_gate_w,
+        per_layer_projection_w,
         post_per_layer_input_norm_w: loader
             .load_bf16_to_gpu(device, &want("post_per_layer_input_norm.weight")?)?,
+        q_proj_fp8_scale,
+        k_proj_fp8_scale,
+        v_proj_fp8_scale,
+        o_proj_fp8_scale,
+        gate_proj_fp8_scale,
+        up_proj_fp8_scale,
+        down_proj_fp8_scale,
+        per_layer_input_gate_fp8_scale,
+        per_layer_projection_fp8_scale,
     })
+}
+
+/// Infer the per-block FP8 quantization tile dimension from the shape
+/// of any q_proj scale tensor (`weight_cols / scale_cols`). Same value
+/// across all projections in a bake (bake_fp8_gemma4.py uses 128).
+fn infer_fp8_block_size(
+    store: &model_store::BakedStore,
+    weight_prefix: &str,
+) -> Result<usize> {
+    let q_name = format!("{weight_prefix}.layers.0.self_attn.q_proj.weight");
+    let scale_name = format!("{q_name}_scale_inv");
+    let w_shape = store
+        .shape(&q_name)
+        .ok_or_else(|| anyhow!("FP8 bake missing {q_name}"))?;
+    let s_shape = store
+        .shape(&scale_name)
+        .ok_or_else(|| anyhow!("FP8 bake missing {scale_name}"))?;
+    if w_shape.len() != 2 || s_shape.len() != 2 {
+        bail!(
+            "FP8 bake q_proj shapes not 2D: weight {:?}, scale {:?}",
+            w_shape,
+            s_shape
+        );
+    }
+    Ok(w_shape[1] / s_shape[1])
 }
 
 pub struct Gemma4Engine {
@@ -540,6 +622,24 @@ impl Gemma4Engine {
         batch_size: usize,
         kv_fp8: bool,
     ) -> Result<Self> {
+        Self::load_with_quant(model_dir, weight_prefix, max_t, device, batch_size, kv_fp8, false)
+    }
+
+    /// `load_with_options` plus an explicit `--fp8-runtime` toggle. Set
+    /// `fp8_runtime = true` to load the v2-fp8 baked package (produced by
+    /// `oracle/bake_fp8_gemma4.py`); the engine swaps each layer's projection
+    /// BF16 buffers with their FP8 byte counterparts and uploads the
+    /// per-layer `Gemma4FP8ScaleDesc` array consumed by the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_with_quant(
+        model_dir: &Path,
+        weight_prefix: &'static str,
+        max_t: usize,
+        device: usize,
+        batch_size: usize,
+        kv_fp8: bool,
+        fp8_runtime: bool,
+    ) -> Result<Self> {
         if batch_size == 0 {
             bail!("Gemma4Engine: batch_size must be >= 1");
         }
@@ -548,6 +648,27 @@ impl Gemma4Engine {
                 "Gemma4Engine: batch_size {} > MAX_BATCH_SIZE {}",
                 batch_size,
                 kernel_ffi::MAX_BATCH_SIZE
+            );
+        }
+        // Engine-level FP8 guards. The CLI in `run_gemma4` rejects these
+        // combos with explanatory messages, but other callers of the
+        // public API (server crate, validators, integration tests) bypass
+        // that guard. The batched persistent-decode kernel has no FP8
+        // scale descriptor parameter, so running it with FP8 byte buffers
+        // would silently dispatch BF16 matmul against FP8-packed weights
+        // / KV bytes — corrupt logits, possible OOB reads. Reject here.
+        if fp8_runtime && batch_size > 1 {
+            bail!(
+                "Gemma4Engine: --fp8-runtime requires batch_size = 1 (FP8 \
+                 weight dequant is wired into the single-batch persistent \
+                 decode kernel only; got batch_size = {batch_size})"
+            );
+        }
+        if kv_fp8 && batch_size > 1 {
+            bail!(
+                "Gemma4Engine: --kv-fp8 requires batch_size = 1 (FP8 KV cache \
+                 path is wired into the single-batch persistent decode kernel \
+                 only; got batch_size = {batch_size})"
             );
         }
         gpu_hal::set_device(device).map_err(|e| anyhow!("set_device: {e}"))?;
@@ -559,10 +680,45 @@ impl Gemma4Engine {
         let num_layers = tcfg.num_hidden_layers;
         let dtype = ScalarType::BF16;
 
+        // Open the v2-fp8 BakedStore upfront under `--fp8-runtime` so each
+        // layer can load its FP8 projections directly from the bake — never
+        // allocating BF16 projection buffers. This keeps the GPU memory
+        // peak in line with the FP8-scaled VRAM admission budget set in
+        // `run_gemma4`. Without this, preflight would lower the budget for
+        // FP8 but the constructor would still allocate BF16 weights and
+        // OOM mid-load on memory-constrained cards. (Codex review #51.)
+        let fp8_store: Option<model_store::BakedStore> = if fp8_runtime {
+            let bake_dir = model_store::fetch::BakeVariant::Fp8Native.bake_dir(model_dir);
+            if !model_store::version_ok(&bake_dir) {
+                bail!(
+                    "Gemma 4 FP8 bake not found at {} — run: \
+                     python3 oracle/bake_fp8_gemma4.py --model-dir {}",
+                    bake_dir.display(),
+                    model_dir.display(),
+                );
+            }
+            eprintln!(
+                "[gemma4] loading FP8 baked package from {}",
+                bake_dir.display()
+            );
+            Some(
+                model_store::BakedStore::open(&bake_dir)
+                    .map_err(|e| anyhow!("open Gemma 4 FP8 bake: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let fp8_block_size: usize = if let Some(store) = fp8_store.as_ref() {
+            infer_fp8_block_size(store, weight_prefix)?
+        } else {
+            0
+        };
+
         let mut layers: Vec<LayerWeights> = Vec::with_capacity(num_layers);
         for i in 0..num_layers {
             layers.push(load_layer_weights(
                 &loader,
+                fp8_store.as_ref(),
                 device,
                 &tcfg,
                 weight_prefix,
@@ -743,6 +899,49 @@ impl Gemma4Engine {
         // layer's scale buffers (matching how kv_cache_k/v aliases work in
         // the main desc), so the kernel's read sites never need to look up
         // the mapping.
+        // Per-layer Gemma4FP8ScaleDesc array on GPU, populated only when
+        // `--fp8-runtime` is active. Weights are shared across sequences,
+        // so this is a single buffer (not batched). Shared-KV layers leave
+        // their `k/v_proj_scale` slots null because the matmul sites for
+        // those projections are bypassed (k/v_proj_w is also null in the
+        // main descriptor).
+        let fp8_scale_descs_gpu: Option<GpuBuffer> = if fp8_runtime {
+            let null_p = std::ptr::null::<c_void>();
+            let mut layer_descs: Vec<Gemma4FP8ScaleDesc> = Vec::with_capacity(num_layers);
+            for l in 0..num_layers {
+                let w = &layers[l];
+                let take = |b: &Option<GpuBuffer>| -> *const c_void {
+                    b.as_ref().map(|x| x.as_ptr()).unwrap_or(null_p)
+                };
+                layer_descs.push(Gemma4FP8ScaleDesc {
+                    q_proj_scale: take(&w.q_proj_fp8_scale),
+                    k_proj_scale: take(&w.k_proj_fp8_scale),
+                    v_proj_scale: take(&w.v_proj_fp8_scale),
+                    o_proj_scale: take(&w.o_proj_fp8_scale),
+                    gate_proj_scale: take(&w.gate_proj_fp8_scale),
+                    up_proj_scale: take(&w.up_proj_fp8_scale),
+                    down_proj_scale: take(&w.down_proj_fp8_scale),
+                    per_layer_input_gate_scale: take(&w.per_layer_input_gate_fp8_scale),
+                    per_layer_projection_scale: take(&w.per_layer_projection_fp8_scale),
+                    block_size: fp8_block_size as c_int,
+                });
+            }
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    layer_descs.as_ptr() as *const u8,
+                    layer_descs.len() * std::mem::size_of::<Gemma4FP8ScaleDesc>(),
+                )
+            };
+            Some(GpuBuffer::from_host_bytes(
+                device,
+                ScalarType::U8,
+                &[bytes.len()],
+                bytes,
+            )?)
+        } else {
+            None
+        };
+
         let kv_fp8_descs_gpu: Option<Vec<GpuBuffer>> = if kv_fp8 {
             let mut bufs: Vec<GpuBuffer> = Vec::with_capacity(batch_size);
             for seq in 0..batch_size {
@@ -869,7 +1068,7 @@ impl Gemma4Engine {
             kv_scale_k: if kv_fp8 { Some(kv_scale_k_buf) } else { None },
             kv_scale_v: if kv_fp8 { Some(kv_scale_v_buf) } else { None },
             kv_fp8_descs_gpu,
-            fp8_scale_descs_gpu: None,
+            fp8_scale_descs_gpu,
         })
     }
 
@@ -977,24 +1176,28 @@ impl Gemma4Engine {
         if seq_len > self.max_t {
             bail!("prefill: prompt_len {seq_len} > max_t {}", self.max_t);
         }
-        // Under --kv-fp8 the K/V cache buffers are u8 (FP8-E4M3), so the
-        // BF16-typed prefill primitive chain (`kv_append_prefill`,
-        // `attn_prefill`, `copy_kv_slots_range`) can't write into them
-        // correctly. Route prefill through the same persistent decode
-        // kernel that decode uses — one call per prompt token. Slower than
-        // batched prefill but the FP8 path is only wired into the
-        // single-batch persistent kernel today, so this stays consistent
-        // with the kernel's contract.
+        // Under --kv-fp8 (u8 K/V cache) OR --fp8-runtime (u8 projection
+        // weights) the BF16 prefill primitive chain (`kv_append_prefill`,
+        // `attn_prefill`, `copy_kv_slots_range`, `matvec_batched` against
+        // BF16-typed buffers) reads element widths that no longer match
+        // the actual byte layout. Route prefill through the same
+        // persistent decode kernel that decode uses — one call per prompt
+        // token. Slower than batched prefill but the FP8 paths are only
+        // wired into the single-batch persistent kernel today, so this
+        // stays consistent with the kernel's contract.
         //
         // `capture` (per-layer activation capture for diagnostic tooling)
         // is intentionally rejected here: the per-token persistent decode
         // path doesn't expose the prefill primitive intermediates the
         // capture struct needs.
-        if self.kv_fp8_descs_gpu.is_some() {
+        let needs_persistent_prefill =
+            self.kv_fp8_descs_gpu.is_some() || self.fp8_scale_descs_gpu.is_some();
+        if needs_persistent_prefill {
             if capture {
                 bail!(
-                    "Gemma 4 --kv-fp8 prefill cannot also capture per-layer \
-                     activations (no FP8-aware capture path yet)"
+                    "Gemma 4 FP8 modes (--kv-fp8 / --fp8-runtime) prefill cannot \
+                     also capture per-layer activations (no FP8-aware capture \
+                     path yet)"
                 );
             }
             let mut last_logits: Vec<f32> = Vec::new();

@@ -3321,16 +3321,24 @@ __global__ void g4_persistent_decode_kernel(
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag
 ) __attribute__((launch_bounds(256, 1))) {
-    // FP8-runtime weight dequant LUT — populated once per launch when active.
-    // Body wiring in PR-B; for now `fp8_scales` is parameter-only so the
-    // binary contract is stable and the engine PR can flip the flag without
-    // another bridge/FFI change. Reads of `fp8_scales` are no-ops here.
-    (void)fp8_scales;
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
     const int nb = gridDim.x;
 
+    // LDS layout: lds[0..bs] for block-wide reductions, lds[bs..bs+256] for
+    // the FP8-runtime weight-dequant LUT. Bridge always allocates the full
+    // `(bs + 256) * 4 B` so the layout is constant whether `fp8_scales` is
+    // null or not.
     extern __shared__ float lds[];
+    float* fp8_lut = lds + bs;
+    if (fp8_scales != nullptr) {
+        if (tid < 256) {
+            fp8_lut[tid] = g4_fp8_e4m3_to_float(static_cast<uint8_t>(tid));
+        }
+        __syncthreads();
+    }
+    const int fp8_block_size =
+        (fp8_scales != nullptr) ? fp8_scales[0].block_size : 0;
 
     for (int layer = 0; layer < num_layers; ++layer) {
         const Gemma4DecodeLayerDesc L = layers[layer];
@@ -3372,6 +3380,14 @@ __global__ void g4_persistent_decode_kernel(
         T* k_cache = static_cast<T*>(L.kv_cache_k);
         T* v_cache = static_cast<T*>(L.kv_cache_v);
 
+        // FP8-weights for THIS layer. When `use_fp8_w` is true, the
+        // matmul sites below interpret the `*_proj_w` pointers as u8 FP8
+        // bytes and apply per-block dequant via `g4_fp8_dequant_weight_lut`.
+        const bool use_fp8_w = (fp8_scales != nullptr);
+        const Gemma4FP8ScaleDesc Sfp8 = use_fp8_w
+            ? fp8_scales[layer]
+            : Gemma4FP8ScaleDesc{};
+
         // =========================================================
         // Phase A — attention block. Mirrors g4_fused_attn_block_kernel.
         // Workspace layout (from offset 0):
@@ -3411,44 +3427,74 @@ __global__ void g4_persistent_decode_kernel(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
         // Wave-per-row QKV matmul: each wave independently steals a row via
-        // atomicAdd + __shfl broadcast, accumulates with 4-wide BF16 loads,
-        // reduces with wave shuffle. No __syncthreads per row.
+        // atomicAdd + __shfl broadcast, accumulates with 4-wide BF16 loads
+        // (or per-block FP8 dequant when use_fp8_w), reduces with wave
+        // shuffle. No __syncthreads per row.
         {
             const int lane = tid % warpSize;
             const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
+            const int vd4 = hidden_size & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_qkv)) break;
 
-                const T* w;
                 int weight_row;
+                const T* w_bf16;
+                const void* wbase_fp8 = nullptr;
+                const void* sbase_fp8 = nullptr;
                 if (row < static_cast<unsigned int>(q_dim)) {
-                    w = q_proj_w;
+                    w_bf16 = q_proj_w;
                     weight_row = static_cast<int>(row);
+                    if (use_fp8_w) {
+                        wbase_fp8 = static_cast<const void*>(q_proj_w);
+                        sbase_fp8 = Sfp8.q_proj_scale;
+                    }
                 } else if (row < static_cast<unsigned int>(q_dim + kv_dim)) {
-                    w = k_proj_w;
+                    w_bf16 = k_proj_w;
                     weight_row = static_cast<int>(row - q_dim);
+                    if (use_fp8_w) {
+                        wbase_fp8 = static_cast<const void*>(k_proj_w);
+                        sbase_fp8 = Sfp8.k_proj_scale;
+                    }
                 } else {
-                    w = v_proj_w;
+                    w_bf16 = v_proj_w;
                     weight_row = static_cast<int>(row - q_dim - kv_dim);
+                    if (use_fp8_w) {
+                        wbase_fp8 = static_cast<const void*>(v_proj_w);
+                        sbase_fp8 = Sfp8.v_proj_scale;
+                    }
                 }
-                const T* w_row =
-                    w + static_cast<size_t>(weight_row) * hidden_size;
 
                 float p = 0.0f;
-                const int vd4 = hidden_size & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(w_row[c]);
-                    float w1 = g4_to_float(w_row[c+1]);
-                    float w2 = g4_to_float(w_row[c+2]);
-                    float w3 = g4_to_float(w_row[c+3]);
-                    p += w0 * normed_f32[c]   + w1 * normed_f32[c+1]
-                       + w2 * normed_f32[c+2] + w3 * normed_f32[c+3];
-                }
-                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
-                    p += g4_to_float(w_row[c]) * normed_f32[c];
+                if (use_fp8_w) {
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase_fp8, sbase_fp8, weight_row, c,   hidden_size, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase_fp8, sbase_fp8, weight_row, c+1, hidden_size, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase_fp8, sbase_fp8, weight_row, c+2, hidden_size, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase_fp8, sbase_fp8, weight_row, c+3, hidden_size, fp8_block_size, fp8_lut);
+                        p += w0 * normed_f32[c]   + w1 * normed_f32[c+1]
+                           + w2 * normed_f32[c+2] + w3 * normed_f32[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase_fp8, sbase_fp8, weight_row, c, hidden_size, fp8_block_size, fp8_lut)
+                             * normed_f32[c];
+                    }
+                } else {
+                    const T* w_row =
+                        w_bf16 + static_cast<size_t>(weight_row) * hidden_size;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(w_row[c]);
+                        float w1 = g4_to_float(w_row[c+1]);
+                        float w2 = g4_to_float(w_row[c+2]);
+                        float w3 = g4_to_float(w_row[c+3]);
+                        p += w0 * normed_f32[c]   + w1 * normed_f32[c+1]
+                           + w2 * normed_f32[c+2] + w3 * normed_f32[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_to_float(w_row[c]) * normed_f32[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) proj_f32[row] = result;
@@ -3611,24 +3657,41 @@ __global__ void g4_persistent_decode_kernel(
         // A7 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int vd4 = q_dim & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(hidden_size)) break;
-                const T* wr = o_proj_w + static_cast<size_t>(row) * q_dim;
                 float p = 0.0f;
-                const int vd4 = q_dim & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(wr[c]);
-                    float w1 = g4_to_float(wr[c+1]);
-                    float w2 = g4_to_float(wr[c+2]);
-                    float w3 = g4_to_float(wr[c+3]);
-                    p += w0 * attn_out_f32[c]   + w1 * attn_out_f32[c+1]
-                       + w2 * attn_out_f32[c+2] + w3 * attn_out_f32[c+3];
-                }
-                for (int c = vd4 + lane; c < q_dim; c += warpSize) {
-                    p += g4_to_float(wr[c]) * attn_out_f32[c];
+                if (use_fp8_w) {
+                    const void* wbase = static_cast<const void*>(o_proj_w);
+                    const void* sbase = Sfp8.o_proj_scale;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c,   q_dim, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+1, q_dim, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+2, q_dim, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+3, q_dim, fp8_block_size, fp8_lut);
+                        p += w0 * attn_out_f32[c]   + w1 * attn_out_f32[c+1]
+                           + w2 * attn_out_f32[c+2] + w3 * attn_out_f32[c+3];
+                    }
+                    for (int c = vd4 + lane; c < q_dim; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase, sbase, row, c, q_dim, fp8_block_size, fp8_lut)
+                             * attn_out_f32[c];
+                    }
+                } else {
+                    const T* wr = o_proj_w + static_cast<size_t>(row) * q_dim;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(wr[c]);
+                        float w1 = g4_to_float(wr[c+1]);
+                        float w2 = g4_to_float(wr[c+2]);
+                        float w3 = g4_to_float(wr[c+3]);
+                        p += w0 * attn_out_f32[c]   + w1 * attn_out_f32[c+1]
+                           + w2 * attn_out_f32[c+2] + w3 * attn_out_f32[c+3];
+                    }
+                    for (int c = vd4 + lane; c < q_dim; c += warpSize) {
+                        p += g4_to_float(wr[c]) * attn_out_f32[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) oproj_f32[row] = result;
@@ -3715,32 +3778,48 @@ __global__ void g4_persistent_decode_kernel(
         {
             const int lane = tid % warpSize;
             const int total_mlp1 = 2 * intermediate_size;
+            const int vd4 = hidden_size & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(total_mlp1)) break;
 
-                const T* w = (row < static_cast<unsigned int>(intermediate_size))
-                    ? gate_proj_w : up_proj_w;
-                const int weight_row =
-                    (row < static_cast<unsigned int>(intermediate_size))
-                        ? static_cast<int>(row)
-                        : static_cast<int>(row - intermediate_size);
-                const T* wr = w + static_cast<size_t>(weight_row) * hidden_size;
+                const bool is_gate = row < static_cast<unsigned int>(intermediate_size);
+                const T* w_bf16 = is_gate ? gate_proj_w : up_proj_w;
+                const int weight_row = is_gate
+                    ? static_cast<int>(row)
+                    : static_cast<int>(row - intermediate_size);
 
                 float p = 0.0f;
-                const int vd4 = hidden_size & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(wr[c]);
-                    float w1 = g4_to_float(wr[c+1]);
-                    float w2 = g4_to_float(wr[c+2]);
-                    float w3 = g4_to_float(wr[c+3]);
-                    p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
-                       + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
-                }
-                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
-                    p += g4_to_float(wr[c]) * b_normed_ff[c];
+                if (use_fp8_w) {
+                    const void* wbase = static_cast<const void*>(w_bf16);
+                    const void* sbase = is_gate ? Sfp8.gate_proj_scale : Sfp8.up_proj_scale;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c,   hidden_size, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+1, hidden_size, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+2, hidden_size, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+3, hidden_size, fp8_block_size, fp8_lut);
+                        p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
+                           + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c, hidden_size, fp8_block_size, fp8_lut)
+                             * b_normed_ff[c];
+                    }
+                } else {
+                    const T* wr = w_bf16 + static_cast<size_t>(weight_row) * hidden_size;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(wr[c]);
+                        float w1 = g4_to_float(wr[c+1]);
+                        float w2 = g4_to_float(wr[c+2]);
+                        float w3 = g4_to_float(wr[c+3]);
+                        p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
+                           + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_to_float(wr[c]) * b_normed_ff[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) b_gate_up[row] = result;
@@ -3768,26 +3847,43 @@ __global__ void g4_persistent_decode_kernel(
         // B4 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int vd4 = intermediate_size & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-                const T* wr = down_proj_w +
-                    static_cast<size_t>(row) * intermediate_size;
                 float p = 0.0f;
-                const int vd4 = intermediate_size & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(wr[c]);
-                    float w1 = g4_to_float(wr[c+1]);
-                    float w2 = g4_to_float(wr[c+2]);
-                    float w3 = g4_to_float(wr[c+3]);
-                    p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
-                       + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
-                }
-                for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
-                    p += g4_to_float(wr[c]) * b_gated_proj[c];
+                if (use_fp8_w) {
+                    const void* wbase = static_cast<const void*>(down_proj_w);
+                    const void* sbase = Sfp8.down_proj_scale;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c,   intermediate_size, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+1, intermediate_size, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+2, intermediate_size, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+3, intermediate_size, fp8_block_size, fp8_lut);
+                        p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
+                           + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
+                    }
+                    for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase, sbase, row, c, intermediate_size, fp8_block_size, fp8_lut)
+                             * b_gated_proj[c];
+                    }
+                } else {
+                    const T* wr = down_proj_w +
+                        static_cast<size_t>(row) * intermediate_size;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(wr[c]);
+                        float w1 = g4_to_float(wr[c+1]);
+                        float w2 = g4_to_float(wr[c+2]);
+                        float w3 = g4_to_float(wr[c+3]);
+                        p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
+                           + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
+                    }
+                    for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
+                        p += g4_to_float(wr[c]) * b_gated_proj[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) b_down_out[row] = result;
@@ -3817,26 +3913,43 @@ __global__ void g4_persistent_decode_kernel(
         // B7 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int vd4 = hidden_size & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(ple_hidden)) break;
 
-                const T* wr = pli_gate_w +
-                    static_cast<size_t>(row) * hidden_size;
                 float p = 0.0f;
-                const int vd4 = hidden_size & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(wr[c]);
-                    float w1 = g4_to_float(wr[c+1]);
-                    float w2 = g4_to_float(wr[c+2]);
-                    float w3 = g4_to_float(wr[c+3]);
-                    p += w0 * b_h_pre_ple[c]   + w1 * b_h_pre_ple[c+1]
-                       + w2 * b_h_pre_ple[c+2] + w3 * b_h_pre_ple[c+3];
-                }
-                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
-                    p += g4_to_float(wr[c]) * b_h_pre_ple[c];
+                if (use_fp8_w) {
+                    const void* wbase = static_cast<const void*>(pli_gate_w);
+                    const void* sbase = Sfp8.per_layer_input_gate_scale;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c,   hidden_size, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+1, hidden_size, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+2, hidden_size, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+3, hidden_size, fp8_block_size, fp8_lut);
+                        p += w0 * b_h_pre_ple[c]   + w1 * b_h_pre_ple[c+1]
+                           + w2 * b_h_pre_ple[c+2] + w3 * b_h_pre_ple[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase, sbase, row, c, hidden_size, fp8_block_size, fp8_lut)
+                             * b_h_pre_ple[c];
+                    }
+                } else {
+                    const T* wr = pli_gate_w +
+                        static_cast<size_t>(row) * hidden_size;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(wr[c]);
+                        float w1 = g4_to_float(wr[c+1]);
+                        float w2 = g4_to_float(wr[c+2]);
+                        float w3 = g4_to_float(wr[c+3]);
+                        p += w0 * b_h_pre_ple[c]   + w1 * b_h_pre_ple[c+1]
+                           + w2 * b_h_pre_ple[c+2] + w3 * b_h_pre_ple[c+3];
+                    }
+                    for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                        p += g4_to_float(wr[c]) * b_h_pre_ple[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) b_gated_ple[row] = result;
@@ -3860,26 +3973,43 @@ __global__ void g4_persistent_decode_kernel(
         // B9 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int vd4 = ple_hidden & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl(row, 0);
                 if (row >= static_cast<unsigned int>(hidden_size)) break;
 
-                const T* wr = pli_proj_w +
-                    static_cast<size_t>(row) * ple_hidden;
                 float p = 0.0f;
-                const int vd4 = ple_hidden & ~3;
-                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                    float w0 = g4_to_float(wr[c]);
-                    float w1 = g4_to_float(wr[c+1]);
-                    float w2 = g4_to_float(wr[c+2]);
-                    float w3 = g4_to_float(wr[c+3]);
-                    p += w0 * b_gated_act[c]   + w1 * b_gated_act[c+1]
-                       + w2 * b_gated_act[c+2] + w3 * b_gated_act[c+3];
-                }
-                for (int c = vd4 + lane; c < ple_hidden; c += warpSize) {
-                    p += g4_to_float(wr[c]) * b_gated_act[c];
+                if (use_fp8_w) {
+                    const void* wbase = static_cast<const void*>(pli_proj_w);
+                    const void* sbase = Sfp8.per_layer_projection_scale;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c,   ple_hidden, fp8_block_size, fp8_lut);
+                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+1, ple_hidden, fp8_block_size, fp8_lut);
+                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+2, ple_hidden, fp8_block_size, fp8_lut);
+                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+3, ple_hidden, fp8_block_size, fp8_lut);
+                        p += w0 * b_gated_act[c]   + w1 * b_gated_act[c+1]
+                           + w2 * b_gated_act[c+2] + w3 * b_gated_act[c+3];
+                    }
+                    for (int c = vd4 + lane; c < ple_hidden; c += warpSize) {
+                        p += g4_fp8_dequant_weight_lut(wbase, sbase, row, c, ple_hidden, fp8_block_size, fp8_lut)
+                             * b_gated_act[c];
+                    }
+                } else {
+                    const T* wr = pli_proj_w +
+                        static_cast<size_t>(row) * ple_hidden;
+                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                        float w0 = g4_to_float(wr[c]);
+                        float w1 = g4_to_float(wr[c+1]);
+                        float w2 = g4_to_float(wr[c+2]);
+                        float w3 = g4_to_float(wr[c+3]);
+                        p += w0 * b_gated_act[c]   + w1 * b_gated_act[c+1]
+                           + w2 * b_gated_act[c+2] + w3 * b_gated_act[c+3];
+                    }
+                    for (int c = vd4 + lane; c < ple_hidden; c += warpSize) {
+                        p += g4_to_float(wr[c]) * b_gated_act[c];
+                    }
                 }
                 float result = g4_wave_reduce_sum_f32(p);
                 if (lane == 0) b_projected[row] = result;
