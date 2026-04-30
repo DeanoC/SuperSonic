@@ -265,8 +265,24 @@ pub fn run_phi4(
         eprintln!("[weights] loading FP8 baked package from {}", bake_dir.display());
         let store = model_store::BakedStore::open(&bake_dir)
             .map_err(|e| anyhow!("open Phi-4 FP8 bake: {e}"))?;
-        Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
-            .map_err(|e| anyhow!("load Phi-4 FP8 weights: {e}"))?
+        let fp8_weights = Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
+            .map_err(|e| anyhow!("load Phi-4 FP8 weights: {e}"))?;
+        // `version_ok` only checks the manifest header — a stale or
+        // partial bake could ship FP8 projection bytes without the
+        // companion `*_scale_inv` tensors. The loader silently leaves
+        // `is_fp8 = false` in that case, after which the kernel would
+        // dispatch the BF16 matmul path against FP8-packed bytes
+        // (corrupt logits / OOB reads). Refuse to proceed.
+        if !fp8_weights.is_fp8 {
+            bail!(
+                "Phi-4 FP8 bake at {} is missing FP8 scale tensors — refusing to \
+                 run --fp8-runtime against a partial bake.\n\
+                 Re-bake with: python3 oracle/bake_fp8_phi4.py --model-dir {}",
+                bake_dir.display(),
+                cli.model_dir.display(),
+            );
+        }
+        fp8_weights
     } else if cli.no_bake {
         eprintln!("[weights] loading from raw safetensors (--no-bake)");
         Phi4Weights::load(&cli.model_dir, &config, ordinal, params.weight_prefix)
