@@ -38,8 +38,8 @@ pub fn run_phi4(
         }
     };
 
-    if cli.fp8_runtime {
-        bail!("Phi-4 has no --fp8-runtime path yet");
+    if cli.fp8_runtime && cli.int4 {
+        bail!("Phi-4 --fp8-runtime cannot combine with --int4 (pick one weight quantization)");
     }
     if cli.batch_size != 1 {
         bail!("Phi-4 engine is single-sequence at launch (--batch-size must be 1)");
@@ -116,13 +116,36 @@ pub fn run_phi4(
         kv_per_token += scale_bytes_per_layer * config.num_hidden_layers as u64;
     }
     let kv_bytes = kv_per_token * context_tokens as u64;
+    // The registry's `fixed_bytes` budget is sized for BF16 weights + scratch.
+    // Under --int4 / --fp8-runtime the weight footprint shrinks to ~1/4 / ~1/2
+    // (plus a tiny scale/zero overhead), so applying the BF16 budget verbatim
+    // would reject valid runs on memory-constrained cards — the exact scenario
+    // these flags are meant to unlock. Mirror the 0.37× scaling that
+    // qwen35_dflash_engine.rs already uses for INT4 targets, and pick a
+    // conservative 0.6× for FP8 (≈ half-bytes weights + small scale_inv +
+    // unchanged scratch).
+    let quant_fixed_bytes = if cli.int4 {
+        (entry.vram.fixed_bytes as f64 * 0.37) as u64
+    } else if cli.fp8_runtime {
+        (entry.vram.fixed_bytes as f64 * 0.6) as u64
+    } else {
+        entry.vram.fixed_bytes
+    };
     let estimated_vram =
-        ((entry.vram.fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
+        ((quant_fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+    let weight_label = if cli.int4 {
+        "weights+scratch (INT4-scaled)"
+    } else if cli.fp8_runtime {
+        "weights+scratch (FP8-scaled)"
+    } else {
+        "weights+scratch"
+    };
     eprintln!(
-        "[vram] estimated={:.2}GiB (weights+scratch={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
+        "[vram] estimated={:.2}GiB ({}={:.2}GiB + kv_cache={:.2}GiB for {}tok) available={:.1}GiB",
         gib(estimated_vram),
-        gib(entry.vram.fixed_bytes),
+        weight_label,
+        gib(quant_fixed_bytes),
         gib(kv_bytes),
         context_tokens,
         gib(total_vram),
@@ -210,6 +233,56 @@ pub fn run_phi4(
             .map_err(|e| anyhow!("open Phi-4 INT4 bake: {e}"))?;
         Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
             .map_err(|e| anyhow!("load Phi-4 INT4 weights: {e}"))?
+    } else if cli.fp8_runtime {
+        // FP8-runtime path: load v2-fp8 bake (produced by oracle/bake_fp8_phi4.py).
+        // Mirrors the INT4 lock + fetch dance — no auto-bake at runtime, since
+        // BF16 → FP8 calibration is a Python-side producer step.
+        let variant = model_store::fetch::BakeVariant::Fp8Native;
+        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        if !cli.no_download
+            && should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir))
+        {
+            let canonical_model = model_variant.to_string();
+            match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
+                Ok(true) => eprintln!(
+                    "[fetch] installed Phi-4 FP8 bake at {}",
+                    bake_dir.display()
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("[fetch] Phi-4 FP8 bake fetch failed: {e}"),
+            }
+        }
+        if !model_store::version_ok(&bake_dir) {
+            bail!(
+                "Phi-4 FP8 bake not found at {} and download disabled / failed.\n\
+                 Run: python3 oracle/bake_fp8_phi4.py --model-dir {}",
+                bake_dir.display(),
+                cli.model_dir.display(),
+            );
+        }
+        eprintln!("[weights] loading FP8 baked package from {}", bake_dir.display());
+        let store = model_store::BakedStore::open(&bake_dir)
+            .map_err(|e| anyhow!("open Phi-4 FP8 bake: {e}"))?;
+        let fp8_weights = Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
+            .map_err(|e| anyhow!("load Phi-4 FP8 weights: {e}"))?;
+        // `version_ok` only checks the manifest header — a stale or
+        // partial bake could ship FP8 projection bytes without the
+        // companion `*_scale_inv` tensors. The loader silently leaves
+        // `is_fp8 = false` in that case, after which the kernel would
+        // dispatch the BF16 matmul path against FP8-packed bytes
+        // (corrupt logits / OOB reads). Refuse to proceed.
+        if !fp8_weights.is_fp8 {
+            bail!(
+                "Phi-4 FP8 bake at {} is missing FP8 scale tensors — refusing to \
+                 run --fp8-runtime against a partial bake.\n\
+                 Re-bake with: python3 oracle/bake_fp8_phi4.py --model-dir {}",
+                bake_dir.display(),
+                cli.model_dir.display(),
+            );
+        }
+        fp8_weights
     } else if cli.no_bake {
         eprintln!("[weights] loading from raw safetensors (--no-bake)");
         Phi4Weights::load(&cli.model_dir, &config, ordinal, params.weight_prefix)
@@ -248,6 +321,12 @@ pub fn run_phi4(
         eprintln!(
             "[weights] INT4 runtime dequant active (group_size={})",
             weights.int4_group_size
+        );
+    }
+    if weights.is_fp8 {
+        eprintln!(
+            "[weights] FP8 runtime dequant active (block_size={})",
+            weights.fp8_block_size
         );
     }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
@@ -334,6 +413,25 @@ pub fn run_phi4(
         Some(
             GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], bytes)
                 .map_err(|e| anyhow!("upload phi4 int4 scale descs: {e}"))?,
+        )
+    } else {
+        None
+    };
+
+    // FP8 weight scale descriptor array — built and uploaded once. Each entry
+    // points at the per-projection `_scale_inv` GPU buffer that
+    // `Phi4Weights::load_baked` parked alongside the FP8 weight bytes.
+    let fp8_scale_device: Option<GpuBuffer> = if weights.is_fp8 {
+        let descs = build_fp8_descs(&weights, weights.fp8_block_size);
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                descs.as_ptr() as *const u8,
+                descs.len() * std::mem::size_of::<phi4_ffi::Phi4FP8ScaleDesc>(),
+            )
+        };
+        Some(
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], bytes)
+                .map_err(|e| anyhow!("upload phi4 fp8 scale descs: {e}"))?,
         )
     } else {
         None
@@ -435,7 +533,7 @@ pub fn run_phi4(
             sin_table,
             proj_buf_floats,
             attn_scratch_floats,
-            None,
+            fp8_scale_device.as_ref(),
             kv_fp8_desc_device.as_ref(),
             1,
             None,
@@ -687,6 +785,34 @@ fn build_kv_fp8_descs(state: &Phi4ModelState) -> Vec<phi4_ffi::Phi4KVCacheFp8Des
 /// Build the per-layer parallel-struct array of INT4 scale/zero pointers.
 /// Pointers reference GPU buffers held by `weights`; struct must remain
 /// alive only as long as those buffers do (the engine owns both).
+/// Build the per-layer parallel-struct array of FP8 `_scale_inv` pointers.
+/// Pointers reference GPU buffers held by `weights`; struct must remain alive
+/// only as long as those buffers do (the engine owns both).
+fn build_fp8_descs(
+    weights: &Phi4Weights,
+    block_size: usize,
+) -> Vec<phi4_ffi::Phi4FP8ScaleDesc> {
+    use std::ffi::c_void;
+    let ptr = |opt: &Option<GpuBuffer>| -> *const c_void {
+        opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
+    };
+    let block_size_c = block_size as std::ffi::c_int;
+    let mut descs = Vec::with_capacity(weights.layers.len());
+    for lw in &weights.layers {
+        descs.push(phi4_ffi::Phi4FP8ScaleDesc {
+            gate_proj_scale: ptr(&lw.gate_proj_fp8_scale),
+            up_proj_scale: ptr(&lw.up_proj_fp8_scale),
+            down_proj_scale: ptr(&lw.down_proj_fp8_scale),
+            q_proj_scale: ptr(&lw.q_proj_fp8_scale),
+            k_proj_scale: ptr(&lw.k_proj_fp8_scale),
+            v_proj_scale: ptr(&lw.v_proj_fp8_scale),
+            o_proj_scale: ptr(&lw.o_proj_fp8_scale),
+            block_size: block_size_c,
+        });
+    }
+    descs
+}
+
 fn build_int4_descs(weights: &Phi4Weights) -> Vec<phi4_ffi::Phi4INT4ScaleDesc> {
     use std::ffi::c_void;
     let ptr = |opt: &Option<GpuBuffer>| -> *const c_void {
