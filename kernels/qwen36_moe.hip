@@ -1190,7 +1190,265 @@ __global__ void qwen36_moe_linear_step_kernel(
         }
     }
 
-    // Stages 4..5 hook in here in follow-up commits.
+    if (stage < 4) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    const int OFF_BETA    = OFF_K_REP + V * k_dim;
+    const int OFF_G       = OFF_BETA + V;
+    const int OFF_REC_OUT = OFF_G + V;
+
+    // -- Phase F: beta + g per V-head ---------------------------------------
+    // beta[h] = sigmoid(b_raw[h])                                  (F32)
+    // g[h]    = -softplus(a_raw[h] + dt_bias[h]) * exp(A_log[h])   (F32)
+    //
+    // V is small (32 on 35B-A3B) so we do this on block 0 only — every
+    // other block parks at the next grid barrier.
+    if (blockIdx.x == 0) {
+        for (int h = tid; h < V; h += block_size) {
+            const float a_v       = workspace[OFF_A_RAW + h];
+            const float b_v       = workspace[OFF_B_RAW + h];
+            const float dt_b      = static_cast<float>(dt_bias[h]);
+            const float a_log_v   = static_cast<float>(a_log[h]);
+            const float a_log_exp = expf(a_log_v);
+            const float arg       = a_v + dt_b;
+            const float softplus  = log1pf(expf(arg));
+            workspace[OFF_BETA + h] = 1.0f / (1.0f + expf(-b_v));
+            workspace[OFF_G + h]    = -softplus * a_log_exp;
+        }
+    }
+    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+
+    // -- Phase G: delta-rule recurrent update --------------------------------
+    //
+    // Per V-head (work-stolen):
+    //   1. state[h, :, :] *= exp(g[h])                          (decay)
+    //   2. kv_mem[j] = sum_i(state[h, i, j] * k_rep[h, i])     for j ∈ [0, v_dim)
+    //   3. delta[j]  = (v_heads[h, j] - kv_mem[j]) * beta[h]
+    //   4. state[h, i, j] += k_rep[h, i] * delta[j]            (outer product)
+    //   5. rec_out[h, j] = sum_i(state[h, i, j] * q_scaled[h, i])  (BF16-round on store)
+    //
+    // All math in F32; recurrent state stays F32 between decode steps so
+    // there's no precision loss across the sequence. rec_out is BF16-rounded
+    // when written to workspace because Phase H (per-head RMS norm) reads it
+    // as a BF16 input.
+    //
+    // LDS scratch (per block):
+    //   kv_mem_lds[v_dim]  - kv_mem reduction outputs (F32)
+    //   delta_lds[v_dim]   - delta values (F32)
+    //   v_dim is bounded by 256 (35B-A3B uses 128); a static LDS array
+    //   sized 256 fits all current configs and avoids dynamic LDS arithmetic.
+    constexpr int V_DIM_MAX = 256;
+    __shared__ float kv_mem_lds[V_DIM_MAX];
+    __shared__ float delta_lds[V_DIM_MAX];
+    __shared__ float head_beta;
+    __shared__ float head_gstep;
+
+    {
+        for (;;) {
+            __shared__ unsigned int vh_s;
+            if (tid == 0) {
+                vh_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int h = static_cast<int>(vh_s);
+            if (h >= V) break;
+
+            if (tid == 0) {
+                head_beta  = workspace[OFF_BETA + h];
+                head_gstep = expf(workspace[OFF_G + h]);
+            }
+            __syncthreads();
+
+            const int state_off = h * k_dim * v_dim;
+            const int kv_off    = OFF_K_REP + h * k_dim;
+            const int qv_off    = OFF_Q_REP + h * k_dim;
+            const int v_off     = OFF_QKV_RAW + 2 * key_dim + h * v_dim;
+            const int total_state = k_dim * v_dim;
+
+            // Step 1: decay.
+            for (int e = tid; e < total_state; e += block_size) {
+                recurrent_state[state_off + e] *= head_gstep;
+            }
+            __syncthreads();
+
+            // Step 2: kv_mem[j] = sum_i(state[h, i, j] * k_rep[h, i]).
+            // Loop over j; for each j do a block-wide reduction over i.
+            for (int j = 0; j < v_dim; ++j) {
+                float partial = 0.0f;
+                for (int i = tid; i < k_dim; i += block_size) {
+                    partial += recurrent_state[state_off + i * v_dim + j] *
+                               workspace[kv_off + i];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    kv_mem_lds[j] = shared_scratch[0];
+                }
+                __syncthreads();
+            }
+
+            // Step 3: delta[j] = (v_heads[h, j] - kv_mem[j]) * beta[h].
+            for (int j = tid; j < v_dim; j += block_size) {
+                const float v_val = workspace[v_off + j];
+                delta_lds[j] = (v_val - kv_mem_lds[j]) * head_beta;
+            }
+            __syncthreads();
+
+            // Step 4: state[h, i, j] += k_rep[h, i] * delta[j].
+            for (int e = tid; e < total_state; e += block_size) {
+                const int i = e / v_dim;
+                const int j = e - i * v_dim;
+                recurrent_state[state_off + e] +=
+                    workspace[kv_off + i] * delta_lds[j];
+            }
+            __syncthreads();
+
+            // Step 5: recurrent_out[h, j] = sum_i(state[h, i, j] * q_scaled[h, i]).
+            for (int j = 0; j < v_dim; ++j) {
+                float partial = 0.0f;
+                for (int i = tid; i < k_dim; i += block_size) {
+                    partial += recurrent_state[state_off + i * v_dim + j] *
+                               workspace[qv_off + i];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    // Match oracle's `recurrent_out.to(dtype)` — F32 → BF16
+                    // cast happens here so Phase H reads BF16-precision
+                    // values regardless of stage.
+                    const float r = bf16_round_rne_f32(shared_scratch[0]);
+                    workspace[OFF_REC_OUT + h * v_dim + j] = r;
+                    if (stage == 4) {
+                        output[h * v_dim + j] = static_cast<T>(r);
+                    }
+                }
+                __syncthreads();
+            }
+        }
+    }
+
+    if (stage < 5) return;
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase H: per-V-head RMS norm + z-gate + multiply --------------------
+    //
+    // For each V-head h:
+    //   out_normed[h, :] = rms_norm(rec_out[h, :], norm_w, eps)        (per head)
+    //   z_silu[h, j]     = bf16(z_raw[h, j] * sigmoid(z_raw[h, j]))    (silu)
+    //   out_gated[h, j]  = bf16(out_normed[h, j] * z_silu[h, j])
+    //
+    // Fuse the three into one per-(h, j) computation, writing out_gated
+    // back into the OFF_REC_OUT slot — rec_out is no longer needed after
+    // this point. Block-per-head; V=32 work units fit comfortably across
+    // num_cus on gfx1100.
+    {
+        for (;;) {
+            __shared__ unsigned int vh_s;
+            if (tid == 0) {
+                vh_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int h = static_cast<int>(vh_s);
+            if (h >= V) break;
+
+            const int rec_off = OFF_REC_OUT + h * v_dim;
+            const int z_off   = OFF_Z_RAW   + h * v_dim;
+
+            // RMS norm reduction over v_dim — F32 partial then block-reduce.
+            float partial_sq = 0.0f;
+            for (int j = tid; j < v_dim; j += block_size) {
+                const float v = workspace[rec_off + j];
+                partial_sq += v * v;
+            }
+            shared_scratch[tid] = partial_sq;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            __shared__ float head_inv_rms_norm;
+            if (tid == 0) {
+                head_inv_rms_norm =
+                    rsqrtf(shared_scratch[0] / static_cast<float>(v_dim) + rms_norm_eps);
+            }
+            __syncthreads();
+
+            // Per-element fused: out_normed * z_silu, BF16-rounded at every
+            // dtype boundary so the path matches the oracle byte-for-byte.
+            for (int j = tid; j < v_dim; j += block_size) {
+                const float r       = workspace[rec_off + j];
+                const float n_w     = static_cast<float>(norm_w[j]);
+                const float on      = bf16_round_rne_f32(r * head_inv_rms_norm * n_w);
+                const float z_val   = workspace[z_off + j];
+                const float z_sig   = 1.0f / (1.0f + expf(-z_val));
+                const float z_silu_val = bf16_round_rne_f32(z_val * z_sig);
+                const float gated   = bf16_round_rne_f32(on * z_silu_val);
+                workspace[rec_off + j] = gated;   // overwrites rec_out in-place
+            }
+            __syncthreads();
+        }
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase I: out_proj matmul + residual --------------------------------
+    //
+    // out_gated lives at workspace[OFF_REC_OUT : OFF_REC_OUT + V*v_dim].
+    // out_proj_w shape: [hidden, V*v_dim].
+    //
+    //   o_out[i]          = bf16(sum_j(out_proj_w[i, j] * out_gated[j]))
+    //   output_hidden[i]  = bf16(input_hidden[i] + o_out[i])
+    //
+    // Two BF16 RNE rounds — one at the matmul boundary, one at the
+    // residual add — exactly mirroring `o_out = out_flat @ out_proj.T`
+    // and `output_hidden = input_hidden + o_out` in the oracle.
+    {
+        const int qd = V * v_dim;
+
+        for (;;) {
+            __shared__ unsigned int my_row_s;
+            if (tid == 0) {
+                my_row_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_s);
+            if (my_row >= hidden) break;
+
+            const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
+            float partial = 0.0f;
+            for (int j = tid; j < qd; j += block_size) {
+                partial += static_cast<float>(w_row[j]) * workspace[OFF_REC_OUT + j];
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                const float o_out  = bf16_round_rne_f32(shared_scratch[0]);
+                const float in_f   = static_cast<float>(input_hidden[my_row]);
+                const float result = bf16_round_rne_f32(in_f + o_out);
+                if (stage == 5) {
+                    output[my_row] = static_cast<T>(result);
+                }
+            }
+            __syncthreads();
+        }
+    }
 }
 
 } // namespace qwen36_moe

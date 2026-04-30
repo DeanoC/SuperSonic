@@ -585,12 +585,7 @@ pub fn linear_step_launch(
             params.stage
         )));
     }
-    if params.stage > 3 {
-        return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::linear_step_launch: stage {} not yet implemented (PR 4b3 stages 1-3 only)",
-            params.stage
-        )));
-    }
+    // All five stages are wired through PR 4b3 step 6.
 
     let backend = output.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -853,6 +848,61 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Convert a stream of F32 little-endian bytes to F32 values. Used
+    /// for parity-checking the recurrent state buffer (stage 4+), which
+    /// production keeps in F32 across decode steps.
+    #[cfg(supersonic_backend_hip)]
+    fn f32_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
+        assert!(bytes.len() % 4 == 0, "qwen36_moe parity: F32 bytes must be multiple of 4");
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    /// Same shape as `assert_parity` but for F32 buffers — used for the
+    /// recurrent state which never casts to BF16. Tolerances are tighter
+    /// (no BF16 rounding noise to absorb).
+    #[cfg(supersonic_backend_hip)]
+    fn assert_parity_f32(
+        label: &str,
+        got_bytes: &[u8],
+        want_bytes: &[u8],
+        max_abs_tol: f32,
+        cos_sim_floor: f64,
+    ) {
+        assert_eq!(got_bytes.len(), want_bytes.len(),
+                   "{label}: byte length mismatch");
+        let got = f32_bytes_to_f32(got_bytes);
+        let want = f32_bytes_to_f32(want_bytes);
+        let n = got.len();
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut got_sq = 0.0f64;
+        let mut want_sq = 0.0f64;
+        let mut exact = 0usize;
+        for i in 0..n {
+            let d = (got[i] - want[i]).abs();
+            if d == 0.0 { exact += 1; }
+            max_abs_diff = max_abs_diff.max(d);
+            sum_abs_diff += d;
+            dot += got[i] as f64 * want[i] as f64;
+            got_sq += (got[i] as f64).powi(2);
+            want_sq += (want[i] as f64).powi(2);
+        }
+        let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
+        let mean_abs_diff = sum_abs_diff / n as f32;
+        eprintln!(
+            "[parity {label}] n={n} exact={exact} max_abs={max_abs_diff:.5e} \
+             mean_abs={mean_abs_diff:.5e} cos_sim={cos_sim:.7}"
+        );
+        assert!(max_abs_diff <= max_abs_tol,
+                "{label}: max_abs={max_abs_diff} exceeds tolerance {max_abs_tol}");
+        assert!(cos_sim >= cos_sim_floor,
+                "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}");
     }
 
     /// Convert a stream of BF16 little-endian bytes to F32. The oracle
@@ -2051,5 +2101,367 @@ mod tests {
                       &k_rep_expected, 0.04, 0.9999);
         assert_parity("linear step3 v_heads", &got_bytes_full[k_end..v_end],
                       &v_heads_expected, 0.04, 0.9999);
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_linear_step_4_recurrent_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_linear_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON not set. \
+                 See `qwen36_moe_linear_step_1_qkv_raw_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 4 needs everything stage 3 needed plus dt_bias, A_log, and
+        // the prior recurrent state.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let in_proj_qkv_w_bytes = b64_decode(weights["in_proj_qkv_w"].as_str().unwrap());
+        let in_proj_z_w_bytes = b64_decode(weights["in_proj_z_w"].as_str().unwrap());
+        let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
+        let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
+        let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
+        let conv1d_bias_bytes = weights.get("conv1d_bias")
+            .and_then(|v| v.as_str())
+            .map(b64_decode);
+        let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
+        let dt_bias_bytes = b64_decode(weights["dt_bias"].as_str().unwrap());
+        let a_log_bytes = b64_decode(weights["a_log"].as_str().unwrap());
+        // recurrent_state_before is encoded as F32 (production layout).
+        let recurrent_state_before_bytes =
+            b64_decode(weights["recurrent_state_before"].as_str().unwrap());
+        let recurrent_out_expected = b64_decode(inters["recurrent_out"].as_str().unwrap());
+        let state_after_expected = b64_decode(inters["state_after"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let k_us = geom.num_k_heads as usize;
+        let v_us = geom.num_v_heads as usize;
+        let kd_us = geom.head_k_dim as usize;
+        let vd_us = geom.head_v_dim as usize;
+        let kernel = geom.conv_kernel_dim as usize;
+        let kstate = kernel - 1;
+        let key_dim = k_us * kd_us;
+        let val_dim = v_us * vd_us;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let v_kdim = v_us * kd_us;
+        let v_vdim = v_us * vd_us;
+        let state_elems = v_us * kd_us * vd_us;
+
+        assert_eq!(dt_bias_bytes.len(), v_us * 2);
+        assert_eq!(a_log_bytes.len(), v_us * 2);
+        // recurrent_state encoded F32 (4 bytes/elem).
+        assert_eq!(recurrent_state_before_bytes.len(), state_elems * 4);
+        assert_eq!(recurrent_out_expected.len(), v_vdim * 2);
+        assert_eq!(state_after_expected.len(), state_elems * 4);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let in_proj_qkv_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
+        ).expect("upload in_proj_qkv_w");
+        let in_proj_z_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
+        ).expect("upload in_proj_z_w");
+        let in_proj_a_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
+        ).expect("upload in_proj_a_w");
+        let in_proj_b_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
+        ).expect("upload in_proj_b_w");
+        let conv1d_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
+        ).expect("upload conv1d_w");
+        let conv1d_bias = match &conv1d_bias_bytes {
+            Some(bytes) => Some(
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
+                    .expect("upload conv1d_bias"),
+            ),
+            None => None,
+        };
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
+        ).expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
+        ).expect("upload a_log");
+        let mut conv_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
+        ).expect("upload conv_state");
+        let mut recurrent_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::F32, &[state_elems], &recurrent_state_before_bytes,
+        ).expect("upload recurrent_state");
+
+        // Stage 4 publishes recurrent_out [V*v_dim] BF16. The buffer is
+        // sized for the largest staged intermediate (still stage 3's
+        // q_scaled||k_rep||v_heads = 2*V*k_dim + V*v_dim).
+        let stage_publish_max = 2 * v_kdim + v_vdim;
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[stage_publish_max],
+        ).expect("alloc output");
+        // Workspace for stage 4 = previous + BETA + G + REC_OUT.
+        let workspace_floats =
+            qkv_dim + val_dim + 2 * v_us
+            + 2 * (k_us * kd_us)
+            + 2 * v_kdim
+            + v_us + v_us
+            + v_vdim;
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[workspace_floats],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 4,
+            hidden: geom.hidden,
+            num_k_heads: geom.num_k_heads,
+            num_v_heads: geom.num_v_heads,
+            head_k_dim: geom.head_k_dim,
+            head_v_dim: geom.head_v_dim,
+            conv_kernel_dim: geom.conv_kernel_dim,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            dt_bias: dt_bias.as_ptr(),
+            a_log: a_log.as_ptr(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("linear_step_launch stage 4");
+
+        // Stage 4 publishes recurrent_out [V*v_dim] BF16.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let rec_out_bytes = &got_bytes_full[..v_vdim * 2];
+        // Recurrent state mixes BF16-rounded inputs (k_rep, q_scaled,
+        // v_heads) into F32-precision math; the per-V*v_dim reduction is
+        // 128-wide so allow the same envelope as the qkv_proj reduction.
+        assert_parity(
+            "linear step4 recurrent_out",
+            rec_out_bytes,
+            &recurrent_out_expected,
+            0.04,
+            0.9999,
+        );
+
+        // Also verify state_after — the F32 recurrent state has been
+        // mutated in place by the kernel and must match the oracle's
+        // post-update state for the next decode step to work.
+        let state_after_got = recurrent_state.to_host_bytes().expect("download state");
+        // F32 throughout (no BF16 rounding); be tighter on max_abs.
+        // Per-element rounding error from F32 arithmetic + cast-from-BF16
+        // operands is at most a few ULPs of the magnitude.
+        assert_parity_f32(
+            "linear step4 state_after",
+            &state_after_got,
+            &state_after_expected,
+            5e-3,
+            0.9999,
+        );
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_linear_step_5_output_hidden_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_linear_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON not set. \
+                 See `qwen36_moe_linear_step_1_qkv_raw_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 5 needs every weight from earlier stages plus norm_w and out_proj_w.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let in_proj_qkv_w_bytes = b64_decode(weights["in_proj_qkv_w"].as_str().unwrap());
+        let in_proj_z_w_bytes = b64_decode(weights["in_proj_z_w"].as_str().unwrap());
+        let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
+        let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
+        let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
+        let conv1d_bias_bytes = weights.get("conv1d_bias")
+            .and_then(|v| v.as_str())
+            .map(b64_decode);
+        let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
+        let dt_bias_bytes = b64_decode(weights["dt_bias"].as_str().unwrap());
+        let a_log_bytes = b64_decode(weights["a_log"].as_str().unwrap());
+        let recurrent_state_before_bytes =
+            b64_decode(weights["recurrent_state_before"].as_str().unwrap());
+        let norm_w_bytes = b64_decode(weights["norm_w"].as_str().unwrap());
+        let out_proj_w_bytes = b64_decode(weights["out_proj_w"].as_str().unwrap());
+        let output_hidden_expected = b64_decode(inters["output_hidden"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let k_us = geom.num_k_heads as usize;
+        let v_us = geom.num_v_heads as usize;
+        let kd_us = geom.head_k_dim as usize;
+        let vd_us = geom.head_v_dim as usize;
+        let kernel = geom.conv_kernel_dim as usize;
+        let kstate = kernel - 1;
+        let key_dim = k_us * kd_us;
+        let val_dim = v_us * vd_us;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let v_kdim = v_us * kd_us;
+        let v_vdim = v_us * vd_us;
+        let state_elems = v_us * kd_us * vd_us;
+
+        assert_eq!(norm_w_bytes.len(), vd_us * 2);
+        assert_eq!(out_proj_w_bytes.len(), hidden_us * v_vdim * 2);
+        assert_eq!(output_hidden_expected.len(), hidden_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let in_proj_qkv_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
+        ).expect("upload in_proj_qkv_w");
+        let in_proj_z_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
+        ).expect("upload in_proj_z_w");
+        let in_proj_a_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
+        ).expect("upload in_proj_a_w");
+        let in_proj_b_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
+        ).expect("upload in_proj_b_w");
+        let conv1d_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
+        ).expect("upload conv1d_w");
+        let conv1d_bias = match &conv1d_bias_bytes {
+            Some(bytes) => Some(
+                GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
+                    .expect("upload conv1d_bias"),
+            ),
+            None => None,
+        };
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
+        ).expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
+        ).expect("upload a_log");
+        let norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[vd_us], &norm_w_bytes,
+        ).expect("upload norm_w");
+        let out_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us, v_vdim], &out_proj_w_bytes,
+        ).expect("upload out_proj_w");
+        let mut conv_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
+        ).expect("upload conv_state");
+        let mut recurrent_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::F32, &[state_elems], &recurrent_state_before_bytes,
+        ).expect("upload recurrent_state");
+
+        let stage_publish_max = 2 * v_kdim + v_vdim;
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[stage_publish_max],
+        ).expect("alloc output");
+        let workspace_floats =
+            qkv_dim + val_dim + 2 * v_us
+            + 2 * (k_us * kd_us)
+            + 2 * v_kdim
+            + v_us + v_us
+            + v_vdim;
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[workspace_floats],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 5,
+            hidden: geom.hidden,
+            num_k_heads: geom.num_k_heads,
+            num_v_heads: geom.num_v_heads,
+            head_k_dim: geom.head_k_dim,
+            head_v_dim: geom.head_v_dim,
+            conv_kernel_dim: geom.conv_kernel_dim,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            dt_bias: dt_bias.as_ptr(),
+            a_log: a_log.as_ptr(),
+            norm_w: norm_w.as_ptr(),
+            out_proj_w: out_proj_w.as_ptr(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("linear_step_launch stage 5");
+
+        // Stage 5 publishes output_hidden into output[0..hidden) BF16.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_bytes_full[..hidden_us * 2];
+        // out_proj reduces over V*v_dim=4096 lanes; same envelope as
+        // PR 4b2 stage 5.
+        assert_parity(
+            "linear step5 output_hidden",
+            got_bytes,
+            &output_hidden_expected,
+            0.05,
+            0.9999,
+        );
     }
 }
