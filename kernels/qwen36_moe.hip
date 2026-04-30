@@ -2064,6 +2064,39 @@ __global__ void qwen36_moe_ffn_step_kernel(
             __syncthreads();
         }
     }
+
+    if (stage < 5) {
+        return;
+    }
+
+    // -- Phase K: residual add — output_hidden = input + moe + shared  -----
+    // The trivial closing slice. Each output row is independent; F32 sum
+    // with one BF16 round at the store, matching the oracle's
+    // `(input_hidden.f32 + moe_out.f32 + shared_out.f32).to(dtype)`.
+    //
+    // moe_out is already in workspace at OFF_MOE_OUT (BF16-rounded F32);
+    // shared_out is at OFF_SHARED_OUT (BF16-rounded F32). We add the
+    // input_hidden (BF16 → F32 promotion) on top.
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+    for (;;) {
+        __shared__ unsigned int my_row_k_s;
+        if (tid == 0) {
+            my_row_k_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_k_s);
+        if (my_row >= hidden) break;
+
+        if (tid == 0) {
+            const float in_f   = static_cast<float>(input_hidden[my_row]);
+            const float moe_f  = workspace[OFF_MOE_OUT + my_row];
+            const float shr_f  = workspace[OFF_SHARED_OUT + my_row];
+            const float val    = bf16_round_rne_f32(in_f + moe_f + shr_f);
+            output[my_row] = static_cast<T>(val);
+        }
+        __syncthreads();
+    }
 }
 
 } // namespace qwen36_moe

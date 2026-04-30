@@ -3255,4 +3255,138 @@ mod tests {
             0.999,
         );
     }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_ffn_step_5_output_hidden_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_ffn_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_FFN_ORACLE_JSON not set. \
+                 See `qwen36_moe_ffn_step_1_topk_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 5 is the trivial closer — same weights as stage 4 plus the
+        // residual add against `input_hidden`.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
+        let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
+        let gate_up_proj_w_bytes =
+            b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
+        let down_proj_w_bytes = b64_decode(weights["down_proj_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes =
+            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes =
+            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes =
+            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_expert_gate_w_bytes =
+            b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
+        let output_hidden_expected_bytes =
+            b64_decode(inters["output_hidden"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let e_us = geom.num_experts as usize;
+        let i_us = geom.moe_intermediate as usize;
+        let is_us = geom.shared_intermediate as usize;
+        let k_us = geom.top_k as usize;
+
+        assert_eq!(output_hidden_expected_bytes.len(), hidden_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let post_attn_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
+        ).expect("upload post_attn_norm_w");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
+        ).expect("upload gate_w");
+        let gate_up_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, 2 * i_us, hidden_us], &gate_up_proj_w_bytes,
+        ).expect("upload gate_up_proj_w");
+        let down_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us, i_us], &down_proj_w_bytes,
+        ).expect("upload down_proj_w");
+        let shared_gate_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
+        ).expect("upload shared_gate_proj_w");
+        let shared_up_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
+        ).expect("upload shared_up_proj_w");
+        let shared_down_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
+        ).expect("upload shared_down_proj_w");
+        let shared_expert_gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
+        ).expect("upload shared_expert_gate_w");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
+        ).expect("alloc output");
+        let mut output_idx = GpuBuffer::zeros(
+            ordinal, ScalarType::U32, &[k_us],
+        ).expect("alloc output_idx");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 5,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: post_attn_norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: gate_up_proj_w.as_ptr(),
+            down_proj_w: down_proj_w.as_ptr(),
+            shared_gate_proj_w: shared_gate_proj_w.as_ptr(),
+            shared_up_proj_w: shared_up_proj_w.as_ptr(),
+            shared_down_proj_w: shared_down_proj_w.as_ptr(),
+            shared_expert_gate_w: shared_expert_gate_w.as_ptr(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("ffn_step_launch stage 5");
+
+        // Stage 5 publishes output_hidden = input_hidden + moe_out +
+        // shared_out (all F32, BF16-round once at the end). The residual
+        // addition can't make accuracy worse than stage 4's moe_out, so
+        // the same envelope applies.
+        let got_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_full[..hidden_us * 2];
+        assert_parity(
+            "ffn step5 output_hidden",
+            got_bytes,
+            &output_hidden_expected_bytes,
+            0.05,
+            0.999,
+        );
+    }
 }
