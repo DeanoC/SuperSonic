@@ -403,9 +403,9 @@ pub fn attn_step_launch(
             params.stage
         )));
     }
-    if params.stage > 1 {
+    if params.stage > 2 {
         return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 step 1 only)",
+            "qwen36_moe::attn_step_launch: stage {} not yet implemented (PR 4b2 stages 1-2 only)",
             params.stage
         )));
     }
@@ -683,51 +683,126 @@ mod tests {
             .collect()
     }
 
+    /// Geometry pulled from the oracle JSON's `config` block — pinned to
+    /// what every parity test in this file consumes.
+    #[cfg(supersonic_backend_hip)]
+    struct OracleGeom {
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rms_norm_eps: f32,
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    fn load_oracle_json() -> Option<(serde_json::Value, OracleGeom)> {
+        let json_path = std::env::var("SUPERSONIC_QWEN36_ORACLE_JSON").ok()?;
+        let raw = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|e| panic!("read oracle json {json_path}: {e}"));
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("oracle json parse");
+        assert_eq!(
+            json["dtype"].as_str().unwrap_or(""),
+            "bf16",
+            "PR 4b2 parity tests require the oracle to be in bf16 mode"
+        );
+        let cfg = &json["config"];
+        let geom = OracleGeom {
+            hidden: cfg["hidden"].as_i64().unwrap() as i32,
+            num_heads: cfg["num_attention_heads"].as_i64().unwrap() as i32,
+            num_kv_heads: cfg["num_kv_heads"].as_i64().unwrap() as i32,
+            head_dim: cfg["head_dim"].as_i64().unwrap() as i32,
+            rms_norm_eps: cfg["rms_norm_eps"].as_f64().unwrap() as f32,
+        };
+        Some((json, geom))
+    }
+
+    /// Compare a kernel-produced BF16 buffer against the matching oracle
+    /// intermediate, emit a one-line summary, and assert tolerances. BF16
+    /// stores at every boundary mean most elements are bit-exact; the rare
+    /// 1-ULP misses come from F32 accumulation-order drift in the matmul.
+    #[cfg(supersonic_backend_hip)]
+    fn assert_parity(
+        label: &str,
+        got_bytes: &[u8],
+        want_bytes: &[u8],
+        max_abs_tol: f32,
+        cos_sim_floor: f64,
+    ) {
+        assert_eq!(
+            got_bytes.len(), want_bytes.len(),
+            "{label}: byte length mismatch"
+        );
+        let got = bf16_bytes_to_f32(got_bytes);
+        let want = bf16_bytes_to_f32(want_bytes);
+        let n = got.len();
+        let mut max_abs_diff = 0.0f32;
+        let mut sum_abs_diff = 0.0f32;
+        let mut dot = 0.0f64;
+        let mut got_sq = 0.0f64;
+        let mut want_sq = 0.0f64;
+        let mut exact = 0usize;
+        for i in 0..n {
+            let d = (got[i] - want[i]).abs();
+            if d == 0.0 { exact += 1; }
+            max_abs_diff = max_abs_diff.max(d);
+            sum_abs_diff += d;
+            dot += got[i] as f64 * want[i] as f64;
+            got_sq += (got[i] as f64).powi(2);
+            want_sq += (want[i] as f64).powi(2);
+        }
+        let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
+        let mean_abs_diff = sum_abs_diff / n as f32;
+        eprintln!(
+            "[parity {label}] n={n} exact={exact} max_abs={max_abs_diff:.5e} \
+             mean_abs={mean_abs_diff:.5e} cos_sim={cos_sim:.7}"
+        );
+        assert!(
+            max_abs_diff <= max_abs_tol,
+            "{label}: max_abs={max_abs_diff} exceeds tolerance {max_abs_tol}"
+        );
+        assert!(
+            cos_sim >= cos_sim_floor,
+            "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}"
+        );
+    }
+
+    /// Returns workspace size sufficient for the largest staged
+    /// intermediate (currently stage 2: 2*H*d + 2*Hkv*d + H*d + Hkv*d F32).
+    /// Bumped by future stages as RoPE / attn buffers get added.
+    #[cfg(supersonic_backend_hip)]
+    fn parity_workspace_floats(num_heads: i32, num_kv_heads: i32, head_dim: i32) -> usize {
+        let h = num_heads as usize;
+        let hkv = num_kv_heads as usize;
+        let d = head_dim as usize;
+        2 * h * d + 2 * hkv * d + h * d + hkv * d
+    }
+
     #[cfg(supersonic_backend_hip)]
     #[test]
     fn qwen36_moe_attn_step_1_q_normed_matches_oracle() {
         use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
 
-        let json_path = match std::env::var("SUPERSONIC_QWEN36_ORACLE_JSON") {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!(
-                    "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
-                     Generate a fixture with \
-                     `python oracle/qwen36_moe_oracle.py --mode synthetic --out /tmp/syn.json` \
-                     and re-run."
-                );
-                return;
-            }
+        let Some((json, geom)) = load_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
+                 Generate a fixture with \
+                 `python oracle/qwen36_moe_oracle.py --mode synthetic --out /tmp/syn.json` \
+                 and re-run."
+            );
+            return;
         };
-
-        let raw = std::fs::read_to_string(&json_path)
-            .unwrap_or_else(|e| panic!("read oracle json {json_path}: {e}"));
-        let json: serde_json::Value = serde_json::from_str(&raw)
-            .expect("oracle json parse");
-        let cfg = &json["config"];
         let weights = &json["weights"];
         let inters = &json["intermediates"];
-        assert_eq!(json["dtype"].as_str().unwrap_or(""), "bf16",
-                   "PR 4b2 step 1 requires the oracle to be in bf16 mode");
 
-        let hidden = cfg["hidden"].as_i64().unwrap() as i32;
-        let num_heads = cfg["num_attention_heads"].as_i64().unwrap() as i32;
-        let num_kv_heads = cfg["num_kv_heads"].as_i64().unwrap() as i32;
-        let head_dim = cfg["head_dim"].as_i64().unwrap() as i32;
-        let rms_norm_eps = cfg["rms_norm_eps"].as_f64().unwrap() as f32;
-
-        // Decode the four BF16 inputs we need for stage 1.
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
         let q_proj_w_bytes = b64_decode(weights["q_proj_w"].as_str().unwrap());
         let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
         let q_normed_expected_bytes = b64_decode(inters["q_normed"].as_str().unwrap());
 
-        // Sanity-check sizes against config-derived shapes.
-        let hidden_us = hidden as usize;
-        let h_us = num_heads as usize;
-        let d_us = head_dim as usize;
+        let hidden_us = geom.hidden as usize;
+        let h_us = geom.num_heads as usize;
+        let d_us = geom.head_dim as usize;
         assert_eq!(input_hidden_bytes.len(), hidden_us * 2);
         assert_eq!(input_norm_w_bytes.len(), hidden_us * 2);
         assert_eq!(q_proj_w_bytes.len(), 2 * h_us * d_us * hidden_us * 2);
@@ -737,9 +812,6 @@ mod tests {
         set_backend(Backend::Hip);
         let ordinal = 0usize;
 
-        // Upload all four inputs as BF16 buffers. The kernel reads them
-        // through `*const c_void` so the gpu-hal shape just needs to match
-        // element count.
         let input_hidden = GpuBuffer::from_host_bytes(
             ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
         ).expect("upload input_hidden");
@@ -757,7 +829,8 @@ mod tests {
             ordinal, ScalarType::BF16, &[h_us * d_us],
         ).expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[2 * h_us * d_us],
+            ordinal, ScalarType::F32,
+            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
             ordinal, ScalarType::U8, &[32],
@@ -765,13 +838,13 @@ mod tests {
 
         let params = Qwen36MoeAttnStepParams {
             stage: 1,
-            hidden,
-            num_heads,
-            num_kv_heads,
-            head_dim,
+            hidden: geom.hidden,
+            num_heads: geom.num_heads,
+            num_kv_heads: geom.num_kv_heads,
+            head_dim: geom.head_dim,
             rotary_dim: 0,
             rope_theta: 0.0,
-            rms_norm_eps,
+            rms_norm_eps: geom.rms_norm_eps,
             position: 0,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
@@ -797,49 +870,122 @@ mod tests {
         .expect("attn_step_launch stage 1");
 
         let got_bytes = output.to_host_bytes().expect("download output");
-        assert_eq!(got_bytes.len(), q_normed_expected_bytes.len());
-
-        let got = bf16_bytes_to_f32(&got_bytes);
-        let want = bf16_bytes_to_f32(&q_normed_expected_bytes);
-
-        // BF16 q_normed parity: kernel and oracle both round to BF16 at
-        // every store boundary, so most elements should be exact. The
-        // F32-accumulation order in the matmul can cause rare 1-ULP
-        // BF16 disagreements in the lower bits; tolerate that with a tight
-        // absolute threshold and require cosine similarity ≥ 0.9999.
-        let n = got.len();
-        let mut max_abs_diff = 0.0f32;
-        let mut sum_abs_diff = 0.0f32;
-        let mut dot = 0.0f64;
-        let mut got_sq = 0.0f64;
-        let mut want_sq = 0.0f64;
-        let mut exact = 0usize;
-        for i in 0..n {
-            let d = (got[i] - want[i]).abs();
-            if d == 0.0 { exact += 1; }
-            max_abs_diff = max_abs_diff.max(d);
-            sum_abs_diff += d;
-            dot += got[i] as f64 * want[i] as f64;
-            got_sq += (got[i] as f64).powi(2);
-            want_sq += (want[i] as f64).powi(2);
-        }
-        let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
-        let mean_abs_diff = sum_abs_diff / n as f32;
-        eprintln!(
-            "[parity step1] n={n} exact={exact} max_abs={max_abs_diff:.5e} \
-             mean_abs={mean_abs_diff:.5e} cos_sim={cos_sim:.7}"
-        );
-
-        // Tolerances: synth-mode q_normed values land in roughly [-2, 2].
         // BF16 ULP at magnitude 1 is ~7.8e-3; allow 4× that for matmul
-        // accumulation order drift.
-        assert!(
-            max_abs_diff <= 0.04,
-            "kernel q_normed diverges from oracle: max_abs={max_abs_diff} (>0.04)"
-        );
-        assert!(
-            cos_sim >= 0.9999,
-            "kernel q_normed cosine similarity {cos_sim:.7} below 0.9999"
-        );
+        // accumulation order drift across the 2048-wide reduction.
+        assert_parity("step1 q_normed", &got_bytes, &q_normed_expected_bytes, 0.04, 0.9999);
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_attn_step_2_k_normed_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_ORACLE_JSON not set. \
+                 See `qwen36_moe_attn_step_1_q_normed_matches_oracle` for setup."
+            );
+            return;
+        };
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 2 still runs the stage-1 prerequisite (q_normed lives in
+        // workspace for later RoPE), so the kernel needs the q-side weights
+        // even though we only verify k_normed here.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let q_proj_w_bytes = b64_decode(weights["q_proj_w"].as_str().unwrap());
+        let k_proj_w_bytes = b64_decode(weights["k_proj_w"].as_str().unwrap());
+        let v_proj_w_bytes = b64_decode(weights["v_proj_w"].as_str().unwrap());
+        let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
+        let k_norm_w_bytes = b64_decode(weights["k_norm_w"].as_str().unwrap());
+        let k_normed_expected_bytes = b64_decode(inters["k_normed"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let h_us = geom.num_heads as usize;
+        let hkv_us = geom.num_kv_heads as usize;
+        let d_us = geom.head_dim as usize;
+        assert_eq!(k_proj_w_bytes.len(), hkv_us * d_us * hidden_us * 2);
+        assert_eq!(v_proj_w_bytes.len(), hkv_us * d_us * hidden_us * 2);
+        assert_eq!(k_norm_w_bytes.len(), d_us * 2);
+        assert_eq!(k_normed_expected_bytes.len(), hkv_us * d_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let q_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
+        ).expect("upload q_proj_w");
+        let k_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
+        ).expect("upload k_proj_w");
+        let v_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
+        ).expect("upload v_proj_w");
+        let q_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
+        ).expect("upload q_norm_w");
+        let k_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
+        ).expect("upload k_norm_w");
+
+        // Output is sized for the largest staged intermediate (H*d). Stage 2
+        // writes Hkv*d BF16 elements at the start of the buffer.
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[h_us * d_us],
+        ).expect("alloc output");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32,
+            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 2,
+            hidden: geom.hidden,
+            num_heads: geom.num_heads,
+            num_kv_heads: geom.num_kv_heads,
+            head_dim: geom.head_dim,
+            rotary_dim: 0,
+            rope_theta: 0.0,
+            rms_norm_eps: geom.rms_norm_eps,
+            position: 0,
+        };
+        let weight_ptrs = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: k_proj_w.as_ptr(),
+            v_proj_w: v_proj_w.as_ptr(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: k_norm_w.as_ptr(),
+            o_proj_w: std::ptr::null(),
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("attn_step_launch stage 2");
+
+        // Stage 2 publishes k_normed into the first Hkv*d BF16 elements of
+        // the output buffer. Slice down to just those bytes for parity.
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_bytes_full[..hkv_us * d_us * 2];
+        assert_parity("step2 k_normed", got_bytes, &k_normed_expected_bytes, 0.04, 0.9999);
     }
 }

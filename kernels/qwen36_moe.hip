@@ -244,12 +244,15 @@ __global__ void qwen36_moe_descriptor_walk_stub(
 //   grid_size  = num_cus  (one block per CU, all guaranteed concurrent on
 //                          RDNA3 → grid_barrier safe without coop launch)
 //
-//   workspace[F32], at least 2*H*d + 2*Hkv*d entries:
-//     [0,           2*H*d):           q_raw   (BF16-rounded F32 to mirror
-//                                              PyTorch's BF16 q_raw matmul)
-//     reserved for stage 2+:
-//     [2*H*d,       2*H*d + Hkv*d):   k_raw
-//     [2*H*d + Hkv*d, 2*H*d + 2*Hkv*d): v_raw
+//   workspace[F32], staged-attention scratch (offsets in F32 elements):
+//     Q_RAW    = 0                             [2*H*d]   q_proj output
+//     K_RAW    = 2*H*d                         [Hkv*d]   k_proj output
+//     V_RAW    = 2*H*d + Hkv*d                 [Hkv*d]   v_proj output
+//     Q_NORMED = 2*H*d + 2*Hkv*d               [H*d]     stage-1 result
+//     K_NORMED = 2*H*d + 2*Hkv*d + H*d         [Hkv*d]   stage-2 result
+//   …RoPE / attn slots (stages 3+) get appended in their own commits.
+//   Total stage-2 footprint: 2*H*d + 2*Hkv*d + H*d + Hkv*d F32 elements.
+//   For 35B-A3B (H=16, Hkv=2, d=256, hidden=2048) that's 13,824 F32 = 54 KiB.
 //
 //   counters[0]: work-stealing index, reused across phases. Reset by
 //                grid_barrier_reset_counter at every phase boundary.
@@ -373,13 +376,23 @@ __global__ void qwen36_moe_attn_step_kernel(
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
 
-    // -- Phase C: per-head RMS norm of q_lanes = workspace[0..H*d] ---------
-    // Each block grabs a head index and reduces across head_dim, writing
-    // BF16 q_normed[h*d : (h+1)*d] to `output`.
-    if (stage >= 1) {
-        const int H = num_heads;
-        const int d = head_dim;
+    // Workspace offsets (F32 elements). Kept in locals so the layout is
+    // documented next to the code that uses it.
+    const int H        = num_heads;
+    const int Hkv      = num_kv_heads;
+    const int d        = head_dim;
+    const int OFF_Q_RAW    = 0;
+    const int OFF_K_RAW    = 2 * H * d;
+    const int OFF_V_RAW    = 2 * H * d + Hkv * d;
+    const int OFF_Q_NORMED = 2 * H * d + 2 * Hkv * d;
+    const int OFF_K_NORMED = 2 * H * d + 2 * Hkv * d + H * d;
 
+    // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
+    // Each block grabs a head index, reduces across head_dim, writes BF16
+    // q_normed to workspace[Q_NORMED..]. If stage == 1 we also publish
+    // q_normed to the host-visible `output` buffer; later stages keep
+    // q_normed in workspace as RoPE input.
+    {
         for (;;) {
             __shared__ unsigned int head_s;
             if (tid == 0) {
@@ -392,7 +405,7 @@ __global__ void qwen36_moe_attn_step_kernel(
             const int base = h * d;
             float partial = 0.0f;
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[base + i];
+                const float v = workspace[OFF_Q_RAW + base + i];
                 partial += v * v;
             }
             shared_scratch[tid] = partial;
@@ -408,16 +421,117 @@ __global__ void qwen36_moe_attn_step_kernel(
             __syncthreads();
 
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[base + i];
+                const float v = workspace[OFF_Q_RAW + base + i];
                 const float wv = load_as_float<T>(q_norm_w, i);
                 const float normed = bf16_round_rne_f32(v * head_inv_rms * wv);
-                output[base + i] = static_cast<T>(normed);
+                // Round-trip through BF16 representation: store BF16 in
+                // workspace as F32 so the next-stage RoPE reader sees the
+                // exact dtype-cast values PyTorch's `.to(bf16)` produces.
+                workspace[OFF_Q_NORMED + base + i] = normed;
+                if (stage == 1) {
+                    output[base + i] = static_cast<T>(normed);
+                }
             }
             __syncthreads();
         }
     }
 
-    // Stages 2..5 hook in here in follow-up commits. Each starts with a
+    if (stage < 2) {
+        // Stage 1 stops here. The reset_counter call below would still be
+        // safe but is unnecessary work for the parity test.
+        return;
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase D: k_raw, v_raw via fused work-stealing matvec --------------
+    // Combine k_proj_w and v_proj_w into a single 2*Hkv*d-row work pool so
+    // every block stays busy regardless of which projection it claims. Both
+    // projections share the same x_norm input, so this is purely a row
+    // dispatch fold — same pattern PyTorch uses internally for fused QKV.
+    const int kv_total_rows = 2 * Hkv * d;
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(&counters[0], 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= kv_total_rows) break;
+
+        // First Hkv*d rows belong to k_proj, next Hkv*d to v_proj.
+        const bool is_v = my_row >= Hkv * d;
+        const int proj_row = is_v ? (my_row - Hkv * d) : my_row;
+        const T* w_row = (is_v ? v_proj_w : k_proj_w)
+            + static_cast<size_t>(proj_row) * hidden;
+        const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
+
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            workspace[dst_off] = bf16_round_rne_f32(shared_scratch[0]);
+        }
+        __syncthreads();
+    }
+
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
+
+    // -- Phase E: per-head RMS norm of K (Hkv heads) -----------------------
+    // Same shape as Phase C but reduces over Hkv heads, sourcing from
+    // workspace[K_RAW] and writing workspace[K_NORMED]. If stage == 2
+    // we also publish k_normed to the host-visible `output` buffer.
+    {
+        for (;;) {
+            __shared__ unsigned int head_s;
+            if (tid == 0) {
+                head_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int h = static_cast<int>(head_s);
+            if (h >= Hkv) break;
+
+            const int base = h * d;
+            float partial = 0.0f;
+            for (int i = tid; i < d; i += block_size) {
+                const float v = workspace[OFF_K_RAW + base + i];
+                partial += v * v;
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            __shared__ float head_inv_rms;
+            if (tid == 0) {
+                head_inv_rms = rsqrtf(shared_scratch[0] / static_cast<float>(d) + rms_norm_eps);
+            }
+            __syncthreads();
+
+            for (int i = tid; i < d; i += block_size) {
+                const float v = workspace[OFF_K_RAW + base + i];
+                const float wv = load_as_float<T>(k_norm_w, i);
+                const float normed = bf16_round_rne_f32(v * head_inv_rms * wv);
+                workspace[OFF_K_NORMED + base + i] = normed;
+                if (stage == 2) {
+                    output[base + i] = static_cast<T>(normed);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Stages 3..5 hook in here in follow-up commits. Each starts with a
     // grid_barrier_reset_counter and reuses `counters[0]` for its own
     // work-stealing.
 }
