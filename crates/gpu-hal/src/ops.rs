@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::backend::{current_backend, Backend, DeviceInfo};
+use crate::backend::{
+    current_backend, current_memory_architecture, Backend, DeviceInfo, MemoryArchitecture,
+};
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
 use crate::error::{backend_error, GpuError, Result};
@@ -293,8 +295,30 @@ pub fn set_device(ordinal: usize) -> Result<()> {
     Ok(())
 }
 
-/// Allocate `len_bytes` of device memory, returning a non-null pointer.
-pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
+/// Distinguishes which underlying allocator produced a buffer pointer, so the
+/// matching `free` call can be issued at drop time. Internal coordination
+/// type between [`alloc`] and [`free`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllocatorKind {
+    /// Classic device-pointer allocation: `hipMalloc` / `cudaMalloc` /
+    /// `supersonic_metal_alloc`. Free with the matching `*Free`.
+    Discrete,
+    /// HIP host-mapped+coherent allocation (`hipHostMalloc` with
+    /// `HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT`). The pointer
+    /// addresses system RAM directly and is usable from both host and device
+    /// on RDNA3 integrated / unified-memory arches. Free with `hipHostFree`.
+    UnifiedHost,
+}
+
+/// Allocate `len_bytes` of device-addressable memory, returning a non-null
+/// pointer plus the allocator kind that produced it. On HIP arches with
+/// `MemoryArchitecture::Unified` (gfx1150 APU), the allocation comes out of
+/// system RAM via `hipHostMalloc(MAPPED | COHERENT)` so host and device see
+/// the same physical bytes.
+pub(crate) fn alloc(
+    ordinal: usize,
+    len_bytes: usize,
+) -> Result<(NonNull<c_void>, AllocatorKind)> {
     if len_bytes == 0 {
         return Err(GpuError::InvalidArg("allocation size must be > 0".into()));
     }
@@ -302,11 +326,21 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
         let backend = current_backend();
         with_device_impl(backend, ordinal, || {
             let mut ptr = std::ptr::null_mut();
+            let mut kind = AllocatorKind::Discrete;
             let status = match backend {
                 Backend::Hip => {
                     #[cfg(supersonic_backend_hip)]
                     unsafe {
-                        hipMalloc(&mut ptr, len_bytes)
+                        if current_memory_architecture() == MemoryArchitecture::Unified {
+                            kind = AllocatorKind::UnifiedHost;
+                            hipHostMalloc(
+                                &mut ptr,
+                                len_bytes,
+                                HIP_HOST_MALLOC_MAPPED | HIP_HOST_MALLOC_COHERENT,
+                            )
+                        } else {
+                            hipMalloc(&mut ptr, len_bytes)
+                        }
                     }
                     #[cfg(not(supersonic_backend_hip))]
                     1
@@ -329,17 +363,30 @@ pub fn alloc(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
                 }
             };
             if status != 0 {
-                return Err(match backend {
-                    Backend::Hip => backend_error(Backend::Hip, "hipMalloc", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaMalloc", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalAlloc", status),
+                return Err(match (backend, kind) {
+                    (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                        backend_error(Backend::Hip, "hipHostMalloc(unified)", status)
+                    }
+                    (Backend::Hip, _) => backend_error(Backend::Hip, "hipMalloc", status),
+                    (Backend::Cuda, _) => backend_error(Backend::Cuda, "cudaMalloc", status),
+                    (Backend::Metal, _) => backend_error(Backend::Metal, "metalAlloc", status),
                 });
             }
-            NonNull::new(ptr).ok_or_else(|| match backend {
-                Backend::Hip => GpuError::backend(Backend::Hip, "hipMalloc returned null".into()),
-                Backend::Cuda => GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into()),
-                Backend::Metal => GpuError::backend(Backend::Metal, "metalAlloc returned null".into()),
-            })
+            let nn = NonNull::new(ptr).ok_or_else(|| match (backend, kind) {
+                (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                    GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
+                }
+                (Backend::Hip, _) => {
+                    GpuError::backend(Backend::Hip, "hipMalloc returned null".into())
+                }
+                (Backend::Cuda, _) => {
+                    GpuError::backend(Backend::Cuda, "cudaMalloc returned null".into())
+                }
+                (Backend::Metal, _) => {
+                    GpuError::backend(Backend::Metal, "metalAlloc returned null".into())
+                }
+            })?;
+            Ok((nn, kind))
         })
     })
 }
@@ -463,22 +510,40 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
     }
 }
 
-/// Allocate `len_bytes` of device memory, zeroed.
-pub fn alloc_zeros(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_void>> {
-    let ptr = alloc(ordinal, len_bytes)?;
+/// Allocate `len_bytes` of device memory, zeroed. Same allocator-dispatch
+/// behavior as [`alloc`].
+pub(crate) fn alloc_zeros(
+    ordinal: usize,
+    len_bytes: usize,
+) -> Result<(NonNull<c_void>, AllocatorKind)> {
+    let (ptr, kind) = alloc(ordinal, len_bytes)?;
     memset_zeros(ordinal, ptr.as_ptr(), len_bytes)?;
-    Ok(ptr)
+    Ok((ptr, kind))
 }
 
-/// Free device memory. No-op on null.
-pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
+/// Free a buffer allocated by [`alloc`]. Dispatches `hipFree` vs `hipHostFree`
+/// based on the recorded allocator kind. No-op on null.
+pub(crate) fn free(
+    backend: Backend,
+    ordinal: usize,
+    ptr: *mut c_void,
+    allocator: AllocatorKind,
+) {
     if ptr.is_null() {
         return;
     }
     hal_profile_time("free", 0, || {
         let _ = with_device_impl(backend, ordinal, || {
-            let status = match backend {
-                Backend::Hip => {
+            let status = match (backend, allocator) {
+                (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                    #[cfg(supersonic_backend_hip)]
+                    unsafe {
+                        hipHostFree(ptr)
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    1
+                }
+                (Backend::Hip, _) => {
                     #[cfg(supersonic_backend_hip)]
                     unsafe {
                         hipFree(ptr)
@@ -486,7 +551,7 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
                     #[cfg(not(supersonic_backend_hip))]
                     1
                 }
-                Backend::Cuda => {
+                (Backend::Cuda, _) => {
                     #[cfg(supersonic_backend_cuda)]
                     unsafe {
                         cudaFree(ptr)
@@ -494,7 +559,7 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
                     #[cfg(not(supersonic_backend_cuda))]
                     1
                 }
-                Backend::Metal => {
+                (Backend::Metal, _) => {
                     #[cfg(supersonic_backend_metal)]
                     unsafe {
                         supersonic_metal_free(ptr)
@@ -504,10 +569,13 @@ pub fn free(backend: Backend, ordinal: usize, ptr: *mut c_void) {
                 }
             };
             if status != 0 {
-                return Err(match backend {
-                    Backend::Hip => backend_error(Backend::Hip, "hipFree", status),
-                    Backend::Cuda => backend_error(Backend::Cuda, "cudaFree", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalFree", status),
+                return Err(match (backend, allocator) {
+                    (Backend::Hip, AllocatorKind::UnifiedHost) => {
+                        backend_error(Backend::Hip, "hipHostFree", status)
+                    }
+                    (Backend::Hip, _) => backend_error(Backend::Hip, "hipFree", status),
+                    (Backend::Cuda, _) => backend_error(Backend::Cuda, "cudaFree", status),
+                    (Backend::Metal, _) => backend_error(Backend::Metal, "metalFree", status),
                 });
             }
             Ok(())

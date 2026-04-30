@@ -1,6 +1,6 @@
 use std::fmt;
 
-pub use gpu_hal::Backend;
+pub use gpu_hal::{Backend, MemoryArchitecture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
@@ -144,23 +144,6 @@ impl fmt::Display for GpuArch {
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
-}
-
-/// How a GPU's memory is wired relative to host RAM.
-///
-/// This is the dimension that drives allocation/copy policy — it's coarser
-/// than `GpuArch` on purpose. Future code that wants "should I use pinned
-/// host memory / managed memory / zero-copy?" should branch on this rather
-/// than enumerating arches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryArchitecture {
-    /// Discrete GPU with dedicated VRAM, distinct from host RAM. `hipMalloc`
-    /// / `cudaMalloc` allocate device memory; H2D/D2H copies traverse PCIe.
-    Discrete,
-    /// APU / integrated GPU sharing system RAM with the host. Allocations
-    /// come out of system memory; H2D/D2H may be eligible for zero-copy or
-    /// host-coherent / managed paths.
-    Unified,
 }
 
 /// Per-arch policy bundle. Returned by [`ArchProfile::for_arch`] — one source

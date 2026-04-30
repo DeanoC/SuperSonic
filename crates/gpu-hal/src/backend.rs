@@ -54,7 +54,38 @@ pub struct DeviceInfo {
     pub clock_rate_khz: u32,
 }
 
+/// How a GPU's memory is wired relative to host RAM.
+///
+/// Drives allocation/copy policy in `gpu-hal`. `Discrete` (default) keeps the
+/// classic `hipMalloc` / `cudaMalloc` device-pointer path. `Unified` switches
+/// HIP allocations to mapped+coherent host pages so host and device address
+/// the same physical bytes — the right shape for APUs (gfx1150) and Apple
+/// M-series, where there is no separate VRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryArchitecture {
+    Discrete,
+    Unified,
+}
+
+impl MemoryArchitecture {
+    fn code(self) -> u8 {
+        match self {
+            Self::Discrete => 1,
+            Self::Unified => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Self {
+        match code {
+            2 => Self::Unified,
+            // 0 (unset) and 1 both mean Discrete — preserves pre-wiring behavior.
+            _ => Self::Discrete,
+        }
+    }
+}
+
 static DEFAULT_BACKEND: AtomicU8 = AtomicU8::new(0);
+static DEFAULT_MEMORY_ARCHITECTURE: AtomicU8 = AtomicU8::new(0);
 
 pub fn compiled_backends() -> Vec<Backend> {
     let mut backends = Vec::new();
@@ -83,4 +114,17 @@ pub fn current_backend() -> Backend {
         .into_iter()
         .next()
         .expect("no GPU backends compiled")
+}
+
+/// Set the active memory architecture. Called once at startup after
+/// `set_backend`, typically from `ArchProfile::for_arch(...).memory`.
+pub fn set_memory_architecture(arch: MemoryArchitecture) {
+    DEFAULT_MEMORY_ARCHITECTURE.store(arch.code(), Ordering::Relaxed);
+}
+
+/// Read the active memory architecture. Defaults to `Discrete` until a
+/// `set_memory_architecture` call lands — preserves classic alloc behavior
+/// for any code path that runs before startup wiring.
+pub fn current_memory_architecture() -> MemoryArchitecture {
+    MemoryArchitecture::from_code(DEFAULT_MEMORY_ARCHITECTURE.load(Ordering::Relaxed))
 }
