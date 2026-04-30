@@ -90,6 +90,55 @@ __device__ __forceinline__ float g4_bf16_round_rne_f32_finite(float x) {
     return y;
 }
 
+// -----------------------------------------------------------------------------
+// FP8-E4M3-FN helpers for KV-cache quantization. Mirrors phi4.hip's
+// `fp8_e4m3_to_float` / `float_to_fp8_e4m3` — duplicated here to keep
+// gemma4.hip a standalone TU (per CLAUDE.md, hipcc on gfx11xx is fragile to
+// cross-TU contamination, so we never #include another model's .hip).
+// E4M3-FN encoding: 1 sign + 4 exponent + 3 mantissa, bias=7, no inf,
+// NaN encoded at 0x7F / 0xFF, max representable absolute value = 448.
+// -----------------------------------------------------------------------------
+__device__ inline float g4_fp8_e4m3_to_float(uint8_t byte) {
+    int sign = (byte >> 7) & 1;
+    int exp = (byte >> 3) & 0xF;
+    int mantissa = byte & 0x7;
+    if (byte == 0x7F || byte == 0xFF) return 0.0f;  // NaN → 0
+    float val;
+    if (exp == 0) {
+        val = static_cast<float>(mantissa) / 8.0f * 1.52587890625e-2f;
+    } else {
+        val = (1.0f + static_cast<float>(mantissa) / 8.0f)
+              * exp2f(static_cast<float>(exp - 7));
+    }
+    return sign ? -val : val;
+}
+
+__device__ inline uint8_t g4_float_to_fp8_e4m3(float val) {
+    uint8_t sign = 0;
+    if (val < 0.0f) { sign = 0x80; val = -val; }
+    if (val >= 448.0f) return sign | 0x7E;
+    if (val < 1.52587890625e-2f * 0.125f) return sign;
+    if (val < 0.015625f) {
+        int mantissa = __float2int_rn(val / 1.52587890625e-2f * 8.0f);
+        if (mantissa < 0) mantissa = 0;
+        if (mantissa >= 8) return sign | 0x08;
+        return sign | static_cast<uint8_t>(mantissa);
+    }
+    float log2_val = log2f(val);
+    int exp = static_cast<int>(floorf(log2_val)) + 7;
+    if (exp < 1) exp = 1;
+    if (exp > 14) exp = 14;
+    float pow2 = exp2f(static_cast<float>(exp - 7));
+    int mantissa = __float2int_rn((val / pow2 - 1.0f) * 8.0f);
+    if (mantissa < 0) mantissa = 0;
+    if (mantissa >= 8) {
+        mantissa = 0;
+        exp += 1;
+        if (exp > 14) return sign | 0x7E;
+    }
+    return sign | (static_cast<uint8_t>(exp) << 3) | static_cast<uint8_t>(mantissa);
+}
+
 // Dequantize 8 INT4 weights from 4 packed bytes = 1 packed uint32.
 // `col` is the starting weight column (must be 2-aligned; always is since
 // we step by 8 across a row whose byte stride is `in_dim/2`).
@@ -1782,6 +1831,86 @@ __device__ inline void g4_block_kv_append_f32_to_bf16(
     __syncthreads();
 }
 
+// FP8-E4M3 variant of the KV append. Quantizes one decode token's K/V into
+// the cache at position `pos`, with a per-(head, position) F32 absmax scale.
+// The cache buffers are reinterpreted as `uint8_t*` (1 byte per element);
+// `kv_scale_k` / `kv_scale_v` hold one F32 scale per (head, position).
+//
+// Block-collaborative absmax: one wave-wide reduction per K head, then per V
+// head. `lds[bs]` is a scratch buffer in shared memory.
+//
+// Caller must call this from a single block. Threads cooperate; output is
+// written at `kv_cache_{k,v}[h * max_T + pos][d]` and
+// `kv_scale_{k,v}[h * max_T + pos]`.
+__device__ inline void g4_block_kv_append_f32_to_fp8(
+    const float* __restrict__ k_f32,
+    const float* __restrict__ v_f32,
+    uint8_t* __restrict__ k_cache,
+    uint8_t* __restrict__ v_cache,
+    float* __restrict__ k_scale_buf,
+    float* __restrict__ v_scale_buf,
+    int num_kv_heads,
+    int head_dim,
+    int pos,
+    int max_T,
+    float* __restrict__ lds
+) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+
+    for (int h = 0; h < num_kv_heads; ++h) {
+        // Per-head absmax over [head_dim] — bf16-rounded values match the
+        // BF16-round in the existing append path, keeping the FP8 dequant
+        // numerically aligned with the BF16 reference.
+        float my_k = 0.0f, my_v = 0.0f;
+        if (tid < head_dim) {
+            const float k_bf16 =
+                g4_bf16_round_rne_f32_finite(k_f32[h * head_dim + tid]);
+            const float v_bf16 =
+                g4_bf16_round_rne_f32_finite(v_f32[h * head_dim + tid]);
+            my_k = fabsf(k_bf16);
+            my_v = fabsf(v_bf16);
+        }
+        lds[tid] = my_k;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+            __syncthreads();
+        }
+        const float k_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
+        const float k_inv = 1.0f / k_scale;
+        if (tid == 0) {
+            k_scale_buf[static_cast<size_t>(h) * max_T + pos] = k_scale;
+        }
+        __syncthreads();
+
+        lds[tid] = my_v;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+            __syncthreads();
+        }
+        const float v_scale = fmaxf(lds[0] / 448.0f, 1e-12f);
+        const float v_inv = 1.0f / v_scale;
+        if (tid == 0) {
+            v_scale_buf[static_cast<size_t>(h) * max_T + pos] = v_scale;
+        }
+        __syncthreads();
+
+        for (int d = tid; d < head_dim; d += bs) {
+            const size_t off =
+                (static_cast<size_t>(h) * max_T + pos) * head_dim + d;
+            const float k_store =
+                g4_bf16_round_rne_f32_finite(k_f32[h * head_dim + d]);
+            const float v_store =
+                g4_bf16_round_rne_f32_finite(v_f32[h * head_dim + d]);
+            k_cache[off] = g4_float_to_fp8_e4m3(k_store * k_inv);
+            v_cache[off] = g4_float_to_fp8_e4m3(v_store * v_inv);
+        }
+        __syncthreads();
+    }
+}
+
 // Fused attention-block persistent kernel. Single launch per Gemma 4
 // decoder-layer attention half. Orchestration:
 //   0. All blocks: hidden BF16 → hidden_f32 (residual copy).
@@ -3116,6 +3245,17 @@ struct Gemma4BatchSeqDesc {
     int   kv_max_t[G4_MAX_BATCH_SIZE];
 };
 
+// Mirror of `Gemma4KVCacheFp8Desc` in `crates/kernel-ffi/src/gemma4.rs`.
+// Parallel-struct to `Gemma4DecodeLayerDesc` — when --kv-fp8 is active the
+// main desc's `kv_cache_k` / `kv_cache_v` slots hold u8-packed FP8-E4M3
+// bytes; this struct carries the matching per-(head, position) F32 absmax
+// scales. Both fields are nullptr in BF16 KV mode (current single-batch
+// kernel uses non-null as the dispatch signal).
+struct Gemma4KVCacheFp8Desc {
+    void* kv_scale_k;  // [num_kv_heads, max_T] F32, or nullptr for BF16 KV
+    void* kv_scale_v;  // [num_kv_heads, max_T] F32, or nullptr for BF16 KV
+};
+
 template <typename T>
 __global__ void g4_persistent_decode_kernel(
     int num_layers,
@@ -3125,6 +3265,7 @@ __global__ void g4_persistent_decode_kernel(
     float eps,
     float scale,
     const Gemma4DecodeLayerDesc* __restrict__ layers,
+    const Gemma4KVCacheFp8Desc* __restrict__ kv_fp8_descs, // null = BF16 KV
     T* __restrict__ hidden_io,                          // [hidden_size] BF16 in/out
     const T* __restrict__ per_layer_inputs,              // [num_layers, ple_hidden] BF16
     float* __restrict__ workspace,
@@ -3150,6 +3291,18 @@ __global__ void g4_persistent_decode_kernel(
         const int q_dim = num_q_heads * head_dim;
         const int kv_dim = num_kv_heads * head_dim;
 
+        // FP8 KV cache scales for THIS layer. Shared-KV layers receive scale
+        // pointers aliased to the source layer's scale tensors via the engine,
+        // matching how `kv_cache_k` / `kv_cache_v` are aliased. nullptr in
+        // BF16 KV mode (and on layers we never wrote scales for).
+        const float* kv_scale_k = (kv_fp8_descs != nullptr)
+            ? static_cast<const float*>(kv_fp8_descs[layer].kv_scale_k)
+            : nullptr;
+        const float* kv_scale_v = (kv_fp8_descs != nullptr)
+            ? static_cast<const float*>(kv_fp8_descs[layer].kv_scale_v)
+            : nullptr;
+        const bool use_fp8_kv = (kv_scale_k != nullptr) && (kv_scale_v != nullptr);
+
         const T* input_norm_w = static_cast<const T*>(L.input_norm_w);
         const T* q_proj_w = static_cast<const T*>(L.q_proj_w);
         const T* k_proj_w = static_cast<const T*>(L.k_proj_w);
@@ -3160,6 +3313,9 @@ __global__ void g4_persistent_decode_kernel(
         const T* post_attn_norm_w = static_cast<const T*>(L.post_attn_norm_w);
         const T* cos_table = static_cast<const T*>(L.cos_table);
         const T* sin_table = static_cast<const T*>(L.sin_table);
+        // When use_fp8_kv is true, kv_cache_k/v hold u8 FP8-E4M3 bytes; we
+        // reinterpret at the read/write sites to keep the BF16 path's
+        // template `T*` typing untouched everywhere else.
         T* k_cache = static_cast<T*>(L.kv_cache_k);
         T* v_cache = static_cast<T*>(L.kv_cache_v);
 
@@ -3263,8 +3419,18 @@ __global__ void g4_persistent_decode_kernel(
                 num_q_heads, head_dim, rotary_dim, position);
             g4_block_rope_f32<T>(k_f32, cos_table, sin_table,
                 num_kv_heads, head_dim, rotary_dim, position);
-            g4_block_kv_append_f32_to_bf16<T>(k_f32, v_f32, k_cache, v_cache,
-                num_kv_heads, head_dim, position, max_T);
+            if (use_fp8_kv) {
+                g4_block_kv_append_f32_to_fp8(
+                    k_f32, v_f32,
+                    reinterpret_cast<uint8_t*>(k_cache),
+                    reinterpret_cast<uint8_t*>(v_cache),
+                    const_cast<float*>(kv_scale_k),
+                    const_cast<float*>(kv_scale_v),
+                    num_kv_heads, head_dim, position, max_T, lds);
+            } else {
+                g4_block_kv_append_f32_to_bf16<T>(k_f32, v_f32, k_cache, v_cache,
+                    num_kv_heads, head_dim, position, max_T);
+            }
         } else if (shared_kv && blockIdx.x == 0) {
             g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
                 num_q_heads, head_dim, eps, lds);
@@ -3280,6 +3446,9 @@ __global__ void g4_persistent_decode_kernel(
         const int num_q_per_kv = num_q_heads / num_kv_heads;
         {
             const int total_items = num_q_heads * kv_len;
+            const uint8_t* k_cache_fp8 = use_fp8_kv
+                ? reinterpret_cast<const uint8_t*>(L.kv_cache_k)
+                : nullptr;
             for (int item = blockIdx.x * bs + tid;
                  item < total_items; item += nb * bs) {
                 const int t = item % kv_len;
@@ -3291,11 +3460,21 @@ __global__ void g4_persistent_decode_kernel(
                     const int kv_h = q_h / num_q_per_kv;
                     const float* qr = q_f32 +
                         static_cast<size_t>(q_h) * head_dim;
-                    const T* kr = k_cache +
-                        (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
                     float acc = 0.0f;
-                    for (int d = 0; d < head_dim; ++d) {
-                        acc += qr[d] * g4_to_float(kr[d]);
+                    if (use_fp8_kv) {
+                        const uint8_t* kr_fp8 = k_cache_fp8 +
+                            (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                        const float k_s =
+                            kv_scale_k[static_cast<size_t>(kv_h) * max_T + t];
+                        for (int d = 0; d < head_dim; ++d) {
+                            acc += qr[d] * (g4_fp8_e4m3_to_float(kr_fp8[d]) * k_s);
+                        }
+                    } else {
+                        const T* kr = k_cache +
+                            (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                        for (int d = 0; d < head_dim; ++d) {
+                            acc += qr[d] * g4_to_float(kr[d]);
+                        }
                     }
                     val = acc * scale;
                 }
@@ -3339,6 +3518,9 @@ __global__ void g4_persistent_decode_kernel(
         // A6: value aggregation.
         {
             const int total_items = num_q_heads * head_dim;
+            const uint8_t* v_cache_fp8 = use_fp8_kv
+                ? reinterpret_cast<const uint8_t*>(L.kv_cache_v)
+                : nullptr;
             for (int item = blockIdx.x * bs + tid;
                  item < total_items; item += nb * bs) {
                 const int d = item % head_dim;
@@ -3347,10 +3529,20 @@ __global__ void g4_persistent_decode_kernel(
                 const float* pr = scores_f32 +
                     static_cast<size_t>(q_h) * max_T;
                 float acc = 0.0f;
-                for (int t = 0; t < kv_len; ++t) {
-                    const T* vr = v_cache +
-                        (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
-                    acc += pr[t] * g4_to_float(vr[d]);
+                if (use_fp8_kv) {
+                    for (int t = 0; t < kv_len; ++t) {
+                        const uint8_t* vr_fp8 = v_cache_fp8 +
+                            (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                        const float v_s =
+                            kv_scale_v[static_cast<size_t>(kv_h) * max_T + t];
+                        acc += pr[t] * (g4_fp8_e4m3_to_float(vr_fp8[d]) * v_s);
+                    }
+                } else {
+                    for (int t = 0; t < kv_len; ++t) {
+                        const T* vr = v_cache +
+                            (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
+                        acc += pr[t] * g4_to_float(vr[d]);
+                    }
                 }
                 attn_out_f32[static_cast<size_t>(q_h) * head_dim + d] = acc;
             }

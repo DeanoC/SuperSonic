@@ -870,6 +870,7 @@ fn main() -> Result<()> {
             0,
             dtype,
             &layers_gpu,
+            None,
             h_io,
             &pli_gpu,
             &mut mega_workspace,
