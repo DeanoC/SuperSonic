@@ -183,3 +183,47 @@ the bake, escalate to Option 2.
    qwen3.6-35b-a3b --model-dir <snap> --prompt "The quick brown fox"
    --max-new-tokens 16 --temperature 0.8 --top-p 0.9` — output should
    be coherent English (not the current degenerate "UDAUDAUDA" pattern).
+
+## Update: Option 1 (scale search) landed and re-baked
+
+Scale search shipped in commit 91d7185. Re-bake completed in 32.8 min
+on the local 35B-A3B with --num-samples 32 + cpu=20GiB max_memory.
+Per-tensor cos_sim survey vs safetensors:
+
+  tensor                                              old      new    delta
+  layers.3.self_attn.q_proj                        0.9611   0.9787  +0.0176
+  layers.3.self_attn.k_proj                        0.9711   0.9838  +0.0126
+  layers.3.self_attn.o_proj                        0.9000   0.9357  +0.0357
+  layers.0.linear_attn.in_proj_qkv                 0.9410   0.9617  +0.0208
+  layers.0.linear_attn.in_proj_z                   0.9707   0.9823  +0.0116
+  layers.0.linear_attn.out_proj                    0.8991   0.9423  +0.0432
+  layers.0.mlp.shared_expert.gate_proj             0.8804   0.9278  +0.0474
+  layers.0.mlp.shared_expert.up_proj               0.9523   0.9732  +0.0209
+  layers.0.mlp.shared_expert.down_proj             0.9249   0.9569  +0.0319
+
+Worst tensors gained the most (+0.04 to +0.05). Average +0.025.
+Bake's own Python-side post-quant gen now produces a coherent first
+token: "The quick brown fox jumps面面…" — "jumps" follows the prompt
+correctly before degenerating into vocab gibberish.
+
+**However**: our SuperSonic kernel chain on the same weights still
+produces near-random output. Per-block parity tests at production
+geometry against safetensors are bit-exact (separately verified), but
+the 40-layer chain at production scale produces:
+
+  greedy  "The quick brown fox" → "::.::.::.::.::.::.::.::.ivadspot…"
+  T=0.8   "The quick brown fox" → "::. fundamentaisReviewer_color…"
+
+Different prompts produce different first tokens (kernel responds to
+input), but tokens aren't semantically appropriate. Since Python
+forward on the same weights produces "jumps" but our chain doesn't,
+the gap is in the kernel-side multi-layer chain at production scale —
+NOT bake quality, NOT sampling, NOT the per-block kernels.
+
+Acceptance criteria from this doc not met yet (worst tensor still
+0.928 vs ≥ 0.98 target; coherent generation through kernel chain not
+achieved). Next quality lever: localise the production-scale kernel
+chain bug via a per-layer parity harness on real bake weights — load
+layer N's INT4 from the bake, run kernel + Python single-layer ref
+side-by-side, find which layer's output first diverges. That will
+isolate the kernel bug independent of the bake.
