@@ -215,6 +215,46 @@ extern "C" {
     ) -> c_int;
 }
 
+#[cfg(supersonic_backend_cuda)]
+extern "C" {
+    /// CUDA standalone BF16 RMSNorm without add_unit_offset.
+    pub fn phi4_cuda_rms_norm(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_rows: usize,
+        n_cols: usize,
+        eps: f32,
+        xs: *const c_void,
+        weight: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    /// CUDA Phi-4-mini persistent decode megakernel.
+    pub fn phi4_cuda_persistent_decode(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_dim: usize,
+        intermediate_size: usize,
+        seqlen_offset: usize,
+        layers: *const Phi4DecodeLayerDesc,
+        hidden_io: *mut c_void,
+        workspace: *mut f32,
+        counters: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        proj_buf_floats: usize,
+        attn_scratch_floats: usize,
+        fp8_scales: *const Phi4FP8ScaleDesc,
+        kv_fp8_descs: *const Phi4KVCacheFp8Desc,
+        batch_size: usize,
+        batch_descs: *const Phi4BatchSeqDesc,
+        int4_scales: *const Phi4INT4ScaleDesc,
+    ) -> c_int;
+}
+
 /// Single-row standalone RMSNorm (no add_unit_offset) — suitable for the
 /// final `model.norm.weight` step before the lm_head matvec. BF16 only.
 pub fn rms_norm(
@@ -255,9 +295,25 @@ pub fn rms_norm(
             }
         }
         Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "phi4::rms_norm: CUDA backend not yet wired".into(),
-            ));
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                phi4_cuda_rms_norm(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    1,
+                    hidden_dim,
+                    eps,
+                    input.as_ptr(),
+                    weight.as_ptr(),
+                    output.as_mut_ptr(),
+                )
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "phi4::rms_norm: CUDA backend not compiled".into(),
+                ));
+            }
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -273,9 +329,16 @@ pub fn rms_norm(
 
 fn phi4_backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
-        Backend::Hip => GpuError::backend(Backend::Hip, format!("{what} failed with status {status}")),
-        Backend::Cuda => GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}")),
-        Backend::Metal => GpuError::backend(Backend::Metal, format!("{what} failed with status {status}")),
+        Backend::Hip => {
+            GpuError::backend(Backend::Hip, format!("{what} failed with status {status}"))
+        }
+        Backend::Cuda => {
+            GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}"))
+        }
+        Backend::Metal => GpuError::backend(
+            Backend::Metal,
+            format!("{what} failed with status {status}"),
+        ),
     }
 }
 
@@ -365,9 +428,38 @@ pub fn persistent_decode(
             }
         }
         Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "phi4::persistent_decode: CUDA backend not yet wired for Phi-4".into(),
-            ));
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                phi4_cuda_persistent_decode(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    num_layers,
+                    hidden_dim,
+                    intermediate_size,
+                    seqlen_offset,
+                    layer_descs_device.as_ptr() as *const Phi4DecodeLayerDesc,
+                    hidden_io.as_mut_ptr(),
+                    workspace.as_mut_ptr() as *mut f32,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                    cos_table.as_ptr(),
+                    sin_table.as_ptr(),
+                    proj_buf_floats,
+                    attn_scratch_floats,
+                    fp8_scales_ptr,
+                    kv_fp8_ptr,
+                    batch_size,
+                    batch_descs_ptr,
+                    int4_ptr,
+                )
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "phi4::persistent_decode: CUDA backend not compiled".into(),
+                ));
+            }
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(

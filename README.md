@@ -64,18 +64,25 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ⏳¹ |  ✅  |      ✅     |   ⏳¹  |
+| phi4-mini        |  ✅² |  ✅² |      ✅²    |   ⏳²  |
 
 ¹ `qwen3.5-9b` BF16 needs the BF16 bake uploaded before that lane is available
   from release-backed downloads. `--kv-fp8` depends on the BF16 weights, so the
   9B CUDA KV-FP8 lane is blocked on the same bake. INT4 and FP8-runtime bakes
   are already published and validated on `sm86`.
+² `phi4-mini` BF16 CUDA is wired and validated on `sm86` with the CPU oracle.
+  INT4 uses the downloadable bake and passes the reconstructed-bake corpus
+  oracle on CUDA. FP8-runtime uses the downloadable FP8-native bake and passes
+  the PyTorch oracle on CUDA. FP8-KV has descriptor/kernel hooks but still needs
+  CUDA bake/validation work.
 
 CUDA support is validated on NVIDIA `sm86` hardware (RTX 3090-class) with
 hand-maintained CUDA sources and no generic fallback backend. Qwen3.5 BF16,
 INT4, FP8-runtime, and KV-FP8 lanes are now at parity with the HIP matrix for
-0.8B, 2B, and 4B. The remaining Qwen3.5 9B gap is artifact availability: the
-BF16 bake still needs to be produced and uploaded, and the 9B KV-FP8 lane
-becomes available after that bake exists.
+0.8B, 2B, and 4B, and `phi4-mini` BF16/FP8-runtime have native CUDA
+persistent-decode lanes. The remaining Qwen3.5 9B gap is artifact
+availability: the BF16 bake still needs to be produced and uploaded, and the
+9B KV-FP8 lane becomes available after that bake exists.
 
 CUDA KV-FP8 notes:
 
@@ -202,6 +209,16 @@ SUPERSONIC_BACKENDS=cuda TIMEOUT=1200 CORPUS_TIMEOUT=1200 ./tests/sm86/run_4b_lo
 # Qwen3.5-4B batched decode
 SUPERSONIC_BACKENDS=cuda TIMEOUT=900 CORPUS_TIMEOUT=600 ./tests/sm86/run_batch.sh /path/to/Qwen3.5-4B
 
+# Phi-4-mini FP8-runtime release bake + PyTorch oracle
+HF_HOME=/dev/shm/hf_home SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
+  --backend cuda \
+  --model phi4-mini \
+  --model-dir /dev/shm/Phi-4-mini \
+  --prompt "Hello, world" \
+  --max-new-tokens 8 \
+  --fp8-runtime \
+  --validate
+
 # Llama 3.1 8B INT8 component decode
 SUPERSONIC_BACKENDS=cuda ./target/release/supersonic \
   --backend cuda \
@@ -233,6 +250,10 @@ SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_all.sh \
   /path/to/Qwen3.5-0.8B \
   /path/to/Qwen3.5-4B
 ```
+
+The warm `phi4-mini --fp8-runtime --validate` command above passes on `sm86`
+with `token_mismatches=0`, `max_delta=1.5000`, and `34.7 ms/step` over 8
+generated tokens.
 
 Each `sm86` script currently validates:
 

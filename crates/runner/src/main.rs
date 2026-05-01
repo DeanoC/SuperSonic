@@ -199,6 +199,20 @@ fn resolve_qwen_oracle_model_id(
     model_variant.hf_model_id().to_string()
 }
 
+fn resolve_phi4_oracle_model_id(
+    explicit_model_id: Option<&str>,
+    model_dir: &Path,
+    model_variant: &ModelVariant,
+) -> String {
+    if let Some(model_id) = explicit_model_id {
+        return model_id.to_string();
+    }
+    if model_dir_has_raw_safetensors(model_dir) {
+        return model_dir.to_string_lossy().into_owned();
+    }
+    model_variant.hf_model_id().to_string()
+}
+
 struct HostLmHeadRescorer {
     loader: WeightLoader,
     tensor_name: String,
@@ -816,7 +830,14 @@ fn effective_fixed_vram(
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_fixed_vram, should_fetch_bake, should_fetch_exact_bake};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{
+        effective_fixed_vram, resolve_phi4_oracle_model_id, should_fetch_bake,
+        should_fetch_exact_bake,
+    };
+    use crate::registry::ModelVariant;
 
     #[test]
     fn bootstrap_download_satisfies_forced_bake_download() {
@@ -841,6 +862,52 @@ mod tests {
     #[test]
     fn q4km_gptq_uses_int4_vram_estimate() {
         assert_eq!(effective_fixed_vram(100, false, true, false, false), 37);
+    }
+
+    #[test]
+    fn phi4_oracle_uses_hf_id_without_local_safetensors() {
+        let model_dir = unique_temp_dir("phi4-oracle-no-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
+
+        assert_eq!(resolved, "microsoft/Phi-4-mini-instruct");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn phi4_oracle_uses_local_dir_when_safetensors_present() {
+        let model_dir = unique_temp_dir("phi4-oracle-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.safetensors.index.json"), "{}").unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
+
+        assert_eq!(resolved, model_dir.to_string_lossy());
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn phi4_oracle_explicit_model_id_wins() {
+        let model_dir = unique_temp_dir("phi4-oracle-explicit");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(
+            Some("local-or-remote/override"),
+            &model_dir,
+            &ModelVariant::Phi4_Mini,
+        );
+
+        assert_eq!(resolved, "local-or-remote/override");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }
 

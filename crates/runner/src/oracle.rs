@@ -377,12 +377,13 @@ pub fn run_qwen35_trace_oracle(
 }
 
 /// Run the Phi-4 oracle (`oracle/phi4_oracle.py`) for a single prompt.
-/// Mirrors `run_gemma4_oracle`: loads weights from `model_dir`, tokenizes
-/// the prompt Python-side. Phi-4 oracle additionally accepts `--device`
-/// because it can run on CPU or CUDA depending on availability.
+/// Loads weights from either a local model directory or a HuggingFace model
+/// id, then tokenizes the prompt Python-side. Phi-4 oracle additionally
+/// accepts `--device` because it can run on CPU or CUDA depending on
+/// availability.
 pub fn run_phi4_oracle(
     oracle_script: &Path,
-    model_dir: &Path,
+    model_source: &str,
     prompt: &str,
     max_new_tokens: usize,
     dtype: &str,
@@ -392,7 +393,7 @@ pub fn run_phi4_oracle(
     let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
         .arg("--model-dir")
-        .arg(model_dir)
+        .arg(model_source)
         .arg("--prompt")
         .arg(prompt)
         .arg("--max-new-tokens")
@@ -405,7 +406,7 @@ pub fn run_phi4_oracle(
     eprintln!(
         "[oracle] running: {python} {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype} --device {device}",
         oracle_script.display(),
-        model_dir.display(),
+        model_source,
     );
 
     let output = cmd
