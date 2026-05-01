@@ -692,25 +692,12 @@ pub fn run(
     //    id so the "doesn't bail" criterion is verifiable end-to-end.
     println!();
     println!("=== Decode (PR 4c step 2: host-orchestrated chained launches) ===");
-    let token = decode_first_token(&cli.model_dir, &report)?;
-    let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    match crate::load_tokenizer(&tokenizer_path) {
-        Ok(tok) => match tok.decode(&[token], false) {
-            Ok(text) => println!("First decoded token: id={token}  text={text:?}"),
-            Err(e) => {
-                println!("First decoded token id: {token}");
-                println!("  (tokenizer decode failed: {e})");
-            }
-        },
-        Err(e) => {
-            println!("First decoded token id: {token}");
-            println!("  (tokenizer not loadable from {}: {e})", tokenizer_path.display());
-        }
-    }
-    println!(
-        "(Note: fresh state, single token. Multi-token + prompt-driven \
-         generation + GPU-side lm_head land in PR 4d.)"
-    );
+    decode_text(
+        &cli.model_dir,
+        &report,
+        &cli.prompt,
+        cli.max_new_tokens.max(1),
+    )?;
     Ok(())
 }
 
@@ -937,12 +924,280 @@ fn host_load_bytes(store: &BakedStore, name: &str) -> Result<Vec<u8>> {
     Ok(raw.to_vec())
 }
 
-/// Run one decode step against a real bake. Returns the argmax token id
-/// from the resulting logits. Prefers the INT4 GPTQ bake at
-/// `<model>/.supersonic/v{V}-int4-gptq/` (fits 24 GiB VRAM at ~17 GiB);
-/// falls back to the BF16 bake at `<model>/.supersonic/v{V}/` if INT4
-/// isn't present (BF16 is ~65 GiB and won't fit on a 7900 XTX, but the
-/// path stays for completeness).
+/// Tokenize the prompt and run the multi-token decode loop end-to-end:
+/// prefill the prompt one token at a time (linear-attn state accumulates
+/// in place; full-attn is currently `kv_len=1` per call — KV-cache
+/// extension is a follow-up), then generate `max_new` tokens via greedy
+/// argmax against the (cached) host-side lm_head GEMV. Streams decoded
+/// text to stdout as each token arrives.
+///
+/// **Quality caveat**: the per-block kernels are stage-5 single-block
+/// launchers — they don't expose KV cache pointers, so full-attention
+/// layers (10 of 40) attend only to the current token. Linear-attn
+/// layers (the other 30) accumulate state correctly across decode steps
+/// because the kernel mutates `conv_state`/`recurrent_state` in place.
+/// Real full-attn KV needs an FFI extension on `Qwen36MoeAttnStepWeights`
+/// + corresponding kernel work — separate piece.
+fn decode_text(
+    model_dir: &Path,
+    report: &DryRunReport,
+    prompt: &str,
+    max_new: usize,
+) -> Result<()> {
+    use std::io::Write as _;
+
+    let weight_prefix = report.kernel_params.weight_prefix;
+
+    // Tokenizer first — without it we can't tokenize the prompt or stream
+    // decoded text. Falls back to BOS-only if the tokenizer can't load.
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = crate::load_tokenizer(&tokenizer_path).ok();
+
+    let bos_id = report
+        .config
+        .text_config
+        .bos_token_id
+        .as_ref()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let eos_id = report
+        .config
+        .text_config
+        .eos_token_id
+        .as_ref()
+        .and_then(|v| v.as_u64())
+        .map(|v| v as u32);
+
+    let prompt_ids: Vec<u32> = match (&tokenizer, prompt.is_empty()) {
+        (Some(tok), false) => {
+            let enc = tok.encode(prompt, true)
+                .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
+            let ids: Vec<u32> = enc.get_ids().to_vec();
+            if ids.is_empty() {
+                vec![bos_id]
+            } else {
+                ids
+            }
+        }
+        _ => vec![bos_id],
+    };
+    println!(
+        "  prompt: {prompt:?} → {} token{} ({:?}{}…)",
+        prompt_ids.len(),
+        if prompt_ids.len() == 1 { "" } else { "s" },
+        &prompt_ids[..prompt_ids.len().min(8)],
+        if prompt_ids.len() > 8 { ", " } else { "" },
+    );
+
+    // Pick the bake. INT4 is the realistic path on 24 GiB VRAM.
+    let int4_dir = model_store::bake_dir_int4(model_dir);
+    let bf16_dir = model_store::bake_dir(model_dir);
+    let (bake_dir, int4_enabled) = if int4_dir.exists() {
+        (int4_dir, true)
+    } else if bf16_dir.exists() {
+        (bf16_dir, false)
+    } else {
+        return Err(anyhow!(
+            "decode requires a baked package — neither INT4-GPTQ ({}) nor \
+             BF16 ({}) exists. Create one with the standard bake pipeline \
+             or re-run with --dry-run for analytic accounting only.",
+            int4_dir.display(),
+            bf16_dir.display()
+        ));
+    };
+    println!(
+        "  loading from bake: {} ({})",
+        bake_dir.display(),
+        if int4_enabled { "INT4 GPTQ" } else { "BF16" }
+    );
+    let store = BakedStore::open(&bake_dir)
+        .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
+
+    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+
+    let mut layers = Vec::with_capacity(geom.num_layers as usize);
+    println!(
+        "  loading {} layers ({} INT4 sidecar sets)…",
+        geom.num_layers,
+        if int4_enabled { geom.num_layers } else { 0 },
+    );
+    for li in 0..geom.num_layers as usize {
+        let layer = load_layer_buffers(
+            &store,
+            ordinal,
+            li,
+            &geom,
+            &report.config.text_config,
+            weight_prefix,
+            int4_enabled,
+        )
+        .with_context(|| format!("load layer {li} weights"))?;
+        layers.push(layer);
+    }
+
+    // Cache final_norm + dequantized lm_head once. Both are ≥1 GiB BF16
+    // for 35B-A3B; reusing the cached buffers across decode steps avoids
+    // redoing the ~1 second INT4 dequant per token.
+    let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
+        .context("load final norm")?;
+    let lm_head_bf16_bytes = load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
+        .context("prepare host-side lm_head BF16 buffer")?;
+    println!(
+        "  cached lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB).",
+        lm_head_bf16_bytes.len() as f64 / MIB,
+        final_norm_bytes.len() as f64 / 1024.0,
+    );
+
+    println!(
+        "  decoding {} prompt token{} + generating ≤{} new token{}…",
+        prompt_ids.len(),
+        if prompt_ids.len() == 1 { "" } else { "s" },
+        max_new,
+        if max_new == 1 { "" } else { "s" },
+    );
+    println!();
+    print!("> ");
+    if let Some(tok) = &tokenizer {
+        if let Ok(prompt_text) = tok.decode(&prompt_ids, false) {
+            print!("{prompt_text}");
+        }
+    }
+    std::io::stdout().flush().ok();
+
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
+    let mut current_token: u32 = prompt_ids[0];
+    let mut position: i32 = 0;
+    // Standard prefill+generate shape: feed prompt[0..N-1] as prefill (logits
+    // discarded), then prompt[N-1] is the first forward whose logits we
+    // sample. Subsequent gen steps feed the just-sampled token. Total
+    // forwards = (prompt_len - 1) prefill + max_new generation = prompt_len
+    // + max_new - 1.
+    let total_steps = prompt_ids.len() + max_new - 1;
+
+    for step in 0..total_steps {
+        // Embed lookup for the current token.
+        let initial_hidden = lookup_embed_row(
+            &store,
+            weight_prefix,
+            current_token as usize,
+            geom.hidden as usize,
+        )
+        .with_context(|| format!("embed lookup token {current_token} (step {step})"))?;
+
+        // Run the chain. Linear-attn state mutates in `layers` in place.
+        let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
+            .with_context(|| format!("chained decode (step {step}, position {position})"))?;
+        position += 1;
+
+        // Prefill steps: feed the next prompt token without computing logits.
+        if step + 1 < prompt_ids.len() {
+            current_token = prompt_ids[step + 1];
+            continue;
+        }
+
+        // Generation step: lm_head + argmax → next token.
+        let logits = host_final_norm_lm_head(
+            &outputs.final_hidden_bytes,
+            &final_norm_bytes,
+            &lm_head_bf16_bytes,
+            geom.hidden as usize,
+            geom.vocab as usize,
+            geom.rms_norm_eps,
+        );
+        let next_token = argmax_bf16_logits(&logits);
+        generated_ids.push(next_token);
+
+        // Stream-decode and print.
+        if let Some(tok) = &tokenizer {
+            if let Ok(text) = tok.decode(&[next_token], false) {
+                print!("{text}");
+                std::io::stdout().flush().ok();
+            }
+        }
+
+        if Some(next_token) == eos_id {
+            break;
+        }
+        current_token = next_token;
+    }
+
+    println!();
+    println!();
+    println!(
+        "Generated {} token{} ({} prompt + {} new). EOS: {}.",
+        generated_ids.len(),
+        if generated_ids.len() == 1 { "" } else { "s" },
+        prompt_ids.len(),
+        generated_ids.len(),
+        if eos_id.map(|e| generated_ids.last() == Some(&e)).unwrap_or(false) {
+            "yes"
+        } else {
+            "no (max_new_tokens hit)"
+        },
+    );
+    println!(
+        "  (Note: full-attn KV cache is a follow-up — those layers see only \
+         the current token; quality is degraded but the pipeline is end-to-end.)"
+    );
+    if !generated_ids.is_empty() {
+        println!("  Generated ids: {generated_ids:?}");
+    }
+
+    Ok(())
+}
+
+/// Load + dequantize lm_head into a BF16 byte buffer that the host-side
+/// GEMV in `host_final_norm_lm_head` consumes. Handles the three layouts:
+/// tied embeddings (BF16 from embed_tokens), standalone BF16, or INT4
+/// GPTQ (packed nibbles + scale/zero sidecars). The dequant runs once per
+/// process; the result is reused across all decode steps.
+fn load_lm_head_bf16(
+    store: &BakedStore,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    geom: &MultiLayerGeom,
+) -> Result<Vec<u8>> {
+    let (lm_name, lm_packed) = if text_config.tie_word_embeddings {
+        let n = format!("{weight_prefix}.embed_tokens.weight");
+        let b = host_load_bytes(store, &n).context("load tied lm_head from embed_tokens")?;
+        (n, b)
+    } else {
+        let n = "lm_head.weight";
+        let b = host_load_bytes(store, n).context("load lm_head")?;
+        (n.to_string(), b)
+    };
+    let scale_name = format!("{lm_name}_int4_scale");
+    if store.contains(&scale_name) {
+        let zero_name = format!("{lm_name}_int4_zero");
+        let scale = host_load_bytes(store, &scale_name).context("load lm_head INT4 scale")?;
+        let zero = host_load_bytes(store, &zero_name).context("load lm_head INT4 zero")?;
+        let vocab = geom.vocab as usize;
+        let hidden = geom.hidden as usize;
+        println!(
+            "  dequantizing lm_head INT4 [{vocab}, {hidden}] (≈{:.1} MiB → {:.1} MiB BF16)…",
+            lm_packed.len() as f64 / MIB,
+            (vocab * hidden * 2) as f64 / MIB,
+        );
+        Ok(dequant_int4_to_bf16_bytes(
+            &lm_packed,
+            &scale,
+            &zero,
+            vocab,
+            hidden,
+            QWEN36_MOE_INT4_GROUP_SIZE as usize,
+        ))
+    } else {
+        Ok(lm_packed)
+    }
+}
+
+/// Legacy single-token entry point — keeps the original `decode_first_token`
+/// callable so the path stays exercised. Currently unused but documents the
+/// minimal one-step decode shape.
+#[allow(dead_code)]
 fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
     let weight_prefix = report.kernel_params.weight_prefix;
 
