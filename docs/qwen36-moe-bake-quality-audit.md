@@ -227,3 +227,69 @@ chain bug via a per-layer parity harness on real bake weights — load
 layer N's INT4 from the bake, run kernel + Python single-layer ref
 side-by-side, find which layer's output first diverges. That will
 isolate the kernel bug independent of the bake.
+
+## Update: HF parity bugs were the real blocker (PR #64)
+
+The "kernel chain produces near-random output" symptom traced to two
+HF-vs-SuperSonic decode-math discrepancies, NOT bake quality:
+
+  1. **`Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset** (line 819 of
+     `transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`). Our
+     oracles + kernel + host code were doing plain `output * weight`,
+     which scales norm output to ~zero against trained delta weights.
+  2. **`q_proj` per-head interleaved `[q | gate]` split.** HF reshapes
+     via `q_proj(x).view(..., H, head_dim*2).chunk(2, -1)`; we were
+     splitting flat `[:H*d]`/`[H*d:]`, which only happens to work for
+     head 0.
+
+After PR #64 lands, end-to-end on the SAME `v2-int4-gptq` bake — no
+rebake — produces:
+
+    "The quick brown fox" → "jumps over the lazy dog."
+    "The capital of France is" → "Paris. Paris is the most populous
+                                  city in the European Union, …"
+    "Q: List three primary colors. A:" → "Red, Yellow, and Blue.<EOS>"
+    Python Fibonacci prompt → 80 tokens of correct, indented code
+
+Per-tensor cos_sim survey on `v2-int4-gptq` post-scale-search,
+re-measured with **F64 reductions** (F32 reductions on tensors
+≥100M elements — e.g. lm_head — under-estimate norms enough to push
+cos_sim above 1.0; it came out at 1.20 before fixing the precision):
+
+| Class                                            | mean cos_sim | min    | tile count |
+|--------------------------------------------------|--------------|--------|------------|
+| `mlp.experts.gate_up_proj`  (fused, GPTQ)        | 0.987–0.993  | 0.957  | 128/expert |
+| `mlp.experts.down_proj`     (fused, GPTQ)        | 0.987–0.993  | 0.960  | 64/expert  |
+| `lm_head.weight`                                 | 0.987        | 0.987  | 31040      |
+| `linear_attn.in_proj_z`                          | 0.982        | 0.982  | 512        |
+| `self_attn.k_proj`                               | 0.984        | 0.984  | 64         |
+| `self_attn.q_proj`                               | 0.978        | 0.978  | 1024       |
+| `self_attn.v_proj`                               | 0.969        | 0.969  | 64         |
+| `self_attn.o_proj`                               | 0.936        | 0.936  | 512        |
+| `linear_attn.in_proj_qkv`                        | 0.961        | 0.961  | 1024       |
+| `linear_attn.out_proj`                           | 0.942        | 0.942  | 512        |
+| `mlp.shared_expert.gate_proj`                    | 0.928–0.967  | 0.928  | 64         |
+| `mlp.shared_expert.up_proj`                      | 0.973–0.978  | 0.973  | 64         |
+| `mlp.shared_expert.down_proj`                    | 0.949–0.957  | 0.949  | 64         |
+
+The audit's earlier "experts are min/max-only" finding is now stale —
+scale search (commit `91d7185`) was applied to BOTH the dense GPTQ
+path AND the fused-expert path, lifting MoE-expert cos_sim into the
+0.987–0.993 band. The remaining gap to ≥ 0.98 is concentrated in the
+**dense layer-OUTPUT projections** (`o_proj`, `out_proj`, `down_proj`,
+`shared_expert.gate_proj`) — they sit at the END of GPTQ's
+sequential-calibration order and inherit the most accumulated error
+from the projections quantized before them.
+
+End-to-end output suggests the existing bake is now **functionally
+adequate** for production use even though the formal ≥ 0.98 acceptance
+bar isn't met on every tensor. Closing the remaining 1–7% gap on the
+worst tensors is a separate, lower-priority quality push (Options 2,
+4 from this doc) — no longer blocking coherent decode.
+
+The survey is reproducible via:
+
+    ~/venvs/rocm/bin/python oracle/qwen36_moe_bake_cossim_survey.py \
+        --model-dir <snapshot> \
+        --bake-dir <snapshot>/.supersonic/v2-int4-gptq \
+        --layers 0,3 --out /tmp/qwen36_cossim_survey.tsv
