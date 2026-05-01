@@ -91,6 +91,11 @@ pub enum AttnLayerBuffers {
         k_norm_w: GpuBuffer,
         o_proj_w: GpuBuffer,
         int4: Option<FullAttnInt4Sidecars>,
+        /// PR 4d KV cache for this full-attention layer. When `Some`, the
+        /// kernel writes the current step's K/V at slot `position` and
+        /// attends over `kv_len = position + 1` past tokens. When `None`
+        /// (parity tests, single-token decode), back-compat kv_len=1.
+        kv_cache: Option<FullAttnKvCache>,
     },
     Linear {
         input_norm_w: GpuBuffer,
@@ -110,6 +115,16 @@ pub enum AttnLayerBuffers {
         recurrent_state: GpuBuffer,
         int4: Option<LinearAttnInt4Sidecars>,
     },
+}
+
+/// PR 4d KV cache for a full-attention layer. `[kv_max_t, num_kv_heads *
+/// head_dim]` BF16 each, mutated by the kernel: at decode position `p` it
+/// writes the current step's K/V at slot `p` then attends over
+/// `kv_len = p + 1` past tokens. Lifetime tied to one decode session.
+pub struct FullAttnKvCache {
+    pub k: GpuBuffer,
+    pub v: GpuBuffer,
+    pub kv_max_t: i32,
 }
 
 /// INT4 sidecars for a full-attention layer. Mirrors the per-block FFI
@@ -355,8 +370,28 @@ pub fn run_chained_decode(
     let mut hidden_b =
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).context("alloc hidden_b")?;
 
+    // PR 4d: when any full-attn layer carries a KV cache, the kernel uses
+    // an additional `[H, kv_max_t]` F32 region (OFF_SCORES) for per-head
+    // attention scores. Size workspace for the largest kv_max_t any layer
+    // declares.
+    let max_kv_t = layers
+        .iter()
+        .filter_map(|l| match &l.attn {
+            AttnLayerBuffers::Full {
+                kv_cache: Some(c), ..
+            } => Some(c.kv_max_t as usize),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let attn_extra = if max_kv_t > 0 {
+        geom.num_attention_heads as usize * max_kv_t
+    } else {
+        0
+    };
+
     // Shared attention scratch: sized for the larger of (full, linear).
-    let attn_ws_floats = full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom));
+    let attn_ws_floats = full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom)) + attn_extra;
     let attn_out_elems = full_attn_output_elems(geom).max(linear_attn_output_elems(geom));
     let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
         .context("alloc attn_output")?;
@@ -405,6 +440,7 @@ pub fn run_chained_decode(
                 k_norm_w,
                 o_proj_w,
                 int4,
+                kv_cache,
             } => {
                 let params = Qwen36MoeAttnStepParams {
                     stage: 5,
@@ -417,6 +453,10 @@ pub fn run_chained_decode(
                     rms_norm_eps: geom.rms_norm_eps,
                     position,
                 };
+                let (kv_k_ptr, kv_v_ptr, kv_max_t) = match kv_cache {
+                    Some(c) => (c.k.as_mut_ptr(), c.v.as_mut_ptr(), c.kv_max_t),
+                    None => (ptr::null_mut(), ptr::null_mut(), 0),
+                };
                 let weights = Qwen36MoeAttnStepWeights {
                     input_hidden: input_ptr,
                     input_norm_w: input_norm_w.as_ptr(),
@@ -426,6 +466,9 @@ pub fn run_chained_decode(
                     q_norm_w: q_norm_w.as_ptr(),
                     k_norm_w: k_norm_w.as_ptr(),
                     o_proj_w: o_proj_w.as_ptr(),
+                    kv_cache_k: kv_k_ptr,
+                    kv_cache_v: kv_v_ptr,
+                    kv_max_t,
                 };
                 let int4_ptrs = match int4 {
                     Some(s) => Qwen36MoeAttnStepInt4 {

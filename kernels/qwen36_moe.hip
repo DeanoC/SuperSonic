@@ -399,6 +399,14 @@ __global__ void qwen36_moe_attn_step_kernel(
     const hip_bfloat16* __restrict__     o_proj_zero,
     T* __restrict__                output,        // BF16, sized for the largest staged intermediate
     float* __restrict__             workspace,    // F32 scratch, see header comment
+    // PR 4d KV cache extension. When `kv_cache_k`/`kv_cache_v` are non-null
+    // and `kv_max_t > 0`, Phase G writes the current step's K/V at slot
+    // `position` and attends over `kv_len = position + 1` past tokens. When
+    // both pointers are null, falls back to the kv_len=1 self-attention
+    // path (PR 4b2 behavior — back-compat for the parity tests).
+    T* __restrict__                kv_cache_k,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
+    T* __restrict__                kv_cache_v,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
+    int                            kv_max_t,      // capacity bound; 0 ⇔ no cache
     unsigned int* __restrict__     counters,
     unsigned int* __restrict__     barrier_counter,
     unsigned int* __restrict__     barrier_flag) {
@@ -408,7 +416,7 @@ __global__ void qwen36_moe_attn_step_kernel(
     (void)o_proj_w;
     (void)rotary_dim;
     (void)rope_theta;
-    (void)position;
+    // `position` is now read in Phase G when KV cache is enabled.
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
@@ -514,6 +522,12 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int OFF_ATTN     = 4 * H * d + 4 * Hkv * d;
     const int OFF_GATED    = 5 * H * d + 4 * Hkv * d;
     const int OFF_O_OUT    = 6 * H * d + 4 * Hkv * d;
+    // Scores for the attention reduction when kv_len > 1. Per Q head we
+    // need [kv_len] F32 slots; allocate per-head slots [H, kv_max_t] so
+    // blocks processing different heads don't race. When kv_cache_k is
+    // null (back-compat kv_len=1 path) this region is unused — the engine
+    // doesn't need to allocate space for it.
+    const int OFF_SCORES   = 6 * H * d + 4 * Hkv * d + hidden;
 
     // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
     // Each block grabs a head index, reduces across head_dim, writes BF16
@@ -760,27 +774,53 @@ __global__ void qwen36_moe_attn_step_kernel(
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
 
-    // -- Phase G: GQA self-attention, kv_len = 1 ----------------------------
+    // -- Phase G: GQA self-attention with optional KV cache -----------------
     //
-    // The PR-4b2 oracle runs without a KV cache, so the only K/V token is
-    // the just-emitted one. With a single-token K, softmax over the score
-    // vector reduces to a single element ≡ 1.0 regardless of the score.
-    // The output therefore collapses to:
+    // Two modes selected by whether kv_cache_k/v are non-null:
     //
-    //   attn[h, :] = bf16(1.0) * v_full[h, :]
-    //              = v_raw[h // rep, :]      (already BF16-rounded F32)
+    // 1) Back-compat (kv_cache == null): kv_len = 1 self-attention. Softmax
+    //    over a single score is 1.0; output[h] = V[h_kv]. Same path as the
+    //    PR 4b2 oracle, kept bit-exact so the per-block parity tests don't
+    //    regress.
     //
-    // We still compute the QK score (skipped for the output) so the path
-    // exercises q_rot / k_rot loads — that's the slice of compute the
-    // future kv_len > 1 extension will reuse, with the softmax becoming
-    // non-trivial. For now the score is intentionally unused.
-    //
-    // Each block grabs one Q head, broadcasts the matching KV head's V row
-    // into workspace[ATTN + h*d : ...] and (when stage == 4) into output.
+    // 2) KV cache enabled (kv_cache != null): write current (K_rot, V_raw)
+    //    at slot `position`, then attend over kv_len = position + 1 past
+    //    tokens with real softmax (max-stabilised, F32 exp). Per-Q-head
+    //    work-stealing; per-head scores live at workspace[OFF_SCORES +
+    //    hq * kv_max_t] so concurrent blocks computing different heads
+    //    don't race. Cap: kv_max_t must accommodate position + 1.
     {
         const int rep   = H / Hkv;
         const float scale = rsqrtf(static_cast<float>(d));
+        const bool use_kv_cache = (kv_cache_k != nullptr && kv_cache_v != nullptr);
+        const int kv_len = use_kv_cache ? (position + 1) : 1;
 
+        // Step 1: write current K/V into the cache (if enabled). All blocks
+        // cooperate via a flat work-stealing index since the writes are
+        // independent across (h_kv, i).
+        if (use_kv_cache) {
+            const int slot_base = position * Hkv * d;
+            const int total = Hkv * d;
+            for (int idx = blockIdx.x * block_size + tid;
+                 idx < total;
+                 idx += num_blocks * block_size) {
+                const int h_kv = idx / d;
+                const int i    = idx % d;
+                const float kv = workspace[OFF_K_ROT + h_kv * d + i];
+                const float vv = workspace[OFF_V_RAW + h_kv * d + i];
+                kv_cache_k[slot_base + h_kv * d + i] = static_cast<T>(kv);
+                kv_cache_v[slot_base + h_kv * d + i] = static_cast<T>(vv);
+            }
+            // Ensure all blocks' writes are visible before the read-side
+            // attention reduction reads cache[0..=position].
+            grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                       &counters[0]);
+        }
+
+        // Step 2: per-Q-head attention reduction. Each block claims one head
+        // via atomicAdd on counters[0]; the write phase above already reset
+        // it (via grid_barrier_reset_counter when use_kv_cache, or by leaving
+        // it untouched when not).
         for (;;) {
             __shared__ unsigned int head_s;
             if (tid == 0) {
@@ -792,34 +832,96 @@ __global__ void qwen36_moe_attn_step_kernel(
 
             const int h_kv = hq / rep;
 
-            // Score (q · k) * scale — computed for path-coverage only at
-            // kv_len=1. Single-block reduction over head_dim=256.
-            float partial = 0.0f;
-            for (int i = tid; i < d; i += block_size) {
-                const float q = workspace[OFF_Q_ROT + hq   * d + i];
-                const float k = workspace[OFF_K_ROT + h_kv * d + i];
-                partial += q * k;
+            if (kv_len == 1) {
+                // Back-compat fast path — bit-exact match for PR 4b2 parity.
+                float partial = 0.0f;
+                for (int i = tid; i < d; i += block_size) {
+                    const float q = workspace[OFF_Q_ROT + hq   * d + i];
+                    const float k = workspace[OFF_K_ROT + h_kv * d + i];
+                    partial += q * k;
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                __shared__ float head_score;
+                if (tid == 0) {
+                    head_score = shared_scratch[0] * scale;
+                }
+                __syncthreads();
+                (void)head_score;
+                // softmax([s]) = [1.0]; output collapses to V at this position.
+                for (int i = tid; i < d; i += block_size) {
+                    const float v = workspace[OFF_V_RAW + h_kv * d + i];
+                    workspace[OFF_ATTN + hq * d + i] = v;
+                    if (stage == 4) {
+                        output[hq * d + i] = static_cast<T>(v);
+                    }
+                }
+                __syncthreads();
+                continue;
             }
-            shared_scratch[tid] = partial;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+
+            // KV-cache path. Compute scores[t] = (q · K_cache[t]) * scale
+            // for t in 0..=position. Per-head scores live at
+            // workspace[OFF_SCORES + hq * kv_max_t + t].
+            const int score_base = OFF_SCORES + hq * kv_max_t;
+            for (int t = 0; t < kv_len; t++) {
+                float partial = 0.0f;
+                for (int i = tid; i < d; i += block_size) {
+                    const float q = workspace[OFF_Q_ROT + hq * d + i];
+                    const float k = static_cast<float>(
+                        kv_cache_k[t * Hkv * d + h_kv * d + i]);
+                    partial += q * k;
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    workspace[score_base + t] = shared_scratch[0] * scale;
+                }
                 __syncthreads();
             }
-            __shared__ float head_score;
+
+            // Softmax with max-stabilisation. Done by tid==0 to keep the
+            // reduction simple — kv_len is small (≤ context window) and the
+            // remaining work (V-weighted reduction) is the bulk of the cost.
+            __shared__ float max_score;
+            __shared__ float exp_sum;
             if (tid == 0) {
-                head_score = shared_scratch[0] * scale;
+                float m = workspace[score_base];
+                for (int t = 1; t < kv_len; t++) {
+                    m = fmaxf(m, workspace[score_base + t]);
+                }
+                max_score = m;
+                float s = 0.0f;
+                for (int t = 0; t < kv_len; t++) {
+                    const float e = expf(workspace[score_base + t] - m);
+                    workspace[score_base + t] = e;
+                    s += e;
+                }
+                exp_sum = s;
             }
             __syncthreads();
-            (void)head_score;
 
-            // softmax([s]) = [1.0]; bf16(1.0 * v) = v. v_raw is already
-            // BF16-rounded F32 from Phase D so no extra rounding needed.
+            // Weighted sum of V over t. Each thread handles a slice of d.
+            const float inv_sum = 1.0f / exp_sum;
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[OFF_V_RAW + h_kv * d + i];
-                workspace[OFF_ATTN + hq * d + i] = v;
+                float acc = 0.0f;
+                for (int t = 0; t < kv_len; t++) {
+                    const float w = workspace[score_base + t] * inv_sum;
+                    const float v = static_cast<float>(
+                        kv_cache_v[t * Hkv * d + h_kv * d + i]);
+                    acc += w * v;
+                }
+                workspace[OFF_ATTN + hq * d + i] = acc;
                 if (stage == 4) {
-                    output[hq * d + i] = static_cast<T>(v);
+                    output[hq * d + i] = static_cast<T>(acc);
                 }
             }
             __syncthreads();

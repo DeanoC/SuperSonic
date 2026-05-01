@@ -161,6 +161,9 @@ fn build_full_attn_layer(
         k_norm_w: upload_bf16(ordinal, &[d], &b64_field(weights, "k_norm_w"), "k_norm_w"),
         o_proj_w,
         int4,
+        // Parity test runs at position=0; KV cache stays disabled so the
+        // kernel uses the back-compat kv_len=1 self-attention path.
+        kv_cache: None,
     }
 }
 

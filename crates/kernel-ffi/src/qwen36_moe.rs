@@ -280,6 +280,9 @@ extern "C" {
         o_proj_zero: *const c_void,
         output: *mut c_void,
         workspace: *mut f32,
+        kv_cache_k: *mut c_void,
+        kv_cache_v: *mut c_void,
+        kv_max_t: c_int,
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
@@ -545,6 +548,33 @@ pub struct Qwen36MoeAttnStepWeights {
     pub q_norm_w: *const c_void,
     pub k_norm_w: *const c_void,
     pub o_proj_w: *const c_void,
+    /// PR 4d KV cache. When both `kv_cache_k` and `kv_cache_v` are non-null
+    /// (and `kv_max_t > 0`), the kernel writes the current step's K/V at
+    /// slot `position` and attends over `kv_len = position + 1` past tokens.
+    /// When both are null, falls back to the kv_len=1 self-attention path
+    /// (back-compat for the per-block parity tests). Layout: BF16 tensors
+    /// of shape `[kv_max_t, num_kv_heads * head_dim]`.
+    pub kv_cache_k: *mut c_void,
+    pub kv_cache_v: *mut c_void,
+    pub kv_max_t: i32,
+}
+
+impl Default for Qwen36MoeAttnStepWeights {
+    fn default() -> Self {
+        Self {
+            input_hidden: std::ptr::null(),
+            input_norm_w: std::ptr::null(),
+            q_proj_w: std::ptr::null(),
+            k_proj_w: std::ptr::null(),
+            v_proj_w: std::ptr::null(),
+            q_norm_w: std::ptr::null(),
+            k_norm_w: std::ptr::null(),
+            o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
+        }
+    }
 }
 
 /// Optional INT4 sidecar pointers + group size for the full-attention
@@ -655,6 +685,9 @@ pub fn attn_step_launch(
                     int4.o_proj_zero,
                     output.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
+                    weights.kv_cache_k,
+                    weights.kv_cache_v,
+                    weights.kv_max_t as c_int,
                     counters,
                     barrier_counter,
                     barrier_flag,
@@ -1595,6 +1628,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: std::ptr::null(),
             o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
 
         attn_step_launch(
@@ -1713,6 +1749,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: k_norm_w.as_ptr(),
             o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
 
         attn_step_launch(
@@ -1840,6 +1879,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: k_norm_w.as_ptr(),
             o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
 
         attn_step_launch(
@@ -1958,6 +2000,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: k_norm_w.as_ptr(),
             o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
 
         attn_step_launch(
@@ -2079,6 +2124,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: k_norm_w.as_ptr(),
             o_proj_w: o_proj_w.as_ptr(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
 
         attn_step_launch(
@@ -2293,6 +2341,9 @@ mod tests {
             q_norm_w: q_norm_w.as_ptr(),
             k_norm_w: k_norm_w.as_ptr(),
             o_proj_w: o_packed_buf.as_ptr(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
         };
         let int4_ptrs = Qwen36MoeAttnStepInt4 {
             group_size,

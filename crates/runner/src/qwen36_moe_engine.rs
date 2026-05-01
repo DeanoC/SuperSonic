@@ -27,8 +27,8 @@ use qwen36_moe::weights::{
 
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
-    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom,
+    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
+    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -767,6 +767,11 @@ fn load_layer_buffers(
     text_config: &TextConfig,
     weight_prefix: &str,
     int4_enabled: bool,
+    // When > 0, allocate a KV cache for full-attention layers sized for
+    // `kv_max_t` past tokens. Linear-attn layers use `conv_state` +
+    // `recurrent_state` instead (always allocated). 0 = no KV cache,
+    // kernel falls back to kv_len=1 (back-compat for the parity test).
+    kv_max_t: usize,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -787,6 +792,22 @@ fn load_layer_buffers(
         } else {
             None
         };
+        // KV cache: allocate per-layer when multi-token decode is requested.
+        // Layout: BF16 [kv_max_t, num_kv_heads * head_dim] for both K and V.
+        let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
+        let kv_cache = if kv_max_t > 0 {
+            let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
+            let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
+            Some(FullAttnKvCache {
+                k,
+                v,
+                kv_max_t: kv_max_t as i32,
+            })
+        } else {
+            None
+        };
         AttnLayerBuffers::Full {
             input_norm_w: load_to_gpu(store, ordinal, &format!("{lp}.input_layernorm.weight"))?,
             q_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight"))?,
@@ -796,6 +817,7 @@ fn load_layer_buffers(
             k_norm_w: load_to_gpu(store, ordinal, &format!("{fa}.k_norm.weight"))?,
             o_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight"))?,
             int4,
+            kv_cache,
         }
     } else {
         let la = format!("{lp}.linear_attn");
@@ -925,19 +947,20 @@ fn host_load_bytes(store: &BakedStore, name: &str) -> Result<Vec<u8>> {
 }
 
 /// Tokenize the prompt and run the multi-token decode loop end-to-end:
-/// prefill the prompt one token at a time (linear-attn state accumulates
-/// in place; full-attn is currently `kv_len=1` per call — KV-cache
-/// extension is a follow-up), then generate `max_new` tokens via greedy
-/// argmax against the (cached) host-side lm_head GEMV. Streams decoded
-/// text to stdout as each token arrives.
+/// prefill the prompt one token at a time, then generate `max_new`
+/// tokens via greedy argmax against the (cached) host-side lm_head
+/// GEMV. Streams decoded text to stdout as each token arrives.
 ///
-/// **Quality caveat**: the per-block kernels are stage-5 single-block
-/// launchers — they don't expose KV cache pointers, so full-attention
-/// layers (10 of 40) attend only to the current token. Linear-attn
-/// layers (the other 30) accumulate state correctly across decode steps
-/// because the kernel mutates `conv_state`/`recurrent_state` in place.
-/// Real full-attn KV needs an FFI extension on `Qwen36MoeAttnStepWeights`
-/// + corresponding kernel work — separate piece.
+/// State persistence across decode steps:
+///  - Linear-attn `conv_state` + `recurrent_state` mutated in place by
+///    the kernel.
+///  - Full-attn KV cache (PR 4d): per-layer `[kv_max_t, Hkv*d]` BF16
+///    buffers; the kernel writes the current step's K/V at slot
+///    `position` and attends over `kv_len = position + 1` past tokens.
+///    `kv_max_t` sized for `prompt_len + max_new` here.
+///
+/// Greedy decoding only — sampling (temperature/top-p) and GPU-side
+/// lm_head GEMV (currently host F32) are next perf/quality steps.
 fn decode_text(
     model_dir: &Path,
     report: &DryRunReport,
@@ -1018,11 +1041,17 @@ fn decode_text(
     set_backend(Backend::Hip);
     let ordinal = 0usize;
 
+    // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
+    // generously here since per-layer KV is small (10 full-attn layers ×
+    // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
+    let kv_max_t = prompt_ids.len() + max_new;
+
     let mut layers = Vec::with_capacity(geom.num_layers as usize);
     println!(
-        "  loading {} layers ({} INT4 sidecar sets)…",
+        "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
         if int4_enabled { geom.num_layers } else { 0 },
+        kv_max_t,
     );
     for li in 0..geom.num_layers as usize {
         let layer = load_layer_buffers(
@@ -1033,6 +1062,7 @@ fn decode_text(
             &report.config.text_config,
             weight_prefix,
             int4_enabled,
+            kv_max_t,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
@@ -1139,8 +1169,8 @@ fn decode_text(
         },
     );
     println!(
-        "  (Note: full-attn KV cache is a follow-up — those layers see only \
-         the current token; quality is degraded but the pipeline is end-to-end.)"
+        "  (Note: greedy decoding only; sampling, temperature/top-p, and \
+         GPU-side lm_head are next.)"
     );
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
@@ -1247,6 +1277,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             &report.config.text_config,
             weight_prefix,
             int4_enabled,
+            0, // legacy single-token path: no KV cache, kv_len=1 fast path.
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

@@ -128,6 +128,9 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     const void*   o_proj_zero,
     void*         output,
     float*        workspace,
+    void*         kv_cache_k,
+    void*         kv_cache_v,
+    int           kv_max_t,
     unsigned int* counters,
     unsigned int* barrier_counter,
     unsigned int* barrier_flag) {
@@ -160,6 +163,16 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
         (v_proj_scale != nullptr) || (o_proj_scale != nullptr);
     if (any_int4 && int4_group_size <= 0) return 116;
     if (!any_int4 && int4_group_size != 0) return 117;
+
+    // KV cache: pointers must be paired (both null or both non-null), and
+    // kv_max_t must be positive when enabled + ≥ position+1 to fit the
+    // current write.
+    const bool kv_enabled = (kv_cache_k != nullptr || kv_cache_v != nullptr);
+    if ((kv_cache_k == nullptr) != (kv_cache_v == nullptr)) return 118;
+    if (kv_enabled) {
+        if (kv_max_t <= 0) return 119;
+        if (position < 0 || position >= kv_max_t) return 120;
+    }
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -214,6 +227,9 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
                        static_cast<const hip_bfloat16*>(o_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        workspace,
+                       static_cast<hip_bfloat16*>(kv_cache_k),
+                       static_cast<hip_bfloat16*>(kv_cache_v),
+                       kv_max_t,
                        counters,
                        barrier_counter,
                        barrier_flag);
