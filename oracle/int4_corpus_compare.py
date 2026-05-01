@@ -139,14 +139,18 @@ def load_raw_tensor(manifest_by_name: dict, weights: np.memmap,
 def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     log(f"[oracle] loading HF model (bf16) to {device}")
-    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    except Exception as exc:
+        log(f"[oracle] tokenizer remote code failed ({exc}); retrying with built-in tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=False)
     try:
         model = AutoModelForCausalLM.from_pretrained(
             str(model_dir),
             torch_dtype=torch.bfloat16,
             trust_remote_code=True,
         ).to(device)
-    except ImportError as exc:
+    except Exception as exc:
         log(f"[oracle] remote model code failed ({exc}); retrying with built-in architecture")
         model = AutoModelForCausalLM.from_pretrained(
             str(model_dir),
@@ -254,10 +258,30 @@ def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
 # ---------------------------------------------------------------------------
 # Greedy decode for comparison
 # ---------------------------------------------------------------------------
+def collect_eos_token_ids(tokenizer, model) -> set[int]:
+    eos_ids: set[int] = set()
+
+    def add(value) -> None:
+        if value is None:
+            return
+        if isinstance(value, int):
+            eos_ids.add(value)
+            return
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                add(item)
+
+    add(getattr(tokenizer, "eos_token_id", None))
+    add(getattr(getattr(model, "config", None), "eos_token_id", None))
+    add(getattr(getattr(model, "generation_config", None), "eos_token_id", None))
+    return eos_ids
+
+
 @torch.no_grad()
 def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
                   device: torch.device) -> tuple[list[int], str]:
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    eos_token_ids = collect_eos_token_ids(tokenizer, model)
     past = None
     next_id = None
     for pos in range(ids.shape[1]):
@@ -274,6 +298,8 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
     for _ in range(max_new_tokens):
         assert next_id is not None
         new_ids.append(next_id)
+        if next_id in eos_token_ids:
+            break
         out = model(
             input_ids=torch.tensor([[next_id]], device=device),
             past_key_values=past,
@@ -382,14 +408,11 @@ def main() -> int:
 
         # Token-level comparison
         n = min(len(py_ids), len(rs_ids))
-        first_diverge = next(
-            (j for j in range(n) if py_ids[j] != rs_ids[j]),
-            n if len(py_ids) == len(rs_ids) else n,
-        )
-        ok = first_diverge == args.max_new_tokens
+        first_diverge = next((j for j in range(n) if py_ids[j] != rs_ids[j]), n)
+        ok = py_ids == rs_ids
         if ok:
             matches += 1
-        log(f"  agree_for={first_diverge}/{args.max_new_tokens} "
+        log(f"  agree_for={first_diverge}/{max(len(py_ids), len(rs_ids))} "
             f"{'MATCH' if ok else 'DIVERGE'}")
         results.append({
             "prompt": prompt,
