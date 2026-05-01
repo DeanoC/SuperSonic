@@ -235,12 +235,28 @@ def load_tensor(model_dir: Path, name: str, device: str = "cpu") -> torch.Tensor
 # ---------------------------------------------------------------------------
 # Math primitives
 # ---------------------------------------------------------------------------
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMS norm without add-unit-offset. Computed in F32, output in input dtype."""
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = True,
+) -> torch.Tensor:
+    """RMS norm. Computed in F32, output in input dtype.
+
+    `add_unit_offset=True` matches HuggingFace `Qwen3_5MoeRMSNorm`:
+    `output = x_normed * (1.0 + weight)`. Default — used for
+    `input_layernorm` here.
+
+    `add_unit_offset=False` matches HuggingFace `Qwen3_5MoeRMSNormGated`
+    (no offset). Pass explicitly for `linear_attn.norm`, the only site
+    in this oracle that uses the gated convention.
+    """
     in_dtype = x.dtype
     xf = x.to(torch.float32)
     var = xf.pow(2).mean(dim=-1, keepdim=True)
-    out = xf * torch.rsqrt(var + eps) * weight.to(torch.float32)
+    w_f = weight.to(torch.float32)
+    scale = (1.0 + w_f) if add_unit_offset else w_f
+    out = xf * torch.rsqrt(var + eps) * scale
     return out.to(in_dtype)
 
 
@@ -362,9 +378,12 @@ def reference_linear_attn_layer(
     state_after = state + k_rep_f.unsqueeze(-1) * delta.unsqueeze(1)
     recurrent_out = (state_after * q_scaled_f.unsqueeze(-1)).sum(dim=1)   # [V, v_dim]
 
-    # 10. Per-head RMS norm of recurrent output.
+    # 10. Per-head RMS norm of recurrent output. The gated path uses
+    # `Qwen3_5MoeRMSNormGated` in HF — plain `weight`, no `(1+w)` offset.
     rec_out_dtype = recurrent_out.to(dtype)
-    out_normed = rms_norm(rec_out_dtype, norm_w, rms_norm_eps)      # [V, v_dim]
+    out_normed = rms_norm(
+        rec_out_dtype, norm_w, rms_norm_eps, add_unit_offset=False
+    )                                                                # [V, v_dim]
 
     # 11. Z gating (silu(z) elementwise multiply).
     z_heads = z_raw.reshape(V, v_dim)

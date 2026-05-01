@@ -230,12 +230,30 @@ def load_tensor(model_dir: Path, name: str, device: str = "cpu") -> torch.Tensor
 # ---------------------------------------------------------------------------
 # Math primitives — kept structurally identical to what the kernel will do
 # ---------------------------------------------------------------------------
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMS norm without add-unit-offset. Computed in F32, output in input dtype."""
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = True,
+) -> torch.Tensor:
+    """RMS norm. Computed in F32, output in input dtype.
+
+    `add_unit_offset=True` matches HuggingFace `Qwen3_5MoeRMSNorm`:
+    `output = x_normed * (1.0 + weight)` — the stored weight is a small
+    delta around 0 and the effective scale is `1 + weight`. Used for
+    `input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`,
+    and the final `model.norm`.
+
+    `add_unit_offset=False` matches HuggingFace `Qwen3_5MoeRMSNormGated`
+    (no offset, plain `output = x_normed * weight`) — used for
+    `linear_attn.norm` only. Pass explicitly at that call site.
+    """
     in_dtype = x.dtype
     xf = x.to(torch.float32)
     var = xf.pow(2).mean(dim=-1, keepdim=True)
-    out = xf * torch.rsqrt(var + eps) * weight.to(torch.float32)
+    w_f = weight.to(torch.float32)
+    scale = (1.0 + w_f) if add_unit_offset else w_f
+    out = xf * torch.rsqrt(var + eps) * scale
     return out.to(in_dtype)
 
 
@@ -329,12 +347,24 @@ def reference_full_attention_layer(
     v_raw = x_norm @ v_proj_w.T  # [Hkv*d]
 
     # 3. Split Q's gate off and reshape per-head.
-    q_lanes = q_raw[: H * d]
-    out_gate_lanes = q_raw[H * d :]
-    q_heads = q_lanes.reshape(H, d)            # [H, d]
+    #
+    # HF `Qwen3_5MoeAttention.forward` (line 672 of modeling_qwen3_5_moe.py)
+    # does:
+    #   query_states, gate = torch.chunk(
+    #       q_proj(x).view(*input_shape, -1, head_dim * 2), 2, dim=-1)
+    # i.e. reshape the flat `[H*2*d]` q_proj output to `[H, 2*d]` then
+    # chunk on the last dim. This makes the layout per-head interleaved
+    # `[q_h | gate_h]`: for head h, channels `[h*2d, h*2d+d)` are q, and
+    # `[h*2d+d, (h+1)*2d)` are the output gate. The trained q_proj weight
+    # rows are organized in this same order, so we MUST follow HF's
+    # convention — splitting flat `[:H*d]`/`[H*d:]` reads gate values
+    # into q (and vice versa) once h ≥ 1.
+    q_paired = q_raw.reshape(H, 2 * d)         # [H, 2*d]
+    q_heads, out_gate = torch.chunk(q_paired, 2, dim=-1)  # each [H, d]
+    q_lanes = q_heads.reshape(H * d)
+    out_gate_lanes = out_gate.reshape(H * d)
     k_heads = k_raw.reshape(Hkv, d)            # [Hkv, d]
     v_heads = v_raw.reshape(Hkv, d)            # [Hkv, d]
-    out_gate = out_gate_lanes.reshape(H, d)    # [H, d]
 
     # 4. Per-head Q/K RMS norm.
     q_normed = rms_norm(q_heads, q_norm_w, rms_norm_eps)
