@@ -531,11 +531,19 @@ __global__ void qwen36_moe_attn_step_kernel(
     // doesn't need to allocate space for it.
     const int OFF_SCORES   = 6 * H * d + 4 * Hkv * d + hidden;
 
-    // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
+    // -- Phase C: per-head RMS norm of q lanes ----------------------------
+    //
+    // The q_proj output at `workspace[OFF_Q_RAW..OFF_Q_RAW+2*H*d]` carries
+    // BF16-rounded rows of `q_proj_w @ x_norm` in their natural HF layout:
+    // per-head interleaved `[q_h | gate_h]` because HF reshapes via
+    // `q_proj(x).view(..., H, head_dim*2).chunk(2, dim=-1)` (line 672 of
+    // modeling_qwen3_5_moe.py). For head h the q values live at offset
+    // `h*2*d + i` (i in [0, d)) and the output gate at `h*2*d + d + i`.
+    //
     // Each block grabs a head index, reduces across head_dim, writes BF16
-    // q_normed to workspace[Q_NORMED..]. If stage == 1 we also publish
-    // q_normed to the host-visible `output` buffer; later stages keep
-    // q_normed in workspace as RoPE input.
+    // q_normed to a *tightly packed* `OFF_Q_NORMED + h*d` so the RoPE +
+    // attention readers downstream see a `[H, d]` q array. If stage == 1
+    // we also publish q_normed to the host-visible `output` buffer.
     {
         for (;;) {
             __shared__ unsigned int head_s;
@@ -546,10 +554,11 @@ __global__ void qwen36_moe_attn_step_kernel(
             const int h = static_cast<int>(head_s);
             if (h >= H) break;
 
-            const int base = h * d;
+            const int q_in_base  = h * 2 * d;   // HF interleaved q half
+            const int q_out_base = h * d;       // tightly packed q_normed
             float partial = 0.0f;
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[OFF_Q_RAW + base + i];
+                const float v = workspace[OFF_Q_RAW + q_in_base + i];
                 partial += v * v;
             }
             shared_scratch[tid] = partial;
@@ -565,16 +574,16 @@ __global__ void qwen36_moe_attn_step_kernel(
             __syncthreads();
 
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[OFF_Q_RAW + base + i];
+                const float v = workspace[OFF_Q_RAW + q_in_base + i];
                 const float wv = load_as_float<T>(q_norm_w, i);
                 // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset.
                 const float normed = bf16_round_rne_f32(v * head_inv_rms * (1.0f + wv));
                 // Round-trip through BF16 representation: store BF16 in
                 // workspace as F32 so the next-stage RoPE reader sees the
                 // exact dtype-cast values PyTorch's `.to(bf16)` produces.
-                workspace[OFF_Q_NORMED + base + i] = normed;
+                workspace[OFF_Q_NORMED + q_out_base + i] = normed;
                 if (stage == 1) {
-                    output[base + i] = static_cast<T>(normed);
+                    output[q_out_base + i] = static_cast<T>(normed);
                 }
             }
             __syncthreads();
@@ -939,9 +948,11 @@ __global__ void qwen36_moe_attn_step_kernel(
 
     // -- Phase H: gated_attn = bf16(sigmoid(out_gate)) * attn --------------
     //
-    // out_gate is the upper half of q_raw stored at workspace[Q_RAW + H*d:].
-    // Each block grabs one Q head and produces gated_attn[h, :] in workspace.
-    // Oracle math (qwen36_moe_oracle.py line 215):
+    // out_gate is the second-half lane of q_proj's per-head interleaved
+    // output: for head h it lives at workspace[OFF_Q_RAW + h*2*d + d + i]
+    // (HF `view(..., H, head_dim*2).chunk(2, -1)` convention). Each block
+    // grabs one Q head and produces gated_attn[h, :] in workspace.
+    // Oracle math (qwen36_moe_oracle.py `out_gate * attn`):
     //   sigmoid_bf16 = bf16(sigmoid(f32(out_gate)))
     //   gated_attn   = bf16(sigmoid_bf16 * attn)
     {
@@ -955,7 +966,7 @@ __global__ void qwen36_moe_attn_step_kernel(
             if (h >= H) break;
 
             for (int i = tid; i < d; i += block_size) {
-                const float out_gate = workspace[OFF_Q_RAW + H * d + h * d + i];
+                const float out_gate = workspace[OFF_Q_RAW + h * 2 * d + d + i];
                 const float attn_v   = workspace[OFF_ATTN + h * d + i];
                 const float sig      = 1.0f / (1.0f + expf(-out_gate));
                 const float sig_bf   = bf16_round_rne_f32(sig);
