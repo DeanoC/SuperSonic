@@ -1159,7 +1159,7 @@ pub fn int4_dequant_smoke_launch(
     }
 
     let backend = packed_buf.backend();
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
