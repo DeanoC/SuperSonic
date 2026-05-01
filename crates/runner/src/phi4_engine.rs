@@ -22,6 +22,24 @@ use phi4::rope::Phi4LongRope;
 use phi4::state::Phi4ModelState;
 use phi4::weights::Phi4Weights;
 
+fn phi4_bootstrap_bake_variant(
+    config_present: bool,
+    int4: bool,
+    fp8_runtime: bool,
+    no_download: bool,
+) -> Option<model_store::fetch::BakeVariant> {
+    if config_present || no_download {
+        return None;
+    }
+    if int4 {
+        Some(model_store::fetch::BakeVariant::Int4Gptq)
+    } else if fp8_runtime {
+        Some(model_store::fetch::BakeVariant::Fp8Native)
+    } else {
+        None
+    }
+}
+
 /// Run Phi-4-mini as a one-shot CLI decode. Parallel to `run_gemma4` /
 /// the inline Qwen path in `main.rs`.
 pub fn run_phi4(
@@ -55,15 +73,12 @@ pub fn run_phi4(
     }
 
     let mut bootstrap_bake = None;
-    if !cli.model_dir.join("config.json").exists()
-        && (cli.int4 || cli.fp8_runtime)
-        && !cli.no_download
-    {
-        let variant = if cli.int4 {
-            model_store::fetch::BakeVariant::Int4Gptq
-        } else {
-            model_store::fetch::BakeVariant::Fp8Native
-        };
+    if let Some(variant) = phi4_bootstrap_bake_variant(
+        cli.model_dir.join("config.json").exists(),
+        cli.int4,
+        cli.fp8_runtime,
+        cli.no_download,
+    ) {
         let bake_dir = variant.bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
@@ -815,6 +830,38 @@ pub fn run_phi4(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::phi4_bootstrap_bake_variant;
+    use model_store::fetch::BakeVariant;
+
+    #[test]
+    fn blank_phi4_fp8_dir_bootstraps_release_bake() {
+        assert_eq!(
+            phi4_bootstrap_bake_variant(false, false, true, false),
+            Some(BakeVariant::Fp8Native)
+        );
+    }
+
+    #[test]
+    fn blank_phi4_int4_dir_bootstraps_release_bake() {
+        assert_eq!(
+            phi4_bootstrap_bake_variant(false, true, false, false),
+            Some(BakeVariant::Int4Gptq)
+        );
+    }
+
+    #[test]
+    fn phi4_bootstrap_skips_existing_metadata_or_disabled_downloads() {
+        assert_eq!(phi4_bootstrap_bake_variant(true, false, true, false), None);
+        assert_eq!(phi4_bootstrap_bake_variant(false, false, true, true), None);
+        assert_eq!(
+            phi4_bootstrap_bake_variant(false, false, false, false),
+            None
+        );
+    }
 }
 
 fn greedy_argmax(logits: &[f32]) -> u32 {
