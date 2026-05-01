@@ -140,16 +140,40 @@ def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
     from transformers import AutoModelForCausalLM, AutoTokenizer
     log(f"[oracle] loading HF model (bf16) to {device}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        str(model_dir),
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    ).to(device)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            str(model_dir),
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        ).to(device)
+    except ImportError as exc:
+        log(f"[oracle] remote model code failed ({exc}); retrying with built-in architecture")
+        model = AutoModelForCausalLM.from_pretrained(
+            str(model_dir),
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=False,
+        ).to(device)
     model.eval()
 
     manifest, weights = load_bake(bake_dir)
     by_name = {t["name"]: t for t in manifest["tensors"]}
     log(f"[oracle] bake has {len(by_name)} tensors")
+
+    def split_raw_name_for_fused(hf_wname: str) -> list[str] | None:
+        if hf_wname.endswith(".self_attn.qkv_proj.weight"):
+            prefix = hf_wname[: -len(".self_attn.qkv_proj.weight")]
+            return [
+                f"{prefix}.self_attn.q_proj.weight",
+                f"{prefix}.self_attn.k_proj.weight",
+                f"{prefix}.self_attn.v_proj.weight",
+            ]
+        if hf_wname.endswith(".mlp.gate_up_proj.weight"):
+            prefix = hf_wname[: -len(".mlp.gate_up_proj.weight")]
+            return [
+                f"{prefix}.mlp.gate_proj.weight",
+                f"{prefix}.mlp.up_proj.weight",
+            ]
+        return None
 
     # Build translation from HF state-dict name to bake raw name.
     sd_keys = list(model.state_dict().keys())
@@ -165,25 +189,43 @@ def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
                 hf_to_raw[k] = cand
 
     # Patch every INT4 weight in the HF model with the bake's dequantised values.
+    # Phi-4's HF module keeps qkv_proj and gate_up_proj fused, while the
+    # SuperSonic bake splits them into per-projection shards; stitch those back
+    # together along the output-row axis before copying into the module.
     int4_count = 0
+    int4_fused_count = 0
     for mod_name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
             continue
         hf_wname = mod_name + ".weight"
         raw_wname = hf_to_raw.get(hf_wname)
-        if raw_wname is None:
-            continue
-        meta = by_name.get(raw_wname)
-        if meta is None or meta["layout"] != "Int4Quantized":
-            continue
-        recon = dequant_int4_tensor(by_name, weights, raw_wname)
+        if raw_wname is not None:
+            meta = by_name.get(raw_wname)
+            if meta is None or meta["layout"] != "Int4Quantized":
+                continue
+            recon = dequant_int4_tensor(by_name, weights, raw_wname)
+        else:
+            shard_names = split_raw_name_for_fused(hf_wname)
+            if not shard_names or not all(
+                by_name.get(n, {}).get("layout") == "Int4Quantized"
+                for n in shard_names
+            ):
+                continue
+            recon = np.concatenate(
+                [dequant_int4_tensor(by_name, weights, n) for n in shard_names],
+                axis=0,
+            )
+            int4_fused_count += 1
         assert recon.shape == tuple(mod.weight.shape), \
             f"shape mismatch for {raw_wname}: {recon.shape} vs {tuple(mod.weight.shape)}"
         with torch.no_grad():
             # Already bf16-rounded values in f32; .to(bfloat16) is exact.
             mod.weight.data.copy_(torch.from_numpy(recon).to(torch.bfloat16).to(device))
         int4_count += 1
-    log(f"[oracle] patched {int4_count} INT4 linear layers with kernel-accurate weights")
+    log(
+        f"[oracle] patched {int4_count} INT4 linear layers with "
+        f"kernel-accurate weights ({int4_fused_count} fused)"
+    )
 
     # Patch A_log (was F32, HF downcasts to bf16; bake stores exp(F32)->bf16).
     alog_count = 0
@@ -216,15 +258,32 @@ def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
 def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
                   device: torch.device) -> tuple[list[int], str]:
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    prompt_len = ids.shape[1]
-    gen = model.generate(
-        ids,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        use_cache=True,
-    )
-    new_ids = gen[0][prompt_len:].tolist()
-    text = tokenizer.decode(gen[0], skip_special_tokens=True)
+    past = None
+    next_id = None
+    for pos in range(ids.shape[1]):
+        out = model(
+            input_ids=ids[:, pos:pos + 1],
+            past_key_values=past,
+            use_cache=True,
+            return_dict=True,
+        )
+        past = out.past_key_values
+        next_id = int(torch.argmax(out.logits[0, -1]).item())
+
+    new_ids: list[int] = []
+    for _ in range(max_new_tokens):
+        assert next_id is not None
+        new_ids.append(next_id)
+        out = model(
+            input_ids=torch.tensor([[next_id]], device=device),
+            past_key_values=past,
+            use_cache=True,
+            return_dict=True,
+        )
+        past = out.past_key_values
+        next_id = int(torch.argmax(out.logits[0, -1]).item())
+
+    text = tokenizer.decode(ids[0].tolist() + new_ids, skip_special_tokens=True)
     return new_ids, text
 
 

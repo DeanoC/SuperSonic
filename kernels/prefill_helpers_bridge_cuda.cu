@@ -292,7 +292,8 @@ __global__ void pfx_lm_head_argmax_blocks_bf16_kernel(
     int hidden_dim,
     int vocab_size,
     float* __restrict__ block_best_vals,
-    uint32_t* __restrict__ block_best_idxs
+    uint32_t* __restrict__ block_best_idxs,
+    bool round_logits_to_bf16
 ) {
     extern __shared__ float shared_hidden[];
     __shared__ float warp_best_vals[8];
@@ -324,7 +325,9 @@ __global__ void pfx_lm_head_argmax_blocks_bf16_kernel(
             partial += __shfl_down_sync(0xffffffffu, partial, offset);
         }
 
-        const float logit = __bfloat162float(__float2bfloat16(partial));
+        const float logit = round_logits_to_bf16
+            ? __bfloat162float(__float2bfloat16(partial))
+            : partial;
         if (lane == 0 && (logit > best_val || (logit == best_val && static_cast<uint32_t>(row) < best_idx))) {
             best_val = logit;
             best_idx = static_cast<uint32_t>(row);
@@ -573,7 +576,8 @@ int lm_head_argmax_bf16_device(
     const void* weight,
     void* block_best_vals,
     void* block_best_idxs,
-    void* out_index
+    void* out_index,
+    bool round_logits_to_bf16
 ) {
     ScopedHipDevice scoped(device_ordinal);
     constexpr int block = 256;
@@ -585,7 +589,8 @@ int lm_head_argmax_bf16_device(
         hidden_dim,
         vocab_size,
         static_cast<float*>(block_best_vals),
-        static_cast<uint32_t*>(block_best_idxs));
+        static_cast<uint32_t*>(block_best_idxs),
+        round_logits_to_bf16);
     if (cudaGetLastError() != cudaSuccess) return 411;
     pfx_argmax_blocks_kernel<<<1, block>>>(
         static_cast<const float*>(block_best_vals),
@@ -822,5 +827,28 @@ extern "C" int supersonic_qwen35_cuda_lm_head_argmax_bf16(
         weight,
         block_best_vals,
         block_best_idxs,
-        out_index);
+        out_index,
+        true);
+}
+
+extern "C" int supersonic_qwen35_cuda_lm_head_argmax_bf16_f32accum(
+    size_t device_ordinal,
+    size_t hidden_dim,
+    size_t vocab_size,
+    const void* hidden,
+    const void* weight,
+    void* block_best_vals,
+    void* block_best_idxs,
+    void* out_index
+) {
+    return lm_head_argmax_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(hidden_dim),
+        static_cast<int>(vocab_size),
+        hidden,
+        weight,
+        block_best_vals,
+        block_best_idxs,
+        out_index,
+        false);
 }

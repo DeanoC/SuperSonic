@@ -210,10 +210,7 @@ impl ArchProfile {
 /// larger grids that only stay hang-free when co-residence is enforced by
 /// `hipLaunchCooperativeKernel`. User env vars `SUPERSONIC_QWEN4B_BLOCKS`
 /// / `_COOP` still override any preset inside the bridge.
-pub fn qwen35_4b_launch_preset(
-    arch: &GpuArch,
-    model: &ModelVariant,
-) -> Option<(i32, bool)> {
+pub fn qwen35_4b_launch_preset(arch: &GpuArch, model: &ModelVariant) -> Option<(i32, bool)> {
     match (arch, model) {
         // gfx1150 + 0.8B: cooperative launch at 32 blocks caps conservatively
         // at 24 on 0.8B's 14 KB LDS and runs at 77 ms/tok vs. the non-coop
@@ -642,6 +639,19 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Phi4_Mini,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 8 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Phi4(Phi4KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Llama3_1_8B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
@@ -748,6 +758,11 @@ mod tests {
     fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
         assert!(lookup(&ModelVariant::Qwen3_5_2B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
         assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
+    }
+
+    #[test]
+    fn cuda_sm86_registry_includes_phi4_mini() {
+        assert!(lookup(&ModelVariant::Phi4_Mini, &Backend::Cuda, &GpuArch::Sm86).is_some());
     }
 
     #[test]

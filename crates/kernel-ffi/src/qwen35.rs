@@ -170,7 +170,10 @@ unsafe extern "C" {
 // `cudaGetDeviceProperties` on the Rust side).
 #[cfg(supersonic_backend_hip)]
 unsafe extern "C" {
-    fn supersonic_hip_device_clock_khz(device_ordinal: c_int, clock_rate_khz_out: *mut u32) -> c_int;
+    fn supersonic_hip_device_clock_khz(
+        device_ordinal: c_int,
+        clock_rate_khz_out: *mut u32,
+    ) -> c_int;
 
     // Per-model launch preset for the qwen4b persistent decode kernel.
     // `blocks=0` clears the preset (falls back to the hardcoded gfx11xx 2x
@@ -217,6 +220,17 @@ unsafe extern "C" {
         out_index: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_cuda_lm_head_argmax_bf16_f32accum(
+        device_ordinal: usize,
+        hidden_dim: usize,
+        vocab_size: usize,
+        hidden: *const c_void,
+        weight: *const c_void,
+        block_best_vals: *mut c_void,
+        block_best_idxs: *mut c_void,
+        out_index: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_4b_cuda_lm_head_bf16_gemm(
         device_ordinal: usize,
         in_dim: usize,
@@ -229,9 +243,16 @@ unsafe extern "C" {
 
 fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
-        Backend::Hip => GpuError::backend(Backend::Hip, format!("{what} failed with status {status}")),
-        Backend::Cuda => GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}")),
-        Backend::Metal => GpuError::backend(Backend::Metal, format!("{what} failed with status {status}")),
+        Backend::Hip => {
+            GpuError::backend(Backend::Hip, format!("{what} failed with status {status}"))
+        }
+        Backend::Cuda => {
+            GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}"))
+        }
+        Backend::Metal => GpuError::backend(
+            Backend::Metal,
+            format!("{what} failed with status {status}"),
+        ),
     }
 }
 
@@ -701,9 +722,10 @@ pub fn cuda_argmax_bf16(
         let status =
             supersonic_qwen35_cuda_argmax_bf16(ordinal, n, logits.as_ptr(), out_index.as_mut_ptr());
         if status != 0 {
-            return Err(GpuError::backend(Backend::Cuda, format!(
-                "cuda_argmax_bf16 failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("cuda_argmax_bf16 failed with status {status}"),
+            ));
         }
         Ok(())
     }
@@ -769,9 +791,10 @@ pub fn cuda_lm_head_argmax_bf16(
             out_index.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::backend(Backend::Cuda, format!(
-                "cuda_lm_head_argmax_bf16 failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("cuda_lm_head_argmax_bf16 failed with status {status}"),
+            ));
         }
         Ok(())
     }
@@ -787,6 +810,74 @@ pub fn cuda_lm_head_argmax_bf16(
             hidden_dim,
             vocab_size,
         );
+        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+    }
+}
+
+pub fn cuda_lm_head_argmax_bf16_f32accum(
+    ordinal: usize,
+    hidden: &GpuBuffer,
+    weight: &GpuBuffer,
+    block_best_vals: &mut GpuBuffer,
+    block_best_idxs: &mut GpuBuffer,
+    out_index: &mut GpuBuffer,
+    hidden_dim: usize,
+    vocab_size: usize,
+) -> Result<(), GpuError> {
+    if hidden.backend() != Backend::Cuda
+        || weight.backend() != Backend::Cuda
+        || block_best_vals.backend() != Backend::Cuda
+        || block_best_idxs.backend() != Backend::Cuda
+        || out_index.backend() != Backend::Cuda
+    {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16_f32accum requires CUDA buffers".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16 || weight.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "cuda_lm_head_argmax_bf16_f32accum requires BF16 hidden/weight, got {:?}/{:?}",
+            hidden.dtype(),
+            weight.dtype()
+        )));
+    }
+    if block_best_vals.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16_f32accum requires F32 block_best_vals".into(),
+        ));
+    }
+    if block_best_idxs.dtype() != ScalarType::U32 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16_f32accum requires U32 block_best_idxs".into(),
+        ));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() != 1 {
+        return Err(GpuError::InvalidArg(
+            "cuda_lm_head_argmax_bf16_f32accum requires a U32[1] output buffer".into(),
+        ));
+    }
+    #[cfg(supersonic_backend_cuda)]
+    unsafe {
+        let status = supersonic_qwen35_cuda_lm_head_argmax_bf16_f32accum(
+            ordinal,
+            hidden_dim,
+            vocab_size,
+            hidden.as_ptr(),
+            weight.as_ptr(),
+            block_best_vals.as_mut_ptr(),
+            block_best_idxs.as_mut_ptr(),
+            out_index.as_mut_ptr(),
+        );
+        if status != 0 {
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("cuda_lm_head_argmax_bf16_f32accum failed with status {status}"),
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(supersonic_backend_cuda))]
+    {
         Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
     }
 }
@@ -834,9 +925,10 @@ pub fn cuda_target_nll_bf16(
             out_nll.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::backend(Backend::Cuda, format!(
-                "cuda_target_nll_bf16 failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("cuda_target_nll_bf16 failed with status {status}"),
+            ));
         }
         Ok(())
     }
@@ -885,9 +977,10 @@ pub fn cuda_accumulate_target_nll_bf16(
             out_sum.as_mut_ptr(),
         );
         if status != 0 {
-            return Err(GpuError::backend(Backend::Cuda, format!(
-                "cuda_accumulate_target_nll_bf16 failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("cuda_accumulate_target_nll_bf16 failed with status {status}"),
+            ));
         }
         Ok(())
     }

@@ -261,6 +261,11 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             "llama31_certified_kv_cuda.o",
             "building Llama31 certified KV CUDA bridge",
         ),
+        (
+            "phi4_bridge_cuda.cu",
+            "phi4_cuda.o",
+            "building Phi-4 CUDA bridge",
+        ),
     ];
     let archs = detect_cuda_archs();
     println!(
@@ -367,6 +372,8 @@ fn main() {
         "full_attention_bridge_4b_cuda.cu",
         "prefill_helpers_bridge_cuda.cu",
         "certified_kv_bridge_cuda.cu",
+        "phi4_cuda.cuh",
+        "phi4_bridge_cuda.cu",
     ] {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }

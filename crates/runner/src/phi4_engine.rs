@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::phi4 as phi4_ffi;
 
 use crate::oracle::OracleOutput;
@@ -54,10 +54,37 @@ pub fn run_phi4(
         bail!("Phi-4 engine has no chunked prefill yet (--prefill-chunk-size must be 0)");
     }
 
+    let mut bootstrap_bake = None;
+    if !cli.model_dir.join("config.json").exists()
+        && (cli.int4 || cli.fp8_runtime)
+        && !cli.no_download
+    {
+        let variant = if cli.int4 {
+            model_store::fetch::BakeVariant::Int4Gptq
+        } else {
+            model_store::fetch::BakeVariant::Fp8Native
+        };
+        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        let canonical_model = model_variant.to_string();
+        match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
+            Ok(true) => {
+                eprintln!(
+                    "[fetch] installed Phi-4 bootstrap {variant} bake at {}",
+                    bake_dir.display()
+                );
+                bootstrap_bake = Some(variant);
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[fetch] Phi-4 bootstrap bake fetch failed: {e}"),
+        }
+    }
+
     if !cli.model_dir.join("config.json").exists() {
         bail!(
-            "Phi-4 model dir {} has no config.json. Phi-4 has no release-hosted bake yet — \
-             populate the directory by hand: `huggingface-cli download {} --local-dir {}`",
+            "Phi-4 model dir {} has no config.json, and release-backed metadata could not be fetched. \
+             Populate the directory by hand: `huggingface-cli download {} --local-dir {}`",
             cli.model_dir.display(),
             model_variant.hf_model_id(),
             cli.model_dir.display(),
@@ -170,9 +197,14 @@ pub fn run_phi4(
             .join("oracle/phi4_oracle.py");
         let oracle_device =
             crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
+        let oracle_model = crate::resolve_phi4_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            model_variant,
+        );
         let oracle = oracle_mod::run_phi4_oracle(
             &oracle_script,
-            &cli.model_dir,
+            &oracle_model,
             cli.prompt.as_str(),
             cli.max_new_tokens,
             &cli.oracle_dtype,
@@ -207,8 +239,10 @@ pub fn run_phi4(
         // use: refetch when --download-bake is set OR when the local bake
         // is missing/stale. Honors the documented CLI semantics so users
         // who explicitly pass --download-bake actually get a refresh.
+        let force_download =
+            cli.download_bake && bootstrap_bake != Some(model_store::fetch::BakeVariant::Int4Gptq);
         if !cli.no_download
-            && should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir))
+            && should_fetch_exact_bake(force_download, model_store::version_ok(&bake_dir))
         {
             let canonical_model = model_variant.to_string();
             match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
@@ -244,15 +278,14 @@ pub fn run_phi4(
         let bake_dir = variant.bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        let force_download =
+            cli.download_bake && bootstrap_bake != Some(model_store::fetch::BakeVariant::Fp8Native);
         if !cli.no_download
-            && should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir))
+            && should_fetch_exact_bake(force_download, model_store::version_ok(&bake_dir))
         {
             let canonical_model = model_variant.to_string();
             match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
-                Ok(true) => eprintln!(
-                    "[fetch] installed Phi-4 FP8 bake at {}",
-                    bake_dir.display()
-                ),
+                Ok(true) => eprintln!("[fetch] installed Phi-4 FP8 bake at {}", bake_dir.display()),
                 Ok(false) => {}
                 Err(e) => eprintln!("[fetch] Phi-4 FP8 bake fetch failed: {e}"),
             }
@@ -265,7 +298,10 @@ pub fn run_phi4(
                 cli.model_dir.display(),
             );
         }
-        eprintln!("[weights] loading FP8 baked package from {}", bake_dir.display());
+        eprintln!(
+            "[weights] loading FP8 baked package from {}",
+            bake_dir.display()
+        );
         let store = model_store::BakedStore::open(&bake_dir)
             .map_err(|e| anyhow!("open Phi-4 FP8 bake: {e}"))?;
         let fp8_weights = Phi4Weights::load_baked(&store, &config, ordinal, params.weight_prefix)
@@ -341,6 +377,16 @@ pub fn run_phi4(
     let hidden_size = config.hidden_size;
     let intermediate_size = config.intermediate_size;
     let num_layers = config.num_hidden_layers;
+    let debug_limit_layers = std::env::var("SUPERSONIC_PHI4_LIMIT_LAYERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0 && n <= num_layers);
+    let launch_layers = debug_limit_layers.unwrap_or(num_layers);
+    if let Some(n) = debug_limit_layers {
+        eprintln!("[phi4-debug] limiting persistent decode to {n}/{num_layers} layers");
+    }
+    let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
+    let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
     let head_dim = config.head_dim();
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
@@ -368,6 +414,12 @@ pub fn run_phi4(
         .map_err(|e| anyhow!("alloc sync_buf: {e}"))?;
     let mut matvec_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
         .map_err(|e| anyhow!("alloc matvec counter: {e}"))?;
+    let mut lm_argmax_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[512])
+        .map_err(|e| anyhow!("alloc lm_argmax_vals: {e}"))?;
+    let mut lm_argmax_idxs = GpuBuffer::zeros(ordinal, ScalarType::U32, &[512])
+        .map_err(|e| anyhow!("alloc lm_argmax_idxs: {e}"))?;
+    let mut lm_argmax_out = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .map_err(|e| anyhow!("alloc lm_argmax_out: {e}"))?;
 
     let mut hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_size])
         .map_err(|e| anyhow!("alloc hidden_io: {e}"))?;
@@ -392,8 +444,7 @@ pub fn run_phi4(
     // is set. Rebuilt + h2d'd every step like the main descs because the
     // scale-buffer pointers can move when ensure_kv_capacity grows the cache.
     let mut kv_fp8_desc_device: Option<GpuBuffer> = if cli.kv_fp8 {
-        let kv_fp8_desc_bytes =
-            num_layers * std::mem::size_of::<phi4_ffi::Phi4KVCacheFp8Desc>();
+        let kv_fp8_desc_bytes = num_layers * std::mem::size_of::<phi4_ffi::Phi4KVCacheFp8Desc>();
         Some(
             GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_fp8_desc_bytes])
                 .map_err(|e| anyhow!("alloc kv_fp8 desc_device: {e}"))?,
@@ -524,7 +575,7 @@ pub fn run_phi4(
         phi4_ffi::persistent_decode(
             ordinal,
             ScalarType::BF16,
-            num_layers,
+            launch_layers,
             hidden_size,
             intermediate_size,
             pos,
@@ -543,6 +594,27 @@ pub fn run_phi4(
             int4_scale_device.as_ref(),
         )
         .map_err(|e| anyhow!("phi4 persistent_decode at step {step}: {e}"))?;
+
+        if let Some(ref path) = debug_dump_hidden {
+            if step == prompt_ids.len() - 1 {
+                let hidden_bytes = hidden_io
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("debug hidden D2H at step {step}: {e}"))?;
+                let hidden_f32: Vec<f32> = hidden_bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect();
+                let payload = serde_json::json!({
+                    "step": step,
+                    "prompt_tokens": prompt_ids.len(),
+                    "layers": launch_layers,
+                    "hidden": hidden_f32,
+                });
+                std::fs::write(path, serde_json::to_vec(&payload)?)
+                    .map_err(|e| anyhow!("write debug hidden dump {path}: {e}"))?;
+                eprintln!("[phi4-debug] wrote hidden dump to {path}");
+            }
+        }
 
         // 7. Mark KV slot filled.
         for ls in state.layers.iter_mut() {
@@ -564,32 +636,83 @@ pub fn run_phi4(
             )
             .map_err(|e| anyhow!("final rms_norm at step {step}: {e}"))?;
 
-            kernel_ffi::standalone_matvec_4b(
-                ordinal,
-                ScalarType::BF16,
-                &mut logits_buf,
-                &normed_buf,
-                &*weights.lm_head,
-                hidden_size,
-                config.vocab_size,
-                &mut matvec_counter,
-            )
-            .map_err(|e| anyhow!("lm_head matvec at step {step}: {e}"))?;
+            let use_direct_cuda_argmax = normed_buf.backend() == Backend::Cuda
+                && oracle_output.is_none()
+                && debug_dump_logits.is_none();
+            let (next, logits_f32) = if use_direct_cuda_argmax {
+                kernel_ffi::cuda_lm_head_argmax_bf16_f32accum(
+                    ordinal,
+                    &normed_buf,
+                    &*weights.lm_head,
+                    &mut lm_argmax_vals,
+                    &mut lm_argmax_idxs,
+                    &mut lm_argmax_out,
+                    hidden_size,
+                    config.vocab_size,
+                )
+                .map_err(|e| anyhow!("lm_head argmax at step {step}: {e}"))?;
+                let idx_bytes = lm_argmax_out
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("lm_head argmax D2H at step {step}: {e}"))?;
+                let next =
+                    u32::from_le_bytes([idx_bytes[0], idx_bytes[1], idx_bytes[2], idx_bytes[3]]);
+                (next, None)
+            } else {
+                kernel_ffi::standalone_matvec_4b(
+                    ordinal,
+                    ScalarType::BF16,
+                    &mut logits_buf,
+                    &normed_buf,
+                    &*weights.lm_head,
+                    hidden_size,
+                    config.vocab_size,
+                    &mut matvec_counter,
+                )
+                .map_err(|e| anyhow!("lm_head matvec at step {step}: {e}"))?;
 
-            let logits_bytes = logits_buf
-                .to_host_bytes()
-                .map_err(|e| anyhow!("logits D2H at step {step}: {e}"))?;
-            let logits_f32: Vec<f32> = logits_bytes
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
-                .collect();
-
-            let next = greedy_argmax(&logits_f32);
+                let logits_bytes = logits_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("logits D2H at step {step}: {e}"))?;
+                let logits_f32: Vec<f32> = logits_bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect();
+                (greedy_argmax(&logits_f32), Some(logits_f32))
+            };
+            if let (Some(ref path), Some(ref logits_f32)) = (&debug_dump_logits, &logits_f32) {
+                if in_prefill && step == prompt_ids.len() - 1 {
+                    let mut ranked: Vec<(usize, f32)> =
+                        logits_f32.iter().copied().enumerate().collect();
+                    ranked.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    let top: Vec<_> = ranked
+                        .into_iter()
+                        .take(16)
+                        .map(|(id, logit)| serde_json::json!({ "id": id, "logit": logit }))
+                        .collect();
+                    let payload = serde_json::json!({
+                        "step": step,
+                        "prompt_tokens": prompt_ids.len(),
+                        "layers": launch_layers,
+                        "next": next,
+                        "top": top,
+                    });
+                    std::fs::write(path, serde_json::to_vec(&payload)?)
+                        .map_err(|e| anyhow!("write debug logits dump {path}: {e}"))?;
+                    eprintln!("[phi4-debug] wrote logits dump to {path}");
+                }
+            }
 
             // --validate: compare against oracle. Prefill comparison happens
             // on the LAST prefill step (the only one we sample); decode
             // comparisons happen per generated step.
             if let Some(ref oracle) = oracle_output {
+                let logits_f32 = logits_f32
+                    .as_ref()
+                    .expect("oracle validation requires materialized logits");
                 if in_prefill {
                     let delta = validate::max_abs_delta(&logits_f32, &oracle.prefill_logits);
                     if delta > max_delta {
@@ -626,7 +749,7 @@ pub fn run_phi4(
                 }
             }
 
-            last_logits = Some(logits_f32);
+            last_logits = logits_f32.or_else(|| Some(Vec::new()));
 
             if in_prefill {
                 // End of prefill: hand off to decode loop.
@@ -695,12 +818,15 @@ pub fn run_phi4(
 }
 
 fn greedy_argmax(logits: &[f32]) -> u32 {
-    logits
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx as u32)
-        .unwrap_or(0)
+    let mut best_idx = 0usize;
+    let mut best = f32::NEG_INFINITY;
+    for (idx, &value) in logits.iter().enumerate() {
+        if value > best {
+            best = value;
+            best_idx = idx;
+        }
+    }
+    best_idx as u32
 }
 
 fn build_descs(
@@ -791,10 +917,7 @@ fn build_kv_fp8_descs(state: &Phi4ModelState) -> Vec<phi4_ffi::Phi4KVCacheFp8Des
 /// Build the per-layer parallel-struct array of FP8 `_scale_inv` pointers.
 /// Pointers reference GPU buffers held by `weights`; struct must remain alive
 /// only as long as those buffers do (the engine owns both).
-fn build_fp8_descs(
-    weights: &Phi4Weights,
-    block_size: usize,
-) -> Vec<phi4_ffi::Phi4FP8ScaleDesc> {
+fn build_fp8_descs(weights: &Phi4Weights, block_size: usize) -> Vec<phi4_ffi::Phi4FP8ScaleDesc> {
     use std::ffi::c_void;
     let ptr = |opt: &Option<GpuBuffer>| -> *const c_void {
         opt.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null())
