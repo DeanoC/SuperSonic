@@ -32,7 +32,8 @@ use base64::Engine;
 use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_decode::{
     bf16_bytes_to_f32, host_final_norm_lm_head, is_full_attn_layer, run_chained_decode,
-    AttnLayerBuffers, FfnLayerBuffers, LayerBuffers, MultiLayerGeom,
+    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
+    LinearAttnInt4Sidecars, MultiLayerGeom,
 };
 use serde_json::Value;
 
@@ -87,24 +88,79 @@ fn upload_f32(ordinal: usize, shape: &[usize], bytes: &[u8], label: &str) -> Gpu
         .unwrap_or_else(|e| panic!("upload {label}: {e}"))
 }
 
+fn upload_u8(ordinal: usize, shape: &[usize], bytes: &[u8], label: &str) -> GpuBuffer {
+    GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, shape, bytes)
+        .unwrap_or_else(|e| panic!("upload {label}: {e}"))
+}
+
+/// Helper: pull (packed_u8, scale_bf16, zero_bf16) byte streams for one
+/// INT4-quantized tensor out of `int4_weights_per_layer[li].{attn|ffn}.<name>`.
+fn decode_int4_sidecar(block: &Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let blk = &block[name];
+    let packed = b64(blk["packed"].as_str()
+        .unwrap_or_else(|| panic!("missing int4 {name}.packed")));
+    let scale = b64(blk["scale"].as_str()
+        .unwrap_or_else(|| panic!("missing int4 {name}.scale")));
+    let zero = b64(blk["zero"].as_str()
+        .unwrap_or_else(|| panic!("missing int4 {name}.zero")));
+    (packed, scale, zero)
+}
+
 fn build_full_attn_layer(
     ordinal: usize,
     geom: &MultiLayerGeom,
     weights: &Value,
+    int4_block: Option<&Value>,
+    group_size: i32,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let h = geom.num_attention_heads as usize;
     let hkv = geom.num_kv_heads as usize;
     let d = geom.head_dim as usize;
 
+    // In INT4 mode the projection weight buffers carry packed nibbles
+    // ([out, in/2] u8) instead of BF16 reconstructions. Sidecars come from
+    // the parallel `int4_weights_per_layer[li].attn` block.
+    let (q_proj_w, k_proj_w, v_proj_w, o_proj_w, int4) = if let Some(blk) = int4_block {
+        let (qp, qs, qz) = decode_int4_sidecar(blk, "q_proj_w");
+        let (kp, ks, kz) = decode_int4_sidecar(blk, "k_proj_w");
+        let (vp, vs, vz) = decode_int4_sidecar(blk, "v_proj_w");
+        let (op, os, oz) = decode_int4_sidecar(blk, "o_proj_w");
+        let q_proj_w = upload_u8(ordinal, &[2 * h * d, hidden / 2], &qp, "q_proj packed");
+        let k_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &kp, "k_proj packed");
+        let v_proj_w = upload_u8(ordinal, &[hkv * d, hidden / 2], &vp, "v_proj packed");
+        let o_proj_w = upload_u8(ordinal, &[hidden, h * d / 2], &op, "o_proj packed");
+        let int4 = FullAttnInt4Sidecars {
+            group_size,
+            q_proj_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "q scale"),
+            q_proj_zero:  upload_bf16(ordinal, &[qz.len() / 2], &qz, "q zero"),
+            k_proj_scale: upload_bf16(ordinal, &[ks.len() / 2], &ks, "k scale"),
+            k_proj_zero:  upload_bf16(ordinal, &[kz.len() / 2], &kz, "k zero"),
+            v_proj_scale: upload_bf16(ordinal, &[vs.len() / 2], &vs, "v scale"),
+            v_proj_zero:  upload_bf16(ordinal, &[vz.len() / 2], &vz, "v zero"),
+            o_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "o scale"),
+            o_proj_zero:  upload_bf16(ordinal, &[oz.len() / 2], &oz, "o zero"),
+        };
+        (q_proj_w, k_proj_w, v_proj_w, o_proj_w, Some(int4))
+    } else {
+        (
+            upload_bf16(ordinal, &[2 * h * d, hidden], &b64_field(weights, "q_proj_w"), "q_proj_w"),
+            upload_bf16(ordinal, &[hkv * d, hidden], &b64_field(weights, "k_proj_w"), "k_proj_w"),
+            upload_bf16(ordinal, &[hkv * d, hidden], &b64_field(weights, "v_proj_w"), "v_proj_w"),
+            upload_bf16(ordinal, &[hidden, h * d], &b64_field(weights, "o_proj_w"), "o_proj_w"),
+            None,
+        )
+    };
+
     AttnLayerBuffers::Full {
         input_norm_w: upload_bf16(ordinal, &[hidden], &b64_field(weights, "input_norm_w"), "input_norm_w"),
-        q_proj_w: upload_bf16(ordinal, &[2 * h * d, hidden], &b64_field(weights, "q_proj_w"), "q_proj_w"),
-        k_proj_w: upload_bf16(ordinal, &[hkv * d, hidden], &b64_field(weights, "k_proj_w"), "k_proj_w"),
-        v_proj_w: upload_bf16(ordinal, &[hkv * d, hidden], &b64_field(weights, "v_proj_w"), "v_proj_w"),
+        q_proj_w,
+        k_proj_w,
+        v_proj_w,
         q_norm_w: upload_bf16(ordinal, &[d], &b64_field(weights, "q_norm_w"), "q_norm_w"),
         k_norm_w: upload_bf16(ordinal, &[d], &b64_field(weights, "k_norm_w"), "k_norm_w"),
-        o_proj_w: upload_bf16(ordinal, &[hidden, h * d], &b64_field(weights, "o_proj_w"), "o_proj_w"),
+        o_proj_w,
+        int4,
     }
 }
 
@@ -112,6 +168,8 @@ fn build_linear_attn_layer(
     ordinal: usize,
     geom: &MultiLayerGeom,
     weights: &Value,
+    int4_block: Option<&Value>,
+    group_size: i32,
 ) -> AttnLayerBuffers {
     let hidden = geom.hidden as usize;
     let k = geom.num_k_heads as usize;
@@ -129,10 +187,36 @@ fn build_linear_attn_layer(
         .and_then(|v| v.as_str())
         .map(|s| upload_bf16(ordinal, &[qkv_dim], &b64(s), "conv1d_bias"));
 
+    let (in_proj_qkv_w, in_proj_z_w, out_proj_w, int4) = if let Some(blk) = int4_block {
+        let (qp, qs, qz) = decode_int4_sidecar(blk, "in_proj_qkv_w");
+        let (zp, zs, zz) = decode_int4_sidecar(blk, "in_proj_z_w");
+        let (op, os, oz) = decode_int4_sidecar(blk, "out_proj_w");
+        let in_proj_qkv_w = upload_u8(ordinal, &[qkv_dim, hidden / 2], &qp, "in_proj_qkv packed");
+        let in_proj_z_w = upload_u8(ordinal, &[val_dim, hidden / 2], &zp, "in_proj_z packed");
+        let out_proj_w = upload_u8(ordinal, &[hidden, val_dim / 2], &op, "out_proj packed");
+        let int4 = LinearAttnInt4Sidecars {
+            group_size,
+            in_proj_qkv_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "in_proj_qkv scale"),
+            in_proj_qkv_zero:  upload_bf16(ordinal, &[qz.len() / 2], &qz, "in_proj_qkv zero"),
+            in_proj_z_scale:   upload_bf16(ordinal, &[zs.len() / 2], &zs, "in_proj_z scale"),
+            in_proj_z_zero:    upload_bf16(ordinal, &[zz.len() / 2], &zz, "in_proj_z zero"),
+            out_proj_scale:    upload_bf16(ordinal, &[os.len() / 2], &os, "out_proj scale"),
+            out_proj_zero:     upload_bf16(ordinal, &[oz.len() / 2], &oz, "out_proj zero"),
+        };
+        (in_proj_qkv_w, in_proj_z_w, out_proj_w, Some(int4))
+    } else {
+        (
+            upload_bf16(ordinal, &[qkv_dim, hidden], &b64_field(weights, "in_proj_qkv_w"), "in_proj_qkv_w"),
+            upload_bf16(ordinal, &[val_dim, hidden], &b64_field(weights, "in_proj_z_w"), "in_proj_z_w"),
+            upload_bf16(ordinal, &[hidden, val_dim], &b64_field(weights, "out_proj_w"), "out_proj_w"),
+            None,
+        )
+    };
+
     AttnLayerBuffers::Linear {
         input_norm_w: upload_bf16(ordinal, &[hidden], &b64_field(weights, "input_norm_w"), "input_norm_w"),
-        in_proj_qkv_w: upload_bf16(ordinal, &[qkv_dim, hidden], &b64_field(weights, "in_proj_qkv_w"), "in_proj_qkv_w"),
-        in_proj_z_w: upload_bf16(ordinal, &[val_dim, hidden], &b64_field(weights, "in_proj_z_w"), "in_proj_z_w"),
+        in_proj_qkv_w,
+        in_proj_z_w,
         in_proj_a_w: upload_bf16(ordinal, &[v, hidden], &b64_field(weights, "in_proj_a_w"), "in_proj_a_w"),
         in_proj_b_w: upload_bf16(ordinal, &[v, hidden], &b64_field(weights, "in_proj_b_w"), "in_proj_b_w"),
         // The kernel's depthwise conv1d expects the channel-major layout the
@@ -143,7 +227,7 @@ fn build_linear_attn_layer(
         dt_bias: upload_bf16(ordinal, &[v], &b64_field(weights, "dt_bias"), "dt_bias"),
         a_log: upload_bf16(ordinal, &[v], &b64_field(weights, "a_log"), "a_log"),
         norm_w: upload_bf16(ordinal, &[vd], &b64_field(weights, "norm_w"), "norm_w"),
-        out_proj_w: upload_bf16(ordinal, &[hidden, val_dim], &b64_field(weights, "out_proj_w"), "out_proj_w"),
+        out_proj_w,
         conv_state: upload_bf16(
             ordinal,
             &[qkv_dim, kernel - 1],
@@ -157,39 +241,76 @@ fn build_linear_attn_layer(
             &b64_field(weights, "recurrent_state_before"),
             "recurrent_state_before",
         ),
+        int4,
     }
 }
 
-fn build_ffn_layer(ordinal: usize, geom: &MultiLayerGeom, weights: &Value) -> FfnLayerBuffers {
+fn build_ffn_layer(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    weights: &Value,
+    int4_block: Option<&Value>,
+    group_size: i32,
+) -> FfnLayerBuffers {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
     let i_dim = geom.moe_intermediate as usize;
     let is_dim = geom.shared_intermediate as usize;
 
+    let (gate_up_proj_w, down_proj_w, shared_gate_proj_w, shared_up_proj_w, shared_down_proj_w, int4) =
+        if let Some(blk) = int4_block {
+            let (gp, gs, gz) = decode_int4_sidecar(blk, "gate_up_proj_w");
+            let (dp, ds, dz) = decode_int4_sidecar(blk, "down_proj_w");
+            let (sgp, sgs, sgz) = decode_int4_sidecar(blk, "shared_gate_proj_w");
+            let (sup, sus, suz) = decode_int4_sidecar(blk, "shared_up_proj_w");
+            let (sdp, sds, sdz) = decode_int4_sidecar(blk, "shared_down_proj_w");
+            // Fused-expert tensors are 3D `[E, out, in]`; packed is
+            // `[E, out, in/2]` u8.
+            let gate_up_proj_w = upload_u8(ordinal, &[e, 2 * i_dim, hidden / 2], &gp, "gate_up packed");
+            let down_proj_w = upload_u8(ordinal, &[e, hidden, i_dim / 2], &dp, "down_proj packed");
+            let shared_gate_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sgp, "sgp packed");
+            let shared_up_proj_w = upload_u8(ordinal, &[is_dim, hidden / 2], &sup, "sup packed");
+            let shared_down_proj_w = upload_u8(ordinal, &[hidden, is_dim / 2], &sdp, "sdp packed");
+            let int4 = FfnInt4Sidecars {
+                group_size,
+                gate_up_proj_scale: upload_bf16(ordinal, &[gs.len() / 2], &gs, "gate_up scale"),
+                gate_up_proj_zero:  upload_bf16(ordinal, &[gz.len() / 2], &gz, "gate_up zero"),
+                down_proj_scale:    upload_bf16(ordinal, &[ds.len() / 2], &ds, "down_proj scale"),
+                down_proj_zero:     upload_bf16(ordinal, &[dz.len() / 2], &dz, "down_proj zero"),
+                shared_gate_proj_scale: upload_bf16(ordinal, &[sgs.len() / 2], &sgs, "sgp scale"),
+                shared_gate_proj_zero:  upload_bf16(ordinal, &[sgz.len() / 2], &sgz, "sgp zero"),
+                shared_up_proj_scale:   upload_bf16(ordinal, &[sus.len() / 2], &sus, "sup scale"),
+                shared_up_proj_zero:    upload_bf16(ordinal, &[suz.len() / 2], &suz, "sup zero"),
+                shared_down_proj_scale: upload_bf16(ordinal, &[sds.len() / 2], &sds, "sdp scale"),
+                shared_down_proj_zero:  upload_bf16(ordinal, &[sdz.len() / 2], &sdz, "sdp zero"),
+            };
+            (gate_up_proj_w, down_proj_w, shared_gate_proj_w, shared_up_proj_w, shared_down_proj_w, Some(int4))
+        } else {
+            (
+                upload_bf16(ordinal, &[e, 2 * i_dim, hidden], &b64_field(weights, "gate_up_proj_w"), "gate_up_proj_w"),
+                upload_bf16(ordinal, &[e, hidden, i_dim], &b64_field(weights, "down_proj_w"), "down_proj_w"),
+                upload_bf16(ordinal, &[is_dim, hidden], &b64_field(weights, "shared_gate_proj_w"), "shared_gate_proj_w"),
+                upload_bf16(ordinal, &[is_dim, hidden], &b64_field(weights, "shared_up_proj_w"), "shared_up_proj_w"),
+                upload_bf16(ordinal, &[hidden, is_dim], &b64_field(weights, "shared_down_proj_w"), "shared_down_proj_w"),
+                None,
+            )
+        };
+
     FfnLayerBuffers {
         post_attn_norm_w: upload_bf16(ordinal, &[hidden], &b64_field(weights, "post_attn_norm_w"), "post_attn_norm_w"),
         gate_w: upload_bf16(ordinal, &[e, hidden], &b64_field(weights, "gate_w"), "gate_w"),
-        gate_up_proj_w: upload_bf16(
-            ordinal,
-            &[e, 2 * i_dim, hidden],
-            &b64_field(weights, "gate_up_proj_w"),
-            "gate_up_proj_w",
-        ),
-        down_proj_w: upload_bf16(
-            ordinal,
-            &[e, hidden, i_dim],
-            &b64_field(weights, "down_proj_w"),
-            "down_proj_w",
-        ),
-        shared_gate_proj_w: upload_bf16(ordinal, &[is_dim, hidden], &b64_field(weights, "shared_gate_proj_w"), "shared_gate_proj_w"),
-        shared_up_proj_w: upload_bf16(ordinal, &[is_dim, hidden], &b64_field(weights, "shared_up_proj_w"), "shared_up_proj_w"),
-        shared_down_proj_w: upload_bf16(ordinal, &[hidden, is_dim], &b64_field(weights, "shared_down_proj_w"), "shared_down_proj_w"),
+        gate_up_proj_w,
+        down_proj_w,
+        shared_gate_proj_w,
+        shared_up_proj_w,
+        shared_down_proj_w,
         shared_expert_gate_w: upload_bf16(
             ordinal,
             &[1, hidden],
             &b64_field(weights, "shared_expert_gate_w"),
             "shared_expert_gate_w",
         ),
+        int4,
     }
 }
 
@@ -257,10 +378,11 @@ fn multilayer_chained_decode_matches_oracle() {
         .unwrap_or_else(|e| panic!("read multi-layer oracle json {json_path}: {e}"));
     let json: Value = serde_json::from_str(&raw).expect("parse multi-layer oracle json");
     let schema = json["schema"].as_str().unwrap_or("");
-    assert_eq!(
-        schema, "qwen36-moe-oracle-multilayer-v1",
-        "PR 4c step 2 only handles BF16 multi-layer schema (got {schema}); INT4 multi-layer parity is a follow-up"
-    );
+    let int4_mode = match schema {
+        "qwen36-moe-oracle-multilayer-v1" => false,
+        "qwen36-moe-oracle-multilayer-int4-v1" => true,
+        other => panic!("unsupported multi-layer schema: {other}"),
+    };
     assert_eq!(
         json["dtype"].as_str().unwrap_or(""),
         "bf16",
@@ -269,6 +391,11 @@ fn multilayer_chained_decode_matches_oracle() {
 
     let geom = parse_geom(&json);
     let position = json["position"].as_i64().unwrap_or(0) as i32;
+    let int4_group_size = if int4_mode {
+        json["config"]["int4_group_size"].as_i64().unwrap_or(128) as i32
+    } else {
+        0
+    };
 
     set_backend(Backend::Hip);
     let ordinal = 0usize;
@@ -284,16 +411,27 @@ fn multilayer_chained_decode_matches_oracle() {
         "weights_per_layer length mismatch"
     );
 
+    // INT4 sidecar block — present iff the oracle was run with --int4.
+    let int4_per_layer: Option<&Vec<Value>> = if int4_mode {
+        Some(json["int4_weights_per_layer"]
+            .as_array()
+            .expect("INT4 oracle missing int4_weights_per_layer (regenerate with --int4 and without --no-emit-weights)"))
+    } else {
+        None
+    };
+
     let mut layers: Vec<LayerBuffers> = Vec::with_capacity(geom.num_layers as usize);
     for (li, layer_json) in weights_per_layer.iter().enumerate() {
         let attn_w = &layer_json["attn"];
         let ffn_w = &layer_json["ffn"];
+        let attn_int4 = int4_per_layer.map(|v| &v[li]["attn"]);
+        let ffn_int4 = int4_per_layer.map(|v| &v[li]["ffn"]);
         let attn = if is_full_attn_layer(li as i32) {
-            build_full_attn_layer(ordinal, &geom, attn_w)
+            build_full_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
         } else {
-            build_linear_attn_layer(ordinal, &geom, attn_w)
+            build_linear_attn_layer(ordinal, &geom, attn_w, attn_int4, int4_group_size)
         };
-        let ffn = build_ffn_layer(ordinal, &geom, ffn_w);
+        let ffn = build_ffn_layer(ordinal, &geom, ffn_w, ffn_int4, int4_group_size);
         layers.push(LayerBuffers { attn, ffn });
     }
 

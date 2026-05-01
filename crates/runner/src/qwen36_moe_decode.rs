@@ -76,7 +76,11 @@ pub struct MultiLayerGeom {
 
 /// Per-layer attention weight buffers. The two variants are mutually
 /// exclusive: a layer is full xor linear. Selection happens at populate time
-/// via [`is_full_attn_layer`].
+/// via [`is_full_attn_layer`]. When [`AttnLayerBuffers::Full::int4`] /
+/// [`AttnLayerBuffers::Linear::int4`] is `Some`, the matching weight buffer
+/// holds INT4 packed nibbles (`u8`, `[out, in/2]`) instead of BF16; the
+/// sidecar carries `(scale, zero)` BF16 tiles `[out/gs, in/gs]` and the
+/// active group_size.
 pub enum AttnLayerBuffers {
     Full {
         input_norm_w: GpuBuffer,
@@ -86,6 +90,7 @@ pub enum AttnLayerBuffers {
         q_norm_w: GpuBuffer,
         k_norm_w: GpuBuffer,
         o_proj_w: GpuBuffer,
+        int4: Option<FullAttnInt4Sidecars>,
     },
     Linear {
         input_norm_w: GpuBuffer,
@@ -103,11 +108,58 @@ pub enum AttnLayerBuffers {
         // ([V*K*Vd] F32), both mutated in place by the kernel.
         conv_state: GpuBuffer,
         recurrent_state: GpuBuffer,
+        int4: Option<LinearAttnInt4Sidecars>,
     },
 }
 
+/// INT4 sidecars for a full-attention layer. Mirrors the per-block FFI
+/// struct [`Qwen36MoeAttnStepInt4`]; only the four projection weights
+/// (q/k/v/o) are quantizable — norms stay BF16. Group size is pinned to
+/// 128 across the runtime + bake.
+pub struct FullAttnInt4Sidecars {
+    pub group_size: i32,
+    pub q_proj_scale: GpuBuffer,
+    pub q_proj_zero: GpuBuffer,
+    pub k_proj_scale: GpuBuffer,
+    pub k_proj_zero: GpuBuffer,
+    pub v_proj_scale: GpuBuffer,
+    pub v_proj_zero: GpuBuffer,
+    pub o_proj_scale: GpuBuffer,
+    pub o_proj_zero: GpuBuffer,
+}
+
+/// INT4 sidecars for a linear-attention layer. Mirrors
+/// [`Qwen36MoeLinearStepInt4`]; only `in_proj_qkv`, `in_proj_z`, `out_proj`
+/// are quantized — `in_proj_a/b`, conv1d, dt_bias, A_log, norms all stay BF16.
+pub struct LinearAttnInt4Sidecars {
+    pub group_size: i32,
+    pub in_proj_qkv_scale: GpuBuffer,
+    pub in_proj_qkv_zero: GpuBuffer,
+    pub in_proj_z_scale: GpuBuffer,
+    pub in_proj_z_zero: GpuBuffer,
+    pub out_proj_scale: GpuBuffer,
+    pub out_proj_zero: GpuBuffer,
+}
+
+/// INT4 sidecars for an MoE FFN block. Mirrors [`Qwen36MoeFfnStepInt4`];
+/// the router (`gate_w`) and the scalar `shared_expert_gate` stay BF16.
+pub struct FfnInt4Sidecars {
+    pub group_size: i32,
+    pub gate_up_proj_scale: GpuBuffer,
+    pub gate_up_proj_zero: GpuBuffer,
+    pub down_proj_scale: GpuBuffer,
+    pub down_proj_zero: GpuBuffer,
+    pub shared_gate_proj_scale: GpuBuffer,
+    pub shared_gate_proj_zero: GpuBuffer,
+    pub shared_up_proj_scale: GpuBuffer,
+    pub shared_up_proj_zero: GpuBuffer,
+    pub shared_down_proj_scale: GpuBuffer,
+    pub shared_down_proj_zero: GpuBuffer,
+}
+
 /// Per-layer MoE FFN weight buffers. Always present (every layer has an
-/// FFN block).
+/// FFN block). When `int4` is `Some`, every `*_proj_w` field carries
+/// packed nibbles instead of BF16 weights.
 pub struct FfnLayerBuffers {
     pub post_attn_norm_w: GpuBuffer,
     pub gate_w: GpuBuffer,
@@ -117,6 +169,7 @@ pub struct FfnLayerBuffers {
     pub shared_up_proj_w: GpuBuffer,
     pub shared_down_proj_w: GpuBuffer,
     pub shared_expert_gate_w: GpuBuffer,
+    pub int4: Option<FfnInt4Sidecars>,
 }
 
 /// One layer's worth of GPU-resident weight + state buffers.
@@ -351,6 +404,7 @@ pub fn run_chained_decode(
                 q_norm_w,
                 k_norm_w,
                 o_proj_w,
+                int4,
             } => {
                 let params = Qwen36MoeAttnStepParams {
                     stage: 5,
@@ -373,12 +427,26 @@ pub fn run_chained_decode(
                     k_norm_w: k_norm_w.as_ptr(),
                     o_proj_w: o_proj_w.as_ptr(),
                 };
+                let int4_ptrs = match int4 {
+                    Some(s) => Qwen36MoeAttnStepInt4 {
+                        group_size: s.group_size,
+                        q_proj_scale: s.q_proj_scale.as_ptr(),
+                        q_proj_zero: s.q_proj_zero.as_ptr(),
+                        k_proj_scale: s.k_proj_scale.as_ptr(),
+                        k_proj_zero: s.k_proj_zero.as_ptr(),
+                        v_proj_scale: s.v_proj_scale.as_ptr(),
+                        v_proj_zero: s.v_proj_zero.as_ptr(),
+                        o_proj_scale: s.o_proj_scale.as_ptr(),
+                        o_proj_zero: s.o_proj_zero.as_ptr(),
+                    },
+                    None => Qwen36MoeAttnStepInt4::disabled(),
+                };
                 attn_step_launch(
                     ordinal,
                     ScalarType::BF16,
                     params,
                     &weights,
-                    &Qwen36MoeAttnStepInt4::disabled(),
+                    &int4_ptrs,
                     &mut attn_output,
                     &mut attn_workspace,
                     &mut sync_buf,
@@ -399,6 +467,7 @@ pub fn run_chained_decode(
                 out_proj_w,
                 conv_state,
                 recurrent_state,
+                int4,
             } => {
                 let params = Qwen36MoeLinearStepParams {
                     stage: 5,
@@ -429,12 +498,24 @@ pub fn run_chained_decode(
                     conv_state: conv_state.as_mut_ptr(),
                     recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
                 };
+                let int4_ptrs = match int4 {
+                    Some(s) => Qwen36MoeLinearStepInt4 {
+                        group_size: s.group_size,
+                        in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
+                        in_proj_qkv_zero: s.in_proj_qkv_zero.as_ptr(),
+                        in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
+                        in_proj_z_zero: s.in_proj_z_zero.as_ptr(),
+                        out_proj_scale: s.out_proj_scale.as_ptr(),
+                        out_proj_zero: s.out_proj_zero.as_ptr(),
+                    },
+                    None => Qwen36MoeLinearStepInt4::disabled(),
+                };
                 linear_step_launch(
                     ordinal,
                     ScalarType::BF16,
                     params,
                     &weights,
-                    &Qwen36MoeLinearStepInt4::disabled(),
+                    &int4_ptrs,
                     &mut attn_output,
                     &mut attn_workspace,
                     &mut sync_buf,
@@ -490,12 +571,28 @@ pub fn run_chained_decode(
             shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
             shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
         };
+        let ffn_int4_ptrs = match &ffn.int4 {
+            Some(s) => Qwen36MoeFfnStepInt4 {
+                group_size: s.group_size,
+                gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                gate_up_proj_zero: s.gate_up_proj_zero.as_ptr(),
+                down_proj_scale: s.down_proj_scale.as_ptr(),
+                down_proj_zero: s.down_proj_zero.as_ptr(),
+                shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                shared_gate_proj_zero: s.shared_gate_proj_zero.as_ptr(),
+                shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                shared_up_proj_zero: s.shared_up_proj_zero.as_ptr(),
+                shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                shared_down_proj_zero: s.shared_down_proj_zero.as_ptr(),
+            },
+            None => Qwen36MoeFfnStepInt4::disabled(),
+        };
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
             params,
             &ffn_weights,
-            &Qwen36MoeFfnStepInt4::disabled(),
+            &ffn_int4_ptrs,
             &mut ffn_output,
             &mut ffn_output_idx,
             &mut ffn_workspace,
@@ -624,6 +721,56 @@ pub fn host_final_norm_lm_head(
     }
 
     f32_to_bf16_bytes(&logits)
+}
+
+/// Dequantize an INT4-packed weight slab back to BF16 bytes. Mirrors the
+/// kernel's `int4_dequant_scalar`: for each output row + input column the
+/// nibble is split off the byte (even col → low nibble, odd col → high),
+/// converted to F32, then `bf16(q*s - z*s)` written using the matching
+/// `[out/gs, in/gs]` BF16 scale/zero tile.
+///
+/// Used by the host-side lm_head path when the bake quantizes lm_head.
+/// `out_dim` × `in_dim` BF16 result = ~1 GiB for 35B-A3B (vocab 248K ×
+/// hidden 2048); fine for one-token smoke, kernel-side lm_head is PR 4d.
+pub fn dequant_int4_to_bf16_bytes(
+    packed: &[u8],
+    scale_bf16: &[u8],
+    zero_bf16: &[u8],
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> Vec<u8> {
+    assert_eq!(packed.len(), out_dim * in_dim / 2, "packed size mismatch");
+    assert_eq!(in_dim % group_size, 0, "in_dim must be divisible by group_size");
+    assert_eq!(out_dim % group_size, 0, "out_dim must be divisible by group_size");
+    let n_row_tiles = out_dim / group_size;
+    let n_col_tiles = in_dim / group_size;
+    assert_eq!(scale_bf16.len(), n_row_tiles * n_col_tiles * 2, "scale size mismatch");
+    assert_eq!(zero_bf16.len(), n_row_tiles * n_col_tiles * 2, "zero size mismatch");
+
+    let scale = bf16_bytes_to_f32(scale_bf16);
+    let zero = bf16_bytes_to_f32(zero_bf16);
+    let mut out = Vec::with_capacity(out_dim * in_dim * 2);
+    let half_in = in_dim / 2;
+    for o in 0..out_dim {
+        let row_tile = o / group_size;
+        let row_base = o * half_in;
+        for i in 0..in_dim {
+            let col_tile = i / group_size;
+            let tile_idx = row_tile * n_col_tiles + col_tile;
+            let s = scale[tile_idx];
+            let z = zero[tile_idx];
+            let byte = packed[row_base + (i / 2)];
+            let nib = if i % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+            let q = nib as f32;
+            // Single-rounding bf16(q*s - z*s) — matches the kernel's
+            // `bf16_round_rne_f32_finite(n*s - zs)`.
+            let bf = f32_to_bf16_bits(q * s - z * s);
+            out.push((bf & 0xFF) as u8);
+            out.push((bf >> 8) as u8);
+        }
+    }
+    out
 }
 
 /// Greedy argmax over a BF16 logits buffer. Returns the highest-scoring
