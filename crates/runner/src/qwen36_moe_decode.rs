@@ -212,6 +212,13 @@ pub struct DecodeOutputs {
     /// `[num_layers][hidden]` BF16. `output_after_ffn[i]` is layer `i`'s
     /// post-FFN residual (input to layer `i+1`).
     pub per_layer_ffn_out: Vec<Vec<u8>>,
+    /// Wall-clock breakdown of the kernel launches inside this chain.
+    /// `*_us` are sums-across-layers in microseconds. The launches are
+    /// internally synchronous (`hipDeviceSynchronize` in the bridge), so
+    /// the host wall-clock here measures real GPU + sync time.
+    pub kernel_full_attn_us: u64,
+    pub kernel_linear_attn_us: u64,
+    pub kernel_ffn_us: u64,
 }
 
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
@@ -333,12 +340,85 @@ fn download_hidden_bf16(
 ///  - (Full-attn: no KV cache here. The single-block kernels treat each
 ///    call as `kv_len=1` self-attention; KV-cache extension is a PR 4d
 ///    follow-up.)
+/// Knobs for `run_chained_decode`'s per-layer diagnostics.
+///
+/// Two costly options that the production decode loop doesn't need:
+///
+///   - `capture_per_layer`: when true, D2H-downloads each layer's
+///     post-attn and post-ffn hidden into `DecodeOutputs.per_layer_*`.
+///     The multilayer parity test consumes these; the engine doesn't.
+///     Each download forces a full GPU sync, so on 35B-A3B (40 layers)
+///     the unconditional path is ~80 syncs/token of pure overhead. Off
+///     by default — turn on only for tests / parity diagnostics.
+///   - `trace_norms`: when true, prints per-layer L2 norms for spotting
+///     signal blow-up / collapse / NaN at production scale. Implies
+///     `capture_per_layer` (we need the data to compute the norm).
+///     Defaults from the `SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS` env var
+///     — see `ChainedDecodeOptions::from_env`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChainedDecodeOptions {
+    pub capture_per_layer: bool,
+    pub trace_norms: bool,
+}
+
+impl ChainedDecodeOptions {
+    /// Default flags + the legacy `SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS`
+    /// env var as the trace-norms enable. Production callers use this.
+    pub fn from_env() -> Self {
+        let trace_norms = std::env::var("SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false);
+        Self {
+            capture_per_layer: false,
+            trace_norms,
+        }
+    }
+}
+
 pub fn run_chained_decode(
     ordinal: usize,
     geom: &MultiLayerGeom,
     layers: &mut [LayerBuffers],
     initial_hidden_bytes: &[u8],
     position: i32,
+) -> Result<DecodeOutputs> {
+    run_chained_decode_with_options(
+        ordinal, geom, layers, initial_hidden_bytes, position,
+        ChainedDecodeOptions {
+            // Existing behaviour: parity tests rely on `per_layer_*` —
+            // they call this entry point directly. The fast engine path
+            // routes through `run_chained_decode_fast` (defined below).
+            capture_per_layer: true,
+            trace_norms: ChainedDecodeOptions::from_env().trace_norms,
+        },
+    )
+}
+
+/// Production decode entry point: skips the per-layer D2H downloads
+/// (which force ~80 GPU syncs/token on 35B-A3B and which neither the
+/// engine nor sampling consume — only the multilayer parity test
+/// reads `per_layer_*`). Reuses `run_chained_decode_with_options`'s
+/// implementation so parity guarantees are unchanged.
+pub fn run_chained_decode_fast(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+) -> Result<DecodeOutputs> {
+    run_chained_decode_with_options(
+        ordinal, geom, layers, initial_hidden_bytes, position,
+        ChainedDecodeOptions::from_env(),
+    )
+}
+
+pub fn run_chained_decode_with_options(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    options: ChainedDecodeOptions,
 ) -> Result<DecodeOutputs> {
     let hidden = geom.hidden as usize;
     if initial_hidden_bytes.len() != hidden * 2 {
@@ -413,13 +493,20 @@ pub fn run_chained_decode(
     let mut per_layer_attn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
     let mut per_layer_ffn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
 
-    // Optional per-layer L2-norm trace, gated by env var. Cheap (one D2H
-    // copy + a sum-of-squares per layer) and invaluable for spotting
-    // where the chain's signal blows up / collapses / NaNs at production
-    // scale where we have no oracle to gate against.
-    let trace_norms = std::env::var("SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false);
+    // Per-kernel-class wall-clock accumulators. Reported back via
+    // `DecodeOutputs.kernel_*_us`; the engine surfaces them under
+    // `--emit-stage-timings` so we can see whether attn / linear / ffn
+    // dominates the chain time.
+    let mut t_full_attn = std::time::Duration::ZERO;
+    let mut t_linear_attn = std::time::Duration::ZERO;
+    let mut t_ffn = std::time::Duration::ZERO;
+
+    // `capture` ⇔ "I need the per-layer hidden bytes on the host".
+    // True if the caller asked for them OR if `trace_norms` is on (norm
+    // computation reads the BF16 bytes). Otherwise we skip the D2H
+    // copies entirely, which on 35B-A3B drops 80 GPU syncs/token.
+    let trace_norms = options.trace_norms;
+    let capture = options.capture_per_layer || trace_norms;
     if trace_norms {
         let init_norm = bf16_bytes_to_f32(initial_hidden_bytes)
             .iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -497,6 +584,7 @@ pub fn run_chained_decode(
                     },
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
+                let t_k = std::time::Instant::now();
                 attn_step_launch(
                     ordinal,
                     ScalarType::BF16,
@@ -508,6 +596,7 @@ pub fn run_chained_decode(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
+                t_full_attn += t_k.elapsed();
             }
             AttnLayerBuffers::Linear {
                 input_norm_w,
@@ -566,6 +655,7 @@ pub fn run_chained_decode(
                     },
                     None => Qwen36MoeLinearStepInt4::disabled(),
                 };
+                let t_k = std::time::Instant::now();
                 linear_step_launch(
                     ordinal,
                     ScalarType::BF16,
@@ -577,6 +667,7 @@ pub fn run_chained_decode(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
+                t_linear_attn += t_k.elapsed();
             }
         }
 
@@ -595,17 +686,19 @@ pub fn run_chained_decode(
         // Swap front: the just-published value is now the "current input".
         front = 1 - front;
 
-        let attn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
-            .context("download per-layer attn output")?;
-        if trace_norms {
-            let v = bf16_bytes_to_f32(&attn_out_bytes);
-            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nan = v.iter().any(|x| !x.is_finite());
-            let kind = if matches!(layer.attn, AttnLayerBuffers::Full { .. }) { "full" } else { "lin " };
-            eprintln!("[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
-                if nan { " NaN!" } else { "" });
+        if capture {
+            let attn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
+                .context("download per-layer attn output")?;
+            if trace_norms {
+                let v = bf16_bytes_to_f32(&attn_out_bytes);
+                let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nan = v.iter().any(|x| !x.is_finite());
+                let kind = if matches!(layer.attn, AttnLayerBuffers::Full { .. }) { "full" } else { "lin " };
+                eprintln!("[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
+                    if nan { " NaN!" } else { "" });
+            }
+            per_layer_attn_out.push(attn_out_bytes);
         }
-        per_layer_attn_out.push(attn_out_bytes);
 
         // ---- FFN ----
         reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (ffn)")?;
@@ -652,6 +745,7 @@ pub fn run_chained_decode(
             },
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
+        let t_k = std::time::Instant::now();
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
@@ -664,6 +758,7 @@ pub fn run_chained_decode(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        t_ffn += t_k.elapsed();
 
         // Same D2D + swap as the attn step.
         gpu_hal::copy_d2d(
@@ -675,16 +770,18 @@ pub fn run_chained_decode(
         .context("d2d ffn_output -> residual")?;
         front = 1 - front;
 
-        let ffn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
-            .context("download per-layer ffn output")?;
-        if trace_norms {
-            let v = bf16_bytes_to_f32(&ffn_out_bytes);
-            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let nan = v.iter().any(|x| !x.is_finite());
-            eprintln!("[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
-                if nan { " NaN!" } else { "" });
+        if capture {
+            let ffn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
+                .context("download per-layer ffn output")?;
+            if trace_norms {
+                let v = bf16_bytes_to_f32(&ffn_out_bytes);
+                let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                let nan = v.iter().any(|x| !x.is_finite());
+                eprintln!("[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
+                    if nan { " NaN!" } else { "" });
+            }
+            per_layer_ffn_out.push(ffn_out_bytes);
         }
-        per_layer_ffn_out.push(ffn_out_bytes);
     }
 
     let final_buf = if front == 0 { &hidden_a } else { &hidden_b };
@@ -695,6 +792,9 @@ pub fn run_chained_decode(
         final_hidden_bytes,
         per_layer_attn_out,
         per_layer_ffn_out,
+        kernel_full_attn_us: t_full_attn.as_micros() as u64,
+        kernel_linear_attn_us: t_linear_attn.as_micros() as u64,
+        kernel_ffn_us: t_ffn.as_micros() as u64,
     })
 }
 

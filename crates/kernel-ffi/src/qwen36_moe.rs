@@ -445,6 +445,35 @@ extern "C" {
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
     ) -> c_int;
+
+    /// Final RMSNorm + lm_head GEMV in a single kernel — replaces the
+    /// host-side `host_final_norm_lm_head_f32` for qwen3.6-MoE.
+    ///
+    /// All buffers are device pointers, all BF16 (`dtype = 2`):
+    ///   - `final_hidden`: [hidden] BF16, the output of `run_chained_decode`.
+    ///   - `final_norm_w`: [hidden] BF16 — `model.norm.weight`. Applies the
+    ///      HF `Qwen3_5MoeRMSNorm` `(1 + w)` unit offset.
+    ///   - `lm_head_w`: [vocab, hidden] BF16, dequantized once at startup.
+    ///   - `logits`: [vocab] BF16, output.
+    ///   - `counter`: [1] u32. Used as a work-stealing atomic across vocab
+    ///     rows; the launcher memsets it to 0 before each call so the
+    ///     caller doesn't need to.
+    ///
+    /// Returns 0 on success; non-zero on validation / launch failure (see
+    /// `qwen36_moe_hip_lm_head_launch` in `kernels/qwen36_moe_bridge.cpp`
+    /// for the error code matrix).
+    pub fn qwen36_moe_hip_lm_head_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden: c_int,
+        vocab: c_int,
+        rms_norm_eps: f32,
+        final_hidden: *const c_void,
+        final_norm_w: *const c_void,
+        lm_head_w: *const c_void,
+        logits: *mut c_void,
+        counter: *mut c_uint,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -1168,6 +1197,88 @@ pub fn int4_dequant_smoke_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe int4_dequant_smoke_launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Safe wrapper for the GPU final RMSNorm + lm_head GEMV.
+///
+/// All buffers must already be on `ordinal` and BF16:
+///   - `final_hidden_buf`: shape `[hidden]`.
+///   - `final_norm_w_buf`: shape `[hidden]` — `model.norm.weight`.
+///   - `lm_head_w_buf`: shape `[vocab, hidden]`. Caller is responsible
+///     for dequantizing INT4 / BF16-casting it once at startup.
+///   - `logits_buf`: shape `[vocab]`, output. Overwritten on every call.
+///   - `counter_buf`: shape `[1]` U32. Used as the work-stealing counter
+///     across vocab rows; the launcher memsets it to 0 before each call.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_launch(
+    ordinal: usize,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    counter_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if hidden <= 0 || vocab <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::lm_head_launch: positive dims required, \
+             got hidden={hidden} vocab={vocab}"
+        )));
+    }
+    let block_size: i32 = 256;
+    if hidden % block_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::lm_head_launch: hidden ({hidden}) must be a \
+             multiple of block_size ({block_size}) — the per-block \
+             reduction across hidden assumes that"
+        )));
+    }
+
+    let backend = lm_head_w_buf.backend();
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_lm_head_launch(
+                    /* dtype = bf16 */ 2,
+                    ordinal,
+                    hidden as c_int,
+                    vocab as c_int,
+                    rms_norm_eps,
+                    final_hidden_buf.as_ptr(),
+                    final_norm_w_buf.as_ptr(),
+                    lm_head_w_buf.as_ptr(),
+                    logits_buf.as_mut_ptr(),
+                    counter_buf.as_mut_ptr() as *mut c_uint,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::lm_head_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::lm_head_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::lm_head_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe lm_head_launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -5094,5 +5205,168 @@ mod tests {
         // group 0 to group 1 (boundary at col=4); spans starting at col=8
         // cross 2→3. Exercises the per-element `g0 != g7` slow path.
         run_int4_dequant_smoke(8, 16, 4, "slow (gsz=4)");
+    }
+
+    /// HIP parity test for the GPU final-RMSNorm + lm_head GEMV kernel.
+    /// Builds a small synthetic vocab=512 / hidden=256 problem on the host,
+    /// runs both:
+    ///   - an F32 reference (the same math as
+    ///     `qwen36_moe_decode::host_final_norm_lm_head_f32`), and
+    ///   - the GPU kernel via `lm_head_launch`,
+    /// then asserts the BF16 logits agree by cosine similarity ≥ 0.999.
+    /// Bit-exactness isn't required: the GPU path multiplies BF16 values
+    /// with F32 accumulation and rounds the final logit to BF16, so it's
+    /// strictly less precise than the host F32-throughout reference. A
+    /// high cos_sim catches any systematic kernel bug while tolerating
+    /// the inherent BF16 rounding noise.
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_lm_head_matches_host_f32_reference() {
+        use gpu_hal::{copy_d2h, set_backend, Backend, GpuBuffer, ScalarType};
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+        let hidden: i32 = 256;
+        let vocab: i32 = 512;
+        let eps: f32 = 1e-6;
+
+        // Deterministic seeded data — same convention the per-block oracles
+        // use (~N(0, 1/sqrt(fan_in)) so logits stay O(1)).
+        fn xorshift(state: &mut u32) -> f32 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *state = x;
+            // Map u32 → roughly N(0, 1) via Box-Muller-light: fold to (-1, 1).
+            ((x & 0xFFFFFF) as f32 / 0xFFFFFF as f32) * 2.0 - 1.0
+        }
+        let mut rng = 0xC0FFEEu32;
+        let mut bf16_round = |v: f32| -> u16 {
+            let bits = v.to_bits();
+            let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
+            ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+        };
+
+        let final_hidden_f32: Vec<f32> =
+            (0..hidden).map(|_| xorshift(&mut rng) * 0.5).collect();
+        let final_norm_w_f32: Vec<f32> =
+            (0..hidden).map(|_| xorshift(&mut rng) * 0.02).collect();
+        // lm_head: ~N(0, 1/sqrt(hidden)).
+        let scale = 1.0 / (hidden as f32).sqrt();
+        let lm_head_f32: Vec<f32> = (0..(vocab as usize) * (hidden as usize))
+            .map(|_| xorshift(&mut rng) * scale)
+            .collect();
+
+        // Pack to BF16 little-endian bytes for the GPU upload.
+        let to_bf16_bytes = |xs: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(xs.len() * 2);
+            for &v in xs {
+                let b = bf16_round(v);
+                out.push((b & 0xFF) as u8);
+                out.push((b >> 8) as u8);
+            }
+            out
+        };
+        let final_hidden_bytes = to_bf16_bytes(&final_hidden_f32);
+        let final_norm_w_bytes = to_bf16_bytes(&final_norm_w_f32);
+        let lm_head_bytes = to_bf16_bytes(&lm_head_f32);
+
+        // F32 reference (matches `host_final_norm_lm_head_f32`).
+        let bf16_to_f32 = |bytes: &[u8]| -> Vec<f32> {
+            bytes
+                .chunks_exact(2)
+                .map(|c| {
+                    let bits = ((c[1] as u32) << 24) | ((c[0] as u32) << 16);
+                    f32::from_bits(bits)
+                })
+                .collect()
+        };
+        let h_f32 = bf16_to_f32(&final_hidden_bytes);
+        let nw_f32 = bf16_to_f32(&final_norm_w_bytes);
+        let lm_f32 = bf16_to_f32(&lm_head_bytes);
+        let mean_sq = h_f32.iter().map(|&x| x * x).sum::<f32>() / hidden as f32;
+        let rsqrt = 1.0 / (mean_sq + eps).sqrt();
+        let normed: Vec<f32> = h_f32
+            .iter()
+            .zip(nw_f32.iter())
+            .map(|(&x, &w)| x * rsqrt * (1.0 + w))
+            .collect();
+        let mut want_logits_f32 = vec![0f32; vocab as usize];
+        for v in 0..vocab as usize {
+            let row = v * hidden as usize;
+            let mut acc = 0f64;
+            for h in 0..hidden as usize {
+                acc += lm_f32[row + h] as f64 * normed[h] as f64;
+            }
+            want_logits_f32[v] = acc as f32;
+        }
+
+        // GPU path.
+        let final_hidden_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden as usize], &final_hidden_bytes,
+        ).expect("upload final_hidden");
+        let final_norm_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden as usize], &final_norm_w_bytes,
+        ).expect("upload final_norm_w");
+        let lm_head_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[vocab as usize, hidden as usize], &lm_head_bytes,
+        ).expect("upload lm_head_w");
+        let mut logits_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[vocab as usize],
+        ).expect("alloc logits");
+        let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+            .expect("alloc counter");
+
+        super::lm_head_launch(
+            ordinal,
+            hidden,
+            vocab,
+            eps,
+            &final_hidden_buf,
+            &final_norm_w_buf,
+            &lm_head_w_buf,
+            &mut logits_buf,
+            &mut counter_buf,
+        ).expect("lm_head launch");
+
+        let mut got_bytes = vec![0u8; vocab as usize * 2];
+        copy_d2h(
+            ordinal,
+            got_bytes.as_mut_ptr() as *mut _,
+            logits_buf.as_ptr(),
+            got_bytes.len(),
+        ).expect("d2h logits");
+        let got_logits = bf16_to_f32(&got_bytes);
+
+        // BF16 cos_sim: should be very high (≥ 0.999) because both paths
+        // converge on the same dot product modulo BF16 rounding noise on
+        // the GPU side. Use F64 reductions to avoid the same precision
+        // pitfall the bake survey hit on lm_head (PR #67).
+        let dot: f64 = got_logits.iter().zip(want_logits_f32.iter())
+            .map(|(&a, &b)| a as f64 * b as f64).sum();
+        let na: f64 = got_logits.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let nb: f64 = want_logits_f32.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let cos_sim = dot / (na * nb);
+        assert!(
+            cos_sim >= 0.999,
+            "GPU lm_head logits cos_sim {cos_sim:.6} below 0.999 threshold \
+             (na={na:.4} nb={nb:.4} dot={dot:.4}) — likely a kernel math bug, \
+             not BF16 rounding noise"
+        );
+
+        // Top-1 should agree on the F32 reference; if it disagrees, log it
+        // (could be a near-tie under BF16 rounding) but don't fail the test.
+        let argmax = |v: &[f32]| v.iter().enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap();
+        let got_top = argmax(&got_logits);
+        let want_top = argmax(&want_logits_f32);
+        if got_top != want_top {
+            eprintln!(
+                "[lm_head parity] argmax differs (got={got_top} want={want_top}) — \
+                 expected at high enough cos_sim with near-tied logits, but logging \
+                 in case it's a real ordering bug"
+            );
+        }
     }
 }

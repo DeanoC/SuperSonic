@@ -27,9 +27,10 @@ use qwen36_moe::weights::{
 
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, bf16_bytes_to_f32, dequant_int4_to_bf16_bytes, host_final_norm_lm_head,
-    host_final_norm_lm_head_f32, run_chained_decode, sample_bf16_logits, AttnLayerBuffers,
-    FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom, XorshiftRng,
+    host_final_norm_lm_head_f32, run_chained_decode, run_chained_decode_fast,
+    sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
+    FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
+    MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -722,6 +723,7 @@ pub fn run(
         &cli.prompt,
         cli.max_new_tokens.max(1),
         sampling,
+        cli.emit_stage_timings,
     )?;
     Ok(())
 }
@@ -1004,6 +1006,7 @@ fn decode_text(
     prompt: &str,
     max_new: usize,
     sampling: SamplingParams,
+    emit_stage_timings: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1106,26 +1109,50 @@ fn decode_text(
         layers.push(layer);
     }
 
-    // Cache final_norm + dequantized lm_head once. Both are ≥1 GiB BF16
-    // for 35B-A3B; reusing the cached buffers across decode steps avoids
-    // redoing the ~1 second INT4 dequant per token. Convert to F32 once
-    // here too — the BF16→F32 fan-out of the lm_head matrix (~970 MiB →
-    // ~2 GiB) was previously dominating per-token latency in the host-
-    // side GEMV path; the F32 view is reused for every generated token.
+    // Upload final_norm + dequantized lm_head to the GPU once. The
+    // GPU lm_head kernel (`qwen36_moe::lm_head_launch`) does
+    // RMSNorm + GEMV in BF16 in one shot, replacing the previous
+    // host-side F32 GEMV that dominated per-token wall-clock at
+    // ~233 ms / 360 ms total on 35B-A3B greedy decode (PR #68
+    // stage-timings).
+    //
+    // VRAM cost: ~970 MiB for lm_head BF16 + 4 KiB for final_norm +
+    // 500 KiB for the logits buffer. Comfortably within the 24 GiB
+    // budget alongside the 17 GiB INT4 weight bake.
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
         .context("load final norm")?;
     let lm_head_bf16_bytes = load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
-        .context("prepare host-side lm_head BF16 buffer")?;
-    let final_norm_f32 = bf16_bytes_to_f32(&final_norm_bytes);
-    let lm_head_f32 = bf16_bytes_to_f32(&lm_head_bf16_bytes);
+        .context("prepare lm_head BF16 buffer")?;
     println!(
-        "  cached lm_head BF16 ({:.1} MiB → F32 {:.1} MiB) and final norm ({:.1} KiB).",
+        "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
         lm_head_bf16_bytes.len() as f64 / MIB,
-        (lm_head_f32.len() * 4) as f64 / MIB,
         final_norm_bytes.len() as f64 / 1024.0,
     );
-    // Drop the BF16 buffer once the F32 view is built — engine doesn't
-    // need it after this point and the 970 MiB allocation is non-trivial.
+    let final_norm_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &final_norm_bytes,
+    )
+    .context("upload final_norm_w to GPU")?;
+    let lm_head_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.vocab as usize, geom.hidden as usize],
+        &lm_head_bf16_bytes,
+    )
+    .context("upload lm_head BF16 to GPU")?;
+    let mut logits_buf = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.vocab as usize],
+    )
+    .context("alloc logits_buf on GPU")?;
+    let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .context("alloc lm_head counter_buf on GPU")?;
+    let mut final_hidden_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
+            .context("alloc final_hidden_buf on GPU")?;
     drop(lm_head_bf16_bytes);
     drop(final_norm_bytes);
 
@@ -1160,8 +1187,27 @@ fn decode_text(
         sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed,
     );
 
+    // Per-stage wall-clock accumulators. Aggregated across generation steps
+    // only (prefill steps run the chain but skip the lm_head/sample stages,
+    // so timing prefill mixed with gen would distort the per-token average).
+    // `chain_ms` includes the GPU work + the D2H copy of `final_hidden_bytes`
+    // — `run_chained_decode` syncs before returning, so the wall-clock here
+    // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
+    // GEMV, sampling, detokenize) are pure host work.
+    let mut gen_steps: usize = 0;
+    let mut t_embed = std::time::Duration::ZERO;
+    let mut t_chain = std::time::Duration::ZERO;
+    let mut t_lm_head = std::time::Duration::ZERO;
+    let mut t_sample = std::time::Duration::ZERO;
+    let mut t_detok = std::time::Duration::ZERO;
+    // Within-chain breakdown by kernel class (microseconds).
+    let mut t_chain_full_attn_us: u64 = 0;
+    let mut t_chain_linear_attn_us: u64 = 0;
+    let mut t_chain_ffn_us: u64 = 0;
+
     for step in 0..total_steps {
         // Embed lookup for the current token.
+        let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
             &store,
             weight_prefix,
@@ -1169,10 +1215,17 @@ fn decode_text(
             geom.hidden as usize,
         )
         .with_context(|| format!("embed lookup token {current_token} (step {step})"))?;
+        let t_embed_step = t0.elapsed();
 
         // Run the chain. Linear-attn state mutates in `layers` in place.
-        let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
+        // `run_chained_decode_fast` skips the per-layer D2H sync chain
+        // (~80 GPU syncs/token on 35B-A3B) — `decode_text` only consumes
+        // `final_hidden_bytes`. The multilayer parity test still calls
+        // the legacy `run_chained_decode` which captures per-layer.
+        let t1 = std::time::Instant::now();
+        let outputs = run_chained_decode_fast(ordinal, &geom, &mut layers, &initial_hidden, position)
             .with_context(|| format!("chained decode (step {step}, position {position})"))?;
+        let t_chain_step = t1.elapsed();
         position += 1;
 
         // Prefill steps: feed the next prompt token without computing logits.
@@ -1191,18 +1244,36 @@ fn decode_text(
             );
         }
 
-        // Generation step: lm_head + sample (greedy when temperature == 0).
-        // Uses the F32-cached final_norm + lm_head so the per-token cost is
-        // just one BF16→F32 of the (small) hidden vector + GEMV; the
-        // expensive lm_head conversion happens once at decode_text start.
-        let logits = host_final_norm_lm_head_f32(
-            &outputs.final_hidden_bytes,
-            &final_norm_f32,
-            &lm_head_f32,
-            geom.hidden as usize,
-            geom.vocab as usize,
+        // Generation step: final_norm + lm_head GEMV on the GPU
+        // (`kernel_ffi::qwen36_moe::lm_head_launch`). H2D the freshly
+        // produced final_hidden into the persistent `final_hidden_buf`
+        // — `run_chained_decode` already D2H'd it for diagnostics; the
+        // re-upload is ~4 KB, microseconds at PCIe Gen4 speeds — then
+        // launch the kernel + D2H the BF16 logits.
+        let t2 = std::time::Instant::now();
+        gpu_hal::copy_h2d(
+            ordinal,
+            final_hidden_buf.as_mut_ptr(),
+            outputs.final_hidden_bytes.as_ptr() as *const _,
+            outputs.final_hidden_bytes.len(),
+        )
+        .context("h2d final_hidden -> final_hidden_buf")?;
+        kernel_ffi::qwen36_moe::lm_head_launch(
+            ordinal,
+            geom.hidden,
+            geom.vocab,
             geom.rms_norm_eps,
-        );
+            &final_hidden_buf,
+            &final_norm_w_buf,
+            &lm_head_w_buf,
+            &mut logits_buf,
+            &mut counter_buf,
+        )
+        .context("gpu lm_head launch")?;
+        let logits = logits_buf
+            .to_host_bytes()
+            .context("d2h logits from GPU lm_head")?;
+        let t_lm_head_step = t2.elapsed();
         if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
             std::fs::write(&dump_path, &logits)
                 .with_context(|| format!("write logits dump to {dump_path}"))?;
@@ -1211,6 +1282,7 @@ fn decode_text(
                 logits.len()
             );
         }
+        let t3 = std::time::Instant::now();
         let next_token = sample_bf16_logits(
             &logits,
             sampling.temperature,
@@ -1218,15 +1290,28 @@ fn decode_text(
             sampling.top_p,
             &mut rng,
         );
+        let t_sample_step = t3.elapsed();
         generated_ids.push(next_token);
 
         // Stream-decode and print.
+        let t4 = std::time::Instant::now();
         if let Some(tok) = &tokenizer {
             if let Ok(text) = tok.decode(&[next_token], false) {
                 print!("{text}");
                 std::io::stdout().flush().ok();
             }
         }
+        let t_detok_step = t4.elapsed();
+
+        gen_steps += 1;
+        t_embed += t_embed_step;
+        t_chain += t_chain_step;
+        t_lm_head += t_lm_head_step;
+        t_sample += t_sample_step;
+        t_detok += t_detok_step;
+        t_chain_full_attn_us += outputs.kernel_full_attn_us;
+        t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
+        t_chain_ffn_us += outputs.kernel_ffn_us;
 
         if Some(next_token) == eos_id {
             break;
@@ -1248,12 +1333,46 @@ fn decode_text(
             "no (max_new_tokens hit)"
         },
     );
-    println!(
-        "  (Note: greedy decoding only; sampling, temperature/top-p, and \
-         GPU-side lm_head are next.)"
-    );
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
+    }
+    if emit_stage_timings && gen_steps > 0 {
+        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let chain_ms = to_ms(t_chain);
+        let embed_ms = to_ms(t_embed);
+        let lm_head_ms = to_ms(t_lm_head);
+        let sample_ms = to_ms(t_sample);
+        let detok_ms = to_ms(t_detok);
+        let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
+        let n = gen_steps as f64;
+        let full_attn_ms = (t_chain_full_attn_us as f64) / 1000.0;
+        let linear_attn_ms = (t_chain_linear_attn_us as f64) / 1000.0;
+        let ffn_ms = (t_chain_ffn_us as f64) / 1000.0;
+        eprintln!(
+            "[qwen36-moe stage-timings] gen_steps={gen_steps} \
+             embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
+             sample_ms_avg={:.3} detok_ms_avg={:.3} total_ms_avg={:.3} \
+             (chain_total_ms={:.1} lm_head_total_ms={:.1})",
+            embed_ms / n,
+            chain_ms / n,
+            lm_head_ms / n,
+            sample_ms / n,
+            detok_ms / n,
+            total_ms / n,
+            chain_ms,
+            lm_head_ms,
+        );
+        eprintln!(
+            "[qwen36-moe chain-breakdown] gen_steps={gen_steps} \
+             full_attn_ms_avg={:.3} linear_attn_ms_avg={:.3} ffn_ms_avg={:.3} \
+             (full_attn_total_ms={:.1} linear_attn_total_ms={:.1} ffn_total_ms={:.1})",
+            full_attn_ms / n,
+            linear_attn_ms / n,
+            ffn_ms / n,
+            full_attn_ms,
+            linear_attn_ms,
+            ffn_ms,
+        );
     }
 
     Ok(())

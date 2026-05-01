@@ -545,3 +545,73 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// PR follow-up to #68: GPU-side final RMSNorm + lm_head GEMV launcher.
+// Replaces the host-side path in `qwen36_moe_decode::host_final_norm_lm_head_f32`
+// which dominated per-token wall-clock at 233 ms / 360 ms total on
+// 35B-A3B greedy decode.
+//
+// Inputs are device pointers (BF16 throughout: final_hidden, final_norm_w,
+// lm_head_w; logits is BF16 output). `counter` is a `[1] u32` device buffer
+// the kernel uses for work-stealing across vocab rows; this launcher
+// memsets it to 0 before launch.
+//
+// Currently bf16-only (`dtype == 2`). Geometry assumptions:
+//   - `hidden % block_size == 0` (block reduction lane scheme assumes it).
+//   - `vocab > 0`; the work-stealing loop self-terminates when
+//     `my_row >= vocab`.
+extern "C" int qwen36_moe_hip_lm_head_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           hidden,
+    int           vocab,
+    float         rms_norm_eps,
+    const void*   final_hidden,
+    const void*   final_norm_w,
+    const void*   lm_head_w,
+    void*         logits,
+    unsigned int* counter) {
+    if (dtype != 2) return 130;            // only bf16 supported
+    if (hidden <= 0 || vocab <= 0) return 132;
+    if (final_hidden == nullptr || final_norm_w == nullptr ||
+        lm_head_w == nullptr || logits == nullptr || counter == nullptr) {
+        return 133;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    constexpr int block_size = 256;
+
+    if (hipMemsetAsync(counter, 0, sizeof(unsigned int)) != hipSuccess) {
+        return 200;
+    }
+
+    // shared_scratch [block_size] + x_norm_lds [hidden], both F32.
+    const size_t lds_bytes =
+        static_cast<size_t>(hidden + block_size) * sizeof(float);
+
+    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_lm_head_kernel<hip_bfloat16>,
+                       dim3(static_cast<unsigned int>(num_blocks)),
+                       dim3(block_size),
+                       lds_bytes, 0,
+                       static_cast<const hip_bfloat16*>(final_hidden),
+                       static_cast<const hip_bfloat16*>(final_norm_w),
+                       static_cast<const hip_bfloat16*>(lm_head_w),
+                       static_cast<hip_bfloat16*>(logits),
+                       counter,
+                       hidden,
+                       vocab,
+                       rms_norm_eps);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}

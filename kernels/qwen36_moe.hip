@@ -113,6 +113,53 @@ __device__ inline void int4_dequant_8(
     }
 }
 
+// Work-stealing matvec inner loop for an INT4 slab `[out_rows, in_cols/2]`.
+//
+// Computes the partial dot product `sum_i (dequant(w[my_row, i]) * x[i])`
+// for the cols this thread is responsible for, using the 8-wide
+// `int4_dequant_8` helper instead of the scalar path.
+//
+// Caller pre-resolves the slab pointers (so the same helper drives both 2D
+// dense and 3D fused-expert matmuls — for 3D, just pass the per-expert
+// slab pointers). `cols` must be a multiple of 8 (the 8-element span unit)
+// AND of `gsz` (so `scale_cols = cols / gsz` is well-defined). Each thread
+// processes 8 cols per iteration starting at `tid * 8`, striding by
+// `block_size * 8`. Caller must ensure `block_size * 8` divides cleanly
+// (hidden=2048 with block_size=256 fits exactly with 1 iter/thread).
+//
+// 4-byte-aligned `pk` load is safe because:
+//   - byte_cols = cols / 2 is a multiple of 4 (cols is a multiple of 8)
+//   - col_start / 2 is a multiple of 4 (col_start is in steps of 8)
+//   so the resulting `&packed[my_row * byte_cols + col_start/2]` is always
+//   4-byte aligned.
+__device__ inline float int4_dq8_matvec_partial(
+    const uint8_t*      __restrict__ packed,
+    const hip_bfloat16* __restrict__ scales,
+    const hip_bfloat16* __restrict__ zeros,
+    const float*        __restrict__ x,
+    int my_row, int cols, int gsz,
+    int tid, int block_size
+) {
+    const int byte_cols  = cols / 2;
+    const int scale_cols = cols / gsz;
+    const int scale_row  = my_row / gsz;
+    const size_t row_byte_off = static_cast<size_t>(my_row) * byte_cols;
+
+    float partial = 0.0f;
+    for (int col_start = tid * 8; col_start < cols; col_start += block_size * 8) {
+        const uint32_t pk = *reinterpret_cast<const uint32_t*>(
+            &packed[row_byte_off + col_start / 2]);
+        float dq[8];
+        int4_dequant_8(pk, scales, zeros,
+                       scale_row, col_start, scale_cols, gsz, dq);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            partial += dq[i] * x[col_start + i];
+        }
+    }
+    return partial;
+}
+
 // Single-element dequant for non-8-aligned tails. `cols` is the unpacked
 // input dim of the 2D slab `(row, col)` indexes into. `scales`/`zeros`
 // are at `[(row/gs) * ((cols + gs - 1)/gs) + col/gs]` — same as the 2D
@@ -481,13 +528,17 @@ __global__ void qwen36_moe_attn_step_kernel(
 
         float partial = 0.0f;
         if (q_int4) {
-            const void* q_packed = reinterpret_cast<const void*>(q_proj_w);
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += int4_dequant_scalar(
-                               q_packed, q_proj_scale, q_proj_zero,
-                               my_row, col, hidden, int4_group_size)
-                           * x_norm_lds[col];
-            }
+            // 8-wide INT4 dequant + dot accumulate. ~2-4× faster than the
+            // scalar path on RDNA3 because it amortizes scale/zero lookups
+            // across the 8-element span and folds 4 nibble-byte reads into
+            // a single 4-byte uint32 load.
+            partial = int4_dq8_matvec_partial(
+                reinterpret_cast<const uint8_t*>(q_proj_w),
+                static_cast<const hip_bfloat16*>(q_proj_scale),
+                static_cast<const hip_bfloat16*>(q_proj_zero),
+                x_norm_lds,
+                my_row, hidden, int4_group_size,
+                tid, block_size);
         } else {
             const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
             for (int col = tid; col < hidden; col += block_size) {
@@ -624,13 +675,11 @@ __global__ void qwen36_moe_attn_step_kernel(
 
         float partial = 0.0f;
         if (i4_scale != nullptr) {
-            const void* w_packed = reinterpret_cast<const void*>(w_slab);
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += int4_dequant_scalar(
-                               w_packed, i4_scale, i4_zero,
-                               proj_row, col, hidden, int4_group_size)
-                           * x_norm_lds[col];
-            }
+            partial = int4_dq8_matvec_partial(
+                reinterpret_cast<const uint8_t*>(w_slab),
+                i4_scale, i4_zero, x_norm_lds,
+                proj_row, hidden, int4_group_size,
+                tid, block_size);
         } else {
             const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
             for (int col = tid; col < hidden; col += block_size) {
@@ -1008,13 +1057,13 @@ __global__ void qwen36_moe_attn_step_kernel(
 
             float partial = 0.0f;
             if (o_int4) {
-                const void* o_packed = reinterpret_cast<const void*>(o_proj_w);
-                for (int j = tid; j < qd; j += block_size) {
-                    partial += int4_dequant_scalar(
-                                   o_packed, o_proj_scale, o_proj_zero,
-                                   my_row, j, qd, int4_group_size)
-                               * workspace[OFF_GATED + j];
-                }
+                partial = int4_dq8_matvec_partial(
+                    reinterpret_cast<const uint8_t*>(o_proj_w),
+                    static_cast<const hip_bfloat16*>(o_proj_scale),
+                    static_cast<const hip_bfloat16*>(o_proj_zero),
+                    workspace + OFF_GATED,
+                    my_row, qd, int4_group_size,
+                    tid, block_size);
             } else {
                 const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
                 for (int j = tid; j < qd; j += block_size) {
@@ -1258,12 +1307,11 @@ __global__ void qwen36_moe_linear_step_kernel(
 
         float partial = 0.0f;
         if (i4_scale != nullptr) {
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += int4_dequant_scalar(
-                               i4_slab, i4_scale, i4_zero,
-                               i4_row, col, hidden, int4_group_size)
-                           * x_norm_lds[col];
-            }
+            partial = int4_dq8_matvec_partial(
+                static_cast<const uint8_t*>(i4_slab),
+                i4_scale, i4_zero, x_norm_lds,
+                i4_row, hidden, int4_group_size,
+                tid, block_size);
         } else {
             for (int col = tid; col < hidden; col += block_size) {
                 partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
@@ -1734,13 +1782,13 @@ __global__ void qwen36_moe_linear_step_kernel(
 
             float partial = 0.0f;
             if (out_int4) {
-                const void* o_packed = reinterpret_cast<const void*>(out_proj_w);
-                for (int j = tid; j < qd; j += block_size) {
-                    partial += int4_dequant_scalar(
-                                   o_packed, out_proj_scale, out_proj_zero,
-                                   my_row, j, qd, int4_group_size)
-                               * workspace[OFF_REC_OUT + j];
-                }
+                partial = int4_dq8_matvec_partial(
+                    reinterpret_cast<const uint8_t*>(out_proj_w),
+                    static_cast<const hip_bfloat16*>(out_proj_scale),
+                    static_cast<const hip_bfloat16*>(out_proj_zero),
+                    workspace + OFF_REC_OUT,
+                    my_row, qd, int4_group_size,
+                    tid, block_size);
             } else {
                 const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
                 for (int j = tid; j < qd; j += block_size) {
@@ -2171,15 +2219,11 @@ __global__ void qwen36_moe_ffn_step_kernel(
 
         float partial = 0.0f;
         if (i4_scale != nullptr) {
-            // INT4 scalar dequant per element. Stride pattern matches the
-            // BF16 path (thread t reads cols t, t+block_size, …) so the
-            // reduction tree is unchanged.
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += int4_dequant_scalar(
-                               i4_slab, i4_scale, i4_zero,
-                               i4_row, col, hidden, int4_group_size)
-                           * h_norm_lds[col];
-            }
+            partial = int4_dq8_matvec_partial(
+                static_cast<const uint8_t*>(i4_slab),
+                i4_scale, i4_zero, h_norm_lds,
+                i4_row, hidden, int4_group_size,
+                tid, block_size);
         } else {
             for (int col = tid; col < hidden; col += block_size) {
                 partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
@@ -2242,16 +2286,13 @@ __global__ void qwen36_moe_ffn_step_kernel(
             if (shared_down_proj_scale != nullptr) {
                 // INT4 path: row `my_row` of `[hidden, Is]` packed as
                 // `[hidden, Is/2]` u8.
-                const void* i4_slab =
-                    reinterpret_cast<const void*>(shared_down_proj_w);
-                for (int col = tid; col < Is_; col += block_size) {
-                    partial += int4_dequant_scalar(
-                                   i4_slab,
-                                   shared_down_proj_scale,
-                                   shared_down_proj_zero,
-                                   my_row, col, Is_, int4_group_size)
-                               * workspace[OFF_SHARED_MID + col];
-                }
+                partial = int4_dq8_matvec_partial(
+                    reinterpret_cast<const uint8_t*>(shared_down_proj_w),
+                    static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                    static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+                    workspace + OFF_SHARED_MID,
+                    my_row, Is_, int4_group_size,
+                    tid, block_size);
             } else {
                 const T* w_row =
                     shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
@@ -2354,14 +2395,11 @@ __global__ void qwen36_moe_ffn_step_kernel(
 
                 float partial = 0.0f;
                 if (gu_int4) {
-                    for (int col = tid; col < hidden; col += block_size) {
-                        partial += int4_dequant_scalar(
-                                       gu_slab_packed,
-                                       gu_slab_scale,
-                                       gu_slab_zero,
-                                       my_row, col, hidden, int4_group_size)
-                                   * h_norm_lds[col];
-                    }
+                    partial = int4_dq8_matvec_partial(
+                        gu_slab_packed, gu_slab_scale, gu_slab_zero,
+                        h_norm_lds,
+                        my_row, hidden, int4_group_size,
+                        tid, block_size);
                 } else {
                     const T* w_row =
                         gu_slab_bf16 + static_cast<size_t>(my_row) * hidden;
@@ -2439,14 +2477,11 @@ __global__ void qwen36_moe_ffn_step_kernel(
 
                 float partial = 0.0f;
                 if (dp_int4) {
-                    for (int col = tid; col < I_; col += block_size) {
-                        partial += int4_dequant_scalar(
-                                       dp_slab_packed,
-                                       dp_slab_scale,
-                                       dp_slab_zero,
-                                       my_row, col, I_, int4_group_size)
-                                   * workspace[OFF_EXPERT_MID + col];
-                    }
+                    partial = int4_dq8_matvec_partial(
+                        dp_slab_packed, dp_slab_scale, dp_slab_zero,
+                        workspace + OFF_EXPERT_MID,
+                        my_row, I_, int4_group_size,
+                        tid, block_size);
                 } else {
                     const T* w_row =
                         dp_slab_bf16 + static_cast<size_t>(my_row) * I_;
@@ -2602,6 +2637,109 @@ __global__ void int4_dequant_smoke_kernel(
             dq_scalar_out[row * in_cols + col] = int4_dequant_scalar(
                 packed, scale, zero, row, col, in_cols, gsz);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Final RMSNorm + lm_head GEMV in a single kernel — replaces the host-side
+// path in `qwen36_moe_decode::host_final_norm_lm_head_f32`.
+//
+// On 35B-A3B the host F32 GEMV at [vocab=248320, hidden=2048] dominated the
+// per-token wall-clock (233 ms of 360 ms in the local greedy benchmark; see
+// PR #68's stage-timings output). Lifting it to the GPU eliminates the F32
+// fan-out of the lm_head matrix (previously 970 MiB → 1.94 GiB at startup +
+// per-token streaming through the host LLC) and the per-token CPU work.
+//
+// Math (matches `host_final_norm_lm_head_f32` byte-for-byte through the
+// BF16 rounding boundary):
+//
+//   inv_rms     = rsqrt(mean(x_i^2) + eps)               # F32 reduction
+//   x_normed[i] = bf16(x_i * inv_rms * (1.0 + final_norm_w[i]))   # `(1+w)`
+//   logits[v]   = bf16(sum_i(lm_head_w[v, i] * x_normed[i]))
+//
+// LDS layout (matches the attn/linear/ffn step kernels):
+//   lds[0,                 block_size):  shared_scratch (block reduction)
+//   lds[block_size,        block_size + hidden):  x_norm_lds (F32 view of
+//                                                  BF16-rounded normed hidden)
+//   Total = (block_size + hidden) * 4 bytes = (256 + 2048) * 4 = 9 KiB on
+//   35B-A3B. Same budget as the attn kernel; ≥2 WGs/CU on gfx1100.
+//
+// Block strategy: each block computes the RMSNorm into its own LDS
+// (redundant across blocks — cheap, ~few µs for hidden=2048 — but lets the
+// matvec read x_norm from LDS instead of global memory). Then a
+// work-stealing loop assigns vocab rows to blocks via an atomic counter.
+// Each block fully reduces one row before grabbing the next.
+//
+// `counter` is a `[1] u32` device buffer; the host must memset it to 0
+// before each launch.
+template <typename T>
+__global__ void qwen36_moe_lm_head_kernel(
+    const T*               __restrict__ final_hidden,    // [hidden] BF16
+    const T*               __restrict__ final_norm_w,    // [hidden] BF16
+    const T*               __restrict__ lm_head_w,       // [vocab, hidden] BF16
+    T*                     __restrict__ logits,          // [vocab] BF16
+    unsigned int*          __restrict__ counter,         // [1] u32
+    int                                  hidden,
+    int                                  vocab,
+    float                                rms_norm_eps) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    extern __shared__ unsigned char lds_raw[];
+    float* shared_scratch = reinterpret_cast<float*>(lds_raw);
+    float* x_norm_lds     = shared_scratch + block_size;
+
+    // -- Phase A: per-block RMSNorm of final_hidden into LDS ---------------
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        const float v = load_as_float<T>(final_hidden, col);
+        x_norm_lds[col] = v;
+        partial_sq += v * v;
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // Apply `(1.0 + w)` HF Qwen3_5MoeRMSNorm unit offset, BF16-round each
+    // x_normed element so the matmul reads what PyTorch reads.
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = load_as_float<T>(final_norm_w, col);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms * (1.0f + w));
+    }
+    __syncthreads();
+
+    // -- Phase B: work-stealing matvec across vocab rows -------------------
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(counter, 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= vocab) break;
+
+        const T* w_row = lm_head_w + static_cast<size_t>(my_row) * hidden;
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            logits[my_row] = static_cast<T>(bf16_round_rne_f32(shared_scratch[0]));
+        }
+        __syncthreads();
     }
 }
 
