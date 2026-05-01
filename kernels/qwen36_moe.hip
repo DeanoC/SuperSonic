@@ -381,6 +381,22 @@ __global__ void qwen36_moe_attn_step_kernel(
     const T* __restrict__          q_norm_w,      // [d]
     const T* __restrict__          k_norm_w,      // [d]               (nullable for stage<2)
     const T* __restrict__          o_proj_w,      // [hidden, H*d]     (nullable for stage<5)
+    // PR 4b6 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
+    // and every sidecar pointer must be null. When non-zero, each sidecar
+    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
+    // null `*_scale` for a given tensor keeps it on the BF16 path, a
+    // non-null pair switches that tensor to INT4. The kernel reinterprets
+    // the matching weight pointer as `const uint8_t*` packed bytes (low
+    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     q_proj_scale,
+    const hip_bfloat16* __restrict__     q_proj_zero,
+    const hip_bfloat16* __restrict__     k_proj_scale,
+    const hip_bfloat16* __restrict__     k_proj_zero,
+    const hip_bfloat16* __restrict__     v_proj_scale,
+    const hip_bfloat16* __restrict__     v_proj_zero,
+    const hip_bfloat16* __restrict__     o_proj_scale,
+    const hip_bfloat16* __restrict__     o_proj_zero,
     T* __restrict__                output,        // BF16, sized for the largest staged intermediate
     float* __restrict__             workspace,    // F32 scratch, see header comment
     unsigned int* __restrict__     counters,
@@ -439,7 +455,10 @@ __global__ void qwen36_moe_attn_step_kernel(
     // Output rows of q_raw are written BF16-rounded into workspace[0..2*H*d]
     // so that the per-head RMS norm in Phase C reads the same F32-of-BF16
     // values PyTorch's BF16 q_raw represents.
+    // INT4 (when `q_proj_scale != nullptr`): treat `q_proj_w` as
+    // `[2*H*d, hidden/2]` u8 and dequant per element. Same matvec stride.
     const int q_out_dim = 2 * num_heads * head_dim;
+    const bool q_int4 = (q_proj_scale != nullptr);
 
     for (;;) {
         __shared__ unsigned int my_row_s;
@@ -450,10 +469,20 @@ __global__ void qwen36_moe_attn_step_kernel(
         const int my_row = static_cast<int>(my_row_s);
         if (my_row >= q_out_dim) break;
 
-        const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        if (q_int4) {
+            const void* q_packed = reinterpret_cast<const void*>(q_proj_w);
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               q_packed, q_proj_scale, q_proj_zero,
+                               my_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -562,13 +591,25 @@ __global__ void qwen36_moe_attn_step_kernel(
         // First Hkv*d rows belong to k_proj, next Hkv*d to v_proj.
         const bool is_v = my_row >= Hkv * d;
         const int proj_row = is_v ? (my_row - Hkv * d) : my_row;
-        const T* w_row = (is_v ? v_proj_w : k_proj_w)
-            + static_cast<size_t>(proj_row) * hidden;
+        const T* w_slab = is_v ? v_proj_w : k_proj_w;
+        const hip_bfloat16* i4_scale = is_v ? v_proj_scale : k_proj_scale;
+        const hip_bfloat16* i4_zero  = is_v ? v_proj_zero  : k_proj_zero;
         const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        if (i4_scale != nullptr) {
+            const void* w_packed = reinterpret_cast<const void*>(w_slab);
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               w_packed, i4_scale, i4_zero,
+                               proj_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -837,6 +878,7 @@ __global__ void qwen36_moe_attn_step_kernel(
     // (when stage == 5) the host-visible output buffer.
     {
         const int qd = H * d;
+        const bool o_int4 = (o_proj_scale != nullptr);
 
         for (;;) {
             __shared__ unsigned int my_row_s;
@@ -847,10 +889,20 @@ __global__ void qwen36_moe_attn_step_kernel(
             const int my_row = static_cast<int>(my_row_s);
             if (my_row >= hidden) break;
 
-            const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
             float partial = 0.0f;
-            for (int j = tid; j < qd; j += block_size) {
-                partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+            if (o_int4) {
+                const void* o_packed = reinterpret_cast<const void*>(o_proj_w);
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += int4_dequant_scalar(
+                                   o_packed, o_proj_scale, o_proj_zero,
+                                   my_row, j, qd, int4_group_size)
+                               * workspace[OFF_GATED + j];
+                }
+            } else {
+                const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();
