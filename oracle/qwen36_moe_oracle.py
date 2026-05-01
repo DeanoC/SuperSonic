@@ -430,9 +430,18 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Qwen3.6-MoE single-layer reference forward (PR 4b oracle)"
     )
-    p.add_argument("--mode", choices=["synthetic", "checkpoint"], default="synthetic")
+    p.add_argument("--mode", choices=["synthetic", "checkpoint", "bake"], default="synthetic")
     p.add_argument("--model-dir", type=Path,
                    help="Path to the HuggingFace safetensors dir (checkpoint mode)")
+    p.add_argument("--bake-dir", type=Path,
+                   help="Path to a SuperSonic INT4 GPTQ bake directory "
+                        "(`bake` mode). Loads layer's INT4 weights directly + "
+                        "reconstructs to BF16 via the kernel's exact "
+                        "`bf16(q*s - z*s)` formula. Schema becomes "
+                        "`qwen36-moe-oracle-layer-int4-v1` with `int4_weights` "
+                        "carrying the bake's *actual* packed/scale/zero — the "
+                        "harness for verifying the kernel produces the right "
+                        "output on the bake's specific INT4 patterns.")
     p.add_argument("--layer-idx", type=int, default=3,
                    help="Full-attention layer index (default 3 = first full layer)")
     p.add_argument("--weight-prefix", default="model.language_model")
@@ -471,6 +480,8 @@ def main() -> None:
     args = parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
+
     if args.mode == "synthetic":
         weights = synthesize_layer(
             hidden=args.hidden,
@@ -480,6 +491,51 @@ def main() -> None:
             seed=args.seed,
             dtype=dtype,
         )
+    elif args.mode == "bake":
+        if args.bake_dir is None:
+            raise SystemExit("--bake-dir is required in bake mode")
+        # Bake mode: load INT4 weights from the SuperSonic bake directly, use
+        # the bake's BF16 reconstructions as the "weights" for the reference
+        # forward, and emit the bake's actual (packed, scale, zero) sidecars
+        # so the kernel-ffi parity test verifies the kernel reproduces what
+        # Python computes on these specific INT4 patterns.
+        from _bake_loader import load_bf16, load_int4
+
+        bake_dir = str(args.bake_dir)
+        lp = f"{args.weight_prefix}.layers.{args.layer_idx}"
+        fa = f"{lp}.self_attn"
+
+        weights = {}
+        int4_sidecars = {}
+        for key, name in [
+            ("q_proj_w", f"{fa}.q_proj.weight"),
+            ("k_proj_w", f"{fa}.k_proj.weight"),
+            ("v_proj_w", f"{fa}.v_proj.weight"),
+            ("o_proj_w", f"{fa}.o_proj.weight"),
+        ]:
+            recon, packed, scale, zero = load_int4(bake_dir, name)
+            weights[key] = recon
+            int4_sidecars[key] = {
+                "packed": packed,
+                "scale": scale.to(torch.float32),
+                "zero": zero.to(torch.float32),
+            }
+        weights["input_norm_w"] = load_bf16(bake_dir, f"{lp}.input_layernorm.weight")
+        weights["q_norm_w"] = load_bf16(bake_dir, f"{fa}.q_norm.weight")
+        weights["k_norm_w"] = load_bf16(bake_dir, f"{fa}.k_norm.weight")
+
+        # Synthesise input_hidden the same way checkpoint mode does so the
+        # parity test has a deterministic input without loading embed_tokens.
+        torch.manual_seed(args.seed)
+        weights["input_hidden"] = (
+            torch.randn(args.hidden, dtype=torch.float32) / args.hidden**0.5
+        ).to(dtype)
+        for k in ("input_norm_w", "q_norm_w", "k_norm_w"):
+            weights[k] = weights[k].to(dtype)
+
+        # Force the INT4 path so the schema/JSON shape matches what the
+        # kernel-ffi INT4 parity tests expect.
+        args.int4 = True
     else:
         if args.model_dir is None:
             raise SystemExit("--model-dir is required in checkpoint mode")
@@ -502,11 +558,11 @@ def main() -> None:
 
     weights = {k: v.to(args.device) for k, v in weights.items()}
 
-    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
-    if args.int4:
+    if args.int4 and int4_sidecars is None:
         # Quantize before computing intermediates so the reference uses the
         # same BF16-reconstructed weights the kernel will see — intermediates
         # are then valid for both the BF16 and INT4 kernel paths.
+        # (Skipped when bake mode already populated int4_sidecars from disk.)
         int4_sidecars = quantize_int4_attn_weights(weights, args.int4_group_size)
 
     intermediates = reference_full_attention_layer(

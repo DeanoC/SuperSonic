@@ -447,9 +447,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Qwen3.6-MoE single-block FFN reference (PR 4b4 oracle)"
     )
-    p.add_argument("--mode", choices=["synthetic", "checkpoint"], default="synthetic")
+    p.add_argument("--mode", choices=["synthetic", "checkpoint", "bake"], default="synthetic")
     p.add_argument("--model-dir", type=Path,
                    help="Path to the HuggingFace safetensors dir (checkpoint mode)")
+    p.add_argument("--bake-dir", type=Path,
+                   help="Path to a SuperSonic INT4 GPTQ bake directory "
+                        "(`bake` mode). Loads layer's INT4 weights directly "
+                        "from the bake; emits the bake's actual sidecars.")
     p.add_argument("--layer-idx", type=int, default=0,
                    help="Layer index. The MoE FFN is identical across full and "
                         "linear attention layers, so layer 0 (linear) is fine.")
@@ -493,6 +497,8 @@ def main() -> None:
     args = parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
+
     if args.mode == "synthetic":
         weights = synthesize_block(
             hidden=args.hidden,
@@ -502,6 +508,57 @@ def main() -> None:
             seed=args.seed,
             dtype=dtype,
         )
+    elif args.mode == "bake":
+        if args.bake_dir is None:
+            raise SystemExit("--bake-dir is required in bake mode")
+        from _bake_loader import load_bf16, load_int4, load_int4_3d
+
+        bake_dir = str(args.bake_dir)
+        lp = f"{args.weight_prefix}.layers.{args.layer_idx}"
+        mp = f"{lp}.mlp"
+
+        weights = {}
+        int4_sidecars = {}
+
+        # Fused-expert tensors: 3D INT4 (per-expert quantized).
+        for key, name in [
+            ("gate_up_proj_w", f"{mp}.experts.gate_up_proj"),
+            ("down_proj_w", f"{mp}.experts.down_proj"),
+        ]:
+            recon, packed, scale, zero = load_int4_3d(bake_dir, name)
+            weights[key] = recon
+            int4_sidecars[key] = {
+                "packed": packed,
+                "scale": scale.to(torch.float32),
+                "zero": zero.to(torch.float32),
+            }
+        # Shared-expert: dense 2D INT4.
+        for key, name in [
+            ("shared_gate_proj_w", f"{mp}.shared_expert.gate_proj.weight"),
+            ("shared_up_proj_w", f"{mp}.shared_expert.up_proj.weight"),
+            ("shared_down_proj_w", f"{mp}.shared_expert.down_proj.weight"),
+        ]:
+            recon, packed, scale, zero = load_int4(bake_dir, name)
+            weights[key] = recon
+            int4_sidecars[key] = {
+                "packed": packed,
+                "scale": scale.to(torch.float32),
+                "zero": zero.to(torch.float32),
+            }
+
+        # Non-quantized (BF16): router gate, scalar shared-gate, post-attn norm.
+        weights["gate_w"] = load_bf16(bake_dir, f"{mp}.gate.weight")
+        weights["shared_expert_gate_w"] = load_bf16(bake_dir, f"{mp}.shared_expert_gate.weight")
+        weights["post_attn_norm_w"] = load_bf16(bake_dir, f"{lp}.post_attention_layernorm.weight")
+
+        torch.manual_seed(args.seed)
+        weights["input_hidden"] = (
+            torch.randn(args.hidden, dtype=torch.float32) / args.hidden ** 0.5
+        ).to(dtype)
+        for k in ("gate_w", "shared_expert_gate_w", "post_attn_norm_w"):
+            weights[k] = weights[k].to(dtype)
+
+        args.int4 = True  # Force INT4 schema/JSON shape.
     else:
         if args.model_dir is None:
             raise SystemExit("--model-dir is required in checkpoint mode")
@@ -520,11 +577,11 @@ def main() -> None:
 
     weights = {k: v.to(args.device) for k, v in weights.items()}
 
-    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
-    if args.int4:
+    if args.int4 and int4_sidecars is None:
         # Quantize before computing intermediates so the reference uses the
         # same BF16-reconstructed weights the kernel will see — intermediates
         # are then valid for both the BF16 and INT4 kernel paths.
+        # (Skipped when bake mode already populated int4_sidecars from disk.)
         int4_sidecars = quantize_int4_ffn_weights(weights, args.int4_group_size)
 
     intermediates = reference_moe_ffn_block(

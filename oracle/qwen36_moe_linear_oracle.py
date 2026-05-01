@@ -502,9 +502,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Qwen3.6-MoE single-layer linear-attention reference forward"
     )
-    p.add_argument("--mode", choices=["synthetic", "checkpoint"], default="synthetic")
+    p.add_argument("--mode", choices=["synthetic", "checkpoint", "bake"], default="synthetic")
     p.add_argument("--model-dir", type=Path,
                    help="Path to the HuggingFace safetensors dir (checkpoint mode)")
+    p.add_argument("--bake-dir", type=Path,
+                   help="Path to a SuperSonic INT4 GPTQ bake directory "
+                        "(`bake` mode). Loads layer's INT4 weights directly "
+                        "from the bake; emits the bake's actual sidecars.")
     p.add_argument("--layer-idx", type=int, default=0,
                    help="Linear-attention layer index (default 0)")
     p.add_argument("--weight-prefix", default="model.language_model")
@@ -539,6 +543,8 @@ def main() -> None:
     args = parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
 
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
+
     if args.mode == "synthetic":
         weights = synthesize_layer(
             hidden=args.hidden,
@@ -551,6 +557,80 @@ def main() -> None:
             dtype=dtype,
             warm_state=(args.state == "warm"),
         )
+    elif args.mode == "bake":
+        if args.bake_dir is None:
+            raise SystemExit("--bake-dir is required in bake mode")
+        from _bake_loader import has_tensor, load_bf16, load_int4, load_native
+
+        bake_dir = str(args.bake_dir)
+        lp = f"{args.weight_prefix}.layers.{args.layer_idx}"
+        la = f"{lp}.linear_attn"
+
+        weights = {}
+        int4_sidecars = {}
+        for key, name in [
+            ("in_proj_qkv_w", f"{la}.in_proj_qkv.weight"),
+            ("in_proj_z_w", f"{la}.in_proj_z.weight"),
+            ("out_proj_w", f"{la}.out_proj.weight"),
+        ]:
+            recon, packed, scale, zero = load_int4(bake_dir, name)
+            weights[key] = recon
+            int4_sidecars[key] = {
+                "packed": packed,
+                "scale": scale.to(torch.float32),
+                "zero": zero.to(torch.float32),
+            }
+
+        weights["input_norm_w"] = load_bf16(bake_dir, f"{lp}.input_layernorm.weight")
+        weights["norm_w"] = load_bf16(bake_dir, f"{la}.norm.weight")
+        weights["in_proj_a_w"] = load_bf16(bake_dir, f"{la}.in_proj_a.weight")
+        weights["in_proj_b_w"] = load_bf16(bake_dir, f"{la}.in_proj_b.weight")
+        weights["conv1d_w"] = load_bf16(bake_dir, f"{la}.conv1d.weight")
+        weights["conv1d_bias"] = (load_bf16(bake_dir, f"{la}.conv1d.bias")
+                                   if has_tensor(bake_dir, f"{la}.conv1d.bias") else None)
+        # Bake-side transforms (mirror Rust crates/model-store/src/transforms.rs):
+        #   dt_bias: stored reshaped (1, 1, V) — squeeze back to [V].
+        #   A_log: stored as PRE-EXPONENTIATED, reshaped (1, 1, V). The
+        #          reference computes a_log.exp() itself, so undo both: log
+        #          + squeeze to recover the [V] raw-log-domain value.
+        weights["dt_bias"] = load_native(bake_dir, f"{la}.dt_bias").squeeze()
+        a_log_exp_raw = load_native(bake_dir, f"{la}.A_log").squeeze().to(torch.float32)
+        weights["a_log"] = torch.log(a_log_exp_raw).to(torch.bfloat16)
+
+        # Reproducible synthetic input + state — same RNG style as
+        # checkpoint mode.
+        torch.manual_seed(args.seed)
+        weights["input_hidden"] = (
+            torch.randn(args.hidden, dtype=torch.float32) / args.hidden ** 0.5
+        ).to(dtype)
+        for k in ("input_norm_w", "norm_w", "in_proj_a_w", "in_proj_b_w",
+                  "conv1d_w", "dt_bias", "a_log"):
+            if weights.get(k) is not None and weights[k].dtype != dtype:
+                weights[k] = weights[k].to(dtype)
+        if weights["conv1d_bias"] is not None:
+            weights["conv1d_bias"] = weights["conv1d_bias"].to(dtype)
+        # Fresh state: the bake doesn't store decode-time state.
+        key_dim = args.num_k_heads * args.head_k_dim
+        value_dim = args.num_v_heads * args.head_v_dim
+        qkv_dim = 2 * key_dim + value_dim
+        if args.state == "warm":
+            weights["conv_state_before"] = (
+                torch.randn(qkv_dim, args.conv_kernel_dim - 1, dtype=torch.float32) * 0.5
+            ).to(dtype)
+            weights["recurrent_state_before"] = (
+                torch.randn(args.num_v_heads, args.head_k_dim, args.head_v_dim,
+                            dtype=torch.float32) * 0.1
+            )
+        else:
+            weights["conv_state_before"] = torch.zeros(
+                qkv_dim, args.conv_kernel_dim - 1, dtype=dtype
+            )
+            weights["recurrent_state_before"] = torch.zeros(
+                args.num_v_heads, args.head_k_dim, args.head_v_dim, dtype=torch.float32
+            )
+
+        # Force INT4 schema/JSON shape so kernel-ffi tests can consume it.
+        args.int4 = True
     else:
         if args.model_dir is None:
             raise SystemExit("--model-dir is required in checkpoint mode")
@@ -593,10 +673,10 @@ def main() -> None:
     weights = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v)
                for k, v in weights.items()}
 
-    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
-    if args.int4:
+    if args.int4 and int4_sidecars is None:
         # Quantize before computing intermediates so the reference uses the
         # same BF16-reconstructed weights the kernel will see.
+        # (Skipped when bake mode already populated int4_sidecars from disk.)
         int4_sidecars = quantize_int4_linear_weights(weights, args.int4_group_size)
 
     intermediates = reference_linear_attn_layer(

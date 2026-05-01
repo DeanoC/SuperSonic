@@ -413,6 +413,19 @@ pub fn run_chained_decode(
     let mut per_layer_attn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
     let mut per_layer_ffn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
 
+    // Optional per-layer L2-norm trace, gated by env var. Cheap (one D2H
+    // copy + a sum-of-squares per layer) and invaluable for spotting
+    // where the chain's signal blows up / collapses / NaNs at production
+    // scale where we have no oracle to gate against.
+    let trace_norms = std::env::var("SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if trace_norms {
+        let init_norm = bf16_bytes_to_f32(initial_hidden_bytes)
+            .iter().map(|x| x * x).sum::<f32>().sqrt();
+        eprintln!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
+    }
+
     // `front` indexes which of (hidden_a, hidden_b) holds the current
     // "input to next launch". Starts at 0 (initial_hidden was uploaded
     // into hidden_a). After each launch we swap.
@@ -582,8 +595,17 @@ pub fn run_chained_decode(
         // Swap front: the just-published value is now the "current input".
         front = 1 - front;
 
-        per_layer_attn_out.push(download_hidden_bf16(ordinal, output_buf, hidden)
-            .context("download per-layer attn output")?);
+        let attn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
+            .context("download per-layer attn output")?;
+        if trace_norms {
+            let v = bf16_bytes_to_f32(&attn_out_bytes);
+            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nan = v.iter().any(|x| !x.is_finite());
+            let kind = if matches!(layer.attn, AttnLayerBuffers::Full { .. }) { "full" } else { "lin " };
+            eprintln!("[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
+                if nan { " NaN!" } else { "" });
+        }
+        per_layer_attn_out.push(attn_out_bytes);
 
         // ---- FFN ----
         reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (ffn)")?;
@@ -653,8 +675,16 @@ pub fn run_chained_decode(
         .context("d2d ffn_output -> residual")?;
         front = 1 - front;
 
-        per_layer_ffn_out.push(download_hidden_bf16(ordinal, output_buf, hidden)
-            .context("download per-layer ffn output")?);
+        let ffn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
+            .context("download per-layer ffn output")?;
+        if trace_norms {
+            let v = bf16_bytes_to_f32(&ffn_out_bytes);
+            let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nan = v.iter().any(|x| !x.is_finite());
+            eprintln!("[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
+                if nan { " NaN!" } else { "" });
+        }
+        per_layer_ffn_out.push(ffn_out_bytes);
     }
 
     let final_buf = if front == 0 { &hidden_a } else { &hidden_b };
