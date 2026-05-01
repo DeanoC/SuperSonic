@@ -60,36 +60,25 @@ see [docs/dflash.md](docs/dflash.md).
 
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
 |------------------|:----:|:----:|:-----------:|:------:|
-| qwen3.5-0.8b     |  ✅  |  —   |      —      |    —   |
-| qwen3.5-2b       |  ✅  |  —   |      —      |    —   |
-| qwen3.5-4b       |  ✅  |  —   |      —      |   ✅³  |
-| qwen3.5-9b       |  ✅  |  —   |      —      |    —   |
+| qwen3.5-0.8b     |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.5-9b       |  ⏳¹ |  ✅  |      ✅     |   ⏳¹  |
 
-³ CUDA `--kv-fp8` is currently validated only for `qwen3.5-4b` on `sm86`.
-  Single-sequence BF16 decode now defaults to the persistent kernel path.
-  `--kv-fp8` single-sequence decode still uses replayed prefill for
-  correctness; batched `--batch-size 2` uses the persistent kernel path.
-  `qwen3.5-2b` and `qwen3.5-9b` are checked BF16 CUDA lanes on `sm86`, but do
-  not currently have CUDA KV-FP8, INT4, or FP8-runtime support.
+¹ `qwen3.5-9b` BF16 needs the BF16 bake uploaded before that lane is available
+  from release-backed downloads. `--kv-fp8` depends on the BF16 weights, so the
+  9B CUDA KV-FP8 lane is blocked on the same bake. INT4 and FP8-runtime bakes
+  are already published and validated on `sm86`.
 
-CUDA v1 is BF16-first. `--int4` and `--fp8-runtime` are rejected at runtime.
+CUDA support is validated on NVIDIA `sm86` hardware (RTX 3090-class) with
+hand-maintained CUDA sources and no generic fallback backend. Qwen3.5 BF16,
+INT4, FP8-runtime, and KV-FP8 lanes are now at parity with the HIP matrix for
+0.8B, 2B, and 4B. The remaining Qwen3.5 9B gap is artifact availability: the
+BF16 bake still needs to be produced and uploaded, and the 9B KV-FP8 lane
+becomes available after that bake exists.
 
-CUDA support is currently a narrow v1 surface:
+CUDA KV-FP8 notes:
 
-- hand-maintained CUDA sources only; no generic fallback backend
-- BF16 decode path only
-- validated on NVIDIA `sm86` hardware (RTX 3090-class)
-- validated for both baked weights and direct `--no-bake` safetensors loads
-- CUDA `--kv-fp8` support is currently limited to `qwen3.5-4b` on `sm86`
-
-CUDA v1 does not currently support:
-
-- `--int4`
-- `--fp8-runtime`
-
-CUDA KV-FP8 is currently a narrow supported surface:
-
-- validated only on `qwen3.5-4b` / `sm86`
 - checked against the CPU oracle on the CUDA test machine
 - batched `--batch-size 2` uses the real persistent kernel path
 - single-sequence decode uses replayed prefill only for `--kv-fp8`
