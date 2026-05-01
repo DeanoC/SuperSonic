@@ -44,6 +44,96 @@ __device__ __forceinline__ float bf16_round_rne_f32(float x) {
     return y;
 }
 
+// ---------------------------------------------------------------------------
+// INT4 group-quant dequant — ported from kernels/full_attention_4b.hip
+// (PR 4b5). Per CLAUDE.md the qwen36_moe and full_attention_4b kernels are
+// isolated compilation units (hipcc on gfx11xx is fragile), so the helpers
+// live here as a copy rather than a shared header. The numerics match
+// `oracle/bake_int4.py`'s reconstruction exactly:
+//   recon = bf16_round_rne_f32(nibble * scale - zero * scale)
+// (single rounding through BF16 at the end).
+//
+// Layout (matches the bake + the full_attention_4b versions):
+//   weights : `[..., out, in/2]` u8   — 2 nibbles/byte, even col → low.
+//   scale   : `[..., out/gs, in/gs]` BF16
+//   zero    : `[..., out/gs, in/gs]` BF16
+
+// Dequantize 8 INT4 weights from 4 packed bytes.
+// `packed` carries 8 nibbles in the same nibble-order
+// `int4_dequant_8` in full_attention_4b uses (low nibble = even col).
+// `col` is the starting input column for the 8-element span (must be
+// 2-aligned). `scale_row = row / gsz`, `scale_cols = (cols + gsz - 1) / gsz`,
+// `sb = scale_row * scale_cols`. Fast path covers the common case where all
+// 8 columns share a group (gs=128 + 8-element step ⇒ true except at group
+// boundaries).
+__device__ inline void int4_dequant_8(
+    uint32_t packed,
+    const hip_bfloat16* __restrict__ scales,
+    const hip_bfloat16* __restrict__ zeros,
+    int scale_row, int col, int scale_cols, int gsz,
+    float out[8]
+) {
+    const int sb = scale_row * scale_cols;
+    int n0 = (packed >>  0) & 0xF;
+    int n1 = (packed >>  4) & 0xF;
+    int n2 = (packed >>  8) & 0xF;
+    int n3 = (packed >> 12) & 0xF;
+    int n4 = (packed >> 16) & 0xF;
+    int n5 = (packed >> 20) & 0xF;
+    int n6 = (packed >> 24) & 0xF;
+    int n7 = (packed >> 28) & 0xF;
+
+    const int g0 = col / gsz;
+    const int g7 = (col + 7) / gsz;
+    if (g0 == g7) {
+        float s = static_cast<float>(scales[sb + g0]);
+        float zs = static_cast<float>(zeros[sb + g0]) * s;
+        out[0] = bf16_round_rne_f32(static_cast<float>(n0) * s - zs);
+        out[1] = bf16_round_rne_f32(static_cast<float>(n1) * s - zs);
+        out[2] = bf16_round_rne_f32(static_cast<float>(n2) * s - zs);
+        out[3] = bf16_round_rne_f32(static_cast<float>(n3) * s - zs);
+        out[4] = bf16_round_rne_f32(static_cast<float>(n4) * s - zs);
+        out[5] = bf16_round_rne_f32(static_cast<float>(n5) * s - zs);
+        out[6] = bf16_round_rne_f32(static_cast<float>(n6) * s - zs);
+        out[7] = bf16_round_rne_f32(static_cast<float>(n7) * s - zs);
+    } else {
+        float s0 = static_cast<float>(scales[sb + g0]);
+        float zs0 = static_cast<float>(zeros[sb + g0]) * s0;
+        float s1 = static_cast<float>(scales[sb + g7]);
+        float zs1 = static_cast<float>(zeros[sb + g7]) * s1;
+        #define I4DQ(idx, ni) do { \
+            int gi = (col + idx) / gsz; \
+            float si = (gi == g0) ? s0 : s1; \
+            float zsi = (gi == g0) ? zs0 : zs1; \
+            out[idx] = bf16_round_rne_f32(static_cast<float>(ni) * si - zsi); \
+        } while(0)
+        I4DQ(0, n0); I4DQ(1, n1); I4DQ(2, n2); I4DQ(3, n3);
+        I4DQ(4, n4); I4DQ(5, n5); I4DQ(6, n6); I4DQ(7, n7);
+        #undef I4DQ
+    }
+}
+
+// Single-element dequant for non-8-aligned tails. `cols` is the unpacked
+// input dim of the 2D slab `(row, col)` indexes into. `scales`/`zeros`
+// are at `[(row/gs) * ((cols + gs - 1)/gs) + col/gs]` — same as the 2D
+// helpers in full_attention_4b.
+__device__ inline float int4_dequant_scalar(
+    const void* w_ptr, const void* scale_ptr, const void* zero_ptr,
+    int row, int col, int cols, int group_size
+) {
+    const uint8_t* data = static_cast<const uint8_t*>(w_ptr);
+    int byte_cols = cols / 2;
+    uint8_t packed_byte = data[static_cast<size_t>(row) * byte_cols + col / 2];
+    int nibble = (col & 1) ? ((packed_byte >> 4) & 0xF) : (packed_byte & 0xF);
+    const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    const hip_bfloat16* zeros = static_cast<const hip_bfloat16*>(zero_ptr);
+    int si = (row / group_size) * ((cols + group_size - 1) / group_size)
+           + col / group_size;
+    float s = static_cast<float>(scales[si]);
+    return bf16_round_rne_f32(
+        static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
+}
+
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------
 
 struct DecodeLayerDesc {
@@ -291,8 +381,32 @@ __global__ void qwen36_moe_attn_step_kernel(
     const T* __restrict__          q_norm_w,      // [d]
     const T* __restrict__          k_norm_w,      // [d]               (nullable for stage<2)
     const T* __restrict__          o_proj_w,      // [hidden, H*d]     (nullable for stage<5)
+    // PR 4b6 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
+    // and every sidecar pointer must be null. When non-zero, each sidecar
+    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
+    // null `*_scale` for a given tensor keeps it on the BF16 path, a
+    // non-null pair switches that tensor to INT4. The kernel reinterprets
+    // the matching weight pointer as `const uint8_t*` packed bytes (low
+    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     q_proj_scale,
+    const hip_bfloat16* __restrict__     q_proj_zero,
+    const hip_bfloat16* __restrict__     k_proj_scale,
+    const hip_bfloat16* __restrict__     k_proj_zero,
+    const hip_bfloat16* __restrict__     v_proj_scale,
+    const hip_bfloat16* __restrict__     v_proj_zero,
+    const hip_bfloat16* __restrict__     o_proj_scale,
+    const hip_bfloat16* __restrict__     o_proj_zero,
     T* __restrict__                output,        // BF16, sized for the largest staged intermediate
     float* __restrict__             workspace,    // F32 scratch, see header comment
+    // PR 4d KV cache extension. When `kv_cache_k`/`kv_cache_v` are non-null
+    // and `kv_max_t > 0`, Phase G writes the current step's K/V at slot
+    // `position` and attends over `kv_len = position + 1` past tokens. When
+    // both pointers are null, falls back to the kv_len=1 self-attention
+    // path (PR 4b2 behavior — back-compat for the parity tests).
+    T* __restrict__                kv_cache_k,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
+    T* __restrict__                kv_cache_v,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
+    int                            kv_max_t,      // capacity bound; 0 ⇔ no cache
     unsigned int* __restrict__     counters,
     unsigned int* __restrict__     barrier_counter,
     unsigned int* __restrict__     barrier_flag) {
@@ -302,7 +416,7 @@ __global__ void qwen36_moe_attn_step_kernel(
     (void)o_proj_w;
     (void)rotary_dim;
     (void)rope_theta;
-    (void)position;
+    // `position` is now read in Phase G when KV cache is enabled.
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
@@ -349,7 +463,10 @@ __global__ void qwen36_moe_attn_step_kernel(
     // Output rows of q_raw are written BF16-rounded into workspace[0..2*H*d]
     // so that the per-head RMS norm in Phase C reads the same F32-of-BF16
     // values PyTorch's BF16 q_raw represents.
+    // INT4 (when `q_proj_scale != nullptr`): treat `q_proj_w` as
+    // `[2*H*d, hidden/2]` u8 and dequant per element. Same matvec stride.
     const int q_out_dim = 2 * num_heads * head_dim;
+    const bool q_int4 = (q_proj_scale != nullptr);
 
     for (;;) {
         __shared__ unsigned int my_row_s;
@@ -360,10 +477,20 @@ __global__ void qwen36_moe_attn_step_kernel(
         const int my_row = static_cast<int>(my_row_s);
         if (my_row >= q_out_dim) break;
 
-        const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        if (q_int4) {
+            const void* q_packed = reinterpret_cast<const void*>(q_proj_w);
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               q_packed, q_proj_scale, q_proj_zero,
+                               my_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -395,6 +522,12 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int OFF_ATTN     = 4 * H * d + 4 * Hkv * d;
     const int OFF_GATED    = 5 * H * d + 4 * Hkv * d;
     const int OFF_O_OUT    = 6 * H * d + 4 * Hkv * d;
+    // Scores for the attention reduction when kv_len > 1. Per Q head we
+    // need [kv_len] F32 slots; allocate per-head slots [H, kv_max_t] so
+    // blocks processing different heads don't race. When kv_cache_k is
+    // null (back-compat kv_len=1 path) this region is unused — the engine
+    // doesn't need to allocate space for it.
+    const int OFF_SCORES   = 6 * H * d + 4 * Hkv * d + hidden;
 
     // -- Phase C: per-head RMS norm of q_lanes = workspace[Q_RAW : Q_RAW+H*d]
     // Each block grabs a head index, reduces across head_dim, writes BF16
@@ -472,13 +605,25 @@ __global__ void qwen36_moe_attn_step_kernel(
         // First Hkv*d rows belong to k_proj, next Hkv*d to v_proj.
         const bool is_v = my_row >= Hkv * d;
         const int proj_row = is_v ? (my_row - Hkv * d) : my_row;
-        const T* w_row = (is_v ? v_proj_w : k_proj_w)
-            + static_cast<size_t>(proj_row) * hidden;
+        const T* w_slab = is_v ? v_proj_w : k_proj_w;
+        const hip_bfloat16* i4_scale = is_v ? v_proj_scale : k_proj_scale;
+        const hip_bfloat16* i4_zero  = is_v ? v_proj_zero  : k_proj_zero;
         const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        if (i4_scale != nullptr) {
+            const void* w_packed = reinterpret_cast<const void*>(w_slab);
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               w_packed, i4_scale, i4_zero,
+                               proj_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -629,27 +774,53 @@ __global__ void qwen36_moe_attn_step_kernel(
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
 
-    // -- Phase G: GQA self-attention, kv_len = 1 ----------------------------
+    // -- Phase G: GQA self-attention with optional KV cache -----------------
     //
-    // The PR-4b2 oracle runs without a KV cache, so the only K/V token is
-    // the just-emitted one. With a single-token K, softmax over the score
-    // vector reduces to a single element ≡ 1.0 regardless of the score.
-    // The output therefore collapses to:
+    // Two modes selected by whether kv_cache_k/v are non-null:
     //
-    //   attn[h, :] = bf16(1.0) * v_full[h, :]
-    //              = v_raw[h // rep, :]      (already BF16-rounded F32)
+    // 1) Back-compat (kv_cache == null): kv_len = 1 self-attention. Softmax
+    //    over a single score is 1.0; output[h] = V[h_kv]. Same path as the
+    //    PR 4b2 oracle, kept bit-exact so the per-block parity tests don't
+    //    regress.
     //
-    // We still compute the QK score (skipped for the output) so the path
-    // exercises q_rot / k_rot loads — that's the slice of compute the
-    // future kv_len > 1 extension will reuse, with the softmax becoming
-    // non-trivial. For now the score is intentionally unused.
-    //
-    // Each block grabs one Q head, broadcasts the matching KV head's V row
-    // into workspace[ATTN + h*d : ...] and (when stage == 4) into output.
+    // 2) KV cache enabled (kv_cache != null): write current (K_rot, V_raw)
+    //    at slot `position`, then attend over kv_len = position + 1 past
+    //    tokens with real softmax (max-stabilised, F32 exp). Per-Q-head
+    //    work-stealing; per-head scores live at workspace[OFF_SCORES +
+    //    hq * kv_max_t] so concurrent blocks computing different heads
+    //    don't race. Cap: kv_max_t must accommodate position + 1.
     {
         const int rep   = H / Hkv;
         const float scale = rsqrtf(static_cast<float>(d));
+        const bool use_kv_cache = (kv_cache_k != nullptr && kv_cache_v != nullptr);
+        const int kv_len = use_kv_cache ? (position + 1) : 1;
 
+        // Step 1: write current K/V into the cache (if enabled). All blocks
+        // cooperate via a flat work-stealing index since the writes are
+        // independent across (h_kv, i).
+        if (use_kv_cache) {
+            const int slot_base = position * Hkv * d;
+            const int total = Hkv * d;
+            for (int idx = blockIdx.x * block_size + tid;
+                 idx < total;
+                 idx += num_blocks * block_size) {
+                const int h_kv = idx / d;
+                const int i    = idx % d;
+                const float kv = workspace[OFF_K_ROT + h_kv * d + i];
+                const float vv = workspace[OFF_V_RAW + h_kv * d + i];
+                kv_cache_k[slot_base + h_kv * d + i] = static_cast<T>(kv);
+                kv_cache_v[slot_base + h_kv * d + i] = static_cast<T>(vv);
+            }
+            // Ensure all blocks' writes are visible before the read-side
+            // attention reduction reads cache[0..=position].
+            grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                       &counters[0]);
+        }
+
+        // Step 2: per-Q-head attention reduction. Each block claims one head
+        // via atomicAdd on counters[0]; the write phase above already reset
+        // it (via grid_barrier_reset_counter when use_kv_cache, or by leaving
+        // it untouched when not).
         for (;;) {
             __shared__ unsigned int head_s;
             if (tid == 0) {
@@ -661,34 +832,96 @@ __global__ void qwen36_moe_attn_step_kernel(
 
             const int h_kv = hq / rep;
 
-            // Score (q · k) * scale — computed for path-coverage only at
-            // kv_len=1. Single-block reduction over head_dim=256.
-            float partial = 0.0f;
-            for (int i = tid; i < d; i += block_size) {
-                const float q = workspace[OFF_Q_ROT + hq   * d + i];
-                const float k = workspace[OFF_K_ROT + h_kv * d + i];
-                partial += q * k;
+            if (kv_len == 1) {
+                // Back-compat fast path — bit-exact match for PR 4b2 parity.
+                float partial = 0.0f;
+                for (int i = tid; i < d; i += block_size) {
+                    const float q = workspace[OFF_Q_ROT + hq   * d + i];
+                    const float k = workspace[OFF_K_ROT + h_kv * d + i];
+                    partial += q * k;
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                __shared__ float head_score;
+                if (tid == 0) {
+                    head_score = shared_scratch[0] * scale;
+                }
+                __syncthreads();
+                (void)head_score;
+                // softmax([s]) = [1.0]; output collapses to V at this position.
+                for (int i = tid; i < d; i += block_size) {
+                    const float v = workspace[OFF_V_RAW + h_kv * d + i];
+                    workspace[OFF_ATTN + hq * d + i] = v;
+                    if (stage == 4) {
+                        output[hq * d + i] = static_cast<T>(v);
+                    }
+                }
+                __syncthreads();
+                continue;
             }
-            shared_scratch[tid] = partial;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+
+            // KV-cache path. Compute scores[t] = (q · K_cache[t]) * scale
+            // for t in 0..=position. Per-head scores live at
+            // workspace[OFF_SCORES + hq * kv_max_t + t].
+            const int score_base = OFF_SCORES + hq * kv_max_t;
+            for (int t = 0; t < kv_len; t++) {
+                float partial = 0.0f;
+                for (int i = tid; i < d; i += block_size) {
+                    const float q = workspace[OFF_Q_ROT + hq * d + i];
+                    const float k = static_cast<float>(
+                        kv_cache_k[t * Hkv * d + h_kv * d + i]);
+                    partial += q * k;
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    workspace[score_base + t] = shared_scratch[0] * scale;
+                }
                 __syncthreads();
             }
-            __shared__ float head_score;
+
+            // Softmax with max-stabilisation. Done by tid==0 to keep the
+            // reduction simple — kv_len is small (≤ context window) and the
+            // remaining work (V-weighted reduction) is the bulk of the cost.
+            __shared__ float max_score;
+            __shared__ float exp_sum;
             if (tid == 0) {
-                head_score = shared_scratch[0] * scale;
+                float m = workspace[score_base];
+                for (int t = 1; t < kv_len; t++) {
+                    m = fmaxf(m, workspace[score_base + t]);
+                }
+                max_score = m;
+                float s = 0.0f;
+                for (int t = 0; t < kv_len; t++) {
+                    const float e = expf(workspace[score_base + t] - m);
+                    workspace[score_base + t] = e;
+                    s += e;
+                }
+                exp_sum = s;
             }
             __syncthreads();
-            (void)head_score;
 
-            // softmax([s]) = [1.0]; bf16(1.0 * v) = v. v_raw is already
-            // BF16-rounded F32 from Phase D so no extra rounding needed.
+            // Weighted sum of V over t. Each thread handles a slice of d.
+            const float inv_sum = 1.0f / exp_sum;
             for (int i = tid; i < d; i += block_size) {
-                const float v = workspace[OFF_V_RAW + h_kv * d + i];
-                workspace[OFF_ATTN + hq * d + i] = v;
+                float acc = 0.0f;
+                for (int t = 0; t < kv_len; t++) {
+                    const float w = workspace[score_base + t] * inv_sum;
+                    const float v = static_cast<float>(
+                        kv_cache_v[t * Hkv * d + h_kv * d + i]);
+                    acc += w * v;
+                }
+                workspace[OFF_ATTN + hq * d + i] = acc;
                 if (stage == 4) {
-                    output[hq * d + i] = static_cast<T>(v);
+                    output[hq * d + i] = static_cast<T>(acc);
                 }
             }
             __syncthreads();
@@ -747,6 +980,7 @@ __global__ void qwen36_moe_attn_step_kernel(
     // (when stage == 5) the host-visible output buffer.
     {
         const int qd = H * d;
+        const bool o_int4 = (o_proj_scale != nullptr);
 
         for (;;) {
             __shared__ unsigned int my_row_s;
@@ -757,10 +991,20 @@ __global__ void qwen36_moe_attn_step_kernel(
             const int my_row = static_cast<int>(my_row_s);
             if (my_row >= hidden) break;
 
-            const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
             float partial = 0.0f;
-            for (int j = tid; j < qd; j += block_size) {
-                partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+            if (o_int4) {
+                const void* o_packed = reinterpret_cast<const void*>(o_proj_w);
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += int4_dequant_scalar(
+                                   o_packed, o_proj_scale, o_proj_zero,
+                                   my_row, j, qd, int4_group_size)
+                               * workspace[OFF_GATED + j];
+                }
+            } else {
+                const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();
@@ -851,6 +1095,17 @@ __global__ void qwen36_moe_linear_step_kernel(
     const T* __restrict__          out_proj_w,          // unused at stage 1
     T* __restrict__                conv_state,          // unused at stage 1
     float* __restrict__            recurrent_state,     // unused at stage 1
+    // PR 4b6 INT4 sidecars. Same null-pointer-as-mode discipline as the
+    // full-attn kernel. Only the three projections that the bake quantizes
+    // are wired (in_proj_qkv, in_proj_z, out_proj). in_proj_a/in_proj_b are
+    // tiny per-V-head scalars and stay BF16.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     in_proj_qkv_scale,
+    const hip_bfloat16* __restrict__     in_proj_qkv_zero,
+    const hip_bfloat16* __restrict__     in_proj_z_scale,
+    const hip_bfloat16* __restrict__     in_proj_z_zero,
+    const hip_bfloat16* __restrict__     out_proj_scale,
+    const hip_bfloat16* __restrict__     out_proj_zero,
     T* __restrict__                output,
     float* __restrict__            workspace,
     unsigned int* __restrict__     counters,
@@ -942,28 +1197,60 @@ __global__ void qwen36_moe_linear_step_kernel(
         if (my_row >= total_rows) break;
 
         // Pick projection + per-projection row-index + workspace dst.
-        const T* w_row;
+        // BF16 path tracks `w_row`; INT4 path tracks (slab base, scale, zero,
+        // local row index) so the helper indexes within the per-projection
+        // 2D weight regardless of which projection the row belongs to.
+        const T* w_row = nullptr;
+        const void* i4_slab = nullptr;
+        const hip_bfloat16* i4_scale = nullptr;
+        const hip_bfloat16* i4_zero  = nullptr;
+        int i4_row = 0;
         int dst_off;
         if (my_row < qkv_dim) {
-            w_row   = in_proj_qkv_w + static_cast<size_t>(my_row) * hidden;
+            if (in_proj_qkv_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(in_proj_qkv_w);
+                i4_scale = in_proj_qkv_scale;
+                i4_zero  = in_proj_qkv_zero;
+                i4_row   = my_row;
+            } else {
+                w_row = in_proj_qkv_w + static_cast<size_t>(my_row) * hidden;
+            }
             dst_off = OFF_QKV_RAW + my_row;
         } else if (my_row < qkv_dim + val_dim) {
             const int r = my_row - qkv_dim;
-            w_row   = in_proj_z_w + static_cast<size_t>(r) * hidden;
+            if (in_proj_z_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(in_proj_z_w);
+                i4_scale = in_proj_z_scale;
+                i4_zero  = in_proj_z_zero;
+                i4_row   = r;
+            } else {
+                w_row = in_proj_z_w + static_cast<size_t>(r) * hidden;
+            }
             dst_off = OFF_Z_RAW + r;
         } else if (my_row < qkv_dim + val_dim + V) {
+            // in_proj_a stays BF16 — bake excludes it.
             const int r = my_row - (qkv_dim + val_dim);
             w_row   = in_proj_a_w + static_cast<size_t>(r) * hidden;
             dst_off = OFF_A_RAW + r;
         } else {
+            // in_proj_b stays BF16 — bake excludes it.
             const int r = my_row - (qkv_dim + val_dim + V);
             w_row   = in_proj_b_w + static_cast<size_t>(r) * hidden;
             dst_off = OFF_B_RAW + r;
         }
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
+        if (i4_scale != nullptr) {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               i4_slab, i4_scale, i4_zero,
+                               i4_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -1417,6 +1704,7 @@ __global__ void qwen36_moe_linear_step_kernel(
     // and `output_hidden = input_hidden + o_out` in the oracle.
     {
         const int qd = V * v_dim;
+        const bool out_int4 = (out_proj_scale != nullptr);
 
         for (;;) {
             __shared__ unsigned int my_row_s;
@@ -1427,10 +1715,20 @@ __global__ void qwen36_moe_linear_step_kernel(
             const int my_row = static_cast<int>(my_row_s);
             if (my_row >= hidden) break;
 
-            const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
             float partial = 0.0f;
-            for (int j = tid; j < qd; j += block_size) {
-                partial += static_cast<float>(w_row[j]) * workspace[OFF_REC_OUT + j];
+            if (out_int4) {
+                const void* o_packed = reinterpret_cast<const void*>(out_proj_w);
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += int4_dequant_scalar(
+                                   o_packed, out_proj_scale, out_proj_zero,
+                                   my_row, j, qd, int4_group_size)
+                               * workspace[OFF_REC_OUT + j];
+                }
+            } else {
+                const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += static_cast<float>(w_row[j]) * workspace[OFF_REC_OUT + j];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();
@@ -1526,6 +1824,24 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const T* __restrict__          shared_up_proj_w,             // [Is, hidden]       (nullable for stage<2)
     const T* __restrict__          shared_down_proj_w,           // [hidden, Is]       (nullable for stage<2)
     const T* __restrict__          shared_expert_gate_w,         // [1, hidden]        (nullable for stage<2)
+    // PR 4b5 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
+    // and every sidecar pointer must be null. When non-zero, each sidecar
+    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
+    // null `*_scale` for a given tensor keeps it on the BF16 path, a
+    // non-null pair switches that tensor to INT4. The kernel reinterprets
+    // the matching weight pointer as `const uint8_t*` packed bytes (low
+    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     gate_up_proj_scale,
+    const hip_bfloat16* __restrict__     gate_up_proj_zero,
+    const hip_bfloat16* __restrict__     down_proj_scale,
+    const hip_bfloat16* __restrict__     down_proj_zero,
+    const hip_bfloat16* __restrict__     shared_gate_proj_scale,
+    const hip_bfloat16* __restrict__     shared_gate_proj_zero,
+    const hip_bfloat16* __restrict__     shared_up_proj_scale,
+    const hip_bfloat16* __restrict__     shared_up_proj_zero,
+    const hip_bfloat16* __restrict__     shared_down_proj_scale,
+    const hip_bfloat16* __restrict__     shared_down_proj_zero,
     T* __restrict__                output,                       // BF16, sized for the largest staged intermediate
     int* __restrict__              output_idx,                   // [k] topk indices (stage 1+)
     float* __restrict__            workspace,
@@ -1534,6 +1850,10 @@ __global__ void qwen36_moe_ffn_step_kernel(
     unsigned int* __restrict__     barrier_flag) {
     // gate_up_proj_w, down_proj_w are used at stage>=3.
     // shared_*_w are used at stage>=2.
+    // INT4 sidecars (`*_scale`/`*_zero`) are read only for tensors whose
+    // `*_scale` pointer is non-null. The router (`gate_w`) and the scalar
+    // shared-expert gate (`shared_expert_gate_w`) are always BF16 — the
+    // INT4 bake excludes them, matching `crates/qwen36_moe/src/weights.rs`.
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
@@ -1793,27 +2113,58 @@ __global__ void qwen36_moe_ffn_step_kernel(
         const int my_row = static_cast<int>(my_row_d_s);
         if (my_row >= total_rows_d) break;
 
-        const T* w_row;
+        const T* w_row = nullptr;                          // BF16 path
+        const void* i4_slab = nullptr;                     // INT4 path: full [out, hidden/2] u8
+        const hip_bfloat16* i4_scale = nullptr;
+        const hip_bfloat16* i4_zero  = nullptr;
+        int      i4_row = 0;                               // row index within the slab
         int      write_offset;
         bool     is_gate_row = false;
         if (my_row < Is_) {
-            w_row        = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+            if (shared_gate_proj_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(shared_gate_proj_w);
+                i4_scale = shared_gate_proj_scale;
+                i4_zero  = shared_gate_proj_zero;
+                i4_row   = my_row;
+            } else {
+                w_row = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+            }
             write_offset = OFF_SGP + my_row;
         } else if (my_row < 2 * Is_) {
             const int local = my_row - Is_;
-            w_row        = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+            if (shared_up_proj_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(shared_up_proj_w);
+                i4_scale = shared_up_proj_scale;
+                i4_zero  = shared_up_proj_zero;
+                i4_row   = local;
+            } else {
+                w_row = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+            }
             write_offset = OFF_SUP + local;
         } else {
             // Single-row "[1, hidden]" weight; dot it with h_norm and apply
-            // sigmoid() before storing into SG_SCALAR.
+            // sigmoid() before storing into SG_SCALAR. Always BF16 — the
+            // INT4 bake excludes `shared_expert_gate`.
             w_row        = shared_expert_gate_w;
             write_offset = OFF_SG_SCALAR;
             is_gate_row  = true;
         }
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+        if (i4_scale != nullptr) {
+            // INT4 scalar dequant per element. Stride pattern matches the
+            // BF16 path (thread t reads cols t, t+block_size, …) so the
+            // reduction tree is unchanged.
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               i4_slab, i4_scale, i4_zero,
+                               i4_row, col, hidden, int4_group_size)
+                           * h_norm_lds[col];
+            }
+        } else {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -1868,12 +2219,27 @@ __global__ void qwen36_moe_ffn_step_kernel(
             const int my_row = static_cast<int>(my_row_f_s);
             if (my_row >= hidden) break;
 
-            const T* w_row =
-                shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
             float partial = 0.0f;
-            for (int col = tid; col < Is_; col += block_size) {
-                partial += static_cast<float>(w_row[col])
-                           * workspace[OFF_SHARED_MID + col];
+            if (shared_down_proj_scale != nullptr) {
+                // INT4 path: row `my_row` of `[hidden, Is]` packed as
+                // `[hidden, Is/2]` u8.
+                const void* i4_slab =
+                    reinterpret_cast<const void*>(shared_down_proj_w);
+                for (int col = tid; col < Is_; col += block_size) {
+                    partial += int4_dequant_scalar(
+                                   i4_slab,
+                                   shared_down_proj_scale,
+                                   shared_down_proj_zero,
+                                   my_row, col, Is_, int4_group_size)
+                               * workspace[OFF_SHARED_MID + col];
+                }
+            } else {
+                const T* w_row =
+                    shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
+                for (int col = tid; col < Is_; col += block_size) {
+                    partial += static_cast<float>(w_row[col])
+                               * workspace[OFF_SHARED_MID + col];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();
@@ -1930,11 +2296,34 @@ __global__ void qwen36_moe_ffn_step_kernel(
         const int e = s_expert_idx;
 
         // Phase G: matvec gate_up_proj_w[e] @ h_norm → EXPERT_GU[2*I].
-        // Layout: gate_up_proj_w[E, 2*I, hidden] — slab `e` base is
+        // BF16 layout: gate_up_proj_w[E, 2*I, hidden] — slab `e` base is
         // `e * 2*I * hidden`; row `r` adds `r * hidden`.
+        // INT4 layout (when `gate_up_proj_scale != nullptr`):
+        //   weights : [E, 2*I, hidden/2] u8   — slab `e` base in bytes is
+        //                                        `e * 2*I * (hidden/2)`.
+        //   scale   : [E, 2*I/gsz, hidden/gsz] BF16 — slab `e` base in
+        //                                        BF16 elems is
+        //                                        `e * (2*I/gsz) * (hidden/gsz)`.
+        // Same dequant + reduction discipline as the shared-expert INT4
+        // path (step 3); only the per-expert slab base offsets differ.
         {
-            const T* gu_slab =
+            const bool gu_int4 = (gate_up_proj_scale != nullptr);
+            const T* gu_slab_bf16 =
                 gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
+            const uint8_t*      gu_slab_packed = nullptr;
+            const hip_bfloat16* gu_slab_scale  = nullptr;
+            const hip_bfloat16* gu_slab_zero   = nullptr;
+            if (gu_int4) {
+                gu_slab_packed = reinterpret_cast<const uint8_t*>(gate_up_proj_w)
+                               + static_cast<size_t>(e) * two_I
+                                 * (hidden / 2);
+                const int gsr = two_I  / int4_group_size;
+                const int gsc = hidden / int4_group_size;
+                gu_slab_scale = gate_up_proj_scale
+                              + static_cast<size_t>(e) * gsr * gsc;
+                gu_slab_zero  = gate_up_proj_zero
+                              + static_cast<size_t>(e) * gsr * gsc;
+            }
             for (;;) {
                 __shared__ unsigned int my_row_g_s;
                 if (tid == 0) {
@@ -1944,10 +2333,23 @@ __global__ void qwen36_moe_ffn_step_kernel(
                 const int my_row = static_cast<int>(my_row_g_s);
                 if (my_row >= two_I) break;
 
-                const T* w_row = gu_slab + static_cast<size_t>(my_row) * hidden;
                 float partial = 0.0f;
-                for (int col = tid; col < hidden; col += block_size) {
-                    partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+                if (gu_int4) {
+                    for (int col = tid; col < hidden; col += block_size) {
+                        partial += int4_dequant_scalar(
+                                       gu_slab_packed,
+                                       gu_slab_scale,
+                                       gu_slab_zero,
+                                       my_row, col, hidden, int4_group_size)
+                                   * h_norm_lds[col];
+                    }
+                } else {
+                    const T* w_row =
+                        gu_slab_bf16 + static_cast<size_t>(my_row) * hidden;
+                    for (int col = tid; col < hidden; col += block_size) {
+                        partial += static_cast<float>(w_row[col])
+                                   * h_norm_lds[col];
+                    }
                 }
                 shared_scratch[tid] = partial;
                 __syncthreads();
@@ -1977,13 +2379,35 @@ __global__ void qwen36_moe_ffn_step_kernel(
         }
 
         // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[j*hidden..].
-        // Layout: down_proj_w[E, hidden, I]; slab `e` base is `e * hidden * I`,
-        // row `r` adds `r * I`. Contracts over I → one F32 per output row.
+        // BF16 layout: down_proj_w[E, hidden, I]; slab `e` base is
+        // `e * hidden * I`, row `r` adds `r * I`. Contracts over I → one
+        // F32 per output row.
+        // INT4 layout (when `down_proj_scale != nullptr`):
+        //   weights : [E, hidden, I/2] u8   — slab `e` base in bytes is
+        //                                      `e * hidden * (I/2)`.
+        //   scale   : [E, hidden/gsz, I/gsz] BF16 — slab `e` base in BF16
+        //                                      elems is
+        //                                      `e * (hidden/gsz) * (I/gsz)`.
         grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                    &counters[0]);
         {
-            const T* dp_slab =
+            const bool dp_int4 = (down_proj_scale != nullptr);
+            const T* dp_slab_bf16 =
                 down_proj_w + static_cast<size_t>(e) * hidden * I_;
+            const uint8_t*      dp_slab_packed = nullptr;
+            const hip_bfloat16* dp_slab_scale  = nullptr;
+            const hip_bfloat16* dp_slab_zero   = nullptr;
+            if (dp_int4) {
+                dp_slab_packed = reinterpret_cast<const uint8_t*>(down_proj_w)
+                               + static_cast<size_t>(e) * hidden
+                                 * (I_ / 2);
+                const int gsr = hidden / int4_group_size;
+                const int gsc = I_     / int4_group_size;
+                dp_slab_scale = down_proj_scale
+                              + static_cast<size_t>(e) * gsr * gsc;
+                dp_slab_zero  = down_proj_zero
+                              + static_cast<size_t>(e) * gsr * gsc;
+            }
             const int slot_off = OFF_EXPERT_STACK + j * hidden;
             for (;;) {
                 __shared__ unsigned int my_row_i_s;
@@ -1994,11 +2418,23 @@ __global__ void qwen36_moe_ffn_step_kernel(
                 const int my_row = static_cast<int>(my_row_i_s);
                 if (my_row >= hidden) break;
 
-                const T* w_row = dp_slab + static_cast<size_t>(my_row) * I_;
                 float partial = 0.0f;
-                for (int col = tid; col < I_; col += block_size) {
-                    partial += static_cast<float>(w_row[col])
-                               * workspace[OFF_EXPERT_MID + col];
+                if (dp_int4) {
+                    for (int col = tid; col < I_; col += block_size) {
+                        partial += int4_dequant_scalar(
+                                       dp_slab_packed,
+                                       dp_slab_scale,
+                                       dp_slab_zero,
+                                       my_row, col, I_, int4_group_size)
+                                   * workspace[OFF_EXPERT_MID + col];
+                    }
+                } else {
+                    const T* w_row =
+                        dp_slab_bf16 + static_cast<size_t>(my_row) * I_;
+                    for (int col = tid; col < I_; col += block_size) {
+                        partial += static_cast<float>(w_row[col])
+                                   * workspace[OFF_EXPERT_MID + col];
+                    }
                 }
                 shared_scratch[tid] = partial;
                 __syncthreads();
@@ -2096,6 +2532,57 @@ __global__ void qwen36_moe_ffn_step_kernel(
             output[my_row] = static_cast<T>(val);
         }
         __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR 4b5 step 2: INT4 dequant smoke kernel.
+//
+// Single-thread sweep over a small `[out_rows, in_cols]` slab that calls
+// both `int4_dequant_8` (fused 8-wide path) and `int4_dequant_scalar`
+// (single-element path) into separate output buffers. The host test
+// compares each output byte-for-byte against a Rust-side reference
+// implementing the same `bf16(q*s - z*s)` math. This catches porting
+// bugs in the helpers in isolation, before they're folded into the FFN
+// matmuls in step 3+.
+//
+// Pre-conditions (the bridge validates them):
+//   - in_cols % 8 == 0
+//   - in_cols % gsz == 0, gsz % 2 == 0 (single-byte index by `col / 2`)
+//   - out_rows % gsz == 0 (single-row scale tile per scale_row)
+__global__ void int4_dequant_smoke_kernel(
+    const uint8_t*      packed,        // [out_rows, in_cols / 2]
+    const hip_bfloat16* scale,         // [out_rows / gsz, in_cols / gsz]
+    const hip_bfloat16* zero,          // [out_rows / gsz, in_cols / gsz]
+    int                 out_rows,
+    int                 in_cols,
+    int                 gsz,
+    float*              dq_8_out,      // [out_rows * in_cols] from int4_dequant_8
+    float*              dq_scalar_out  // [out_rows * in_cols] from int4_dequant_scalar
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const int byte_cols = in_cols / 2;
+    const int scale_cols = in_cols / gsz;
+    for (int row = 0; row < out_rows; ++row) {
+        // Path A: 8-wide fused dequant.
+        for (int col = 0; col < in_cols; col += 8) {
+            uint32_t pk = 0;
+            for (int b = 0; b < 4; ++b) {
+                pk |= static_cast<uint32_t>(
+                          packed[row * byte_cols + col / 2 + b]) << (8 * b);
+            }
+            float d[8];
+            int4_dequant_8(pk, scale, zero,
+                           row / gsz, col, scale_cols, gsz, d);
+            for (int i = 0; i < 8; ++i) {
+                dq_8_out[row * in_cols + col + i] = d[i];
+            }
+        }
+        // Path B: scalar dequant (one element at a time).
+        for (int col = 0; col < in_cols; ++col) {
+            dq_scalar_out[row * in_cols + col] = int4_dequant_scalar(
+                packed, scale, zero, row, col, in_cols, gsz);
+        }
     }
 }
 

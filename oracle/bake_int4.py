@@ -278,19 +278,62 @@ def gptq_quantize(
     def set_tile_scales(gc: int, group_view: torch.Tensor) -> None:
         # group_view: [out_f, W] where W <= gs
         # Reshape to [scale_rows, gs, W] and compute per-row-tile min/max in one go.
+        # PR4d quality fix: AutoGPTQ-style scale search. Plain min/max gave
+        # per-tensor cos_sim 0.88-0.97 vs safetensors on the 35B-A3B bake;
+        # see docs/qwen36-moe-bake-quality-audit.md. Search over a small grid
+        # of "shrunk" scale factors (p < 1) and pick the per-row-tile setting
+        # that minimises post-BF16-round MSE on the dequantised tile. p < 1
+        # trades clipping at the distribution tails for tighter quantisation
+        # across the body — typically net positive for trained weights
+        # which concentrate near zero.
         width = group_view.shape[1]
         gv = group_view.reshape(scale_rows, gs, width)
-        tmax = gv.amax(dim=(1, 2))  # [scale_rows]
-        tmin = gv.amin(dim=(1, 2))
-        rng = tmax - tmin
-        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
-        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
-        # Round through BF16 so the values we use to reconstruct weights match
-        # exactly what the runtime kernel reads (scale/zero are stored BF16).
-        sc = sc.to(torch.bfloat16).to(torch.float32)
-        zf = zf.to(torch.bfloat16).to(torch.float32)
-        scale_tile[:, gc] = sc
-        zero_tile[:, gc] = zf
+        tmax_orig = gv.amax(dim=(1, 2))  # [scale_rows]
+        tmin_orig = gv.amin(dim=(1, 2))
+
+        def derive(tmin_v: torch.Tensor, tmax_v: torch.Tensor):
+            rng_v = tmax_v - tmin_v
+            sc_v = torch.where(rng_v > 0, rng_v / 15.0, torch.ones_like(rng_v))
+            zf_v = torch.where(rng_v > 0, -tmin_v / sc_v, torch.zeros_like(rng_v))
+            # Round through BF16 so what we evaluate matches what the runtime
+            # kernel reads (scale/zero are BF16 sidecars).
+            return (sc_v.to(torch.bfloat16).to(torch.float32),
+                    zf_v.to(torch.bfloat16).to(torch.float32))
+
+        def tile_mse(sc_v: torch.Tensor, zf_v: torch.Tensor) -> torch.Tensor:
+            # Quantise + dequantise this column-group with the candidate
+            # (sc, zf) per row-tile, return per-row-tile MSE vs `gv`.
+            sc_b = sc_v.unsqueeze(1).unsqueeze(2)  # [scale_rows, 1, 1]
+            zf_b = zf_v.unsqueeze(1).unsqueeze(2)
+            # Guard against the rng==0 fallback yielding sc_b=1 → sc_b is
+            # always > 0 from `derive`; this is just defensive.
+            safe_sc = torch.where(sc_b == 0, torch.ones_like(sc_b), sc_b)
+            q = torch.clamp(torch.round(gv / safe_sc + zf_b), 0.0, 15.0)
+            recon = (q * sc_b - zf_b * sc_b).to(torch.bfloat16).to(torch.float32)
+            return ((gv - recon) ** 2).mean(dim=(1, 2))
+
+        # Baseline: full min/max (p=1.0). Always kept as the fallback so a
+        # numerically odd shrink can never regress us below the original.
+        best_sc, best_zf = derive(tmin_orig, tmax_orig)
+        best_mse = tile_mse(best_sc, best_zf)
+
+        # Shrunk-range candidates. p < 1 multiplies both tmin and tmax by p
+        # (symmetric shrink toward zero — same convention as AutoGPTQ's
+        # `Quantizer.find_params` mse=True path). Grid kept small (~7
+        # candidates) so the per-block scale-search cost stays under a
+        # millisecond per call; AutoGPTQ defaults to maxshrink=0.8 grid=100,
+        # but the marginal MSE gain after the first ~5 candidates is
+        # negligible for trained weights.
+        for p in (0.95, 0.90, 0.85, 0.80, 0.75, 0.70):
+            sc_p, zf_p = derive(p * tmin_orig, p * tmax_orig)
+            mse_p = tile_mse(sc_p, zf_p)
+            better = mse_p < best_mse
+            best_sc = torch.where(better, sc_p, best_sc)
+            best_zf = torch.where(better, zf_p, best_zf)
+            best_mse = torch.where(better, mse_p, best_mse)
+
+        scale_tile[:, gc] = best_sc
+        zero_tile[:, gc] = best_zf
 
     # Iterate columns in blocks; use blocksize == group_size so block boundaries
     # line up with column-group boundaries.
@@ -364,6 +407,54 @@ def pack_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
     return (r[..., 0] | (r[..., 1] << 4)).contiguous()
 
 
+@torch.no_grad()
+def _minmax_int4_search_2d(
+    tiles: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """AutoGPTQ-style scale search for 2D-tiled INT4 quantisation.
+
+    `tiles` is a [scale_rows, gs, scale_cols, gs] float32 tensor — i.e. the
+    weights laid out so that axes (1, 3) span one quantisation tile. Returns
+    `(scale, zero)` of shape `[scale_rows, scale_cols]` (BF16-rounded F32),
+    chosen per-tile from a small grid of "shrink" factors that minimise
+    post-BF16-round MSE on the dequantised tile.
+
+    Used by `fused_expert_minmax_int4*`. The dense-projection scale search
+    in `gptq_quantize::set_tile_scales` runs the same algorithm specialised
+    for one column-group at a time (1D scale shape) so the two paths agree
+    on what "best scale" means.
+    """
+    tmax_orig = tiles.amax(dim=(1, 3))  # [scale_rows, scale_cols]
+    tmin_orig = tiles.amin(dim=(1, 3))
+
+    def derive(tmin_v: torch.Tensor, tmax_v: torch.Tensor):
+        rng_v = tmax_v - tmin_v
+        sc_v = torch.where(rng_v > 0, rng_v / 15.0, torch.ones_like(rng_v))
+        zf_v = torch.where(rng_v > 0, -tmin_v / sc_v, torch.zeros_like(rng_v))
+        # Round through BF16 — what the runtime kernel reads.
+        return (sc_v.to(torch.bfloat16).to(torch.float32),
+                zf_v.to(torch.bfloat16).to(torch.float32))
+
+    def tile_mse(sc_v: torch.Tensor, zf_v: torch.Tensor) -> torch.Tensor:
+        sc_b = sc_v.unsqueeze(1).unsqueeze(3)  # [sr, 1, sc, 1]
+        zf_b = zf_v.unsqueeze(1).unsqueeze(3)
+        safe_sc = torch.where(sc_b == 0, torch.ones_like(sc_b), sc_b)
+        q = torch.clamp(torch.round(tiles / safe_sc + zf_b), 0.0, 15.0)
+        recon = (q * sc_b - zf_b * sc_b).to(torch.bfloat16).to(torch.float32)
+        return ((tiles - recon) ** 2).mean(dim=(1, 3))  # [sr, sc]
+
+    best_sc, best_zf = derive(tmin_orig, tmax_orig)
+    best_mse = tile_mse(best_sc, best_zf)
+    for p in (0.95, 0.90, 0.85, 0.80, 0.75, 0.70):
+        sc_p, zf_p = derive(p * tmin_orig, p * tmax_orig)
+        mse_p = tile_mse(sc_p, zf_p)
+        better = mse_p < best_mse
+        best_sc = torch.where(better, sc_p, best_sc)
+        best_zf = torch.where(better, zf_p, best_zf)
+        best_mse = torch.where(better, mse_p, best_mse)
+    return best_sc, best_zf
+
+
 # ---------------------------------------------------------------------------
 # Fused MoE expert quantization (no GPTQ — min/max group-quant per expert).
 #
@@ -423,17 +514,10 @@ def fused_expert_minmax_int4(
 
     for e in range(E):
         slab = W[e].to(device=dev, dtype=torch.float32)
-        # Reduce per-tile min/max in one reshape — vectorised inside the slab.
+        # Tile shape [sr, gs, sc, gs] so axes (1, 3) span one tile.
         tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
-        tmax = tiles.amax(dim=(1, 3))
-        tmin = tiles.amin(dim=(1, 3))
-        rng = tmax - tmin
-        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
-        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
-        # Round through BF16 so reconstruction matches what the runtime kernel
-        # will read from the BF16 sidecar tensors.
-        sc = sc.to(torch.bfloat16).to(torch.float32)
-        zf = zf.to(torch.bfloat16).to(torch.float32)
+        # Per-tile scale search (same algorithm as gptq_quantize).
+        sc, zf = _minmax_int4_search_2d(tiles)
         sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
         zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
         q = torch.clamp(torch.round(slab / sc_full + zf_full), 0.0, 15.0).to(torch.uint8)
@@ -486,13 +570,8 @@ def fused_expert_minmax_int4_packed(
     for e in range(E):
         slab = W[e].to(device=dev, dtype=torch.float32)
         tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
-        tmax = tiles.amax(dim=(1, 3))
-        tmin = tiles.amin(dim=(1, 3))
-        rng = tmax - tmin
-        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
-        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
-        sc = sc.to(torch.bfloat16).to(torch.float32)
-        zf = zf.to(torch.bfloat16).to(torch.float32)
+        # Per-tile scale search (same algorithm as gptq_quantize).
+        sc, zf = _minmax_int4_search_2d(tiles)
         sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
         zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
         q = torch.clamp(torch.round(slab / sc_full + zf_full), 0.0, 15.0).to(torch.uint8)

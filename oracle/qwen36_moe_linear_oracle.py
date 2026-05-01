@@ -2,10 +2,20 @@
 """
 PyTorch reference for one Qwen3.6-MoE linear-attention layer's decode step.
 
-Companion to PR 4b3 step 1. The 3-of-4 layers in the hybrid pattern that
-aren't full-attention are linear-attention (delta-rule recurrent state
-+ depthwise conv pre-mix), and they need their own staged kernel.
-This oracle is the parity ground-truth for that kernel.
+Companion to PR 4b3 step 1 (BF16) and PR 4b6 step 3 (INT4). The 3-of-4
+layers in the hybrid pattern that aren't full-attention are
+linear-attention (delta-rule recurrent state + depthwise conv pre-mix),
+and they need their own staged kernel. This oracle is the parity
+ground-truth for that kernel.
+
+`--int4` switches into INT4 mode: the three projection weights that the
+INT4 bake quantizes (`in_proj_qkv`, `in_proj_z`, `out_proj`) are
+min/max group-quantized at gs=128 with BF16 scale + zero. `in_proj_a`
+and `in_proj_b` (small per-V-head scalars) plus the conv1d, dt_bias,
+A_log, norms and state buffers all stay BF16 — the bake excludes them
+from the INT4 budget; see `crates/qwen36_moe/src/weights.rs::lin_int4`.
+
+Schema becomes `qwen36-moe-oracle-linear-int4-v1` when --int4 is set.
 
 As with `qwen36_moe_oracle.py`, the math is hand-rolled to avoid pulling
 in the multimodal `Qwen3_5MoeForConditionalGeneration` class — it would
@@ -87,6 +97,120 @@ def b64_f32(t: torch.Tensor) -> str:
     return base64.b64encode(
         t.to(torch.float32).contiguous().cpu().numpy().tobytes()
     ).decode()
+
+
+def b64_u8(t: torch.Tensor) -> str:
+    return base64.b64encode(
+        t.to(torch.uint8).contiguous().cpu().numpy().tobytes()
+    ).decode()
+
+
+# Tensors the INT4 bake quantizes for one linear-attention layer. The
+# small per-V-head scalars `in_proj_a` / `in_proj_b` plus all the
+# small/conv/state tensors stay BF16 — the bake excludes them. See
+# `crates/qwen36_moe/src/weights.rs::lin_int4` for the matching budget.
+INT4_LINEAR_TARGETS: tuple[str, ...] = (
+    "in_proj_qkv_w",
+    "in_proj_z_w",
+    "out_proj_w",
+)
+
+
+@torch.no_grad()
+def minmax_int4_packed_and_recon(
+    W: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Min/max INT4 group-quant for a 2D `[out, in]` weight. Mirrors the
+    helpers in `qwen36_moe_oracle.py` and `qwen36_moe_ffn_oracle.py`,
+    which in turn mirror `oracle/bake_int4.py`. Single-rounding
+    `bf16(q*s - z*s)` reconstruction matches the kernel's
+    `int4_dequant_scalar`.
+
+    Returns (packed/scale/zero on CPU; recon stays on `W.device`):
+      packed   uint8  shape `[out, in/2]`     two nibbles per byte,
+                                               even col → low nibble.
+      scale    f32    shape `[out/gs, in/gs]` BF16 values stored as f32.
+      zero     f32    shape `[out/gs, in/gs]` BF16 values stored as f32.
+      recon    bf16   shape `[out, in]`        kernel's reconstruction.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"expected 2D, got shape {tuple(W.shape)}")
+    out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(
+            f"out_features {out_f} must be divisible by group_size={gs}"
+        )
+    sr = out_f // gs
+    sc = in_f // gs
+
+    slab = W.to(torch.float32)
+    tiles = slab.reshape(sr, gs, sc, gs)
+    tmax = tiles.amax(dim=(1, 3))
+    tmin = tiles.amin(dim=(1, 3))
+    rng = tmax - tmin
+    s = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
+    z = torch.where(rng > 0, -tmin / s, torch.zeros_like(rng))
+    s = s.to(torch.bfloat16).to(torch.float32)
+    z = z.to(torch.bfloat16).to(torch.float32)
+    s_full = s.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+    z_full = z.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+    q = torch.clamp(
+        torch.round(slab / s_full + z_full), 0.0, 15.0
+    ).to(torch.uint8)
+    recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
+    return packed.cpu(), s.cpu(), z.cpu(), recon
+
+
+@torch.no_grad()
+def dequant_int4_packed(
+    packed: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Reference dequant — inverse of `minmax_int4_packed_and_recon`."""
+    out_f = packed.shape[-2]
+    in_half = packed.shape[-1]
+    in_f = in_half * 2
+    gs = group_size
+    q = torch.empty((out_f, in_f), dtype=torch.uint8)
+    q[:, 0::2] = packed & 0x0F
+    q[:, 1::2] = (packed >> 4) & 0x0F
+    s_full = scale.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+    z_full = zero.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+    recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
+    return recon.to(torch.float32)
+
+
+def quantize_int4_linear_weights(
+    weights: dict[str, torch.Tensor], group_size: int
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Quantize the INT4-targeted linear-attn weights in-place: replace
+    each entry in `weights` with its BF16 reconstruction (cast to the
+    weight's original dtype + device). Return a parallel dict of
+    `{name: {"packed", "scale", "zero"}}` sidecars on CPU."""
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] = {}
+    for name in INT4_LINEAR_TARGETS:
+        if name not in weights:
+            raise SystemExit(f"INT4 mode missing required weight: {name}")
+        W = weights[name]
+        packed, scale, zero, recon = minmax_int4_packed_and_recon(W, group_size)
+
+        recon_check = dequant_int4_packed(packed, scale, zero, group_size)
+        diff = (recon.to(torch.float32).cpu() - recon_check).abs().max().item()
+        if diff != 0.0:
+            raise RuntimeError(
+                f"INT4 self-check failed for {name}: "
+                f"max |recon - dequant(packed)| = {diff:.3e}"
+            )
+
+        int4_sidecars[name] = {"packed": packed, "scale": scale, "zero": zero}
+        weights[name] = recon.to(dtype=W.dtype, device=W.device)
+    return int4_sidecars
 
 
 def find_shard_for(model_dir: Path, name: str) -> Path:
@@ -378,9 +502,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Qwen3.6-MoE single-layer linear-attention reference forward"
     )
-    p.add_argument("--mode", choices=["synthetic", "checkpoint"], default="synthetic")
+    p.add_argument("--mode", choices=["synthetic", "checkpoint", "bake"], default="synthetic")
     p.add_argument("--model-dir", type=Path,
                    help="Path to the HuggingFace safetensors dir (checkpoint mode)")
+    p.add_argument("--bake-dir", type=Path,
+                   help="Path to a SuperSonic INT4 GPTQ bake directory "
+                        "(`bake` mode). Loads layer's INT4 weights directly "
+                        "from the bake; emits the bake's actual sidecars.")
     p.add_argument("--layer-idx", type=int, default=0,
                    help="Linear-attention layer index (default 0)")
     p.add_argument("--weight-prefix", default="model.language_model")
@@ -399,12 +527,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--head-v-dim", type=int, default=128)
     p.add_argument("--conv-kernel-dim", type=int, default=4)
     p.add_argument("--rms-norm-eps", type=float, default=1e-6)
+    p.add_argument("--int4", action="store_true",
+                   help="Quantize the three projection weights "
+                        "(in_proj_qkv, in_proj_z, out_proj) to INT4 "
+                        "(min/max group-quant). Schema becomes "
+                        "`qwen36-moe-oracle-linear-int4-v1`.")
+    p.add_argument("--int4-group-size", type=int, default=128,
+                   help="Group size for INT4 min/max quant. Must divide "
+                        "out_features and in_features of every quantized "
+                        "tensor. The runtime + bake both pin to 128.")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
 
     if args.mode == "synthetic":
         weights = synthesize_layer(
@@ -418,6 +557,80 @@ def main() -> None:
             dtype=dtype,
             warm_state=(args.state == "warm"),
         )
+    elif args.mode == "bake":
+        if args.bake_dir is None:
+            raise SystemExit("--bake-dir is required in bake mode")
+        from _bake_loader import has_tensor, load_bf16, load_int4, load_native
+
+        bake_dir = str(args.bake_dir)
+        lp = f"{args.weight_prefix}.layers.{args.layer_idx}"
+        la = f"{lp}.linear_attn"
+
+        weights = {}
+        int4_sidecars = {}
+        for key, name in [
+            ("in_proj_qkv_w", f"{la}.in_proj_qkv.weight"),
+            ("in_proj_z_w", f"{la}.in_proj_z.weight"),
+            ("out_proj_w", f"{la}.out_proj.weight"),
+        ]:
+            recon, packed, scale, zero = load_int4(bake_dir, name)
+            weights[key] = recon
+            int4_sidecars[key] = {
+                "packed": packed,
+                "scale": scale.to(torch.float32),
+                "zero": zero.to(torch.float32),
+            }
+
+        weights["input_norm_w"] = load_bf16(bake_dir, f"{lp}.input_layernorm.weight")
+        weights["norm_w"] = load_bf16(bake_dir, f"{la}.norm.weight")
+        weights["in_proj_a_w"] = load_bf16(bake_dir, f"{la}.in_proj_a.weight")
+        weights["in_proj_b_w"] = load_bf16(bake_dir, f"{la}.in_proj_b.weight")
+        weights["conv1d_w"] = load_bf16(bake_dir, f"{la}.conv1d.weight")
+        weights["conv1d_bias"] = (load_bf16(bake_dir, f"{la}.conv1d.bias")
+                                   if has_tensor(bake_dir, f"{la}.conv1d.bias") else None)
+        # Bake-side transforms (mirror Rust crates/model-store/src/transforms.rs):
+        #   dt_bias: stored reshaped (1, 1, V) — squeeze back to [V].
+        #   A_log: stored as PRE-EXPONENTIATED, reshaped (1, 1, V). The
+        #          reference computes a_log.exp() itself, so undo both: log
+        #          + squeeze to recover the [V] raw-log-domain value.
+        weights["dt_bias"] = load_native(bake_dir, f"{la}.dt_bias").squeeze()
+        a_log_exp_raw = load_native(bake_dir, f"{la}.A_log").squeeze().to(torch.float32)
+        weights["a_log"] = torch.log(a_log_exp_raw).to(torch.bfloat16)
+
+        # Reproducible synthetic input + state — same RNG style as
+        # checkpoint mode.
+        torch.manual_seed(args.seed)
+        weights["input_hidden"] = (
+            torch.randn(args.hidden, dtype=torch.float32) / args.hidden ** 0.5
+        ).to(dtype)
+        for k in ("input_norm_w", "norm_w", "in_proj_a_w", "in_proj_b_w",
+                  "conv1d_w", "dt_bias", "a_log"):
+            if weights.get(k) is not None and weights[k].dtype != dtype:
+                weights[k] = weights[k].to(dtype)
+        if weights["conv1d_bias"] is not None:
+            weights["conv1d_bias"] = weights["conv1d_bias"].to(dtype)
+        # Fresh state: the bake doesn't store decode-time state.
+        key_dim = args.num_k_heads * args.head_k_dim
+        value_dim = args.num_v_heads * args.head_v_dim
+        qkv_dim = 2 * key_dim + value_dim
+        if args.state == "warm":
+            weights["conv_state_before"] = (
+                torch.randn(qkv_dim, args.conv_kernel_dim - 1, dtype=torch.float32) * 0.5
+            ).to(dtype)
+            weights["recurrent_state_before"] = (
+                torch.randn(args.num_v_heads, args.head_k_dim, args.head_v_dim,
+                            dtype=torch.float32) * 0.1
+            )
+        else:
+            weights["conv_state_before"] = torch.zeros(
+                qkv_dim, args.conv_kernel_dim - 1, dtype=dtype
+            )
+            weights["recurrent_state_before"] = torch.zeros(
+                args.num_v_heads, args.head_k_dim, args.head_v_dim, dtype=torch.float32
+            )
+
+        # Force INT4 schema/JSON shape so kernel-ffi tests can consume it.
+        args.int4 = True
     else:
         if args.model_dir is None:
             raise SystemExit("--model-dir is required in checkpoint mode")
@@ -460,6 +673,12 @@ def main() -> None:
     weights = {k: (v.to(args.device) if isinstance(v, torch.Tensor) else v)
                for k, v in weights.items()}
 
+    if args.int4 and int4_sidecars is None:
+        # Quantize before computing intermediates so the reference uses the
+        # same BF16-reconstructed weights the kernel will see.
+        # (Skipped when bake mode already populated int4_sidecars from disk.)
+        int4_sidecars = quantize_int4_linear_weights(weights, args.int4_group_size)
+
     intermediates = reference_linear_attn_layer(
         num_k_heads=args.num_k_heads,
         num_v_heads=args.num_v_heads,
@@ -490,24 +709,38 @@ def main() -> None:
         else:
             intermediate_payload[k] = encode(v)
 
+    config = {
+        "hidden": args.hidden,
+        "num_k_heads": args.num_k_heads,
+        "num_v_heads": args.num_v_heads,
+        "head_k_dim": args.head_k_dim,
+        "head_v_dim": args.head_v_dim,
+        "conv_kernel_dim": args.conv_kernel_dim,
+        "rms_norm_eps": args.rms_norm_eps,
+    }
+    if args.int4:
+        config["int4_group_size"] = args.int4_group_size
+
     out = {
-        "schema": "qwen36-moe-linear-oracle-layer-v1",
+        "schema": ("qwen36-moe-oracle-linear-int4-v1"
+                   if args.int4 else "qwen36-moe-linear-oracle-layer-v1"),
         "mode": args.mode,
         "state": args.state,
         "layer_idx": args.layer_idx,
         "dtype": args.dtype,
-        "config": {
-            "hidden": args.hidden,
-            "num_k_heads": args.num_k_heads,
-            "num_v_heads": args.num_v_heads,
-            "head_k_dim": args.head_k_dim,
-            "head_v_dim": args.head_v_dim,
-            "conv_kernel_dim": args.conv_kernel_dim,
-            "rms_norm_eps": args.rms_norm_eps,
-        },
+        "config": config,
         "weights": weight_payload,
         "intermediates": intermediate_payload,
     }
+    if int4_sidecars is not None:
+        out["int4_weights"] = {
+            name: {
+                "packed": b64_u8(t["packed"]),
+                "scale": b64_bf16(t["scale"]),
+                "zero": b64_bf16(t["zero"]),
+            }
+            for name, t in int4_sidecars.items()
+        }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out))
 

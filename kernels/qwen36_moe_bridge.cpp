@@ -117,8 +117,20 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     const void*   q_norm_w,
     const void*   k_norm_w,
     const void*   o_proj_w,
+    int           int4_group_size,
+    const void*   q_proj_scale,
+    const void*   q_proj_zero,
+    const void*   k_proj_scale,
+    const void*   k_proj_zero,
+    const void*   v_proj_scale,
+    const void*   v_proj_zero,
+    const void*   o_proj_scale,
+    const void*   o_proj_zero,
     void*         output,
     float*        workspace,
+    void*         kv_cache_k,
+    void*         kv_cache_v,
+    int           kv_max_t,
     unsigned int* counters,
     unsigned int* barrier_counter,
     unsigned int* barrier_flag) {
@@ -133,6 +145,33 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
         counters == nullptr || barrier_counter == nullptr ||
         barrier_flag == nullptr) {
         return 113;
+    }
+    // INT4 sidecars: each scale must be paired with a zero. group_size==0
+    // disables INT4 entirely; otherwise it must be positive.
+    if (int4_group_size < 0) return 114;
+    auto pair_ok = [](const void* s, const void* z) -> bool {
+        return (s == nullptr) == (z == nullptr);
+    };
+    if (!pair_ok(q_proj_scale, q_proj_zero) ||
+        !pair_ok(k_proj_scale, k_proj_zero) ||
+        !pair_ok(v_proj_scale, v_proj_zero) ||
+        !pair_ok(o_proj_scale, o_proj_zero)) {
+        return 115;
+    }
+    const bool any_int4 =
+        (q_proj_scale != nullptr) || (k_proj_scale != nullptr) ||
+        (v_proj_scale != nullptr) || (o_proj_scale != nullptr);
+    if (any_int4 && int4_group_size <= 0) return 116;
+    if (!any_int4 && int4_group_size != 0) return 117;
+
+    // KV cache: pointers must be paired (both null or both non-null), and
+    // kv_max_t must be positive when enabled + ≥ position+1 to fit the
+    // current write.
+    const bool kv_enabled = (kv_cache_k != nullptr || kv_cache_v != nullptr);
+    if ((kv_cache_k == nullptr) != (kv_cache_v == nullptr)) return 118;
+    if (kv_enabled) {
+        if (kv_max_t <= 0) return 119;
+        if (position < 0 || position >= kv_max_t) return 120;
     }
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
@@ -177,8 +216,20 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
                        static_cast<const hip_bfloat16*>(q_norm_w),
                        static_cast<const hip_bfloat16*>(k_norm_w),
                        static_cast<const hip_bfloat16*>(o_proj_w),
+                       int4_group_size,
+                       static_cast<const hip_bfloat16*>(q_proj_scale),
+                       static_cast<const hip_bfloat16*>(q_proj_zero),
+                       static_cast<const hip_bfloat16*>(k_proj_scale),
+                       static_cast<const hip_bfloat16*>(k_proj_zero),
+                       static_cast<const hip_bfloat16*>(v_proj_scale),
+                       static_cast<const hip_bfloat16*>(v_proj_zero),
+                       static_cast<const hip_bfloat16*>(o_proj_scale),
+                       static_cast<const hip_bfloat16*>(o_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        workspace,
+                       static_cast<hip_bfloat16*>(kv_cache_k),
+                       static_cast<hip_bfloat16*>(kv_cache_v),
+                       kv_max_t,
                        counters,
                        barrier_counter,
                        barrier_flag);
@@ -217,6 +268,13 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     const void*   out_proj_w,
     void*         conv_state,
     float*        recurrent_state,
+    int           int4_group_size,
+    const void*   in_proj_qkv_scale,
+    const void*   in_proj_qkv_zero,
+    const void*   in_proj_z_scale,
+    const void*   in_proj_z_zero,
+    const void*   out_proj_scale,
+    const void*   out_proj_zero,
     void*         output,
     float*        workspace,
     unsigned int* counters,
@@ -236,6 +294,23 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
         barrier_flag == nullptr) {
         return 123;
     }
+    // INT4 sidecars: each scale must be paired with a zero. group_size==0
+    // disables INT4 entirely; otherwise it must be positive.
+    if (int4_group_size < 0) return 124;
+    auto pair_ok = [](const void* s, const void* z) -> bool {
+        return (s == nullptr) == (z == nullptr);
+    };
+    if (!pair_ok(in_proj_qkv_scale, in_proj_qkv_zero) ||
+        !pair_ok(in_proj_z_scale, in_proj_z_zero) ||
+        !pair_ok(out_proj_scale, out_proj_zero)) {
+        return 125;
+    }
+    const bool any_int4 =
+        (in_proj_qkv_scale != nullptr) ||
+        (in_proj_z_scale != nullptr) ||
+        (out_proj_scale != nullptr);
+    if (any_int4 && int4_group_size <= 0) return 126;
+    if (!any_int4 && int4_group_size != 0) return 127;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -280,6 +355,13 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
                        static_cast<const hip_bfloat16*>(out_proj_w),
                        static_cast<hip_bfloat16*>(conv_state),
                        recurrent_state,
+                       int4_group_size,
+                       static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
+                       static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
+                       static_cast<const hip_bfloat16*>(in_proj_z_scale),
+                       static_cast<const hip_bfloat16*>(in_proj_z_zero),
+                       static_cast<const hip_bfloat16*>(out_proj_scale),
+                       static_cast<const hip_bfloat16*>(out_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        workspace,
                        counters,
@@ -314,6 +396,17 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     const void*   shared_up_proj_w,
     const void*   shared_down_proj_w,
     const void*   shared_expert_gate_w,
+    int           int4_group_size,
+    const void*   gate_up_proj_scale,
+    const void*   gate_up_proj_zero,
+    const void*   down_proj_scale,
+    const void*   down_proj_zero,
+    const void*   shared_gate_proj_scale,
+    const void*   shared_gate_proj_zero,
+    const void*   shared_up_proj_scale,
+    const void*   shared_up_proj_zero,
+    const void*   shared_down_proj_scale,
+    const void*   shared_down_proj_zero,
     void*         output,
     int*          output_idx,
     float*        workspace,
@@ -332,6 +425,26 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         barrier_counter == nullptr || barrier_flag == nullptr) {
         return 133;
     }
+    // INT4 mode: group_size must divide the relevant dims and each scale
+    // must be paired with a zero. group_size==0 disables INT4 entirely.
+    if (int4_group_size < 0) return 134;
+    auto pair_ok = [](const void* s, const void* z) -> bool {
+        return (s == nullptr) == (z == nullptr);
+    };
+    if (!pair_ok(gate_up_proj_scale, gate_up_proj_zero) ||
+        !pair_ok(down_proj_scale, down_proj_zero) ||
+        !pair_ok(shared_gate_proj_scale, shared_gate_proj_zero) ||
+        !pair_ok(shared_up_proj_scale, shared_up_proj_zero) ||
+        !pair_ok(shared_down_proj_scale, shared_down_proj_zero)) {
+        return 135;
+    }
+    const bool any_int4 =
+        (gate_up_proj_scale != nullptr) || (down_proj_scale != nullptr) ||
+        (shared_gate_proj_scale != nullptr) ||
+        (shared_up_proj_scale != nullptr) ||
+        (shared_down_proj_scale != nullptr);
+    if (any_int4 && int4_group_size <= 0) return 136;
+    if (!any_int4 && int4_group_size != 0) return 137;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -370,6 +483,17 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
                        static_cast<const hip_bfloat16*>(shared_up_proj_w),
                        static_cast<const hip_bfloat16*>(shared_down_proj_w),
                        static_cast<const hip_bfloat16*>(shared_expert_gate_w),
+                       int4_group_size,
+                       static_cast<const hip_bfloat16*>(gate_up_proj_scale),
+                       static_cast<const hip_bfloat16*>(gate_up_proj_zero),
+                       static_cast<const hip_bfloat16*>(down_proj_scale),
+                       static_cast<const hip_bfloat16*>(down_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_up_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_up_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_down_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        output_idx,
                        workspace,
@@ -380,5 +504,44 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     hipError_t sync_err_ffn   = hipDeviceSynchronize();
     if (launch_err_ffn != hipSuccess) return 254;
     if (sync_err_ffn != hipSuccess) return 255;
+    return 0;
+}
+
+// PR 4b5 step 2: INT4 dequant smoke launcher.
+// Drives `qwen36_moe::int4_dequant_smoke_kernel` over a small `[out_rows,
+// in_cols]` slab and writes both helpers' outputs to separate buffers.
+// The Rust-side test validates byte-for-byte against a host reference.
+extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
+    size_t         device_ordinal,
+    const uint8_t* packed,
+    const void*    scale,
+    const void*    zero,
+    int            out_rows,
+    int            in_cols,
+    int            gsz,
+    float*         dq_8_out,
+    float*         dq_scalar_out) {
+    if (packed == nullptr || scale == nullptr || zero == nullptr ||
+        dq_8_out == nullptr || dq_scalar_out == nullptr) {
+        return 140;
+    }
+    if (out_rows <= 0 || in_cols <= 0 || gsz <= 0) return 141;
+    if (in_cols % 8 != 0) return 142;
+    if (in_cols % gsz != 0 || gsz % 2 != 0) return 143;
+    if (out_rows % gsz != 0) return 144;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipLaunchKernelGGL(qwen36_moe::int4_dequant_smoke_kernel,
+                       dim3(1), dim3(1), 0, 0,
+                       packed,
+                       static_cast<const hip_bfloat16*>(scale),
+                       static_cast<const hip_bfloat16*>(zero),
+                       out_rows, in_cols, gsz,
+                       dq_8_out, dq_scalar_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
     return 0;
 }

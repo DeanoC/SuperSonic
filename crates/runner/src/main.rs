@@ -9,6 +9,7 @@ mod oracle;
 mod phi4_engine;
 mod prefill_engine;
 mod qwen35_dflash_engine;
+mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod registry;
 mod validate;
@@ -343,6 +344,26 @@ pub(crate) struct Cli {
     /// Maximum tokens to generate
     #[arg(long, default_value = "8")]
     max_new_tokens: usize,
+
+    /// Sampling temperature. 0 = greedy argmax (default; reproducible).
+    /// Typical sampled values: 0.7–1.0.
+    #[arg(long, default_value = "0.0")]
+    temperature: f32,
+
+    /// Top-K filter: keep only the K highest-probability tokens before
+    /// sampling. 0 = no cap (full vocab considered).
+    #[arg(long, default_value = "0")]
+    top_k: usize,
+
+    /// Top-P (nucleus) filter: keep the smallest set of tokens whose
+    /// cumulative probability ≥ top_p. 1.0 = no truncation.
+    #[arg(long, default_value = "1.0")]
+    top_p: f32,
+
+    /// RNG seed for non-greedy sampling. Same seed + same prompt + same
+    /// model = bit-identical generation.
+    #[arg(long, default_value = "42")]
+    sampling_seed: u64,
 
     /// Maximum context size in tokens (prompt + generated). Used for VRAM estimation.
     /// Defaults to prompt length + max_new_tokens if not specified.
@@ -1138,13 +1159,10 @@ fn main() -> Result<()> {
     } else if cli.certified_kv_shadow_validate {
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
-    if model_variant.family() == ModelFamily::Qwen36Moe && !cli.dry_run {
-        anyhow::bail!(
-            "qwen3.6-35b-a3b decode runtime is not yet implemented. \
-             Re-run with --dry-run to enumerate the checkpoint and report VRAM accounting; \
-             the kernel lands in PR 4 (CUDA) and PR 6 (HIP) of docs/qwen36-moe-plan.md."
-        );
-    }
+    // PR 4c step 2 wires the host-orchestrated chained-launch decode path
+    // for Qwen3.6-MoE — qwen36_moe_engine::run handles both --dry-run and
+    // the BF16 decode path (one token from the bake) so this early bail is
+    // no longer needed.
 
     // 2. Detect GPU
     let (arch_name, total_vram, warp_size) = match backend {
