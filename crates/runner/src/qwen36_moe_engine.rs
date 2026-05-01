@@ -27,9 +27,10 @@ use qwen36_moe::weights::{
 
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, bf16_bytes_to_f32, dequant_int4_to_bf16_bytes, host_final_norm_lm_head,
-    host_final_norm_lm_head_f32, run_chained_decode, sample_bf16_logits, AttnLayerBuffers,
-    FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom, XorshiftRng,
+    host_final_norm_lm_head_f32, run_chained_decode, run_chained_decode_fast,
+    sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
+    FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
+    MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -1213,8 +1214,12 @@ fn decode_text(
         let t_embed_step = t0.elapsed();
 
         // Run the chain. Linear-attn state mutates in `layers` in place.
+        // `run_chained_decode_fast` skips the per-layer D2H sync chain
+        // (~80 GPU syncs/token on 35B-A3B) — `decode_text` only consumes
+        // `final_hidden_bytes`. The multilayer parity test still calls
+        // the legacy `run_chained_decode` which captures per-layer.
         let t1 = std::time::Instant::now();
-        let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
+        let outputs = run_chained_decode_fast(ordinal, &geom, &mut layers, &initial_hidden, position)
             .with_context(|| format!("chained decode (step {step}, position {position})"))?;
         let t_chain_step = t1.elapsed();
         position += 1;
