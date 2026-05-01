@@ -2,12 +2,25 @@
 """
 PyTorch reference for one Qwen3.6-MoE FFN block's decode step.
 
-Companion to PR 4b4 of docs/qwen36-moe-plan.md. The attention oracle
-(`qwen36_moe_oracle.py`) covers the pre-FFN half of a layer; this oracle
-covers the post-attention half — RMS norm, top-k MoE expert dispatch,
-shared-expert path, and the final residual add. The HIP kernel's
-parity test reads the JSON this script emits and compares its own
+Companion to PR 4b4 (BF16) and PR 4b5 (INT4) of docs/qwen36-moe-plan.md.
+The attention oracle (`qwen36_moe_oracle.py`) covers the pre-FFN half of a
+layer; this oracle covers the post-attention half — RMS norm, top-k MoE
+expert dispatch, shared-expert path, and the final residual add. The HIP
+kernel's parity test reads the JSON this script emits and compares its own
 intermediates point for point.
+
+`--int4` switches into INT4 mode: the five projection weights that the
+INT4 bake quantizes (`gate_up_proj`, `down_proj`, and the shared expert's
+`gate_proj`/`up_proj`/`down_proj`) are min/max group-quantized at gs=128
+with BF16 scale + zero. The `weights` block then carries the BF16-rounded
+*reconstruction* of those tensors (so the existing BF16 kernel path is
+still exercised) and a parallel `int4_weights` block carries the packed
+nibbles + scale + zero sidecars the INT4 kernel path will read. Schema
+becomes `qwen36-moe-oracle-ffn-int4-v1`.
+
+The INT4 quantization mirrors `oracle/bake_int4.py::fused_expert_minmax_int4_packed`
+exactly so reconstructions are byte-identical with what the runtime
+loader hands the kernel.
 
 The MoE FFN block on Qwen3-Next (35B-A3B):
 
@@ -80,6 +93,170 @@ def b64_i32(t: torch.Tensor) -> str:
     return base64.b64encode(
         t.to(torch.int32).contiguous().cpu().numpy().tobytes()
     ).decode()
+
+
+def b64_u8(t: torch.Tensor) -> str:
+    return base64.b64encode(
+        t.to(torch.uint8).contiguous().cpu().numpy().tobytes()
+    ).decode()
+
+
+# Tensors the INT4 bake quantizes for the FFN block. The router (`gate_w`)
+# and the scalar shared-expert gate (`shared_expert_gate_w`) stay BF16 — the
+# weight accountant in `crates/qwen36_moe/src/weights.rs` excludes them from
+# the INT4 budget for the same reason.
+INT4_FFN_TARGETS: tuple[str, ...] = (
+    "gate_up_proj_w",
+    "down_proj_w",
+    "shared_gate_proj_w",
+    "shared_up_proj_w",
+    "shared_down_proj_w",
+)
+
+
+@torch.no_grad()
+def minmax_int4_packed_and_recon(
+    W: torch.Tensor, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Min/max INT4 group-quant for a tensor whose last two axes are
+    `[out, in]`. Leading axes (e.g. the per-layer expert axis) are
+    preserved. Mirrors `bake_int4.py::fused_expert_minmax_int4_packed` for
+    3D fused-expert tensors and the equivalent 2D layout the bake produces
+    for dense projections (after collapsing GPTQ to plain min/max — group
+    size and storage layout are the same).
+
+    Returns (all on CPU except `recon`, which stays on `W.device` so it can
+    be reinjected as the BF16 weight value the BF16 kernel path reads):
+
+      packed   uint8  shape `[..., out, in/2]`     two nibbles per byte,
+                                                    even col → low nibble.
+      scale    f32    shape `[..., out/gs, in/gs]` BF16 values stored as f32.
+      zero     f32    shape `[..., out/gs, in/gs]` BF16 values stored as f32.
+      recon    bf16   shape `[..., out, in]`        single-rounding
+                                                    `bf16(q*s - z*s)` —
+                                                    matches the kernel's
+                                                    `bf16_round_rne_f32_finite(
+                                                       n*s - zs)` exactly.
+    """
+    if W.dim() < 2:
+        raise ValueError(f"expected 2+ dim, got shape {tuple(W.shape)}")
+    out_f, in_f = W.shape[-2], W.shape[-1]
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(
+            f"out_features {out_f} must be divisible by group_size={gs}"
+        )
+    sr = out_f // gs
+    sc = in_f // gs
+    leading = tuple(W.shape[:-2])
+    Wf = W.reshape(-1, out_f, in_f).to(torch.float32)
+    n_slabs = Wf.shape[0]
+
+    packed_buf = torch.empty((n_slabs, out_f, in_f // 2), dtype=torch.uint8)
+    scale_buf = torch.empty((n_slabs, sr, sc), dtype=torch.float32)
+    zero_buf = torch.empty((n_slabs, sr, sc), dtype=torch.float32)
+    recon_buf = torch.empty((n_slabs, out_f, in_f),
+                            dtype=torch.bfloat16, device=W.device)
+
+    for i in range(n_slabs):
+        slab = Wf[i]
+        tiles = slab.reshape(sr, gs, sc, gs)
+        tmax = tiles.amax(dim=(1, 3))
+        tmin = tiles.amin(dim=(1, 3))
+        rng = tmax - tmin
+        s = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
+        z = torch.where(rng > 0, -tmin / s, torch.zeros_like(rng))
+        # Round through BF16 — sidecars are stored BF16 in the bake and
+        # the kernel reads BF16 scale/zero.
+        s = s.to(torch.bfloat16).to(torch.float32)
+        z = z.to(torch.bfloat16).to(torch.float32)
+        s_full = s.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+        z_full = z.repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+        q = torch.clamp(
+            torch.round(slab / s_full + z_full), 0.0, 15.0
+        ).to(torch.uint8)
+        # Single-rounding reconstruction: bf16(q*s - z*s). The kernel
+        # computes `bf16(n*s - zs)` with `zs = z*s` precomputed in F32, so
+        # the rounding boundary is identical.
+        recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
+        # Pack 2 nibbles/byte: even col → low, odd col → high. Same
+        # convention as the runtime loader and `int4_dequant_8`.
+        packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
+
+        packed_buf[i] = packed.cpu()
+        scale_buf[i] = s.cpu()
+        zero_buf[i] = z.cpu()
+        recon_buf[i] = recon
+
+    packed_buf = packed_buf.reshape(leading + (out_f, in_f // 2))
+    scale_buf = scale_buf.reshape(leading + (sr, sc))
+    zero_buf = zero_buf.reshape(leading + (sr, sc))
+    recon_buf = recon_buf.reshape(leading + (out_f, in_f))
+    return packed_buf, scale_buf, zero_buf, recon_buf
+
+
+@torch.no_grad()
+def dequant_int4_packed(
+    packed: torch.Tensor,
+    scale: torch.Tensor,
+    zero: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """Reference dequant — inverse of `minmax_int4_packed_and_recon`. Used
+    for the in-process self-check below. Returns BF16 values as F32."""
+    out_f = packed.shape[-2]
+    in_half = packed.shape[-1]
+    in_f = in_half * 2
+    gs = group_size
+    leading = tuple(packed.shape[:-2])
+    pf = packed.reshape(-1, out_f, in_half)
+    sf = scale.reshape(-1, out_f // gs, in_f // gs)
+    zf = zero.reshape(-1, out_f // gs, in_f // gs)
+    n = pf.shape[0]
+    out = torch.empty((n, out_f, in_f), dtype=torch.float32)
+    for i in range(n):
+        q = torch.empty((out_f, in_f), dtype=torch.uint8)
+        q[:, 0::2] = pf[i] & 0x0F
+        q[:, 1::2] = (pf[i] >> 4) & 0x0F
+        s_full = sf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+        z_full = zf[i].repeat_interleave(gs, 0).repeat_interleave(gs, 1)
+        recon = (q.to(torch.float32) * s_full - z_full * s_full).to(torch.bfloat16)
+        out[i] = recon.to(torch.float32)
+    return out.reshape(leading + (out_f, in_f))
+
+
+def quantize_int4_ffn_weights(
+    weights: dict[str, torch.Tensor], group_size: int
+) -> dict[str, dict[str, torch.Tensor]]:
+    """Quantize the INT4-targeted FFN weights in-place: replace each entry
+    in `weights` with its BF16 reconstruction (cast to that weight's
+    original dtype + device). Return a parallel dict of
+    `{name: {"packed", "scale", "zero"}}` sidecars on CPU."""
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] = {}
+    for name in INT4_FFN_TARGETS:
+        if name not in weights:
+            raise SystemExit(f"INT4 mode missing required weight: {name}")
+        W = weights[name]
+        packed, scale, zero, recon = minmax_int4_packed_and_recon(W, group_size)
+
+        # In-process self-check: verify (packed, scale, zero) round-trips
+        # to exactly `recon`. Catches packing bugs before the kernel ever
+        # sees the JSON.
+        recon_check = dequant_int4_packed(packed, scale, zero, group_size)
+        diff = (recon.to(torch.float32).cpu() - recon_check).abs().max().item()
+        if diff != 0.0:
+            raise RuntimeError(
+                f"INT4 self-check failed for {name}: "
+                f"max |recon - dequant(packed)| = {diff:.3e}"
+            )
+
+        int4_sidecars[name] = {"packed": packed, "scale": scale, "zero": zero}
+        weights[name] = recon.to(dtype=W.dtype, device=W.device)
+    return int4_sidecars
 
 
 def find_shard_for(model_dir: Path, name: str) -> Path:
@@ -298,6 +475,17 @@ def parse_args() -> argparse.Namespace:
                         "35B-A3B but kept separate in case future configs differ)")
     p.add_argument("--top-k", type=int, default=8)
     p.add_argument("--rms-norm-eps", type=float, default=1e-6)
+    p.add_argument("--int4", action="store_true",
+                   help="Quantize the fused-expert and shared-expert MLP "
+                        "weights to INT4 (min/max group-quant). The `weights` "
+                        "block carries the BF16 reconstruction; an additional "
+                        "`int4_weights` block carries (packed, scale, zero) "
+                        "sidecars for the kernel's INT4 path. Schema becomes "
+                        "`qwen36-moe-oracle-ffn-int4-v1`.")
+    p.add_argument("--int4-group-size", type=int, default=128,
+                   help="Group size for INT4 min/max quant. Must divide "
+                        "out_features and in_features of every quantized "
+                        "tensor. The runtime + bake both pin to 128.")
     return p.parse_args()
 
 
@@ -332,6 +520,13 @@ def main() -> None:
 
     weights = {k: v.to(args.device) for k, v in weights.items()}
 
+    int4_sidecars: dict[str, dict[str, torch.Tensor]] | None = None
+    if args.int4:
+        # Quantize before computing intermediates so the reference uses the
+        # same BF16-reconstructed weights the kernel will see — intermediates
+        # are then valid for both the BF16 and INT4 kernel paths.
+        int4_sidecars = quantize_int4_ffn_weights(weights, args.int4_group_size)
+
     intermediates = reference_moe_ffn_block(
         num_experts=args.num_experts,
         moe_intermediate=args.moe_intermediate,
@@ -353,22 +548,36 @@ def main() -> None:
         else:
             enc_intermediates[k] = encode(v)
 
+    config = {
+        "hidden": args.hidden,
+        "num_experts": args.num_experts,
+        "moe_intermediate": args.moe_intermediate,
+        "shared_intermediate": args.shared_intermediate,
+        "top_k": args.top_k,
+        "rms_norm_eps": args.rms_norm_eps,
+    }
+    if args.int4:
+        config["int4_group_size"] = args.int4_group_size
+
     out = {
-        "schema": "qwen36-moe-oracle-ffn-v1",
+        "schema": ("qwen36-moe-oracle-ffn-int4-v1"
+                   if args.int4 else "qwen36-moe-oracle-ffn-v1"),
         "mode": args.mode,
         "layer_idx": args.layer_idx,
         "dtype": args.dtype,
-        "config": {
-            "hidden": args.hidden,
-            "num_experts": args.num_experts,
-            "moe_intermediate": args.moe_intermediate,
-            "shared_intermediate": args.shared_intermediate,
-            "top_k": args.top_k,
-            "rms_norm_eps": args.rms_norm_eps,
-        },
+        "config": config,
         "weights": enc_weights,
         "intermediates": enc_intermediates,
     }
+    if int4_sidecars is not None:
+        out["int4_weights"] = {
+            name: {
+                "packed": b64_u8(t["packed"]),
+                "scale": b64_bf16(t["scale"]),
+                "zero": b64_bf16(t["zero"]),
+            }
+            for name, t in int4_sidecars.items()
+        }
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(out))
 
@@ -377,8 +586,9 @@ def main() -> None:
     delta = (intermediates["output_hidden"] - weights["input_hidden"]
              ).to(torch.float32).norm().item()
     selected = intermediates["topk_idx"].tolist()
+    int4_tag = "int4" if args.int4 else "bf16-w"
     sys.stderr.write(
-        f"[oracle-ffn] layer={args.layer_idx} mode={args.mode} "
+        f"[oracle-ffn] layer={args.layer_idx} mode={args.mode} weights={int4_tag} "
         f"|input|={in_norm:.4f} |output|={out_norm:.4f} |delta|={delta:.4f} "
         f"top_k={selected}\n"
     )
