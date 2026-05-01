@@ -693,10 +693,23 @@ pub fn run(
     println!();
     println!("=== Decode (PR 4c step 2: host-orchestrated chained launches) ===");
     let token = decode_first_token(&cli.model_dir, &report)?;
-    println!("First decoded token id: {token}");
+    let tokenizer_path = cli.model_dir.join("tokenizer.json");
+    match crate::load_tokenizer(&tokenizer_path) {
+        Ok(tok) => match tok.decode(&[token], false) {
+            Ok(text) => println!("First decoded token: id={token}  text={text:?}"),
+            Err(e) => {
+                println!("First decoded token id: {token}");
+                println!("  (tokenizer decode failed: {e})");
+            }
+        },
+        Err(e) => {
+            println!("First decoded token id: {token}");
+            println!("  (tokenizer not loadable from {}: {e})", tokenizer_path.display());
+        }
+    }
     println!(
-        "(Note: fresh state, single token, raw vocab id. KV-cache extension, \
-         tokenizer, and GPU-side lm_head land in PR 4d.)"
+        "(Note: fresh state, single token. Multi-token + prompt-driven \
+         generation + GPU-side lm_head land in PR 4d.)"
     );
     Ok(())
 }
