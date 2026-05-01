@@ -3840,6 +3840,206 @@ mod tests {
         );
     }
 
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_ffn_step_3_expert0_int4_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_ffn_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_FFN_ORACLE_JSON not set. \
+                 See `qwen36_moe_ffn_step_2_shared_out_int4_matches_oracle` for setup."
+            );
+            return;
+        };
+        if !ffn_oracle_is_int4(&json) {
+            eprintln!(
+                "skip: oracle JSON is not INT4 (schema={}). Generate one with \
+                 `--int4` to exercise this test.",
+                json["schema"].as_str().unwrap_or("?"),
+            );
+            return;
+        }
+        let cfg = &json["config"];
+        let group_size = cfg["int4_group_size"].as_i64().unwrap_or(0) as i32;
+        assert!(group_size > 0, "INT4 oracle missing config.int4_group_size");
+
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Stage 3 needs everything stage 2 needed plus the fused gate_up_proj.
+        // gate_up_proj routes through INT4 (step 4 wires Phase G); down_proj
+        // stays BF16 in this test until step 5 lands. The oracle's BF16
+        // reconstruction for down_proj is in `weights.down_proj_w`.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
+        let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
+        let down_proj_w_bytes = b64_decode(weights["down_proj_w"].as_str().unwrap());
+        let shared_expert_gate_w_bytes =
+            b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
+
+        let (gup_packed, gup_scale, gup_zero) =
+            decode_int4_sidecar(&json, "gate_up_proj_w");
+        let (sgp_packed, sgp_scale, sgp_zero) =
+            decode_int4_sidecar(&json, "shared_gate_proj_w");
+        let (sup_packed, sup_scale, sup_zero) =
+            decode_int4_sidecar(&json, "shared_up_proj_w");
+        let (sdp_packed, sdp_scale, sdp_zero) =
+            decode_int4_sidecar(&json, "shared_down_proj_w");
+
+        let expert_stack_expected = b64_decode(inters["expert_stack"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let e_us = geom.num_experts as usize;
+        let i_us = geom.moe_intermediate as usize;
+        let is_us = geom.shared_intermediate as usize;
+        let k_us = geom.top_k as usize;
+        let gsz_us = group_size as usize;
+        let two_i = 2 * i_us;
+
+        // Sanity: fused-expert packed shape is [E, 2*I, hidden/2].
+        assert_eq!(gup_packed.len(), e_us * two_i * (hidden_us / 2),
+            "gate_up_proj packed bytes mismatch");
+        assert_eq!(gup_scale.len(),
+            e_us * (two_i / gsz_us) * (hidden_us / gsz_us) * 2,
+            "gate_up_proj scale bytes mismatch");
+        assert_eq!(down_proj_w_bytes.len(), e_us * hidden_us * i_us * 2,
+            "down_proj BF16 bytes mismatch");
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let post_attn_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
+        ).expect("upload post_attn_norm_w");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
+        ).expect("upload gate_w");
+        let down_proj_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16,
+            &[e_us, hidden_us, i_us], &down_proj_w_bytes,
+        ).expect("upload down_proj_w");
+        let shared_expert_gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
+        ).expect("upload shared_expert_gate_w");
+
+        let gup_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[gup_packed.len()], &gup_packed,
+        ).expect("upload gup packed");
+        let gup_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[gup_scale.len() / 2], &gup_scale,
+        ).expect("upload gup scale");
+        let gup_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[gup_zero.len() / 2], &gup_zero,
+        ).expect("upload gup zero");
+
+        let sgp_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed,
+        ).expect("upload sgp packed");
+        let sgp_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sgp_scale.len() / 2], &sgp_scale,
+        ).expect("upload sgp scale");
+        let sgp_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero,
+        ).expect("upload sgp zero");
+        let sup_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed,
+        ).expect("upload sup packed");
+        let sup_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sup_scale.len() / 2], &sup_scale,
+        ).expect("upload sup scale");
+        let sup_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero,
+        ).expect("upload sup zero");
+        let sdp_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed,
+        ).expect("upload sdp packed");
+        let sdp_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sdp_scale.len() / 2], &sdp_scale,
+        ).expect("upload sdp scale");
+        let sdp_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero,
+        ).expect("upload sdp zero");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
+        ).expect("alloc output");
+        let mut output_idx = GpuBuffer::zeros(
+            ordinal, ScalarType::U32, &[k_us],
+        ).expect("alloc output_idx");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 3,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: post_attn_norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: gup_packed_buf.as_ptr(),  // packed u8 — INT4 path
+            down_proj_w: down_proj_w.as_ptr(),         // BF16 reconstruction
+            shared_gate_proj_w: sgp_packed_buf.as_ptr(),
+            shared_up_proj_w: sup_packed_buf.as_ptr(),
+            shared_down_proj_w: sdp_packed_buf.as_ptr(),
+            shared_expert_gate_w: shared_expert_gate_w.as_ptr(),
+        };
+        let int4_ptrs = Qwen36MoeFfnStepInt4 {
+            group_size,
+            gate_up_proj_scale: gup_scale_buf.as_ptr(),
+            gate_up_proj_zero: gup_zero_buf.as_ptr(),
+            // down_proj stays BF16 until step 5 wires Phase I.
+            down_proj_scale: std::ptr::null(),
+            down_proj_zero: std::ptr::null(),
+            shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
+            shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_scale: sup_scale_buf.as_ptr(),
+            shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_scale: sdp_scale_buf.as_ptr(),
+            shared_down_proj_zero: sdp_zero_buf.as_ptr(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &int4_ptrs,
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("ffn_step_launch stage 3 (int4)");
+
+        // Stage 3 publishes expert_0_out (BF16-cast view of the F32 stack)
+        // into output[0..hidden]. Compare against `intermediates.expert_stack`
+        // restricted to slot j=0.
+        let got_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_full[..hidden_us * 2];
+        let expected_bytes = &expert_stack_expected[..hidden_us * 2];
+        assert_parity(
+            "ffn step3 int4 expert_0_out",
+            got_bytes,
+            expected_bytes,
+            0.05,
+            0.999,
+        );
+    }
+
     // -------------------------------------------------------------------
     // PR 4b5 step 2: INT4 dequant smoke test.
     //
