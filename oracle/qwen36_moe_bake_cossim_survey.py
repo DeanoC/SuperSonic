@@ -16,7 +16,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Callable
 
 import torch
 from safetensors import safe_open
@@ -27,12 +26,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _bake_loader import load_int4, load_int4_3d  # noqa: E402
 
 
+class TensorAbsent(Exception):
+    """Raised when a tensor name is legitimately absent for this layer
+    type (e.g. asking for `self_attn.q_proj` on a linear-attention
+    layer). Distinguishes legit-absent from real corruption (tensor is
+    expected but missing from one side, or shape mismatch) so the
+    caller can skip the former and surface the latter."""
+
+
 def find_shard_for(model_dir: Path, name: str) -> Path:
     idx_path = model_dir / "model.safetensors.index.json"
     if idx_path.exists():
         wm = json.loads(idx_path.read_text())["weight_map"]
         if name not in wm:
-            raise SystemExit(f"tensor not in safetensors index: {name}")
+            raise TensorAbsent(f"tensor not in safetensors index: {name}")
         return model_dir / wm[name]
     single = model_dir / "model.safetensors"
     if single.exists():
@@ -61,8 +68,19 @@ def cos_sim_2d(recon: torch.Tensor, ref: torch.Tensor) -> float:
 def survey_dense(
     bake_dir: str, model_dir: Path, name: str
 ) -> tuple[tuple[int, ...], int, float]:
+    """Returns (shape, tiles, cos_sim).
+
+    Raises `TensorAbsent` when the tensor is legitimately not present
+    for this layer type (caller should skip silently). Any other
+    failure — bake missing a tensor that safetensors has, shape
+    mismatch, dequant error — propagates to surface real corruption.
+    """
+    # Safetensors is the source of truth for "does this tensor exist
+    # for this layer type". Probe there first; if absent, it's a legit
+    # layer-type miss and the caller should skip. If present, anything
+    # below this point that fails is a real error.
+    ref = load_safetensors(model_dir, name)  # raises TensorAbsent
     recon, _packed, _s, _z = load_int4(bake_dir, name)
-    ref = load_safetensors(model_dir, name)
     if recon.shape != ref.shape:
         raise SystemExit(
             f"{name}: shape mismatch recon {tuple(recon.shape)} vs "
@@ -76,9 +94,13 @@ def survey_dense(
 def survey_fused(
     bake_dir: str, model_dir: Path, name: str
 ) -> tuple[tuple[int, ...], int, float, float, float]:
-    """Returns (shape, tiles_per_expert, mean cos_sim, min, max)."""
+    """Returns (shape, tiles_per_expert, mean cos_sim, min, max).
+
+    Same failure-mode contract as `survey_dense`: `TensorAbsent` for
+    legit layer-type miss; everything else propagates.
+    """
+    ref = load_safetensors(model_dir, name)  # raises TensorAbsent
     recon, _packed, _s, _z = load_int4_3d(bake_dir, name)
-    ref = load_safetensors(model_dir, name)
     if recon.shape != ref.shape:
         raise SystemExit(
             f"{name}: shape mismatch recon {tuple(recon.shape)} vs "
@@ -113,10 +135,14 @@ def main() -> None:
     rows: list[tuple[str, str, str, float, float, float]] = []  # (name, shape, tiles, mean, min, max)
 
     def add_dense(name: str) -> None:
+        # Only TensorAbsent is "expected miss for this layer type" — any
+        # other exception (KeyError from a bake manifest miss when the
+        # tensor IS in safetensors, SystemExit from a shape mismatch,
+        # dequant error) is real corruption and must surface.
         try:
             shape, tiles, cs = survey_dense(bake_dir, args.model_dir, name)
-        except (SystemExit, KeyError) as e:
-            return  # tensor doesn't exist for this layer type — quiet skip.
+        except TensorAbsent:
+            return
         rows.append((name, str(shape), str(tiles), cs, cs, cs))
 
     def add_fused(name: str) -> None:
@@ -124,7 +150,7 @@ def main() -> None:
             shape, tiles, cs_mean, cs_min, cs_max = survey_fused(
                 bake_dir, args.model_dir, name
             )
-        except (SystemExit, KeyError):
+        except TensorAbsent:
             return
         rows.append((name, str(shape), f"{tiles}/expert", cs_mean, cs_min, cs_max))
 
