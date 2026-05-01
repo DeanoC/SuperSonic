@@ -2605,4 +2605,107 @@ __global__ void int4_dequant_smoke_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Final RMSNorm + lm_head GEMV in a single kernel — replaces the host-side
+// path in `qwen36_moe_decode::host_final_norm_lm_head_f32`.
+//
+// On 35B-A3B the host F32 GEMV at [vocab=248320, hidden=2048] dominated the
+// per-token wall-clock (233 ms of 360 ms in the local greedy benchmark; see
+// PR #68's stage-timings output). Lifting it to the GPU eliminates the F32
+// fan-out of the lm_head matrix (previously 970 MiB → 1.94 GiB at startup +
+// per-token streaming through the host LLC) and the per-token CPU work.
+//
+// Math (matches `host_final_norm_lm_head_f32` byte-for-byte through the
+// BF16 rounding boundary):
+//
+//   inv_rms     = rsqrt(mean(x_i^2) + eps)               # F32 reduction
+//   x_normed[i] = bf16(x_i * inv_rms * (1.0 + final_norm_w[i]))   # `(1+w)`
+//   logits[v]   = bf16(sum_i(lm_head_w[v, i] * x_normed[i]))
+//
+// LDS layout (matches the attn/linear/ffn step kernels):
+//   lds[0,                 block_size):  shared_scratch (block reduction)
+//   lds[block_size,        block_size + hidden):  x_norm_lds (F32 view of
+//                                                  BF16-rounded normed hidden)
+//   Total = (block_size + hidden) * 4 bytes = (256 + 2048) * 4 = 9 KiB on
+//   35B-A3B. Same budget as the attn kernel; ≥2 WGs/CU on gfx1100.
+//
+// Block strategy: each block computes the RMSNorm into its own LDS
+// (redundant across blocks — cheap, ~few µs for hidden=2048 — but lets the
+// matvec read x_norm from LDS instead of global memory). Then a
+// work-stealing loop assigns vocab rows to blocks via an atomic counter.
+// Each block fully reduces one row before grabbing the next.
+//
+// `counter` is a `[1] u32` device buffer; the host must memset it to 0
+// before each launch.
+template <typename T>
+__global__ void qwen36_moe_lm_head_kernel(
+    const T*               __restrict__ final_hidden,    // [hidden] BF16
+    const T*               __restrict__ final_norm_w,    // [hidden] BF16
+    const T*               __restrict__ lm_head_w,       // [vocab, hidden] BF16
+    T*                     __restrict__ logits,          // [vocab] BF16
+    unsigned int*          __restrict__ counter,         // [1] u32
+    int                                  hidden,
+    int                                  vocab,
+    float                                rms_norm_eps) {
+    const int tid = threadIdx.x;
+    const int block_size = blockDim.x;
+    extern __shared__ unsigned char lds_raw[];
+    float* shared_scratch = reinterpret_cast<float*>(lds_raw);
+    float* x_norm_lds     = shared_scratch + block_size;
+
+    // -- Phase A: per-block RMSNorm of final_hidden into LDS ---------------
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        const float v = load_as_float<T>(final_hidden, col);
+        x_norm_lds[col] = v;
+        partial_sq += v * v;
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // Apply `(1.0 + w)` HF Qwen3_5MoeRMSNorm unit offset, BF16-round each
+    // x_normed element so the matmul reads what PyTorch reads.
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = load_as_float<T>(final_norm_w, col);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms * (1.0f + w));
+    }
+    __syncthreads();
+
+    // -- Phase B: work-stealing matvec across vocab rows -------------------
+    for (;;) {
+        __shared__ unsigned int my_row_s;
+        if (tid == 0) {
+            my_row_s = atomicAdd(counter, 1u);
+        }
+        __syncthreads();
+        const int my_row = static_cast<int>(my_row_s);
+        if (my_row >= vocab) break;
+
+        const T* w_row = lm_head_w + static_cast<size_t>(my_row) * hidden;
+        float partial = 0.0f;
+        for (int col = tid; col < hidden; col += block_size) {
+            partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+        }
+        shared_scratch[tid] = partial;
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            logits[my_row] = static_cast<T>(bf16_round_rne_f32(shared_scratch[0]));
+        }
+        __syncthreads();
+    }
+}
+
 } // namespace qwen36_moe

@@ -1108,26 +1108,50 @@ fn decode_text(
         layers.push(layer);
     }
 
-    // Cache final_norm + dequantized lm_head once. Both are ≥1 GiB BF16
-    // for 35B-A3B; reusing the cached buffers across decode steps avoids
-    // redoing the ~1 second INT4 dequant per token. Convert to F32 once
-    // here too — the BF16→F32 fan-out of the lm_head matrix (~970 MiB →
-    // ~2 GiB) was previously dominating per-token latency in the host-
-    // side GEMV path; the F32 view is reused for every generated token.
+    // Upload final_norm + dequantized lm_head to the GPU once. The
+    // GPU lm_head kernel (`qwen36_moe::lm_head_launch`) does
+    // RMSNorm + GEMV in BF16 in one shot, replacing the previous
+    // host-side F32 GEMV that dominated per-token wall-clock at
+    // ~233 ms / 360 ms total on 35B-A3B greedy decode (PR #68
+    // stage-timings).
+    //
+    // VRAM cost: ~970 MiB for lm_head BF16 + 4 KiB for final_norm +
+    // 500 KiB for the logits buffer. Comfortably within the 24 GiB
+    // budget alongside the 17 GiB INT4 weight bake.
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
         .context("load final norm")?;
     let lm_head_bf16_bytes = load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
-        .context("prepare host-side lm_head BF16 buffer")?;
-    let final_norm_f32 = bf16_bytes_to_f32(&final_norm_bytes);
-    let lm_head_f32 = bf16_bytes_to_f32(&lm_head_bf16_bytes);
+        .context("prepare lm_head BF16 buffer")?;
     println!(
-        "  cached lm_head BF16 ({:.1} MiB → F32 {:.1} MiB) and final norm ({:.1} KiB).",
+        "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
         lm_head_bf16_bytes.len() as f64 / MIB,
-        (lm_head_f32.len() * 4) as f64 / MIB,
         final_norm_bytes.len() as f64 / 1024.0,
     );
-    // Drop the BF16 buffer once the F32 view is built — engine doesn't
-    // need it after this point and the 970 MiB allocation is non-trivial.
+    let final_norm_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &final_norm_bytes,
+    )
+    .context("upload final_norm_w to GPU")?;
+    let lm_head_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.vocab as usize, geom.hidden as usize],
+        &lm_head_bf16_bytes,
+    )
+    .context("upload lm_head BF16 to GPU")?;
+    let mut logits_buf = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.vocab as usize],
+    )
+    .context("alloc logits_buf on GPU")?;
+    let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .context("alloc lm_head counter_buf on GPU")?;
+    let mut final_hidden_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
+            .context("alloc final_hidden_buf on GPU")?;
     drop(lm_head_bf16_bytes);
     drop(final_norm_bytes);
 
@@ -1211,16 +1235,35 @@ fn decode_text(
             );
         }
 
-        // Generation step: final_norm + lm_head GEMV (host F32, cached).
+        // Generation step: final_norm + lm_head GEMV on the GPU
+        // (`kernel_ffi::qwen36_moe::lm_head_launch`). H2D the freshly
+        // produced final_hidden into the persistent `final_hidden_buf`
+        // — `run_chained_decode` already D2H'd it for diagnostics; the
+        // re-upload is ~4 KB, microseconds at PCIe Gen4 speeds — then
+        // launch the kernel + D2H the BF16 logits.
         let t2 = std::time::Instant::now();
-        let logits = host_final_norm_lm_head_f32(
-            &outputs.final_hidden_bytes,
-            &final_norm_f32,
-            &lm_head_f32,
-            geom.hidden as usize,
-            geom.vocab as usize,
+        gpu_hal::copy_h2d(
+            ordinal,
+            final_hidden_buf.as_mut_ptr(),
+            outputs.final_hidden_bytes.as_ptr() as *const _,
+            outputs.final_hidden_bytes.len(),
+        )
+        .context("h2d final_hidden -> final_hidden_buf")?;
+        kernel_ffi::qwen36_moe::lm_head_launch(
+            ordinal,
+            geom.hidden,
+            geom.vocab,
             geom.rms_norm_eps,
-        );
+            &final_hidden_buf,
+            &final_norm_w_buf,
+            &lm_head_w_buf,
+            &mut logits_buf,
+            &mut counter_buf,
+        )
+        .context("gpu lm_head launch")?;
+        let logits = logits_buf
+            .to_host_bytes()
+            .context("d2h logits from GPU lm_head")?;
         let t_lm_head_step = t2.elapsed();
         if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
             std::fs::write(&dump_path, &logits)
