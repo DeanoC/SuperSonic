@@ -281,14 +281,29 @@ def load_tensor(model_dir: Path, name: str, device: str = "cpu") -> torch.Tensor
 # ---------------------------------------------------------------------------
 # Math primitives — kept structurally identical to what the kernel will do
 # ---------------------------------------------------------------------------
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMS norm without add-unit-offset. F32 internals, output in input dtype.
-    Matches the attention oracle's `rms_norm` byte-for-byte so the kernel can
-    reuse the same implementation across the attn + FFN halves of a layer."""
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = True,
+) -> torch.Tensor:
+    """RMS norm with the HuggingFace `Qwen3_5MoeRMSNorm` convention.
+    F32 internals, output in input dtype. Matches the attention oracle's
+    `rms_norm` byte-for-byte so the kernel can reuse the same implementation
+    across the attn + FFN halves of a layer.
+
+    `add_unit_offset=True` (default) matches HuggingFace
+    `Qwen3_5MoeRMSNorm`: `output = x_normed * (1.0 + weight)`. Used for
+    `post_attention_layernorm`. The FFN block has no gated-norm site so
+    the parameter is passive here, kept for parity with the attn/linear
+    oracles.
+    """
     in_dtype = x.dtype
     xf = x.to(torch.float32)
     var = xf.pow(2).mean(dim=-1, keepdim=True)
-    out = xf * torch.rsqrt(var + eps) * weight.to(torch.float32)
+    w_f = weight.to(torch.float32)
+    scale = (1.0 + w_f) if add_unit_offset else w_f
+    out = xf * torch.rsqrt(var + eps) * scale
     return out.to(in_dtype)
 
 

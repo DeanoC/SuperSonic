@@ -744,9 +744,15 @@ pub fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
 
 /// Apply RMSnorm + lm_head GEMV on the host. Mirrors the multi-layer
 /// oracle's tail:
-///   final_normed = rms_norm(hidden, final_norm_w, eps)
+///   final_normed = rms_norm(hidden, final_norm_w, eps)   # (1+w) offset
 ///   logits       = final_normed.to(F32) @ lm_head_w.to(F32).T
 ///   logits       = logits.to(BF16)
+///
+/// The RMSnorm uses the HuggingFace `Qwen3_5MoeRMSNorm` convention with
+/// the `(1.0 + weight)` unit offset — `model.norm` in the HF text model
+/// (line 1354 of `transformers/models/qwen3_5_moe/modeling_qwen3_5_moe.py`)
+/// is an instance of `Qwen3_5MoeRMSNorm` whose forward computes
+/// `output * (1.0 + self.weight.float())`.
 ///
 /// All inputs are BF16 little-endian byte streams; output is BF16
 /// little-endian bytes for `vocab` logit channels.
@@ -794,14 +800,18 @@ pub fn host_final_norm_lm_head_f32(
 
     let h_f32 = bf16_bytes_to_f32(hidden_bytes);
 
-    // RMSnorm: F32 mean of squares -> rsqrt(var+eps) -> elementwise mul by w.
+    // RMSnorm with the HF `Qwen3_5MoeRMSNorm` convention: F32 mean of
+    // squares -> rsqrt(var+eps) -> elementwise mul by `(1.0 + w)`. The
+    // stored weight is a small delta around zero (initialized to zeros
+    // in HF — line 810 of modeling_qwen3_5_moe.py) and the effective
+    // scale factor is `1 + w`.
     let mean_sq: f32 =
         h_f32.iter().map(|&x| x * x).sum::<f32>() / hidden as f32;
     let rsqrt = 1.0 / (mean_sq + eps).sqrt();
     let normed: Vec<f32> = h_f32
         .iter()
         .zip(final_norm_w_f32.iter())
-        .map(|(&x, &w)| x * rsqrt * w)
+        .map(|(&x, &w)| x * rsqrt * (1.0 + w))
         .collect();
 
     // GEMV: lm_head [vocab, hidden] @ normed [hidden] -> logits [vocab].
@@ -1016,14 +1026,35 @@ mod tests {
 
     #[test]
     fn rms_norm_then_lm_head_matches_naive_computation() {
-        // Tiny hand-checked case. RMS-normalised (1, 2, 3) with norm_w=(1,1,1)
-        // and eps=0 has mean_sq=14/3 → rsqrt=sqrt(3/14). Times lm_head row
-        // [1, 0, 0] yields 1*sqrt(3/14) ≈ 0.4629. BF16 rounding is loose
-        // enough that we check within 1e-2.
+        // Tiny hand-checked case. RMS-normalised (1, 2, 3) has mean_sq=14/3
+        // → rsqrt=sqrt(3/14). With norm_w=(1,1,1) and the HF `(1+w)` unit
+        // offset, the effective scale per channel is 2. Times lm_head row
+        // [1, 0, 0] yields `1 * sqrt(3/14) * 2` ≈ 0.9258. BF16 rounding
+        // is loose enough that we check within 1e-2.
         let hidden = 3usize;
         let vocab = 1usize;
         let h_bytes = f32_to_bf16_bytes(&[1.0, 2.0, 3.0]);
         let w_bytes = f32_to_bf16_bytes(&[1.0, 1.0, 1.0]);
+        let lm_bytes = f32_to_bf16_bytes(&[1.0, 0.0, 0.0]);
+        let logits = host_final_norm_lm_head(&h_bytes, &w_bytes, &lm_bytes, hidden, vocab, 0.0);
+        let logit = bf16_bytes_to_f32(&logits)[0];
+        let expected = 2.0 * (3.0f32 / 14.0).sqrt();
+        assert!(
+            (logit - expected).abs() < 1e-2,
+            "logit {logit} far from expected {expected}"
+        );
+    }
+
+    #[test]
+    fn rms_norm_unit_offset_zero_weight_is_identity_scale() {
+        // With norm_w = zeros, the HF `(1+w)` convention degrades to
+        // a plain RMSnorm (effective scale = 1). Locks the offset in
+        // semantics — same input as the test above with weight=1 should
+        // give exactly half the logit when weight=0.
+        let hidden = 3usize;
+        let vocab = 1usize;
+        let h_bytes = f32_to_bf16_bytes(&[1.0, 2.0, 3.0]);
+        let w_bytes = f32_to_bf16_bytes(&[0.0, 0.0, 0.0]);
         let lm_bytes = f32_to_bf16_bytes(&[1.0, 0.0, 0.0]);
         let logits = host_final_norm_lm_head(&h_bytes, &w_bytes, &lm_bytes, hidden, vocab, 0.0);
         let logit = bf16_bytes_to_f32(&logits)[0];

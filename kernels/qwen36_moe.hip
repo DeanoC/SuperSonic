@@ -452,10 +452,12 @@ __global__ void qwen36_moe_attn_step_kernel(
     __syncthreads();
 
     // BF16-round each x_norm element so the matmul reads what PyTorch reads
-    // (its `out.to(in_dtype)` step in rms_norm).
+    // (its `out.to(in_dtype)` step in rms_norm). HF `Qwen3_5MoeRMSNorm`
+    // applies the `(1.0 + weight)` unit offset (line 819 of
+    // modeling_qwen3_5_moe.py); `input_layernorm` is one such instance.
     for (int col = tid; col < hidden; col += block_size) {
         const float w = load_as_float<T>(input_norm_w, col);
-        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * w);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * (1.0f + w));
     }
     __syncthreads();
 
@@ -565,7 +567,8 @@ __global__ void qwen36_moe_attn_step_kernel(
             for (int i = tid; i < d; i += block_size) {
                 const float v = workspace[OFF_Q_RAW + base + i];
                 const float wv = load_as_float<T>(q_norm_w, i);
-                const float normed = bf16_round_rne_f32(v * head_inv_rms * wv);
+                // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset.
+                const float normed = bf16_round_rne_f32(v * head_inv_rms * (1.0f + wv));
                 // Round-trip through BF16 representation: store BF16 in
                 // workspace as F32 so the next-stage RoPE reader sees the
                 // exact dtype-cast values PyTorch's `.to(bf16)` produces.
@@ -675,7 +678,8 @@ __global__ void qwen36_moe_attn_step_kernel(
             for (int i = tid; i < d; i += block_size) {
                 const float v = workspace[OFF_K_RAW + base + i];
                 const float wv = load_as_float<T>(k_norm_w, i);
-                const float normed = bf16_round_rne_f32(v * head_inv_rms * wv);
+                // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset.
+                const float normed = bf16_round_rne_f32(v * head_inv_rms * (1.0f + wv));
                 workspace[OFF_K_NORMED + base + i] = normed;
                 if (stage == 2) {
                     output[base + i] = static_cast<T>(normed);
@@ -1165,9 +1169,11 @@ __global__ void qwen36_moe_linear_step_kernel(
     }
     __syncthreads();
 
+    // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset for
+    // `input_layernorm` ahead of the linear-attn block.
     for (int col = tid; col < hidden; col += block_size) {
         const float w = static_cast<float>(input_norm_w[col]);
-        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * w);
+        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms_input * (1.0f + w));
     }
     __syncthreads();
 
@@ -1903,11 +1909,13 @@ __global__ void qwen36_moe_ffn_step_kernel(
     __syncthreads();
 
     // BF16-round each h_norm element so the matmul reads what PyTorch reads.
-    // Block 0 is also responsible for staging the F32 of-BF16 view into
-    // workspace[OFF_H_NORM] for any later stages that prefer global memory.
+    // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset for
+    // `post_attention_layernorm`. Block 0 also stages the F32 of-BF16 view
+    // into workspace[OFF_H_NORM] for any later stages that prefer global
+    // memory.
     for (int col = tid; col < hidden; col += block_size) {
         const float w = static_cast<float>(post_attn_norm_w[col]);
-        const float v = bf16_round_rne_f32(h_norm_lds[col] * inv_rms_input * w);
+        const float v = bf16_round_rne_f32(h_norm_lds[col] * inv_rms_input * (1.0f + w));
         h_norm_lds[col] = v;
         if (blockIdx.x == 0) {
             workspace[OFF_H_NORM + col] = v;

@@ -230,12 +230,30 @@ def load_tensor(model_dir: Path, name: str, device: str = "cpu") -> torch.Tensor
 # ---------------------------------------------------------------------------
 # Math primitives — kept structurally identical to what the kernel will do
 # ---------------------------------------------------------------------------
-def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """RMS norm without add-unit-offset. Computed in F32, output in input dtype."""
+def rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    add_unit_offset: bool = True,
+) -> torch.Tensor:
+    """RMS norm. Computed in F32, output in input dtype.
+
+    `add_unit_offset=True` matches HuggingFace `Qwen3_5MoeRMSNorm`:
+    `output = x_normed * (1.0 + weight)` — the stored weight is a small
+    delta around 0 and the effective scale is `1 + weight`. Used for
+    `input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`,
+    and the final `model.norm`.
+
+    `add_unit_offset=False` matches HuggingFace `Qwen3_5MoeRMSNormGated`
+    (no offset, plain `output = x_normed * weight`) — used for
+    `linear_attn.norm` only. Pass explicitly at that call site.
+    """
     in_dtype = x.dtype
     xf = x.to(torch.float32)
     var = xf.pow(2).mean(dim=-1, keepdim=True)
-    out = xf * torch.rsqrt(var + eps) * weight.to(torch.float32)
+    w_f = weight.to(torch.float32)
+    scale = (1.0 + w_f) if add_unit_offset else w_f
+    out = xf * torch.rsqrt(var + eps) * scale
     return out.to(in_dtype)
 
 
