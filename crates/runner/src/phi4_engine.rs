@@ -403,6 +403,7 @@ pub fn run_phi4(
     let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
     let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
     let debug_dump_direct_argmax = std::env::var("SUPERSONIC_PHI4_DUMP_DIRECT_ARGMAX").ok();
+    let cuda_argmax_f32_accum = std::env::var_os("SUPERSONIC_PHI4_CUDA_ARGMAX_F32ACCUM").is_some();
     let mut debug_logit_samples: Vec<serde_json::Value> = Vec::new();
     let mut debug_direct_argmax_samples: Vec<serde_json::Value> = Vec::new();
     let head_dim = config.head_dim();
@@ -658,16 +659,30 @@ pub fn run_phi4(
                 && oracle_output.is_none()
                 && debug_dump_logits.is_none();
             let (next, logits_f32) = if use_direct_cuda_argmax {
-                kernel_ffi::cuda_lm_head_argmax_bf16_f32accum(
-                    ordinal,
-                    &normed_buf,
-                    &*weights.lm_head,
-                    &mut lm_argmax_vals,
-                    &mut lm_argmax_idxs,
-                    &mut lm_argmax_out,
-                    hidden_size,
-                    config.vocab_size,
-                )
+                if cuda_argmax_f32_accum {
+                    kernel_ffi::cuda_lm_head_argmax_bf16_f32accum(
+                        ordinal,
+                        &normed_buf,
+                        &*weights.lm_head,
+                        &mut lm_argmax_vals,
+                        &mut lm_argmax_idxs,
+                        &mut lm_argmax_out,
+                        hidden_size,
+                        config.vocab_size,
+                    )
+                } else {
+                    // Match the materialized/HIP path: logits are BF16 before greedy argmax.
+                    kernel_ffi::cuda_lm_head_argmax_bf16(
+                        ordinal,
+                        &normed_buf,
+                        &*weights.lm_head,
+                        &mut lm_argmax_vals,
+                        &mut lm_argmax_idxs,
+                        &mut lm_argmax_out,
+                        hidden_size,
+                        config.vocab_size,
+                    )
+                }
                 .map_err(|e| anyhow!("lm_head argmax at step {step}: {e}"))?;
                 let idx_bytes = lm_argmax_out
                     .to_host_bytes()
