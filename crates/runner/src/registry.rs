@@ -454,7 +454,11 @@ static REGISTRY: &[RegistryEntry] = &[
             attn_scratch_floats: 16384,
             weight_prefix: "model.language_model",
             kv_chunk_size: 256,
-            use_4b_kernel: false,
+            // CUDA low-bit and KV-FP8 modes share the descriptor plumbing in
+            // the 4B-capable persistent kernel. The older dedicated 0.8B CUDA
+            // hero path remains available only as an opt-in fast BF16 route in
+            // main.rs when low-bit descriptors are absent.
+            use_4b_kernel: true,
         }),
     },
     RegistryEntry {

@@ -531,8 +531,8 @@ pub(crate) struct Cli {
     trace_oracle_prefill_layer: Option<usize>,
 
     /// Batch size for decode (number of sequences decoded in parallel).
-    /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
-    /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
+    /// Default 1. Supported on Qwen3.5 through the 4B-capable persistent
+    /// kernel and Gemma 4 BF16 + INT4 via per-family batched megakernels.
     #[arg(long, default_value = "1")]
     batch_size: usize,
 
@@ -1324,15 +1324,24 @@ fn main() -> Result<()> {
     }
 
     if backend == Backend::Cuda {
-        if cli.int4 {
-            anyhow::bail!("CUDA v1 does not support --int4 yet");
+        let qwen35_sm86 = matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_0_8B
+                | ModelVariant::Qwen3_5_2B
+                | ModelVariant::Qwen3_5_4B
+                | ModelVariant::Qwen3_5_9B
+        ) && entry.arch == GpuArch::Sm86;
+        if cli.int4 && !qwen35_sm86 {
+            anyhow::bail!("CUDA --int4 currently supports only Qwen3.5 on sm86");
         }
-        if cli.fp8_runtime && model_variant != ModelVariant::Qwen3_6_27B {
-            anyhow::bail!("CUDA --fp8-runtime currently supports only qwen3.6-27b on sm86");
+        if cli.fp8_runtime && !(qwen35_sm86 || model_variant == ModelVariant::Qwen3_6_27B) {
+            anyhow::bail!(
+                "CUDA --fp8-runtime currently supports only Qwen3.5 and qwen3.6-27b on sm86"
+            );
         }
         if cli.kv_fp8 {
-            if model_variant != ModelVariant::Qwen3_5_4B || gpu_arch != GpuArch::Sm86 {
-                anyhow::bail!("CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86");
+            if !qwen35_sm86 {
+                anyhow::bail!("CUDA --kv-fp8 currently supports only Qwen3.5 on sm86");
             }
             if env::var_os("SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR").is_none() {
                 env::set_var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW", "128");
@@ -1582,8 +1591,31 @@ fn main() -> Result<()> {
     }
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
+    let gpu_validate_enabled = cli.gpu_validate && cli.batch_size == 1;
+    if cli.gpu_validate && cli.batch_size > 1 {
+        eprintln!("[gpu-validate] GPU oracle disabled for batch_size > 1");
+    }
+    let cuda_08b_hero_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();
+    let cuda_08b_hero_candidate = backend == Backend::Cuda
+        && gpu_arch == GpuArch::Sm86
+        && model_variant == ModelVariant::Qwen3_5_0_8B
+        && cli.batch_size == 1
+        && !cli.validate
+        && !gpu_validate_enabled
+        && !cli.force_component_decode
+        && !cli.force_kernel_decode
+        && !cli.kv_fp8
+        && !weights.is_fp8
+        && !weights.is_int4
+        && !cuda_08b_hero_disabled;
+    // The sm86 registry entry advertises the 4B-capable path so low-bit and
+    // KV-FP8 descriptor plumbing is available. Plain 0.8B BF16 can still use
+    // the older dedicated CUDA hero path unless callers opt out or request a
+    // mode that needs the 4B descriptors.
+    let use_4b_kernel = params.use_4b_kernel && !cuda_08b_hero_candidate;
+
     // Validate batch_size
-    if cli.batch_size > 1 && !params.use_4b_kernel {
+    if cli.batch_size > 1 && !use_4b_kernel {
         anyhow::bail!("--batch-size > 1 requires 4B kernel (2B/4B/9B models)");
     }
     if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
@@ -1613,7 +1645,7 @@ fn main() -> Result<()> {
         params.proj_buf_floats,
         attn_scratch_floats,
         params.kv_chunk_size,
-        params.use_4b_kernel,
+        use_4b_kernel,
         cli.prefill_chunk_size,
         cli.kv_fp8,
         cli.batch_size,
@@ -1981,17 +2013,11 @@ fn main() -> Result<()> {
         engine.replicate_state_to_batch()?;
     }
 
-    let gpu_validate_enabled = if cli.gpu_validate && cli.batch_size == 1 {
+    if gpu_validate_enabled {
         eprintln!(
             "[gpu-validate] replaying full token history through GPU prefill for reference..."
         );
-        true
-    } else {
-        if cli.gpu_validate && cli.batch_size > 1 {
-            eprintln!("[gpu-validate] GPU oracle disabled for batch_size > 1");
-        }
-        false
-    };
+    }
     // Replay-prefill path used to be the default for 4B single-seq decode
     // (safety net for numerical-parity work during the CUDA sm86 bring-up)
     // but it scales O(N) per step with context length and was ~7x slower
@@ -2002,7 +2028,7 @@ fn main() -> Result<()> {
     let cuda_qwen2b_replay_default = backend == Backend::Cuda
         && model_variant == ModelVariant::Qwen3_5_2B
         && cli.batch_size == 1
-        && params.use_4b_kernel
+        && use_4b_kernel
         && !cli.kv_fp8
         && !cli.force_kernel_decode
         && !cli.force_component_decode;
@@ -2014,39 +2040,25 @@ fn main() -> Result<()> {
         && !cli.force_kernel_decode
         && !cli.force_component_decode
         && !cli.kv_fp8
-        && params.use_4b_kernel
+        && use_4b_kernel
         && (cli.force_replay_decode || cuda_qwen2b_replay_default);
     let replay_kv_fp8_enabled =
-        params.use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
+        use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
     let component_single_decode_enabled =
-        cli.batch_size == 1 && params.use_4b_kernel && cli.force_component_decode;
+        cli.batch_size == 1 && use_4b_kernel && cli.force_component_decode;
     // Use the batched persistent megakernel path (decode_step_batch with b=1)
     // for 4B single-seq decode by default — measured ~300 ms/tok on gfx1150
     // vs ~500 ms/tok for decode_step() and ~2500 ms/tok for the legacy
     // replay path. Opt-out via --force-replay-decode (legacy parity) or
     // --force-component-decode (primitive-chain correctness).
     let kernel_single_decode_enabled = cli.batch_size == 1
-        && params.use_4b_kernel
+        && use_4b_kernel
         && !cli.force_replay_decode
         && !cli.force_component_decode;
-    let cuda_08b_hero_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_08B_HERO").is_some();
-    let cuda_08b_hero_enabled = backend == Backend::Cuda
-        && gpu_arch == GpuArch::Sm86
-        && model_variant == ModelVariant::Qwen3_5_0_8B
-        && !params.use_4b_kernel
-        && cli.batch_size == 1
-        && !cli.validate
-        && !gpu_validate_enabled
-        && !cli.force_component_decode
-        && !cli.force_kernel_decode
-        && !cli.kv_fp8
-        && oracle_output.is_none()
-        && !engine.weights().is_fp8
-        && !engine.weights().is_int4
-        && !cuda_08b_hero_disabled;
+    let cuda_08b_hero_enabled = cuda_08b_hero_candidate;
     let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
     let cuda_fast_greedy_enabled = backend == Backend::Cuda
-        && !params.use_4b_kernel
+        && !use_4b_kernel
         && cli.batch_size == 1
         && !cli.validate
         && !gpu_validate_enabled
@@ -2086,13 +2098,13 @@ fn main() -> Result<()> {
         }
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
         eprintln!("[decode] single-sequence CUDA KV-FP8 uses replayed GPU prefill for correctness");
-    } else if cli.batch_size > 1 && params.use_4b_kernel && cli.kv_fp8 {
+    } else if cli.batch_size > 1 && use_4b_kernel && cli.kv_fp8 {
         eprintln!("[decode] batched CUDA KV-FP8 uses the persistent kernel path");
     } else if component_single_decode_enabled {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the component decode path");
-    } else if cli.batch_size == 1 && params.use_4b_kernel && cli.force_kernel_decode {
+    } else if cli.batch_size == 1 && use_4b_kernel && cli.force_kernel_decode {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
-    } else if cli.batch_size == 1 && params.use_4b_kernel && cli.kv_fp8 {
+    } else if cli.batch_size == 1 && use_4b_kernel && cli.kv_fp8 {
         eprintln!("[decode] WARNING: single-sequence CUDA KV-FP8 uses the b=1 kernel path");
     } else if cuda_08b_hero_enabled {
         eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
@@ -2143,7 +2155,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
@@ -2169,7 +2181,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
@@ -2190,7 +2202,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
@@ -2211,7 +2223,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
@@ -2280,7 +2292,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                     cli.kv_fp8,
                     cli.batch_size,
                     step,
@@ -2323,7 +2335,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?
             } else if replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
@@ -2347,7 +2359,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                 }
                 if let Some(trace_layer) = cli.trace_component_input_layer {
@@ -2370,7 +2382,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     logits
                 } else if let Some(trace_layer) = cli.trace_component_layer {
@@ -2393,7 +2405,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     logits
                 } else if let Some(trace_layer) = cli.trace_component_linear_layer {
@@ -2417,7 +2429,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     logits
                 } else {
@@ -2444,7 +2456,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
@@ -2469,7 +2481,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
@@ -2489,7 +2501,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
@@ -2509,7 +2521,7 @@ fn main() -> Result<()> {
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
-                        params.use_4b_kernel,
+                        use_4b_kernel,
                     )?;
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
@@ -2581,7 +2593,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                 )?;
                 let delta = validate::max_abs_delta(&logits, &gpu_logits);
                 let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
@@ -2613,7 +2625,7 @@ fn main() -> Result<()> {
                     ordinal,
                     params.kv_chunk_size,
                     cli.prefill_chunk_size,
-                    params.use_4b_kernel,
+                    use_4b_kernel,
                     cli.kv_fp8,
                     cli.batch_size,
                     step,
