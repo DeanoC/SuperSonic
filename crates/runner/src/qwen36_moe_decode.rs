@@ -766,9 +766,33 @@ pub fn host_final_norm_lm_head(
         "lm_head bytes mismatch"
     );
 
-    let h_f32 = bf16_bytes_to_f32(hidden_bytes);
+    // BF16-input convenience wrapper. For multi-token decode loops use
+    // `host_final_norm_lm_head_f32` directly with cached F32 lm_head + norm
+    // weight to avoid re-converting the (multi-GiB) lm_head matrix per step.
     let w_f32 = bf16_bytes_to_f32(final_norm_w_bytes);
     let lm_f32 = bf16_bytes_to_f32(lm_head_w_bytes);
+    host_final_norm_lm_head_f32(hidden_bytes, &w_f32, &lm_f32, hidden, vocab, eps)
+}
+
+/// Same math as [`host_final_norm_lm_head`] but with `final_norm_w` and
+/// `lm_head_w` already converted to F32 by the caller. Hot-loop variant —
+/// the BF16→F32 conversion of the lm_head matrix is by far the dominant
+/// cost on the 35B-A3B geometry (~1 GiB BF16 → ~2 GiB F32 per call), and
+/// it never changes across tokens, so the engine converts it once and
+/// passes the F32 view here per-step.
+pub fn host_final_norm_lm_head_f32(
+    hidden_bytes: &[u8],
+    final_norm_w_f32: &[f32],
+    lm_head_w_f32: &[f32],
+    hidden: usize,
+    vocab: usize,
+    eps: f32,
+) -> Vec<u8> {
+    assert_eq!(hidden_bytes.len(), hidden * 2, "hidden bytes mismatch");
+    assert_eq!(final_norm_w_f32.len(), hidden, "norm_w f32 len mismatch");
+    assert_eq!(lm_head_w_f32.len(), vocab * hidden, "lm_head f32 len mismatch");
+
+    let h_f32 = bf16_bytes_to_f32(hidden_bytes);
 
     // RMSnorm: F32 mean of squares -> rsqrt(var+eps) -> elementwise mul by w.
     let mean_sq: f32 =
@@ -776,7 +800,7 @@ pub fn host_final_norm_lm_head(
     let rsqrt = 1.0 / (mean_sq + eps).sqrt();
     let normed: Vec<f32> = h_f32
         .iter()
-        .zip(w_f32.iter())
+        .zip(final_norm_w_f32.iter())
         .map(|(&x, &w)| x * rsqrt * w)
         .collect();
 
@@ -788,7 +812,7 @@ pub fn host_final_norm_lm_head(
         let row_start = v * hidden;
         let mut acc = 0f64;
         for h in 0..hidden {
-            acc += lm_f32[row_start + h] as f64 * normed[h] as f64;
+            acc += lm_head_w_f32[row_start + h] as f64 * normed[h] as f64;
         }
         logits[v] = acc as f32;
     }

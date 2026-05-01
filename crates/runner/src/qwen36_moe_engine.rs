@@ -26,9 +26,10 @@ use qwen36_moe::weights::{
 };
 
 use crate::qwen36_moe_decode::{
-    argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
-    sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
-    FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, XorshiftRng,
+    argmax_bf16_logits, bf16_bytes_to_f32, dequant_int4_to_bf16_bytes, host_final_norm_lm_head,
+    host_final_norm_lm_head_f32, run_chained_decode, sample_bf16_logits, AttnLayerBuffers,
+    FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
+    LinearAttnInt4Sidecars, MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -672,6 +673,23 @@ pub fn run(
         return Ok(());
     }
 
+    // The decode kernels (`kernels/qwen36_moe.hip`, the per-block step
+    // launchers in `kernel-ffi`) are HIP-only. The registry currently has
+    // both HIP and CUDA entries for `qwen3.6-35b-a3b` but the CUDA branches
+    // of `attn_step_launch` / `linear_step_launch` / `ffn_step_launch` all
+    // return `InvalidArg("CUDA backend not yet wired")`. Fail here with a
+    // clear message instead of letting the engine commit to HIP buffers
+    // (which would crash later inside the kernel-ffi wrappers when the
+    // registry-selected backend disagrees).
+    if entry.backend != Backend::Hip {
+        anyhow::bail!(
+            "qwen3.6-35b-a3b decode kernels are HIP-only at this stage; \
+             registry-selected backend was {:?}. Re-run with --backend hip, \
+             or use --dry-run for analytic accounting.",
+            entry.backend,
+        );
+    }
+
     // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
     // launches in `crate::qwen36_moe_decode::run_chained_decode` against
     // per-layer weight buffers loaded from the baked package. INT4 GPTQ
@@ -1090,16 +1108,26 @@ fn decode_text(
 
     // Cache final_norm + dequantized lm_head once. Both are ≥1 GiB BF16
     // for 35B-A3B; reusing the cached buffers across decode steps avoids
-    // redoing the ~1 second INT4 dequant per token.
+    // redoing the ~1 second INT4 dequant per token. Convert to F32 once
+    // here too — the BF16→F32 fan-out of the lm_head matrix (~970 MiB →
+    // ~2 GiB) was previously dominating per-token latency in the host-
+    // side GEMV path; the F32 view is reused for every generated token.
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
         .context("load final norm")?;
     let lm_head_bf16_bytes = load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
         .context("prepare host-side lm_head BF16 buffer")?;
+    let final_norm_f32 = bf16_bytes_to_f32(&final_norm_bytes);
+    let lm_head_f32 = bf16_bytes_to_f32(&lm_head_bf16_bytes);
     println!(
-        "  cached lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB).",
+        "  cached lm_head BF16 ({:.1} MiB → F32 {:.1} MiB) and final norm ({:.1} KiB).",
         lm_head_bf16_bytes.len() as f64 / MIB,
+        (lm_head_f32.len() * 4) as f64 / MIB,
         final_norm_bytes.len() as f64 / 1024.0,
     );
+    // Drop the BF16 buffer once the F32 view is built — engine doesn't
+    // need it after this point and the 970 MiB allocation is non-trivial.
+    drop(lm_head_bf16_bytes);
+    drop(final_norm_bytes);
 
     println!(
         "  decoding {} prompt token{} + generating ≤{} new token{}…",
@@ -1164,10 +1192,13 @@ fn decode_text(
         }
 
         // Generation step: lm_head + sample (greedy when temperature == 0).
-        let logits = host_final_norm_lm_head(
+        // Uses the F32-cached final_norm + lm_head so the per-token cost is
+        // just one BF16→F32 of the (small) hidden vector + GEMV; the
+        // expensive lm_head conversion happens once at decode_text start.
+        let logits = host_final_norm_lm_head_f32(
             &outputs.final_hidden_bytes,
-            &final_norm_bytes,
-            &lm_head_bf16_bytes,
+            &final_norm_f32,
+            &lm_head_f32,
             geom.hidden as usize,
             geom.vocab as usize,
             geom.rms_norm_eps,
