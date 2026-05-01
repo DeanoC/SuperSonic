@@ -27,8 +27,8 @@ use qwen36_moe::weights::{
 
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
-    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
-    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom,
+    sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
+    FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -692,13 +692,32 @@ pub fn run(
     //    id so the "doesn't bail" criterion is verifiable end-to-end.
     println!();
     println!("=== Decode (PR 4c step 2: host-orchestrated chained launches) ===");
+    let sampling = SamplingParams {
+        temperature: cli.temperature,
+        top_k: cli.top_k,
+        top_p: cli.top_p,
+        seed: cli.sampling_seed,
+    };
     decode_text(
         &cli.model_dir,
         &report,
         &cli.prompt,
         cli.max_new_tokens.max(1),
+        sampling,
     )?;
     Ok(())
+}
+
+/// Bundles the sampling knobs for the multi-token decode loop. `temperature
+/// <= 0` ⇔ greedy argmax (the deterministic default — bit-identical with
+/// any seed). At temperature > 0, `top_k`/`top_p` filter the distribution
+/// before sampling, then `seed` drives the xorshift RNG.
+#[derive(Debug, Clone, Copy)]
+pub struct SamplingParams {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub seed: u64,
 }
 
 /// Build the geometry the chained decoder needs from the parsed config +
@@ -966,6 +985,7 @@ fn decode_text(
     report: &DryRunReport,
     prompt: &str,
     max_new: usize,
+    sampling: SamplingParams,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1106,6 +1126,11 @@ fn decode_text(
     // forwards = (prompt_len - 1) prefill + max_new generation = prompt_len
     // + max_new - 1.
     let total_steps = prompt_ids.len() + max_new - 1;
+    let mut rng = XorshiftRng::new(sampling.seed);
+    println!(
+        "  sampling: temp={} top_k={} top_p={} seed={}",
+        sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed,
+    );
 
     for step in 0..total_steps {
         // Embed lookup for the current token.
@@ -1128,7 +1153,7 @@ fn decode_text(
             continue;
         }
 
-        // Generation step: lm_head + argmax → next token.
+        // Generation step: lm_head + sample (greedy when temperature == 0).
         let logits = host_final_norm_lm_head(
             &outputs.final_hidden_bytes,
             &final_norm_bytes,
@@ -1137,7 +1162,13 @@ fn decode_text(
             geom.vocab as usize,
             geom.rms_norm_eps,
         );
-        let next_token = argmax_bf16_logits(&logits);
+        let next_token = sample_bf16_logits(
+            &logits,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            &mut rng,
+        );
         generated_ids.push(next_token);
 
         // Stream-decode and print.

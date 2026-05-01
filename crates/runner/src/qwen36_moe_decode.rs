@@ -816,6 +816,108 @@ pub fn dequant_int4_to_bf16_bytes(
     out
 }
 
+/// Tiny dependency-free xorshift64 RNG. Deterministic given the seed —
+/// the engine's `--sampling-seed` plus identical prompt + model + sampling
+/// params produces bit-identical generation.
+pub struct XorshiftRng(u64);
+
+impl XorshiftRng {
+    pub fn new(seed: u64) -> Self {
+        // Xorshift requires a non-zero state.
+        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+    }
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    /// Uniform `f32` in `[0, 1)`. 24 random bits → IEEE single mantissa.
+    pub fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / ((1u64 << 24) as f32)
+    }
+}
+
+/// Sample one token from BF16 logits with optional temperature, top-K,
+/// and top-P (nucleus) filters. `temperature <= 0` falls through to
+/// greedy argmax (the deterministic, reproducible default — same as
+/// [`argmax_bf16_logits`]). `top_k == 0` means "no top-K cap" (full
+/// vocab); `top_p >= 1.0` means "no nucleus truncation".
+///
+/// Greedy is bit-identical to argmax_bf16_logits (same iteration order,
+/// no temperature scaling).
+pub fn sample_bf16_logits(
+    logits_bytes: &[u8],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng: &mut XorshiftRng,
+) -> u32 {
+    if temperature <= 0.0 || top_k == 1 {
+        return argmax_bf16_logits(logits_bytes);
+    }
+    let logits = bf16_bytes_to_f32(logits_bytes);
+    let inv_t = 1.0 / temperature;
+
+    // Top-K: pick the K highest-logit indices, descending. For top_k==0
+    // sort the entire vocab (slow but only paid when sampling — vocab≈248K
+    // takes ~few ms per token, negligible vs the chained decode).
+    let mut indexed: Vec<(usize, f32)> =
+        logits.iter().enumerate().map(|(i, &v)| (i, v * inv_t)).collect();
+    let k = if top_k == 0 || top_k > indexed.len() {
+        indexed.len()
+    } else {
+        // Partial sort: select_nth_unstable + sort the head saves the tail.
+        let _ = indexed.select_nth_unstable_by(top_k - 1, |a, b| {
+            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        top_k
+    };
+    indexed.truncate(k);
+    indexed.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Softmax with max-stabilisation over the kept indices.
+    let max_logit = indexed[0].1;
+    let mut exps: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_logit).exp()).collect();
+    let sum: f32 = exps.iter().sum();
+    if sum <= 0.0 || !sum.is_finite() {
+        return indexed[0].0 as u32;
+    }
+    for e in &mut exps {
+        *e /= sum;
+    }
+
+    // Top-P nucleus: smallest prefix whose cumulative prob ≥ top_p.
+    let nucleus_size = if top_p >= 1.0 {
+        exps.len()
+    } else {
+        let mut cum = 0.0f32;
+        let mut n = exps.len();
+        for (i, &p) in exps.iter().enumerate() {
+            cum += p;
+            if cum >= top_p {
+                n = i + 1;
+                break;
+            }
+        }
+        n.max(1)
+    };
+
+    // Sample from the (renormalised) nucleus.
+    let nucleus_sum: f32 = exps[..nucleus_size].iter().sum();
+    let r: f32 = rng.next_f32() * nucleus_sum;
+    let mut cum = 0.0f32;
+    for i in 0..nucleus_size {
+        cum += exps[i];
+        if cum >= r {
+            return indexed[i].0 as u32;
+        }
+    }
+    indexed[0].0 as u32
+}
+
 /// Greedy argmax over a BF16 logits buffer. Returns the highest-scoring
 /// token id. Used by the runner's first-token smoke path.
 pub fn argmax_bf16_logits(logits_bytes: &[u8]) -> u32 {

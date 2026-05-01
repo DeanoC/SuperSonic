@@ -331,6 +331,26 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "8")]
     max_new_tokens: usize,
 
+    /// Sampling temperature. 0 = greedy argmax (default; reproducible).
+    /// Typical sampled values: 0.7–1.0.
+    #[arg(long, default_value = "0.0")]
+    temperature: f32,
+
+    /// Top-K filter: keep only the K highest-probability tokens before
+    /// sampling. 0 = no cap (full vocab considered).
+    #[arg(long, default_value = "0")]
+    top_k: usize,
+
+    /// Top-P (nucleus) filter: keep the smallest set of tokens whose
+    /// cumulative probability ≥ top_p. 1.0 = no truncation.
+    #[arg(long, default_value = "1.0")]
+    top_p: f32,
+
+    /// RNG seed for non-greedy sampling. Same seed + same prompt + same
+    /// model = bit-identical generation.
+    #[arg(long, default_value = "42")]
+    sampling_seed: u64,
+
     /// Maximum context size in tokens (prompt + generated). Used for VRAM estimation.
     /// Defaults to prompt length + max_new_tokens if not specified.
     #[arg(long)]
