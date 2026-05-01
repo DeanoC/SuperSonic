@@ -408,6 +408,17 @@ extern "C" {
         shared_up_proj_w: *const c_void,
         shared_down_proj_w: *const c_void,
         shared_expert_gate_w: *const c_void,
+        int4_group_size: c_int,
+        gate_up_proj_scale: *const c_void,
+        gate_up_proj_zero: *const c_void,
+        down_proj_scale: *const c_void,
+        down_proj_zero: *const c_void,
+        shared_gate_proj_scale: *const c_void,
+        shared_gate_proj_zero: *const c_void,
+        shared_up_proj_scale: *const c_void,
+        shared_up_proj_zero: *const c_void,
+        shared_down_proj_scale: *const c_void,
+        shared_down_proj_zero: *const c_void,
         output: *mut c_void,
         output_idx: *mut c_int,
         workspace: *mut f32,
@@ -756,6 +767,10 @@ pub struct Qwen36MoeFfnStepParams {
 /// Weight pointers for the staged MoE FFN parity launcher. Pointers unused
 /// by the requested `stage` may be null; the kernel won't dereference them.
 /// See [`qwen36_moe_hip_ffn_step_launch`] for the per-stage matrix.
+///
+/// Each `*_proj_w` pointer carries either a BF16 weight slab (when the
+/// matching field in [`Qwen36MoeFfnStepInt4`] is null) or an INT4 packed-u8
+/// slab (when the matching `*_scale`/`*_zero` pair is set).
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeFfnStepWeights {
     pub input_hidden: *const c_void,
@@ -767,6 +782,48 @@ pub struct Qwen36MoeFfnStepWeights {
     pub shared_up_proj_w: *const c_void,
     pub shared_down_proj_w: *const c_void,
     pub shared_expert_gate_w: *const c_void,
+}
+
+/// Optional INT4 sidecar pointers + group size for the FFN parity launcher
+/// (PR 4b5). `group_size == 0` ⇒ INT4 disabled and every sidecar pointer
+/// must be null. When non-zero, each tensor is independently switchable:
+/// a non-null `*_scale`/`*_zero` pair routes that tensor's matvec through
+/// `int4_dequant_scalar`; a null pair keeps it on the BF16 path. Scales
+/// and zeros are BF16 with the bake's group layout — `[..., out/gs, in/gs]`.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeFfnStepInt4 {
+    pub group_size: i32,
+    pub gate_up_proj_scale: *const c_void,
+    pub gate_up_proj_zero: *const c_void,
+    pub down_proj_scale: *const c_void,
+    pub down_proj_zero: *const c_void,
+    pub shared_gate_proj_scale: *const c_void,
+    pub shared_gate_proj_zero: *const c_void,
+    pub shared_up_proj_scale: *const c_void,
+    pub shared_up_proj_zero: *const c_void,
+    pub shared_down_proj_scale: *const c_void,
+    pub shared_down_proj_zero: *const c_void,
+}
+
+impl Qwen36MoeFfnStepInt4 {
+    /// All-null sidecars + group_size=0. Use this when the BF16 path is
+    /// what you want — the kernel falls through to the existing matvecs
+    /// for every tensor.
+    pub const fn disabled() -> Self {
+        Self {
+            group_size: 0,
+            gate_up_proj_scale: std::ptr::null(),
+            gate_up_proj_zero: std::ptr::null(),
+            down_proj_scale: std::ptr::null(),
+            down_proj_zero: std::ptr::null(),
+            shared_gate_proj_scale: std::ptr::null(),
+            shared_gate_proj_zero: std::ptr::null(),
+            shared_up_proj_scale: std::ptr::null(),
+            shared_up_proj_zero: std::ptr::null(),
+            shared_down_proj_scale: std::ptr::null(),
+            shared_down_proj_zero: std::ptr::null(),
+        }
+    }
 }
 
 /// Safe wrapper for the PR 4b4 staged MoE FFN parity launcher.
@@ -782,6 +839,7 @@ pub fn ffn_step_launch(
     dtype: ScalarType,
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
     output: &mut GpuBuffer,
     output_idx: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
@@ -835,6 +893,17 @@ pub fn ffn_step_launch(
                     weights.shared_up_proj_w,
                     weights.shared_down_proj_w,
                     weights.shared_expert_gate_w,
+                    int4.group_size as c_int,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    int4.shared_gate_proj_scale,
+                    int4.shared_gate_proj_zero,
+                    int4.shared_up_proj_scale,
+                    int4.shared_up_proj_zero,
+                    int4.shared_down_proj_scale,
+                    int4.shared_down_proj_zero,
                     output.as_mut_ptr(),
                     output_idx.as_mut_ptr() as *mut c_int,
                     workspace.as_mut_ptr() as *mut f32,
@@ -2821,18 +2890,45 @@ mod tests {
     }
 
     /// Workspace floats sufficient for the largest staged FFN intermediate
-    /// (stage 5). Same convention as `parity_workspace_floats` for the attn
-    /// kernel — keep tight so a stage that overruns fails loudly.
+    /// (stage 5). Mirrors the kernel's per-stage offset layout in
+    /// `kernels/qwen36_moe.hip` (search `OFF_H_NORM`):
+    ///   H_NORM        [hidden]
+    ///   ROUTER_LOGITS [E]
+    ///   ROUTER_PROBS  [E]
+    ///   TOPK_VAL      [k]
+    ///   TOPK_IDX      [k]
+    ///   SG_SCALAR     [1]
+    ///   SGP           [Is]
+    ///   SUP           [Is]
+    ///   SHARED_MID    [Is]
+    ///   SHARED_OUT    [hidden]
+    ///   EXPERT_GU     [2*I]
+    ///   EXPERT_MID    [I]
+    ///   EXPERT_STACK  [k*hidden]
+    ///   MOE_OUT       [hidden]
+    ///
+    /// PR 4b4 step 4 (the original stage-3+ test wiring) silently undersized
+    /// this by 385 floats on the synthetic config — it omitted SG_SCALAR,
+    /// SGP, SUP, EXPERT_GU and EXPERT_MID. The HIP allocator's slack hid the
+    /// OOB on the BF16 path. The new INT4-sidecar kernel parameters PR 4b5
+    /// step 3 adds shift register/stack layout enough that the same OOB
+    /// starts overwriting live cooperative-launch state and stage>=4 hangs.
+    /// The right fix is to size the buffer for what the kernel actually uses.
     #[cfg(supersonic_backend_hip)]
     fn ffn_parity_workspace_floats(geom: &FfnOracleGeom) -> usize {
         let hidden = geom.hidden as usize;
         let e = geom.num_experts as usize;
         let k = geom.top_k as usize;
         let is_dim = geom.shared_intermediate as usize;
-        // hidden + 2*E + 2*k (router pieces)
-        // + is_dim (shared_mid) + hidden (shared_out)
-        // + k*hidden (expert_stack) + hidden (moe_out) + hidden (output)
-        hidden + 2 * e + 2 * k + is_dim + 3 * hidden + k * hidden
+        let i_dim = geom.moe_intermediate as usize;
+        // 3*hidden = H_NORM + SHARED_OUT + MOE_OUT
+        // 2*e      = ROUTER_LOGITS + ROUTER_PROBS
+        // 2*k      = TOPK_VAL + TOPK_IDX
+        // 1        = SG_SCALAR
+        // 3*is_dim = SGP + SUP + SHARED_MID
+        // 3*i_dim  = EXPERT_GU(2*I) + EXPERT_MID(I)
+        // k*hidden = EXPERT_STACK
+        3 * hidden + 2 * e + 2 * k + 1 + 3 * is_dim + 3 * i_dim + k * hidden
     }
 
     /// Output BF16 elements sufficient for the largest staged FFN
@@ -2936,6 +3032,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeFfnStepInt4::disabled(),
             &mut output,
             &mut output_idx,
             &mut workspace,
@@ -3078,6 +3175,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeFfnStepInt4::disabled(),
             &mut output,
             &mut output_idx,
             &mut workspace,
@@ -3222,6 +3320,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeFfnStepInt4::disabled(),
             &mut output,
             &mut output_idx,
             &mut workspace,
@@ -3355,6 +3454,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeFfnStepInt4::disabled(),
             &mut output,
             &mut output_idx,
             &mut workspace,
@@ -3489,6 +3589,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeFfnStepInt4::disabled(),
             &mut output,
             &mut output_idx,
             &mut workspace,
@@ -3506,6 +3607,234 @@ mod tests {
             "ffn step5 output_hidden",
             got_bytes,
             &output_hidden_expected_bytes,
+            0.05,
+            0.999,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PR 4b5 step 3: shared-expert INT4 parity vs the INT4 oracle.
+    //
+    // Driven by the same env var as the BF16 FFN tests; skipped silently
+    // when the JSON's schema is not `qwen36-moe-oracle-ffn-int4-v1`. The
+    // INT4 oracle's `weights` block carries the BF16-reconstruction of
+    // each quantized tensor, so the BF16 reference computed against those
+    // weights is the exact intermediate the kernel must reproduce when
+    // it dequantizes (packed, scale, zero) on the fly.
+    //
+    // Step 3 wires only the shared-expert tensors (gate_proj, up_proj,
+    // down_proj). Fused-expert weights stay BF16 in this test —
+    // `weights.gate_up_proj_w` and `weights.down_proj_w` are uploaded as
+    // BF16 and `Qwen36MoeFfnStepInt4`'s fused-expert sidecars stay null.
+    // Steps 4/5 will switch those over.
+    // -------------------------------------------------------------------
+
+    #[cfg(supersonic_backend_hip)]
+    fn ffn_oracle_is_int4(json: &serde_json::Value) -> bool {
+        json["schema"].as_str() == Some("qwen36-moe-oracle-ffn-int4-v1")
+    }
+
+    /// Pulls (packed, scale, zero) bytes for one INT4-quantized FFN tensor
+    /// from the oracle JSON. Returns owned `Vec<u8>` buffers in their
+    /// native byte representations (u8 for packed, BF16 LE for scale/zero).
+    #[cfg(supersonic_backend_hip)]
+    fn decode_int4_sidecar(
+        json: &serde_json::Value, name: &str,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let blk = &json["int4_weights"][name];
+        let packed = b64_decode(blk["packed"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")));
+        let scale = b64_decode(blk["scale"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")));
+        let zero = b64_decode(blk["zero"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")));
+        (packed, scale, zero)
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_ffn_step_2_shared_out_int4_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_ffn_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_FFN_ORACLE_JSON not set. \
+                 Generate an INT4 fixture with \
+                 `python oracle/qwen36_moe_ffn_oracle.py --mode synthetic \
+                 --int4 --out /tmp/qwen36_ffn_int4.json` and re-run."
+            );
+            return;
+        };
+        if !ffn_oracle_is_int4(&json) {
+            eprintln!(
+                "skip: oracle JSON is not INT4 (schema={}). Generate one with \
+                 the `--int4` flag if you want to exercise this test.",
+                json["schema"].as_str().unwrap_or("?"),
+            );
+            return;
+        }
+        let cfg = &json["config"];
+        let group_size = cfg["int4_group_size"].as_i64().unwrap_or(0) as i32;
+        assert!(group_size > 0, "INT4 oracle missing config.int4_group_size");
+
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // Shared-expert weights become INT4 packed bytes; everything else
+        // stays as BF16 from `weights`. The BF16 reconstruction is *not*
+        // used at the kernel call site for INT4 tensors (the kernel reads
+        // packed bytes), but the oracle ran its reference computation
+        // against the same reconstruction so the intermediate target lines
+        // up byte-for-byte with the kernel's output.
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
+        let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
+        let shared_expert_gate_w_bytes =
+            b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
+
+        let (sgp_packed, sgp_scale, sgp_zero) =
+            decode_int4_sidecar(&json, "shared_gate_proj_w");
+        let (sup_packed, sup_scale, sup_zero) =
+            decode_int4_sidecar(&json, "shared_up_proj_w");
+        let (sdp_packed, sdp_scale, sdp_zero) =
+            decode_int4_sidecar(&json, "shared_down_proj_w");
+
+        let shared_out_expected_bytes =
+            b64_decode(inters["shared_out"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let e_us = geom.num_experts as usize;
+        let is_us = geom.shared_intermediate as usize;
+        let k_us = geom.top_k as usize;
+        let gsz_us = group_size as usize;
+
+        // Sanity: shapes match the bake convention.
+        assert_eq!(sgp_packed.len(), is_us * (hidden_us / 2),
+            "shared_gate_proj packed bytes mismatch");
+        assert_eq!(sgp_scale.len(), (is_us / gsz_us) * (hidden_us / gsz_us) * 2,
+            "shared_gate_proj scale bytes mismatch");
+        assert_eq!(sup_packed.len(), is_us * (hidden_us / 2));
+        assert_eq!(sdp_packed.len(), hidden_us * (is_us / 2));
+        assert_eq!(shared_out_expected_bytes.len(), hidden_us * 2);
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let post_attn_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
+        ).expect("upload post_attn_norm_w");
+        let gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
+        ).expect("upload gate_w");
+        let shared_expert_gate_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
+        ).expect("upload shared_expert_gate_w");
+
+        // Packed INT4 buffers — uploaded as u8.
+        let sgp_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed,
+        ).expect("upload sgp packed");
+        let sup_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed,
+        ).expect("upload sup packed");
+        let sdp_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed,
+        ).expect("upload sdp packed");
+        // BF16 scale/zero sidecars.
+        let sgp_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sgp_scale.len() / 2], &sgp_scale,
+        ).expect("upload sgp scale");
+        let sgp_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero,
+        ).expect("upload sgp zero");
+        let sup_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sup_scale.len() / 2], &sup_scale,
+        ).expect("upload sup scale");
+        let sup_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero,
+        ).expect("upload sup zero");
+        let sdp_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sdp_scale.len() / 2], &sdp_scale,
+        ).expect("upload sdp scale");
+        let sdp_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero,
+        ).expect("upload sdp zero");
+
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
+        ).expect("alloc output");
+        let mut output_idx = GpuBuffer::zeros(
+            ordinal, ScalarType::U32, &[k_us],
+        ).expect("alloc output_idx");
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 2,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        // Shared-expert weight pointers point at the *packed* u8 buffers.
+        // Fused-expert pointers stay null (stage<3 doesn't read them).
+        let weight_ptrs = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: post_attn_norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: std::ptr::null(),
+            down_proj_w: std::ptr::null(),
+            shared_gate_proj_w: sgp_packed_buf.as_ptr(),
+            shared_up_proj_w: sup_packed_buf.as_ptr(),
+            shared_down_proj_w: sdp_packed_buf.as_ptr(),
+            shared_expert_gate_w: shared_expert_gate_w.as_ptr(),
+        };
+        let int4_ptrs = Qwen36MoeFfnStepInt4 {
+            group_size,
+            gate_up_proj_scale: std::ptr::null(),
+            gate_up_proj_zero: std::ptr::null(),
+            down_proj_scale: std::ptr::null(),
+            down_proj_zero: std::ptr::null(),
+            shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
+            shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_scale: sup_scale_buf.as_ptr(),
+            shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_scale: sdp_scale_buf.as_ptr(),
+            shared_down_proj_zero: sdp_zero_buf.as_ptr(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &int4_ptrs,
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("ffn_step_launch stage 2 (int4)");
+
+        // Same envelope as the BF16 stage 2 test: cos_sim ≥ 0.999, max
+        // |delta| ≤ 0.05. The reconstruction is bit-identical to what the
+        // oracle ran reference against, so any residual disagreement is
+        // F32 reduction-order drift through the matvec — same as BF16.
+        let got_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_full[..hidden_us * 2];
+        assert_parity(
+            "ffn step2 int4 shared_out",
+            got_bytes,
+            &shared_out_expected_bytes,
             0.05,
             0.999,
         );

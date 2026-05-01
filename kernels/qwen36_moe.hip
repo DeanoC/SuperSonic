@@ -1616,6 +1616,24 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const T* __restrict__          shared_up_proj_w,             // [Is, hidden]       (nullable for stage<2)
     const T* __restrict__          shared_down_proj_w,           // [hidden, Is]       (nullable for stage<2)
     const T* __restrict__          shared_expert_gate_w,         // [1, hidden]        (nullable for stage<2)
+    // PR 4b5 INT4 sidecars. `int4_group_size == 0` ⇒ all weights are BF16
+    // and every sidecar pointer must be null. When non-zero, each sidecar
+    // pair (`*_scale`, `*_zero`) is consulted independently per tensor: a
+    // null `*_scale` for a given tensor keeps it on the BF16 path, a
+    // non-null pair switches that tensor to INT4. The kernel reinterprets
+    // the matching weight pointer as `const uint8_t*` packed bytes (low
+    // nibble = even col) and dequants per-element via `int4_dequant_scalar`.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     gate_up_proj_scale,
+    const hip_bfloat16* __restrict__     gate_up_proj_zero,
+    const hip_bfloat16* __restrict__     down_proj_scale,
+    const hip_bfloat16* __restrict__     down_proj_zero,
+    const hip_bfloat16* __restrict__     shared_gate_proj_scale,
+    const hip_bfloat16* __restrict__     shared_gate_proj_zero,
+    const hip_bfloat16* __restrict__     shared_up_proj_scale,
+    const hip_bfloat16* __restrict__     shared_up_proj_zero,
+    const hip_bfloat16* __restrict__     shared_down_proj_scale,
+    const hip_bfloat16* __restrict__     shared_down_proj_zero,
     T* __restrict__                output,                       // BF16, sized for the largest staged intermediate
     int* __restrict__              output_idx,                   // [k] topk indices (stage 1+)
     float* __restrict__            workspace,
@@ -1624,6 +1642,10 @@ __global__ void qwen36_moe_ffn_step_kernel(
     unsigned int* __restrict__     barrier_flag) {
     // gate_up_proj_w, down_proj_w are used at stage>=3.
     // shared_*_w are used at stage>=2.
+    // INT4 sidecars (`*_scale`/`*_zero`) are read only for tensors whose
+    // `*_scale` pointer is non-null. The router (`gate_w`) and the scalar
+    // shared-expert gate (`shared_expert_gate_w`) are always BF16 — the
+    // INT4 bake excludes them, matching `crates/qwen36_moe/src/weights.rs`.
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
@@ -1883,27 +1905,58 @@ __global__ void qwen36_moe_ffn_step_kernel(
         const int my_row = static_cast<int>(my_row_d_s);
         if (my_row >= total_rows_d) break;
 
-        const T* w_row;
+        const T* w_row = nullptr;                          // BF16 path
+        const void* i4_slab = nullptr;                     // INT4 path: full [out, hidden/2] u8
+        const hip_bfloat16* i4_scale = nullptr;
+        const hip_bfloat16* i4_zero  = nullptr;
+        int      i4_row = 0;                               // row index within the slab
         int      write_offset;
         bool     is_gate_row = false;
         if (my_row < Is_) {
-            w_row        = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+            if (shared_gate_proj_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(shared_gate_proj_w);
+                i4_scale = shared_gate_proj_scale;
+                i4_zero  = shared_gate_proj_zero;
+                i4_row   = my_row;
+            } else {
+                w_row = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+            }
             write_offset = OFF_SGP + my_row;
         } else if (my_row < 2 * Is_) {
             const int local = my_row - Is_;
-            w_row        = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+            if (shared_up_proj_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(shared_up_proj_w);
+                i4_scale = shared_up_proj_scale;
+                i4_zero  = shared_up_proj_zero;
+                i4_row   = local;
+            } else {
+                w_row = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+            }
             write_offset = OFF_SUP + local;
         } else {
             // Single-row "[1, hidden]" weight; dot it with h_norm and apply
-            // sigmoid() before storing into SG_SCALAR.
+            // sigmoid() before storing into SG_SCALAR. Always BF16 — the
+            // INT4 bake excludes `shared_expert_gate`.
             w_row        = shared_expert_gate_w;
             write_offset = OFF_SG_SCALAR;
             is_gate_row  = true;
         }
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+        if (i4_scale != nullptr) {
+            // INT4 scalar dequant per element. Stride pattern matches the
+            // BF16 path (thread t reads cols t, t+block_size, …) so the
+            // reduction tree is unchanged.
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               i4_slab, i4_scale, i4_zero,
+                               i4_row, col, hidden, int4_group_size)
+                           * h_norm_lds[col];
+            }
+        } else {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -1958,12 +2011,27 @@ __global__ void qwen36_moe_ffn_step_kernel(
             const int my_row = static_cast<int>(my_row_f_s);
             if (my_row >= hidden) break;
 
-            const T* w_row =
-                shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
             float partial = 0.0f;
-            for (int col = tid; col < Is_; col += block_size) {
-                partial += static_cast<float>(w_row[col])
-                           * workspace[OFF_SHARED_MID + col];
+            if (shared_down_proj_scale != nullptr) {
+                // INT4 path: row `my_row` of `[hidden, Is]` packed as
+                // `[hidden, Is/2]` u8.
+                const void* i4_slab =
+                    reinterpret_cast<const void*>(shared_down_proj_w);
+                for (int col = tid; col < Is_; col += block_size) {
+                    partial += int4_dequant_scalar(
+                                   i4_slab,
+                                   shared_down_proj_scale,
+                                   shared_down_proj_zero,
+                                   my_row, col, Is_, int4_group_size)
+                               * workspace[OFF_SHARED_MID + col];
+                }
+            } else {
+                const T* w_row =
+                    shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
+                for (int col = tid; col < Is_; col += block_size) {
+                    partial += static_cast<float>(w_row[col])
+                               * workspace[OFF_SHARED_MID + col];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();

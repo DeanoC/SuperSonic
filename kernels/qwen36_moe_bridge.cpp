@@ -314,6 +314,17 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     const void*   shared_up_proj_w,
     const void*   shared_down_proj_w,
     const void*   shared_expert_gate_w,
+    int           int4_group_size,
+    const void*   gate_up_proj_scale,
+    const void*   gate_up_proj_zero,
+    const void*   down_proj_scale,
+    const void*   down_proj_zero,
+    const void*   shared_gate_proj_scale,
+    const void*   shared_gate_proj_zero,
+    const void*   shared_up_proj_scale,
+    const void*   shared_up_proj_zero,
+    const void*   shared_down_proj_scale,
+    const void*   shared_down_proj_zero,
     void*         output,
     int*          output_idx,
     float*        workspace,
@@ -332,6 +343,26 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         barrier_counter == nullptr || barrier_flag == nullptr) {
         return 133;
     }
+    // INT4 mode: group_size must divide the relevant dims and each scale
+    // must be paired with a zero. group_size==0 disables INT4 entirely.
+    if (int4_group_size < 0) return 134;
+    auto pair_ok = [](const void* s, const void* z) -> bool {
+        return (s == nullptr) == (z == nullptr);
+    };
+    if (!pair_ok(gate_up_proj_scale, gate_up_proj_zero) ||
+        !pair_ok(down_proj_scale, down_proj_zero) ||
+        !pair_ok(shared_gate_proj_scale, shared_gate_proj_zero) ||
+        !pair_ok(shared_up_proj_scale, shared_up_proj_zero) ||
+        !pair_ok(shared_down_proj_scale, shared_down_proj_zero)) {
+        return 135;
+    }
+    const bool any_int4 =
+        (gate_up_proj_scale != nullptr) || (down_proj_scale != nullptr) ||
+        (shared_gate_proj_scale != nullptr) ||
+        (shared_up_proj_scale != nullptr) ||
+        (shared_down_proj_scale != nullptr);
+    if (any_int4 && int4_group_size <= 0) return 136;
+    if (!any_int4 && int4_group_size != 0) return 137;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -370,6 +401,17 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
                        static_cast<const hip_bfloat16*>(shared_up_proj_w),
                        static_cast<const hip_bfloat16*>(shared_down_proj_w),
                        static_cast<const hip_bfloat16*>(shared_expert_gate_w),
+                       int4_group_size,
+                       static_cast<const hip_bfloat16*>(gate_up_proj_scale),
+                       static_cast<const hip_bfloat16*>(gate_up_proj_zero),
+                       static_cast<const hip_bfloat16*>(down_proj_scale),
+                       static_cast<const hip_bfloat16*>(down_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_up_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_up_proj_zero),
+                       static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                       static_cast<const hip_bfloat16*>(shared_down_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        output_idx,
                        workspace,
