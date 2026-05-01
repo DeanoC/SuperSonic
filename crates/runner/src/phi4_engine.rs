@@ -401,6 +401,7 @@ pub fn run_phi4(
         eprintln!("[phi4-debug] limiting persistent decode to {n}/{num_layers} layers");
     }
     let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
+    let debug_dump_layer_components = std::env::var("SUPERSONIC_PHI4_DUMP_LAYER_COMPONENTS").ok();
     let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
     let debug_dump_direct_argmax = std::env::var("SUPERSONIC_PHI4_DUMP_DIRECT_ARGMAX").ok();
     let cuda_argmax_f32_accum = std::env::var_os("SUPERSONIC_PHI4_CUDA_ARGMAX_F32ACCUM").is_some();
@@ -587,6 +588,21 @@ pub fn run_phi4(
         gpu_hal::memset_zeros(ordinal, sync_buf.as_mut_ptr(), sync_buf.len_bytes())
             .map_err(|e| anyhow!("reset sync_buf at step {step}: {e}"))?;
 
+        let debug_component_kernel_input =
+            if debug_dump_layer_components.is_some() && step == prompt_ids.len() - 1 {
+                let hidden_bytes = hidden_io
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("debug kernel input D2H at step {step}: {e}"))?;
+                Some(
+                    hidden_bytes
+                        .chunks_exact(2)
+                        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                        .collect::<Vec<f32>>(),
+                )
+            } else {
+                None
+            };
+
         // 5. Pick LongRoPE table for this position (short vs long).
         let (cos_table, sin_table) = rope.tables_for_kv_len(pos);
 
@@ -632,6 +648,53 @@ pub fn run_phi4(
                 std::fs::write(path, serde_json::to_vec(&payload)?)
                     .map_err(|e| anyhow!("write debug hidden dump {path}: {e}"))?;
                 eprintln!("[phi4-debug] wrote hidden dump to {path}");
+            }
+        }
+        if let Some(ref path) = debug_dump_layer_components {
+            if step == prompt_ids.len() - 1 {
+                let workspace_bytes = workspace
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("debug workspace D2H at step {step}: {e}"))?;
+                let workspace_f32: Vec<f32> = workspace_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let hidden_base = 0;
+                let normed_base = hidden_base + hidden_size;
+                let gate_up_base = normed_base + hidden_size;
+                let mlp_out_base = gate_up_base + 2 * intermediate_size;
+                let token_out_base = mlp_out_base + hidden_size;
+                let proj_buf_base = token_out_base + hidden_size;
+                let hidden_bytes = hidden_io
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("debug hidden D2H at step {step}: {e}"))?;
+                let final_hidden: Vec<f32> = hidden_bytes
+                    .chunks_exact(2)
+                    .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                    .collect();
+                let payload = serde_json::json!({
+                    "step": step,
+                    "prompt_tokens": prompt_ids.len(),
+                    "layers": launch_layers,
+                    "kernel_input": debug_component_kernel_input
+                        .as_ref()
+                        .expect("component dump captures kernel input before launch"),
+                    "workspace_layout": {
+                        "hidden_f32": [hidden_base, hidden_size],
+                        "normed": [normed_base, hidden_size],
+                        "gate_up": [gate_up_base, 2 * intermediate_size],
+                        "mlp_out": [mlp_out_base, hidden_size],
+                        "token_out": [token_out_base, hidden_size],
+                        "proj_buf": [proj_buf_base, proj_buf_floats],
+                    },
+                    "post_attn_hidden": &workspace_f32[token_out_base..token_out_base + hidden_size],
+                    "post_attn_normed": &workspace_f32[normed_base..normed_base + hidden_size],
+                    "mlp_out": &workspace_f32[mlp_out_base..mlp_out_base + hidden_size],
+                    "final_hidden": final_hidden,
+                });
+                std::fs::write(path, serde_json::to_vec(&payload)?)
+                    .map_err(|e| anyhow!("write layer component dump {path}: {e}"))?;
+                eprintln!("[phi4-debug] wrote layer component dump to {path}");
             }
         }
 
