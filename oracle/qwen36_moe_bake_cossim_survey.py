@@ -42,9 +42,18 @@ def find_shard_for(model_dir: Path, name: str) -> Path:
             raise TensorAbsent(f"tensor not in safetensors index: {name}")
         return model_dir / wm[name]
     single = model_dir / "model.safetensors"
-    if single.exists():
-        return single
-    raise SystemExit(f"no safetensors at {model_dir}")
+    if not single.exists():
+        raise SystemExit(f"no safetensors at {model_dir}")
+    # Single-file mode: there's no index to consult, so probe the file's
+    # tensor keys directly. Without this, `load_safetensors` would call
+    # `get_tensor(name)` for tensors that legitimately don't exist for
+    # this layer type (e.g. `self_attn.*` on a linear-attn layer) and
+    # safetensors would raise — which would now propagate past
+    # `TensorAbsent` and abort the survey. Header-only open is cheap.
+    with safe_open(str(single), framework="pt", device="cpu") as f:
+        if name not in f.keys():
+            raise TensorAbsent(f"tensor not in single-file safetensors: {name}")
+    return single
 
 
 def load_safetensors(model_dir: Path, name: str) -> torch.Tensor:
