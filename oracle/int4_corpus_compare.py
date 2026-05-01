@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -278,12 +279,29 @@ def collect_eos_token_ids(tokenizer, model) -> set[int]:
 
 
 @torch.no_grad()
+def topk_payload(logits: torch.Tensor, tokenizer, top_k: int) -> list[dict]:
+    if top_k <= 0:
+        return []
+    logits_cpu = logits.float().detach().cpu()
+    k = min(top_k, logits_cpu.numel())
+    vals, idx = torch.topk(logits_cpu, k)
+    return [
+        {
+            "id": int(i),
+            "logit": float(v),
+            "text": tokenizer.decode([int(i)], skip_special_tokens=False),
+        }
+        for v, i in zip(vals, idx)
+    ]
+
+
 def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
-                  device: torch.device) -> tuple[list[int], str]:
+                  device: torch.device, top_k: int = 16) -> tuple[list[int], str, list[list[dict]]]:
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
     eos_token_ids = collect_eos_token_ids(tokenizer, model)
     past = None
     next_id = None
+    next_top: list[dict] = []
     for pos in range(ids.shape[1]):
         out = model(
             input_ids=ids[:, pos:pos + 1],
@@ -292,12 +310,16 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
             return_dict=True,
         )
         past = out.past_key_values
-        next_id = int(torch.argmax(out.logits[0, -1]).item())
+        logits = out.logits[0, -1]
+        next_id = int(torch.argmax(logits).item())
+        next_top = topk_payload(logits, tokenizer, top_k) if top_k > 0 else []
 
     new_ids: list[int] = []
+    top_by_token: list[list[dict]] = []
     for _ in range(max_new_tokens):
         assert next_id is not None
         new_ids.append(next_id)
+        top_by_token.append(next_top)
         if next_id in eos_token_ids:
             break
         out = model(
@@ -307,10 +329,12 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
             return_dict=True,
         )
         past = out.past_key_values
-        next_id = int(torch.argmax(out.logits[0, -1]).item())
+        logits = out.logits[0, -1]
+        next_id = int(torch.argmax(logits).item())
+        next_top = topk_payload(logits, tokenizer, top_k) if top_k > 0 else []
 
     text = tokenizer.decode(ids[0].tolist() + new_ids, skip_special_tokens=True)
-    return new_ids, text
+    return new_ids, text, top_by_token
 
 
 def rust_greedy(binary: Path, model_variant: str, model_dir: Path,
@@ -342,6 +366,98 @@ def rust_greedy(binary: Path, model_variant: str, model_dir: Path,
     return tokens, "\n".join(text_lines)
 
 
+def rust_materialized_diagnostics(binary: Path, model_variant: str, model_dir: Path,
+                                  prompt: str, max_new_tokens: int) -> dict:
+    with tempfile.NamedTemporaryFile(prefix="supersonic-rust-logits-", suffix=".json", delete=False) as f:
+        dump_path = Path(f.name)
+    cmd = [
+        str(binary), "--model", model_variant,
+        "--model-dir", str(model_dir),
+        "--prompt", prompt,
+        "--max-new-tokens", str(max_new_tokens),
+        "--int4",
+    ]
+    env = {k: v for k, v in os.environ.items() if k != "HSA_OVERRIDE_GFX_VERSION"}
+    env["SUPERSONIC_PHI4_DUMP_LOGITS"] = str(dump_path)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+        if proc.returncode != 0:
+            raise RuntimeError(f"supersonic diagnostic failed:\n{proc.stderr}\n{proc.stdout}")
+        tokens: list[int] = []
+        text_lines: list[str] = []
+        for line in proc.stdout.splitlines():
+            if line.startswith("[tokens] "):
+                tokens = [int(x) for x in line[len("[tokens] "):].split()]
+            else:
+                text_lines.append(line)
+        payload = json.loads(dump_path.read_text())
+        return {
+            "tokens": tokens,
+            "text": "\n".join(text_lines),
+            "samples": payload.get("samples", []),
+        }
+    finally:
+        try:
+            dump_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _logit_for(top: list[dict], token_id: int) -> float | None:
+    for item in top:
+        if item.get("id") == token_id:
+            return float(item["logit"])
+    return None
+
+
+def mismatch_diagnostic(py_ids: list[int], rs_ids: list[int], first_diverge: int,
+                        py_top_by_token: list[list[dict]], rust_diag: dict,
+                        near_tie_threshold: float) -> dict:
+    py_token = py_ids[first_diverge] if first_diverge < len(py_ids) else None
+    rust_token = rs_ids[first_diverge] if first_diverge < len(rs_ids) else None
+    py_top = py_top_by_token[first_diverge] if first_diverge < len(py_top_by_token) else []
+    rust_diag_tokens = rust_diag.get("tokens", [])
+    prefix_aligned = rust_diag_tokens[:first_diverge] == rs_ids[:first_diverge]
+
+    if not prefix_aligned:
+        return {
+            "python_token": py_token,
+            "rust_token": rust_token,
+            "python_top": py_top,
+            "rust_materialized_tokens": rust_diag_tokens,
+            "rust_materialized_top": [],
+            "logit_gaps": [],
+            "near_tie": False,
+            "prefix_aligned": False,
+        }
+
+    rust_samples = rust_diag.get("samples", [])
+    rust_sample = rust_samples[first_diverge] if first_diverge < len(rust_samples) else {}
+    rust_top = rust_sample.get("top", [])
+
+    py_chosen_logit = _logit_for(py_top, py_token) if py_token is not None else None
+    py_rust_logit = _logit_for(py_top, rust_token) if rust_token is not None else None
+    rust_chosen_logit = _logit_for(rust_top, rust_token) if rust_token is not None else None
+    rust_py_logit = _logit_for(rust_top, py_token) if py_token is not None else None
+
+    gaps = []
+    if py_chosen_logit is not None and py_rust_logit is not None:
+        gaps.append(abs(py_chosen_logit - py_rust_logit))
+    if rust_chosen_logit is not None and rust_py_logit is not None:
+        gaps.append(abs(rust_chosen_logit - rust_py_logit))
+    near_tie = bool(gaps) and min(gaps) <= near_tie_threshold
+    return {
+        "python_token": py_token,
+        "rust_token": rust_token,
+        "python_top": py_top,
+        "rust_materialized_tokens": rust_diag.get("tokens", []),
+        "rust_materialized_top": rust_top,
+        "logit_gaps": gaps,
+        "near_tie": near_tie,
+        "prefix_aligned": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -361,6 +477,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None)
     p.add_argument("--report", type=Path, default=None,
                    help="Optional JSON output path for detailed results")
+    p.add_argument("--diagnose-mismatches", action="store_true",
+                   help="On token mismatch, rerun Rust with materialized logits and include top-k diagnostics.")
+    p.add_argument("--diagnostic-top-k", type=int, default=16)
+    p.add_argument("--near-tie-threshold", type=float, default=0.5)
     return p.parse_args()
 
 
@@ -390,8 +510,9 @@ def main() -> int:
     for i, prompt in enumerate(prompts):
         log(f"\n[corpus] ({i+1}/{len(prompts)}) prompt={prompt!r}")
         t0 = time.perf_counter()
-        py_ids, py_text = python_greedy(
-            tokenizer, model, prompt, args.max_new_tokens, device,
+        diagnostic_top_k = args.diagnostic_top_k if args.diagnose_mismatches else 0
+        py_ids, py_text, py_top_by_token = python_greedy(
+            tokenizer, model, prompt, args.max_new_tokens, device, diagnostic_top_k,
         )
         py_ms = (time.perf_counter() - t0) * 1000
         log(f"  python  ({py_ms:.0f}ms): {py_text!r}")
@@ -414,13 +535,31 @@ def main() -> int:
             matches += 1
         log(f"  agree_for={first_diverge}/{max(len(py_ids), len(rs_ids))} "
             f"{'MATCH' if ok else 'DIVERGE'}")
-        results.append({
+        result = {
             "prompt": prompt,
             "python_tokens": py_ids,
             "rust_tokens": rs_ids,
             "first_divergence": first_diverge,
             "matched": ok,
-        })
+        }
+        if args.diagnose_mismatches and not ok:
+            rust_diag = rust_materialized_diagnostics(
+                args.binary, args.model_variant, args.model_dir,
+                prompt, args.max_new_tokens,
+            )
+            diag = mismatch_diagnostic(
+                py_ids, rs_ids, first_diverge, py_top_by_token, rust_diag,
+                args.near_tie_threshold,
+            )
+            result["diagnostic"] = diag
+            log(
+                "  diagnostic: "
+                f"near_tie={diag['near_tie']} "
+                f"prefix_aligned={diag['prefix_aligned']} "
+                f"python_token={diag['python_token']} rust_token={diag['rust_token']} "
+                f"gaps={diag['logit_gaps']}"
+            )
+        results.append(result)
 
     log(f"\n[corpus] {matches}/{len(prompts)} prompts matched in full")
     if args.report:

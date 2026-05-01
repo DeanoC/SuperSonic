@@ -402,6 +402,7 @@ pub fn run_phi4(
     }
     let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
     let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
+    let mut debug_logit_samples: Vec<serde_json::Value> = Vec::new();
     let head_dim = config.head_dim();
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
@@ -695,30 +696,36 @@ pub fn run_phi4(
                 (greedy_argmax(&logits_f32), Some(logits_f32))
             };
             if let (Some(ref path), Some(ref logits_f32)) = (&debug_dump_logits, &logits_f32) {
-                if in_prefill && step == prompt_ids.len() - 1 {
-                    let mut ranked: Vec<(usize, f32)> =
-                        logits_f32.iter().copied().enumerate().collect();
-                    ranked.sort_by(|a, b| {
-                        b.1.partial_cmp(&a.1)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                            .then_with(|| a.0.cmp(&b.0))
-                    });
-                    let top: Vec<_> = ranked
-                        .into_iter()
-                        .take(16)
-                        .map(|(id, logit)| serde_json::json!({ "id": id, "logit": logit }))
-                        .collect();
-                    let payload = serde_json::json!({
-                        "step": step,
-                        "prompt_tokens": prompt_ids.len(),
-                        "layers": launch_layers,
-                        "next": next,
-                        "top": top,
-                    });
-                    std::fs::write(path, serde_json::to_vec(&payload)?)
-                        .map_err(|e| anyhow!("write debug logits dump {path}: {e}"))?;
-                    eprintln!("[phi4-debug] wrote logits dump to {path}");
-                }
+                let mut ranked: Vec<(usize, f32)> =
+                    logits_f32.iter().copied().enumerate().collect();
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                let top: Vec<_> = ranked
+                    .into_iter()
+                    .take(16)
+                    .map(|(id, logit)| serde_json::json!({ "id": id, "logit": logit }))
+                    .collect();
+                debug_logit_samples.push(serde_json::json!({
+                    "step": step,
+                    "decode_index": if in_prefill { -1 } else { (step - prompt_ids.len()) as isize },
+                    "input_token": current_token,
+                    "next": next,
+                    "top": top.clone(),
+                }));
+                let payload = serde_json::json!({
+                    "step": step,
+                    "prompt_tokens": prompt_ids.len(),
+                    "layers": launch_layers,
+                    "next": next,
+                    "top": top,
+                    "samples": &debug_logit_samples,
+                });
+                std::fs::write(path, serde_json::to_vec(&payload)?)
+                    .map_err(|e| anyhow!("write debug logits dump {path}: {e}"))?;
+                eprintln!("[phi4-debug] wrote logits dump to {path}");
             }
 
             // --validate: compare against oracle. Prefill comparison happens
