@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
+use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::{Config, TextConfig};
@@ -24,6 +25,10 @@ use qwen36_moe::weights::{
     DEFAULT_PREFIX,
 };
 
+use crate::qwen36_moe_decode::{
+    argmax_bf16_logits, host_final_norm_lm_head, run_chained_decode, AttnLayerBuffers,
+    FfnLayerBuffers, LayerBuffers, MultiLayerGeom,
+};
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
 const GIB: f64 = (1024 * 1024 * 1024) as f64;
@@ -635,13 +640,6 @@ pub fn run(
     entry: &RegistryEntry,
     total_vram: u64,
 ) -> Result<()> {
-    if !cli.dry_run {
-        anyhow::bail!(
-            "qwen3.6-35b-a3b runtime: only --dry-run is implemented at this stage. \
-             Re-run with --dry-run to enumerate weights, compute the VRAM budget, \
-             and exit. Full decode lands in PR 4 (CUDA) and PR 6 (HIP)."
-        );
-    }
     // Derive context_size + an honest source flag so the printed report can
     // tell the user which of three answers they got: explicit, prompt-derived
     // estimate, or worst-case defaults-only. The `--context-size` path is
@@ -669,5 +667,272 @@ pub fn run(
         cli.no_bake,
     )?;
     print_report(&report);
+    if cli.dry_run {
+        return Ok(());
+    }
+
+    // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
+    // launches in `crate::qwen36_moe_decode::run_chained_decode` against
+    // per-layer weight buffers loaded from the BF16 baked package. The
+    // multi-layer parity test in `crates/runner/tests/qwen36_moe_multilayer_parity.rs`
+    // gates the decode core against the Python multi-layer oracle (cos_sim
+    // ≥ 0.999); this entry point is the same chain wired to the bake.
+    //
+    // Caveats for PR 4c step 2:
+    //  - BF16 only. INT4 chained decode + KV-cache extension are PR 4d.
+    //  - One token, fresh state. Conv + recurrent state start zeroed; the
+    //    full-attn KV cache isn't allocated (single-block kernels run with
+    //    `kv_len=1`). Multi-token generation needs prefill + state
+    //    persistence which lands later.
+    //  - Tokenizer not wired — the produced token is printed as a raw vocab
+    //    id so the "doesn't bail" criterion is verifiable end-to-end.
+    println!();
+    println!("=== Decode (PR 4c step 2: host-orchestrated chained launches) ===");
+    let token = decode_first_token(&cli.model_dir, &report)?;
+    println!("First decoded token id: {token}");
+    println!(
+        "(Note: BF16 only, fresh state, raw vocab id. INT4 chained decode + \
+         tokenizer + KV cache extension land in PR 4d.)"
+    );
     Ok(())
+}
+
+/// Build the geometry the chained decoder needs from the parsed config +
+/// the registry's per-family params. Mirrors what
+/// `oracle/qwen36_moe_multilayer_oracle.py` puts in `config` and what
+/// `MultiLayerGeom` consumes.
+fn build_multi_layer_geom(
+    text_config: &TextConfig,
+    kernel_params: &Qwen36MoeKernelParams,
+) -> MultiLayerGeom {
+    MultiLayerGeom {
+        hidden: text_config.hidden_size as i32,
+        vocab: text_config.vocab_size as i32,
+        num_layers: text_config.num_hidden_layers as i32,
+        rms_norm_eps: text_config.rms_norm_eps as f32,
+
+        num_attention_heads: text_config.num_attention_heads as i32,
+        num_kv_heads: text_config.num_key_value_heads as i32,
+        head_dim: text_config.head_dim as i32,
+        rotary_dim: text_config.rotary_dim() as i32,
+        rope_theta: text_config.rope_theta() as f32,
+
+        num_k_heads: text_config.linear_num_key_heads as i32,
+        num_v_heads: text_config.linear_num_value_heads as i32,
+        head_k_dim: text_config.linear_key_head_dim as i32,
+        head_v_dim: text_config.linear_value_head_dim as i32,
+        conv_kernel_dim: text_config.linear_conv_kernel_dim as i32,
+
+        num_experts: kernel_params.num_experts as i32,
+        moe_intermediate: kernel_params.moe_intermediate_size as i32,
+        shared_intermediate: kernel_params.shared_expert_intermediate_size as i32,
+        top_k: kernel_params.top_k as i32,
+    }
+}
+
+/// Open a BakedStore from the bake dir, loading one tensor by name to a
+/// fresh GpuBuffer. The wrapper exists to attach a useful context message
+/// when a tensor is missing (the bake-validation in `inspect_bake` already
+/// runs as part of the dry-run, so a missing tensor here is a real bug).
+fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuffer> {
+    store
+        .load_to_gpu(name, ordinal)
+        .with_context(|| format!("BakedStore::load_to_gpu({name})"))
+}
+
+/// Build one layer's worth of GPU-resident weight + state buffers from a
+/// BakedStore. Decides full-attn vs linear-attn by consulting the config's
+/// `layer_types` (every 4th layer is full per the standard hybrid pattern).
+fn load_layer_buffers(
+    store: &BakedStore,
+    ordinal: usize,
+    layer_idx: usize,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+) -> Result<LayerBuffers> {
+    let lp = format!("{weight_prefix}.layers.{layer_idx}");
+
+    let attn = if text_config.is_full_attention(layer_idx) {
+        let fa = format!("{lp}.self_attn");
+        AttnLayerBuffers::Full {
+            input_norm_w: load_to_gpu(store, ordinal, &format!("{lp}.input_layernorm.weight"))?,
+            q_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight"))?,
+            k_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.k_proj.weight"))?,
+            v_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.v_proj.weight"))?,
+            q_norm_w: load_to_gpu(store, ordinal, &format!("{fa}.q_norm.weight"))?,
+            k_norm_w: load_to_gpu(store, ordinal, &format!("{fa}.k_norm.weight"))?,
+            o_proj_w: load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight"))?,
+        }
+    } else {
+        let la = format!("{lp}.linear_attn");
+        let kernel = geom.conv_kernel_dim as usize;
+        let key_dim = (geom.num_k_heads as usize) * (geom.head_k_dim as usize);
+        let val_dim = (geom.num_v_heads as usize) * (geom.head_v_dim as usize);
+        let qkv_dim = 2 * key_dim + val_dim;
+        let state_elems =
+            (geom.num_v_heads as usize) * (geom.head_k_dim as usize) * (geom.head_v_dim as usize);
+
+        // First-decode-token state: conv + recurrent both zeros. The kernel
+        // mutates them in place; PR 4d will persist them across decode steps.
+        let conv_state = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, kernel - 1])
+            .with_context(|| format!("alloc conv_state (layer {layer_idx})"))?;
+        let recurrent_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[state_elems])
+            .with_context(|| format!("alloc recurrent_state (layer {layer_idx})"))?;
+
+        AttnLayerBuffers::Linear {
+            input_norm_w: load_to_gpu(store, ordinal, &format!("{lp}.input_layernorm.weight"))?,
+            in_proj_qkv_w: load_to_gpu(store, ordinal, &format!("{la}.in_proj_qkv.weight"))?,
+            in_proj_z_w: load_to_gpu(store, ordinal, &format!("{la}.in_proj_z.weight"))?,
+            in_proj_a_w: load_to_gpu(store, ordinal, &format!("{la}.in_proj_a.weight"))?,
+            in_proj_b_w: load_to_gpu(store, ordinal, &format!("{la}.in_proj_b.weight"))?,
+            conv1d_w: load_to_gpu(store, ordinal, &format!("{la}.conv1d.weight"))?,
+            // conv1d.bias may be absent — match the loader's behaviour.
+            conv1d_bias: store
+                .contains(&format!("{la}.conv1d.bias"))
+                .then(|| load_to_gpu(store, ordinal, &format!("{la}.conv1d.bias")))
+                .transpose()?,
+            dt_bias: load_to_gpu(store, ordinal, &format!("{la}.dt_bias"))?,
+            a_log: load_to_gpu(store, ordinal, &format!("{la}.A_log"))?,
+            norm_w: load_to_gpu(store, ordinal, &format!("{la}.norm.weight"))?,
+            out_proj_w: load_to_gpu(store, ordinal, &format!("{la}.out_proj.weight"))?,
+            conv_state,
+            recurrent_state,
+        }
+    };
+
+    let mp = format!("{lp}.mlp");
+    let ffn = FfnLayerBuffers {
+        post_attn_norm_w: load_to_gpu(store, ordinal, &format!("{lp}.post_attention_layernorm.weight"))?,
+        gate_w: load_to_gpu(store, ordinal, &format!("{mp}.gate.weight"))?,
+        // Note: experts.gate_up_proj / experts.down_proj have NO `.weight`
+        // suffix in the published checkpoint — see expected_tensor_specs.
+        gate_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?,
+        down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj"))?,
+        shared_gate_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.gate_proj.weight"))?,
+        shared_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.up_proj.weight"))?,
+        shared_down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.down_proj.weight"))?,
+        shared_expert_gate_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert_gate.weight"))?,
+    };
+
+    Ok(LayerBuffers { attn, ffn })
+}
+
+/// Look up one row of the embedding table on the host. For the
+/// "first decode token" smoke path we use token 0 (or BOS if defined) so
+/// the path runs end-to-end without a tokenizer. The full embed_tokens
+/// tensor is BF16 `[vocab, hidden]`; we slice the first `hidden*2` bytes
+/// out of its mmap-backed raw payload to avoid a full GPU upload of the
+/// embedding table.
+fn lookup_embed_row(
+    store: &BakedStore,
+    weight_prefix: &str,
+    token_id: usize,
+    hidden: usize,
+) -> Result<Vec<u8>> {
+    let name = format!("{weight_prefix}.embed_tokens.weight");
+    let bytes = store
+        .raw_bytes(&name)
+        .ok_or_else(|| anyhow!("missing {name} in bake"))?;
+    let row_bytes = hidden * 2;
+    let start = token_id * row_bytes;
+    let end = start + row_bytes;
+    if end > bytes.len() {
+        return Err(anyhow!(
+            "embed_tokens row {token_id} out of bounds (need {end} bytes, have {})",
+            bytes.len()
+        ));
+    }
+    Ok(bytes[start..end].to_vec())
+}
+
+/// Pull the host-side bytes for a small tensor (final norm, lm_head). For
+/// lm_head with vocab=248K × hidden=2048 BF16 that's ~1 GiB — host RAM is
+/// fine but a future revision should run lm_head on the GPU (PR 4d).
+fn host_load_bytes(store: &BakedStore, name: &str) -> Result<Vec<u8>> {
+    let raw = store
+        .raw_bytes(name)
+        .ok_or_else(|| anyhow!("missing {name} in bake"))?;
+    Ok(raw.to_vec())
+}
+
+/// Run one decode step against a real bake. Returns the argmax token id
+/// from the resulting logits.
+///
+/// **Untested on a real bake** — the 35B-A3B BF16 bake doesn't fit 24 GiB
+/// VRAM, and we don't have a smaller-geometry production bake to validate
+/// against. The decode core is parity-tested (cos_sim ≥ 0.999 vs Python
+/// oracle) via `crates/runner/tests/qwen36_moe_multilayer_parity.rs`; if a
+/// loadable bake materialises, this path uses the same chain wired to its
+/// per-layer pointers, so a crash here is more likely a tensor-name typo
+/// than an algorithmic bug.
+fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
+    let weight_prefix = report.kernel_params.weight_prefix;
+    let bake_dir = model_store::bake_dir(model_dir);
+    if !bake_dir.exists() {
+        return Err(anyhow!(
+            "decode requires a BF16 baked package at {}; create one with the \
+             standard bake pipeline or re-run with --dry-run for analytic accounting only. \
+             (PR 4c step 2 wires BF16 only — INT4 chained decode is PR 4d.)",
+            bake_dir.display()
+        ));
+    }
+    let store = BakedStore::open(&bake_dir)
+        .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
+
+    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+
+    let mut layers = Vec::with_capacity(geom.num_layers as usize);
+    for li in 0..geom.num_layers as usize {
+        let layer = load_layer_buffers(
+            &store,
+            ordinal,
+            li,
+            &geom,
+            &report.config.text_config,
+            weight_prefix,
+        )
+        .with_context(|| format!("load layer {li} weights"))?;
+        layers.push(layer);
+    }
+
+    // BOS token: if the config exposes one, prefer it; otherwise default to
+    // 0. Either way the parity criterion is "doesn't bail and emits a token",
+    // and the produced token id reflects whatever embedding row we picked.
+    let bos = report
+        .config
+        .text_config
+        .bos_token_id
+        .as_ref()
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let initial_hidden = lookup_embed_row(&store, weight_prefix, bos, geom.hidden as usize)
+        .with_context(|| format!("lookup embed row {bos}"))?;
+
+    let outputs =
+        run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, 0).context("chained decode")?;
+
+    let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
+        .context("load final norm")?;
+    // `tie_word_embeddings`: lm_head shares bytes with embed_tokens. Either
+    // way we read the [vocab, hidden] BF16 slab as a flat byte stream.
+    let lm_head_bytes = if report.config.text_config.tie_word_embeddings {
+        host_load_bytes(&store, &format!("{weight_prefix}.embed_tokens.weight"))
+            .context("load lm_head (tied)")?
+    } else {
+        host_load_bytes(&store, "lm_head.weight").context("load lm_head")?
+    };
+
+    let logits = host_final_norm_lm_head(
+        &outputs.final_hidden_bytes,
+        &final_norm_bytes,
+        &lm_head_bytes,
+        geom.hidden as usize,
+        geom.vocab as usize,
+        geom.rms_norm_eps,
+    );
+    Ok(argmax_bf16_logits(&logits))
 }

@@ -9,6 +9,7 @@ mod oracle;
 mod phi4_engine;
 mod prefill_engine;
 mod qwen35_dflash_engine;
+mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod registry;
 mod validate;
@@ -1071,13 +1072,10 @@ fn main() -> Result<()> {
     } else if cli.certified_kv_shadow_validate {
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
-    if model_variant.family() == ModelFamily::Qwen36Moe && !cli.dry_run {
-        anyhow::bail!(
-            "qwen3.6-35b-a3b decode runtime is not yet implemented. \
-             Re-run with --dry-run to enumerate the checkpoint and report VRAM accounting; \
-             the kernel lands in PR 4 (CUDA) and PR 6 (HIP) of docs/qwen36-moe-plan.md."
-        );
-    }
+    // PR 4c step 2 wires the host-orchestrated chained-launch decode path
+    // for Qwen3.6-MoE — qwen36_moe_engine::run handles both --dry-run and
+    // the BF16 decode path (one token from the bake) so this early bail is
+    // no longer needed.
 
     // 2. Detect GPU
     let (arch_name, total_vram, warp_size) = match backend {
