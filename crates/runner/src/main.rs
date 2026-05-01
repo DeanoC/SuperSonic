@@ -531,8 +531,8 @@ pub(crate) struct Cli {
     trace_oracle_prefill_layer: Option<usize>,
 
     /// Batch size for decode (number of sequences decoded in parallel).
-    /// Default 1. Supported on Qwen3.5 (requires 4B kernel: 2B/4B/9B models)
-    /// and Gemma 4 BF16 + INT4 via per-family batched megakernels.
+    /// Default 1. Supported on Qwen3.5 through the 4B-capable persistent
+    /// kernel and Gemma 4 BF16 + INT4 via per-family batched megakernels.
     #[arg(long, default_value = "1")]
     batch_size: usize,
 
@@ -1324,15 +1324,24 @@ fn main() -> Result<()> {
     }
 
     if backend == Backend::Cuda {
-        if cli.int4 {
-            anyhow::bail!("CUDA v1 does not support --int4 yet");
+        let qwen35_sm86 = matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_0_8B
+                | ModelVariant::Qwen3_5_2B
+                | ModelVariant::Qwen3_5_4B
+                | ModelVariant::Qwen3_5_9B
+        ) && entry.arch == GpuArch::Sm86;
+        if cli.int4 && !qwen35_sm86 {
+            anyhow::bail!("CUDA --int4 currently supports only Qwen3.5 on sm86");
         }
-        if cli.fp8_runtime && model_variant != ModelVariant::Qwen3_6_27B {
-            anyhow::bail!("CUDA --fp8-runtime currently supports only qwen3.6-27b on sm86");
+        if cli.fp8_runtime && !(qwen35_sm86 || model_variant == ModelVariant::Qwen3_6_27B) {
+            anyhow::bail!(
+                "CUDA --fp8-runtime currently supports only Qwen3.5 and qwen3.6-27b on sm86"
+            );
         }
         if cli.kv_fp8 {
-            if model_variant != ModelVariant::Qwen3_5_4B || gpu_arch != GpuArch::Sm86 {
-                anyhow::bail!("CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86");
+            if !qwen35_sm86 {
+                anyhow::bail!("CUDA --kv-fp8 currently supports only Qwen3.5 on sm86");
             }
             if env::var_os("SUPERSONIC_DEBUG_ENABLE_CUDA_KV_FP8_BF16_SIDECAR").is_none() {
                 env::set_var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW", "128");

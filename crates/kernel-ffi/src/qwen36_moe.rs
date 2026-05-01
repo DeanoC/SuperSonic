@@ -411,7 +411,7 @@ pub fn stub_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
 
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
@@ -518,7 +518,7 @@ pub fn attn_step_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
 
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
@@ -644,7 +644,7 @@ pub fn linear_step_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
 
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
@@ -780,7 +780,7 @@ pub fn ffn_step_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
 
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {

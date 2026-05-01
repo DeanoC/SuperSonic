@@ -73,27 +73,27 @@ COMMON_4B=(
     --max-new-tokens 1
 )
 
-run_fail "Test 1: CUDA rejects --int4" \
-    "CUDA v1 does not support --int4 yet" \
-    "${COMMON_0_8B[@]}" --int4
+COMMON_QWEN36_27B=(
+    --backend cuda
+    --model qwen3.6-27b
+    --model-dir "$MODEL_DIR_4B"
+    --prompt "Hello"
+    --max-new-tokens 1
+)
 
-run_fail "Test 2: CUDA rejects --fp8-runtime" \
-    "CUDA v1 does not support --fp8-runtime yet" \
-    "${COMMON_4B[@]}" --fp8-runtime
+run_fail "Test 1: CUDA rejects --int4 outside Qwen3.5" \
+    "CUDA --int4 currently supports only Qwen3.5 on sm86" \
+    "${COMMON_QWEN36_27B[@]}" --int4
 
-run_fail "Test 3: CUDA rejects --kv-fp8 on unsupported model" \
-    "CUDA --kv-fp8 currently supports only qwen3.5-4b on sm86" \
-    "${COMMON_0_8B[@]}" --kv-fp8
+run_fail "Test 2: CUDA rejects --kv-fp8 outside Qwen3.5" \
+    "CUDA --kv-fp8 currently supports only Qwen3.5 on sm86" \
+    "${COMMON_QWEN36_27B[@]}" --kv-fp8
 
-run_fail "Test 4: CUDA rejects batch on non-4B kernel" \
-    "--batch-size > 1 requires 4B kernel" \
-    "${COMMON_0_8B[@]}" --batch-size 2
-
-run_fail "Test 5: CUDA rejects out-of-range batch size" \
+run_fail "Test 3: CUDA rejects out-of-range batch size" \
     "--batch-size must be 1.." \
-    "${COMMON_4B[@]}" --batch-size 0
+    "${COMMON_4B[@]}" --int4 --batch-size 0
 
-run_fail "Test 6: unknown CUDA override stays explicit on unsupported model" \
+run_fail "Test 4: unknown CUDA override stays explicit on unsupported model" \
     "--allow-untested-gpu=sm999: no registry entry for model=gemma4-e2b backend=CUDA arch=sm999" \
     --backend cuda \
     --allow-untested-gpu sm999 \
