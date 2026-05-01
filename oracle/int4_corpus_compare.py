@@ -280,7 +280,11 @@ def collect_eos_token_ids(tokenizer, model) -> set[int]:
 
 @torch.no_grad()
 def topk_payload(logits: torch.Tensor, tokenizer, top_k: int) -> list[dict]:
-    vals, idx = torch.topk(logits.float().detach().cpu(), top_k)
+    if top_k <= 0:
+        return []
+    logits_cpu = logits.float().detach().cpu()
+    k = min(top_k, logits_cpu.numel())
+    vals, idx = torch.topk(logits_cpu, k)
     return [
         {
             "id": int(i),
@@ -308,7 +312,7 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
         past = out.past_key_values
         logits = out.logits[0, -1]
         next_id = int(torch.argmax(logits).item())
-        next_top = topk_payload(logits, tokenizer, top_k)
+        next_top = topk_payload(logits, tokenizer, top_k) if top_k > 0 else []
 
     new_ids: list[int] = []
     top_by_token: list[list[dict]] = []
@@ -327,7 +331,7 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
         past = out.past_key_values
         logits = out.logits[0, -1]
         next_id = int(torch.argmax(logits).item())
-        next_top = topk_payload(logits, tokenizer, top_k)
+        next_top = topk_payload(logits, tokenizer, top_k) if top_k > 0 else []
 
     text = tokenizer.decode(ids[0].tolist() + new_ids, skip_special_tokens=True)
     return new_ids, text, top_by_token
@@ -506,8 +510,9 @@ def main() -> int:
     for i, prompt in enumerate(prompts):
         log(f"\n[corpus] ({i+1}/{len(prompts)}) prompt={prompt!r}")
         t0 = time.perf_counter()
+        diagnostic_top_k = args.diagnostic_top_k if args.diagnose_mismatches else 0
         py_ids, py_text, py_top_by_token = python_greedy(
-            tokenizer, model, prompt, args.max_new_tokens, device, args.diagnostic_top_k,
+            tokenizer, model, prompt, args.max_new_tokens, device, diagnostic_top_k,
         )
         py_ms = (time.perf_counter() - t0) * 1000
         log(f"  python  ({py_ms:.0f}ms): {py_text!r}")
