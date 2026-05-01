@@ -1,0 +1,185 @@
+# Qwen3.6-MoE INT4 GPTQ bake quality audit
+
+**Status**: audit complete, no algorithmic bugs found. Quality issues are
+design limitations of the in-house GPTQ implementation.
+
+## Symptom
+
+Multi-token decode against the local INT4 GPTQ bake at
+`<model>/.supersonic/v2-int4-gptq/` produces near-random output:
+
+  $ supersonic --model qwen3.6-35b-a3b --model-dir <snap> \
+      --prompt "The quick brown fox" --max-new-tokens 8
+  > The quick brown foxstoreparepareUDAUDAUDAUDAUDA
+
+Per-prompt argmax IS responsive to input (different prompts → different
+first tokens), but the model immediately settles into a small set of
+tokens (UDA/store/pare/udas/lis). At T=0.8 + top_p=0.9 the entire vocab
+is sampled near-uniformly including foreign scripts ("OLOG internsieß
+第二段的统一 발표isk"), confirming the logit distribution is nearly flat.
+
+## What we ruled out
+
+### Engine + decode pipeline ✅
+  - Multi-layer parity test (synthetic 4-layer): cos_sim 0.9999 final
+    logits, BF16 + INT4 modes both pass.
+  - Per-block parity tests at *production* geometry against real
+    safetensors weights:
+      - Full-attn (layer 3, H=16, Hkv=2, d=256, hidden=2048):
+        n=2048 exact=2048 cos_sim=1.0  (bit-exact)
+      - Linear-attn (layer 0): passes
+      - FFN (layer 0, E=256, top_k=8, I=Is=512): passes
+  - KV cache reads/writes verified by the kv_len=1 fast-path being
+    bit-exact with the pre-cache PR 4b2 implementation.
+
+### Sampling ✅
+  - Greedy-vs-sampled output proves the issue isn't sampling — the
+    underlying logit distribution itself is too flat for either to
+    produce coherent text.
+
+### Bake ↔ kernel format ✅
+  - Python dequant `bf16(q*s - z*s)` matches the kernel's
+    `int4_dequant_scalar` formula exactly (same nibble-packing
+    convention, same tile indexing, same rounding).
+
+## What we found
+
+### Per-tensor INT4 reconstruction error from the bake
+
+Sampled tensors compared bake-INT4-reconstruction vs safetensors BF16
+(ground truth):
+
+  tensor                                         shape    tiles    cos_sim
+  layers.3.self_attn.q_proj                  (8192, 2048)  1024     0.961
+  layers.3.self_attn.o_proj                  (2048, 4096)   512     0.900
+  layers.0.linear_attn.in_proj_qkv           (8192, 2048)  1024     0.941
+  layers.0.linear_attn.in_proj_z             (4096, 2048)   512     0.971
+  layers.0.linear_attn.out_proj              (2048, 4096)   512     0.899
+  layers.0.mlp.shared_expert.gate_proj        (512, 2048)    64     0.880
+  layers.0.mlp.shared_expert.up_proj          (512, 2048)    64     0.952
+  layers.0.mlp.shared_expert.down_proj        (2048, 512)    64     0.925
+
+Per-tensor 3-12% directional error compounds across 40 layers ×
+multiple tensors per layer to effectively-random hidden states by the
+time the chain reaches the lm_head. Production AutoGPTQ INT4 typically
+delivers ≥ 0.99 per-tensor cos_sim; we are 0.05–0.12 below that bar.
+
+Notable: tensors that produce a `[..., out=2048 or 512]` (o_proj,
+out_proj, shared_expert.gate_proj) consistently land at the bottom of
+the cos_sim range. Those are the layer-output projections that GPTQ
+quantizes LAST in each layer's order; they inherit the most accumulated
+sequential-calibration error.
+
+### Algorithm audit (oracle/bake_int4.py)
+
+Walked the implementation against canonical GPTQ end to end. Every
+piece checks out:
+
+  - **Hessian** (`HessianHook`, line 513–536):
+    `H = 2/N * sum_t x_t x_t^T` accumulated via forward-pre hooks.
+    Recursive average update is correct; total `H` after all samples
+    matches the canonical formula.
+
+  - **Damping** (line 247–254): `H[i,i] += damp * mean(diag(H))`,
+    damp=0.01 default (matches AutoGPTQ).
+
+  - **Cholesky-of-inverse** (line 263–269): `L = chol(H)` (lower);
+    `Hinv = L^-T L^-1`; `U = chol(Hinv, upper=True)` upper-triangular
+    such that `U^T U = Hinv`. Stored back in `Hinv` (variable name is
+    misleading but math is correct).
+
+  - **Per-column error propagation** (line 307–340): standard GPTQ
+    update `err = (w - q_dq) / U[i,i]`; `W[:, i+1:] -= err * U[i, i+1:]`.
+
+  - **Block boundary error propagation** (line 343–344): standard
+    `Err1 @ Hinv[b:e, e:]` propagates accumulated block errors to all
+    columns past the block. With `blocksize == group_size == 128`, no
+    column-group spans a block boundary.
+
+  - **Scale derivation** (line 278–293): per-tile min/max,
+    `sc = rng/15`, `zf = -tmin/sc`, both rounded through BF16 to match
+    runtime kernel reads.
+
+  - **Quantization** (line 326–332): `q = clamp(round(w/sc + zf), 0, 15)`;
+    `q_dq = bf16(q*sc - zf*sc)` — matches kernel's `int4_dequant_scalar`
+    exactly so error feedback uses what the kernel will actually read.
+
+  - **Sequential calibration** (line 824–906): standard. Each layer's
+    quantized outputs feed the next layer's Hessian collection.
+
+  - **Calibration data** (line 1267–1280): defaults to 128 sequences ×
+    2048 tokens from WikiText-2 train. Standard.
+
+  - **lm_head GPTQ** (line 921–999): same algorithm applied to lm_head
+    using post-final-norm hidden as activation. Correct.
+
+### Identified design limitations (not bugs)
+
+1. **No scale search.** `set_tile_scales` (line 278) uses plain min/max
+   for every tile. AutoGPTQ tries multiple candidate scales per tile
+   (typically `rng * f / 15` for `f in [1.0, 0.95, 0.9, …]`) and picks
+   the one minimizing per-tile reconstruction MSE. Skipping scale
+   search costs noticeable per-tensor accuracy; this is the most likely
+   single contributor to our cos_sim gap vs AutoGPTQ-class output.
+
+2. **Min/max for fused experts (no GPTQ).** `fused_expert_minmax_int4`
+   (line 386) does plain min/max on each expert's `[out, in]` slab.
+   Justified in code comments by the fused 3D layout being awkward for
+   Hessian-aware quant on the producer host. ~half the model's
+   parameters take this path on Qwen3.6-MoE.
+
+3. **Coarse 128×128 tile granularity.** Each `(scale, zero)` pair
+   covers a 16384-weight tile with 16 quantization levels. Narrower
+   projections (e.g. shared_expert.gate_proj `[512, 2048]`, only 64
+   tiles total) get the most coarse quantization — visible in the
+   cos_sim survey.
+
+## What to do
+
+The audit confirms no bug to fix in the GPTQ algorithm. The realistic
+quality lever options, in order of expected impact vs effort:
+
+### Option 1: Add scale search (~1 day; modest gain per re-bake hour)
+Patch `set_tile_scales` (line 278 of `oracle/bake_int4.py`) to try
+~5 candidate scales per tile and pick the one minimizing per-tile MSE.
+~30 LoC. Re-baking 35B-A3B takes hours (whole calibration loop), so
+each iteration is expensive — but no infrastructure changes needed.
+
+### Option 2: Migrate to AutoGPTQ (~1 week; biggest gain)
+AutoGPTQ has been battle-tested on hundreds of production models and
+includes scale search, activation reordering, static-vs-dynamic group
+choices, and other tuning. Output format would need a small adapter
+(their `[in, out]` packing vs our `[out, in/2]`) but their per-tensor
+quality is well-documented at ≥ 0.99 cos_sim. Best long-term answer.
+
+### Option 3: Less aggressive quantization (~1 day; large gain at runtime cost)
+Switch from INT4 (4 bits + 16 levels) to INT8 (8 bits + 256 levels) for
+dense projections. Per-tensor cos_sim would jump to ~0.999. Doubles the
+weight VRAM (17 GiB → ~26 GiB), so no longer fits 24 GiB on this card —
+only useful when the goal is "verify the engine works end-to-end on
+*good* weights, even if not deployable on this card".
+
+### Option 4: Hessian-aware MoE expert quant (~2 days; modest gain)
+Replace `fused_expert_minmax_int4` with a router-aware GPTQ that only
+includes calibration tokens routed to each expert. Substantial code
+work; only worth it if dense projections (currently the worst tensors)
+are first improved by Option 1 or 2.
+
+## Recommendation
+
+Start with **Option 1 (add scale search)**. Smallest blast radius, no
+new infrastructure, directly addresses the worst-quality tensors in the
+audit. If post-scale-search per-tensor cos_sim still under 0.98 across
+the bake, escalate to Option 2.
+
+## Verification protocol for any future bake
+
+1. Run `oracle/bake_int4.py --model-dir <snap>` to produce
+   `.supersonic/v2-int4-gptq/`.
+2. Run the per-tensor cos_sim survey (see this doc's "What we found"
+   section — script captured in shell history at audit time).
+3. Acceptance: every quantized tensor cos_sim ≥ 0.98 vs safetensors.
+4. End-to-end smoke: `cargo run --release --bin supersonic --model
+   qwen3.6-35b-a3b --model-dir <snap> --prompt "The quick brown fox"
+   --max-new-tokens 16 --temperature 0.8 --top-p 0.9` — output should
+   be coherent English (not the current degenerate "UDAUDAUDA" pattern).
