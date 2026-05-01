@@ -722,6 +722,7 @@ pub fn run(
         &cli.prompt,
         cli.max_new_tokens.max(1),
         sampling,
+        cli.emit_stage_timings,
     )?;
     Ok(())
 }
@@ -1004,6 +1005,7 @@ fn decode_text(
     prompt: &str,
     max_new: usize,
     sampling: SamplingParams,
+    emit_stage_timings: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1160,8 +1162,23 @@ fn decode_text(
         sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed,
     );
 
+    // Per-stage wall-clock accumulators. Aggregated across generation steps
+    // only (prefill steps run the chain but skip the lm_head/sample stages,
+    // so timing prefill mixed with gen would distort the per-token average).
+    // `chain_ms` includes the GPU work + the D2H copy of `final_hidden_bytes`
+    // — `run_chained_decode` syncs before returning, so the wall-clock here
+    // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
+    // GEMV, sampling, detokenize) are pure host work.
+    let mut gen_steps: usize = 0;
+    let mut t_embed = std::time::Duration::ZERO;
+    let mut t_chain = std::time::Duration::ZERO;
+    let mut t_lm_head = std::time::Duration::ZERO;
+    let mut t_sample = std::time::Duration::ZERO;
+    let mut t_detok = std::time::Duration::ZERO;
+
     for step in 0..total_steps {
         // Embed lookup for the current token.
+        let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
             &store,
             weight_prefix,
@@ -1169,10 +1186,13 @@ fn decode_text(
             geom.hidden as usize,
         )
         .with_context(|| format!("embed lookup token {current_token} (step {step})"))?;
+        let t_embed_step = t0.elapsed();
 
         // Run the chain. Linear-attn state mutates in `layers` in place.
+        let t1 = std::time::Instant::now();
         let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
             .with_context(|| format!("chained decode (step {step}, position {position})"))?;
+        let t_chain_step = t1.elapsed();
         position += 1;
 
         // Prefill steps: feed the next prompt token without computing logits.
@@ -1191,10 +1211,8 @@ fn decode_text(
             );
         }
 
-        // Generation step: lm_head + sample (greedy when temperature == 0).
-        // Uses the F32-cached final_norm + lm_head so the per-token cost is
-        // just one BF16→F32 of the (small) hidden vector + GEMV; the
-        // expensive lm_head conversion happens once at decode_text start.
+        // Generation step: final_norm + lm_head GEMV (host F32, cached).
+        let t2 = std::time::Instant::now();
         let logits = host_final_norm_lm_head_f32(
             &outputs.final_hidden_bytes,
             &final_norm_f32,
@@ -1203,6 +1221,7 @@ fn decode_text(
             geom.vocab as usize,
             geom.rms_norm_eps,
         );
+        let t_lm_head_step = t2.elapsed();
         if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
             std::fs::write(&dump_path, &logits)
                 .with_context(|| format!("write logits dump to {dump_path}"))?;
@@ -1211,6 +1230,7 @@ fn decode_text(
                 logits.len()
             );
         }
+        let t3 = std::time::Instant::now();
         let next_token = sample_bf16_logits(
             &logits,
             sampling.temperature,
@@ -1218,15 +1238,25 @@ fn decode_text(
             sampling.top_p,
             &mut rng,
         );
+        let t_sample_step = t3.elapsed();
         generated_ids.push(next_token);
 
         // Stream-decode and print.
+        let t4 = std::time::Instant::now();
         if let Some(tok) = &tokenizer {
             if let Ok(text) = tok.decode(&[next_token], false) {
                 print!("{text}");
                 std::io::stdout().flush().ok();
             }
         }
+        let t_detok_step = t4.elapsed();
+
+        gen_steps += 1;
+        t_embed += t_embed_step;
+        t_chain += t_chain_step;
+        t_lm_head += t_lm_head_step;
+        t_sample += t_sample_step;
+        t_detok += t_detok_step;
 
         if Some(next_token) == eos_id {
             break;
@@ -1248,12 +1278,32 @@ fn decode_text(
             "no (max_new_tokens hit)"
         },
     );
-    println!(
-        "  (Note: greedy decoding only; sampling, temperature/top-p, and \
-         GPU-side lm_head are next.)"
-    );
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
+    }
+    if emit_stage_timings && gen_steps > 0 {
+        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let chain_ms = to_ms(t_chain);
+        let embed_ms = to_ms(t_embed);
+        let lm_head_ms = to_ms(t_lm_head);
+        let sample_ms = to_ms(t_sample);
+        let detok_ms = to_ms(t_detok);
+        let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
+        let n = gen_steps as f64;
+        eprintln!(
+            "[qwen36-moe stage-timings] gen_steps={gen_steps} \
+             embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
+             sample_ms_avg={:.3} detok_ms_avg={:.3} total_ms_avg={:.3} \
+             (chain_total_ms={:.1} lm_head_total_ms={:.1})",
+            embed_ms / n,
+            chain_ms / n,
+            lm_head_ms / n,
+            sample_ms / n,
+            detok_ms / n,
+            total_ms / n,
+            chain_ms,
+            lm_head_ms,
+        );
     }
 
     Ok(())
