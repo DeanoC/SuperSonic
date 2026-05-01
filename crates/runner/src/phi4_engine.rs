@@ -402,7 +402,9 @@ pub fn run_phi4(
     }
     let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
     let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
+    let debug_dump_direct_argmax = std::env::var("SUPERSONIC_PHI4_DUMP_DIRECT_ARGMAX").ok();
     let mut debug_logit_samples: Vec<serde_json::Value> = Vec::new();
+    let mut debug_direct_argmax_samples: Vec<serde_json::Value> = Vec::new();
     let head_dim = config.head_dim();
     let num_heads = config.num_attention_heads;
     let num_kv_heads = config.num_key_value_heads;
@@ -672,6 +674,49 @@ pub fn run_phi4(
                     .map_err(|e| anyhow!("lm_head argmax D2H at step {step}: {e}"))?;
                 let next =
                     u32::from_le_bytes([idx_bytes[0], idx_bytes[1], idx_bytes[2], idx_bytes[3]]);
+                if let Some(ref path) = debug_dump_direct_argmax {
+                    let vals_bytes = lm_argmax_vals
+                        .to_host_bytes()
+                        .map_err(|e| anyhow!("lm_head argmax vals D2H at step {step}: {e}"))?;
+                    let idxs_bytes = lm_argmax_idxs
+                        .to_host_bytes()
+                        .map_err(|e| anyhow!("lm_head argmax idxs D2H at step {step}: {e}"))?;
+                    let vals = vals_bytes
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                    let idxs = idxs_bytes
+                        .chunks_exact(4)
+                        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+                    let mut ranked: Vec<(u32, f32)> = idxs.zip(vals).collect();
+                    ranked.sort_by(|a, b| {
+                        b.1.partial_cmp(&a.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    let top_blocks: Vec<_> = ranked
+                        .into_iter()
+                        .take(16)
+                        .map(|(id, logit)| serde_json::json!({ "id": id, "logit": logit }))
+                        .collect();
+                    debug_direct_argmax_samples.push(serde_json::json!({
+                        "step": step,
+                        "decode_index": if in_prefill { -1 } else { (step - prompt_ids.len()) as isize },
+                        "input_token": current_token,
+                        "next": next,
+                        "top_block_winners": top_blocks,
+                    }));
+                    let payload = serde_json::json!({
+                        "step": step,
+                        "prompt_tokens": prompt_ids.len(),
+                        "layers": launch_layers,
+                        "next": next,
+                        "partial_block_winners": true,
+                        "samples": &debug_direct_argmax_samples,
+                    });
+                    std::fs::write(path, serde_json::to_vec(&payload)?)
+                        .map_err(|e| anyhow!("write direct argmax dump {path}: {e}"))?;
+                    eprintln!("[phi4-debug] wrote direct argmax dump to {path}");
+                }
                 (next, None)
             } else {
                 kernel_ffi::standalone_matvec_4b(

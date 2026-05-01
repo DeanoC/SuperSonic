@@ -1240,7 +1240,7 @@ pub fn lm_head_launch(
     }
 
     let backend = lm_head_w_buf.backend();
-    let status = match backend {
+    let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
             unsafe {
