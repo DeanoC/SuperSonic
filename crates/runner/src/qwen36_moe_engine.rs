@@ -1200,6 +1200,10 @@ fn decode_text(
     let mut t_lm_head = std::time::Duration::ZERO;
     let mut t_sample = std::time::Duration::ZERO;
     let mut t_detok = std::time::Duration::ZERO;
+    // Within-chain breakdown by kernel class (microseconds).
+    let mut t_chain_full_attn_us: u64 = 0;
+    let mut t_chain_linear_attn_us: u64 = 0;
+    let mut t_chain_ffn_us: u64 = 0;
 
     for step in 0..total_steps {
         // Embed lookup for the current token.
@@ -1305,6 +1309,9 @@ fn decode_text(
         t_lm_head += t_lm_head_step;
         t_sample += t_sample_step;
         t_detok += t_detok_step;
+        t_chain_full_attn_us += outputs.kernel_full_attn_us;
+        t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
+        t_chain_ffn_us += outputs.kernel_ffn_us;
 
         if Some(next_token) == eos_id {
             break;
@@ -1338,6 +1345,9 @@ fn decode_text(
         let detok_ms = to_ms(t_detok);
         let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
         let n = gen_steps as f64;
+        let full_attn_ms = (t_chain_full_attn_us as f64) / 1000.0;
+        let linear_attn_ms = (t_chain_linear_attn_us as f64) / 1000.0;
+        let ffn_ms = (t_chain_ffn_us as f64) / 1000.0;
         eprintln!(
             "[qwen36-moe stage-timings] gen_steps={gen_steps} \
              embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
@@ -1351,6 +1361,17 @@ fn decode_text(
             total_ms / n,
             chain_ms,
             lm_head_ms,
+        );
+        eprintln!(
+            "[qwen36-moe chain-breakdown] gen_steps={gen_steps} \
+             full_attn_ms_avg={:.3} linear_attn_ms_avg={:.3} ffn_ms_avg={:.3} \
+             (full_attn_total_ms={:.1} linear_attn_total_ms={:.1} ffn_total_ms={:.1})",
+            full_attn_ms / n,
+            linear_attn_ms / n,
+            ffn_ms / n,
+            full_attn_ms,
+            linear_attn_ms,
+            ffn_ms,
         );
     }
 

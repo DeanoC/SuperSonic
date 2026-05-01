@@ -212,6 +212,13 @@ pub struct DecodeOutputs {
     /// `[num_layers][hidden]` BF16. `output_after_ffn[i]` is layer `i`'s
     /// post-FFN residual (input to layer `i+1`).
     pub per_layer_ffn_out: Vec<Vec<u8>>,
+    /// Wall-clock breakdown of the kernel launches inside this chain.
+    /// `*_us` are sums-across-layers in microseconds. The launches are
+    /// internally synchronous (`hipDeviceSynchronize` in the bridge), so
+    /// the host wall-clock here measures real GPU + sync time.
+    pub kernel_full_attn_us: u64,
+    pub kernel_linear_attn_us: u64,
+    pub kernel_ffn_us: u64,
 }
 
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
@@ -486,6 +493,14 @@ pub fn run_chained_decode_with_options(
     let mut per_layer_attn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
     let mut per_layer_ffn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
 
+    // Per-kernel-class wall-clock accumulators. Reported back via
+    // `DecodeOutputs.kernel_*_us`; the engine surfaces them under
+    // `--emit-stage-timings` so we can see whether attn / linear / ffn
+    // dominates the chain time.
+    let mut t_full_attn = std::time::Duration::ZERO;
+    let mut t_linear_attn = std::time::Duration::ZERO;
+    let mut t_ffn = std::time::Duration::ZERO;
+
     // `capture` ⇔ "I need the per-layer hidden bytes on the host".
     // True if the caller asked for them OR if `trace_norms` is on (norm
     // computation reads the BF16 bytes). Otherwise we skip the D2H
@@ -569,6 +584,7 @@ pub fn run_chained_decode_with_options(
                     },
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
+                let t_k = std::time::Instant::now();
                 attn_step_launch(
                     ordinal,
                     ScalarType::BF16,
@@ -580,6 +596,7 @@ pub fn run_chained_decode_with_options(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
+                t_full_attn += t_k.elapsed();
             }
             AttnLayerBuffers::Linear {
                 input_norm_w,
@@ -638,6 +655,7 @@ pub fn run_chained_decode_with_options(
                     },
                     None => Qwen36MoeLinearStepInt4::disabled(),
                 };
+                let t_k = std::time::Instant::now();
                 linear_step_launch(
                     ordinal,
                     ScalarType::BF16,
@@ -649,6 +667,7 @@ pub fn run_chained_decode_with_options(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
+                t_linear_attn += t_k.elapsed();
             }
         }
 
@@ -726,6 +745,7 @@ pub fn run_chained_decode_with_options(
             },
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
+        let t_k = std::time::Instant::now();
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
@@ -738,6 +758,7 @@ pub fn run_chained_decode_with_options(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        t_ffn += t_k.elapsed();
 
         // Same D2D + swap as the attn step.
         gpu_hal::copy_d2d(
@@ -771,6 +792,9 @@ pub fn run_chained_decode_with_options(
         final_hidden_bytes,
         per_layer_attn_out,
         per_layer_ffn_out,
+        kernel_full_attn_us: t_full_attn.as_micros() as u64,
+        kernel_linear_attn_us: t_linear_attn.as_micros() as u64,
+        kernel_ffn_us: t_ffn.as_micros() as u64,
     })
 }
 
