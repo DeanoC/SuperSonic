@@ -270,13 +270,17 @@ fn linear_attn_output_elems(geom: &MultiLayerGeom) -> usize {
 /// FFN parity launcher workspace floats — copied from the per-block test
 /// file's `ffn_parity_workspace_floats`. See its docstring for the
 /// per-stage layout (`OFF_H_NORM` in `kernels/qwen36_moe.hip`).
+///
+/// The per-expert scratch slabs (`EXPERT_GU`, `EXPERT_MID`) are sized
+/// `k * 2*I` and `k * I` respectively so all `top_k` experts can run
+/// G/H/I concurrently (one block-group per expert).
 fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
     let k = geom.top_k as usize;
     let is_dim = geom.shared_intermediate as usize;
     let i_dim = geom.moe_intermediate as usize;
-    3 * hidden + 2 * e + 2 * k + 1 + 3 * is_dim + 3 * i_dim + k * hidden
+    3 * hidden + 2 * e + 2 * k + 1 + 3 * is_dim + k * 3 * i_dim + k * hidden
 }
 
 /// FFN output BF16 elements — stage 5 publishes `[hidden]`, which is also
@@ -285,11 +289,18 @@ fn ffn_output_elems(geom: &MultiLayerGeom) -> usize {
     geom.hidden as usize
 }
 
-/// Reset the 32-byte cooperative-launch sync buffer between launches. The
+/// Reset the 96-byte cooperative-launch sync buffer between launches. The
 /// kernels use it for atomic counters + the grid barrier; failure to reset
 /// would cause the next launch's barrier to hang or skip work.
+///
+/// Layout (matches the four qwen36_moe FFI wrappers):
+///   counters[0..16]      bytes  0..63  (16 work-stealing slots, used by the
+///                                       FFN concurrent-experts dispatch)
+///   barrier_counter      bytes 64..67
+///   barrier_flag         bytes 68..71
+///   (padding to 96 bytes for alignment headroom)
 fn reset_sync_buf(ordinal: usize, sync_buf: &mut GpuBuffer) -> Result<(), GpuError> {
-    memset_zeros(ordinal, sync_buf.as_mut_ptr(), 32)
+    memset_zeros(ordinal, sync_buf.as_mut_ptr(), 96)
 }
 
 /// Copy `[hidden]` BF16 elements out of a GPU buffer into a freshly
@@ -488,7 +499,7 @@ pub fn run_chained_decode_with_options(
         .context("alloc ffn_workspace")?;
 
     let mut sync_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::U8, &[32]).context("alloc sync_buf")?;
+        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc sync_buf")?;
 
     let mut per_layer_attn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());
     let mut per_layer_ffn_out: Vec<Vec<u8>> = Vec::with_capacity(layers.len());

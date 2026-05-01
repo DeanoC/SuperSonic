@@ -457,7 +457,13 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
 
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
+    // Zero the 2*top_k work-stealing counter slots used by the concurrent
+    // per-expert G/I phases. The engine's `reset_sync_buf` covers the full
+    // 96-byte buffer (counters + barrier counter + flag); this paranoid
+    // memset just guards single-launch callers (parity tests) that allocate
+    // sync_buf via `GpuBuffer::zeros` (already zero) and would only fail if
+    // someone reused a sync_buf without resetting.
+    if (hipMemsetAsync(counters, 0, 2 * top_k * sizeof(unsigned int)) != hipSuccess) {
         return 200;
     }
 

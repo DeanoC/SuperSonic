@@ -1848,13 +1848,18 @@ __global__ void qwen36_moe_linear_step_kernel(
 //     SUP           = hidden + 2*E + 2*k + 1 + Is                    [Is]  shared_up_proj output
 //     SHARED_MID    = hidden + 2*E + 2*k + 1 + 2*Is                  [Is]  silu(sgp) * sup (F32)
 //     SHARED_OUT    = hidden + 2*E + 2*k + 1 + 3*Is                  [hidden] shared expert path output (BF16-rounded F32)
-//     EXPERT_GU     = ... + hidden                                   [2*I] gate_up_proj output for one expert (F32)
-//     EXPERT_MID    = ... + 2*I                                      [I]   silu(gu[:I]) * gu[I:]  (F32)
-//     EXPERT_STACK  = ... + I                                        [k * hidden] per-expert outs (F32, no BF16 round)
+//     EXPERT_GU     = ... + hidden                                   [k * 2*I] per-expert gate_up_proj outputs (F32)
+//                                                                    one [2*I] slab per concurrent expert group
+//     EXPERT_MID    = ... + k*2*I                                    [k * I]   per-expert silu(gu[:I]) * gu[I:] (F32)
+//                                                                    one [I] slab per concurrent expert group
+//     EXPERT_STACK  = ... + k*I                                      [k * hidden] per-expert outs (F32, no BF16 round)
 //     MOE_OUT       = ... + k*hidden                                 [hidden] BF16-rounded F32
 //     OUTPUT_HIDDEN = ... + hidden                                   [hidden]
 //   For 35B-A3B (hidden=2048, E=256, k=8, Is=512, I=512) stage-5 footprint
-//   is ~28,177 F32 = ~110 KiB. Well within the persistent-decode budget.
+//   is ~38,929 F32 = ~152 KiB after EXPERT_GU/MID grew K_top-wide so all
+//   `top_k` experts can run G/H/I concurrently (one block-group per expert,
+//   `num_blocks / k` blocks per group on gfx1100 = 96/8 = 12). Still well
+//   within the persistent-decode budget.
 //
 //   Numerics: every per-expert intermediate (EXPERT_GU, EXPERT_MID,
 //   EXPERT_STACK) stays raw F32 to mirror the oracle's all-F32 chain
@@ -1939,8 +1944,8 @@ __global__ void qwen36_moe_ffn_step_kernel(
     const int OFF_SHARED_MID    = OFF_SUP + shared_intermediate;
     const int OFF_SHARED_OUT    = OFF_SHARED_MID + shared_intermediate;
     const int OFF_EXPERT_GU     = OFF_SHARED_OUT + hidden;
-    const int OFF_EXPERT_MID    = OFF_EXPERT_GU + 2 * moe_intermediate;
-    const int OFF_EXPERT_STACK  = OFF_EXPERT_MID + moe_intermediate;
+    const int OFF_EXPERT_MID    = OFF_EXPERT_GU + top_k * 2 * moe_intermediate;
+    const int OFF_EXPERT_STACK  = OFF_EXPERT_MID + top_k * moe_intermediate;
     const int OFF_MOE_OUT       = OFF_EXPERT_STACK + top_k * hidden;
 
     // -- Phase A: load input + post_attn RMS norm --------------------------
@@ -2322,14 +2327,50 @@ __global__ void qwen36_moe_ffn_step_kernel(
         return;
     }
 
-    // -- Phase G/H/I: per-expert FFN — k-iteration loop  -------------------
-    // Stage 3 dispatches just topk_idx[0]; stage 4+ sweeps all k experts.
-    // The per-iteration body is the same; the difference is what we do
-    // after the loop:
-    //   stage 3 → expose EXPERT_STACK[0] BF16-cast as the parity output
-    //   stage 4 → sum topk_w[j] * EXPERT_STACK[j] across j, BF16-round once
+    // -- Phase G/H/I: per-expert FFN — concurrent across all top_k experts -
+    // Previous revision iterated `j = 0 .. k_iters` sequentially with three
+    // grid barriers per iteration (~24 total at K_top=8). This dispatch
+    // assigns every block to one of `K_top` expert "groups" via cyclic
+    // partitioning and runs all groups in parallel for each of G, H, I —
+    // collapsing to three grid barriers total.
     //
-    // Within each iteration:
+    // Block partitioning (cyclic; distributes any leftover blocks evenly):
+    //   group_id = blockIdx.x % top_k
+    //   sub_id   = blockIdx.x / top_k
+    // For 35B-A3B on gfx1100 (num_blocks=96, top_k=8) every group gets
+    // exactly 12 blocks. On other geometries the residual `num_blocks %
+    // top_k` blocks fall into the early groups; those groups simply have
+    // one extra block contending the same counter slot, which is fine.
+    //
+    // Workspace layout (set up at the OFF_* constants above):
+    //   EXPERT_GU [k * 2*I]   — group g writes [g*2*I .. (g+1)*2*I)
+    //   EXPERT_MID [k * I]    — group g writes [g*I   .. (g+1)*I)
+    //   EXPERT_STACK [k * hidden] — group g writes [g*hidden .. (g+1)*hidden)
+    //
+    // Counter slots (in `counters[]`, all zeroed by `reset_sync_buf` on the
+    // host before each launch — see the sync_buf docstring in
+    // `crates/kernel-ffi/src/qwen36_moe.rs`):
+    //   counters[g]            — Phase G work-stealing for group g (0..2*I)
+    //   counters[top_k + g]    — Phase I work-stealing for group g (0..hidden)
+    //   counters[0]            — re-used by Phase J / K (reset before each)
+    //
+    // Phase shape:
+    //   Phase G (parallel across active groups, work-stealing on counters[g])
+    //   → grid_barrier
+    //   Phase H (one block per active group: sub_id==0, distributes I
+    //            elements via tid-stride; other blocks idle)
+    //   → grid_barrier
+    //   Phase I (parallel, work-stealing on counters[top_k+g])
+    //   → if (stage < 4) return            ← stage 3 exits here
+    //   → grid_barrier_reset_counter(&counters[0])  ← gate Phase J
+    //
+    // Stage 3 dispatches only group 0 by setting `active_groups = 1`. All
+    // blocks still hit the unconditional barriers (the grid barrier needs
+    // every block to participate or it hangs); only the work bodies are
+    // gated on `group_active`. Stage 3's parity-output write fires when
+    // `group_id == 0` (mirrors the old `j == 0` condition).
+    //
+    // Within each group g (`e = topk_idx[g]`):
     //   gu  = gate_up_proj_w[e] @ h_norm                            [2*I]
     //   mid = silu(gu[:I]) * gu[I:]                                 [I]
     //   eo  = down_proj_w[e].T @ mid                                [hidden]
@@ -2338,174 +2379,191 @@ __global__ void qwen36_moe_ffn_step_kernel(
 
     const int I_ = moe_intermediate;
     const int two_I = 2 * I_;
-    const int k_iters = (stage == 3) ? 1 : top_k;
+    const int K_ = top_k;
+    const int active_groups = (stage == 3) ? 1 : K_;
+    const int group_id = blockIdx.x % K_;
+    const bool group_active = (group_id < active_groups);
 
-    for (int j = 0; j < k_iters; j++) {
-        // Per-iteration: every block reads the chosen expert index for
-        // this slot from workspace. Visible across blocks because the
-        // last grid barrier (Phase F's reset, plus any from the
-        // previous iteration's Phase I) ordered the writes.
-        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                                   &counters[0]);
+    // Phase F left counters[0] at `hidden` (atomicAdds during work-stealing).
+    // Phase G of group 0 uses that same slot, so reset it here before any
+    // group reads its counter. counters[1..K_] and counters[K_..2*K_] were
+    // zeroed by `reset_sync_buf` before launch and stay zero through all of
+    // attn/Phase A..F (which only touch counters[0]).
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
 
-        __shared__ int s_expert_idx;
-        if (tid == 0) {
-            s_expert_idx = __float_as_int(workspace[OFF_TOPK_IDX + j]);
+    // Each block reads its own group's expert index. All blocks within a
+    // group compute the same `e`; different groups compute different `e`.
+    __shared__ int s_expert_idx;
+    if (tid == 0) {
+        s_expert_idx = __float_as_int(workspace[OFF_TOPK_IDX + group_id]);
+    }
+    __syncthreads();
+    const int e = s_expert_idx;
+
+    // Phase G: matvec gate_up_proj_w[e] @ h_norm → EXPERT_GU[g*2*I..].
+    // BF16 layout: gate_up_proj_w[E, 2*I, hidden] — slab `e` base is
+    // `e * 2*I * hidden`; row `r` adds `r * hidden`.
+    // INT4 layout (when `gate_up_proj_scale != nullptr`):
+    //   weights : [E, 2*I, hidden/2] u8   — slab `e` base in bytes is
+    //                                        `e * 2*I * (hidden/2)`.
+    //   scale   : [E, 2*I/gsz, hidden/gsz] BF16 — slab `e` base in
+    //                                        BF16 elems is
+    //                                        `e * (2*I/gsz) * (hidden/gsz)`.
+    if (group_active) {
+        const bool gu_int4 = (gate_up_proj_scale != nullptr);
+        const T* gu_slab_bf16 =
+            gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
+        const uint8_t*      gu_slab_packed = nullptr;
+        const hip_bfloat16* gu_slab_scale  = nullptr;
+        const hip_bfloat16* gu_slab_zero   = nullptr;
+        if (gu_int4) {
+            gu_slab_packed = reinterpret_cast<const uint8_t*>(gate_up_proj_w)
+                           + static_cast<size_t>(e) * two_I
+                             * (hidden / 2);
+            const int gsr = two_I  / int4_group_size;
+            const int gsc = hidden / int4_group_size;
+            gu_slab_scale = gate_up_proj_scale
+                          + static_cast<size_t>(e) * gsr * gsc;
+            gu_slab_zero  = gate_up_proj_zero
+                          + static_cast<size_t>(e) * gsr * gsc;
         }
-        __syncthreads();
-        const int e = s_expert_idx;
+        const int gu_off = OFF_EXPERT_GU + group_id * two_I;
+        for (;;) {
+            __shared__ unsigned int my_row_g_s;
+            if (tid == 0) {
+                my_row_g_s = atomicAdd(&counters[group_id], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_g_s);
+            if (my_row >= two_I) break;
 
-        // Phase G: matvec gate_up_proj_w[e] @ h_norm → EXPERT_GU[2*I].
-        // BF16 layout: gate_up_proj_w[E, 2*I, hidden] — slab `e` base is
-        // `e * 2*I * hidden`; row `r` adds `r * hidden`.
-        // INT4 layout (when `gate_up_proj_scale != nullptr`):
-        //   weights : [E, 2*I, hidden/2] u8   — slab `e` base in bytes is
-        //                                        `e * 2*I * (hidden/2)`.
-        //   scale   : [E, 2*I/gsz, hidden/gsz] BF16 — slab `e` base in
-        //                                        BF16 elems is
-        //                                        `e * (2*I/gsz) * (hidden/gsz)`.
-        // Same dequant + reduction discipline as the shared-expert INT4
-        // path (step 3); only the per-expert slab base offsets differ.
-        {
-            const bool gu_int4 = (gate_up_proj_scale != nullptr);
-            const T* gu_slab_bf16 =
-                gate_up_proj_w + static_cast<size_t>(e) * two_I * hidden;
-            const uint8_t*      gu_slab_packed = nullptr;
-            const hip_bfloat16* gu_slab_scale  = nullptr;
-            const hip_bfloat16* gu_slab_zero   = nullptr;
+            float partial = 0.0f;
             if (gu_int4) {
-                gu_slab_packed = reinterpret_cast<const uint8_t*>(gate_up_proj_w)
-                               + static_cast<size_t>(e) * two_I
-                                 * (hidden / 2);
-                const int gsr = two_I  / int4_group_size;
-                const int gsc = hidden / int4_group_size;
-                gu_slab_scale = gate_up_proj_scale
-                              + static_cast<size_t>(e) * gsr * gsc;
-                gu_slab_zero  = gate_up_proj_zero
-                              + static_cast<size_t>(e) * gsr * gsc;
+                partial = int4_dq8_matvec_partial(
+                    gu_slab_packed, gu_slab_scale, gu_slab_zero,
+                    h_norm_lds,
+                    my_row, hidden, int4_group_size,
+                    tid, block_size);
+            } else {
+                const T* w_row =
+                    gu_slab_bf16 + static_cast<size_t>(my_row) * hidden;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += static_cast<float>(w_row[col])
+                               * h_norm_lds[col];
+                }
             }
-            for (;;) {
-                __shared__ unsigned int my_row_g_s;
-                if (tid == 0) {
-                    my_row_g_s = atomicAdd(&counters[0], 1u);
-                }
-                __syncthreads();
-                const int my_row = static_cast<int>(my_row_g_s);
-                if (my_row >= two_I) break;
-
-                float partial = 0.0f;
-                if (gu_int4) {
-                    partial = int4_dq8_matvec_partial(
-                        gu_slab_packed, gu_slab_scale, gu_slab_zero,
-                        h_norm_lds,
-                        my_row, hidden, int4_group_size,
-                        tid, block_size);
-                } else {
-                    const T* w_row =
-                        gu_slab_bf16 + static_cast<size_t>(my_row) * hidden;
-                    for (int col = tid; col < hidden; col += block_size) {
-                        partial += static_cast<float>(w_row[col])
-                                   * h_norm_lds[col];
-                    }
-                }
-                shared_scratch[tid] = partial;
-                __syncthreads();
-                for (int s = block_size / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) {
-                    workspace[OFF_EXPERT_GU + my_row] = shared_scratch[0];
-                }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
                 __syncthreads();
             }
-        }
-
-        // Phase H: smid = silu(gu[:I]) * gu[I:] (block-0 only, F32 throughout).
-        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                                   &counters[0]);
-        if (blockIdx.x == 0) {
-            for (int i = tid; i < I_; i += block_size) {
-                const float gp = workspace[OFF_EXPERT_GU + i];
-                const float up = workspace[OFF_EXPERT_GU + I_ + i];
-                const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
-                const float silu_gp    = gp * sigmoid_gp;
-                workspace[OFF_EXPERT_MID + i] = silu_gp * up;
+            if (tid == 0) {
+                workspace[gu_off + my_row] = shared_scratch[0];
             }
             __syncthreads();
         }
+    }
 
-        // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[j*hidden..].
-        // BF16 layout: down_proj_w[E, hidden, I]; slab `e` base is
-        // `e * hidden * I`, row `r` adds `r * I`. Contracts over I → one
-        // F32 per output row.
-        // INT4 layout (when `down_proj_scale != nullptr`):
-        //   weights : [E, hidden, I/2] u8   — slab `e` base in bytes is
-        //                                      `e * hidden * (I/2)`.
-        //   scale   : [E, hidden/gsz, I/gsz] BF16 — slab `e` base in BF16
-        //                                      elems is
-        //                                      `e * (hidden/gsz) * (I/gsz)`.
-        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                                   &counters[0]);
-        {
-            const bool dp_int4 = (down_proj_scale != nullptr);
-            const T* dp_slab_bf16 =
-                down_proj_w + static_cast<size_t>(e) * hidden * I_;
-            const uint8_t*      dp_slab_packed = nullptr;
-            const hip_bfloat16* dp_slab_scale  = nullptr;
-            const hip_bfloat16* dp_slab_zero   = nullptr;
+    // Barrier 1: publish EXPERT_GU writes (all groups) before Phase H reads.
+    // Every block must reach the barrier even if its group is inactive.
+    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+
+    // Phase H: mid = silu(gu[:I]) * gu[I:], one block per active group.
+    // sub_id 0 of each active group does its own group's I elements; with
+    // block_size=256 and I<=1024 a single block easily covers the slab.
+    // Other blocks idle (they hit barrier 2 below).
+    {
+        const int sub_id = blockIdx.x / K_;
+        if (sub_id == 0 && group_active) {
+            const int gu_off  = OFF_EXPERT_GU + group_id * two_I;
+            const int mid_off = OFF_EXPERT_MID + group_id * I_;
+            for (int i = tid; i < I_; i += block_size) {
+                const float gp = workspace[gu_off + i];
+                const float up = workspace[gu_off + I_ + i];
+                const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                const float silu_gp    = gp * sigmoid_gp;
+                workspace[mid_off + i] = silu_gp * up;
+            }
+            __syncthreads();
+        }
+    }
+
+    // Barrier 2: publish EXPERT_MID writes (all groups) before Phase I reads.
+    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+
+    // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[g*hidden..].
+    // BF16 layout: down_proj_w[E, hidden, I]; slab `e` base is
+    // `e * hidden * I`, row `r` adds `r * I`. Contracts over I → one
+    // F32 per output row.
+    // INT4 layout (when `down_proj_scale != nullptr`):
+    //   weights : [E, hidden, I/2] u8   — slab `e` base in bytes is
+    //                                      `e * hidden * (I/2)`.
+    //   scale   : [E, hidden/gsz, I/gsz] BF16 — slab `e` base in BF16
+    //                                      elems is
+    //                                      `e * (hidden/gsz) * (I/gsz)`.
+    // Stage-3 parity output (BF16 cast of EXPERT_STACK[0]) is emitted by
+    // group 0 only — same per-row write the previous `j==0` branch did.
+    if (group_active) {
+        const bool dp_int4 = (down_proj_scale != nullptr);
+        const T* dp_slab_bf16 =
+            down_proj_w + static_cast<size_t>(e) * hidden * I_;
+        const uint8_t*      dp_slab_packed = nullptr;
+        const hip_bfloat16* dp_slab_scale  = nullptr;
+        const hip_bfloat16* dp_slab_zero   = nullptr;
+        if (dp_int4) {
+            dp_slab_packed = reinterpret_cast<const uint8_t*>(down_proj_w)
+                           + static_cast<size_t>(e) * hidden
+                             * (I_ / 2);
+            const int gsr = hidden / int4_group_size;
+            const int gsc = I_     / int4_group_size;
+            dp_slab_scale = down_proj_scale
+                          + static_cast<size_t>(e) * gsr * gsc;
+            dp_slab_zero  = down_proj_zero
+                          + static_cast<size_t>(e) * gsr * gsc;
+        }
+        const int slot_off = OFF_EXPERT_STACK + group_id * hidden;
+        const int mid_off  = OFF_EXPERT_MID   + group_id * I_;
+        for (;;) {
+            __shared__ unsigned int my_row_i_s;
+            if (tid == 0) {
+                my_row_i_s = atomicAdd(&counters[K_ + group_id], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_i_s);
+            if (my_row >= hidden) break;
+
+            float partial = 0.0f;
             if (dp_int4) {
-                dp_slab_packed = reinterpret_cast<const uint8_t*>(down_proj_w)
-                               + static_cast<size_t>(e) * hidden
-                                 * (I_ / 2);
-                const int gsr = hidden / int4_group_size;
-                const int gsc = I_     / int4_group_size;
-                dp_slab_scale = down_proj_scale
-                              + static_cast<size_t>(e) * gsr * gsc;
-                dp_slab_zero  = down_proj_zero
-                              + static_cast<size_t>(e) * gsr * gsc;
+                partial = int4_dq8_matvec_partial(
+                    dp_slab_packed, dp_slab_scale, dp_slab_zero,
+                    workspace + mid_off,
+                    my_row, I_, int4_group_size,
+                    tid, block_size);
+            } else {
+                const T* w_row =
+                    dp_slab_bf16 + static_cast<size_t>(my_row) * I_;
+                for (int col = tid; col < I_; col += block_size) {
+                    partial += static_cast<float>(w_row[col])
+                               * workspace[mid_off + col];
+                }
             }
-            const int slot_off = OFF_EXPERT_STACK + j * hidden;
-            for (;;) {
-                __shared__ unsigned int my_row_i_s;
-                if (tid == 0) {
-                    my_row_i_s = atomicAdd(&counters[0], 1u);
-                }
-                __syncthreads();
-                const int my_row = static_cast<int>(my_row_i_s);
-                if (my_row >= hidden) break;
-
-                float partial = 0.0f;
-                if (dp_int4) {
-                    partial = int4_dq8_matvec_partial(
-                        dp_slab_packed, dp_slab_scale, dp_slab_zero,
-                        workspace + OFF_EXPERT_MID,
-                        my_row, I_, int4_group_size,
-                        tid, block_size);
-                } else {
-                    const T* w_row =
-                        dp_slab_bf16 + static_cast<size_t>(my_row) * I_;
-                    for (int col = tid; col < I_; col += block_size) {
-                        partial += static_cast<float>(w_row[col])
-                                   * workspace[OFF_EXPERT_MID + col];
-                    }
-                }
-                shared_scratch[tid] = partial;
-                __syncthreads();
-                for (int s = block_size / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) {
-                    const float val = shared_scratch[0];
-                    workspace[slot_off + my_row] = val;
-                    if (stage == 3 && j == 0) {
-                        // Match oracle's `expert_stack.to(dtype)` exposure.
-                        output[my_row] = static_cast<T>(bf16_round_rne_f32(val));
-                    }
-                }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
                 __syncthreads();
             }
+            if (tid == 0) {
+                const float val = shared_scratch[0];
+                workspace[slot_off + my_row] = val;
+                if (stage == 3 && group_id == 0) {
+                    // Match oracle's `expert_stack.to(dtype)` exposure.
+                    output[my_row] = static_cast<T>(bf16_round_rne_f32(val));
+                }
+            }
+            __syncthreads();
         }
     }
 
@@ -2525,7 +2583,6 @@ __global__ void qwen36_moe_ffn_step_kernel(
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
     {
-        const int K_ = top_k;
         for (;;) {
             __shared__ unsigned int my_row_j_s;
             if (tid == 0) {

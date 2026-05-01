@@ -247,7 +247,7 @@ extern "C" {
     /// (used to hold the BF16-rounded F32 view of `q_raw` between phases).
     /// `output` must be at least `num_heads * head_dim` BF16 entries on
     /// stage 1 — sized for the largest staged intermediate, BF16.
-    /// `sync_buf` (counters/barrier_counter/barrier_flag) must be 32 zero
+    /// `sync_buf` (counters/barrier_counter/barrier_flag) must be 96 zero
     /// bytes — see [`stub_launch`] for the layout convention.
     pub fn qwen36_moe_hip_attn_step_launch(
         dtype: c_int,
@@ -311,7 +311,7 @@ extern "C" {
     /// for stage 1 (later stages bump that up via the safe wrapper).
     /// `output` must be at least `qkv_dim` BF16 entries on stage 1 (sized
     /// for the largest staged intermediate by the safe wrapper). `sync_buf`
-    /// (counters/barrier_counter/barrier_flag) must be 32 zero bytes.
+    /// (counters/barrier_counter/barrier_flag) must be 96 zero bytes.
     pub fn qwen36_moe_hip_linear_step_launch(
         dtype: c_int,
         device_ordinal: usize,
@@ -375,7 +375,7 @@ extern "C" {
     /// entries for stage 1 (later stages bump that up). `output` must be at
     /// least `top_k` BF16 entries on stage 1 and `output_idx` must be at
     /// least `top_k` i32 entries. `sync_buf` (counters/barrier_counter/
-    /// barrier_flag) must be 32 zero bytes.
+    /// barrier_flag) must be 96 zero bytes.
     ///
     /// PR 4b5 step 2: INT4 dequant smoke launcher.
     ///
@@ -477,9 +477,12 @@ extern "C" {
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
-/// as a 32-byte zeroed scratch (work-stealing counter at offset 0, grid
-/// barrier counter at +16, flag at +20 — same layout as
-/// `crate::persistent_decode_4b`).
+/// as a 96-byte zeroed scratch — 16 u32 work-stealing counter slots at
+/// +0..+63 (only counters[0] used here; the FFN concurrent-experts dispatch
+/// uses 2*K_top of them), grid barrier counter at +64, flag at +68. The
+/// 32-byte form used by `crate::persistent_decode_4b` is the older single-
+/// counter layout — qwen36_moe shares one widened sync_buf across all four
+/// step launchers (stub/attn/linear/ffn) so any can run with any.
 ///
 /// Returns when the kernel signals completion via `hipDeviceSynchronize`.
 /// The smoke-test path reads `workspace` back to verify descriptor
@@ -499,8 +502,12 @@ pub fn stub_launch(
     }
     let backend = layer_descs_device.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
-    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
-    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+    // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
+    // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
+    // only touch counters[0]). Barrier counter+flag follow at +64/+68.
+    // Sync_buf must be at least 96 bytes zeroed before launch.
+    let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
         Backend::Hip => {
@@ -649,8 +656,8 @@ impl Qwen36MoeAttnStepInt4 {
 /// `output` must be a BF16 buffer with at least `num_heads * head_dim`
 /// elements (the size of the largest staged intermediate). `workspace` must
 /// be an F32 buffer with at least `2 * num_heads * head_dim` elements.
-/// `sync_buf` must be a 32-byte zero buffer (counter @ +0, barrier counter
-/// @ +16, barrier flag @ +20).
+/// `sync_buf` must be a 96-byte zero buffer (counters @ +0..+63 — only
+/// counters[0] used here, barrier counter @ +64, barrier flag @ +68).
 pub fn attn_step_launch(
     ordinal: usize,
     dtype: ScalarType,
@@ -676,8 +683,12 @@ pub fn attn_step_launch(
 
     let backend = output.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
-    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
-    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+    // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
+    // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
+    // only touch counters[0]). Barrier counter+flag follow at +64/+68.
+    // Sync_buf must be at least 96 bytes zeroed before launch.
+    let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
         Backend::Hip => {
@@ -823,8 +834,8 @@ impl Qwen36MoeLinearStepInt4 {
 }
 
 /// Safe wrapper for the PR 4b3 staged linear-attention parity launcher.
-/// Same workspace / sync_buf layout as
-/// [`attn_step_launch`]: 32-byte zero scratch, F32 workspace sized for the
+/// Same workspace / sync_buf layout as [`attn_step_launch`]: 96-byte zero
+/// scratch (only counters[0] used here), F32 workspace sized for the
 /// stage's footprint, BF16 output sized for the largest staged intermediate.
 pub fn linear_step_launch(
     ordinal: usize,
@@ -851,8 +862,12 @@ pub fn linear_step_launch(
 
     let backend = output.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
-    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
-    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+    // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
+    // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
+    // only touch counters[0]). Barrier counter+flag follow at +64/+68.
+    // Sync_buf must be at least 96 bytes zeroed before launch.
+    let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
         Backend::Hip => {
@@ -1006,8 +1021,10 @@ impl Qwen36MoeFfnStepInt4 {
 /// (the size of the largest staged intermediate). `output_idx` must be an
 /// i32 buffer with at least `top_k` elements. `workspace` must be an F32
 /// buffer sized for the requested stage's footprint (see the layout comment
-/// in `kernels/qwen36_moe.hip`). `sync_buf` must be a 32-byte zero buffer
-/// (counter @ +0, barrier counter @ +16, barrier flag @ +20).
+/// in `kernels/qwen36_moe.hip`). `sync_buf` must be a 96-byte zero buffer:
+/// 16 u32 work-stealing counter slots at +0..+63 (the per-expert G/I phases
+/// use counters[0..2*top_k] for cyclic per-group dispatch), barrier counter
+/// at +64, barrier flag at +68.
 pub fn ffn_step_launch(
     ordinal: usize,
     dtype: ScalarType,
@@ -1041,8 +1058,12 @@ pub fn ffn_step_launch(
 
     let backend = output.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
-    let barrier_counter = unsafe { (counters as *mut u8).add(16) as *mut c_uint };
-    let barrier_flag = unsafe { (counters as *mut u8).add(20) as *mut c_uint };
+    // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
+    // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
+    // only touch counters[0]). Barrier counter+flag follow at +64/+68.
+    // Sync_buf must be at least 96 bytes zeroed before launch.
+    let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
         Backend::Hip => {
@@ -1380,7 +1401,7 @@ mod tests {
         // ~MiB; keeping this tiny lets the smoke test stay fast.
         let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[16])
             .expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[32])
+        let mut sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
             .expect("alloc sync buf");
 
         stub_launch(
@@ -1716,7 +1737,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -1837,7 +1858,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -1967,7 +1988,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -2088,7 +2109,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -2212,7 +2233,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -2428,7 +2449,7 @@ mod tests {
             &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
@@ -2621,7 +2642,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -2767,7 +2788,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -2928,7 +2949,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -3102,7 +3123,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -3291,7 +3312,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -3524,7 +3545,7 @@ mod tests {
             ordinal, ScalarType::F32, &[workspace_floats],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
@@ -3651,8 +3672,8 @@ mod tests {
     ///   SUP           [Is]
     ///   SHARED_MID    [Is]
     ///   SHARED_OUT    [hidden]
-    ///   EXPERT_GU     [2*I]
-    ///   EXPERT_MID    [I]
+    ///   EXPERT_GU     [k * 2*I]   one [2*I] slab per concurrent expert group
+    ///   EXPERT_MID    [k * I]     one [I]   slab per concurrent expert group
     ///   EXPERT_STACK  [k*hidden]
     ///   MOE_OUT       [hidden]
     ///
@@ -3670,14 +3691,16 @@ mod tests {
         let k = geom.top_k as usize;
         let is_dim = geom.shared_intermediate as usize;
         let i_dim = geom.moe_intermediate as usize;
-        // 3*hidden = H_NORM + SHARED_OUT + MOE_OUT
-        // 2*e      = ROUTER_LOGITS + ROUTER_PROBS
-        // 2*k      = TOPK_VAL + TOPK_IDX
-        // 1        = SG_SCALAR
-        // 3*is_dim = SGP + SUP + SHARED_MID
-        // 3*i_dim  = EXPERT_GU(2*I) + EXPERT_MID(I)
-        // k*hidden = EXPERT_STACK
-        3 * hidden + 2 * e + 2 * k + 1 + 3 * is_dim + 3 * i_dim + k * hidden
+        // 3*hidden     = H_NORM + SHARED_OUT + MOE_OUT
+        // 2*e          = ROUTER_LOGITS + ROUTER_PROBS
+        // 2*k          = TOPK_VAL + TOPK_IDX
+        // 1            = SG_SCALAR
+        // 3*is_dim     = SGP + SUP + SHARED_MID
+        // k*3*i_dim    = EXPERT_GU(k*2*I) + EXPERT_MID(k*I) — sized for the
+        //                concurrent-experts G/H/I dispatch (one slab per
+        //                expert group)
+        // k*hidden     = EXPERT_STACK
+        3 * hidden + 2 * e + 2 * k + 1 + 3 * is_dim + k * 3 * i_dim + k * hidden
     }
 
     /// Output BF16 elements sufficient for the largest staged FFN
@@ -3752,7 +3775,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -3895,7 +3918,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4040,7 +4063,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4174,7 +4197,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4309,7 +4332,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4522,7 +4545,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4723,7 +4746,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
@@ -4922,7 +4945,7 @@ mod tests {
             ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
         ).expect("alloc workspace");
         let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[32],
+            ordinal, ScalarType::U8, &[96],
         ).expect("alloc sync buf");
 
         let _ = (i_us, is_us);  // kept for clarity above.
