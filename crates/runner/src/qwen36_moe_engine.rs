@@ -10,9 +10,12 @@
 //! the only meaningful runtime check is "did the safetensors index match
 //! what we expect from the config" plus a budget comparison.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
+use model_store::manifest::LayoutTag;
+use model_store::BakedStore;
 use qwen36_moe::config::{Config, TextConfig};
 use qwen36_moe::loader::{ScalarKind, WeightLoader};
 use qwen36_moe::state::{StateAccount, StateLayout};
@@ -42,6 +45,34 @@ pub struct DryRunReport {
     pub loader_warning: Option<String>,
     pub registry_budget_bytes: u64,
     pub gpu_total_vram_bytes: u64,
+    /// Populated when an INT4 baked package is present and loadable.
+    pub bake: Option<BakeAccount>,
+}
+
+/// Summary of a baked-package's contents — the runtime-ready view the
+/// kernel will see at decode time. Built by mmap'ing the bake at
+/// `model-store::bake_dir_int4()` and walking its manifest.
+#[derive(Debug, Clone)]
+pub struct BakeAccount {
+    pub bake_dir: PathBuf,
+    pub manifest_format_version: u32,
+    pub manifest_converter_version: u32,
+    pub tensor_count: usize,
+    pub weights_bin_bytes: u64,
+    /// Per-LayoutTag tensor counts. Sorted alphabetically by tag name for
+    /// deterministic output.
+    pub by_layout: BTreeMap<String, usize>,
+    /// Tensors expected per `expected_tensor_specs` that are absent from
+    /// the bake's index. A non-empty list means the bake is incomplete.
+    pub missing_specs: Vec<String>,
+    /// INT4 expert tensors per layer the runtime relies on. Each entry is
+    /// `(layer_idx, name)` for any of `gate_up_proj`, `down_proj` that's
+    /// missing or has a wrong layout.
+    pub bad_expert_tensors: Vec<(usize, String)>,
+    /// Cached aggregate byte sizes per category. Useful for comparing the
+    /// bake against the analytic INT4 projection.
+    pub int4_quantized_bytes: u64,
+    pub raw_bytes: u64,
 }
 
 pub fn run_qwen36_moe_dry_run(
@@ -70,6 +101,8 @@ pub fn run_qwen36_moe_dry_run(
 
     let layout = StateLayout::new(context_size, batch_size, kv_fp8);
     let state = StateAccount::from_config(&config.text_config, layout);
+
+    let bake = inspect_bake(model_dir, &config.text_config, weight_prefix);
 
     let mut on_disk_bytes = None;
     let mut on_disk_tensor_count = None;
@@ -157,6 +190,85 @@ pub fn run_qwen36_moe_dry_run(
         loader_warning,
         registry_budget_bytes,
         gpu_total_vram_bytes: total_vram,
+        bake,
+    })
+}
+
+/// Open the INT4 baked package (if present and valid) and summarise its
+/// contents. Returns None when no bake is on disk or its manifest can't be
+/// parsed; the dry-run continues either way.
+fn inspect_bake(
+    model_dir: &Path,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+) -> Option<BakeAccount> {
+    let bake_dir = model_store::bake_dir_int4(model_dir);
+    if !bake_dir.exists() {
+        return None;
+    }
+    // Re-parse the manifest header even though BakedStore does too — we
+    // expose format/converter versions in the report so a stale bake is
+    // visible without having to dig into the file by hand.
+    let manifest_text =
+        std::fs::read_to_string(model_store::manifest_path(&bake_dir)).ok()?;
+    let manifest: model_store::manifest::Manifest =
+        serde_json::from_str(&manifest_text).ok()?;
+    let store = BakedStore::open(&bake_dir).ok()?;
+    let weights_bin_bytes = std::fs::metadata(model_store::weights_bin_path(&bake_dir))
+        .ok()?
+        .len();
+
+    // Aggregate per-layout tensor counts and per-category byte totals.
+    let mut by_layout: BTreeMap<String, usize> = BTreeMap::new();
+    let mut int4_quantized_bytes: u64 = 0;
+    let mut raw_bytes: u64 = 0;
+    for t in &manifest.tensors {
+        let key = format!("{:?}", t.layout);
+        *by_layout.entry(key).or_default() += 1;
+        match t.layout {
+            LayoutTag::Int4Quantized => int4_quantized_bytes += t.byte_len,
+            LayoutTag::Raw => raw_bytes += t.byte_len,
+            _ => {}
+        }
+    }
+
+    // Cross-check the bake against the runtime's expected tensor specs.
+    // A missing entry here would crash the loader at decode time; surface
+    // it during dry-run instead.
+    let specs = expected_tensor_specs(text_config, weight_prefix);
+    let mut missing_specs = Vec::new();
+    for spec in &specs {
+        if !store.contains(&spec.name) {
+            missing_specs.push(spec.name.clone());
+        }
+    }
+
+    // The fused MoE expert tensors are the bulk of the bake (~80% of the
+    // INT4 byte total on 35B-A3B). Spot-check every layer; absence here is
+    // fatal because the kernel can't run without a routed expert.
+    let mut bad_expert_tensors = Vec::new();
+    for li in 0..text_config.num_hidden_layers as usize {
+        for kind in ["gate_up_proj", "down_proj"] {
+            let name = format!("{weight_prefix}.layers.{li}.mlp.experts.{kind}");
+            match store.layout(&name) {
+                Some(LayoutTag::Int4Quantized) => {}
+                Some(other) => bad_expert_tensors.push((li, format!("{name} (layout={other:?})"))),
+                None => bad_expert_tensors.push((li, format!("{name} (missing)"))),
+            }
+        }
+    }
+
+    Some(BakeAccount {
+        bake_dir,
+        manifest_format_version: manifest.format_version,
+        manifest_converter_version: manifest.converter_version,
+        tensor_count: manifest.tensors.len(),
+        weights_bin_bytes,
+        by_layout,
+        missing_specs,
+        bad_expert_tensors,
+        int4_quantized_bytes,
+        raw_bytes,
     })
 }
 
@@ -369,6 +481,72 @@ pub fn print_report(report: &DryRunReport) {
         println!("  WARNING: {w}");
     }
     println!();
+    if let Some(bake) = &report.bake {
+        println!("[INT4 baked package]");
+        println!("  bake_dir:        {}", bake.bake_dir.display());
+        println!(
+            "  manifest:        format_version={} converter_version={}",
+            bake.manifest_format_version, bake.manifest_converter_version,
+        );
+        println!(
+            "  weights.bin:     {:.2} GiB    ({} tensors indexed)",
+            bake.weights_bin_bytes as f64 / GIB,
+            bake.tensor_count,
+        );
+        println!(
+            "  INT4 / Raw:      {:.2} GiB / {:.2} GiB",
+            bake.int4_quantized_bytes as f64 / GIB,
+            bake.raw_bytes as f64 / GIB,
+        );
+        let parts: Vec<String> = bake
+            .by_layout
+            .iter()
+            .map(|(l, n)| format!("{l}={n}"))
+            .collect();
+        println!("  layouts:         {}", parts.join(", "));
+        // Compare against the analytic INT4 projection — small drift is
+        // expected (the analytic model rounds shapes; the bake is exact).
+        let analytic_gib = report.int4_projected_bytes as f64 / GIB;
+        let bake_gib = bake.weights_bin_bytes as f64 / GIB;
+        println!(
+            "  vs analytic:     bake={:.2} GiB analytic_int4={:.2} GiB drift={:+.2} GiB",
+            bake_gib,
+            analytic_gib,
+            bake_gib - analytic_gib,
+        );
+        if !bake.missing_specs.is_empty() {
+            println!(
+                "  MISSING SPECS:   {} (showing first 10)",
+                bake.missing_specs.len()
+            );
+            for n in bake.missing_specs.iter().take(10) {
+                println!("    - {n}");
+            }
+        }
+        if !bake.bad_expert_tensors.is_empty() {
+            println!(
+                "  BAD EXPERT TENSORS: {} (showing first 10)",
+                bake.bad_expert_tensors.len()
+            );
+            for (li, n) in bake.bad_expert_tensors.iter().take(10) {
+                println!("    - layer {li}: {n}");
+            }
+        }
+        let bake_ok = bake.missing_specs.is_empty()
+            && bake.bad_expert_tensors.is_empty();
+        println!(
+            "  ready-for-decode: {}",
+            if bake_ok { "YES" } else { "NO" }
+        );
+        println!();
+    } else {
+        println!(
+            "[INT4 baked package] not present at .supersonic/v{}-int4-gptq/ \
+             (run `oracle/bake_int4.py` to produce one)",
+            model_store::manifest::FORMAT_VERSION
+        );
+        println!();
+    }
     println!("[VRAM budget]");
     println!(
         "  registry estimate (INT4 weights + KV @ ctx, ×overhead): {:.2} GiB",
