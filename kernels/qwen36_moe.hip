@@ -2171,13 +2171,35 @@ __global__ void qwen36_moe_ffn_step_kernel(
         }
 
         // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[j*hidden..].
-        // Layout: down_proj_w[E, hidden, I]; slab `e` base is `e * hidden * I`,
-        // row `r` adds `r * I`. Contracts over I → one F32 per output row.
+        // BF16 layout: down_proj_w[E, hidden, I]; slab `e` base is
+        // `e * hidden * I`, row `r` adds `r * I`. Contracts over I → one
+        // F32 per output row.
+        // INT4 layout (when `down_proj_scale != nullptr`):
+        //   weights : [E, hidden, I/2] u8   — slab `e` base in bytes is
+        //                                      `e * hidden * (I/2)`.
+        //   scale   : [E, hidden/gsz, I/gsz] BF16 — slab `e` base in BF16
+        //                                      elems is
+        //                                      `e * (hidden/gsz) * (I/gsz)`.
         grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                    &counters[0]);
         {
-            const T* dp_slab =
+            const bool dp_int4 = (down_proj_scale != nullptr);
+            const T* dp_slab_bf16 =
                 down_proj_w + static_cast<size_t>(e) * hidden * I_;
+            const uint8_t*      dp_slab_packed = nullptr;
+            const hip_bfloat16* dp_slab_scale  = nullptr;
+            const hip_bfloat16* dp_slab_zero   = nullptr;
+            if (dp_int4) {
+                dp_slab_packed = reinterpret_cast<const uint8_t*>(down_proj_w)
+                               + static_cast<size_t>(e) * hidden
+                                 * (I_ / 2);
+                const int gsr = hidden / int4_group_size;
+                const int gsc = I_     / int4_group_size;
+                dp_slab_scale = down_proj_scale
+                              + static_cast<size_t>(e) * gsr * gsc;
+                dp_slab_zero  = down_proj_zero
+                              + static_cast<size_t>(e) * gsr * gsc;
+            }
             const int slot_off = OFF_EXPERT_STACK + j * hidden;
             for (;;) {
                 __shared__ unsigned int my_row_i_s;
@@ -2188,11 +2210,23 @@ __global__ void qwen36_moe_ffn_step_kernel(
                 const int my_row = static_cast<int>(my_row_i_s);
                 if (my_row >= hidden) break;
 
-                const T* w_row = dp_slab + static_cast<size_t>(my_row) * I_;
                 float partial = 0.0f;
-                for (int col = tid; col < I_; col += block_size) {
-                    partial += static_cast<float>(w_row[col])
-                               * workspace[OFF_EXPERT_MID + col];
+                if (dp_int4) {
+                    for (int col = tid; col < I_; col += block_size) {
+                        partial += int4_dequant_scalar(
+                                       dp_slab_packed,
+                                       dp_slab_scale,
+                                       dp_slab_zero,
+                                       my_row, col, I_, int4_group_size)
+                                   * workspace[OFF_EXPERT_MID + col];
+                    }
+                } else {
+                    const T* w_row =
+                        dp_slab_bf16 + static_cast<size_t>(my_row) * I_;
+                    for (int col = tid; col < I_; col += block_size) {
+                        partial += static_cast<float>(w_row[col])
+                                   * workspace[OFF_EXPERT_MID + col];
+                    }
                 }
                 shared_scratch[tid] = partial;
                 __syncthreads();
