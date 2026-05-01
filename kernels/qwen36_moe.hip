@@ -1344,8 +1344,11 @@ __global__ void qwen36_moe_linear_step_kernel(
         return;
     }
 
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
+    // No barrier here: post-Phase-B barrier above already published Phase B's
+    // writes (qkv_raw etc.), and Phase C uses strided thread-per-channel
+    // distribution — it never touches counters[0]. The pre-D barrier below
+    // resets counters[0] for Phase D. (Earlier revisions had a redundant
+    // grid_barrier_reset_counter here; it was pure vestige.)
 
     // -- Phase C: depthwise conv1d + silu + state update -------------------
     //
@@ -1544,9 +1547,6 @@ __global__ void qwen36_moe_linear_step_kernel(
 
     if (stage < 4) return;
 
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-
     const int OFF_BETA    = OFF_K_REP + V * k_dim;
     const int OFF_G       = OFF_BETA + V;
     const int OFF_REC_OUT = OFF_G + V;
@@ -1556,7 +1556,13 @@ __global__ void qwen36_moe_linear_step_kernel(
     // g[h]    = -softplus(a_raw[h] + dt_bias[h]) * exp(A_log[h])   (F32)
     //
     // V is small (32 on 35B-A3B) so we do this on block 0 only — every
-    // other block parks at the next grid barrier.
+    // other block parks at the post-F grid_barrier below.
+    //
+    // No pre-F barrier: Phase F reads only `a_raw`, `b_raw` (Phase B writes,
+    // long since published) and the host-uploaded BF16 tables `dt_bias` /
+    // `a_log`. Phase F doesn't touch counters[0] (block-0-only, no atomic
+    // claim). counters[0] is left at V from Phase E's work-stealing; the
+    // post-F barrier (below) resets it to 0 in time for Phase G.
     if (blockIdx.x == 0) {
         for (int h = tid; h < V; h += block_size) {
             const float a_v       = workspace[OFF_A_RAW + h];
@@ -1570,7 +1576,11 @@ __global__ void qwen36_moe_linear_step_kernel(
             workspace[OFF_G + h]    = -softplus * a_log_exp;
         }
     }
-    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    // Post-F barrier: publishes Phase F (beta, g) AND transitively Phase E's
+    // writes (q_rep, k_rep) to all blocks, AND resets counters[0] (left at V
+    // by Phase E) for Phase G's per-V-head work-stealing.
+    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                               &counters[0]);
 
     // -- Phase G: delta-rule recurrent update --------------------------------
     //
