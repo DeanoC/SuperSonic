@@ -47,6 +47,30 @@ pub struct DryRunReport {
     pub gpu_total_vram_bytes: u64,
     /// Populated when an INT4 baked package is present and loadable.
     pub bake: Option<BakeAccount>,
+    /// What the dry-run actually used for KV-cache sizing — and where it
+    /// came from. The string flavor (`Explicit`, `EstimatedFromPrompt`,
+    /// `MaxNewTokensOnly`) lets `print_report` flag the worst case so the
+    /// user knows the `fit:YES` answer covered their realistic prompt.
+    pub context_size_used: usize,
+    pub context_size_source: ContextSizeSource,
+}
+
+/// How `context_size_used` was derived. Anything other than `Explicit`
+/// means the dry-run is making an assumption the caller should verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextSizeSource {
+    /// User passed `--context-size`; honoured verbatim.
+    Explicit,
+    /// User passed `--prompt` but no `--context-size`; estimated as
+    /// (prompt char count) + max_new_tokens. Char count is a conservative
+    /// upper bound on token count for English-ish text — true tokenisation
+    /// would need the model's tokenizer, which the dry-run path doesn't
+    /// load.
+    EstimatedFromPrompt,
+    /// Neither `--context-size` nor `--prompt` was given. Defaults to
+    /// max_new_tokens — almost certainly an undercount for any real
+    /// session. The report flags this as a worst-case caveat.
+    MaxNewTokensOnly,
 }
 
 /// Summary of a baked-package's contents — the runtime-ready view the
@@ -80,6 +104,7 @@ pub fn run_qwen36_moe_dry_run(
     entry: &RegistryEntry,
     total_vram: u64,
     context_size: usize,
+    context_size_source: ContextSizeSource,
     batch_size: usize,
     kv_fp8: bool,
     no_bake: bool,
@@ -191,6 +216,8 @@ pub fn run_qwen36_moe_dry_run(
         registry_budget_bytes,
         gpu_total_vram_bytes: total_vram,
         bake,
+        context_size_used: context_size,
+        context_size_source,
     })
 }
 
@@ -422,6 +449,18 @@ pub fn print_report(report: &DryRunReport) {
     );
     println!();
     println!("[state accounting]");
+    let max_pos = report.config.text_config.max_position_embeddings;
+    let ctx_label = match report.context_size_source {
+        ContextSizeSource::Explicit => "explicit --context-size".to_string(),
+        ContextSizeSource::EstimatedFromPrompt => {
+            format!("estimated from --prompt (chars + max_new_tokens)")
+        }
+        ContextSizeSource::MaxNewTokensOnly => "max_new_tokens only".to_string(),
+    };
+    println!(
+        "  context tokens:     {:>8}     (source: {ctx_label}; model max_pos={max_pos})",
+        report.context_size_used,
+    );
     println!(
         "  KV cache (full attn): {:>8.2} GiB",
         report.state.full_kv_bytes as f64 / GIB,
@@ -567,6 +606,28 @@ pub fn print_report(report: &DryRunReport) {
             report.checkpoint.total_bytes as f64 / GIB
         );
     }
+    if report.context_size_source == ContextSizeSource::MaxNewTokensOnly {
+        println!();
+        println!(
+            "  WARNING: context_size defaulted to max_new_tokens={}. KV cache for a real",
+            report.context_size_used,
+        );
+        println!(
+            "  decode session will be larger; pass --context-size <N> (or --prompt) for an",
+        );
+        println!(
+            "  honest fit number. Worst case at the model's max ({} tokens) needs",
+            max_pos,
+        );
+        // Quick worst-case KV estimate at model max — gives the user one
+        // concrete data point before they have to re-run with a flag.
+        let worst_kv = report.config.text_config.kv_bytes_per_token(2)
+            * max_pos as u64;
+        println!(
+            "  ~{:.2} GiB of KV cache alone (BF16).",
+            worst_kv as f64 / GIB,
+        );
+    }
 }
 
 pub fn run(
@@ -581,14 +642,28 @@ pub fn run(
              and exit. Full decode lands in PR 4 (CUDA) and PR 6 (HIP)."
         );
     }
-    let context_size = cli
-        .context_size
-        .unwrap_or_else(|| cli.max_new_tokens.max(1));
+    // Derive context_size + an honest source flag so the printed report can
+    // tell the user which of three answers they got: explicit, prompt-derived
+    // estimate, or worst-case defaults-only. The `--context-size` path is
+    // verbatim; otherwise we fall back to (prompt char count) + max_new_tokens
+    // when a prompt is given (chars are an upper bound on tokens for
+    // English-ish text), or just max_new_tokens when the user gave neither
+    // flag — that last case undercounts KV bytes for any realistic session,
+    // and the report flags it.
+    let max_new = cli.max_new_tokens.max(1);
+    let (context_size, context_size_source) = if let Some(ctx) = cli.context_size {
+        (ctx, ContextSizeSource::Explicit)
+    } else if !cli.prompt.is_empty() {
+        (cli.prompt.chars().count() + max_new, ContextSizeSource::EstimatedFromPrompt)
+    } else {
+        (max_new, ContextSizeSource::MaxNewTokensOnly)
+    };
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
         entry,
         total_vram,
         context_size,
+        context_size_source,
         cli.batch_size.max(1),
         cli.kv_fp8,
         cli.no_bake,

@@ -319,7 +319,7 @@ pub(crate) struct Cli {
     model_dir: PathBuf,
 
     /// Text prompt (will be tokenized). Required unless --dry-run is set.
-    #[arg(long, default_value = "")]
+    #[arg(long, required_unless_present = "dry_run", default_value = "")]
     prompt: String,
 
     /// Do not add tokenizer special tokens when encoding --prompt.
