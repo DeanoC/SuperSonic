@@ -993,6 +993,17 @@ __global__ void qwen36_moe_linear_step_kernel(
     const T* __restrict__          out_proj_w,          // unused at stage 1
     T* __restrict__                conv_state,          // unused at stage 1
     float* __restrict__            recurrent_state,     // unused at stage 1
+    // PR 4b6 INT4 sidecars. Same null-pointer-as-mode discipline as the
+    // full-attn kernel. Only the three projections that the bake quantizes
+    // are wired (in_proj_qkv, in_proj_z, out_proj). in_proj_a/in_proj_b are
+    // tiny per-V-head scalars and stay BF16.
+    int                                  int4_group_size,
+    const hip_bfloat16* __restrict__     in_proj_qkv_scale,
+    const hip_bfloat16* __restrict__     in_proj_qkv_zero,
+    const hip_bfloat16* __restrict__     in_proj_z_scale,
+    const hip_bfloat16* __restrict__     in_proj_z_zero,
+    const hip_bfloat16* __restrict__     out_proj_scale,
+    const hip_bfloat16* __restrict__     out_proj_zero,
     T* __restrict__                output,
     float* __restrict__            workspace,
     unsigned int* __restrict__     counters,
@@ -1084,28 +1095,60 @@ __global__ void qwen36_moe_linear_step_kernel(
         if (my_row >= total_rows) break;
 
         // Pick projection + per-projection row-index + workspace dst.
-        const T* w_row;
+        // BF16 path tracks `w_row`; INT4 path tracks (slab base, scale, zero,
+        // local row index) so the helper indexes within the per-projection
+        // 2D weight regardless of which projection the row belongs to.
+        const T* w_row = nullptr;
+        const void* i4_slab = nullptr;
+        const hip_bfloat16* i4_scale = nullptr;
+        const hip_bfloat16* i4_zero  = nullptr;
+        int i4_row = 0;
         int dst_off;
         if (my_row < qkv_dim) {
-            w_row   = in_proj_qkv_w + static_cast<size_t>(my_row) * hidden;
+            if (in_proj_qkv_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(in_proj_qkv_w);
+                i4_scale = in_proj_qkv_scale;
+                i4_zero  = in_proj_qkv_zero;
+                i4_row   = my_row;
+            } else {
+                w_row = in_proj_qkv_w + static_cast<size_t>(my_row) * hidden;
+            }
             dst_off = OFF_QKV_RAW + my_row;
         } else if (my_row < qkv_dim + val_dim) {
             const int r = my_row - qkv_dim;
-            w_row   = in_proj_z_w + static_cast<size_t>(r) * hidden;
+            if (in_proj_z_scale != nullptr) {
+                i4_slab  = reinterpret_cast<const void*>(in_proj_z_w);
+                i4_scale = in_proj_z_scale;
+                i4_zero  = in_proj_z_zero;
+                i4_row   = r;
+            } else {
+                w_row = in_proj_z_w + static_cast<size_t>(r) * hidden;
+            }
             dst_off = OFF_Z_RAW + r;
         } else if (my_row < qkv_dim + val_dim + V) {
+            // in_proj_a stays BF16 — bake excludes it.
             const int r = my_row - (qkv_dim + val_dim);
             w_row   = in_proj_a_w + static_cast<size_t>(r) * hidden;
             dst_off = OFF_A_RAW + r;
         } else {
+            // in_proj_b stays BF16 — bake excludes it.
             const int r = my_row - (qkv_dim + val_dim + V);
             w_row   = in_proj_b_w + static_cast<size_t>(r) * hidden;
             dst_off = OFF_B_RAW + r;
         }
 
         float partial = 0.0f;
-        for (int col = tid; col < hidden; col += block_size) {
-            partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
+        if (i4_scale != nullptr) {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += int4_dequant_scalar(
+                               i4_slab, i4_scale, i4_zero,
+                               i4_row, col, hidden, int4_group_size)
+                           * x_norm_lds[col];
+            }
+        } else {
+            for (int col = tid; col < hidden; col += block_size) {
+                partial += static_cast<float>(w_row[col]) * x_norm_lds[col];
+            }
         }
         shared_scratch[tid] = partial;
         __syncthreads();
@@ -1559,6 +1602,7 @@ __global__ void qwen36_moe_linear_step_kernel(
     // and `output_hidden = input_hidden + o_out` in the oracle.
     {
         const int qd = V * v_dim;
+        const bool out_int4 = (out_proj_scale != nullptr);
 
         for (;;) {
             __shared__ unsigned int my_row_s;
@@ -1569,10 +1613,20 @@ __global__ void qwen36_moe_linear_step_kernel(
             const int my_row = static_cast<int>(my_row_s);
             if (my_row >= hidden) break;
 
-            const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
             float partial = 0.0f;
-            for (int j = tid; j < qd; j += block_size) {
-                partial += static_cast<float>(w_row[j]) * workspace[OFF_REC_OUT + j];
+            if (out_int4) {
+                const void* o_packed = reinterpret_cast<const void*>(out_proj_w);
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += int4_dequant_scalar(
+                                   o_packed, out_proj_scale, out_proj_zero,
+                                   my_row, j, qd, int4_group_size)
+                               * workspace[OFF_REC_OUT + j];
+                }
+            } else {
+                const T* w_row = out_proj_w + static_cast<size_t>(my_row) * qd;
+                for (int j = tid; j < qd; j += block_size) {
+                    partial += static_cast<float>(w_row[j]) * workspace[OFF_REC_OUT + j];
+                }
             }
             shared_scratch[tid] = partial;
             __syncthreads();

@@ -334,6 +334,13 @@ extern "C" {
         out_proj_w: *const c_void,
         conv_state: *mut c_void,
         recurrent_state: *mut f32,
+        int4_group_size: c_int,
+        in_proj_qkv_scale: *const c_void,
+        in_proj_qkv_zero: *const c_void,
+        in_proj_z_scale: *const c_void,
+        in_proj_z_zero: *const c_void,
+        out_proj_scale: *const c_void,
+        out_proj_zero: *const c_void,
         output: *mut c_void,
         workspace: *mut f32,
         counters: *mut c_uint,
@@ -699,6 +706,11 @@ pub struct Qwen36MoeLinearStepParams {
 /// Pointers unused by the requested `stage` may be null; the kernel won't
 /// dereference them. See [`qwen36_moe_hip_linear_step_launch`] for the
 /// per-stage matrix.
+///
+/// `in_proj_qkv_w`, `in_proj_z_w`, and `out_proj_w` carry either BF16 weight
+/// slabs (when the matching field in [`Qwen36MoeLinearStepInt4`] is null) or
+/// INT4 packed-u8 slabs (when the matching `*_scale`/`*_zero` pair is set).
+/// `in_proj_a_w` / `in_proj_b_w` and the conv/state buffers always stay BF16.
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeLinearStepWeights {
     pub input_hidden: *const c_void,
@@ -717,6 +729,37 @@ pub struct Qwen36MoeLinearStepWeights {
     pub recurrent_state: *mut f32,
 }
 
+/// Optional INT4 sidecar pointers + group size for the linear-attention
+/// parity launcher (PR 4b6). `group_size == 0` ⇒ INT4 disabled and every
+/// sidecar pointer must be null. Only the three projections the bake
+/// quantizes (`in_proj_qkv`, `in_proj_z`, `out_proj`) are switchable —
+/// `in_proj_a` / `in_proj_b` always stay BF16.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoeLinearStepInt4 {
+    pub group_size: i32,
+    pub in_proj_qkv_scale: *const c_void,
+    pub in_proj_qkv_zero: *const c_void,
+    pub in_proj_z_scale: *const c_void,
+    pub in_proj_z_zero: *const c_void,
+    pub out_proj_scale: *const c_void,
+    pub out_proj_zero: *const c_void,
+}
+
+impl Qwen36MoeLinearStepInt4 {
+    /// All-null sidecars + group_size=0. BF16 path falls through.
+    pub const fn disabled() -> Self {
+        Self {
+            group_size: 0,
+            in_proj_qkv_scale: std::ptr::null(),
+            in_proj_qkv_zero: std::ptr::null(),
+            in_proj_z_scale: std::ptr::null(),
+            in_proj_z_zero: std::ptr::null(),
+            out_proj_scale: std::ptr::null(),
+            out_proj_zero: std::ptr::null(),
+        }
+    }
+}
+
 /// Safe wrapper for the PR 4b3 staged linear-attention parity launcher.
 /// Same workspace / sync_buf layout as
 /// [`attn_step_launch`]: 32-byte zero scratch, F32 workspace sized for the
@@ -726,6 +769,7 @@ pub fn linear_step_launch(
     dtype: ScalarType,
     params: Qwen36MoeLinearStepParams,
     weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
@@ -777,6 +821,13 @@ pub fn linear_step_launch(
                     weights.out_proj_w,
                     weights.conv_state,
                     weights.recurrent_state,
+                    int4.group_size as c_int,
+                    int4.in_proj_qkv_scale,
+                    int4.in_proj_qkv_zero,
+                    int4.in_proj_z_scale,
+                    int4.in_proj_z_zero,
+                    int4.out_proj_scale,
+                    int4.out_proj_zero,
                     output.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
                     counters,
@@ -2443,6 +2494,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeLinearStepInt4::disabled(),
             &mut output,
             &mut workspace,
             &mut sync_buf,
@@ -2588,6 +2640,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeLinearStepInt4::disabled(),
             &mut output,
             &mut workspace,
             &mut sync_buf,
@@ -2748,6 +2801,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeLinearStepInt4::disabled(),
             &mut output,
             &mut workspace,
             &mut sync_buf,
@@ -2921,6 +2975,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeLinearStepInt4::disabled(),
             &mut output,
             &mut workspace,
             &mut sync_buf,
@@ -3109,6 +3164,7 @@ mod tests {
             ScalarType::BF16,
             params,
             &weight_ptrs,
+            &Qwen36MoeLinearStepInt4::disabled(),
             &mut output,
             &mut workspace,
             &mut sync_buf,
@@ -3122,6 +3178,246 @@ mod tests {
         // PR 4b2 stage 5.
         assert_parity(
             "linear step5 output_hidden",
+            got_bytes,
+            &output_hidden_expected,
+            0.05,
+            0.9999,
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // PR 4b6 step 4: linear-attn INT4 parity vs the INT4 oracle.
+    // -------------------------------------------------------------------
+
+    #[cfg(supersonic_backend_hip)]
+    fn linear_oracle_is_int4(json: &serde_json::Value) -> bool {
+        json["schema"].as_str() == Some("qwen36-moe-oracle-linear-int4-v1")
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    fn decode_linear_int4_sidecar(
+        json: &serde_json::Value, name: &str,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let blk = &json["int4_weights"][name];
+        let packed = b64_decode(blk["packed"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")));
+        let scale = b64_decode(blk["scale"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")));
+        let zero = b64_decode(blk["zero"].as_str()
+            .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")));
+        (packed, scale, zero)
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_linear_step_5_output_hidden_int4_matches_oracle() {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Some((json, geom)) = load_linear_oracle_json() else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON not set. \
+                 Generate an INT4 fixture with \
+                 `python oracle/qwen36_moe_linear_oracle.py --mode synthetic \
+                 --int4 --out /tmp/qwen36_lin_int4.json`."
+            );
+            return;
+        };
+        if !linear_oracle_is_int4(&json) {
+            eprintln!(
+                "skip: oracle JSON is not INT4 (schema={}). Pass `--int4` to \
+                 the oracle to exercise this test.",
+                json["schema"].as_str().unwrap_or("?"),
+            );
+            return;
+        }
+        let cfg = &json["config"];
+        let group_size = cfg["int4_group_size"].as_i64().unwrap_or(0) as i32;
+        assert!(group_size > 0, "INT4 oracle missing config.int4_group_size");
+
+        let weights = &json["weights"];
+        let inters = &json["intermediates"];
+
+        // BF16 inputs that stay BF16 (norms + small scalars + conv + state).
+        let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
+        let input_norm_w_bytes = b64_decode(weights["input_norm_w"].as_str().unwrap());
+        let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
+        let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
+        let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
+        let conv1d_bias_bytes = weights.get("conv1d_bias")
+            .and_then(|v| v.as_str())
+            .map(b64_decode);
+        let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
+        let dt_bias_bytes = b64_decode(weights["dt_bias"].as_str().unwrap());
+        let a_log_bytes = b64_decode(weights["a_log"].as_str().unwrap());
+        let recurrent_state_before_bytes =
+            b64_decode(weights["recurrent_state_before"].as_str().unwrap());
+        let norm_w_bytes = b64_decode(weights["norm_w"].as_str().unwrap());
+
+        // INT4 sidecars for the three projections.
+        let (qkv_packed, qkv_scale, qkv_zero) =
+            decode_linear_int4_sidecar(&json, "in_proj_qkv_w");
+        let (z_packed, z_scale, z_zero) =
+            decode_linear_int4_sidecar(&json, "in_proj_z_w");
+        let (out_packed, out_scale, out_zero) =
+            decode_linear_int4_sidecar(&json, "out_proj_w");
+
+        let output_hidden_expected = b64_decode(inters["output_hidden"].as_str().unwrap());
+
+        let hidden_us = geom.hidden as usize;
+        let k_us = geom.num_k_heads as usize;
+        let v_us = geom.num_v_heads as usize;
+        let kd_us = geom.head_k_dim as usize;
+        let vd_us = geom.head_v_dim as usize;
+        let conv_kernel = geom.conv_kernel_dim as usize;
+        let qkv_dim = 2 * k_us * kd_us + v_us * vd_us;
+        let val_dim = v_us * vd_us;
+
+        // Sanity: shapes match the bake convention.
+        assert_eq!(qkv_packed.len(), qkv_dim * (hidden_us / 2),
+            "in_proj_qkv packed bytes mismatch");
+        assert_eq!(z_packed.len(), val_dim * (hidden_us / 2));
+        assert_eq!(out_packed.len(), hidden_us * (val_dim / 2));
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let input_hidden = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
+        ).expect("upload input_hidden");
+        let input_norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
+        ).expect("upload input_norm_w");
+        let in_proj_a_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
+        ).expect("upload in_proj_a_w");
+        let in_proj_b_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
+        ).expect("upload in_proj_b_w");
+        let conv1d_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, conv_kernel], &conv1d_w_bytes,
+        ).expect("upload conv1d_w");
+        let conv1d_bias_buf = conv1d_bias_bytes.as_ref().map(|bytes| {
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
+                .expect("upload conv1d_bias")
+        });
+        let mut conv_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_dim, conv_kernel - 1],
+            &conv_state_before_bytes,
+        ).expect("upload conv_state");
+        let dt_bias = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
+        ).expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
+        ).expect("upload a_log");
+        let mut recurrent_state = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::F32, &[v_us, kd_us, vd_us],
+            &recurrent_state_before_bytes,
+        ).expect("upload recurrent_state");
+        let norm_w = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[kd_us], &norm_w_bytes,
+        ).expect("upload norm_w");
+
+        // Projection weights uploaded as packed u8 + BF16 scale/zero.
+        let qkv_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[qkv_packed.len()], &qkv_packed,
+        ).expect("upload qkv packed");
+        let qkv_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_scale.len() / 2], &qkv_scale,
+        ).expect("upload qkv scale");
+        let qkv_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[qkv_zero.len() / 2], &qkv_zero,
+        ).expect("upload qkv zero");
+        let z_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[z_packed.len()], &z_packed,
+        ).expect("upload z packed");
+        let z_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[z_scale.len() / 2], &z_scale,
+        ).expect("upload z scale");
+        let z_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[z_zero.len() / 2], &z_zero,
+        ).expect("upload z zero");
+        let out_packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[out_packed.len()], &out_packed,
+        ).expect("upload out packed");
+        let out_scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[out_scale.len() / 2], &out_scale,
+        ).expect("upload out scale");
+        let out_zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[out_zero.len() / 2], &out_zero,
+        ).expect("upload out zero");
+
+        let v_kdim = v_us * kd_us;
+        let stage_publish_max = 2 * v_kdim + val_dim;
+        let mut output = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[stage_publish_max],
+        ).expect("alloc output");
+        let workspace_floats =
+            qkv_dim + val_dim + 2 * v_us
+            + 2 * (k_us * kd_us)
+            + 2 * v_kdim
+            + v_us + v_us
+            + val_dim;
+        let mut workspace = GpuBuffer::zeros(
+            ordinal, ScalarType::F32, &[workspace_floats],
+        ).expect("alloc workspace");
+        let mut sync_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::U8, &[32],
+        ).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 5,
+            hidden: geom.hidden,
+            num_k_heads: geom.num_k_heads,
+            num_v_heads: geom.num_v_heads,
+            head_k_dim: geom.head_k_dim,
+            head_v_dim: geom.head_v_dim,
+            conv_kernel_dim: geom.conv_kernel_dim,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weight_ptrs = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: qkv_packed_buf.as_ptr(),
+            in_proj_z_w: z_packed_buf.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: conv1d_bias_buf.as_ref().map(|b| b.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            dt_bias: dt_bias.as_ptr(),
+            a_log: a_log.as_ptr(),
+            norm_w: norm_w.as_ptr(),
+            out_proj_w: out_packed_buf.as_ptr(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+        let int4_ptrs = Qwen36MoeLinearStepInt4 {
+            group_size,
+            in_proj_qkv_scale: qkv_scale_buf.as_ptr(),
+            in_proj_qkv_zero: qkv_zero_buf.as_ptr(),
+            in_proj_z_scale: z_scale_buf.as_ptr(),
+            in_proj_z_zero: z_zero_buf.as_ptr(),
+            out_proj_scale: out_scale_buf.as_ptr(),
+            out_proj_zero: out_zero_buf.as_ptr(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weight_ptrs,
+            &int4_ptrs,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("linear_step_launch stage 5 (int4)");
+
+        let got_bytes_full = output.to_host_bytes().expect("download output");
+        let got_bytes = &got_bytes_full[..hidden_us * 2];
+        assert_parity(
+            "linear step5 int4 output_hidden",
             got_bytes,
             &output_hidden_expected,
             0.05,

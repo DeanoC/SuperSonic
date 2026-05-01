@@ -252,6 +252,13 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     const void*   out_proj_w,
     void*         conv_state,
     float*        recurrent_state,
+    int           int4_group_size,
+    const void*   in_proj_qkv_scale,
+    const void*   in_proj_qkv_zero,
+    const void*   in_proj_z_scale,
+    const void*   in_proj_z_zero,
+    const void*   out_proj_scale,
+    const void*   out_proj_zero,
     void*         output,
     float*        workspace,
     unsigned int* counters,
@@ -271,6 +278,23 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
         barrier_flag == nullptr) {
         return 123;
     }
+    // INT4 sidecars: each scale must be paired with a zero. group_size==0
+    // disables INT4 entirely; otherwise it must be positive.
+    if (int4_group_size < 0) return 124;
+    auto pair_ok = [](const void* s, const void* z) -> bool {
+        return (s == nullptr) == (z == nullptr);
+    };
+    if (!pair_ok(in_proj_qkv_scale, in_proj_qkv_zero) ||
+        !pair_ok(in_proj_z_scale, in_proj_z_zero) ||
+        !pair_ok(out_proj_scale, out_proj_zero)) {
+        return 125;
+    }
+    const bool any_int4 =
+        (in_proj_qkv_scale != nullptr) ||
+        (in_proj_z_scale != nullptr) ||
+        (out_proj_scale != nullptr);
+    if (any_int4 && int4_group_size <= 0) return 126;
+    if (!any_int4 && int4_group_size != 0) return 127;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -315,6 +339,13 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
                        static_cast<const hip_bfloat16*>(out_proj_w),
                        static_cast<hip_bfloat16*>(conv_state),
                        recurrent_state,
+                       int4_group_size,
+                       static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
+                       static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
+                       static_cast<const hip_bfloat16*>(in_proj_z_scale),
+                       static_cast<const hip_bfloat16*>(in_proj_z_zero),
+                       static_cast<const hip_bfloat16*>(out_proj_scale),
+                       static_cast<const hip_bfloat16*>(out_proj_zero),
                        static_cast<hip_bfloat16*>(output),
                        workspace,
                        counters,
