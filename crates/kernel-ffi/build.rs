@@ -190,6 +190,11 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
             "dflash_draft_hip.o",
             "building DFlash draft HIP bridge",
         ),
+        (
+            "qwen36_moe_bridge.cpp",
+            "qwen36_moe_hip.o",
+            "building Qwen3.6-MoE HIP bridge",
+        ),
     ];
     let archs = detect_hip_archs();
     if archs.is_empty() {
@@ -353,6 +358,8 @@ fn main() {
         "phi4_bridge.cpp",
         "dflash_draft.hip",
         "dflash_draft_bridge.cpp",
+        "qwen36_moe.hip",
+        "qwen36_moe_bridge.cpp",
         "full_attention_cuda.cuh",
         "full_attention_4b_cuda.cuh",
         "prefill_helpers_cuda.cuh",

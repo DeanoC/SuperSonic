@@ -251,8 +251,33 @@ pub struct Llama31KernelParams {
     pub kv_chunk_size: usize,
 }
 
+/// Sanity bounds + scratch sizes for the Qwen3.6-MoE megakernel. The
+/// `num_experts` / `top_k` / `moe_intermediate_size` fields are NOT the
+/// source of truth — those come from the parsed `config.json`. They live
+/// here so we can refuse to launch a kernel against a checkpoint whose
+/// expert count blows past the megakernel's static scratch sizing.
+///
+/// Scratch fields are placeholder until PR 4 (CUDA kernel) lands. The values
+/// chosen here are conservative upper bounds drawn from the analytic state
+/// account in `qwen36_moe::state` — large enough for batch=1 decode at the
+/// 35B-A3B geometry without overpromising what the kernel will actually
+/// allocate.
+#[derive(Clone, Copy)]
+pub struct Qwen36MoeKernelParams {
+    pub weight_prefix: &'static str,
+    pub kv_chunk_size: usize,
+    pub proj_buf_floats: usize,
+    pub attn_scratch_floats: usize,
+    pub moe_scratch_floats: usize,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub moe_intermediate_size: u32,
+    pub shared_expert_intermediate_size: u32,
+}
+
 pub enum FamilyParams {
     Qwen35(Qwen35KernelParams),
+    Qwen36Moe(Qwen36MoeKernelParams),
     Gemma4(Gemma4KernelParams),
     Phi4(Phi4KernelParams),
     Llama31(Llama31KernelParams),
@@ -625,6 +650,51 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx1100. Primary AMD v1 target.
+    // BF16 won't fit 24 GiB; this entry assumes the INT4 bake. PR 3
+    // wires it for the dry-run path; PR 6 lands the kernel.
+    RegistryEntry {
+        model: ModelVariant::Qwen3_6_35B_A3B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 19 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            moe_scratch_floats: 4_096,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+        }),
+    },
+    // Qwen3.6-35B-A3B q4km on NVIDIA sm86. Primary CUDA v1 target. PR 4 lands
+    // the kernel.
+    RegistryEntry {
+        model: ModelVariant::Qwen3_6_35B_A3B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            moe_scratch_floats: 4_096,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+        }),
+    },
 ];
 
 pub fn lookup(
@@ -727,6 +797,30 @@ mod tests {
         );
         assert_eq!(ModelVariant::Qwen3_6_35B_A3B.to_string(), "qwen3.6-35b-a3b");
         assert!(supported_models_list().contains(&"qwen3.6-27b"));
+        assert!(supported_models_list().contains(&"qwen3.6-35b-a3b"));
+    }
+
+    #[test]
+    fn qwen36_moe_registry_entries_carry_real_geometry() {
+        for (backend, arch) in [
+            (Backend::Hip, GpuArch::Gfx1100),
+            (Backend::Cuda, GpuArch::Sm86),
+        ] {
+            let entry = lookup(&ModelVariant::Qwen3_6_35B_A3B, &backend, &arch)
+                .unwrap_or_else(|| panic!("qwen3.6-35b-a3b {backend} {arch} entry"));
+            match entry.params {
+                FamilyParams::Qwen36Moe(p) => {
+                    assert_eq!(p.weight_prefix, "model.language_model");
+                    assert_eq!(p.num_experts, 256);
+                    assert_eq!(p.top_k, 8);
+                    assert_eq!(p.moe_intermediate_size, 512);
+                    assert_eq!(p.shared_expert_intermediate_size, 512);
+                }
+                _ => panic!("qwen3.6-35b-a3b must use Qwen36Moe family params"),
+            }
+            // VRAM budget must leave headroom on a 24 GiB card.
+            assert!(entry.vram.fixed_bytes <= 24 * GIB);
+        }
     }
 
     #[test]

@@ -597,7 +597,32 @@ def apply_layout(t: torch.Tensor, shape: list[int], layout: str, dtype_str: str)
     raise ValueError(f"unknown layout {layout}")
 
 
+# Fused 3D MoE expert tensors (Qwen3.6-MoE): names lack `.weight` and ship 3D.
+# Treated as `E` parallel `[out, in]` matrices for INT4 packing — see
+# `quantize_minmax_fused_experts` for the driver path.
+FUSED_EXPERT_SUFFIXES = (
+    ".mlp.experts.gate_up_proj",
+    ".mlp.experts.down_proj",
+)
+
+
+def is_fused_expert_target(name: str) -> bool:
+    return any(name.endswith(s) for s in FUSED_EXPERT_SUFFIXES)
+
+
 def is_q4km_target(name: str, shape: list[int], group_size: int) -> bool:
+    if is_fused_expert_target(name):
+        # Real shapes: gate_up_proj [E, 2*moe_int, hidden],
+        #              down_proj    [E, hidden, moe_int].
+        # Validate divisibility on the per-expert (out, in) axes and accept.
+        if len(shape) != 3:
+            return False
+        out_dim, in_dim = shape[1], shape[2]
+        if in_dim % group_size != 0 or in_dim % 2 != 0:
+            return False
+        if out_dim % group_size != 0:
+            return False
+        return True
     if not name.endswith(".weight") or len(shape) != 2:
         return False
     if shape[1] % group_size != 0 or shape[1] % 2 != 0:
@@ -618,6 +643,17 @@ def is_q4km_target(name: str, shape: list[int], group_size: int) -> bool:
         # on the dominant decode-side matmul.
         return True
     return "_proj" in name or "experts" in name or "ffn_" in name
+
+
+def pack_nibbles_3d(nibbles: torch.Tensor) -> torch.Tensor:
+    """Pack `[E, rows, cols]` uint8 nibbles into `[E, rows, cols/2]` u8 bytes."""
+    if nibbles.dim() != 3:
+        raise ValueError(f"expected 3D nibble tensor, got shape {tuple(nibbles.shape)}")
+    e, rows, cols = nibbles.shape
+    if cols % 2 != 0:
+        raise ValueError(f"cols must be even, got {cols}")
+    r = nibbles.reshape(e, rows, cols // 2, 2).to(torch.uint8)
+    return (r[..., 0] | (r[..., 1] << 4)).contiguous()
 
 
 def pack_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
@@ -697,6 +733,56 @@ def quantize_minmax(W: torch.Tensor, group_size: int) -> tuple[torch.Tensor, tor
             scales[gr, gc] = sc
             zeros[gr, gc] = zf
     return pack_nibbles(nibbles), scales, zeros
+
+
+@torch.no_grad()
+def quantize_minmax_fused_experts(
+    W: torch.Tensor,
+    group_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-expert min/max INT4 group-quant for a 3D fused MoE weight slab.
+
+    Input shape: `[E, out, in]`. Each `[out, in]` expert is independently
+    quantized with `group_size`-tile BF16 scale + zero. Mirrors
+    `oracle/bake_int4.fused_expert_minmax_int4` so both bake paths produce the
+    same on-disk layout (packed nibbles `[E, out, in/2]`, scale/zero
+    `[E, out/gs, in/gs]`).
+    """
+    if W.dim() != 3:
+        raise SystemExit(f"fused expert tensor must be 3D, got shape {tuple(W.shape)}")
+    E, out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise SystemExit(
+            f"fused expert in_features {in_f} must be divisible by "
+            f"group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise SystemExit(
+            f"fused expert out_features {out_f} must be divisible by group_size={gs}"
+        )
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    nibbles = torch.empty((E, out_f, in_f), dtype=torch.uint8)
+    scales = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    zeros = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    for e in range(E):
+        slab = W[e].to(torch.float32)
+        tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
+        tmax = tiles.amax(dim=(1, 3))
+        tmin = tiles.amin(dim=(1, 3))
+        rng = tmax - tmin
+        sc = torch.where(rng > 0, rng / 15.0, torch.ones_like(rng))
+        zf = torch.where(rng > 0, -tmin / sc, torch.zeros_like(rng))
+        sc = sc.to(torch.bfloat16).to(torch.float32)
+        zf = zf.to(torch.bfloat16).to(torch.float32)
+        sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+        q = torch.clamp(torch.round(slab / sc_full + zf_full), 0, 15).to(torch.uint8)
+        nibbles[e] = q
+        scales[e] = sc
+        zeros[e] = zf
+    return pack_nibbles_3d(nibbles), scales, zeros
 
 
 @torch.no_grad()
@@ -859,7 +945,19 @@ def encode_tensor_entries(
     entries: list[tuple[str, bytes, list[int], str, str]] = []
     shape = list(t.shape)
     if is_q4km_target(name, shape, group_size):
-        if quantizer == QUANT_GPTQ:
+        if is_fused_expert_target(name):
+            # Fused MoE experts (Qwen3.6-MoE) — 3D `[E, out, in]`. Hessian-aware
+            # GPTQ doesn't apply cleanly to the fused layout (router decides
+            # which expert sees a token, so per-tensor Hessians are not
+            # well-defined). Always use min/max group-quant per expert; reject
+            # GPTQ requests loudly so the operator switches to --quantizer minmax.
+            if quantizer != QUANT_MINMAX:
+                raise SystemExit(
+                    f"{name}: fused MoE experts require --quantizer minmax "
+                    f"(got {quantizer!r}); see docs/qwen36-moe-plan.md §15."
+                )
+            packed, scales, zeros = quantize_minmax_fused_experts(t, group_size)
+        elif quantizer == QUANT_GPTQ:
             H = load_hessian(hessian_dir, name)
             if H is None:
                 raise SystemExit(

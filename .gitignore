@@ -5,6 +5,6 @@
 __pycache__/
 *.pyc
 .env
-.venv/
+.venv*/
 .supersonic/
 .claude/scheduled_tasks.lock

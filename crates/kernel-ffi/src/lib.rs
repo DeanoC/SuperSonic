@@ -7,6 +7,7 @@ mod metal_host;
 mod metal_native;
 pub mod phi4;
 pub mod prefill_ffi;
+pub mod qwen36_moe;
 
 pub use qwen35::{
     cuda_accumulate_target_nll_bf16, cuda_argmax_bf16, cuda_lm_head_argmax_bf16,
