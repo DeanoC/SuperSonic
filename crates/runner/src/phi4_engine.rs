@@ -713,19 +713,15 @@ pub fn run_phi4(
                     "decode_index": if in_prefill { -1 } else { (step - prompt_ids.len()) as isize },
                     "input_token": current_token,
                     "next": next,
-                    "top": top,
+                    "top": top.clone(),
                 }));
                 let payload = serde_json::json!({
                     "step": step,
                     "prompt_tokens": prompt_ids.len(),
                     "layers": launch_layers,
                     "next": next,
-                    "top": debug_logit_samples
-                        .first()
-                        .and_then(|sample| sample.get("top"))
-                        .cloned()
-                        .unwrap_or_else(|| serde_json::json!([])),
-                    "samples": debug_logit_samples,
+                    "top": top,
+                    "samples": &debug_logit_samples,
                 });
                 std::fs::write(path, serde_json::to_vec(&payload)?)
                     .map_err(|e| anyhow!("write debug logits dump {path}: {e}"))?;

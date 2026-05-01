@@ -412,6 +412,21 @@ def mismatch_diagnostic(py_ids: list[int], rs_ids: list[int], first_diverge: int
     py_token = py_ids[first_diverge] if first_diverge < len(py_ids) else None
     rust_token = rs_ids[first_diverge] if first_diverge < len(rs_ids) else None
     py_top = py_top_by_token[first_diverge] if first_diverge < len(py_top_by_token) else []
+    rust_diag_tokens = rust_diag.get("tokens", [])
+    prefix_aligned = rust_diag_tokens[:first_diverge] == rs_ids[:first_diverge]
+
+    if not prefix_aligned:
+        return {
+            "python_token": py_token,
+            "rust_token": rust_token,
+            "python_top": py_top,
+            "rust_materialized_tokens": rust_diag_tokens,
+            "rust_materialized_top": [],
+            "logit_gaps": [],
+            "near_tie": False,
+            "prefix_aligned": False,
+        }
+
     rust_samples = rust_diag.get("samples", [])
     rust_sample = rust_samples[first_diverge] if first_diverge < len(rust_samples) else {}
     rust_top = rust_sample.get("top", [])
@@ -435,6 +450,7 @@ def mismatch_diagnostic(py_ids: list[int], rs_ids: list[int], first_diverge: int
         "rust_materialized_top": rust_top,
         "logit_gaps": gaps,
         "near_tie": near_tie,
+        "prefix_aligned": True,
     }
 
 
@@ -534,6 +550,7 @@ def main() -> int:
             log(
                 "  diagnostic: "
                 f"near_tie={diag['near_tie']} "
+                f"prefix_aligned={diag['prefix_aligned']} "
                 f"python_token={diag['python_token']} rust_token={diag['rust_token']} "
                 f"gaps={diag['logit_gaps']}"
             )
