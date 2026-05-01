@@ -357,6 +357,38 @@ extern "C" {
     /// least `top_k` BF16 entries on stage 1 and `output_idx` must be at
     /// least `top_k` i32 entries. `sync_buf` (counters/barrier_counter/
     /// barrier_flag) must be 32 zero bytes.
+    ///
+    /// PR 4b5 step 2: INT4 dequant smoke launcher.
+    ///
+    /// Drives a tiny single-thread kernel that runs both `int4_dequant_8`
+    /// and `int4_dequant_scalar` over a `[out_rows, in_cols]` slab, writing
+    /// each helper's outputs into a separate buffer. The Rust-side test
+    /// validates byte-for-byte against a host reference computing the same
+    /// `bf16(q*s - z*s)` reconstruction. Catches porting bugs in the
+    /// helpers in isolation, before they're folded into the real FFN
+    /// matmuls in step 3+.
+    ///
+    /// `packed`: u8, shape `[out_rows, in_cols / 2]`, even col → low nibble.
+    /// `scale` / `zero`: BF16, shape `[out_rows / gsz, in_cols / gsz]`.
+    /// `dq_8_out`, `dq_scalar_out`: F32 device buffers, each
+    /// `out_rows * in_cols` long.
+    ///
+    /// Pre-conditions (the bridge validates them):
+    /// - `in_cols % 8 == 0`
+    /// - `in_cols % gsz == 0` and `gsz % 2 == 0`
+    /// - `out_rows % gsz == 0`
+    pub fn qwen36_moe_hip_int4_dequant_smoke_launch(
+        device_ordinal: usize,
+        packed: *const u8,
+        scale: *const c_void,
+        zero: *const c_void,
+        out_rows: c_int,
+        in_cols: c_int,
+        gsz: c_int,
+        dq_8_out: *mut f32,
+        dq_scalar_out: *mut f32,
+    ) -> c_int;
+
     pub fn qwen36_moe_hip_ffn_step_launch(
         dtype: c_int,
         device_ordinal: usize,
@@ -833,6 +865,95 @@ pub fn ffn_step_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe ffn_step launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// PR 4b5 step 2 safe wrapper for the INT4 dequant smoke launcher.
+///
+/// Drives the smoke kernel that exercises both `int4_dequant_8` and
+/// `int4_dequant_scalar` over the supplied `[out_rows, in_cols]` slab.
+/// `packed_buf` must be a u8 buffer with `out_rows * in_cols / 2` bytes.
+/// `scale_buf` and `zero_buf` must be BF16 buffers with `(out_rows / gsz)
+/// * (in_cols / gsz)` elements each. `dq_8_out` and `dq_scalar_out` must
+/// each be F32 buffers with at least `out_rows * in_cols` elements.
+#[allow(clippy::too_many_arguments)]
+pub fn int4_dequant_smoke_launch(
+    ordinal: usize,
+    packed_buf: &GpuBuffer,
+    scale_buf: &GpuBuffer,
+    zero_buf: &GpuBuffer,
+    out_rows: i32,
+    in_cols: i32,
+    gsz: i32,
+    dq_8_out: &mut GpuBuffer,
+    dq_scalar_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out_rows <= 0 || in_cols <= 0 || gsz <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::int4_dequant_smoke_launch: positive dims required, \
+             got out_rows={out_rows} in_cols={in_cols} gsz={gsz}"
+        )));
+    }
+    if in_cols % 8 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::int4_dequant_smoke_launch: in_cols ({in_cols}) must \
+             be divisible by 8 (the helpers' fast-path stride)"
+        )));
+    }
+    if in_cols % gsz != 0 || gsz % 2 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::int4_dequant_smoke_launch: in_cols ({in_cols}) must \
+             be divisible by gsz ({gsz}) and gsz must be even"
+        )));
+    }
+    if out_rows % gsz != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::int4_dequant_smoke_launch: out_rows ({out_rows}) must \
+             be divisible by gsz ({gsz})"
+        )));
+    }
+
+    let backend = packed_buf.backend();
+    let status = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_int4_dequant_smoke_launch(
+                    ordinal,
+                    packed_buf.as_ptr() as *const u8,
+                    scale_buf.as_ptr(),
+                    zero_buf.as_ptr(),
+                    out_rows as c_int,
+                    in_cols as c_int,
+                    gsz as c_int,
+                    dq_8_out.as_mut_ptr() as *mut f32,
+                    dq_scalar_out.as_mut_ptr() as *mut f32,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::int4_dequant_smoke_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::int4_dequant_smoke_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::int4_dequant_smoke_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe int4_dequant_smoke_launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -3388,5 +3509,224 @@ mod tests {
             0.05,
             0.999,
         );
+    }
+
+    // -------------------------------------------------------------------
+    // PR 4b5 step 2: INT4 dequant smoke test.
+    //
+    // Builds a small `[out_rows, in_cols]` weight slab in F32 on host,
+    // runs min/max group-quant to (packed u8, BF16 scale, BF16 zero) with
+    // exactly the same math as `oracle/qwen36_moe_ffn_oracle.py`, uploads
+    // the sidecars, calls the smoke launcher, and verifies the GPU
+    // outputs of `int4_dequant_8` and `int4_dequant_scalar` both equal a
+    // host-computed reference byte-for-byte (these are F32 values rounded
+    // through BF16, so exact equality is the right bar).
+    //
+    // Two configs run in succession to cover both helper paths:
+    //   gsz=8, in_cols=16  → every 8-col span lies in one group     (fast)
+    //   gsz=4, in_cols=16  → every 8-col span crosses a boundary    (slow)
+    // -------------------------------------------------------------------
+
+    /// BF16 round-to-nearest-even of an F32 value, returning the 16-bit
+    /// big-end-of-F32 representation. Same math as the kernel's
+    /// `bf16_round_rne_f32`.
+    #[cfg(supersonic_backend_hip)]
+    fn bf16_round_bits(x: f32) -> u16 {
+        let bits = x.to_bits();
+        let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
+        let r = bits.wrapping_add(rounding_bias);
+        (r >> 16) as u16
+    }
+
+    /// Reverse: F32 from a BF16 bit pattern.
+    #[cfg(supersonic_backend_hip)]
+    fn f32_from_bf16(b: u16) -> f32 {
+        f32::from_bits((b as u32) << 16)
+    }
+
+    /// Min/max INT4 group-quant on a 2D `[out, in]` F32 slab — Rust mirror
+    /// of `minmax_int4_packed_and_recon` in the FFN oracle. Returns
+    /// `(packed [out, in/2] u8, scale [out/gs, in/gs] u16-as-BF16,
+    /// zero [out/gs, in/gs] u16-as-BF16)`.
+    #[cfg(supersonic_backend_hip)]
+    fn host_minmax_int4(
+        w: &[f32], out_rows: usize, in_cols: usize, gsz: usize,
+    ) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
+        assert_eq!(w.len(), out_rows * in_cols);
+        assert_eq!(out_rows % gsz, 0);
+        assert_eq!(in_cols % gsz, 0);
+        assert_eq!(in_cols % 2, 0);
+        let sr = out_rows / gsz;
+        let sc = in_cols / gsz;
+
+        let mut packed = vec![0u8; out_rows * (in_cols / 2)];
+        let mut scale = vec![0u16; sr * sc];
+        let mut zero = vec![0u16; sr * sc];
+
+        for gr in 0..sr {
+            for gc in 0..sc {
+                let mut tmin = f32::INFINITY;
+                let mut tmax = f32::NEG_INFINITY;
+                for r in 0..gsz {
+                    for c in 0..gsz {
+                        let v = w[(gr * gsz + r) * in_cols + gc * gsz + c];
+                        tmin = tmin.min(v);
+                        tmax = tmax.max(v);
+                    }
+                }
+                let rng = tmax - tmin;
+                let s_f = if rng > 0.0 { rng / 15.0 } else { 1.0 };
+                let z_f = if rng > 0.0 { -tmin / s_f } else { 0.0 };
+                let s_bits = bf16_round_bits(s_f);
+                let z_bits = bf16_round_bits(z_f);
+                scale[gr * sc + gc] = s_bits;
+                zero[gr * sc + gc] = z_bits;
+                let s = f32_from_bf16(s_bits);
+                let z = f32_from_bf16(z_bits);
+                for r in 0..gsz {
+                    for c in 0..gsz {
+                        let row = gr * gsz + r;
+                        let col = gc * gsz + c;
+                        let v = w[row * in_cols + col];
+                        let q = (v / s + z).round().clamp(0.0, 15.0) as u8;
+                        // Pack: even col → low nibble, odd col → high nibble.
+                        let byte_idx = row * (in_cols / 2) + col / 2;
+                        if col & 1 == 0 {
+                            packed[byte_idx] = (packed[byte_idx] & 0xF0) | (q & 0x0F);
+                        } else {
+                            packed[byte_idx] = (packed[byte_idx] & 0x0F) | ((q & 0x0F) << 4);
+                        }
+                    }
+                }
+            }
+        }
+        (packed, scale, zero)
+    }
+
+    /// Reference reconstruction: `bf16(q*s - z*s)` per element. Returns
+    /// F32 values whose lower 16 bits are zero (i.e. exactly BF16-precision).
+    #[cfg(supersonic_backend_hip)]
+    fn host_dequant_recon(
+        packed: &[u8], scale: &[u16], zero: &[u16],
+        out_rows: usize, in_cols: usize, gsz: usize,
+    ) -> Vec<f32> {
+        let sc = in_cols / gsz;
+        let mut out = vec![0.0f32; out_rows * in_cols];
+        for row in 0..out_rows {
+            for col in 0..in_cols {
+                let gi = (row / gsz) * sc + col / gsz;
+                let s = f32_from_bf16(scale[gi]);
+                let z = f32_from_bf16(zero[gi]);
+                let byte = packed[row * (in_cols / 2) + col / 2];
+                let n = if col & 1 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                let v = (n as f32) * s - z * s;
+                out[row * in_cols + col] = f32::from_bits(
+                    (bf16_round_bits(v) as u32) << 16,
+                );
+            }
+        }
+        out
+    }
+
+    /// Encode a slice of BF16 16-bit values to LE bytes for `from_host_bytes`.
+    #[cfg(supersonic_backend_hip)]
+    fn bf16_bits_to_bytes(bits: &[u16]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(bits.len() * 2);
+        for b in bits {
+            bytes.extend_from_slice(&b.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Drives one (out_rows, in_cols, gsz) configuration through the smoke
+    /// kernel and asserts both helper outputs match the host reference
+    /// exactly.
+    #[cfg(supersonic_backend_hip)]
+    fn run_int4_dequant_smoke(out_rows: usize, in_cols: usize, gsz: usize, label: &str) {
+        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        // Deterministic synthetic weights: a 32-bit LCG seeded by config so
+        // each smoke variant uses different but reproducible values.
+        let n = out_rows * in_cols;
+        let mut rng_state: u32 = 0xC0FFEE
+            ^ ((out_rows as u32) << 16)
+            ^ ((in_cols as u32) << 8)
+            ^ (gsz as u32);
+        let mut w = vec![0.0f32; n];
+        for v in w.iter_mut() {
+            // LCG (Numerical Recipes constants) → uniform [-1, 1).
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let u = (rng_state >> 8) as f32 / ((1u32 << 24) as f32); // [0,1)
+            *v = u * 2.0 - 1.0;
+        }
+
+        let (packed, scale_bits, zero_bits) = host_minmax_int4(&w, out_rows, in_cols, gsz);
+        let recon_ref = host_dequant_recon(&packed, &scale_bits, &zero_bits,
+                                            out_rows, in_cols, gsz);
+
+        let packed_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::U8, &[packed.len()], &packed,
+        ).expect("upload packed");
+        let scale_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[scale_bits.len()],
+            &bf16_bits_to_bytes(&scale_bits),
+        ).expect("upload scale");
+        let zero_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[zero_bits.len()],
+            &bf16_bits_to_bytes(&zero_bits),
+        ).expect("upload zero");
+
+        let mut dq_8 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n])
+            .expect("alloc dq_8");
+        let mut dq_scalar = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n])
+            .expect("alloc dq_scalar");
+
+        int4_dequant_smoke_launch(
+            ordinal,
+            &packed_buf, &scale_buf, &zero_buf,
+            out_rows as i32, in_cols as i32, gsz as i32,
+            &mut dq_8, &mut dq_scalar,
+        ).expect("smoke launch");
+
+        let dq_8_bytes = dq_8.to_host_bytes().expect("download dq_8");
+        let dq_scalar_bytes = dq_scalar.to_host_bytes().expect("download dq_scalar");
+        let dq_8_v: Vec<f32> = dq_8_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let dq_scalar_v: Vec<f32> = dq_scalar_bytes.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+
+        for i in 0..n {
+            assert_eq!(
+                dq_8_v[i].to_bits(), recon_ref[i].to_bits(),
+                "[{label}] int4_dequant_8 mismatch at i={i}: got {} ({:#010x}), want {} ({:#010x})",
+                dq_8_v[i], dq_8_v[i].to_bits(),
+                recon_ref[i], recon_ref[i].to_bits(),
+            );
+            assert_eq!(
+                dq_scalar_v[i].to_bits(), recon_ref[i].to_bits(),
+                "[{label}] int4_dequant_scalar mismatch at i={i}: got {} ({:#010x}), want {} ({:#010x})",
+                dq_scalar_v[i], dq_scalar_v[i].to_bits(),
+                recon_ref[i], recon_ref[i].to_bits(),
+            );
+        }
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_int4_dequant_smoke_fast_path() {
+        // gsz=8, in_cols=16 → every 8-col span lies in one group, so
+        // `int4_dequant_8` exercises its `g0 == g7` fast path on every span.
+        run_int4_dequant_smoke(8, 16, 8, "fast (gsz=8)");
+    }
+
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_int4_dequant_smoke_slow_path() {
+        // gsz=4, in_cols=16 → 8-col spans starting at col=0 cross from
+        // group 0 to group 1 (boundary at col=4); spans starting at col=8
+        // cross 2→3. Exercises the per-element `g0 != g7` slow path.
+        run_int4_dequant_smoke(8, 16, 4, "slow (gsz=4)");
     }
 }

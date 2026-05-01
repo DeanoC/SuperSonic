@@ -44,6 +44,96 @@ __device__ __forceinline__ float bf16_round_rne_f32(float x) {
     return y;
 }
 
+// ---------------------------------------------------------------------------
+// INT4 group-quant dequant — ported from kernels/full_attention_4b.hip
+// (PR 4b5). Per CLAUDE.md the qwen36_moe and full_attention_4b kernels are
+// isolated compilation units (hipcc on gfx11xx is fragile), so the helpers
+// live here as a copy rather than a shared header. The numerics match
+// `oracle/bake_int4.py`'s reconstruction exactly:
+//   recon = bf16_round_rne_f32(nibble * scale - zero * scale)
+// (single rounding through BF16 at the end).
+//
+// Layout (matches the bake + the full_attention_4b versions):
+//   weights : `[..., out, in/2]` u8   — 2 nibbles/byte, even col → low.
+//   scale   : `[..., out/gs, in/gs]` BF16
+//   zero    : `[..., out/gs, in/gs]` BF16
+
+// Dequantize 8 INT4 weights from 4 packed bytes.
+// `packed` carries 8 nibbles in the same nibble-order
+// `int4_dequant_8` in full_attention_4b uses (low nibble = even col).
+// `col` is the starting input column for the 8-element span (must be
+// 2-aligned). `scale_row = row / gsz`, `scale_cols = (cols + gsz - 1) / gsz`,
+// `sb = scale_row * scale_cols`. Fast path covers the common case where all
+// 8 columns share a group (gs=128 + 8-element step ⇒ true except at group
+// boundaries).
+__device__ inline void int4_dequant_8(
+    uint32_t packed,
+    const hip_bfloat16* __restrict__ scales,
+    const hip_bfloat16* __restrict__ zeros,
+    int scale_row, int col, int scale_cols, int gsz,
+    float out[8]
+) {
+    const int sb = scale_row * scale_cols;
+    int n0 = (packed >>  0) & 0xF;
+    int n1 = (packed >>  4) & 0xF;
+    int n2 = (packed >>  8) & 0xF;
+    int n3 = (packed >> 12) & 0xF;
+    int n4 = (packed >> 16) & 0xF;
+    int n5 = (packed >> 20) & 0xF;
+    int n6 = (packed >> 24) & 0xF;
+    int n7 = (packed >> 28) & 0xF;
+
+    const int g0 = col / gsz;
+    const int g7 = (col + 7) / gsz;
+    if (g0 == g7) {
+        float s = static_cast<float>(scales[sb + g0]);
+        float zs = static_cast<float>(zeros[sb + g0]) * s;
+        out[0] = bf16_round_rne_f32(static_cast<float>(n0) * s - zs);
+        out[1] = bf16_round_rne_f32(static_cast<float>(n1) * s - zs);
+        out[2] = bf16_round_rne_f32(static_cast<float>(n2) * s - zs);
+        out[3] = bf16_round_rne_f32(static_cast<float>(n3) * s - zs);
+        out[4] = bf16_round_rne_f32(static_cast<float>(n4) * s - zs);
+        out[5] = bf16_round_rne_f32(static_cast<float>(n5) * s - zs);
+        out[6] = bf16_round_rne_f32(static_cast<float>(n6) * s - zs);
+        out[7] = bf16_round_rne_f32(static_cast<float>(n7) * s - zs);
+    } else {
+        float s0 = static_cast<float>(scales[sb + g0]);
+        float zs0 = static_cast<float>(zeros[sb + g0]) * s0;
+        float s1 = static_cast<float>(scales[sb + g7]);
+        float zs1 = static_cast<float>(zeros[sb + g7]) * s1;
+        #define I4DQ(idx, ni) do { \
+            int gi = (col + idx) / gsz; \
+            float si = (gi == g0) ? s0 : s1; \
+            float zsi = (gi == g0) ? zs0 : zs1; \
+            out[idx] = bf16_round_rne_f32(static_cast<float>(ni) * si - zsi); \
+        } while(0)
+        I4DQ(0, n0); I4DQ(1, n1); I4DQ(2, n2); I4DQ(3, n3);
+        I4DQ(4, n4); I4DQ(5, n5); I4DQ(6, n6); I4DQ(7, n7);
+        #undef I4DQ
+    }
+}
+
+// Single-element dequant for non-8-aligned tails. `cols` is the unpacked
+// input dim of the 2D slab `(row, col)` indexes into. `scales`/`zeros`
+// are at `[(row/gs) * ((cols + gs - 1)/gs) + col/gs]` — same as the 2D
+// helpers in full_attention_4b.
+__device__ inline float int4_dequant_scalar(
+    const void* w_ptr, const void* scale_ptr, const void* zero_ptr,
+    int row, int col, int cols, int group_size
+) {
+    const uint8_t* data = static_cast<const uint8_t*>(w_ptr);
+    int byte_cols = cols / 2;
+    uint8_t packed_byte = data[static_cast<size_t>(row) * byte_cols + col / 2];
+    int nibble = (col & 1) ? ((packed_byte >> 4) & 0xF) : (packed_byte & 0xF);
+    const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    const hip_bfloat16* zeros = static_cast<const hip_bfloat16*>(zero_ptr);
+    int si = (row / group_size) * ((cols + group_size - 1) / group_size)
+           + col / group_size;
+    float s = static_cast<float>(scales[si]);
+    return bf16_round_rne_f32(
+        static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
+}
+
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------
 
 struct DecodeLayerDesc {
@@ -2096,6 +2186,57 @@ __global__ void qwen36_moe_ffn_step_kernel(
             output[my_row] = static_cast<T>(val);
         }
         __syncthreads();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PR 4b5 step 2: INT4 dequant smoke kernel.
+//
+// Single-thread sweep over a small `[out_rows, in_cols]` slab that calls
+// both `int4_dequant_8` (fused 8-wide path) and `int4_dequant_scalar`
+// (single-element path) into separate output buffers. The host test
+// compares each output byte-for-byte against a Rust-side reference
+// implementing the same `bf16(q*s - z*s)` math. This catches porting
+// bugs in the helpers in isolation, before they're folded into the FFN
+// matmuls in step 3+.
+//
+// Pre-conditions (the bridge validates them):
+//   - in_cols % 8 == 0
+//   - in_cols % gsz == 0, gsz % 2 == 0 (single-byte index by `col / 2`)
+//   - out_rows % gsz == 0 (single-row scale tile per scale_row)
+__global__ void int4_dequant_smoke_kernel(
+    const uint8_t*      packed,        // [out_rows, in_cols / 2]
+    const hip_bfloat16* scale,         // [out_rows / gsz, in_cols / gsz]
+    const hip_bfloat16* zero,          // [out_rows / gsz, in_cols / gsz]
+    int                 out_rows,
+    int                 in_cols,
+    int                 gsz,
+    float*              dq_8_out,      // [out_rows * in_cols] from int4_dequant_8
+    float*              dq_scalar_out  // [out_rows * in_cols] from int4_dequant_scalar
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const int byte_cols = in_cols / 2;
+    const int scale_cols = in_cols / gsz;
+    for (int row = 0; row < out_rows; ++row) {
+        // Path A: 8-wide fused dequant.
+        for (int col = 0; col < in_cols; col += 8) {
+            uint32_t pk = 0;
+            for (int b = 0; b < 4; ++b) {
+                pk |= static_cast<uint32_t>(
+                          packed[row * byte_cols + col / 2 + b]) << (8 * b);
+            }
+            float d[8];
+            int4_dequant_8(pk, scale, zero,
+                           row / gsz, col, scale_cols, gsz, d);
+            for (int i = 0; i < 8; ++i) {
+                dq_8_out[row * in_cols + col + i] = d[i];
+            }
+        }
+        // Path B: scalar dequant (one element at a time).
+        for (int col = 0; col < in_cols; ++col) {
+            dq_scalar_out[row * in_cols + col] = int4_dequant_scalar(
+                packed, scale, zero, row, col, in_cols, gsz);
+        }
     }
 }
 

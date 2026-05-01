@@ -382,3 +382,42 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     if (sync_err_ffn != hipSuccess) return 255;
     return 0;
 }
+
+// PR 4b5 step 2: INT4 dequant smoke launcher.
+// Drives `qwen36_moe::int4_dequant_smoke_kernel` over a small `[out_rows,
+// in_cols]` slab and writes both helpers' outputs to separate buffers.
+// The Rust-side test validates byte-for-byte against a host reference.
+extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
+    size_t         device_ordinal,
+    const uint8_t* packed,
+    const void*    scale,
+    const void*    zero,
+    int            out_rows,
+    int            in_cols,
+    int            gsz,
+    float*         dq_8_out,
+    float*         dq_scalar_out) {
+    if (packed == nullptr || scale == nullptr || zero == nullptr ||
+        dq_8_out == nullptr || dq_scalar_out == nullptr) {
+        return 140;
+    }
+    if (out_rows <= 0 || in_cols <= 0 || gsz <= 0) return 141;
+    if (in_cols % 8 != 0) return 142;
+    if (in_cols % gsz != 0 || gsz % 2 != 0) return 143;
+    if (out_rows % gsz != 0) return 144;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipLaunchKernelGGL(qwen36_moe::int4_dequant_smoke_kernel,
+                       dim3(1), dim3(1), 0, 0,
+                       packed,
+                       static_cast<const hip_bfloat16*>(scale),
+                       static_cast<const hip_bfloat16*>(zero),
+                       out_rows, in_cols, gsz,
+                       dq_8_out, dq_scalar_out);
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
