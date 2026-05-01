@@ -1153,6 +1153,16 @@ fn decode_text(
             continue;
         }
 
+        // Optional dump for the host-side post-chain debug harness.
+        if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN") {
+            std::fs::write(&dump_path, &outputs.final_hidden_bytes)
+                .with_context(|| format!("write final_hidden dump to {dump_path}"))?;
+            eprintln!(
+                "[debug] dumped step={step} position={position} final_hidden ({} BF16 bytes) to {dump_path}",
+                outputs.final_hidden_bytes.len()
+            );
+        }
+
         // Generation step: lm_head + sample (greedy when temperature == 0).
         let logits = host_final_norm_lm_head(
             &outputs.final_hidden_bytes,
@@ -1162,6 +1172,14 @@ fn decode_text(
             geom.vocab as usize,
             geom.rms_norm_eps,
         );
+        if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
+            std::fs::write(&dump_path, &logits)
+                .with_context(|| format!("write logits dump to {dump_path}"))?;
+            eprintln!(
+                "[debug] dumped step={step} logits ({} BF16 bytes) to {dump_path}",
+                logits.len()
+            );
+        }
         let next_token = sample_bf16_logits(
             &logits,
             sampling.temperature,
