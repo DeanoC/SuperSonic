@@ -6,6 +6,7 @@ BINARY="${BINARY:-target/release/supersonic}"
 CONTEXTS="${CONTEXTS:-8K}"
 FAMILIES="${FAMILIES:-pg19}"
 MODES="${MODES:-fp8}"
+DECODE_PATHS="${DECODE_PATHS:-chained}"
 REPEATS="${REPEATS:-1}"
 TIMEOUT="${TIMEOUT:-1800}"
 PG19_SOURCE="${PG19_SOURCE:-synthetic}"
@@ -27,6 +28,7 @@ cargo build --release --bin supersonic
   --contexts "${CONTEXTS}" \
   --families "${FAMILIES}" \
   --modes "${MODES}" \
+  --decode-paths "${DECODE_PATHS}" \
   --repeats "${REPEATS}" \
   --timeout "${TIMEOUT}" \
   --pg19-source "${PG19_SOURCE}" \

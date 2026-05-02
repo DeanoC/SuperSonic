@@ -328,9 +328,19 @@ def parse_stage_timings(output: str) -> dict[str, float]:
     return out
 
 
-def run_once(args: argparse.Namespace, case: Case, mode: str, repeat_idx: int, tmp: Path) -> dict[str, Any]:
-    logits = tmp / f"{case.case_id}_{mode}_{repeat_idx}_logits.bin"
-    hidden = tmp / f"{case.case_id}_{mode}_{repeat_idx}_hidden.bin"
+def run_once(
+    args: argparse.Namespace,
+    case: Case,
+    mode: str,
+    decode_path: str,
+    repeat_idx: int,
+    tmp: Path,
+) -> dict[str, Any]:
+    # Dump filenames include `decode_path` so chained/persistent runs of the
+    # same (case, mode, repeat_idx) don't clobber each other — the
+    # bit-identity check below diff's their SHA256s.
+    logits = tmp / f"{case.case_id}_{mode}_{decode_path}_{repeat_idx}_logits.bin"
+    hidden = tmp / f"{case.case_id}_{mode}_{decode_path}_{repeat_idx}_hidden.bin"
     env = os.environ.copy()
     env["SUPERSONIC_QWEN36_DUMP_LOGITS"] = str(logits)
     env["SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN"] = str(hidden)
@@ -356,6 +366,10 @@ def run_once(args: argparse.Namespace, case: Case, mode: str, repeat_idx: int, t
         raise ValueError(f"unknown mode {mode}")
     if args.emit_stage_timings:
         cmd.append("--emit-stage-timings")
+    if decode_path == "persistent":
+        cmd.append("--persistent-decode")
+    elif decode_path != "chained":
+        raise ValueError(f"unknown decode_path {decode_path}")
 
     start = time.perf_counter()
     try:
@@ -371,6 +385,7 @@ def run_once(args: argparse.Namespace, case: Case, mode: str, repeat_idx: int, t
         output = stdout + stderr
         return {
             "mode": mode,
+            "decode_path": decode_path,
             "repeat_idx": repeat_idx,
             "returncode": None,
             "timed_out": True,
@@ -386,6 +401,7 @@ def run_once(args: argparse.Namespace, case: Case, mode: str, repeat_idx: int, t
     output = proc.stdout + proc.stderr
     row: dict[str, Any] = {
         "mode": mode,
+        "decode_path": decode_path,
         "repeat_idx": repeat_idx,
         "returncode": proc.returncode,
         "wall_seconds": wall,
@@ -409,10 +425,34 @@ def run_once(args: argparse.Namespace, case: Case, mode: str, repeat_idx: int, t
     return row
 
 
+def _cell_key(row: dict[str, Any]) -> str:
+    """Two-axis cell key: `<mode>/<decode_path>`. Older payloads pre-Phase
+    3e.2 only had a `mode` axis; default `decode_path=chained` for
+    backwards compatibility on those rows."""
+    return f"{row['mode']}/{row.get('decode_path', 'chained')}"
+
+
+def _stage_mean(rows: list[dict[str, Any]], key: str) -> float | None:
+    """Mean of `row['stage'][key]` across `rows`. Used for the
+    chained-vs-persistent perf delta. Skips rows whose stage block is
+    missing the key (timeouts, runs that crashed before stage timings
+    printed, etc.)."""
+    vals = [
+        float(r["stage"][key])
+        for r in rows
+        if isinstance(r.get("stage"), dict) and key in r["stage"]
+    ]
+    return statistics.mean(vals) if vals else None
+
+
 def summarize_case(case: Case, runs: list[dict[str, Any]]) -> dict[str, Any]:
-    by_mode: dict[str, list[dict[str, Any]]] = {}
+    # Two-axis grouping: cell = (mode × decode_path). Each cell gets its
+    # own determinism + perf stats. The `chained_vs_persistent` block
+    # below cross-references cells when both decode paths were run for
+    # the same mode.
+    by_cell: dict[str, list[dict[str, Any]]] = {}
     for row in runs:
-        by_mode.setdefault(str(row["mode"]), []).append(row)
+        by_cell.setdefault(_cell_key(row), []).append(row)
     summary: dict[str, Any] = {
         "case_id": case.case_id,
         "family": case.family,
@@ -421,14 +461,14 @@ def summarize_case(case: Case, runs: list[dict[str, Any]]) -> dict[str, Any]:
         "references": case.references,
         "modes": {},
     }
-    for mode, rows in by_mode.items():
+    for cell, rows in by_cell.items():
         ok_rows = [r for r in rows if r.get("returncode") == 0 and not r.get("error")]
         logits_hashes = {r.get("logits_sha256") for r in ok_rows}
         hidden_hashes = {r.get("hidden_sha256") for r in ok_rows}
         generated = {tuple(r.get("generated_ids") or []) for r in ok_rows}
         all_zero = [bool((r.get("logits_stats") or {}).get("all_zero")) for r in ok_rows]
         wall = [float(r.get("wall_seconds") or 0.0) for r in ok_rows]
-        mode_summary = {
+        cell_summary = {
             "runs": len(rows),
             "ok_runs": len(ok_rows),
             "deterministic_logits": len(logits_hashes) == 1 and len(ok_rows) == len(rows),
@@ -439,26 +479,89 @@ def summarize_case(case: Case, runs: list[dict[str, Any]]) -> dict[str, Any]:
             "hidden_hashes": sorted(h for h in hidden_hashes if h),
             "generated_ids": [list(x) for x in sorted(generated)],
             "wall_seconds_mean": statistics.mean(wall) if wall else None,
+            "chain_ms_avg_mean": _stage_mean(ok_rows, "chain_ms_avg"),
+            "total_ms_avg_mean": _stage_mean(ok_rows, "total_ms_avg"),
             "errors": [r.get("error") for r in rows if r.get("error") or r.get("returncode") != 0],
         }
-        summary["modes"][mode] = mode_summary
+        summary["modes"][cell] = cell_summary
 
-    if "fp8" in by_mode and "int4" in by_mode:
-        fp8_ok = [r for r in by_mode["fp8"] if r.get("logits_path") and not r.get("error")]
-        int4_ok = [r for r in by_mode["int4"] if r.get("logits_path") and not r.get("error")]
-        if fp8_ok and int4_ok:
-            summary["fp8_vs_int4_logits"] = compare_vectors(
-                Path(fp8_ok[0]["logits_path"]),
-                Path(int4_ok[0]["logits_path"]),
-            )
+    # FP8↔INT4 quantization comparison (existing). Look for the chained
+    # variants of each mode by default — chained is the canonical
+    # numerical reference. Falls back to whichever decode_path was run if
+    # only one is present.
+    def _pick_for_mode(mode: str) -> dict[str, Any] | None:
+        for decode_path in ("chained", "persistent"):
+            cell_rows = by_cell.get(f"{mode}/{decode_path}", [])
+            ok = [r for r in cell_rows if r.get("logits_path") and not r.get("error")]
+            if ok:
+                return ok[0]
+        return None
+
+    fp8_ref = _pick_for_mode("fp8")
+    int4_ref = _pick_for_mode("int4")
+    if fp8_ref and int4_ref:
+        summary["fp8_vs_int4_logits"] = compare_vectors(
+            Path(fp8_ref["logits_path"]),
+            Path(int4_ref["logits_path"]),
+        )
+
+    # Chained-vs-persistent comparison per mode. Bit-identity is the
+    # gate (Phase 3e parity test asserts it on synthetic fixtures); this
+    # block surfaces it for every real prompt + verifies the perf delta
+    # matches the projected ~9-10% from launch-overhead reclaim.
+    chained_vs_persistent: dict[str, Any] = {}
+    for mode in {row["mode"] for row in runs}:
+        chained_rows = by_cell.get(f"{mode}/chained", [])
+        persistent_rows = by_cell.get(f"{mode}/persistent", [])
+        if not chained_rows or not persistent_rows:
+            continue
+        c_ok = [r for r in chained_rows if r.get("logits_path") and not r.get("error")]
+        p_ok = [r for r in persistent_rows if r.get("logits_path") and not r.get("error")]
+        if not c_ok or not p_ok:
+            continue
+        block: dict[str, Any] = {}
+        # Bit-identity: the persistent kernel runs the IDENTICAL device
+        # functions as the chained step kernels, so logits + hidden + ids
+        # should match byte-for-byte across every (case, mode, repeat).
+        c_logits = {r["logits_sha256"] for r in c_ok if r.get("logits_sha256")}
+        p_logits = {r["logits_sha256"] for r in p_ok if r.get("logits_sha256")}
+        c_hidden = {r["hidden_sha256"] for r in c_ok if r.get("hidden_sha256")}
+        p_hidden = {r["hidden_sha256"] for r in p_ok if r.get("hidden_sha256")}
+        c_ids = {tuple(r.get("generated_ids") or []) for r in c_ok}
+        p_ids = {tuple(r.get("generated_ids") or []) for r in p_ok}
+        block["logits_bit_identical"] = bool(c_logits) and c_logits == p_logits
+        block["hidden_bit_identical"] = bool(c_hidden) and c_hidden == p_hidden
+        block["generated_ids_match"] = bool(c_ids) and c_ids == p_ids
+        # Perf delta. Use stage-level chain_ms_avg when available (most
+        # accurate), wall_seconds otherwise.
+        c_chain = _stage_mean(c_ok, "chain_ms_avg")
+        p_chain = _stage_mean(p_ok, "chain_ms_avg")
+        if c_chain is not None and p_chain is not None and c_chain > 0:
+            block["chain_ms_avg_chained"] = c_chain
+            block["chain_ms_avg_persistent"] = p_chain
+            block["chain_speedup_pct"] = 100.0 * (c_chain - p_chain) / c_chain
+        c_total = _stage_mean(c_ok, "total_ms_avg")
+        p_total = _stage_mean(p_ok, "total_ms_avg")
+        if c_total is not None and p_total is not None and c_total > 0:
+            block["total_ms_avg_chained"] = c_total
+            block["total_ms_avg_persistent"] = p_total
+            block["total_speedup_pct"] = 100.0 * (c_total - p_total) / c_total
+        chained_vs_persistent[mode] = block
+    if chained_vs_persistent:
+        summary["chained_vs_persistent"] = chained_vs_persistent
+
     return summary
 
 
 def evaluate_failures(payload: dict[str, Any], args: argparse.Namespace) -> list[str]:
     failures: list[str] = []
     for case in payload["summary"]:
-        for mode, row in case["modes"].items():
-            label = f"{case['case_id']}:{mode}"
+        # Cell labels are now `<mode>/<decode_path>`; older payloads
+        # written before Phase 3e.2 stayed as plain `<mode>` and the
+        # default decode_path is chained, so the "/" delimiter just
+        # disambiguates and stays human-readable.
+        for cell, row in case["modes"].items():
+            label = f"{case['case_id']}:{cell}"
             if row["ok_runs"] != row["runs"]:
                 failures.append(f"{label} had {row['runs'] - row['ok_runs']} failed runs")
             if args.fail_on_nondeterminism:
@@ -470,6 +573,30 @@ def evaluate_failures(payload: dict[str, Any], args: argparse.Namespace) -> list
                     failures.append(f"{label} generated ids are nondeterministic")
             if row["any_all_zero_logits"]:
                 failures.append(f"{label} produced all-zero logits")
+        # Phase 3e.2 gate: when both decode paths are run for a mode,
+        # the persistent kernel must produce byte-identical
+        # logits/hidden/generated_ids vs the chained reference. This is
+        # the production-prompt analog of the
+        # `multilayer_persistent_decode_matches_chained` parity test;
+        # any divergence here means a regression in the megakernel or
+        # its descriptor wiring on a real prompt the parity test
+        # doesn't cover.
+        cvp = case.get("chained_vs_persistent") or {}
+        for mode, block in cvp.items():
+            label = f"{case['case_id']}:{mode}"
+            if not block.get("logits_bit_identical", True):
+                failures.append(
+                    f"{label} chained vs persistent logits diverged "
+                    f"(should be byte-identical)"
+                )
+            if not block.get("hidden_bit_identical", True):
+                failures.append(
+                    f"{label} chained vs persistent hidden state diverged"
+                )
+            if not block.get("generated_ids_match", True):
+                failures.append(
+                    f"{label} chained vs persistent generated_ids diverged"
+                )
     return failures
 
 
@@ -481,6 +608,18 @@ def main() -> int:
     parser.add_argument("--contexts", default="512,2K,8K")
     parser.add_argument("--families", default="pg19,ruler", help="comma list: pg19,ruler")
     parser.add_argument("--modes", default="fp8,int4", help="comma list: fp8,int4")
+    parser.add_argument(
+        "--decode-paths",
+        default="chained",
+        help=(
+            "comma list: chained,persistent. `persistent` adds "
+            "`--persistent-decode` to the supersonic command (Phase 3e.2 "
+            "megakernel — one cooperative HIP launch per token instead of "
+            "80 step launches). When both are present the suite gates "
+            "byte-identity of logits/hidden/generated_ids and reports the "
+            "perf delta in `chained_vs_persistent` per case."
+        ),
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--max-new-tokens", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=600)
@@ -502,6 +641,12 @@ def main() -> int:
     contexts = parse_contexts(args.contexts)
     families = [x.strip() for x in args.families.split(",") if x.strip()]
     modes = [x.strip() for x in args.modes.split(",") if x.strip()]
+    decode_paths = [x.strip() for x in args.decode_paths.split(",") if x.strip()]
+    if not decode_paths:
+        decode_paths = ["chained"]
+    for dp in decode_paths:
+        if dp not in ("chained", "persistent"):
+            raise ValueError(f"--decode-paths entry {dp!r} not in {{chained, persistent}}")
     if args.repeats < 1:
         raise ValueError("--repeats must be >= 1")
     if not args.binary.exists():
@@ -533,35 +678,54 @@ def main() -> int:
                 flush=True,
             )
             for mode in modes:
-                for repeat_idx in range(args.repeats):
-                    row = run_once(args, case, mode, repeat_idx, tmp)
-                    row["case_id"] = case.case_id
-                    row["family"] = case.family
-                    row["context"] = case.context
-                    row["prompt_tokens"] = case.prompt_tokens
-                    case_runs.append(row)
-                    all_runs.append(row)
-                    status = "ok" if row.get("returncode") == 0 and not row.get("error") else "FAIL"
-                    print(
-                        f"  {mode:<4} repeat={repeat_idx} {status} "
-                        f"ids={row.get('generated_ids')} "
-                        f"logits={str(row.get('logits_sha256', ''))[:12]} "
-                        f"zero={(row.get('logits_stats') or {}).get('all_zero')}"
-                        ,
-                        flush=True,
-                    )
-                    if status != "ok" and not args.continue_on_error:
-                        raise RuntimeError(str(row.get("error") or "run failed"))
+                for decode_path in decode_paths:
+                    for repeat_idx in range(args.repeats):
+                        row = run_once(args, case, mode, decode_path, repeat_idx, tmp)
+                        row["case_id"] = case.case_id
+                        row["family"] = case.family
+                        row["context"] = case.context
+                        row["prompt_tokens"] = case.prompt_tokens
+                        case_runs.append(row)
+                        all_runs.append(row)
+                        status = "ok" if row.get("returncode") == 0 and not row.get("error") else "FAIL"
+                        cell_label = f"{mode}/{decode_path}"
+                        print(
+                            f"  {cell_label:<18} repeat={repeat_idx} {status} "
+                            f"ids={row.get('generated_ids')} "
+                            f"logits={str(row.get('logits_sha256', ''))[:12]} "
+                            f"zero={(row.get('logits_stats') or {}).get('all_zero')}",
+                            flush=True,
+                        )
+                        if status != "ok" and not args.continue_on_error:
+                            raise RuntimeError(str(row.get("error") or "run failed"))
             case_summary = summarize_case(case, case_runs)
             summary.append(case_summary)
-            for mode, row in case_summary["modes"].items():
+            for cell, row in case_summary["modes"].items():
                 print(
-                    f"  summary {mode:<4} logits_det={row['deterministic_logits']} "
+                    f"  summary {cell:<18} logits_det={row['deterministic_logits']} "
                     f"hidden_det={row['deterministic_hidden']} ids_det={row['deterministic_generated_ids']} "
-                    f"all_zero={row['any_all_zero_logits']}"
-                    ,
+                    f"all_zero={row['any_all_zero_logits']}",
                     flush=True,
                 )
+            cvp = case_summary.get("chained_vs_persistent")
+            if cvp:
+                for mode, block in cvp.items():
+                    bits_ok = (
+                        block.get("logits_bit_identical")
+                        and block.get("hidden_bit_identical")
+                        and block.get("generated_ids_match")
+                    )
+                    speedup = block.get("chain_speedup_pct")
+                    parts = [
+                        f"  cvp     {mode:<4} bit_identical={'yes' if bits_ok else 'NO!'}",
+                    ]
+                    if speedup is not None:
+                        parts.append(
+                            f"chain_speedup={speedup:+.2f}% "
+                            f"(chained={block['chain_ms_avg_chained']:.2f}ms "
+                            f"→ persistent={block['chain_ms_avg_persistent']:.2f}ms)"
+                        )
+                    print(" ".join(parts), flush=True)
 
         payload = {
             "schema": "qwen36-verify-suite-v1",
@@ -570,6 +734,7 @@ def main() -> int:
             "contexts": contexts,
             "families": families,
             "modes": modes,
+            "decode_paths": decode_paths,
             "repeats": args.repeats,
             "max_new_tokens": args.max_new_tokens,
             "summary": summary,
