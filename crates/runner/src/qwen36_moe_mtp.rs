@@ -22,10 +22,11 @@
 //! (Phase 6.3).
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{copy_d2d, GpuBuffer, ScalarType};
+use gpu_hal::{copy_d2d, copy_d2h, GpuBuffer, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, ffn_step_launch, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
-    Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+    attn_step_launch, ffn_step_launch, lm_head_launch, Qwen36MoeAttnStepInt4,
+    Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
 
 use crate::qwen36_moe_decode::{
@@ -71,6 +72,17 @@ pub struct MtpForwardScratch {
     /// 96-byte zeroed scratch for the cooperative-launch counters +
     /// barrier state. Must be reset between attn and FFN launches.
     pub sync_buf: GpuBuffer,
+
+    /// Logits buffer for the post-norm + lm_head pass. BF16 `[vocab]`.
+    /// Reused across draft steps; the scalar-fallback lm_head path's
+    /// work-stealing counter (`lm_head_counter`) is the only piece of
+    /// per-call state that needs reset.
+    pub logits: GpuBuffer,
+
+    /// `[1] u32` work-stealing counter for the scalar lm_head path. The
+    /// FFI launcher memsets it to 0 each call so the host doesn't have
+    /// to.
+    pub lm_head_counter: GpuBuffer,
 }
 
 /// Allocate a fresh [`MtpForwardScratch`] sized for `geom`. `kv_max_t` is
@@ -115,6 +127,10 @@ pub fn alloc_mtp_forward_scratch(
     .context("alloc mtp ffn_workspace")?;
     let sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
         .context("alloc mtp sync_buf")?;
+    let logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
+        .context("alloc mtp logits")?;
+    let lm_head_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .context("alloc mtp lm_head_counter")?;
 
     Ok(MtpForwardScratch {
         attn_output,
@@ -124,6 +140,8 @@ pub fn alloc_mtp_forward_scratch(
         ffn_output_idx,
         ffn_workspace,
         sync_buf,
+        logits,
+        lm_head_counter,
     })
 }
 
@@ -294,4 +312,123 @@ pub fn run_mtp_layer_step(
     )
     .context("mtp d2d ffn_output -> out")?;
     Ok(())
+}
+
+/// Result of one MTP draft step: the chosen draft token plus the
+/// recurrent feed for the next step.
+pub struct MtpDraftStepOutputs {
+    /// Greedy-argmax draft token id, picked over the BF16 logits the
+    /// kernel just published. The speculative driver feeds this into
+    /// the next pre-fusion step's `next_token_id`.
+    pub draft_token_id: u32,
+    /// `[hidden]` BF16 little-endian post-RMSNorm hidden state. Becomes
+    /// the next step's `h_base` per the vLLM recurrent equation
+    /// `h_base ← h_post`.
+    pub h_post_bytes: Vec<u8>,
+    /// `[vocab]` BF16 little-endian logits. Useful for sampling
+    /// strategies beyond greedy argmax and for parity diagnostics.
+    pub logits_bytes: Vec<u8>,
+}
+
+/// Run the post-fusion tail of one MTP draft step:
+///
+///   1. [`run_mtp_layer_step`] on `fused_in` → `out` (full-attn + MoE FFN).
+///   2. `lm_head_launch` on `out` with `mtp.norm.weight` → BF16 logits
+///      `[vocab]` AND BF16 `h_post` `[hidden]` (the kernel publishes
+///      both in a single launch — Phase 6.2c.3 added the optional
+///      `x_normed_out` capture).
+///   3. Host-side argmax over the BF16 logits → `draft_token_id`.
+///
+/// `lm_head_w_buf` must be the tied lm_head weight (`lm_head.weight` in
+/// the safetensors / bake — Qwen3.6-MoE shares it with the base model).
+/// `position` and `cache_pos` follow the same conventions as
+/// [`run_mtp_layer_step`]. `out_buf` and `h_post_buf` are caller-owned
+/// scratch buffers (`[hidden]` BF16 each); the speculative driver will
+/// reuse them across all `K` draft steps.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mtp_draft_step(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    mtp: &mut MtpLayerBuffers,
+    position: i32,
+    cache_pos: i32,
+    lm_head_w_buf: &GpuBuffer,
+    fused_in: &GpuBuffer,
+    out_buf: &mut GpuBuffer,
+    h_post_buf: &mut GpuBuffer,
+    scratch: &mut MtpForwardScratch,
+) -> Result<MtpDraftStepOutputs> {
+    // Stage 1: layer forward (attn + FFN, residual-folded).
+    run_mtp_layer_step(
+        ordinal, geom, mtp, position, cache_pos, fused_in, out_buf, scratch,
+    )?;
+
+    // Stage 2: post-RMSNorm + tied lm_head GEMV in one kernel. The
+    // kernel's `x_normed_out` parameter captures `h_post` for the
+    // recurrent feed; without it we'd need a separate RMSNorm pass.
+    //
+    // `mtp.norm_w` is the MTP-specific RMSNorm gain (`mtp.norm.weight`),
+    // distinct from the base model's `model.norm.weight`. The lm_head
+    // weight is tied (same `[vocab, hidden]` BF16 buffer the base
+    // engine uses).
+    lm_head_launch(
+        ordinal,
+        geom.hidden,
+        geom.vocab,
+        geom.rms_norm_eps,
+        out_buf,
+        &mtp.norm_w,
+        lm_head_w_buf,
+        &mut scratch.logits,
+        Some(h_post_buf),
+        &mut scratch.lm_head_counter,
+    )
+    .context("mtp lm_head_launch (post-norm + tied lm_head)")?;
+
+    // Stage 3: D2H logits + h_post; host argmax over the BF16 logits.
+    let hidden = geom.hidden as usize;
+    let vocab = geom.vocab as usize;
+    let mut h_post_bytes = vec![0u8; hidden * 2];
+    copy_d2h(
+        ordinal,
+        h_post_bytes.as_mut_ptr() as *mut _,
+        h_post_buf.as_ptr(),
+        h_post_bytes.len(),
+    )
+    .context("mtp d2h h_post")?;
+    let mut logits_bytes = vec![0u8; vocab * 2];
+    copy_d2h(
+        ordinal,
+        logits_bytes.as_mut_ptr() as *mut _,
+        scratch.logits.as_ptr(),
+        logits_bytes.len(),
+    )
+    .context("mtp d2h logits")?;
+
+    let draft_token_id = argmax_bf16_logits(&logits_bytes, vocab);
+
+    Ok(MtpDraftStepOutputs {
+        draft_token_id,
+        h_post_bytes,
+        logits_bytes,
+    })
+}
+
+/// Greedy argmax over BF16 little-endian logits. Returns the vocab
+/// index of the largest logit, with first-occurrence tie-breaking
+/// (matches PyTorch / vLLM `torch.argmax`).
+fn argmax_bf16_logits(bytes: &[u8], vocab: usize) -> u32 {
+    debug_assert_eq!(bytes.len(), vocab * 2);
+    let mut best_idx: u32 = 0;
+    let mut best_val: f32 = f32::NEG_INFINITY;
+    for i in 0..vocab {
+        let lo = bytes[i * 2] as u32;
+        let hi = bytes[i * 2 + 1] as u32;
+        let f = f32::from_bits((hi << 24) | (lo << 16));
+        if f > best_val {
+            best_val = f;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
 }

@@ -773,6 +773,11 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     const void*   final_norm_w,
     const void*   lm_head_w,
     void*         logits,
+    // Phase 6.2c.3 — optional capture of the BF16-rounded post-RMSNorm
+    // hidden state. Used by the MTP draft loop to feed `h_post` into
+    // the next step's `h_base`. Pass nullptr (the base-decode path) to
+    // skip the export.
+    void*         x_normed_out,
     unsigned int* counter) {
     if (dtype != 2) return 130;            // only bf16 supported
     if (hidden <= 0 || vocab <= 0) return 132;
@@ -813,6 +818,7 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
             static_cast<const hip_bfloat16*>(final_norm_w),
             static_cast<const hip_bfloat16*>(lm_head_w),
             static_cast<hip_bfloat16*>(logits),
+            static_cast<hip_bfloat16*>(x_normed_out),
             hidden,
             vocab,
             rms_norm_eps);
@@ -846,6 +852,7 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
                        static_cast<const hip_bfloat16*>(final_norm_w),
                        static_cast<const hip_bfloat16*>(lm_head_w),
                        static_cast<hip_bfloat16*>(logits),
+                       static_cast<hip_bfloat16*>(x_normed_out),
                        counter,
                        hidden,
                        vocab,

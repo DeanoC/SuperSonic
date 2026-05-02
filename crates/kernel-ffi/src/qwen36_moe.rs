@@ -473,6 +473,10 @@ extern "C" {
         final_norm_w: *const c_void,
         lm_head_w: *const c_void,
         logits: *mut c_void,
+        // Optional BF16 [hidden] export of the post-RMSNorm hidden
+        // state. Phase 6.2c.3 plumbing for the MTP draft loop's
+        // recurrent feed; null = base-decode behavior unchanged.
+        x_normed_out: *mut c_void,
         counter: *mut c_uint,
     ) -> c_int;
 
@@ -1286,6 +1290,11 @@ pub fn int4_dequant_smoke_launch(
 ///   - `lm_head_w_buf`: shape `[vocab, hidden]`. Caller is responsible
 ///     for dequantizing INT4 / BF16-casting it once at startup.
 ///   - `logits_buf`: shape `[vocab]`, output. Overwritten on every call.
+///   - `x_normed_out_buf`: optional `[hidden]` BF16 output. When `Some`,
+///     the kernel also writes the BF16-rounded post-RMSNorm hidden into
+///     this buffer. Used by the Qwen3.6-MoE self-speculative MTP path
+///     (Phase 6.2c.3) to capture `h_post` for the recurrent feed into
+///     the next draft step. `None` is the base-decode behaviour.
 ///   - `counter_buf`: shape `[1]` U32. Used as the work-stealing counter
 ///     across vocab rows; the launcher memsets it to 0 before each call.
 #[allow(clippy::too_many_arguments)]
@@ -1298,6 +1307,7 @@ pub fn lm_head_launch(
     final_norm_w_buf: &GpuBuffer,
     lm_head_w_buf: &GpuBuffer,
     logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if hidden <= 0 || vocab <= 0 {
@@ -1316,6 +1326,9 @@ pub fn lm_head_launch(
     }
 
     let backend = lm_head_w_buf.backend();
+    let x_normed_ptr = x_normed_out_buf
+        .map(|b| b.as_mut_ptr())
+        .unwrap_or(std::ptr::null_mut());
     let status: c_int = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -1330,6 +1343,7 @@ pub fn lm_head_launch(
                     final_norm_w_buf.as_ptr(),
                     lm_head_w_buf.as_ptr(),
                     logits_buf.as_mut_ptr(),
+                    x_normed_ptr,
                     counter_buf.as_mut_ptr() as *mut c_uint,
                 )
             }
@@ -5509,6 +5523,7 @@ mod tests {
             &final_norm_w_buf,
             &lm_head_w_buf,
             &mut logits_buf,
+            None,
             &mut counter_buf,
         ).expect("lm_head launch");
 
