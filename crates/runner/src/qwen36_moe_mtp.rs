@@ -27,7 +27,6 @@ use kernel_ffi::qwen36_moe::{
     attn_step_launch, ffn_step_launch, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
     Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
-use std::ptr;
 
 use crate::qwen36_moe_decode::{
     ffn_output_elems, ffn_workspace_floats, full_attn_output_elems, full_attn_workspace_floats,
@@ -166,15 +165,36 @@ pub fn run_mtp_layer_step(
              defeats MTP's per-session cache semantics."
         ));
     }
+    // MTP requires an allocated KV cache. If `kv_cache` is `None` the
+    // attn kernel silently falls back to its kv_len=1 self-attention
+    // path (back-compat for the per-block parity tests) — that happens
+    // to look correct for `cache_pos == 0` (only one K to attend to)
+    // but for `cache_pos > 0` it makes every draft step attend only to
+    // itself instead of accumulated prior K/V. Reject up front rather
+    // than ship a silent correctness bug.
+    let kv = mtp.kv_cache.as_mut().ok_or_else(|| anyhow!(
+        "run_mtp_layer_step: MtpLayerBuffers.kv_cache is None — MTP \
+         self-attention requires an allocated cache. Construct the \
+         buffers via `load_mtp_buffers(..., kv_max_t > 0)` (Phase 6.2b \
+         loader); without it the kernel falls back to kv_len=1 which \
+         produces wrong outputs for any `cache_pos > 0`."
+    ))?;
+    if cache_pos >= kv.kv_max_t {
+        return Err(anyhow!(
+            "run_mtp_layer_step: cache_pos {cache_pos} ≥ kv_max_t {} — \
+             grow the MTP cache to at least `num_speculative_tokens` \
+             slots when calling the loader.",
+            kv.kv_max_t
+        ));
+    }
     let hidden = geom.hidden as usize;
 
     // ---- attention ----------------------------------------------------
     reset_sync_buf(ordinal, &mut scratch.sync_buf)
         .context("reset sync_buf (mtp attn)")?;
-    let (kv_k_ptr, kv_v_ptr, kv_max_t) = match &mut mtp.kv_cache {
-        Some(c) => (c.k.as_mut_ptr(), c.v.as_mut_ptr(), c.kv_max_t),
-        None => (ptr::null_mut(), ptr::null_mut(), 0),
-    };
+    let kv_k_ptr = kv.k.as_mut_ptr();
+    let kv_v_ptr = kv.v.as_mut_ptr();
+    let kv_max_t = kv.kv_max_t;
     let attn_params = Qwen36MoeAttnStepParams {
         stage: 5,
         hidden: geom.hidden,
