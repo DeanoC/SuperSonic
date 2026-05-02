@@ -108,28 +108,78 @@ sequence on RX 7900 XTX with the published v2-int4-gptq bake,
 
 | Stage          | ms/step  |  tok/s  | share |
 |----------------|---------:|--------:|------:|
-| chain (40 L)   |    60.3  |    16.6 |   76% |
-| ↳ FFN (40 L)   |    34.6  |    28.9 |   44% |
-| ↳ linear-attn (30 L) | 21.2 |  47.2 |   27% |
-| ↳ full-attn (10 L)   |  4.2 |   238 |    5% |
-| lm_head        |    18.8  |    53.2 |   24% |
-| sample/detok   |     0.3  |   3333  |    0% |
-| **total**      | **79.3** |**12.6** | 100%  |
+| chain (40 L)   |    24.72 |    40.5 |   93% |
+| ↳ FFN (40 L)   |    11.42 |    87.6 |   43% |
+| ↳ linear-attn (30 L) | 12.29 |  81.4 |   46% |
+| ↳ full-attn (10 L)   |  2.46 |   406 |    9% |
+| lm_head        |     1.53 |   653.6 |    6% |
+| sample/detok   |     0.27 |  3703.7 |    1% |
+| **total**      | **26.53**|**37.7** | 100%  |
 
 Per-stage `tok/s` is `1000 / ms_per_step` — the throughput that stage
 would sustain if it were the only cost. The headline rate is the
-total row: roughly **12.6 tok/s** on greedy decode. The chain wall-clock is
-host-orchestrated: each layer's attention and FFN are separate HIP
-launches today (`run_chained_decode` in
-`crates/runner/src/qwen36_moe_decode.rs`). The persistent megakernel
-(planned PR 4c step 4) will fold the per-token 80 launches into one
-cooperative kernel and is expected to reclaim several ms of launch
-overhead. Within FFN, the K_top=8 routed experts dispatch
-concurrently via cyclic block partitioning (`group_id = blockIdx.x %
-top_k`) — see PR #74. The shared expert still runs sequentially
-ahead of the routed dispatch; folding it as a 9th concurrent group
-was prototyped (parity-clean) but regressed FFN by ~4 ms due to L2
-cache pressure from 9 simultaneous slab reads, so it's not shipped.
+total row: roughly **37.7 tok/s** on greedy decode (production async
+dispatch; numbers above include the per-step sync needed for the
+chain breakdown to be accurate, which costs ~1.8 ms).
+
+This is **3.0× the original `12.6 tok/s` baseline** (PR #74's concurrent
+expert dispatch). The cumulative gain across the WMMA + dispatch
+optimisation arc:
+
+| Land    | Phase                              | total ms | tok/s | Δ          |
+|---------|------------------------------------|---------:|------:|-----------:|
+| PR #74  | concurrent K_top routed experts    |    79.3  |  12.6 | (baseline) |
+| PR #76  | lm_head WMMA tile                  |    55.9  |  17.9 |       +42% |
+| PR #77  | per-expert FFN INT4 WMMA           |    36.2  |  27.7 |      +120% |
+| PR #78  | linear-attn INT4 WMMA              |    29.9  |  33.5 |      +167% |
+| PR #79  | full-attn INT4 WMMA                |    28.3  |  35.3 |      +180% |
+| PR #80  | defer per-step bridge syncs        |    26.5  |  37.7 |      +199% |
+
+Architectural notes:
+
+- **Decode INT4 GEMVs run through RDNA3 WMMA**
+  (`__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32`) for every weight matmul:
+  q/k/v/o_proj (full-attn), in_proj_qkv/z + out_proj (linear-attn),
+  per-expert gate_up + down_proj (FFN), and lm_head. INT4 weights are
+  dequanted to BF16 in LDS per WMMA tile, so bandwidth utilisation is
+  near-peak on the matmul-bound phases. Helper:
+  `wmma_int4_matvec_partial_16rows` in `kernels/qwen36_moe.hip`.
+- **`USE_WMMA` template parameter** on each step kernel
+  (`qwen36_moe_attn_step_kernel`, `qwen36_moe_linear_step_kernel`,
+  `qwen36_moe_ffn_step_kernel`). Bridge picks the instantiation at
+  launch time based on `device_supports_wmma_bf16(ord)` + dim
+  divisibility checks. `SUPERSONIC_QWEN4B_DISABLE_WMMA=1` forces
+  every WMMA path back to the scalar fallback for A/B work.
+- **Concurrent K_top expert dispatch** (PR #74) preserves block
+  partitioning across PRs #76-79: `group_id = blockIdx.x % top_k`,
+  `sub_id = blockIdx.x / top_k`. Each routed expert group runs G/H/I
+  in parallel; the shared expert still runs sequentially ahead (the
+  9th-group experiment regressed by ~4 ms from L2 pressure, see
+  PR #77 for details). 35B-A3B uses top_k=8, exactly at the FFN
+  sync_buf counter cap of 16 slots.
+- **Async chain dispatch** (PR #80): the 80 step launches per token
+  no longer `hipDeviceSynchronize` between steps — the default stream
+  serializes and the chain-end D2H of `final_hidden_bytes` is the
+  natural barrier. With `--emit-stage-timings` the per-step sync comes
+  back so the breakdown above stays accurate; the production hot path
+  runs async and saves ~1.8 ms/token.
+
+Remaining wedges (looking forward):
+
+- **Phase G of linear-attn (delta-rule recurrent state update)** is
+  *state-bound*, not weight-bound — the per-V-head recurrent state
+  matrix is ~2 MiB per layer and the kernel reads/writes it five times
+  per step. WMMA can't help; further wins would need a state-layout
+  redesign or fused-state kernel.
+- **Persistent megakernel** (Phase 3 in the roadmap) is now a
+  smaller wedge than originally projected, since PR #80 already
+  reclaimed ~80 syncs/token of launch overhead. Folding the 80 launches
+  into one cooperative kernel still has architectural value as a
+  prerequisite for speculative-decode verification but the absolute
+  ms reclaim is now ~1-2 ms.
+- **Speculative decode** is the realistic path to 100+ tok/s — needs a
+  draft head (MTP/Eagle) and a verification kernel that batches K
+  candidates × layers in one launch.
 
 INT4 weight + scratch on the 35B-A3B bake: ~17 GiB on disk, ~21 GiB
 runtime including KV cache at the default context. Within the 24 GiB
