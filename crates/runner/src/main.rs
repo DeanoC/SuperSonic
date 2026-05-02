@@ -13,6 +13,7 @@ mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod qwen36_moe_mtp;
 mod qwen36_moe_speculative;
+mod qwen36_moe_state;
 mod registry;
 mod validate;
 

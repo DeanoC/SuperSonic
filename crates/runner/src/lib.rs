@@ -19,5 +19,6 @@ pub mod prefill_engine;
 pub mod qwen36_moe_decode;
 pub mod qwen36_moe_mtp;
 pub mod qwen36_moe_speculative;
+pub mod qwen36_moe_state;
 pub mod registry;
 pub mod validate;
