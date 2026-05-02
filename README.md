@@ -78,7 +78,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
 | gemma4-e4b       | ✅⁶  |  —   |      —      |   —    |
-| phi4-mini        |  —   |  —   |      —      |   —    |
+| phi4-mini        | ✅⁷  |  —   |      —      |   —    |
 
 ¹ CDNA single-sequence decode uses the persistent megakernel by default.
   `--force-replay-decode` remains available as the slower GPU-prefill
@@ -94,6 +94,8 @@ see [docs/dflash.md](docs/dflash.md).
   chain on CDNA; performance tuning is still pending.
 ⁶ Gemma 4 E4B BF16 uses the existing Gemma 4 HIP kernel path on CDNA;
   performance tuning is still pending.
+⁷ Phi-4-mini BF16 uses a correctness-first single-block CDNA fallback in the
+  existing Phi-4 HIP kernel path; performance tuning is still pending.
 
 ### CUDA on `sm86`
 

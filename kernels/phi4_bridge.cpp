@@ -69,7 +69,16 @@ int persistent_decode_phi4_device(
     hipDeviceProp_t props;
     if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 250;
 
-    const int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    // The Phi-4 HIP megakernel was tuned around RDNA wave32. On CDNA wave64,
+    // the multi-block work-stealing path diverges from the HF oracle; keep the
+    // initial CDNA bring-up on a single block for correctness and revisit the
+    // work distribution when optimizing performance.
+    if (props.warpSize > 32) num_blocks = 1;
+    if (const char* override_blocks = std::getenv("SUPERSONIC_PHI4_NUM_BLOCKS")) {
+        const int requested = std::atoi(override_blocks);
+        if (requested > 0) num_blocks = requested;
+    }
     constexpr int block_size = 256;
     // LDS layout matches the 4B kernel: reduction scratch [block_size] + input
     // cache [max(B*hidden_dim, intermediate_size)] + FP8 LUT [256].
