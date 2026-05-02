@@ -4707,10 +4707,14 @@ __device__ inline void grid_barrier(
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        // Publish all global-memory writes from this block before it marks
+        // itself arrived. The phase release below only covers the last
+        // arriving block's writes; CDNA can otherwise let block 0 observe
+        // stale workspace data from earlier-arriving blocks after the barrier.
+        __threadfence();
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
-            __threadfence();
             __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
         } else {
             while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
@@ -4729,11 +4733,13 @@ __device__ inline void grid_barrier_reset_counter(
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        // See grid_barrier: every arriving block must publish its global
+        // writes before incrementing the arrival counter.
+        __threadfence();
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
             __atomic_store_n(counter_to_reset, 0u, __ATOMIC_RELAXED);
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
-            __threadfence();
             __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
         } else {
             while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
