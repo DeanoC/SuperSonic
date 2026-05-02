@@ -1287,16 +1287,51 @@ def dequant_fp8_tensor(w: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor
     )
 
 
-def set_module_parameter(model: nn.Module, name: str, value: torch.Tensor) -> None:
+def _device_map_target(model: nn.Module, name: str) -> str | int | torch.device | None:
+    """Return the Accelerate device-map target for a parameter, if present."""
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        return None
+    parts = name.split(".")
+    for i in range(len(parts), -1, -1):
+        prefix = ".".join(parts[:i])
+        if prefix in device_map:
+            return device_map[prefix]
+    return None
+
+
+def _torch_device_from_target(target: str | int | torch.device) -> torch.device | None:
+    if isinstance(target, torch.device):
+        return target
+    if isinstance(target, int):
+        return torch.device("cuda", target)
+    if target == "disk":
+        return None
+    return torch.device(target)
+
+
+def set_module_parameter(model: nn.Module, name: str, value: torch.Tensor) -> bool:
     parts = name.split(".")
     module = model
     for part in parts[:-1]:
         module = getattr(module, part)
     old = module._parameters[parts[-1]]
+    if old is not None and old.device.type != "meta":
+        target_device = old.device
+    else:
+        mapped = _device_map_target(model, name)
+        target_device = _torch_device_from_target(mapped) if mapped is not None else None
+    if target_device is None:
+        log(
+            f"[bake-int4] WARNING: {name} is offloaded/meta; leaving FP8 "
+            "parameter in place to preserve Accelerate placement"
+        )
+        return False
     module._parameters[parts[-1]] = nn.Parameter(
-        value,
+        value.to(device=target_device, dtype=torch.bfloat16),
         requires_grad=old.requires_grad if old is not None else False,
     )
+    return True
 
 
 def load_fused_expert_bf16(
@@ -1344,9 +1379,11 @@ def dequantize_remaining_fp8_parameters(
     if fp8_names:
         log(f"[bake-int4] dequantizing {len(fp8_names)} remaining FP8 parameter(s)")
     converted = 0
-    for idx, (name, param) in enumerate(list(named_params.items()), start=1):
+    processed = 0
+    for name, param in list(named_params.items()):
         if param.dtype != torch.float8_e4m3fn:
             continue
+        processed += 1
         scale = named_params.get(f"{name}_scale_inv")
         if scale is not None:
             bf16 = dequant_fp8_tensor(param, scale).to(torch.bfloat16)
@@ -1360,9 +1397,9 @@ def dequantize_remaining_fp8_parameters(
         else:
             log(f"[bake-int4] WARNING: FP8 parameter {name} has no scale_inv; leaving as-is")
             continue
-        set_module_parameter(model, name, bf16)
-        converted += 1
-        if converted % 10 == 0 or converted == len(fp8_names):
+        if set_module_parameter(model, name, bf16):
+            converted += 1
+        if converted and (converted % 10 == 0 or processed == len(fp8_names)):
             log(f"[bake-int4]   dequantized {converted}/{len(fp8_names)} FP8 parameter(s)")
         del bf16
     if converted:
