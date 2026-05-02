@@ -17,5 +17,6 @@ pub mod gemma4_int4_engine;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod qwen36_moe_decode;
+pub mod qwen36_moe_mtp;
 pub mod registry;
 pub mod validate;

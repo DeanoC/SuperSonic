@@ -148,6 +148,9 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     float         rope_theta,
     float         rms_norm_eps,
     int           position,
+    int           cache_pos,    // -1 ⇒ inherit from `position` (base-model
+                                //      decode); ≥0 ⇒ MTP-style decoupled
+                                //      KV-cache slot (see kernel comment).
     const void*   input_hidden,
     const void*   input_norm_w,
     const void*   q_proj_w,
@@ -204,13 +207,14 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     if (!any_int4 && int4_group_size != 0) return 117;
 
     // KV cache: pointers must be paired (both null or both non-null), and
-    // kv_max_t must be positive when enabled + ≥ position+1 to fit the
-    // current write.
+    // kv_max_t must be positive when enabled + the *effective* slot
+    // (cache_pos ≥ 0 ? cache_pos : position) must fit.
     const bool kv_enabled = (kv_cache_k != nullptr || kv_cache_v != nullptr);
     if ((kv_cache_k == nullptr) != (kv_cache_v == nullptr)) return 118;
     if (kv_enabled) {
         if (kv_max_t <= 0) return 119;
-        if (position < 0 || position >= kv_max_t) return 120;
+        const int eff_slot = (cache_pos >= 0) ? cache_pos : position;
+        if (eff_slot < 0 || eff_slot >= kv_max_t) return 120;
     }
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
@@ -259,7 +263,7 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
             dim3(block_size),
             lds_bytes, 0,
             stage, hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
-            rope_theta, rms_norm_eps, position,
+            rope_theta, rms_norm_eps, position, cache_pos,
             static_cast<const hip_bfloat16*>(input_hidden),
             static_cast<const hip_bfloat16*>(input_norm_w),
             static_cast<const hip_bfloat16*>(q_proj_w),
@@ -290,7 +294,7 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
             dim3(block_size),
             lds_bytes, 0,
             stage, hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
-            rope_theta, rms_norm_eps, position,
+            rope_theta, rms_norm_eps, position, cache_pos,
             static_cast<const hip_bfloat16*>(input_hidden),
             static_cast<const hip_bfloat16*>(input_norm_w),
             static_cast<const hip_bfloat16*>(q_proj_w),

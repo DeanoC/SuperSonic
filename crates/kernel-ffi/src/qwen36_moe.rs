@@ -261,6 +261,7 @@ extern "C" {
         rope_theta: f32,
         rms_norm_eps: f32,
         position: c_int,
+        cache_pos: c_int,
         input_hidden: *const c_void,
         input_norm_w: *const c_void,
         q_proj_w: *const c_void,
@@ -586,6 +587,22 @@ pub struct Qwen36MoeAttnStepParams {
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     pub position: i32,
+    /// Optional override for the KV cache slot index. `< 0` (the default
+    /// constructor sets `-1`) ⇒ inherit from `position` — the base-model
+    /// decode case where RoPE position == cache slot. Set to ≥ 0 to
+    /// decouple the two: used by the Qwen3.6-MoE self-speculative MTP
+    /// layer, where RoPE rotates at absolute position `base_seq_len + k`
+    /// but the per-MTP-session cache is fresh per draft session and
+    /// writes step `k` at slot `k`. Phase G writes at `cache_pos` and
+    /// attends over `kv_len = cache_pos + 1`; RoPE still uses `position`.
+    pub cache_pos: i32,
+}
+
+impl Qwen36MoeAttnStepParams {
+    /// Sentinel value for `cache_pos` meaning "inherit from `position`".
+    /// Use this in places that don't yet need MTP semantics so the call
+    /// site reads as "default". Equivalent to `-1`.
+    pub const CACHE_POS_INHERIT: i32 = -1;
 }
 
 /// Weight pointers for the staged-attention parity launcher. Pointers
@@ -727,6 +744,7 @@ pub fn attn_step_launch(
                     params.rope_theta,
                     params.rms_norm_eps,
                     params.position as c_int,
+                    params.cache_pos as c_int,
                     weights.input_hidden,
                     weights.input_norm_w,
                     weights.q_proj_w,
@@ -1885,6 +1903,7 @@ mod tests {
             rope_theta: 0.0,
             rms_norm_eps: geom.rms_norm_eps,
             position: 0,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
             input_hidden: input_hidden.as_ptr(),
@@ -2006,6 +2025,7 @@ mod tests {
             rope_theta: 0.0,
             rms_norm_eps: geom.rms_norm_eps,
             position: 0,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
             input_hidden: input_hidden.as_ptr(),
@@ -2136,6 +2156,7 @@ mod tests {
             rope_theta,
             rms_norm_eps: geom.rms_norm_eps,
             position,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
             input_hidden: input_hidden.as_ptr(),
@@ -2257,6 +2278,7 @@ mod tests {
             rope_theta,
             rms_norm_eps: geom.rms_norm_eps,
             position,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
             input_hidden: input_hidden.as_ptr(),
@@ -2381,6 +2403,7 @@ mod tests {
             rope_theta,
             rms_norm_eps: geom.rms_norm_eps,
             position,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         let weight_ptrs = Qwen36MoeAttnStepWeights {
             input_hidden: input_hidden.as_ptr(),
@@ -2597,6 +2620,7 @@ mod tests {
             rope_theta,
             rms_norm_eps: geom.rms_norm_eps,
             position,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
         };
         // Projection weight pointers point at the packed u8 buffers.
         let weight_ptrs = Qwen36MoeAttnStepWeights {

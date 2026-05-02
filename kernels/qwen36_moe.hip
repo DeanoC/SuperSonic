@@ -546,6 +546,15 @@ __global__ void qwen36_moe_attn_step_kernel(
     float                          rope_theta,    // unused at stage 1
     float                          rms_norm_eps,
     int                            position,      // unused at stage 1
+    // Optional override for the KV cache slot index. Negative ⇒ "same as
+    // `position`" (the base-model decode case where RoPE position == cache
+    // slot). Set to a non-negative value to decouple the two — used by
+    // self-speculative MTP, where RoPE rotates at absolute position
+    // `base_seq_len + k` but the per-MTP-session cache writes at slot
+    // `k` (the cache is fresh per draft session). When `cache_pos >= 0`,
+    // Phase G writes K/V at `cache_pos` and attends over
+    // `kv_len = cache_pos + 1`; RoPE still uses `position`.
+    int                            cache_pos,
     const T* __restrict__          input_hidden,  // [hidden]
     const T* __restrict__          input_norm_w,  // [hidden]
     const T* __restrict__          q_proj_w,      // [2*H*d, hidden]
@@ -574,9 +583,10 @@ __global__ void qwen36_moe_attn_step_kernel(
     float* __restrict__             workspace,    // F32 scratch, see header comment
     // PR 4d KV cache extension. When `kv_cache_k`/`kv_cache_v` are non-null
     // and `kv_max_t > 0`, Phase G writes the current step's K/V at slot
-    // `position` and attends over `kv_len = position + 1` past tokens. When
-    // both pointers are null, falls back to the kv_len=1 self-attention
-    // path (PR 4b2 behavior — back-compat for the parity tests).
+    // `eff_cache_pos = (cache_pos >= 0 ? cache_pos : position)` and attends
+    // over `kv_len = eff_cache_pos + 1` past tokens. When both pointers are
+    // null, falls back to the kv_len=1 self-attention path (PR 4b2 behavior —
+    // back-compat for the parity tests).
     T* __restrict__                kv_cache_k,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
     T* __restrict__                kv_cache_v,    // [kv_max_t, Hkv*d] BF16 (mut, nullable)
     int                            kv_max_t,      // capacity bound; 0 ⇔ no cache
@@ -1167,13 +1177,16 @@ __global__ void qwen36_moe_attn_step_kernel(
         const int rep   = H / Hkv;
         const float scale = rsqrtf(static_cast<float>(d));
         const bool use_kv_cache = (kv_cache_k != nullptr && kv_cache_v != nullptr);
-        const int kv_len = use_kv_cache ? (position + 1) : 1;
+        // Effective cache slot. `cache_pos < 0` ⇒ inherit from `position`
+        // (base-model decode); `cache_pos >= 0` ⇒ MTP-style decoupled write.
+        const int eff_cache_pos = (cache_pos >= 0) ? cache_pos : position;
+        const int kv_len = use_kv_cache ? (eff_cache_pos + 1) : 1;
 
         // Step 1: write current K/V into the cache (if enabled). All blocks
         // cooperate via a flat work-stealing index since the writes are
         // independent across (h_kv, i).
         if (use_kv_cache) {
-            const int slot_base = position * Hkv * d;
+            const int slot_base = eff_cache_pos * Hkv * d;
             const int total = Hkv * d;
             for (int idx = blockIdx.x * block_size + tid;
                  idx < total;
