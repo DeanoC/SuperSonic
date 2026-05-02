@@ -1930,6 +1930,9 @@ impl Gemma4Engine {
         if gpu_hal::current_backend() != Backend::Cuda || self.batch_size != 1 || seq_idx != 0 {
             return Ok(None);
         }
+        if pos >= self.max_t {
+            bail!("decode_step_seq: pos {pos} >= max_t {}", self.max_t);
+        }
         let device = self.device;
         let dtype = ScalarType::BF16;
         let hidden_size = self.tcfg.hidden_size;
