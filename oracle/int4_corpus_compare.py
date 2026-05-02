@@ -48,6 +48,7 @@ DEFAULT_PROMPTS = [
     "Water boils at 100 degrees Celsius at sea level because",
     "Write a haiku about winter.\n",
 ]
+HYBRID_ATTENTION_LOOP_THRESHOLD = 10
 
 
 def log(msg: str) -> None:
@@ -447,18 +448,24 @@ def topk_payload(logits: torch.Tensor, tokenizer, top_k: int) -> list[dict]:
     ]
 
 
+def set_hybrid_attention_mode(model, kv_len_after_call: int, force_loop: bool) -> None:
+    use_loop = force_loop or kv_len_after_call >= HYBRID_ATTENTION_LOOP_THRESHOLD
+    for module in model.modules():
+        if getattr(module, "_supersonic_attention_mode", None) == "hybrid":
+            module._supersonic_loop_attention = use_loop
+
+
 @torch.no_grad()
 def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
                   device: torch.device, top_k: int = 16) -> tuple[list[int], str, list[list[dict]]]:
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    for module in model.modules():
-        if getattr(module, "_supersonic_attention_mode", None) == "hybrid":
-            module._supersonic_loop_attention = ids.shape[1] >= 10
+    force_loop_attention = ids.shape[1] >= HYBRID_ATTENTION_LOOP_THRESHOLD
     eos_token_ids = collect_eos_token_ids(tokenizer, model)
     past = None
     next_id = None
     next_top: list[dict] = []
     for pos in range(ids.shape[1]):
+        set_hybrid_attention_mode(model, pos + 1, force_loop_attention)
         out = model(
             input_ids=ids[:, pos:pos + 1],
             past_key_values=past,
@@ -478,6 +485,7 @@ def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
         top_by_token.append(next_top)
         if next_id in eos_token_ids:
             break
+        set_hybrid_attention_mode(model, ids.shape[1] + len(new_ids), force_loop_attention)
         out = model(
             input_ids=torch.tensor([[next_id]], device=device),
             past_key_values=past,

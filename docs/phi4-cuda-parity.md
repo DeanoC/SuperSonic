@@ -48,7 +48,7 @@ Layer-trace diagnostics show:
 - Given Rust-traced inputs, Python deterministic replay matches CUDA for QKV, attention `o_proj` residual, MLP gate/up/SwiGLU/down, and final hidden at the traced boundaries.
 - The live PyTorch BF16 hook differs from deterministic F32 dot plus BF16 output rounding at Q/K in layer 1, then that small difference accumulates through 32 layers.
 - Forcing `torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False` does not remove the layer-1 QKV mismatch. It changes which corpus prompts miss, so it is not a clean parity definition.
-- `--deterministic-projection-oracle --deterministic-lm-head --deterministic-attention-mode hybrid` patches the Python oracle's decoder Linear, RMSNorm, attention, SwiGLU, and lm-head boundaries to use F32 arithmetic plus explicit BF16 rounding. In hybrid attention mode, prompts with at least 10 input tokens use the explicit decode-order attention loop from the first token; shorter prompts use the matmul attention path that matches the short-context corpus cases.
+- `--deterministic-projection-oracle --deterministic-lm-head --deterministic-attention-mode hybrid` patches the Python oracle's decoder Linear, RMSNorm, attention, SwiGLU, and lm-head boundaries to use F32 arithmetic plus explicit BF16 rounding. In hybrid attention mode, prompts that start at 10 or more tokens use the explicit decode-order attention loop from the first token; shorter prompts recompute the attention path before each prompt/decode token and switch to the loop once the resulting KV length is at least 10 tokens.
 
 Useful reproducibility commands:
 
