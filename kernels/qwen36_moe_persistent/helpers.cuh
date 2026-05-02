@@ -318,8 +318,10 @@ __device__ inline float fp8_dequant_scalar(
 ) {
     const uint8_t* data = static_cast<const uint8_t*>(w_ptr);
     const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    // Native FP8 checkpoints store one scale per `[block_size, block_size]`
+    // tile, i.e. scale shape is `[rows / block_size, cols / block_size]`.
     const int scale_cols = (cols + block_size - 1) / block_size;
-    const int si = row * scale_cols + col / block_size;
+    const int si = (row / block_size) * scale_cols + col / block_size;
     const uint8_t byte = data[static_cast<size_t>(row) * cols + col];
     return bf16_round_rne_f32(fp8_e4m3_to_float(byte) * static_cast<float>(scales[si]));
 }
@@ -351,12 +353,12 @@ __device__ inline void grid_barrier(
     int num_blocks
 ) {
     __syncthreads();
+    __threadfence();
     if (threadIdx.x == 0) {
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
-            __threadfence();
             __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
         } else {
             while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
@@ -372,13 +374,13 @@ __device__ inline void grid_barrier_reset_counter(
     unsigned int* counter_to_reset
 ) {
     __syncthreads();
+    __threadfence();
     if (threadIdx.x == 0) {
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
             __atomic_store_n(counter_to_reset, 0u, __ATOMIC_RELAXED);
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
-            __threadfence();
             __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
         } else {
             while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
