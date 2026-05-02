@@ -76,7 +76,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-4b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-9b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
-| gemma4-e2b       | ✅³  |  —   |      —      |   —    |
+| gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
 | gemma4-e4b       |  —   |  —   |      —      |   —    |
 | phi4-mini        |  —   |  —   |      —      |   —    |
 
@@ -90,6 +90,8 @@ see [docs/dflash.md](docs/dflash.md).
   have the Qwen GPU replay validator wired up.
 ⁴ Qwen3.6 35B A3B currently uses the INT4 GPTQ bake and the host-orchestrated
   HIP chained decode path; performance work is still pending.
+⁵ Gemma 4 E2B INT4 uses the GPTQ bake and the existing Gemma 4 INT4 primitive
+  chain on CDNA; performance tuning is still pending.
 
 ### CUDA on `sm86`
 
