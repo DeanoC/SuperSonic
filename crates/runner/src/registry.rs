@@ -490,6 +490,22 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_0_8B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
@@ -852,10 +868,10 @@ mod tests {
             ModelVariant::Qwen3_5_0_8B,
             ModelVariant::Qwen3_5_2B,
             ModelVariant::Qwen3_5_4B,
+            ModelVariant::Qwen3_5_9B,
         ] {
             assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx942).is_some());
         }
-        assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Hip, &GpuArch::Gfx942).is_none());
     }
 
     #[test]

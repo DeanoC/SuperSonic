@@ -1235,10 +1235,9 @@ fn main() -> Result<()> {
             ModelVariant::Qwen3_5_0_8B
                 | ModelVariant::Qwen3_5_2B
                 | ModelVariant::Qwen3_5_4B
+                | ModelVariant::Qwen3_5_9B
         ) {
-            anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only Qwen3.5 BF16 models up to 4B"
-            );
+            anyhow::bail!("HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B");
         }
         if cli.fp8_runtime || cli.kv_fp8 || cli.q4km || cli.q4km_gptq {
             anyhow::bail!(

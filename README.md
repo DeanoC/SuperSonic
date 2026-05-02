@@ -74,7 +74,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-0.8b     | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-2b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-4b       | ✅¹  | ✅²  |      —      |   —    |
-| qwen3.5-9b       |  —   |  —   |      —      |   —    |
+| qwen3.5-9b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.6-35b-a3b  |  —   |  —   |      —      |   —    |
 | gemma4-e2b       |  —   |  —   |      —      |   —    |
 | gemma4-e4b       |  —   |  —   |      —      |   —    |
