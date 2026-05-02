@@ -10,6 +10,7 @@
 //! the only meaningful runtime check is "did the safetensors index match
 //! what we expect from the config" plus a budget comparison.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -22,15 +23,13 @@ use qwen36_moe::loader::{ScalarKind, WeightLoader};
 use qwen36_moe::state::{StateAccount, StateLayout};
 use qwen36_moe::weights::{
     checkpoint_dtype_acceptable, expected_tensor_specs, CheckpointAccount, CheckpointDtype,
-    DEFAULT_PREFIX,
 };
 
 use crate::qwen36_moe_decode::{
-    argmax_bf16_logits, bf16_bytes_to_f32, dequant_int4_to_bf16_bytes, host_final_norm_lm_head,
-    host_final_norm_lm_head_f32, run_chained_decode, run_chained_decode_fast,
-    sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
-    FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
-    MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
+    argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
+    run_chained_decode_fast, sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars,
+    FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
+    LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -273,7 +272,7 @@ fn inspect_bake(
     let specs = expected_tensor_specs(text_config, weight_prefix);
     let mut missing_specs = Vec::new();
     for spec in &specs {
-        if !store.contains(&spec.name) {
+        if !store_contains_qwen36(&store, &spec.name) {
             missing_specs.push(spec.name.clone());
         }
     }
@@ -285,7 +284,7 @@ fn inspect_bake(
     for li in 0..text_config.num_hidden_layers as usize {
         for kind in ["gate_up_proj", "down_proj"] {
             let name = format!("{weight_prefix}.layers.{li}.mlp.experts.{kind}");
-            match store.layout(&name) {
+            match store_layout_qwen36(&store, &name) {
                 Some(LayoutTag::Int4Quantized) => {}
                 Some(other) => bad_expert_tensors.push((li, format!("{name} (layout={other:?})"))),
                 None => bad_expert_tensors.push((li, format!("{name} (missing)"))),
@@ -779,9 +778,33 @@ fn build_multi_layer_geom(
 /// when a tensor is missing (the bake-validation in `inspect_bake` already
 /// runs as part of the dry-run, so a missing tensor here is a real bug).
 fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuffer> {
+    let resolved = resolve_qwen36_store_name(store, name);
     store
-        .load_to_gpu(name, ordinal)
+        .load_to_gpu(resolved.as_ref(), ordinal)
         .with_context(|| format!("BakedStore::load_to_gpu({name})"))
+}
+
+fn store_contains_qwen36(store: &BakedStore, name: &str) -> bool {
+    store.contains(resolve_qwen36_store_name(store, name).as_ref())
+}
+
+fn store_layout_qwen36<'a>(store: &'a BakedStore, name: &str) -> Option<&'a LayoutTag> {
+    store.layout(resolve_qwen36_store_name(store, name).as_ref())
+}
+
+fn resolve_qwen36_store_name<'a>(store: &BakedStore, name: &'a str) -> Cow<'a, str> {
+    if store.contains(name) {
+        return Cow::Borrowed(name);
+    }
+    if name.contains(".mlp.experts.") {
+        if let Some(rest) = name.strip_prefix("model.language_model.") {
+            let alt = format!("model.{rest}");
+            if store.contains(&alt) {
+                return Cow::Owned(alt);
+            }
+        }
+    }
+    Cow::Borrowed(name)
 }
 
 /// Pinned by `oracle/bake_int4.py` and the kernel — every INT4 tensor in

@@ -767,6 +767,30 @@ static REGISTRY: &[RegistryEntry] = &[
             shared_expert_intermediate_size: 512,
         }),
     },
+    // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx942. CDNA bring-up reuses the
+    // HIP Qwen3.6-MoE kernels and the same baked tensor layout as gfx1100;
+    // the larger VRAM budget reflects MI300X-class cards rather than a
+    // memory-tight 24 GiB target.
+    RegistryEntry {
+        model: ModelVariant::Qwen3_6_35B_A3B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 24 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            moe_scratch_floats: 4_096,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+        }),
+    },
     // Qwen3.6-35B-A3B q4km on NVIDIA sm86. Primary CUDA v1 target. PR 4 lands
     // the kernel.
     RegistryEntry {
@@ -882,6 +906,7 @@ mod tests {
             ModelVariant::Qwen3_5_2B,
             ModelVariant::Qwen3_5_4B,
             ModelVariant::Qwen3_5_9B,
+            ModelVariant::Qwen3_6_35B_A3B,
             ModelVariant::Gemma4_E2B,
         ] {
             assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx942).is_some());
@@ -927,6 +952,7 @@ mod tests {
     fn qwen36_moe_registry_entries_carry_real_geometry() {
         for (backend, arch) in [
             (Backend::Hip, GpuArch::Gfx1100),
+            (Backend::Hip, GpuArch::Gfx942),
             (Backend::Cuda, GpuArch::Sm86),
         ] {
             let entry = lookup(&ModelVariant::Qwen3_6_35B_A3B, &backend, &arch)
