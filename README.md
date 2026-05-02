@@ -24,7 +24,7 @@ Five backend surfaces are validated or in bring-up today:
 | qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
-| qwen3.6-35b-a3b  |  —³  |  ✅³ |      —      |    —   |
+| qwen3.6-35b-a3b  |  ❌³ |  ✅³ |      —      |    —   |
 | gemma4-e2b       |  ✅  |  ✅  |     ✅²    |   ✅²  |
 | gemma4-e4b       |  ✅  |  ✅¹ |     ✅²    |   ✅²  |
 | phi4-mini        |  ✅  |  ✅  |      ✅     |   ✅   |
@@ -39,9 +39,11 @@ Five backend surfaces are validated or in bring-up today:
   same persistent kernel rather than the BF16 prefill primitive chain.
 ³ `qwen3.6-35b-a3b` is the Qwen3.6 hybrid linear/full-attention MoE
   (40 layers, 256 experts, top-8 routing, ~3B active per token; HF
-  release ships in FP8). The published source weights total ~64 GiB
-  on disk, so BF16 cannot run inside 24 GiB. INT4-GPTQ is the only
-  HIP lane: the bake is ~16.9 GiB on-disk and ~21 GiB at runtime (KV and scratch). Calibration needs more host RAM than typical 7900 XTX
+  release ships the large decoder weights in FP8). BF16 is intentionally
+  unsupported for this model: expanding the FP8-native checkpoint into
+  BF16 is a derived debug artifact, not a native model lane. INT4-GPTQ is
+  the only HIP lane today: the bake is ~16.9 GiB on-disk and ~21 GiB at
+  runtime (KV and scratch). Calibration needs more host RAM than typical 7900 XTX
   rigs carry, so consumers pull the published bake from GitHub
   releases (see [docs/bake-distribution.md](docs/bake-distribution.md));
   producer workflow is unchanged. `--fp8-runtime` and `--kv-fp8` are
@@ -75,7 +77,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-2b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
 | qwen3.5-4b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
 | qwen3.5-9b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
-| qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
+| qwen3.6-35b-a3b  |  ❌⁴ | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
 | gemma4-e4b       | ✅⁶  |  —   |      —      |   —    |
 | phi4-mini        | ✅⁷  | ✅⁸  |     ✅⁹     |  ✅¹²  |
@@ -89,7 +91,9 @@ see [docs/dflash.md](docs/dflash.md).
 ³ Gemma 4 E2B BF16 validates against the PyTorch oracle; Gemma does not yet
   have the Qwen GPU replay validator wired up.
 ⁴ Qwen3.6 35B A3B currently uses the INT4 GPTQ bake and the host-orchestrated
-  HIP chained decode path; performance work is still pending.
+  HIP chained decode path; performance work is still pending. BF16 is not
+  supported because the source checkpoint is FP8-native, so a BF16 bake would
+  be an expansion artifact rather than a real model lane.
 ⁵ Gemma 4 E2B INT4 uses the GPTQ bake and the existing Gemma 4 INT4 primitive
   chain on CDNA; performance tuning is still pending.
 ⁶ Gemma 4 E4B BF16 uses the existing Gemma 4 HIP kernel path on CDNA;
