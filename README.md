@@ -77,7 +77,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-9b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
-| gemma4-e4b       |  —   |  —   |      —      |   —    |
+| gemma4-e4b       | ✅⁶  |  —   |      —      |   —    |
 | phi4-mini        |  —   |  —   |      —      |   —    |
 
 ¹ CDNA single-sequence decode uses the persistent megakernel by default.
@@ -92,6 +92,8 @@ see [docs/dflash.md](docs/dflash.md).
   HIP chained decode path; performance work is still pending.
 ⁵ Gemma 4 E2B INT4 uses the GPTQ bake and the existing Gemma 4 INT4 primitive
   chain on CDNA; performance tuning is still pending.
+⁶ Gemma 4 E4B BF16 uses the existing Gemma 4 HIP kernel path on CDNA;
+  performance tuning is still pending.
 
 ### CUDA on `sm86`
 
