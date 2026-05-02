@@ -1819,11 +1819,21 @@ fn decode_text(
                         )?;
                         t_embed += t_embed_start.elapsed();
                         let t_chain_start = std::time::Instant::now();
-                        let _ = run_chained_decode_fast(
+                        let replay_outputs = run_chained_decode_fast(
                             ordinal, &geom, &mut layers,
                             &initial_hidden, pos, emit_stage_timings,
                         )?;
                         t_chain += t_chain_start.elapsed();
+                        // Per-kernel-class breakdown for replay chains
+                        // contributes to the same accumulators as the
+                        // verify chains so `--emit-stage-timings` reports
+                        // honest full-attn/linear-attn/ffn averages on
+                        // partial-accept iters. Without this the reported
+                        // chain breakdown undercounts actual work as the
+                        // accept rate falls.
+                        t_chain_full_attn_us += replay_outputs.kernel_full_attn_us;
+                        t_chain_linear_attn_us += replay_outputs.kernel_linear_attn_us;
+                        t_chain_ffn_us += replay_outputs.kernel_ffn_us;
                         gen_steps += 1;
                     }
                 }
