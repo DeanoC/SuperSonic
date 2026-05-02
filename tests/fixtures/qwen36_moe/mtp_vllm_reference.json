@@ -1,0 +1,181 @@
+{
+  "vllm_reference": {
+    "vllm_version": "0.18.1",
+    "wheel": "vllm==0.18.1+rocm700",
+    "torch": "2.9.1+git8907517",
+    "device": "AMD Instinct MI300X VF",
+    "model_dir": "/models/supersonic-cdna/qwen3.6-35b-a3b-fp8",
+    "speculative_config": {
+      "method": "qwen3_next_mtp",
+      "num_speculative_tokens": 3
+    },
+    "temperature": 0,
+    "max_new_tokens": 8
+  },
+  "expected": [
+    {
+      "fixture": "mtp_real_prefill_quick_brown_fox.json",
+      "prompt": "The quick brown fox jumps over",
+      "draft_token_ids": [
+        15217,
+        5388,
+        13
+      ]
+    },
+    {
+      "fixture": "mtp_real_prefill_factorial.json",
+      "prompt": "def factorial(n):",
+      "draft_token_ids": [
+        262,
+        413,
+        307
+      ]
+    },
+    {
+      "fixture": "mtp_real_prefill_once_upon.json",
+      "prompt": "Once upon a time",
+      "draft_token_ids": [
+        1017,
+        557,
+        264
+      ]
+    }
+  ],
+  "observed_initial_draft_rows": [
+    {
+      "prompt": "The quick brown fox jumps over",
+      "draft_token_ids": [
+        15217,
+        5388,
+        13
+      ]
+    },
+    {
+      "prompt": "def factorial(n):",
+      "draft_token_ids": [
+        262,
+        413,
+        307
+      ]
+    },
+    {
+      "prompt": "Once upon a time",
+      "draft_token_ids": [
+        1017,
+        557,
+        264
+      ]
+    }
+  ],
+  "all_seen_vllm_draft_rows": [
+    [
+      15217,
+      5388,
+      13
+    ],
+    [
+      760,
+      3841,
+      13477
+    ],
+    [
+      262,
+      413,
+      307
+    ],
+    [
+      1017,
+      557,
+      264
+    ],
+    [
+      33075,
+      888,
+      279
+    ],
+    [
+      220,
+      15,
+      25
+    ],
+    [
+      46194,
+      6725,
+      8254
+    ],
+    [
+      5388,
+      13,
+      271
+    ],
+    [
+      285,
+      460,
+      220
+    ],
+    [
+      6725,
+      8105,
+      13
+    ],
+    [
+      852,
+      9939,
+      310
+    ],
+    [
+      198,
+      262,
+      745
+    ],
+    [
+      279,
+      1814,
+      314
+    ]
+  ],
+  "outputs": [
+    {
+      "prompt": "The quick brown fox jumps over",
+      "token_ids": [
+        279,
+        15217,
+        5388,
+        13,
+        271,
+        760,
+        3841,
+        13477
+      ],
+      "text": " the lazy dog.\n\nThe quick brown"
+    },
+    {
+      "prompt": "def factorial(n):",
+      "token_ids": [
+        198,
+        262,
+        413,
+        307,
+        606,
+        220,
+        15,
+        25
+      ],
+      "text": "\n    if n == 0:"
+    },
+    {
+      "prompt": "Once upon a time",
+      "token_ids": [
+        11,
+        1017,
+        557,
+        264,
+        3777,
+        95704,
+        6725,
+        8254
+      ],
+      "text": ", there was a young adventurer named Alex"
+    }
+  ]
+}
