@@ -273,6 +273,28 @@ fn load_ple_raw_row(
     Ok(raw.iter().map(|v| v * scale).collect())
 }
 
+fn load_ple_raw_row_bytes<'a>(
+    loader: &'a UnbakedLoader,
+    weight_name: &str,
+    token_id: u32,
+    expected_row_dim: usize,
+) -> Result<&'a [u8]> {
+    let (shape, bytes) = loader.tensor_bytes(weight_name)?;
+    if shape.len() != 2 || shape[1] != expected_row_dim {
+        bail!(
+            "{weight_name} shape {:?} != [vocab, {expected_row_dim}]",
+            shape
+        );
+    }
+    let vocab = shape[0];
+    if (token_id as usize) >= vocab {
+        bail!("token id {token_id} out of range (vocab={vocab})");
+    }
+    let row_bytes = expected_row_dim * 2;
+    let off = token_id as usize * row_bytes;
+    Ok(&bytes[off..off + row_bytes])
+}
+
 fn gather_ple_raw_batch(
     loader: &UnbakedLoader,
     weight_name: &str,
@@ -557,6 +579,17 @@ pub struct Gemma4Engine {
 
     // Shared counter reused across one-shot primitives (matvec row-steal).
     counter: GpuBuffer,
+
+    // Reused single-token decode staging. These buffers avoid per-token
+    // allocations and keep the embedding + PLI projection path on device.
+    decode_token_ids: GpuBuffer,
+    decode_hidden_io: GpuBuffer,
+    decode_pli_proj: GpuBuffer,
+    decode_pli_normed: GpuBuffer,
+    decode_ple_raw: GpuBuffer,
+    decode_pli: GpuBuffer,
+    decode_post_norm: GpuBuffer,
+    decode_logits: GpuBuffer,
 
     /// Per-(seq, layer) F32 absmax scale buffers for FP8 KV cache. Populated
     /// only when `--kv-fp8` is active (alloc path lands in the engine-wiring
@@ -1036,6 +1069,30 @@ impl Gemma4Engine {
         let mega_barrier_counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let mega_barrier_flag = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
         let counter = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let decode_token_ids = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
+        let decode_hidden_io = GpuBuffer::zeros(device, dtype, &[tcfg.hidden_size])?;
+        let decode_pli_proj = GpuBuffer::zeros(
+            device,
+            dtype,
+            &[num_layers, tcfg.hidden_size_per_layer_input],
+        )?;
+        let decode_pli_normed = GpuBuffer::zeros(
+            device,
+            dtype,
+            &[num_layers, tcfg.hidden_size_per_layer_input],
+        )?;
+        let decode_ple_raw = GpuBuffer::zeros(
+            device,
+            dtype,
+            &[num_layers, tcfg.hidden_size_per_layer_input],
+        )?;
+        let decode_pli = GpuBuffer::zeros(
+            device,
+            dtype,
+            &[num_layers, tcfg.hidden_size_per_layer_input],
+        )?;
+        let decode_post_norm = GpuBuffer::zeros(device, dtype, &[tcfg.hidden_size])?;
+        let decode_logits = GpuBuffer::zeros(device, dtype, &[tcfg.vocab_size])?;
 
         Ok(Self {
             tcfg,
@@ -1065,6 +1122,14 @@ impl Gemma4Engine {
             mega_barrier_counter,
             mega_barrier_flag,
             counter,
+            decode_token_ids,
+            decode_hidden_io,
+            decode_pli_proj,
+            decode_pli_normed,
+            decode_ple_raw,
+            decode_pli,
+            decode_post_norm,
+            decode_logits,
             kv_scale_k: if kv_fp8 { Some(kv_scale_k_buf) } else { None },
             kv_scale_v: if kv_fp8 { Some(kv_scale_v_buf) } else { None },
             kv_fp8_descs_gpu,
@@ -1723,25 +1788,7 @@ impl Gemma4Engine {
         let num_layers = self.tcfg.num_hidden_layers;
         let vocab_size = self.tcfg.vocab_size;
 
-        let h_in_host = load_scaled_embed_row(
-            &self.loader,
-            &format!("{}.embed_tokens.weight", self.weight_prefix),
-            input_token_id,
-            hidden_size,
-        )?;
-        let mut h_running = upload_bf16(device, &[hidden_size], &h_in_host)?;
-
-        let pli_bytes = self.compute_per_layer_inputs_single(input_token_id)?;
-        let expected_pli_bytes = num_layers * ple_hidden * 2;
-        if pli_bytes.len() != expected_pli_bytes {
-            bail!(
-                "compute_per_layer_inputs returned {} bytes, expected {}",
-                pli_bytes.len(),
-                expected_pli_bytes
-            );
-        }
-        let pli_gpu =
-            GpuBuffer::from_host_bytes(device, dtype, &[num_layers, ple_hidden], &pli_bytes)?;
+        self.prepare_single_decode_inputs(input_token_id)?;
 
         g4::persistent_decode(
             device,
@@ -1751,8 +1798,8 @@ impl Gemma4Engine {
                 .as_ref()
                 .map(|v| &v[seq_idx]),
             self.fp8_scale_descs_gpu.as_ref(),
-            &mut h_running,
-            &pli_gpu,
+            &mut self.decode_hidden_io,
+            &self.decode_pli,
             &mut self.mega_workspace,
             &mut self.mega_matvec_counter,
             &mut self.mega_barrier_counter,
@@ -1765,28 +1812,26 @@ impl Gemma4Engine {
             1.0f32,
         )?;
 
-        let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
         g4::rms_norm(
             device,
             dtype,
-            &mut post_norm,
-            &h_running,
+            &mut self.decode_post_norm,
+            &self.decode_hidden_io,
             Some(&self.final_norm_w),
             eps,
             hidden_size,
         )?;
-        let mut logits_gpu = GpuBuffer::zeros(device, dtype, &[vocab_size])?;
         g4::matvec(
             device,
             dtype,
-            &mut logits_gpu,
-            &post_norm,
+            &mut self.decode_logits,
+            &self.decode_post_norm,
             &self.lm_head_w,
             hidden_size,
             vocab_size,
             &mut self.counter,
         )?;
-        let mut logits_host = download_bf16(&logits_gpu)?;
+        let mut logits_host = download_bf16(&self.decode_logits)?;
         let cap = self.tcfg.final_logit_softcapping.unwrap_or(30.0) as f32;
         for v in logits_host.iter_mut() {
             *v = cap * (*v / cap).tanh();
@@ -2009,6 +2054,91 @@ impl Gemma4Engine {
             }
         }
         best as u32
+    }
+
+    fn prepare_single_decode_inputs(&mut self, token_id: u32) -> Result<()> {
+        let device = self.device;
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let num_layers = self.tcfg.num_hidden_layers;
+        let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+        let vocab_size = self.tcfg.vocab_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let total = num_layers * ple_hidden;
+
+        let token_bytes = token_id.to_le_bytes();
+        gpu_hal::copy_h2d(
+            device,
+            self.decode_token_ids.as_mut_ptr(),
+            token_bytes.as_ptr() as *const c_void,
+            token_bytes.len(),
+        )
+        .map_err(|e| anyhow!("upload decode token id: {e}"))?;
+
+        let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+        g4::embed_gather_scaled(
+            device,
+            dtype,
+            &mut self.decode_hidden_io,
+            &self.decode_token_ids,
+            &self.lm_head_w,
+            1,
+            hidden_size,
+            vocab_size,
+            embed_scale,
+        )?;
+
+        g4::matvec(
+            device,
+            dtype,
+            &mut self.decode_pli_proj,
+            &self.decode_hidden_io,
+            &self.per_layer_model_projection_w,
+            hidden_size,
+            total,
+            &mut self.counter,
+        )?;
+
+        let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
+        g4::scalar_mul_inplace(device, dtype, &mut self.decode_pli_proj, proj_scale, total)?;
+        g4::rms_norm_rows(
+            device,
+            dtype,
+            &mut self.decode_pli_normed,
+            &self.decode_pli_proj,
+            Some(&self.per_layer_projection_norm_w),
+            eps,
+            num_layers,
+            ple_hidden,
+        )?;
+
+        let ple_raw_bytes = load_ple_raw_row_bytes(
+            &self.loader,
+            &format!("{}.embed_tokens_per_layer.weight", self.weight_prefix),
+            token_id,
+            total,
+        )?;
+        gpu_hal::copy_h2d(
+            device,
+            self.decode_ple_raw.as_mut_ptr(),
+            ple_raw_bytes.as_ptr() as *const c_void,
+            ple_raw_bytes.len(),
+        )
+        .map_err(|e| anyhow!("upload decode per-layer embedding: {e}"))?;
+        let ple_scale = (ple_hidden as f32).sqrt();
+        g4::scalar_mul_inplace(device, dtype, &mut self.decode_ple_raw, ple_scale, total)?;
+
+        let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
+        g4::add_scaled_residual(
+            device,
+            dtype,
+            &mut self.decode_pli,
+            &self.decode_pli_normed,
+            &self.decode_ple_raw,
+            combine_scale,
+            total,
+        )?;
+        Ok(())
     }
 
     fn compute_per_layer_inputs_single(&mut self, token_id: u32) -> Result<Vec<u8>> {
