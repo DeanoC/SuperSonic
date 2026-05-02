@@ -75,7 +75,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-2b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-4b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-9b       | ✅¹  | ✅²  |      —      |   —    |
-| qwen3.6-35b-a3b  |  —   |  —   |      —      |   —    |
+| qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  |  —   |      —      |   —    |
 | gemma4-e4b       |  —   |  —   |      —      |   —    |
 | phi4-mini        |  —   |  —   |      —      |   —    |
@@ -88,6 +88,8 @@ see [docs/dflash.md](docs/dflash.md).
   replayed GPU prefill.
 ³ Gemma 4 E2B BF16 validates against the PyTorch oracle; Gemma does not yet
   have the Qwen GPU replay validator wired up.
+⁴ Qwen3.6 35B A3B currently uses the INT4 GPTQ bake and the host-orchestrated
+  HIP chained decode path; performance work is still pending.
 
 ### CUDA on `sm86`
 

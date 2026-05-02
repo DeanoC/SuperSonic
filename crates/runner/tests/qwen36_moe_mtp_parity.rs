@@ -10,10 +10,9 @@
 //!
 //! The MTP MoE FFN is ~1.6 GiB BF16 — too large to round-trip through
 //! the oracle JSON (the existing `prefusion_weights` block is already
-//! 16 MiB). The test instead loads `mtp.*` tensors directly from the
-//! model's safetensors at the path given by
-//! `SUPERSONIC_QWEN36_MTP_MODEL_DIR`, exactly mirroring the Phase 6.2a
-//! oracle's load path.
+//! 16 MiB). The test loads `mtp.*` tensors from the INT4 bake's raw BF16
+//! MTP pass-through tensors at the path given by
+//! `SUPERSONIC_QWEN36_MTP_MODEL_DIR`, matching the runtime path.
 //!
 //! Skipped silently when either env var isn't set so CI / non-HIP
 //! machines stay green. To run locally:
@@ -37,6 +36,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use memmap2::Mmap;
+use model_store::BakedStore;
 use runner::qwen36_moe_decode::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 use runner::qwen36_moe_mtp::{
     alloc_mtp_chain_scratch, alloc_mtp_forward_scratch, run_mtp_draft_chain,
@@ -130,8 +130,8 @@ impl SafetensorsShards {
     }
 }
 
-fn load_mtp_buffers_from_safetensors(
-    shards: &SafetensorsShards,
+fn load_mtp_buffers_from_bake(
+    store: &BakedStore,
     ordinal: usize,
     geom: &MultiLayerGeom,
     kv_max_t: usize,
@@ -150,37 +150,38 @@ fn load_mtp_buffers_from_safetensors(
     };
 
     Ok(MtpLayerBuffers {
-        pre_fc_norm_hidden_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.pre_fc_norm_hidden.weight")?,
-        pre_fc_norm_embedding_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.pre_fc_norm_embedding.weight")?,
-        fc_w: shards.load_bf16_to_gpu(ordinal, "mtp.fc.weight")?,
-        norm_w: shards.load_bf16_to_gpu(ordinal, "mtp.norm.weight")?,
-        input_norm_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.input_layernorm.weight")?,
-        post_attn_norm_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.post_attention_layernorm.weight")?,
-        q_proj_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.q_proj.weight")?,
-        k_proj_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.k_proj.weight")?,
-        v_proj_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.v_proj.weight")?,
-        o_proj_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.o_proj.weight")?,
-        q_norm_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.q_norm.weight")?,
-        k_norm_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.self_attn.k_norm.weight")?,
-        gate_w: shards.load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.gate.weight")?,
-        gate_up_proj_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.experts.gate_up_proj")?,
-        down_proj_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.experts.down_proj")?,
-        shared_gate_proj_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.shared_expert.gate_proj.weight")?,
-        shared_up_proj_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.shared_expert.up_proj.weight")?,
-        shared_down_proj_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.shared_expert.down_proj.weight")?,
-        shared_expert_gate_w: shards
-            .load_bf16_to_gpu(ordinal, "mtp.layers.0.mlp.shared_expert_gate.weight")?,
+        pre_fc_norm_hidden_w: store.load_to_gpu("mtp.pre_fc_norm_hidden.weight", ordinal)?,
+        pre_fc_norm_embedding_w: store.load_to_gpu("mtp.pre_fc_norm_embedding.weight", ordinal)?,
+        fc_w: store.load_to_gpu("mtp.fc.weight", ordinal)?,
+        norm_w: store.load_to_gpu("mtp.norm.weight", ordinal)?,
+        input_norm_w: store.load_to_gpu("mtp.layers.0.input_layernorm.weight", ordinal)?,
+        post_attn_norm_w: store
+            .load_to_gpu("mtp.layers.0.post_attention_layernorm.weight", ordinal)?,
+        q_proj_w: store.load_to_gpu("mtp.layers.0.self_attn.q_proj.weight", ordinal)?,
+        k_proj_w: store.load_to_gpu("mtp.layers.0.self_attn.k_proj.weight", ordinal)?,
+        v_proj_w: store.load_to_gpu("mtp.layers.0.self_attn.v_proj.weight", ordinal)?,
+        o_proj_w: store.load_to_gpu("mtp.layers.0.self_attn.o_proj.weight", ordinal)?,
+        q_norm_w: store.load_to_gpu("mtp.layers.0.self_attn.q_norm.weight", ordinal)?,
+        k_norm_w: store.load_to_gpu("mtp.layers.0.self_attn.k_norm.weight", ordinal)?,
+        gate_w: store.load_to_gpu("mtp.layers.0.mlp.gate.weight", ordinal)?,
+        gate_up_proj_w: store.load_to_gpu("mtp.layers.0.mlp.experts.gate_up_proj", ordinal)?,
+        down_proj_w: store.load_to_gpu("mtp.layers.0.mlp.experts.down_proj", ordinal)?,
+        shared_gate_proj_w: store
+            .load_to_gpu("mtp.layers.0.mlp.shared_expert.gate_proj.weight", ordinal)?,
+        shared_up_proj_w: store
+            .load_to_gpu("mtp.layers.0.mlp.shared_expert.up_proj.weight", ordinal)?,
+        shared_down_proj_w: store
+            .load_to_gpu("mtp.layers.0.mlp.shared_expert.down_proj.weight", ordinal)?,
+        shared_expert_gate_w: store
+            .load_to_gpu("mtp.layers.0.mlp.shared_expert_gate.weight", ordinal)?,
         kv_cache,
     })
+}
+
+fn open_mtp_bake(model_dir: &Path) -> Result<BakedStore> {
+    let bake_dir = model_store::bake_dir_int4(model_dir);
+    BakedStore::open(&bake_dir)
+        .with_context(|| format!("open INT4 bake at {}", bake_dir.display()))
 }
 
 fn parse_geom(json: &Value) -> MultiLayerGeom {
@@ -263,13 +264,16 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
     set_backend(Backend::Hip);
     let ordinal = 0usize;
 
-    eprintln!("[mtp parity] loading mtp.* tensors from {} ...", model_dir.display());
-    let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
+    eprintln!(
+        "[mtp parity] loading mtp.* tensors from INT4 bake under {} ...",
+        model_dir.display()
+    );
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     // Cache big enough to hold all draft steps if the test grew. K=1 here
     // is enough for the first step but we size for K=4 to give headroom.
     let kv_max_t = 4usize;
-    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, kv_max_t)
-        .expect("load MtpLayerBuffers from safetensors");
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, kv_max_t)
+        .expect("load MtpLayerBuffers from bake");
     let mut scratch = alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
         .expect("alloc mtp scratch");
 
@@ -399,12 +403,13 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
     let ordinal = 0usize;
 
     eprintln!(
-        "[mtp draft] loading mtp.* + tied lm_head.weight from {} ...",
+        "[mtp draft] loading mtp.* from INT4 bake + tied lm_head.weight from safetensors under {} ...",
         model_dir.display()
     );
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
     let kv_max_t = 4usize;
-    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, kv_max_t)
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, kv_max_t)
         .expect("load mtp buffers");
     let lm_head_w = shards
         .load_bf16_to_gpu(ordinal, "lm_head.weight")

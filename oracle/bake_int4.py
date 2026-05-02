@@ -1417,8 +1417,8 @@ def load_raw_tensor_bf16(
         raise KeyError(f"raw tensor not found: {name}")
     scale_name = f"{name}_scale_inv"
     scale = loader.get(scale_name) if loader is not None else load_raw_tensor(model_dir, scale_name)
-    if scale is not None and t.dim() == 2:
-        return dequant_fp8_blocks(t, scale)
+    if scale is not None:
+        return dequant_fp8_tensor(t, scale)
     return t.to(torch.bfloat16)
 
 
