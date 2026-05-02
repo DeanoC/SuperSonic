@@ -298,6 +298,44 @@ __device__ inline float int4_dequant_scalar(
         static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
 }
 
+__device__ inline float fp8_e4m3_to_float(uint8_t byte) {
+    const int sign = (byte & 0x80) ? -1 : 1;
+    const int exp = (byte >> 3) & 0x0F;
+    const int mant = byte & 0x07;
+    if (exp == 0) {
+        if (mant == 0) return sign < 0 ? -0.0f : 0.0f;
+        return sign * ldexpf(static_cast<float>(mant) / 8.0f, -6);
+    }
+    if (exp == 0x0F) {
+        return sign * 448.0f;
+    }
+    return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
+}
+
+__device__ inline float fp8_dequant_scalar(
+    const void* w_ptr, const void* scale_ptr,
+    int row, int col, int cols, int block_size
+) {
+    const uint8_t* data = static_cast<const uint8_t*>(w_ptr);
+    const hip_bfloat16* scales = static_cast<const hip_bfloat16*>(scale_ptr);
+    const int scale_cols = (cols + block_size - 1) / block_size;
+    const int si = row * scale_cols + col / block_size;
+    const uint8_t byte = data[static_cast<size_t>(row) * cols + col];
+    return bf16_round_rne_f32(fp8_e4m3_to_float(byte) * static_cast<float>(scales[si]));
+}
+
+__device__ inline float fp8_matvec_partial(
+    const void* w_ptr, const void* scale_ptr, const float* __restrict__ x,
+    int row, int cols, int block_size,
+    int tid, int block_threads
+) {
+    float partial = 0.0f;
+    for (int col = tid; col < cols; col += block_threads) {
+        partial += fp8_dequant_scalar(w_ptr, scale_ptr, row, col, cols, block_size) * x[col];
+    }
+    return partial;
+}
+
 // -- Grid barrier (verbatim from full_attention_4b.hip)
 //
 // Acquire/release ordering on `barrier_flag` makes this safe across CUs.

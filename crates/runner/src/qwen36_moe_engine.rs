@@ -28,8 +28,8 @@ use qwen36_moe::weights::{
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
     run_chained_decode_fast, sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars,
-    FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
-    LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
+    FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
+    MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -207,11 +207,10 @@ pub fn run_qwen36_moe_dry_run(
         }
     }
 
-    let kv_bytes_per_token =
-        config.text_config.kv_bytes_per_token(if kv_fp8 { 1 } else { 2 });
-    let registry_budget_bytes = entry
-        .vram
-        .estimate_total(context_size, kv_bytes_per_token);
+    let kv_bytes_per_token = config
+        .text_config
+        .kv_bytes_per_token(if kv_fp8 { 1 } else { 2 });
+    let registry_budget_bytes = entry.vram.estimate_total(context_size, kv_bytes_per_token);
 
     Ok(DryRunReport {
         config,
@@ -247,10 +246,8 @@ fn inspect_bake(
     // Re-parse the manifest header even though BakedStore does too — we
     // expose format/converter versions in the report so a stale bake is
     // visible without having to dig into the file by hand.
-    let manifest_text =
-        std::fs::read_to_string(model_store::manifest_path(&bake_dir)).ok()?;
-    let manifest: model_store::manifest::Manifest =
-        serde_json::from_str(&manifest_text).ok()?;
+    let manifest_text = std::fs::read_to_string(model_store::manifest_path(&bake_dir)).ok()?;
+    let manifest: model_store::manifest::Manifest = serde_json::from_str(&manifest_text).ok()?;
     let store = BakedStore::open(&bake_dir).ok()?;
     let weights_bin_bytes = std::fs::metadata(model_store::weights_bin_path(&bake_dir))
         .ok()?
@@ -330,10 +327,7 @@ fn scalar_to_checkpoint_dtype(s: ScalarKind) -> Option<CheckpointDtype> {
     }
 }
 
-fn sanity_check_kernel_params(
-    config: &TextConfig,
-    params: &Qwen36MoeKernelParams,
-) -> Result<()> {
+fn sanity_check_kernel_params(config: &TextConfig, params: &Qwen36MoeKernelParams) -> Result<()> {
     if config.num_experts as u32 > params.num_experts {
         return Err(anyhow!(
             "config has num_experts={} but registry kernel scratch is sized for at most {}; \
@@ -582,12 +576,8 @@ pub fn print_report(report: &DryRunReport) {
                 println!("    - layer {li}: {n}");
             }
         }
-        let bake_ok = bake.missing_specs.is_empty()
-            && bake.bad_expert_tensors.is_empty();
-        println!(
-            "  ready-for-decode: {}",
-            if bake_ok { "YES" } else { "NO" }
-        );
+        let bake_ok = bake.missing_specs.is_empty() && bake.bad_expert_tensors.is_empty();
+        println!("  ready-for-decode: {}", if bake_ok { "YES" } else { "NO" });
         println!();
     } else {
         println!(
@@ -623,17 +613,14 @@ pub fn print_report(report: &DryRunReport) {
             "  WARNING: context_size defaulted to max_new_tokens={}. KV cache for a real",
             report.context_size_used,
         );
-        println!(
-            "  decode session will be larger; pass --context-size <N> (or --prompt) for an",
-        );
+        println!("  decode session will be larger; pass --context-size <N> (or --prompt) for an",);
         println!(
             "  honest fit number. Worst case at the model's max ({} tokens) needs",
             max_pos,
         );
         // Quick worst-case KV estimate at model max — gives the user one
         // concrete data point before they have to re-run with a flag.
-        let worst_kv = report.config.text_config.kv_bytes_per_token(2)
-            * max_pos as u64;
+        let worst_kv = report.config.text_config.kv_bytes_per_token(2) * max_pos as u64;
         println!(
             "  ~{:.2} GiB of KV cache alone (BF16).",
             worst_kv as f64 / GIB,
@@ -641,11 +628,7 @@ pub fn print_report(report: &DryRunReport) {
     }
 }
 
-pub fn run(
-    cli: &crate::Cli,
-    entry: &RegistryEntry,
-    total_vram: u64,
-) -> Result<()> {
+pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     // Derive context_size + an honest source flag so the printed report can
     // tell the user which of three answers they got: explicit, prompt-derived
     // estimate, or worst-case defaults-only. The `--context-size` path is
@@ -658,7 +641,10 @@ pub fn run(
     let (context_size, context_size_source) = if let Some(ctx) = cli.context_size {
         (ctx, ContextSizeSource::Explicit)
     } else if !cli.prompt.is_empty() {
-        (cli.prompt.chars().count() + max_new, ContextSizeSource::EstimatedFromPrompt)
+        (
+            cli.prompt.chars().count() + max_new,
+            ContextSizeSource::EstimatedFromPrompt,
+        )
     } else {
         (max_new, ContextSizeSource::MaxNewTokensOnly)
     };
@@ -694,15 +680,19 @@ pub fn run(
         );
     }
 
-    // Auto-download the INT4 bake from the GitHub release if missing or
-    // stale. The qwen3.6-MoE engine had been missing this wiring — an
+    // Auto-download the requested release bake if missing or stale. The
+    // qwen3.6-MoE engine had been missing this wiring for INT4 — an
     // oversight visible during Phase 6 bring-up: 35B-A3B INT4
     // calibration OOMs on 24 GiB hosts, so release-hosted bakes are
     // the only realistic way to ship updates (e.g. the post-#84 bake
     // that includes mtp.* tensors for self-speculative decode). Mirrors
     // the Phi-4 / Llama-3.1 / Qwen3.5 paths.
     {
-        let variant = model_store::fetch::BakeVariant::Int4Gptq;
+        let variant = if cli.fp8_runtime {
+            model_store::fetch::BakeVariant::Fp8Native
+        } else {
+            model_store::fetch::BakeVariant::Int4Gptq
+        };
         let bake_dir = variant.bake_dir(&cli.model_dir);
         let _lock = model_store::BakeLock::acquire(&cli.model_dir)
             .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
@@ -715,11 +705,15 @@ pub fn run(
             let canonical_model = entry.model.to_string();
             match crate::try_download_bake(cli, variant, &canonical_model, &bake_dir) {
                 Ok(true) => eprintln!(
-                    "[fetch] installed qwen3.6-MoE INT4 bake at {}",
+                    "[fetch] installed qwen3.6-MoE {} bake at {}",
+                    if cli.fp8_runtime { "FP8" } else { "INT4" },
                     bake_dir.display()
                 ),
                 Ok(false) => {}
-                Err(e) => eprintln!("[fetch] qwen3.6-MoE INT4 bake fetch failed: {e}"),
+                Err(e) => eprintln!(
+                    "[fetch] qwen3.6-MoE {} bake fetch failed: {e}",
+                    if cli.fp8_runtime { "FP8" } else { "INT4" }
+                ),
             }
         }
     }
@@ -758,6 +752,7 @@ pub fn run(
         sampling,
         cli.emit_stage_timings,
         cli.speculative_decode,
+        cli.fp8_runtime,
         cli.batched_spec_verify,
     )?;
     Ok(())
@@ -847,16 +842,26 @@ fn resolve_qwen36_store_name<'a>(store: &BakedStore, name: &'a str) -> Cow<'a, s
 /// `*_int4_scale` sidecar; if any quantizable tensor is present and
 /// uses a different group_size we'd surface that as an error.
 const QWEN36_MOE_INT4_GROUP_SIZE: i32 = 128;
+const QWEN36_MOE_FP8_BLOCK_SIZE: i32 = 128;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen36WeightMode {
+    Bf16,
+    Int4,
+    Fp8,
+}
 
 /// Build one layer's worth of GPU-resident weight + state buffers from a
 /// BakedStore. Decides full-attn vs linear-attn by consulting the config's
 /// `layer_types` (every 4th layer is full per the standard hybrid pattern).
-/// `int4_enabled` controls whether the weight tensors are loaded as packed
-/// nibbles + sidecars or as BF16. The bake naming convention pairs
+/// `weight_mode` controls whether the weight tensors are loaded as BF16,
+/// packed INT4 nibbles + sidecars, or native FP8 bytes + scale sidecars. The
+/// INT4 bake naming convention pairs
 /// `<name>.weight` (packed) with `<name>.weight_int4_scale`/`_int4_zero`
 /// for dense projections, and `<name>` (packed) with `<name>_int4_scale`/
 /// `_int4_zero` for fused-expert tensors (no `.weight` suffix in the
-/// HuggingFace checkpoint).
+/// HuggingFace checkpoint). FP8 uses the same weight names plus
+/// `<name>_scale_inv`.
 fn load_layer_buffers(
     store: &BakedStore,
     ordinal: usize,
@@ -864,7 +869,7 @@ fn load_layer_buffers(
     geom: &MultiLayerGeom,
     text_config: &TextConfig,
     weight_prefix: &str,
-    int4_enabled: bool,
+    weight_mode: Qwen36WeightMode,
     // When > 0, allocate a KV cache for full-attention layers sized for
     // `kv_max_t` past tokens. Linear-attn layers use `conv_state` +
     // `recurrent_state` instead (always allocated). 0 = no KV cache,
@@ -875,20 +880,62 @@ fn load_layer_buffers(
 
     let attn = if text_config.is_full_attention(layer_idx) {
         let fa = format!("{lp}.self_attn");
-        let int4 = if int4_enabled {
-            Some(FullAttnInt4Sidecars {
+        let int4 = match weight_mode {
+            Qwen36WeightMode::Int4 => Some(FullAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-                q_proj_scale: load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight_int4_scale"))?,
-                q_proj_zero:  load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight_int4_zero"))?,
-                k_proj_scale: load_to_gpu(store, ordinal, &format!("{fa}.k_proj.weight_int4_scale"))?,
-                k_proj_zero:  load_to_gpu(store, ordinal, &format!("{fa}.k_proj.weight_int4_zero"))?,
-                v_proj_scale: load_to_gpu(store, ordinal, &format!("{fa}.v_proj.weight_int4_scale"))?,
-                v_proj_zero:  load_to_gpu(store, ordinal, &format!("{fa}.v_proj.weight_int4_zero"))?,
-                o_proj_scale: load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight_int4_scale"))?,
-                o_proj_zero:  load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight_int4_zero"))?,
-            })
-        } else {
-            None
+                q_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.q_proj.weight_int4_scale"),
+                )?,
+                q_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight_int4_zero"))?,
+                k_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.k_proj.weight_int4_scale"),
+                )?,
+                k_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.k_proj.weight_int4_zero"))?,
+                v_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.v_proj.weight_int4_scale"),
+                )?,
+                v_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.v_proj.weight_int4_zero"))?,
+                o_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.o_proj.weight_int4_scale"),
+                )?,
+                o_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight_int4_zero"))?,
+            }),
+            Qwen36WeightMode::Fp8 => Some(FullAttnInt4Sidecars {
+                group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
+                q_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.q_proj.weight_scale_inv"),
+                )?,
+                q_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                k_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.k_proj.weight_scale_inv"),
+                )?,
+                k_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                v_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.v_proj.weight_scale_inv"),
+                )?,
+                v_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                o_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{fa}.o_proj.weight_scale_inv"),
+                )?,
+                o_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            }),
+            Qwen36WeightMode::Bf16 => None,
         };
         // KV cache: allocate per-layer when multi-token decode is requested.
         // Layout: BF16 [kv_max_t, num_kv_heads * head_dim] for both K and V.
@@ -933,18 +980,62 @@ fn load_layer_buffers(
         let recurrent_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[state_elems])
             .with_context(|| format!("alloc recurrent_state (layer {layer_idx})"))?;
 
-        let int4 = if int4_enabled {
-            Some(LinearAttnInt4Sidecars {
+        let int4 = match weight_mode {
+            Qwen36WeightMode::Int4 => Some(LinearAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-                in_proj_qkv_scale: load_to_gpu(store, ordinal, &format!("{la}.in_proj_qkv.weight_int4_scale"))?,
-                in_proj_qkv_zero:  load_to_gpu(store, ordinal, &format!("{la}.in_proj_qkv.weight_int4_zero"))?,
-                in_proj_z_scale:   load_to_gpu(store, ordinal, &format!("{la}.in_proj_z.weight_int4_scale"))?,
-                in_proj_z_zero:    load_to_gpu(store, ordinal, &format!("{la}.in_proj_z.weight_int4_zero"))?,
-                out_proj_scale:    load_to_gpu(store, ordinal, &format!("{la}.out_proj.weight_int4_scale"))?,
-                out_proj_zero:     load_to_gpu(store, ordinal, &format!("{la}.out_proj.weight_int4_zero"))?,
-            })
-        } else {
-            None
+                in_proj_qkv_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_qkv.weight_int4_scale"),
+                )?,
+                in_proj_qkv_zero: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_qkv.weight_int4_zero"),
+                )?,
+                in_proj_z_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_z.weight_int4_scale"),
+                )?,
+                in_proj_z_zero: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_z.weight_int4_zero"),
+                )?,
+                out_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.out_proj.weight_int4_scale"),
+                )?,
+                out_proj_zero: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.out_proj.weight_int4_zero"),
+                )?,
+            }),
+            Qwen36WeightMode::Fp8 => Some(LinearAttnInt4Sidecars {
+                group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
+                in_proj_qkv_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_qkv.weight_scale_inv"),
+                )?,
+                in_proj_qkv_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                in_proj_z_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.in_proj_z.weight_scale_inv"),
+                )?,
+                in_proj_z_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                out_proj_scale: load_to_gpu(
+                    store,
+                    ordinal,
+                    &format!("{la}.out_proj.weight_scale_inv"),
+                )?,
+                out_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            }),
+            Qwen36WeightMode::Bf16 => None,
         };
 
         AttnLayerBuffers::Linear {
@@ -972,34 +1063,126 @@ fn load_layer_buffers(
     let mp = format!("{lp}.mlp");
     // Fused-expert sidecars use `_int4_scale`/`_int4_zero` (no `.weight`).
     // Shared-expert MLPs use the dense `<name>.weight_int4_scale` form.
-    let ffn_int4 = if int4_enabled {
-        Some(FfnInt4Sidecars {
+    let ffn_int4 = match weight_mode {
+        Qwen36WeightMode::Int4 => Some(FfnInt4Sidecars {
             group_size: QWEN36_MOE_INT4_GROUP_SIZE,
-            gate_up_proj_scale: load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj_int4_scale"))?,
-            gate_up_proj_zero:  load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj_int4_zero"))?,
-            down_proj_scale:    load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj_int4_scale"))?,
-            down_proj_zero:     load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj_int4_zero"))?,
-            shared_gate_proj_scale: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.gate_proj.weight_int4_scale"))?,
-            shared_gate_proj_zero:  load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.gate_proj.weight_int4_zero"))?,
-            shared_up_proj_scale:   load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.up_proj.weight_int4_scale"))?,
-            shared_up_proj_zero:    load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.up_proj.weight_int4_zero"))?,
-            shared_down_proj_scale: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.down_proj.weight_int4_scale"))?,
-            shared_down_proj_zero:  load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.down_proj.weight_int4_zero"))?,
-        })
-    } else {
-        None
+            gate_up_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.gate_up_proj_int4_scale"),
+            )?,
+            gate_up_proj_zero: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.gate_up_proj_int4_zero"),
+            )?,
+            down_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.down_proj_int4_scale"),
+            )?,
+            down_proj_zero: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.down_proj_int4_zero"),
+            )?,
+            shared_gate_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.gate_proj.weight_int4_scale"),
+            )?,
+            shared_gate_proj_zero: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.gate_proj.weight_int4_zero"),
+            )?,
+            shared_up_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.up_proj.weight_int4_scale"),
+            )?,
+            shared_up_proj_zero: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.up_proj.weight_int4_zero"),
+            )?,
+            shared_down_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.down_proj.weight_int4_scale"),
+            )?,
+            shared_down_proj_zero: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.down_proj.weight_int4_zero"),
+            )?,
+        }),
+        Qwen36WeightMode::Fp8 => Some(FfnInt4Sidecars {
+            group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
+            gate_up_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.gate_up_proj_scale_inv"),
+            )?,
+            gate_up_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            down_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.experts.down_proj_scale_inv"),
+            )?,
+            down_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_gate_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.gate_proj.weight_scale_inv"),
+            )?,
+            shared_gate_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_up_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.up_proj.weight_scale_inv"),
+            )?,
+            shared_up_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_down_proj_scale: load_to_gpu(
+                store,
+                ordinal,
+                &format!("{mp}.shared_expert.down_proj.weight_scale_inv"),
+            )?,
+            shared_down_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+        }),
+        Qwen36WeightMode::Bf16 => None,
     };
     let ffn = FfnLayerBuffers {
-        post_attn_norm_w: load_to_gpu(store, ordinal, &format!("{lp}.post_attention_layernorm.weight"))?,
+        post_attn_norm_w: load_to_gpu(
+            store,
+            ordinal,
+            &format!("{lp}.post_attention_layernorm.weight"),
+        )?,
         gate_w: load_to_gpu(store, ordinal, &format!("{mp}.gate.weight"))?,
         // Note: experts.gate_up_proj / experts.down_proj have NO `.weight`
         // suffix in the published checkpoint — see expected_tensor_specs.
         gate_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?,
         down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj"))?,
-        shared_gate_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.gate_proj.weight"))?,
-        shared_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.up_proj.weight"))?,
-        shared_down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert.down_proj.weight"))?,
-        shared_expert_gate_w: load_to_gpu(store, ordinal, &format!("{mp}.shared_expert_gate.weight"))?,
+        shared_gate_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            &format!("{mp}.shared_expert.gate_proj.weight"),
+        )?,
+        shared_up_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            &format!("{mp}.shared_expert.up_proj.weight"),
+        )?,
+        shared_down_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            &format!("{mp}.shared_expert.down_proj.weight"),
+        )?,
+        shared_expert_gate_w: load_to_gpu(
+            store,
+            ordinal,
+            &format!("{mp}.shared_expert_gate.weight"),
+        )?,
         int4: ffn_int4,
     };
 
@@ -1188,6 +1371,7 @@ fn decode_text(
     sampling: SamplingParams,
     emit_stage_timings: bool,
     speculative_decode: bool,
+    fp8_runtime: bool,
     batched_spec_verify: bool,
 ) -> Result<()> {
     use std::io::Write as _;
@@ -1206,8 +1390,7 @@ fn decode_text(
     // any of `temperature > 0`, `top_k != 1`, `top_p < 1.0` — counts
     // as non-greedy and is rejected here.
     if speculative_decode {
-        let is_greedy = sampling.temperature <= 0.0
-            || sampling.top_k == 1;
+        let is_greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
         if !is_greedy {
             anyhow::bail!(
                 "--speculative-decode currently supports greedy sampling \
@@ -1216,7 +1399,9 @@ fn decode_text(
                  verification (rejection sampling); until then, re-run with \
                  `--temperature 0` for speculative decode, or drop \
                  `--speculative-decode` for non-greedy sampling.",
-                sampling.temperature, sampling.top_k, sampling.top_p
+                sampling.temperature,
+                sampling.top_k,
+                sampling.top_p
             );
         }
     }
@@ -1245,7 +1430,8 @@ fn decode_text(
 
     let prompt_ids: Vec<u32> = match (&tokenizer, prompt.is_empty()) {
         (Some(tok), false) => {
-            let enc = tok.encode(prompt, true)
+            let enc = tok
+                .encode(prompt, true)
                 .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
             let ids: Vec<u32> = enc.get_ids().to_vec();
             if ids.is_empty() {
@@ -1264,18 +1450,31 @@ fn decode_text(
         if prompt_ids.len() > 8 { ", " } else { "" },
     );
 
-    // Pick the bake. INT4 is the realistic path on 24 GiB VRAM.
+    // Pick the bake. INT4 remains the default small-VRAM path; explicit
+    // --fp8-runtime selects the native FP8 bake.
+    let fp8_dir = model_store::bake_dir_fp8(model_dir);
     let int4_dir = model_store::bake_dir_int4(model_dir);
     let bf16_dir = model_store::bake_dir(model_dir);
-    let (bake_dir, int4_enabled) = if int4_dir.exists() {
-        (int4_dir, true)
+    let (bake_dir, weight_mode) = if fp8_runtime {
+        if !fp8_dir.exists() {
+            return Err(anyhow!(
+                "--fp8-runtime requested but no FP8-native bake exists at {}. \
+                 Create one with `python3 oracle/bake_fp8.py --model-dir {}`.",
+                fp8_dir.display(),
+                model_dir.display()
+            ));
+        }
+        (fp8_dir, Qwen36WeightMode::Fp8)
+    } else if int4_dir.exists() {
+        (int4_dir, Qwen36WeightMode::Int4)
     } else if bf16_dir.exists() {
-        (bf16_dir, false)
+        (bf16_dir, Qwen36WeightMode::Bf16)
     } else {
         return Err(anyhow!(
-            "decode requires a baked package — neither INT4-GPTQ ({}) nor \
-             BF16 ({}) exists. Create one with the standard bake pipeline \
+            "decode requires a baked package — neither FP8-native ({}), \
+             INT4-GPTQ ({}) nor BF16 ({}) exists. Create one with the standard bake pipeline \
              or re-run with --dry-run for analytic accounting only.",
+            fp8_dir.display(),
             int4_dir.display(),
             bf16_dir.display()
         ));
@@ -1283,7 +1482,11 @@ fn decode_text(
     println!(
         "  loading from bake: {} ({})",
         bake_dir.display(),
-        if int4_enabled { "INT4 GPTQ" } else { "BF16" }
+        match weight_mode {
+            Qwen36WeightMode::Bf16 => "BF16",
+            Qwen36WeightMode::Int4 => "INT4 GPTQ",
+            Qwen36WeightMode::Fp8 => "FP8 native",
+        }
     );
     let store = BakedStore::open(&bake_dir)
         .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
@@ -1302,7 +1505,11 @@ fn decode_text(
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
-        if int4_enabled { geom.num_layers } else { 0 },
+        if weight_mode == Qwen36WeightMode::Int4 {
+            geom.num_layers
+        } else {
+            0
+        },
         kv_max_t,
     );
     for li in 0..geom.num_layers as usize {
@@ -1313,7 +1520,7 @@ fn decode_text(
             &geom,
             &report.config.text_config,
             weight_prefix,
-            int4_enabled,
+            weight_mode,
             kv_max_t,
         )
         .with_context(|| format!("load layer {li} weights"))?;
@@ -1378,8 +1585,9 @@ fn decode_text(
     // budget alongside the 17 GiB INT4 weight bake.
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
         .context("load final norm")?;
-    let lm_head_bf16_bytes = load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
-        .context("prepare lm_head BF16 buffer")?;
+    let lm_head_bf16_bytes =
+        load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
+            .context("prepare lm_head BF16 buffer")?;
     println!(
         "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
         lm_head_bf16_bytes.len() as f64 / MIB,
@@ -1399,17 +1607,12 @@ fn decode_text(
         &lm_head_bf16_bytes,
     )
     .context("upload lm_head BF16 to GPU")?;
-    let mut logits_buf = GpuBuffer::zeros(
-        ordinal,
-        ScalarType::BF16,
-        &[geom.vocab as usize],
-    )
-    .context("alloc logits_buf on GPU")?;
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
+        .context("alloc logits_buf on GPU")?;
     let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
         .context("alloc lm_head counter_buf on GPU")?;
-    let mut final_hidden_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
-            .context("alloc final_hidden_buf on GPU")?;
+    let mut final_hidden_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
+        .context("alloc final_hidden_buf on GPU")?;
     drop(lm_head_bf16_bytes);
     drop(final_norm_bytes);
 
@@ -1567,10 +1770,14 @@ fn decode_text(
         // because `run_chained_decode_fast` ends with a D2H copy that
         // implicitly drains the queue.
         let outputs = run_chained_decode_fast(
-            ordinal, &geom, &mut layers, &initial_hidden, position,
+            ordinal,
+            &geom,
+            &mut layers,
+            &initial_hidden,
+            position,
             emit_stage_timings,
         )
-            .with_context(|| format!("chained decode (step {step}, position {position})"))?;
+        .with_context(|| format!("chained decode (step {step}, position {position})"))?;
         let t_chain_step = t1.elapsed();
         position += 1;
 
@@ -1740,15 +1947,21 @@ fn decode_text(
                         for &(pos, input) in inputs {
                             let t_embed_start = std::time::Instant::now();
                             let initial_hidden = lookup_embed_row(
-                                &store, weight_prefix,
-                                input as usize, geom.hidden as usize,
+                                &store,
+                                weight_prefix,
+                                input as usize,
+                                geom.hidden as usize,
                             )?;
                             t_embed += t_embed_start.elapsed();
 
                             let t_chain_start = std::time::Instant::now();
                             let chain_outputs = run_chained_decode_fast(
-                                ordinal, &geom, &mut layers,
-                                &initial_hidden, pos, emit_stage_timings,
+                                ordinal,
+                                &geom,
+                                &mut layers,
+                                &initial_hidden,
+                                pos,
+                                emit_stage_timings,
                             )?;
                             t_chain += t_chain_start.elapsed();
                             t_chain_full_attn_us += chain_outputs.kernel_full_attn_us;
@@ -1765,22 +1978,30 @@ fn decode_text(
                             concat.extend_from_slice(fh);
                         }
                         let fh_buf = gpu_hal::GpuBuffer::from_host_bytes(
-                            ordinal, gpu_hal::ScalarType::BF16,
-                            &[n, hidden], &concat,
+                            ordinal,
+                            gpu_hal::ScalarType::BF16,
+                            &[n, hidden],
+                            &concat,
                         )?;
                         let mut logits_buf_b = gpu_hal::GpuBuffer::zeros(
-                            ordinal, gpu_hal::ScalarType::BF16,
+                            ordinal,
+                            gpu_hal::ScalarType::BF16,
                             &[n, geom.vocab as usize],
                         )?;
                         kernel_ffi::qwen36_moe::lm_head_batched_launch(
-                            ordinal, n as i32, geom.hidden, geom.vocab,
+                            ordinal,
+                            n as i32,
+                            geom.hidden,
+                            geom.vocab,
                             geom.rms_norm_eps,
-                            &fh_buf, &final_norm_w_buf, &lm_head_w_buf,
-                            &mut logits_buf_b, None,
+                            &fh_buf,
+                            &final_norm_w_buf,
+                            &lm_head_w_buf,
+                            &mut logits_buf_b,
+                            None,
                         )?;
-                        let logits_bytes = logits_buf_b
-                            .to_host_bytes()
-                            .context("d2h batched logits")?;
+                        let logits_bytes =
+                            logits_buf_b.to_host_bytes().context("d2h batched logits")?;
                         t_lm_head += t_lm_head_start.elapsed();
 
                         let row_bytes = geom.vocab as usize * 2;
@@ -1814,14 +2035,20 @@ fn decode_text(
                     for &(pos, input) in &replay {
                         let t_embed_start = std::time::Instant::now();
                         let initial_hidden = lookup_embed_row(
-                            &store, weight_prefix,
-                            input as usize, geom.hidden as usize,
+                            &store,
+                            weight_prefix,
+                            input as usize,
+                            geom.hidden as usize,
                         )?;
                         t_embed += t_embed_start.elapsed();
                         let t_chain_start = std::time::Instant::now();
                         let replay_outputs = run_chained_decode_fast(
-                            ordinal, &geom, &mut layers,
-                            &initial_hidden, pos, emit_stage_timings,
+                            ordinal,
+                            &geom,
+                            &mut layers,
+                            &initial_hidden,
+                            pos,
+                            emit_stage_timings,
                         )?;
                         t_chain += t_chain_start.elapsed();
                         // Per-kernel-class breakdown for replay chains
@@ -1960,7 +2187,10 @@ fn decode_text(
         if generated_ids.len() == 1 { "" } else { "s" },
         prompt_ids.len(),
         generated_ids.len(),
-        if eos_id.map(|e| generated_ids.last() == Some(&e)).unwrap_or(false) {
+        if eos_id
+            .map(|e| generated_ids.last() == Some(&e))
+            .unwrap_or(false)
+        {
             "yes"
         } else {
             "no (max_new_tokens hit)"
@@ -2066,10 +2296,10 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
     // Pick the bake. INT4 is the realistic path on 24 GiB VRAM.
     let int4_dir = model_store::bake_dir_int4(model_dir);
     let bf16_dir = model_store::bake_dir(model_dir);
-    let (bake_dir, int4_enabled) = if int4_dir.exists() {
-        (int4_dir, true)
+    let (bake_dir, weight_mode) = if int4_dir.exists() {
+        (int4_dir, Qwen36WeightMode::Int4)
     } else if bf16_dir.exists() {
-        (bf16_dir, false)
+        (bf16_dir, Qwen36WeightMode::Bf16)
     } else {
         return Err(anyhow!(
             "decode requires a baked package — neither INT4-GPTQ ({}) nor \
@@ -2082,7 +2312,11 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
     println!(
         "  loading from bake: {} ({})",
         bake_dir.display(),
-        if int4_enabled { "INT4 GPTQ" } else { "BF16" }
+        if weight_mode == Qwen36WeightMode::Int4 {
+            "INT4 GPTQ"
+        } else {
+            "BF16"
+        }
     );
     let store = BakedStore::open(&bake_dir)
         .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
@@ -2097,7 +2331,11 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
         "  loading {} layer{} ({} INT4 sidecar set{})…",
         geom.num_layers,
         if geom.num_layers == 1 { "" } else { "s" },
-        if int4_enabled { geom.num_layers } else { 0 },
+        if weight_mode == Qwen36WeightMode::Int4 {
+            geom.num_layers
+        } else {
+            0
+        },
         if geom.num_layers == 1 { "" } else { "s" },
     );
     for li in 0..geom.num_layers as usize {
@@ -2108,7 +2346,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             &geom,
             &report.config.text_config,
             weight_prefix,
-            int4_enabled,
+            weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
         )
         .with_context(|| format!("load layer {li} weights"))?;
@@ -2127,15 +2365,21 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
         .unwrap_or(0) as usize;
     let initial_hidden = lookup_embed_row(&store, weight_prefix, bos, geom.hidden as usize)
         .with_context(|| format!("lookup embed row {bos}"))?;
-    println!("  embedding row {bos} loaded ({} BF16 bytes)", initial_hidden.len());
+    println!(
+        "  embedding row {bos} loaded ({} BF16 bytes)",
+        initial_hidden.len()
+    );
 
     println!("  running chained decode…");
-    let outputs =
-        run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, 0).context("chained decode")?;
+    let outputs = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, 0)
+        .context("chained decode")?;
     println!(
         "  decode done; final hidden norm = {:.4}",
         crate::qwen36_moe_decode::bf16_bytes_to_f32(&outputs.final_hidden_bytes)
-            .iter().map(|x| x * x).sum::<f32>().sqrt()
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt()
     );
 
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))

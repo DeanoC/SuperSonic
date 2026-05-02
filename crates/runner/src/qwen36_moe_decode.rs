@@ -652,17 +652,20 @@ pub fn run_chained_decode_with_options(
                     kv_max_t,
                 };
                 let int4_ptrs = match int4 {
-                    Some(s) => Qwen36MoeAttnStepInt4 {
-                        group_size: s.group_size,
-                        q_proj_scale: s.q_proj_scale.as_ptr(),
-                        q_proj_zero: s.q_proj_zero.as_ptr(),
-                        k_proj_scale: s.k_proj_scale.as_ptr(),
-                        k_proj_zero: s.k_proj_zero.as_ptr(),
-                        v_proj_scale: s.v_proj_scale.as_ptr(),
-                        v_proj_zero: s.v_proj_zero.as_ptr(),
-                        o_proj_scale: s.o_proj_scale.as_ptr(),
-                        o_proj_zero: s.o_proj_zero.as_ptr(),
-                    },
+                    Some(s) => {
+                        let fp8 = s.group_size < 0;
+                        Qwen36MoeAttnStepInt4 {
+                            group_size: s.group_size,
+                            q_proj_scale: s.q_proj_scale.as_ptr(),
+                            q_proj_zero: if fp8 { ptr::null() } else { s.q_proj_zero.as_ptr() },
+                            k_proj_scale: s.k_proj_scale.as_ptr(),
+                            k_proj_zero: if fp8 { ptr::null() } else { s.k_proj_zero.as_ptr() },
+                            v_proj_scale: s.v_proj_scale.as_ptr(),
+                            v_proj_zero: if fp8 { ptr::null() } else { s.v_proj_zero.as_ptr() },
+                            o_proj_scale: s.o_proj_scale.as_ptr(),
+                            o_proj_zero: if fp8 { ptr::null() } else { s.o_proj_zero.as_ptr() },
+                        }
+                    }
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
@@ -729,15 +732,18 @@ pub fn run_chained_decode_with_options(
                     recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
                 };
                 let int4_ptrs = match int4 {
-                    Some(s) => Qwen36MoeLinearStepInt4 {
-                        group_size: s.group_size,
-                        in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
-                        in_proj_qkv_zero: s.in_proj_qkv_zero.as_ptr(),
-                        in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
-                        in_proj_z_zero: s.in_proj_z_zero.as_ptr(),
-                        out_proj_scale: s.out_proj_scale.as_ptr(),
-                        out_proj_zero: s.out_proj_zero.as_ptr(),
-                    },
+                    Some(s) => {
+                        let fp8 = s.group_size < 0;
+                        Qwen36MoeLinearStepInt4 {
+                            group_size: s.group_size,
+                            in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
+                            in_proj_qkv_zero: if fp8 { ptr::null() } else { s.in_proj_qkv_zero.as_ptr() },
+                            in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
+                            in_proj_z_zero: if fp8 { ptr::null() } else { s.in_proj_z_zero.as_ptr() },
+                            out_proj_scale: s.out_proj_scale.as_ptr(),
+                            out_proj_zero: if fp8 { ptr::null() } else { s.out_proj_zero.as_ptr() },
+                        }
+                    }
                     None => Qwen36MoeLinearStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
@@ -819,19 +825,22 @@ pub fn run_chained_decode_with_options(
             shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
         };
         let ffn_int4_ptrs = match &ffn.int4 {
-            Some(s) => Qwen36MoeFfnStepInt4 {
-                group_size: s.group_size,
-                gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
-                gate_up_proj_zero: s.gate_up_proj_zero.as_ptr(),
-                down_proj_scale: s.down_proj_scale.as_ptr(),
-                down_proj_zero: s.down_proj_zero.as_ptr(),
-                shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
-                shared_gate_proj_zero: s.shared_gate_proj_zero.as_ptr(),
-                shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
-                shared_up_proj_zero: s.shared_up_proj_zero.as_ptr(),
-                shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
-                shared_down_proj_zero: s.shared_down_proj_zero.as_ptr(),
-            },
+            Some(s) => {
+                let fp8 = s.group_size < 0;
+                Qwen36MoeFfnStepInt4 {
+                    group_size: s.group_size,
+                    gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                    gate_up_proj_zero: if fp8 { ptr::null() } else { s.gate_up_proj_zero.as_ptr() },
+                    down_proj_scale: s.down_proj_scale.as_ptr(),
+                    down_proj_zero: if fp8 { ptr::null() } else { s.down_proj_zero.as_ptr() },
+                    shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                    shared_gate_proj_zero: if fp8 { ptr::null() } else { s.shared_gate_proj_zero.as_ptr() },
+                    shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                    shared_up_proj_zero: if fp8 { ptr::null() } else { s.shared_up_proj_zero.as_ptr() },
+                    shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                    shared_down_proj_zero: if fp8 { ptr::null() } else { s.shared_down_proj_zero.as_ptr() },
+                }
+            }
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
         let t_k = std::time::Instant::now();

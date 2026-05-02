@@ -154,7 +154,10 @@ __device__ inline void qwen36_moe_attn_step_device(
     // INT4 (when `q_proj_scale != nullptr`): treat `q_proj_w` as
     // `[2*H*d, hidden/2]` u8 and dequant per element. Same matvec stride.
     const int q_out_dim = 2 * num_heads * head_dim;
-    const bool q_int4 = (q_proj_scale != nullptr);
+    const bool fp8_mode = int4_group_size < 0;
+    const int quant_group_size = fp8_mode ? -int4_group_size : int4_group_size;
+    const bool q_quant = (q_proj_scale != nullptr);
+    const bool q_int4 = q_quant && !fp8_mode;
 
     bool wmma_handled_qproj = false;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
@@ -164,7 +167,7 @@ __device__ inline void qwen36_moe_attn_step_device(
             // tiles. Same `wmma_int4_matvec_partial_16rows` helper as the
             // FFN/linear-attn WMMA paths; output is BF16-rounded to match
             // the scalar path's `workspace[my_row] = bf16_round_rne_f32(...)`.
-            const int gsc_q = hidden / int4_group_size;
+            const int gsc_q = hidden / quant_group_size;
             const int wave_id = tid >> 5;
             const int lane_in_wave = tid & 31;
             const int lane_row = lane_in_wave & 15;
@@ -190,7 +193,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                     static_cast<const hip_bfloat16*>(q_proj_zero),
                     rhs_row, in_range,
                     x_norm_lds, hidden,
-                    gsc_q, int4_group_size, lane_row);
+                    gsc_q, quant_group_size, lane_row);
                 if (lane_half == 0 && in_range) {
                     workspace[rhs_row] = bf16_round_rne_f32(acc[0]);
                 }
@@ -221,7 +224,14 @@ __device__ inline void qwen36_moe_attn_step_device(
                     static_cast<const hip_bfloat16*>(q_proj_scale),
                     static_cast<const hip_bfloat16*>(q_proj_zero),
                     x_norm_lds,
-                    my_row, hidden, int4_group_size,
+                    my_row, hidden, quant_group_size,
+                    tid, block_size);
+            } else if (q_quant) {
+                partial = fp8_matvec_partial(
+                    reinterpret_cast<const void*>(q_proj_w),
+                    static_cast<const hip_bfloat16*>(q_proj_scale),
+                    x_norm_lds,
+                    my_row, hidden, quant_group_size,
                     tid, block_size);
             } else {
                 const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
@@ -352,14 +362,14 @@ __device__ inline void qwen36_moe_attn_step_device(
 
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
     if constexpr (USE_WMMA) {
-        const int gsc_kv = hidden / int4_group_size;
+        const int gsc_kv = hidden / quant_group_size;
         const int wave_id = tid >> 5;
         const int lane_in_wave = tid & 31;
         const int lane_row = lane_in_wave & 15;
         const int lane_half = lane_in_wave >> 4;
 
         // ------- Sub-pool 1: k_proj -------
-        if (k_proj_scale != nullptr) {
+        if (k_proj_scale != nullptr && !fp8_mode) {
             const uint8_t* slab_packed =
                 reinterpret_cast<const uint8_t*>(k_proj_w);
             for (;;) {
@@ -381,7 +391,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                     static_cast<const hip_bfloat16*>(k_proj_zero),
                     rhs_row, in_range,
                     x_norm_lds, hidden,
-                    gsc_kv, int4_group_size, lane_row);
+                    gsc_kv, quant_group_size, lane_row);
                 if (lane_half == 0 && in_range) {
                     workspace[OFF_K_RAW + rhs_row] =
                         bf16_round_rne_f32(acc[0]);
@@ -389,18 +399,27 @@ __device__ inline void qwen36_moe_attn_step_device(
                 __syncthreads();
             }
         } else {
-            // BF16 fallback for k_proj.
+            // BF16/FP8 fallback for k_proj.
             for (;;) {
                 __shared__ unsigned int my_row_s;
                 if (tid == 0) my_row_s = atomicAdd(&counters[0], 1u);
                 __syncthreads();
                 const int my_row = static_cast<int>(my_row_s);
                 if (my_row >= Hkv * d) break;
-                const T* w_row =
-                    k_proj_w + static_cast<size_t>(my_row) * hidden;
                 float partial = 0.0f;
-                for (int col = tid; col < hidden; col += block_size) {
-                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                if (k_proj_scale != nullptr) {
+                    partial = fp8_matvec_partial(
+                        reinterpret_cast<const void*>(k_proj_w),
+                        static_cast<const hip_bfloat16*>(k_proj_scale),
+                        x_norm_lds,
+                        my_row, hidden, quant_group_size,
+                        tid, block_size);
+                } else {
+                    const T* w_row =
+                        k_proj_w + static_cast<size_t>(my_row) * hidden;
+                    for (int col = tid; col < hidden; col += block_size) {
+                        partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                    }
                 }
                 shared_scratch[tid] = partial;
                 __syncthreads();
@@ -421,7 +440,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                                    &counters[0]);
 
         // ------- Sub-pool 2: v_proj -------
-        if (v_proj_scale != nullptr) {
+        if (v_proj_scale != nullptr && !fp8_mode) {
             const uint8_t* slab_packed =
                 reinterpret_cast<const uint8_t*>(v_proj_w);
             for (;;) {
@@ -443,7 +462,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                     static_cast<const hip_bfloat16*>(v_proj_zero),
                     rhs_row, in_range,
                     x_norm_lds, hidden,
-                    gsc_kv, int4_group_size, lane_row);
+                    gsc_kv, quant_group_size, lane_row);
                 if (lane_half == 0 && in_range) {
                     workspace[OFF_V_RAW + rhs_row] =
                         bf16_round_rne_f32(acc[0]);
@@ -451,18 +470,27 @@ __device__ inline void qwen36_moe_attn_step_device(
                 __syncthreads();
             }
         } else {
-            // BF16 fallback for v_proj.
+            // BF16/FP8 fallback for v_proj.
             for (;;) {
                 __shared__ unsigned int my_row_s;
                 if (tid == 0) my_row_s = atomicAdd(&counters[0], 1u);
                 __syncthreads();
                 const int my_row = static_cast<int>(my_row_s);
                 if (my_row >= Hkv * d) break;
-                const T* w_row =
-                    v_proj_w + static_cast<size_t>(my_row) * hidden;
                 float partial = 0.0f;
-                for (int col = tid; col < hidden; col += block_size) {
-                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                if (v_proj_scale != nullptr) {
+                    partial = fp8_matvec_partial(
+                        reinterpret_cast<const void*>(v_proj_w),
+                        static_cast<const hip_bfloat16*>(v_proj_scale),
+                        x_norm_lds,
+                        my_row, hidden, quant_group_size,
+                        tid, block_size);
+                } else {
+                    const T* w_row =
+                        v_proj_w + static_cast<size_t>(my_row) * hidden;
+                    for (int col = tid; col < hidden; col += block_size) {
+                        partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                    }
                 }
                 shared_scratch[tid] = partial;
                 __syncthreads();
@@ -498,11 +526,17 @@ __device__ inline void qwen36_moe_attn_step_device(
             const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
 
             float partial = 0.0f;
-            if (i4_scale != nullptr) {
+            if (i4_scale != nullptr && !fp8_mode) {
                 partial = int4_dq8_matvec_partial(
                     reinterpret_cast<const uint8_t*>(w_slab),
                     i4_scale, i4_zero, x_norm_lds,
-                    proj_row, hidden, int4_group_size,
+                    proj_row, hidden, quant_group_size,
+                    tid, block_size);
+            } else if (i4_scale != nullptr) {
+                partial = fp8_matvec_partial(
+                    reinterpret_cast<const void*>(w_slab),
+                    i4_scale, x_norm_lds,
+                    proj_row, hidden, quant_group_size,
                     tid, block_size);
             } else {
                 const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
@@ -872,13 +906,14 @@ __device__ inline void qwen36_moe_attn_step_device(
     // (when stage == 5) the host-visible output buffer.
     {
         const int qd = H * d;
-        const bool o_int4 = (o_proj_scale != nullptr);
+        const bool o_quant = (o_proj_scale != nullptr);
+        const bool o_int4 = o_quant && !fp8_mode;
 
         bool wmma_handled_oproj = false;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
         if constexpr (USE_WMMA) {
             if (o_int4) {
-                const int gsc_o = qd / int4_group_size;
+                const int gsc_o = qd / quant_group_size;
                 const int wave_id = tid >> 5;
                 const int lane_in_wave = tid & 31;
                 const int lane_row = lane_in_wave & 15;
@@ -905,7 +940,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                         static_cast<const hip_bfloat16*>(o_proj_zero),
                         rhs_row, in_range,
                         gated_lds_f32, qd,
-                        gsc_o, int4_group_size, lane_row);
+                        gsc_o, quant_group_size, lane_row);
                     if (lane_half == 0 && in_range) {
                         const float o_out  = bf16_round_rne_f32(acc[0]);
                         const float in_f   =
@@ -939,7 +974,14 @@ __device__ inline void qwen36_moe_attn_step_device(
                         static_cast<const hip_bfloat16*>(o_proj_scale),
                         static_cast<const hip_bfloat16*>(o_proj_zero),
                         workspace + OFF_GATED,
-                        my_row, qd, int4_group_size,
+                        my_row, qd, quant_group_size,
+                        tid, block_size);
+                } else if (o_quant) {
+                    partial = fp8_matvec_partial(
+                        reinterpret_cast<const void*>(o_proj_w),
+                        static_cast<const hip_bfloat16*>(o_proj_scale),
+                        workspace + OFF_GATED,
+                        my_row, qd, quant_group_size,
                         tid, block_size);
                 } else {
                     const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;

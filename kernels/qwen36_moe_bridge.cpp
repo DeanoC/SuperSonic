@@ -188,11 +188,11 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
         barrier_flag == nullptr) {
         return 113;
     }
-    // INT4 sidecars: each scale must be paired with a zero. group_size==0
-    // disables INT4 entirely; otherwise it must be positive.
-    if (int4_group_size < 0) return 114;
-    auto pair_ok = [](const void* s, const void* z) -> bool {
-        return (s == nullptr) == (z == nullptr);
+    // Quant sidecars: positive group_size = INT4 (scale+zero pairs),
+    // negative group_size = FP8-native (scale only), 0 = disabled.
+    const bool fp8_mode = int4_group_size < 0;
+    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
+        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
     };
     if (!pair_ok(q_proj_scale, q_proj_zero) ||
         !pair_ok(k_proj_scale, k_proj_zero) ||
@@ -200,11 +200,11 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
         !pair_ok(o_proj_scale, o_proj_zero)) {
         return 115;
     }
-    const bool any_int4 =
+    const bool any_quant =
         (q_proj_scale != nullptr) || (k_proj_scale != nullptr) ||
         (v_proj_scale != nullptr) || (o_proj_scale != nullptr);
-    if (any_int4 && int4_group_size <= 0) return 116;
-    if (!any_int4 && int4_group_size != 0) return 117;
+    if (any_quant && int4_group_size == 0) return 116;
+    if (!any_quant && int4_group_size != 0) return 117;
 
     // KV cache: pointers must be paired (both null or both non-null), and
     // kv_max_t must be positive when enabled + the *effective* slot
@@ -243,10 +243,11 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // K-chunk is 16; per-lane `in_range` checks handle non-16-aligned
     // output dims (`q_out_dim = 2*H*d`, `Hkv*d`, `hidden`).
     const bool any_int4_attn =
-        (q_proj_scale != nullptr) ||
-        (k_proj_scale != nullptr) ||
-        (v_proj_scale != nullptr) ||
-        (o_proj_scale != nullptr);
+        (int4_group_size > 0) &&
+        ((q_proj_scale != nullptr) ||
+         (k_proj_scale != nullptr) ||
+         (v_proj_scale != nullptr) ||
+         (o_proj_scale != nullptr));
     const bool wmma_dims_ok_attn =
         (hidden % 16 == 0) &&
         (int4_group_size > 0) &&
@@ -388,23 +389,23 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
         barrier_flag == nullptr) {
         return 123;
     }
-    // INT4 sidecars: each scale must be paired with a zero. group_size==0
-    // disables INT4 entirely; otherwise it must be positive.
-    if (int4_group_size < 0) return 124;
-    auto pair_ok = [](const void* s, const void* z) -> bool {
-        return (s == nullptr) == (z == nullptr);
+    // Quant sidecars: positive group_size = INT4 (scale+zero pairs),
+    // negative group_size = FP8-native (scale only), 0 = disabled.
+    const bool fp8_mode = int4_group_size < 0;
+    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
+        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
     };
     if (!pair_ok(in_proj_qkv_scale, in_proj_qkv_zero) ||
         !pair_ok(in_proj_z_scale, in_proj_z_zero) ||
         !pair_ok(out_proj_scale, out_proj_zero)) {
         return 125;
     }
-    const bool any_int4 =
+    const bool any_quant =
         (in_proj_qkv_scale != nullptr) ||
         (in_proj_z_scale != nullptr) ||
         (out_proj_scale != nullptr);
-    if (any_int4 && int4_group_size <= 0) return 126;
-    if (!any_int4 && int4_group_size != 0) return 127;
+    if (any_quant && int4_group_size == 0) return 126;
+    if (!any_quant && int4_group_size != 0) return 127;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -431,9 +432,10 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     // the K-chunk size (16) divides hidden and the quant group_size.
     // 35B-A3B (hidden=2048, group_size=128) satisfies both.
     const bool any_int4_routed_lin =
-        (in_proj_qkv_scale != nullptr) ||
-        (in_proj_z_scale   != nullptr) ||
-        (out_proj_scale    != nullptr);
+        (int4_group_size > 0) &&
+        ((in_proj_qkv_scale != nullptr) ||
+         (in_proj_z_scale   != nullptr) ||
+         (out_proj_scale    != nullptr));
     const bool wmma_dims_ok_lin =
         (hidden % 16 == 0) &&
         (int4_group_size > 0) &&
@@ -574,11 +576,11 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         barrier_counter == nullptr || barrier_flag == nullptr) {
         return 133;
     }
-    // INT4 mode: group_size must divide the relevant dims and each scale
-    // must be paired with a zero. group_size==0 disables INT4 entirely.
-    if (int4_group_size < 0) return 134;
-    auto pair_ok = [](const void* s, const void* z) -> bool {
-        return (s == nullptr) == (z == nullptr);
+    // Quant mode: positive group_size = INT4 (scale+zero pairs),
+    // negative group_size = FP8-native (scale only), 0 = disabled.
+    const bool fp8_mode = int4_group_size < 0;
+    auto pair_ok = [fp8_mode](const void* s, const void* z) -> bool {
+        return fp8_mode ? (z == nullptr) : ((s == nullptr) == (z == nullptr));
     };
     if (!pair_ok(gate_up_proj_scale, gate_up_proj_zero) ||
         !pair_ok(down_proj_scale, down_proj_zero) ||
@@ -587,13 +589,13 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         !pair_ok(shared_down_proj_scale, shared_down_proj_zero)) {
         return 135;
     }
-    const bool any_int4 =
+    const bool any_quant =
         (gate_up_proj_scale != nullptr) || (down_proj_scale != nullptr) ||
         (shared_gate_proj_scale != nullptr) ||
         (shared_up_proj_scale != nullptr) ||
         (shared_down_proj_scale != nullptr);
-    if (any_int4 && int4_group_size <= 0) return 136;
-    if (!any_int4 && int4_group_size != 0) return 137;
+    if (any_quant && int4_group_size == 0) return 136;
+    if (!any_quant && int4_group_size != 0) return 137;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -627,6 +629,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     // synthetic fixtures use 16-divisible dims too. The shared expert path
     // (Phase D/F) stays scalar in both variants — Phase 2 of the roadmap.
     const bool routed_int4 =
+        (int4_group_size > 0) &&
         (gate_up_proj_scale != nullptr) && (down_proj_scale != nullptr);
     const bool wmma_dims_ok =
         (hidden % 16 == 0) &&
