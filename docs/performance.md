@@ -106,17 +106,19 @@ INT4-GPTQ from the published FP8 source weights. BF16 doesn't fit in
 sequence on RX 7900 XTX with the published v2-int4-gptq bake,
 6-token prompt + 16-token generation:
 
-| Stage          | ms/step | share |
-|----------------|--------:|------:|
-| chain (40 L)   |   60.3  |   76% |
-| ↳ FFN (40 L)   |   34.6  |   44% |
-| ↳ linear-attn (30 L) | 21.2  |   27% |
-| ↳ full-attn (10 L)   |  4.2  |    5% |
-| lm_head        |   18.8  |   24% |
-| sample/detok   |    0.3  |    0% |
-| **total**      | **79.3**| 100%  |
+| Stage          | ms/step  |  tok/s  | share |
+|----------------|---------:|--------:|------:|
+| chain (40 L)   |    60.3  |    16.6 |   76% |
+| ↳ FFN (40 L)   |    34.6  |    28.9 |   44% |
+| ↳ linear-attn (30 L) | 21.2 |  47.2 |   27% |
+| ↳ full-attn (10 L)   |  4.2 |   238 |    5% |
+| lm_head        |    18.8  |    53.2 |   24% |
+| sample/detok   |     0.3  |   3333  |    0% |
+| **total**      | **79.3** |**12.6** | 100%  |
 
-Roughly **12.6 tok/s** on greedy decode. The chain wall-clock is
+Per-stage `tok/s` is `1000 / ms_per_step` — the throughput that stage
+would sustain if it were the only cost. The headline rate is the
+total row: roughly **12.6 tok/s** on greedy decode. The chain wall-clock is
 host-orchestrated: each layer's attention and FFN are separate HIP
 launches today (`run_chained_decode` in
 `crates/runner/src/qwen36_moe_decode.rs`). The persistent megakernel
