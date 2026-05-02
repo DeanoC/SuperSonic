@@ -370,6 +370,16 @@ fn download_hidden_bf16(
 pub struct ChainedDecodeOptions {
     pub capture_per_layer: bool,
     pub trace_norms: bool,
+    /// When true, call `gpu_hal::sync(ordinal)` after each step launch so
+    /// the per-stage `kernel_*_us` accumulators reflect GPU execution time
+    /// rather than host dispatch queue time. Set by `--emit-stage-timings`
+    /// — production runs leave it false, paying ~80 syncs/token to keep
+    /// the chain breakdown accurate when the user asks for it.
+    /// (Codex review #80: PR #80 made the bridge step launchers async,
+    /// which silently turned the stage-breakdown numbers into host-queue
+    /// times — this flag preserves their original "GPU compute time"
+    /// semantics for users opting into the breakdown.)
+    pub accurate_stage_timings: bool,
 }
 
 impl ChainedDecodeOptions {
@@ -382,6 +392,7 @@ impl ChainedDecodeOptions {
         Self {
             capture_per_layer: false,
             trace_norms,
+            accurate_stage_timings: false,
         }
     }
 }
@@ -401,6 +412,9 @@ pub fn run_chained_decode(
             // routes through `run_chained_decode_fast` (defined below).
             capture_per_layer: true,
             trace_norms: ChainedDecodeOptions::from_env().trace_norms,
+            // The legacy capture path D2H-syncs every step anyway, so the
+            // explicit per-step sync is redundant here (kept off).
+            accurate_stage_timings: false,
         },
     )
 }
@@ -410,16 +424,25 @@ pub fn run_chained_decode(
 /// engine nor sampling consume — only the multilayer parity test
 /// reads `per_layer_*`). Reuses `run_chained_decode_with_options`'s
 /// implementation so parity guarantees are unchanged.
+///
+/// `accurate_stage_timings`: when true, synchronizes between step
+/// launches so the per-stage `kernel_*_us` numbers in `DecodeOutputs`
+/// reflect GPU compute time (not host queue time). Set this when
+/// `--emit-stage-timings` is requested. Default false in production
+/// to keep the chain async.
 pub fn run_chained_decode_fast(
     ordinal: usize,
     geom: &MultiLayerGeom,
     layers: &mut [LayerBuffers],
     initial_hidden_bytes: &[u8],
     position: i32,
+    accurate_stage_timings: bool,
 ) -> Result<DecodeOutputs> {
+    let mut options = ChainedDecodeOptions::from_env();
+    options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_with_options(
         ordinal, geom, layers, initial_hidden_bytes, position,
-        ChainedDecodeOptions::from_env(),
+        options,
     )
 }
 
@@ -607,6 +630,10 @@ pub fn run_chained_decode_with_options(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
+                if options.accurate_stage_timings {
+                    gpu_hal::sync(ordinal)
+                        .context("sync_after_attn_step (accurate_stage_timings)")?;
+                }
                 t_full_attn += t_k.elapsed();
             }
             AttnLayerBuffers::Linear {
@@ -678,6 +705,10 @@ pub fn run_chained_decode_with_options(
                     &mut sync_buf,
                 )
                 .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
+                if options.accurate_stage_timings {
+                    gpu_hal::sync(ordinal)
+                        .context("sync_after_linear_step (accurate_stage_timings)")?;
+                }
                 t_linear_attn += t_k.elapsed();
             }
         }
@@ -769,6 +800,10 @@ pub fn run_chained_decode_with_options(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        if options.accurate_stage_timings {
+            gpu_hal::sync(ordinal)
+                .context("sync_after_ffn_step (accurate_stage_timings)")?;
+        }
         t_ffn += t_k.elapsed();
 
         // Same D2D + swap as the attn step.

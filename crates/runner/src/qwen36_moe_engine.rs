@@ -1223,7 +1223,18 @@ fn decode_text(
         // `final_hidden_bytes`. The multilayer parity test still calls
         // the legacy `run_chained_decode` which captures per-layer.
         let t1 = std::time::Instant::now();
-        let outputs = run_chained_decode_fast(ordinal, &geom, &mut layers, &initial_hidden, position)
+        // When `--emit-stage-timings` is set, sync after each step launch
+        // so the per-stage `kernel_*_us` accumulators in `outputs` reflect
+        // GPU compute time. Without it, PR #80's async dispatch path
+        // would record host queue time instead — fast but useless for
+        // stage-level perf attribution. The total `chain_ms` measured by
+        // the wall-clock around this call stays correct either way
+        // because `run_chained_decode_fast` ends with a D2H copy that
+        // implicitly drains the queue.
+        let outputs = run_chained_decode_fast(
+            ordinal, &geom, &mut layers, &initial_hidden, position,
+            emit_stage_timings,
+        )
             .with_context(|| format!("chained decode (step {step}, position {position})"))?;
         let t_chain_step = t1.elapsed();
         position += 1;
