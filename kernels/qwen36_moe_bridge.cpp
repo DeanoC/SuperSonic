@@ -886,7 +886,20 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
     void*         x_normed_out) {        // [m, hidden] BF16, nullable
     if (dtype != 2) return 130;            // bf16 only
     if (hidden <= 0 || vocab <= 0) return 132;
-    if (m < 1 || m > 16) return 134;
+    // M must be in 1..16 (WMMA tile bound) AND fit the per-block dynamic
+    // LDS budget. The API-level 16 ceiling is necessary but not sufficient
+    // — at hidden=2048 the LDS staging per row is 4 KiB BF16, plus 128 B
+    // reduction scratch, so M=16 would request 65,664 B and overflow the
+    // 64 KiB per-block cap. Compute the hidden-dependent ceiling and
+    // reject inputs that exceed it before the kernel launch crashes
+    // with status 254.
+    if (m < 1) return 134;
+    constexpr size_t LDS_BUDGET_BYTES = 64 * 1024;
+    constexpr size_t REDUCTION_BYTES = 32 * sizeof(float); // 128 B
+    const size_t lds_per_row = static_cast<size_t>(hidden) * sizeof(uint16_t);
+    const size_t max_m_for_lds = (LDS_BUDGET_BYTES - REDUCTION_BYTES) / lds_per_row;
+    const int max_m = (max_m_for_lds < 16u) ? static_cast<int>(max_m_for_lds) : 16;
+    if (m > max_m) return 134;
     if (final_hidden == nullptr || final_norm_w == nullptr ||
         lm_head_w == nullptr || logits == nullptr) {
         return 133;
@@ -906,8 +919,9 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
     constexpr int wmma_block_size = 32;
     const int grid_x = (vocab + 15) / 16;
     // LDS: 32 F32 reduction scratch + m * hidden u16 BF16-rounded inputs.
+    // Bounded above by LDS_BUDGET_BYTES via the `m > max_m` check above.
     const size_t lds_bytes =
-        static_cast<size_t>(wmma_block_size) * sizeof(float) +
+        REDUCTION_BYTES +
         static_cast<size_t>(m) * static_cast<size_t>(hidden) * sizeof(uint16_t);
 
     hipLaunchKernelGGL(
