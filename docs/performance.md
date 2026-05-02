@@ -106,21 +106,40 @@ INT4-GPTQ from the published FP8 source weights. BF16 doesn't fit in
 sequence on RX 7900 XTX with the published v2-int4-gptq bake,
 6-token prompt + 16-token generation:
 
-| Stage          | ms/step  |  tok/s  | share |
-|----------------|---------:|--------:|------:|
-| chain (40 L)   |    24.72 |    40.5 |   93% |
-| ↳ FFN (40 L)   |    11.42 |    87.6 |   43% |
-| ↳ linear-attn (30 L) | 12.29 |  81.4 |   46% |
-| ↳ full-attn (10 L)   |  2.46 |   406 |    9% |
-| lm_head        |     1.53 |   653.6 |    6% |
-| sample/detok   |     0.27 |  3703.7 |    1% |
-| **total**      | **26.53**|**37.7** | 100%  |
+**Production decode (async dispatch, no per-step sync)** — what
+`./target/release/supersonic … --max-new-tokens 16` actually runs:
 
-Per-stage `tok/s` is `1000 / ms_per_step` — the throughput that stage
-would sustain if it were the only cost. The headline rate is the
-total row: roughly **37.7 tok/s** on greedy decode (production async
-dispatch; numbers above include the per-step sync needed for the
-chain breakdown to be accurate, which costs ~1.8 ms).
+| Stage         | ms/step  | tok/s if alone |
+|---------------|---------:|---------------:|
+| chain (40 L)  |    24.72 |           40.5 |
+| lm_head       |     1.53 |          653.6 |
+| sample/detok  |     0.27 |         3703.7 |
+| **total**     |**26.53** |       **37.7** |
+
+The chain wall-clock here is host-real-time end-to-end (the chain
+ends in a D2H copy that drains the queue), but the per-kernel-class
+breakdown isn't observable in this mode — the host can't tell how
+much of `chain_ms` is full-attn vs linear-attn vs FFN without
+forcing a sync between each step launch.
+
+**With `--emit-stage-timings`** (per-step `gpu_hal::sync`, slower but
+attributable):
+
+| Stage          | ms/step  | tok/s if alone | share of chain |
+|----------------|---------:|---------------:|---------------:|
+| ↳ FFN (40 L)         | 11.42 |          87.6 |             43% |
+| ↳ linear-attn (30 L) | 12.29 |          81.4 |             46% |
+| ↳ full-attn (10 L)   |  2.46 |         406.5 |              9% |
+| sub-stage sum        | 26.17 |               |            ~99% |
+| chain (40 L)         | 26.42 |          37.9 |               — |
+| lm_head              |  1.53 |         653.6 |               — |
+| sample/detok         |  0.27 |        3703.7 |               — |
+| **total**            |**28.21**|     **35.4**|               — |
+
+Per-stage `tok/s` is `1000 / ms_per_step` — the throughput that
+stage would sustain if it were the only cost. The 1.7 ms gap between
+the two `total`s is the per-step sync overhead (~80 syncs/token); the
+production headline is the async **37.7 tok/s** number.
 
 This is **3.0× the original `12.6 tok/s` baseline** (PR #74's concurrent
 expert dispatch). The cumulative gain across the WMMA + dispatch
