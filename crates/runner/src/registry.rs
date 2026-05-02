@@ -676,6 +676,19 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 11 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
     // Phi-4-mini: 3.8B dense, full-attention all 32 layers, LongRoPE.
     // BF16 weights ≈ 7.6 GiB; KV cache at 4K ctx ≈ 520 MiB (32 layers × 2 × 8 kv_heads × 128 head_dim × 2 B).
     // Fits gfx1150 with headroom. Weight prefix is bare `model` (Phi stores tensors as `model.*`).
@@ -869,6 +882,7 @@ mod tests {
             ModelVariant::Qwen3_5_2B,
             ModelVariant::Qwen3_5_4B,
             ModelVariant::Qwen3_5_9B,
+            ModelVariant::Gemma4_E2B,
         ] {
             assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx942).is_some());
         }

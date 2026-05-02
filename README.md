@@ -76,7 +76,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-4b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.5-9b       | ✅¹  | ✅²  |      —      |   —    |
 | qwen3.6-35b-a3b  |  —   |  —   |      —      |   —    |
-| gemma4-e2b       |  —   |  —   |      —      |   —    |
+| gemma4-e2b       | ✅³  |  —   |      —      |   —    |
 | gemma4-e4b       |  —   |  —   |      —      |   —    |
 | phi4-mini        |  —   |  —   |      —      |   —    |
 
@@ -86,6 +86,8 @@ see [docs/dflash.md](docs/dflash.md).
 ² INT4 uses the published GPTQ bake. The PyTorch oracle is BF16-only, so INT4
   bring-up checks exact token agreement and BF16-scale logit drift against
   replayed GPU prefill.
+³ Gemma 4 E2B BF16 validates against the PyTorch oracle; Gemma does not yet
+  have the Qwen GPU replay validator wired up.
 
 ### CUDA on `sm86`
 

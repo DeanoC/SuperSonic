@@ -1729,6 +1729,7 @@ __device__ inline void g4_grid_barrier(
     __syncthreads();
     if (threadIdx.x == 0) {
         unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        __threadfence();
         unsigned int old = atomicAdd(barrier_counter, 1u);
         if (old == static_cast<unsigned int>(num_blocks) - 1) {
             __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
