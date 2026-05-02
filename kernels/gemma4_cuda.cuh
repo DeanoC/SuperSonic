@@ -2649,7 +2649,7 @@ struct Gemma4FP8ScaleDesc {
 };
 
 template <typename T>
-__global__ void g4_persistent_decode_kernel(
+__device__ void g4_persistent_decode_body(
     int num_layers,
     int hidden_size,
     int ple_hidden,
@@ -2664,8 +2664,9 @@ __global__ void g4_persistent_decode_kernel(
     float* __restrict__ workspace,
     unsigned int* __restrict__ matvec_counter,
     unsigned int* __restrict__ barrier_counter,
-    unsigned int* __restrict__ barrier_flag
-) __launch_bounds__(256, 1) {
+    unsigned int* __restrict__ barrier_flag,
+    float* __restrict__ lds
+) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
     const int nb = gridDim.x;
@@ -2674,7 +2675,6 @@ __global__ void g4_persistent_decode_kernel(
     // the FP8-runtime weight-dequant LUT. Bridge always allocates the full
     // `(bs + 256) * 4 B` so the layout is constant whether `fp8_scales` is
     // null or not.
-    extern __shared__ float lds[];
     float* fp8_lut = lds + bs;
     if (fp8_scales != nullptr) {
         if (tid < 256) {
@@ -3377,6 +3377,168 @@ __global__ void g4_persistent_decode_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
     }
+}
+
+template <typename T>
+__global__ void g4_persistent_decode_kernel(
+    int num_layers,
+    int hidden_size,
+    int ple_hidden,
+    int position,
+    float eps,
+    float scale,
+    const Gemma4DecodeLayerDesc* __restrict__ layers,
+    const Gemma4KVCacheFp8Desc* __restrict__ kv_fp8_descs,
+    const Gemma4FP8ScaleDesc* __restrict__ fp8_scales,
+    T* __restrict__ hidden_io,
+    const T* __restrict__ per_layer_inputs,
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ matvec_counter,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __launch_bounds__(256, 1) {
+    extern __shared__ float lds[];
+    g4_persistent_decode_body<T>(
+        num_layers, hidden_size, ple_hidden, position, eps, scale,
+        layers, kv_fp8_descs, fp8_scales, hidden_io, per_layer_inputs,
+        workspace, matvec_counter, barrier_counter, barrier_flag, lds);
+}
+
+template <typename T>
+__global__ void g4_persistent_decode_fused_input_kernel(
+    int num_layers,
+    int hidden_size,
+    int ple_hidden,
+    int vocab_size,
+    unsigned int token_id,
+    int position,
+    float eps,
+    float scale,
+    float embed_scale,
+    float proj_scale,
+    float ple_scale,
+    float combine_scale,
+    const Gemma4DecodeLayerDesc* __restrict__ layers,
+    const Gemma4KVCacheFp8Desc* __restrict__ kv_fp8_descs,
+    const Gemma4FP8ScaleDesc* __restrict__ fp8_scales,
+    const T* __restrict__ embed_tokens,
+    const T* __restrict__ embed_tokens_per_layer,
+    const T* __restrict__ per_layer_model_projection_w,
+    const T* __restrict__ per_layer_projection_norm_w,
+    T* __restrict__ hidden_io,
+    T* __restrict__ pli_proj,
+    T* __restrict__ pli_normed,
+    T* __restrict__ ple_raw,
+    T* __restrict__ per_layer_inputs,
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ matvec_counter,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __launch_bounds__(256, 1) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+    const int total = num_layers * ple_hidden;
+    extern __shared__ float lds[];
+
+    if (token_id >= static_cast<unsigned int>(vocab_size)) {
+        for (int i = tid + blockIdx.x * bs; i < hidden_size; i += bs * nb) {
+            hidden_io[i] = g4_from_float<T>(0.0f);
+        }
+        for (int i = tid + blockIdx.x * bs; i < total; i += bs * nb) {
+            per_layer_inputs[i] = g4_from_float<T>(0.0f);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+    } else {
+        const T* embed_row =
+            embed_tokens + static_cast<size_t>(token_id) * hidden_size;
+        for (int i = tid + blockIdx.x * bs; i < hidden_size; i += bs * nb) {
+            hidden_io[i] = g4_from_float<T>(g4_to_float(embed_row[i]) * embed_scale);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        if (blockIdx.x == 0 && tid == 0) {
+            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        {
+            const int lane = tid % warpSize;
+            const int vd4 = hidden_size & ~3;
+            while (true) {
+                unsigned int row;
+                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
+                row = __shfl_sync(0xffffffff, row, 0);
+                if (row >= static_cast<unsigned int>(total)) break;
+                const T* wr = per_layer_model_projection_w +
+                    static_cast<size_t>(row) * hidden_size;
+                float p = 0.0f;
+                for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    float w0 = g4_to_float(wr[c]);
+                    float w1 = g4_to_float(wr[c + 1]);
+                    float w2 = g4_to_float(wr[c + 2]);
+                    float w3 = g4_to_float(wr[c + 3]);
+                    p += w0 * g4_to_float(hidden_io[c])
+                       + w1 * g4_to_float(hidden_io[c + 1])
+                       + w2 * g4_to_float(hidden_io[c + 2])
+                       + w3 * g4_to_float(hidden_io[c + 3]);
+                }
+                for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+                    p += g4_to_float(wr[c]) * g4_to_float(hidden_io[c]);
+                }
+                float result = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) {
+                    pli_proj[row] = g4_from_float<T>(result * proj_scale);
+                }
+            }
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int row = blockIdx.x; row < num_layers; row += nb) {
+            const T* in = pli_proj + static_cast<size_t>(row) * ple_hidden;
+            T* out = pli_normed + static_cast<size_t>(row) * ple_hidden;
+            float ss = 0.0f;
+            for (int c = tid; c < ple_hidden; c += bs) {
+                const float v = g4_to_float(in[c]);
+                ss += v * v;
+            }
+            lds[tid] = ss;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] += lds[tid + s];
+                __syncthreads();
+            }
+            const float inv = rsqrtf(lds[0] / static_cast<float>(ple_hidden) + eps);
+            __syncthreads();
+            for (int c = tid; c < ple_hidden; c += bs) {
+                const float w = per_layer_projection_norm_w
+                    ? g4_to_float(per_layer_projection_norm_w[c])
+                    : 1.0f;
+                out[c] = g4_from_float<T>(g4_to_float(in[c]) * inv * w);
+            }
+            __syncthreads();
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        const T* ple_row =
+            embed_tokens_per_layer + static_cast<size_t>(token_id) * total;
+        for (int i = tid + blockIdx.x * bs; i < total; i += bs * nb) {
+            ple_raw[i] = g4_from_float<T>(g4_to_float(ple_row[i]) * ple_scale);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int i = tid + blockIdx.x * bs; i < total; i += bs * nb) {
+            const float v =
+                (g4_to_float(pli_normed[i]) + g4_to_float(ple_raw[i])) * combine_scale;
+            per_layer_inputs[i] = g4_from_float<T>(v);
+        }
+        g4_grid_barrier(barrier_counter, barrier_flag, nb);
+    }
+
+    g4_persistent_decode_body<T>(
+        num_layers, hidden_size, ple_hidden, position, eps, scale,
+        layers, kv_fp8_descs, fp8_scales, hidden_io, per_layer_inputs,
+        workspace, matvec_counter, barrier_counter, barrier_flag, lds);
 }
 
 // =============================================================================
