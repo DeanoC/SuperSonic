@@ -96,6 +96,56 @@ BF16 `fixed_bytes` × the engine's quant scale factor (0.37× for INT4,
 the VRAM admission preflight, so memory-constrained cards that pass
 preflight will fit at runtime.
 
+### Qwen3.6-MoE on `gfx1100`
+
+`qwen3.6-35b-a3b` is the first MoE model shipped on SuperSonic: 40
+layers (30 linear-attention + 10 full-attention in a hybrid pattern),
+256 experts with top-8 routing, ~3B active parameters per token,
+INT4-GPTQ from the published FP8 source weights. BF16 doesn't fit in
+24 GiB; the INT4 bake is the only HIP lane. Steady-state, single-
+sequence on RX 7900 XTX with the published v2-int4-gptq bake,
+6-token prompt + 16-token generation:
+
+| Stage          | ms/step | share |
+|----------------|--------:|------:|
+| chain (40 L)   |   60.3  |   76% |
+| ↳ FFN (40 L)   |   34.6  |   44% |
+| ↳ linear-attn (30 L) | 21.2  |   27% |
+| ↳ full-attn (10 L)   |  4.2  |    5% |
+| lm_head        |   18.8  |   24% |
+| sample/detok   |    0.3  |    0% |
+| **total**      | **79.3**| 100%  |
+
+Roughly **12.6 tok/s** on greedy decode. The chain wall-clock is
+host-orchestrated: each layer's attention and FFN are separate HIP
+launches today (`run_chained_decode` in
+`crates/runner/src/qwen36_moe_decode.rs`). The persistent megakernel
+(planned PR 4c step 4) will fold the per-token 80 launches into one
+cooperative kernel and is expected to reclaim several ms of launch
+overhead. Within FFN, the K_top=8 routed experts dispatch
+concurrently via cyclic block partitioning (`group_id = blockIdx.x %
+top_k`) — see PR #74. The shared expert still runs sequentially
+ahead of the routed dispatch; folding it as a 9th concurrent group
+was prototyped (parity-clean) but regressed FFN by ~4 ms due to L2
+cache pressure from 9 simultaneous slab reads, so it's not shipped.
+
+INT4 weight + scratch on the 35B-A3B bake: ~17 GiB on disk, ~21 GiB
+runtime including KV cache at the default context. Within the 24 GiB
+budget. Calibration needs more host RAM than typical 7900 XTX rigs
+carry, so the bake is produced on a bigger box and distributed via
+GitHub releases (see [bake-distribution.md](bake-distribution.md));
+consumers pull it automatically on first run.
+
+Reproduce:
+
+```bash
+cargo build --release --bin supersonic
+./target/release/supersonic --model qwen3.6-35b-a3b \
+  --model-dir /path/to/Qwen3.6-35B-A3B-FP8 \
+  --prompt "The quick brown fox jumps over" \
+  --max-new-tokens 16 --emit-stage-timings
+```
+
 ## HIP — `gfx1150` (AMD Radeon 890M iGPU)
 
 16 CUs, 2.9 GHz core, shared with system memory. Measurements on

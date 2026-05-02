@@ -23,6 +23,7 @@ Four backend surfaces are validated today:
 | qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅  |  ✅  |      ✅     |   ✅   |
+| qwen3.6-35b-a3b  |  —³  |  ✅³ |      —      |    —   |
 | gemma4-e2b       |  ✅  |  ✅  |     ✅²    |   ✅²  |
 | gemma4-e4b       |  ✅  |  ✅¹ |     ✅²    |   ✅²  |
 | phi4-mini        |  ✅  |  ✅  |      ✅     |   ✅   |
@@ -35,6 +36,16 @@ Four backend surfaces are validated today:
   cannot combine with `--int4` (the INT4 kernel doesn't yet route the
   FP8 paths). Prefill under either FP8 mode runs per-token through the
   same persistent kernel rather than the BF16 prefill primitive chain.
+³ `qwen3.6-35b-a3b` is the Qwen3.6 hybrid linear/full-attention MoE
+  (40 layers, 256 experts, top-8 routing, ~3B active per token; HF
+  release ships in FP8). The published source weights total ~64 GiB
+  on disk, so BF16 cannot run inside 24 GiB. INT4-GPTQ is the only
+  HIP lane: the bake is ~16.9 GiB on-disk and ~21 GiB at runtime (KV
+  + scratch). Calibration needs more host RAM than typical 7900 XTX
+  rigs carry, so consumers pull the published bake from GitHub
+  releases (see [docs/bake-distribution.md](docs/bake-distribution.md));
+  producer workflow is unchanged. `--fp8-runtime` and `--kv-fp8` are
+  not wired for the MoE family.
 
 ### HIP on `gfx1150`
 
