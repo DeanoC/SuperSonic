@@ -231,6 +231,9 @@ fn resolve_oracle_python() -> String {
     if let Some(value) = env::var_os("SUPERSONIC_ORACLE_PYTHON") {
         return value.to_string_lossy().into_owned();
     }
+    if let Some(value) = env::var_os("PYTHON") {
+        return value.to_string_lossy().into_owned();
+    }
 
     for candidate in ["/opt/homebrew/bin/python3.11", "python3.11", "python3"] {
         if let Ok(status) = Command::new(candidate).arg("--version").status() {
@@ -438,7 +441,8 @@ pub fn run_gemma4_oracle(
     max_new_tokens: usize,
     dtype: &str,
 ) -> Result<OracleOutput> {
-    let mut cmd = Command::new("python3");
+    let python = resolve_oracle_python();
+    let mut cmd = Command::new(&python);
     cmd.arg(oracle_script)
         .arg("--model-dir")
         .arg(model_dir)
@@ -450,7 +454,8 @@ pub fn run_gemma4_oracle(
         .arg(dtype);
 
     eprintln!(
-        "[oracle] running: python3 {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype}",
+        "[oracle] running: {} {} --model-dir {} --prompt <...> --max-new-tokens {max_new_tokens} --dtype {dtype}",
+        python,
         oracle_script.display(),
         model_dir.display(),
     );

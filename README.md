@@ -8,10 +8,11 @@ Measured decode throughput: see [docs/performance.md](docs/performance.md).
 
 ## Supported Matrix
 
-Four backend surfaces are validated today:
+Five backend surfaces are validated or in bring-up today:
 
 - **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
+- **HIP / `gfx942`** — AMD Instinct MI300X-class (CDNA 3, wave64 bring-up)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
 - **Metal / `apple-m4`** — Apple M4, BF16 Qwen3.5 0.8B (CLI + `supersonic-serve`)
 
@@ -65,6 +66,27 @@ Four backend surfaces are validated today:
 
 DFlash speculative decode is available for `qwen3.5-9b` INT4 on HIP —
 see [docs/dflash.md](docs/dflash.md).
+
+### HIP on `gfx942`
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     | ✅¹  | ✅²  |      —      |   —    |
+| qwen3.5-2b       | ✅¹  | ✅²  |      —      |   —    |
+| qwen3.5-4b       | ✅¹  | ✅²  |      —      |   —    |
+| qwen3.5-9b       |  —   |  —   |      —      |   —    |
+| qwen3.6-35b-a3b  |  —   |  —   |      —      |   —    |
+| gemma4-e2b       |  —   |  —   |      —      |   —    |
+| gemma4-e4b       |  —   |  —   |      —      |   —    |
+| phi4-mini        |  —   |  —   |      —      |   —    |
+
+¹ CDNA bring-up currently uses replayed GPU prefill for single-sequence decode.
+  The RDNA persistent decode megakernel compiles on `gfx942`, but its wave64
+  correctness is still under validation and is available only via the explicit
+  debug path `--force-kernel-decode`.
+² INT4 uses the published GPTQ bake and the same replayed GPU prefill
+  correctness path. The PyTorch oracle is BF16-only, so INT4 bring-up checks
+  exact agreement between native decode and replayed GPU prefill.
 
 ### CUDA on `sm86`
 

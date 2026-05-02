@@ -139,6 +139,41 @@ fn has_libcudart(dir: &Path) -> bool {
         })
 }
 
+fn detect_rocm_lib_dir() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for var in ["ROCM_PATH", "HIP_PATH"] {
+        if let Ok(value) = env::var(var) {
+            let root = PathBuf::from(value);
+            candidates.extend([root.join("lib"), root.join("lib64")]);
+        }
+    }
+    candidates.extend([
+        PathBuf::from("/opt/rocm/lib"),
+        PathBuf::from("/opt/rocm/lib64"),
+        PathBuf::from("/opt/rocm-7.0.0/lib"),
+        PathBuf::from("/usr/lib/x86_64-linux-gnu"),
+        PathBuf::from("/usr/lib64"),
+        PathBuf::from("/usr/lib"),
+    ]);
+    candidates.into_iter().find(|dir| has_libamdhip64(dir))
+}
+
+fn has_libamdhip64(dir: &Path) -> bool {
+    if dir.join("libamdhip64.so").exists() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libamdhip64.so.")
+        })
+}
+
 fn run(cmd: &mut Command, context: &str) {
     let status = cmd.status().unwrap_or_else(|err| {
         panic!("{context}: failed to start command {:?}: {err}", cmd);
@@ -234,6 +269,13 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
         &objects,
         "archiving qwen35 megakernel HIP bridges",
     );
+    if let Some(rocm_lib_dir) = detect_rocm_lib_dir() {
+        println!("cargo:rustc-link-search=native={}", rocm_lib_dir.display());
+    } else {
+        println!(
+            "cargo:warning=could not locate libamdhip64 under ROCM_PATH/HIP_PATH or common system library paths; falling back to linker search path"
+        );
+    }
     println!("cargo:rustc-link-lib=dylib=amdhip64");
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-cfg=supersonic_backend_hip");
@@ -335,6 +377,8 @@ fn compile_metal_stubs(manifest_dir: &Path) {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=HIP_PATH");
     println!("cargo:rerun-if-env-changed=CUDA_ARCH");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
