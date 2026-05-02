@@ -76,11 +76,14 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
             },
         ]
         summary = summarize_case(case, runs)
-        self.assertFalse(summary["modes"]["fp8"]["deterministic_logits"])
-        self.assertTrue(summary["modes"]["fp8"]["deterministic_hidden"])
+        # Phase 3e.2: summarize_case keys cells as `<mode>/<decode_path>`.
+        # Rows missing `decode_path` (older payloads) fall back to
+        # "chained" so existing data still loads cleanly.
+        self.assertFalse(summary["modes"]["fp8/chained"]["deterministic_logits"])
+        self.assertTrue(summary["modes"]["fp8/chained"]["deterministic_hidden"])
         payload = {"summary": [summary]}
         failures = evaluate_failures(payload, Namespace(fail_on_nondeterminism=True))
-        self.assertIn("c0:fp8 logits are nondeterministic", failures)
+        self.assertIn("c0:fp8/chained logits are nondeterministic", failures)
 
     def test_failures_detect_all_zero_logits(self):
         payload = {
@@ -88,7 +91,7 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                 {
                     "case_id": "c1",
                     "modes": {
-                        "int4": {
+                        "int4/chained": {
                             "runs": 1,
                             "ok_runs": 1,
                             "deterministic_logits": True,
@@ -101,7 +104,61 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
             ]
         }
         failures = evaluate_failures(payload, Namespace(fail_on_nondeterminism=True))
-        self.assertEqual(failures, ["c1:int4 produced all-zero logits"])
+        self.assertEqual(failures, ["c1:int4/chained produced all-zero logits"])
+
+    def test_chained_vs_persistent_block_flags_divergence_and_speedup(self):
+        # Phase 3e.2: when both decode_paths are run, summarize_case adds a
+        # `chained_vs_persistent` block. Bit-identical hashes should pass;
+        # differing hashes should be flagged as a failure. The perf delta
+        # is computed from `stage.chain_ms_avg`.
+        case = Case("cvp", "pg19", 512, "prompt", [], 511)
+        # `logits_path` / `hidden_path` keys must be set for the
+        # _pick_for_mode helper to find the row, but the values aren't
+        # opened in this code path (compare_vectors isn't called when
+        # only one mode is present).
+        common = {
+            "returncode": 0,
+            "logits_stats": {"all_zero": False},
+            "wall_seconds": 1.0,
+            "logits_path": "/dev/null",
+            "hidden_path": "/dev/null",
+        }
+        runs = [
+            {
+                "mode": "int4", "decode_path": "chained", "repeat_idx": 0,
+                "generated_ids": [42, 7], "logits_sha256": "AAA",
+                "hidden_sha256": "HHH",
+                "stage": {"chain_ms_avg": 30.0, "total_ms_avg": 32.0},
+                **common,
+            },
+            {
+                "mode": "int4", "decode_path": "persistent", "repeat_idx": 0,
+                "generated_ids": [42, 7], "logits_sha256": "AAA",
+                "hidden_sha256": "HHH",
+                "stage": {"chain_ms_avg": 27.0, "total_ms_avg": 29.0},
+                **common,
+            },
+        ]
+        summary = summarize_case(case, runs)
+        cvp = summary["chained_vs_persistent"]["int4"]
+        self.assertTrue(cvp["logits_bit_identical"])
+        self.assertTrue(cvp["hidden_bit_identical"])
+        self.assertTrue(cvp["generated_ids_match"])
+        self.assertAlmostEqual(cvp["chain_speedup_pct"], 10.0, places=4)
+
+        # Divergent hashes should fail the bit-identity gate.
+        runs[1]["logits_sha256"] = "BBB"
+        summary = summarize_case(case, runs)
+        cvp = summary["chained_vs_persistent"]["int4"]
+        self.assertFalse(cvp["logits_bit_identical"])
+        failures = evaluate_failures(
+            {"summary": [summary]},
+            Namespace(fail_on_nondeterminism=False),
+        )
+        self.assertTrue(
+            any("chained vs persistent logits diverged" in f for f in failures),
+            f"expected divergence failure, got: {failures}",
+        )
 
     def test_run_once_records_timeout_as_failed_row(self):
         def fake_run(*args, **kwargs):
@@ -127,7 +184,7 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                     emit_stage_timings=True,
                 )
                 case = Case("c_timeout", "pg19", 8, "hello", [], 7)
-                row = run_once(args, case, "fp8", 0, Path(td))
+                row = run_once(args, case, "fp8", "chained", 0, Path(td))
         finally:
             verify_suite.subprocess.run = old_run
 
