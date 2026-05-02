@@ -11,6 +11,8 @@ mod prefill_engine;
 mod qwen35_dflash_engine;
 mod qwen36_moe_decode;
 mod qwen36_moe_engine;
+mod qwen36_moe_mtp;
+mod qwen36_moe_speculative;
 mod registry;
 mod validate;
 

@@ -524,11 +524,12 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
     let ordinal = 0usize;
 
     eprintln!(
-        "[mtp chain] loading mtp.* + embed_tokens + tied lm_head from {} ...",
+        "[mtp chain] loading mtp.* from INT4 bake + embed_tokens + tied lm_head from safetensors under {} ...",
         model_dir.display()
     );
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, k.max(1))
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
         .expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
@@ -653,9 +654,10 @@ fn qwen36_moe_speculative_driver_orchestration() {
     set_backend(Backend::Hip);
     let ordinal = 0usize;
 
-    eprintln!("[spec] loading mtp.* + embed_tokens + tied lm_head ...");
+    eprintln!("[spec] loading mtp.* from INT4 bake + embed_tokens + tied lm_head from safetensors ...");
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, k.max(1))
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
         .expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")

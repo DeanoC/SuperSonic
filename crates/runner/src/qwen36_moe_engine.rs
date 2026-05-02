@@ -31,6 +31,7 @@ use crate::qwen36_moe_decode::{
     FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
     LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
+use crate::qwen36_moe_speculative::run_speculative_decode_step;
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
 const GIB: f64 = (1024 * 1024 * 1024) as f64;
@@ -690,6 +691,36 @@ pub fn run(
         );
     }
 
+    // Auto-download the INT4 bake from the GitHub release if missing or
+    // stale. The qwen3.6-MoE engine had been missing this wiring — an
+    // oversight visible during Phase 6 bring-up: 35B-A3B INT4
+    // calibration OOMs on 24 GiB hosts, so release-hosted bakes are
+    // the only realistic way to ship updates (e.g. the post-#84 bake
+    // that includes mtp.* tensors for self-speculative decode). Mirrors
+    // the Phi-4 / Llama-3.1 / Qwen3.5 paths.
+    {
+        let variant = model_store::fetch::BakeVariant::Int4Gptq;
+        let bake_dir = variant.bake_dir(&cli.model_dir);
+        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+        // `should_fetch_exact_bake` honors --download-bake (force) and
+        // refuses to fetch when an up-to-date bake is already present.
+        let force_download = cli.download_bake;
+        if !cli.no_download
+            && crate::should_fetch_exact_bake(force_download, model_store::version_ok(&bake_dir))
+        {
+            let canonical_model = entry.model.to_string();
+            match crate::try_download_bake(cli, variant, &canonical_model, &bake_dir) {
+                Ok(true) => eprintln!(
+                    "[fetch] installed qwen3.6-MoE INT4 bake at {}",
+                    bake_dir.display()
+                ),
+                Ok(false) => {}
+                Err(e) => eprintln!("[fetch] qwen3.6-MoE INT4 bake fetch failed: {e}"),
+            }
+        }
+    }
+
     // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
     // launches in `crate::qwen36_moe_decode::run_chained_decode` against
     // per-layer weight buffers loaded from the baked package. INT4 GPTQ
@@ -1156,6 +1187,35 @@ fn decode_text(
 ) -> Result<()> {
     use std::io::Write as _;
 
+    // Greedy-only gate for speculative decode. The Phase 6.3 protocol
+    // verifies MTP drafts via greedy argmax against the base model's
+    // logits — extending it to non-greedy sampling needs rejection
+    // sampling (Speculative Decoding §3 in vLLM's reference), which
+    // hasn't been implemented. Reject up front rather than silently
+    // mix `argmax` (verify) with `sample_bf16_logits` (regular sample),
+    // which would emit a different distribution than plain decode and
+    // break reproducibility.
+    //
+    // `sample_bf16_logits` falls back to argmax when `temperature <= 0`
+    // (or `top_k == 1`), so any non-trivial sampling configuration —
+    // any of `temperature > 0`, `top_k != 1`, `top_p < 1.0` — counts
+    // as non-greedy and is rejected here.
+    if speculative_decode {
+        let is_greedy = sampling.temperature <= 0.0
+            || sampling.top_k == 1;
+        if !is_greedy {
+            anyhow::bail!(
+                "--speculative-decode currently supports greedy sampling \
+                 only (temperature ≤ 0 or top_k == 1). Got temperature={}, \
+                 top_k={}, top_p={}. Phase 6.4 will add sampling-consistent \
+                 verification (rejection sampling); until then, re-run with \
+                 `--temperature 0` for speculative decode, or drop \
+                 `--speculative-decode` for non-greedy sampling.",
+                sampling.temperature, sampling.top_k, sampling.top_p
+            );
+        }
+    }
+
     let weight_prefix = report.kernel_params.weight_prefix;
 
     // Tokenizer first — without it we can't tokenize the prompt or stream
@@ -1273,17 +1333,18 @@ fn decode_text(
     // hide the bake-staleness from a downstream perf-sensitive user.
     //
     // Phase 6.2c+ wires the consumer side into the decode loop.
-    let _mtp_buffers = if speculative_decode {
+    let mtp_buffers_opt = if speculative_decode {
         match load_mtp_buffers(&store, ordinal, &geom, kv_max_t)
             .context("load MTP head from bake")?
         {
             Some(mtp) => {
                 println!(
                     "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                     weights ready, draft/verify path NOT YET WIRED in \
-                     this build (Phase 6.2c+ will land it). Decode \
-                     behaviour and throughput are unchanged from the \
-                     non-speculative path until then."
+                     speculative draft + sequential-verify path active. \
+                     NOTE: sequential verification has zero amortized speedup \
+                     over plain greedy decode (Phase 6.4's batched verify \
+                     kernel is what delivers throughput); this path is the \
+                     correctness foundation."
                 );
                 Some(mtp)
             }
@@ -1347,6 +1408,50 @@ fn decode_text(
     drop(lm_head_bf16_bytes);
     drop(final_norm_bytes);
 
+    // Phase 6.3d speculative-decode setup. When `--speculative-decode` is
+    // set, allocate the MTP forward + chain scratches and upload the
+    // base model's `embed_tokens.weight` to GPU (the MTP draft chain
+    // does GPU-side embed gathering via D2D copy from this buffer).
+    //
+    // The hardcoded num_speculative_tokens=3 mirrors the public Qwen3.6
+    // MTP card's recommendation; making it CLI-tunable is a follow-up.
+    // Memory: ~970 MiB embed_tokens BF16 + ~50 MiB MTP scratches.
+    // Combined with the 17 GiB INT4 base bake + 970 MiB lm_head + 1.6
+    // GiB MTP head, this lands at ~21 GiB GPU resident — within budget
+    // on 24 GiB 7900 XTX with headroom for the per-token activation
+    // buffers.
+    const NUM_SPECULATIVE_TOKENS: usize = 3;
+    let mut mtp_buffers = mtp_buffers_opt;
+    let mut mtp_forward_scratch = if mtp_buffers.is_some() {
+        Some(
+            crate::qwen36_moe_mtp::alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
+                .context("alloc MTP forward scratch")?,
+        )
+    } else {
+        None
+    };
+    let mut mtp_chain_scratch = if mtp_buffers.is_some() {
+        Some(
+            crate::qwen36_moe_mtp::alloc_mtp_chain_scratch(ordinal, &geom)
+                .context("alloc MTP chain scratch")?,
+        )
+    } else {
+        None
+    };
+    let embed_w_buf = if mtp_buffers.is_some() {
+        let embed_name = format!("{weight_prefix}.embed_tokens.weight");
+        let embed = load_to_gpu(&store, ordinal, &embed_name)
+            .with_context(|| format!("upload {embed_name} to GPU"))?;
+        println!(
+            "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
+             scratches (K={NUM_SPECULATIVE_TOKENS} drafts/step)",
+            (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB
+        );
+        Some(embed)
+    } else {
+        None
+    };
+
     println!(
         "  decoding {} prompt token{} + generating ≤{} new token{}…",
         prompt_ids.len(),
@@ -1397,6 +1502,17 @@ fn decode_text(
     let mut t_chain_ffn_us: u64 = 0;
 
     for step in 0..total_steps {
+        // When speculative decode is on, each iteration can commit
+        // multiple tokens (up to K+1), so the standard `total_steps =
+        // prompt_len + max_new - 1` count over-shoots. Break here once
+        // we've already committed `max_new` tokens — otherwise the
+        // next regular chain call would request a cache slot beyond
+        // `kv_max_t = prompt_len + max_new` (status 120). Plain decode
+        // stays bit-identical because it always emits exactly one
+        // token per iteration.
+        if generated_ids.len() >= max_new {
+            break;
+        }
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
@@ -1520,6 +1636,155 @@ fn decode_text(
             break;
         }
         current_token = next_token;
+
+        // Phase 6.3d: speculative extension. After the regular sample,
+        // try to commit additional tokens via MTP draft chain +
+        // sequential base verification. The closure wraps one base
+        // decode step (embed → chain → lm_head → host argmax). Honors
+        // `max_new` and EOS by truncating emitted tokens; the
+        // outer-loop counter advances normally because each iteration
+        // still runs at least one base step.
+        //
+        // Sequential verify gives no amortized speedup vs plain greedy
+        // (each accepted draft costs one base step to produce the next
+        // prediction). Phase 6.4's batched verification is what lifts
+        // tok/s. This wiring is the correctness foundation.
+        if let (Some(mtp), Some(fwd_scratch), Some(chain_scratch), Some(embed_w)) = (
+            mtp_buffers.as_mut(),
+            mtp_forward_scratch.as_mut(),
+            mtp_chain_scratch.as_mut(),
+            embed_w_buf.as_ref(),
+        ) {
+            if generated_ids.len() >= max_new {
+                break;
+            }
+            // Cap K to the remaining max_new headroom so the verify
+            // loop never writes cache slots beyond what we'll
+            // actually commit to `generated_ids`. Spec emits up to
+            // K+1 tokens (K accepted + 1 corrected/bonus), so the
+            // available draft count is `headroom - 1`. If headroom <=
+            // 1 we can still emit 1 token via the K=0 fallback; if
+            // headroom == 0 we already broke out above.
+            let headroom = max_new - generated_ids.len();
+            let dynamic_k = NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
+            let h_base = outputs.final_hidden_bytes.clone();
+            // P2: thread spec-verify timings into the engine-level
+            // accumulators so `--emit-stage-timings` reports honest
+            // per-token costs under speculative decode. Without these
+            // captures, every base step inside the verify loop would
+            // be invisible to `gen_steps` / `t_chain` / `t_lm_head`,
+            // making the speculative path look ~K+1× faster than it
+            // really is on stage-timings dashboards.
+            let result = run_speculative_decode_step(
+                ordinal,
+                &geom,
+                mtp,
+                fwd_scratch,
+                chain_scratch,
+                embed_w,
+                &lm_head_w_buf,
+                &h_base,
+                next_token,
+                position,
+                dynamic_k,
+                |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
+                    // Embed lookup is its own stage in the timing
+                    // breakdown — bundling it into `t_chain` (as the
+                    // first cut of this closure did) systematically
+                    // inflates `chain_ms_avg` and deflates
+                    // `embed_ms_avg` as the MTP accept rate rises.
+                    let t_embed_start = std::time::Instant::now();
+                    let initial_hidden = lookup_embed_row(
+                        &store,
+                        weight_prefix,
+                        input as usize,
+                        geom.hidden as usize,
+                    )?;
+                    t_embed += t_embed_start.elapsed();
+
+                    let t_chain_start = std::time::Instant::now();
+                    let outputs = run_chained_decode_fast(
+                        ordinal,
+                        &geom,
+                        &mut layers,
+                        &initial_hidden,
+                        pos,
+                        emit_stage_timings,
+                    )?;
+                    t_chain += t_chain_start.elapsed();
+                    t_chain_full_attn_us += outputs.kernel_full_attn_us;
+                    t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
+                    t_chain_ffn_us += outputs.kernel_ffn_us;
+
+                    let t_lm_head_start = std::time::Instant::now();
+                    gpu_hal::copy_h2d(
+                        ordinal,
+                        final_hidden_buf.as_mut_ptr(),
+                        outputs.final_hidden_bytes.as_ptr() as *const _,
+                        outputs.final_hidden_bytes.len(),
+                    )?;
+                    kernel_ffi::qwen36_moe::lm_head_launch(
+                        ordinal,
+                        geom.hidden,
+                        geom.vocab,
+                        geom.rms_norm_eps,
+                        &final_hidden_buf,
+                        &final_norm_w_buf,
+                        &lm_head_w_buf,
+                        &mut logits_buf,
+                        None,
+                        &mut counter_buf,
+                    )?;
+                    let logits_bytes = logits_buf
+                        .to_host_bytes()
+                        .context("d2h logits from spec verify lm_head")?;
+                    t_lm_head += t_lm_head_start.elapsed();
+                    // Each verify base step counts as one decode step
+                    // for the per-token average — emitted_tokens.len()
+                    // tokens are committed per spec call, and
+                    // closure-call-count == emitted_tokens.len() in
+                    // both the partial-accept and full-accept (with
+                    // bonus) cases. Bumping here is equivalent to
+                    // "one closure call = one decode step worth of
+                    // base work."
+                    gen_steps += 1;
+                    Ok((
+                        argmax_bf16_logits(&logits_bytes),
+                        outputs.final_hidden_bytes,
+                    ))
+                },
+            )
+            .context("speculative decode step")?;
+
+            // Append emitted tokens. Honour `max_new` and EOS by
+            // breaking out cleanly mid-emission.
+            let mut hit_stop = false;
+            for tok in result.emitted_tokens.iter().copied() {
+                if generated_ids.len() >= max_new {
+                    hit_stop = true;
+                    break;
+                }
+                generated_ids.push(tok);
+                if let Some(t) = &tokenizer {
+                    if let Ok(text) = t.decode(&[tok], false) {
+                        print!("{text}");
+                    }
+                }
+                if Some(tok) == eos_id {
+                    hit_stop = true;
+                    break;
+                }
+            }
+            std::io::stdout().flush().ok();
+            position += result.emitted_tokens.len() as i32;
+            if hit_stop {
+                break;
+            }
+            current_token = *result
+                .emitted_tokens
+                .last()
+                .expect("speculative step must emit at least one token (K=0 fallback ensured)");
+        }
     }
 
     println!();
