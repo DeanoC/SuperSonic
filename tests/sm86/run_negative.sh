@@ -57,6 +57,18 @@ run_fail() {
     echo ""
 }
 
+run_fail_without() {
+    local label="$1"
+    local expected="$2"
+    local forbidden="$3"
+    shift 3
+    run_fail "$label" "$expected" "$@"
+    if grep -Fq -- "$forbidden" "$TMPOUT"; then
+        echo "FAIL: unexpected error substring found: $forbidden"
+        return 1
+    fi
+}
+
 COMMON_0_8B=(
     --backend cuda
     --model qwen3.5-0.8b
@@ -110,8 +122,9 @@ COMMON_GEMMA_E2B=(
     --max-new-tokens 1
 )
 
-run_fail "Test 5: Gemma CUDA rejects INT4" \
+run_fail_without "Test 5: Gemma CUDA rejects INT4" \
     "Gemma 4 CUDA v1 supports BF16 only; --int4 is not wired" \
+    "CUDA --int4 currently supports only Qwen3.5 on sm86" \
     "${COMMON_GEMMA_E2B[@]}" --int4
 
 run_fail "Test 6: Gemma CUDA rejects FP8 runtime" \
