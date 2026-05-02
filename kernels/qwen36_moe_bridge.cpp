@@ -515,43 +515,92 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_ffn_step_kernel<hip_bfloat16>,
-                       dim3(static_cast<unsigned int>(num_blocks)),
-                       dim3(block_size),
-                       lds_bytes, 0,
-                       stage,
-                       hidden,
-                       num_experts,
-                       moe_intermediate,
-                       shared_intermediate,
-                       top_k,
-                       rms_norm_eps,
-                       static_cast<const hip_bfloat16*>(input_hidden),
-                       static_cast<const hip_bfloat16*>(post_attn_norm_w),
-                       static_cast<const hip_bfloat16*>(gate_w),
-                       static_cast<const hip_bfloat16*>(gate_up_proj_w),
-                       static_cast<const hip_bfloat16*>(down_proj_w),
-                       static_cast<const hip_bfloat16*>(shared_gate_proj_w),
-                       static_cast<const hip_bfloat16*>(shared_up_proj_w),
-                       static_cast<const hip_bfloat16*>(shared_down_proj_w),
-                       static_cast<const hip_bfloat16*>(shared_expert_gate_w),
-                       int4_group_size,
-                       static_cast<const hip_bfloat16*>(gate_up_proj_scale),
-                       static_cast<const hip_bfloat16*>(gate_up_proj_zero),
-                       static_cast<const hip_bfloat16*>(down_proj_scale),
-                       static_cast<const hip_bfloat16*>(down_proj_zero),
-                       static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
-                       static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
-                       static_cast<const hip_bfloat16*>(shared_up_proj_scale),
-                       static_cast<const hip_bfloat16*>(shared_up_proj_zero),
-                       static_cast<const hip_bfloat16*>(shared_down_proj_scale),
-                       static_cast<const hip_bfloat16*>(shared_down_proj_zero),
-                       static_cast<hip_bfloat16*>(output),
-                       output_idx,
-                       workspace,
-                       counters,
-                       barrier_counter,
-                       barrier_flag);
+    // WMMA path requires gfx11xx + dim divisibility:
+    //   - hidden % 16 == 0 (Phase G K-chunk + Phase I output rows)
+    //   - moe_intermediate % 16 == 0 (Phase G output rows ÷ 2 + Phase I K-chunk)
+    //   - int4_group_size % 16 == 0  (one scale per 16-element K-chunk)
+    //   - INT4 routed weights present (gate_up_proj_scale / down_proj_scale)
+    // 35B-A3B (hidden=2048, I=512, group_size=128) satisfies all of these;
+    // synthetic fixtures use 16-divisible dims too. The shared expert path
+    // (Phase D/F) stays scalar in both variants — Phase 2 of the roadmap.
+    const bool routed_int4 =
+        (gate_up_proj_scale != nullptr) && (down_proj_scale != nullptr);
+    const bool wmma_dims_ok =
+        (hidden % 16 == 0) &&
+        (moe_intermediate % 16 == 0) &&
+        (int4_group_size > 0) &&
+        (int4_group_size % 16 == 0);
+    const bool use_wmma =
+        routed_int4 &&
+        wmma_dims_ok &&
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+
+    if (use_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_ffn_step_kernel<hip_bfloat16, true>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            stage,
+            hidden, num_experts, moe_intermediate, shared_intermediate, top_k,
+            rms_norm_eps,
+            static_cast<const hip_bfloat16*>(input_hidden),
+            static_cast<const hip_bfloat16*>(post_attn_norm_w),
+            static_cast<const hip_bfloat16*>(gate_w),
+            static_cast<const hip_bfloat16*>(gate_up_proj_w),
+            static_cast<const hip_bfloat16*>(down_proj_w),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_w),
+            static_cast<const hip_bfloat16*>(shared_up_proj_w),
+            static_cast<const hip_bfloat16*>(shared_down_proj_w),
+            static_cast<const hip_bfloat16*>(shared_expert_gate_w),
+            int4_group_size,
+            static_cast<const hip_bfloat16*>(gate_up_proj_scale),
+            static_cast<const hip_bfloat16*>(gate_up_proj_zero),
+            static_cast<const hip_bfloat16*>(down_proj_scale),
+            static_cast<const hip_bfloat16*>(down_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_up_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_up_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+            static_cast<hip_bfloat16*>(output),
+            output_idx,
+            workspace, counters, barrier_counter, barrier_flag);
+    } else {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_ffn_step_kernel<hip_bfloat16, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            stage,
+            hidden, num_experts, moe_intermediate, shared_intermediate, top_k,
+            rms_norm_eps,
+            static_cast<const hip_bfloat16*>(input_hidden),
+            static_cast<const hip_bfloat16*>(post_attn_norm_w),
+            static_cast<const hip_bfloat16*>(gate_w),
+            static_cast<const hip_bfloat16*>(gate_up_proj_w),
+            static_cast<const hip_bfloat16*>(down_proj_w),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_w),
+            static_cast<const hip_bfloat16*>(shared_up_proj_w),
+            static_cast<const hip_bfloat16*>(shared_down_proj_w),
+            static_cast<const hip_bfloat16*>(shared_expert_gate_w),
+            int4_group_size,
+            static_cast<const hip_bfloat16*>(gate_up_proj_scale),
+            static_cast<const hip_bfloat16*>(gate_up_proj_zero),
+            static_cast<const hip_bfloat16*>(down_proj_scale),
+            static_cast<const hip_bfloat16*>(down_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_gate_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_up_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_up_proj_zero),
+            static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+            static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+            static_cast<hip_bfloat16*>(output),
+            output_idx,
+            workspace, counters, barrier_counter, barrier_flag);
+    }
+
     hipError_t launch_err_ffn = hipGetLastError();
     hipError_t sync_err_ffn   = hipDeviceSynchronize();
     if (launch_err_ffn != hipSuccess) return 254;
