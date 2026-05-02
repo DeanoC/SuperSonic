@@ -354,13 +354,22 @@ where
         );
     }
     if num_drafts == 0 {
-        // K=0 degenerate: no MTP work. The driver caller is expected
-        // to use plain greedy decode in this case; this branch keeps
-        // the function total in case a tunable hits 0.
+        // K=0 degenerate: no MTP work, but the contract still requires
+        // we emit one token (the function is documented as always
+        // returning a non-empty `emitted_tokens` so the caller's
+        // `position += emitted.len()` advances). Run a single base
+        // step at `base_position` with `first_token_id` — exactly
+        // what plain greedy decode would do for this token. This
+        // keeps the speculative driver a safe drop-in even when a
+        // tunable disables speculation, avoiding the stalled-loop
+        // failure mode the `--speculative-decode --num-speculative
+        // -tokens=0` knob would otherwise hit.
+        let (predicted, fh) = base_step(base_position, first_token_id)
+            .context("speculative: K=0 fallback base step")?;
         return Ok(SpeculativeStepResult {
-            emitted_tokens: Vec::new(),
+            emitted_tokens: vec![predicted],
             n_accepted: 0,
-            final_hidden_bytes: h_base_in.to_vec(),
+            final_hidden_bytes: fh,
         });
     }
 

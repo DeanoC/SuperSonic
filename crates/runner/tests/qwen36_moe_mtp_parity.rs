@@ -748,4 +748,34 @@ fn qwen36_moe_speculative_driver_orchestration() {
     // regardless of which pass ran.
     assert_eq!(r3.final_hidden_bytes.len(), (geom.hidden as usize) * 2);
     let _ = SpeculativeStepResult { ..r3 };
+
+    // ---- Pass 4: K=0 fallback (no speculation; emit one base token) ----
+    //
+    // Contract: `emitted_tokens` must always be non-empty (the
+    // engine relies on `position += emitted.len()` for forward
+    // progress). When K=0 the driver still runs one base step and
+    // emits its prediction — equivalent to plain greedy decode.
+    let k0_pred: u32 = 4242;
+    let synth_fh_p4 = synth_fh.clone();
+    let mut p4_calls = 0usize;
+    let base_step_p4 = move |_pos: i32, _input: u32|
+        -> anyhow::Result<(u32, Vec<u8>)>
+    {
+        p4_calls += 1;
+        assert_eq!(p4_calls, 1, "K=0 must run exactly one base step");
+        Ok((k0_pred, synth_fh_p4.clone()))
+    };
+    eprintln!("[spec] pass 4 (K=0 fallback)");
+    let r4 = run_speculative_decode_step(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, /* num_drafts */ 0,
+        base_step_p4,
+    ).expect("pass 4 run");
+    assert_eq!(r4.emitted_tokens, vec![k0_pred],
+        "K=0 must still emit exactly one token (the contract is non-empty)");
+    assert_eq!(r4.n_accepted, 0);
+    assert_eq!(r4.final_hidden_bytes.len(), (geom.hidden as usize) * 2);
+    eprintln!("[spec] pass 4: emitted={:?} n_accepted={}", r4.emitted_tokens, r4.n_accepted);
 }
