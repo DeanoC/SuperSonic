@@ -529,7 +529,13 @@ __device__ inline float load_as_float(const T* p, int idx) {
     return static_cast<float>(p[idx]);
 }
 
-template <typename T>
+// `USE_WMMA` (defaults to false for backward-compat with the per-block
+// parity tests) gates the RDNA3 WMMA INT4 path on Phase B (q_proj GEMV),
+// Phase D (fused k_proj/v_proj GEMV — split into two WMMA sub-pools),
+// and Phase I (o_proj GEMV + residual). Same `wmma_int4_matvec_partial_16rows`
+// helper as PRs #77 and #78. Bridge picks the instantiation at launch
+// time based on `device_supports_wmma_bf16(ordinal)` + dim divisibility.
+template <typename T, bool USE_WMMA = false>
 __global__ void qwen36_moe_attn_step_kernel(
     int                            stage,
     int                            hidden,
@@ -637,44 +643,90 @@ __global__ void qwen36_moe_attn_step_kernel(
     const int q_out_dim = 2 * num_heads * head_dim;
     const bool q_int4 = (q_proj_scale != nullptr);
 
-    for (;;) {
-        __shared__ unsigned int my_row_s;
-        if (tid == 0) {
-            my_row_s = atomicAdd(&counters[0], 1u);
-        }
-        __syncthreads();
-        const int my_row = static_cast<int>(my_row_s);
-        if (my_row >= q_out_dim) break;
-
-        float partial = 0.0f;
+    bool wmma_handled_qproj = false;
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+    if constexpr (USE_WMMA) {
         if (q_int4) {
-            // 8-wide INT4 dequant + dot accumulate. ~2-4× faster than the
-            // scalar path on RDNA3 because it amortizes scale/zero lookups
-            // across the 8-element span and folds 4 nibble-byte reads into
-            // a single 4-byte uint32 load.
-            partial = int4_dq8_matvec_partial(
-                reinterpret_cast<const uint8_t*>(q_proj_w),
-                static_cast<const hip_bfloat16*>(q_proj_scale),
-                static_cast<const hip_bfloat16*>(q_proj_zero),
-                x_norm_lds,
-                my_row, hidden, int4_group_size,
-                tid, block_size);
-        } else {
-            const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            // WMMA tile path — 128 rows per atomicAdd, 8 waves × 16-row
+            // tiles. Same `wmma_int4_matvec_partial_16rows` helper as the
+            // FFN/linear-attn WMMA paths; output is BF16-rounded to match
+            // the scalar path's `workspace[my_row] = bf16_round_rne_f32(...)`.
+            const int gsc_q = hidden / int4_group_size;
+            const int wave_id = tid >> 5;
+            const int lane_in_wave = tid & 31;
+            const int lane_row = lane_in_wave & 15;
+            const int lane_half = lane_in_wave >> 4;
+            const uint8_t* slab_packed =
+                reinterpret_cast<const uint8_t*>(q_proj_w);
+            for (;;) {
+                __shared__ unsigned int row_base_s;
+                if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                __syncthreads();
+                const int row_base = static_cast<int>(row_base_s);
+                if (row_base >= q_out_dim) break;
+
+                const int rhs_row = row_base + wave_id * 16 + lane_row;
+                const bool in_range = rhs_row < q_out_dim;
+                const uint8_t* slab_row = in_range
+                    ? slab_packed +
+                      static_cast<size_t>(rhs_row) * (hidden / 2)
+                    : nullptr;
+                qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                    slab_row,
+                    static_cast<const hip_bfloat16*>(q_proj_scale),
+                    static_cast<const hip_bfloat16*>(q_proj_zero),
+                    rhs_row, in_range,
+                    x_norm_lds, hidden,
+                    gsc_q, int4_group_size, lane_row);
+                if (lane_half == 0 && in_range) {
+                    workspace[rhs_row] = bf16_round_rne_f32(acc[0]);
+                }
+                __syncthreads();
             }
+            wmma_handled_qproj = true;
         }
-        shared_scratch[tid] = partial;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+    }
+#endif
+    if (!wmma_handled_qproj) {
+        for (;;) {
+            __shared__ unsigned int my_row_s;
+            if (tid == 0) {
+                my_row_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_s);
+            if (my_row >= q_out_dim) break;
+
+            float partial = 0.0f;
+            if (q_int4) {
+                // 8-wide INT4 dequant + dot accumulate. ~2-4× faster than the
+                // scalar path on RDNA3 because it amortizes scale/zero lookups
+                // across the 8-element span and folds 4 nibble-byte reads into
+                // a single 4-byte uint32 load.
+                partial = int4_dq8_matvec_partial(
+                    reinterpret_cast<const uint8_t*>(q_proj_w),
+                    static_cast<const hip_bfloat16*>(q_proj_scale),
+                    static_cast<const hip_bfloat16*>(q_proj_zero),
+                    x_norm_lds,
+                    my_row, hidden, int4_group_size,
+                    tid, block_size);
+            } else {
+                const T* w_row = q_proj_w + static_cast<size_t>(my_row) * hidden;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                }
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                workspace[my_row] = bf16_round_rne_f32(shared_scratch[0]);
+            }
             __syncthreads();
         }
-        if (tid == 0) {
-            workspace[my_row] = bf16_round_rne_f32(shared_scratch[0]);
-        }
-        __syncthreads();
     }
 
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
@@ -771,51 +823,191 @@ __global__ void qwen36_moe_attn_step_kernel(
                                &counters[0]);
 
     // -- Phase D: k_raw, v_raw via fused work-stealing matvec --------------
-    // Combine k_proj_w and v_proj_w into a single 2*Hkv*d-row work pool so
-    // every block stays busy regardless of which projection it claims. Both
-    // projections share the same x_norm input, so this is purely a row
-    // dispatch fold — same pattern PyTorch uses internally for fused QKV.
+    // Two structural variants:
+    //
+    //   USE_WMMA=false (scalar): fused 2*Hkv*d-row work pool — every block
+    //     stays busy regardless of which projection it claims. PyTorch's
+    //     fused-QKV pattern.
+    //
+    //   USE_WMMA=true: split into k and v sub-pools with one grid barrier
+    //     between. WMMA tiles need 16 contiguous output rows from one slab,
+    //     and k/v live in different weight slabs (`k_proj_w` vs `v_proj_w`)
+    //     with independent INT4 sidecars, so straddling tiles is unsafe.
+    //     One extra grid_barrier_reset_counter (~5 µs × 10 full-attn layers
+    //     = ~50 µs / token); negligible vs the matmul win.
     const int kv_total_rows = 2 * Hkv * d;
-    for (;;) {
-        __shared__ unsigned int my_row_s;
-        if (tid == 0) {
-            my_row_s = atomicAdd(&counters[0], 1u);
-        }
-        __syncthreads();
-        const int my_row = static_cast<int>(my_row_s);
-        if (my_row >= kv_total_rows) break;
 
-        // First Hkv*d rows belong to k_proj, next Hkv*d to v_proj.
-        const bool is_v = my_row >= Hkv * d;
-        const int proj_row = is_v ? (my_row - Hkv * d) : my_row;
-        const T* w_slab = is_v ? v_proj_w : k_proj_w;
-        const hip_bfloat16* i4_scale = is_v ? v_proj_scale : k_proj_scale;
-        const hip_bfloat16* i4_zero  = is_v ? v_proj_zero  : k_proj_zero;
-        const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+    if constexpr (USE_WMMA) {
+        const int gsc_kv = hidden / int4_group_size;
+        const int wave_id = tid >> 5;
+        const int lane_in_wave = tid & 31;
+        const int lane_row = lane_in_wave & 15;
+        const int lane_half = lane_in_wave >> 4;
 
-        float partial = 0.0f;
-        if (i4_scale != nullptr) {
-            partial = int4_dq8_matvec_partial(
-                reinterpret_cast<const uint8_t*>(w_slab),
-                i4_scale, i4_zero, x_norm_lds,
-                proj_row, hidden, int4_group_size,
-                tid, block_size);
+        // ------- Sub-pool 1: k_proj -------
+        if (k_proj_scale != nullptr) {
+            const uint8_t* slab_packed =
+                reinterpret_cast<const uint8_t*>(k_proj_w);
+            for (;;) {
+                __shared__ unsigned int row_base_s;
+                if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                __syncthreads();
+                const int row_base = static_cast<int>(row_base_s);
+                if (row_base >= Hkv * d) break;
+
+                const int rhs_row = row_base + wave_id * 16 + lane_row;
+                const bool in_range = rhs_row < Hkv * d;
+                const uint8_t* slab_row = in_range
+                    ? slab_packed +
+                      static_cast<size_t>(rhs_row) * (hidden / 2)
+                    : nullptr;
+                qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                    slab_row,
+                    static_cast<const hip_bfloat16*>(k_proj_scale),
+                    static_cast<const hip_bfloat16*>(k_proj_zero),
+                    rhs_row, in_range,
+                    x_norm_lds, hidden,
+                    gsc_kv, int4_group_size, lane_row);
+                if (lane_half == 0 && in_range) {
+                    workspace[OFF_K_RAW + rhs_row] =
+                        bf16_round_rne_f32(acc[0]);
+                }
+                __syncthreads();
+            }
         } else {
-            const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+            // BF16 fallback for k_proj.
+            for (;;) {
+                __shared__ unsigned int my_row_s;
+                if (tid == 0) my_row_s = atomicAdd(&counters[0], 1u);
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_s);
+                if (my_row >= Hkv * d) break;
+                const T* w_row =
+                    k_proj_w + static_cast<size_t>(my_row) * hidden;
+                float partial = 0.0f;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    workspace[OFF_K_RAW + my_row] =
+                        bf16_round_rne_f32(shared_scratch[0]);
+                }
+                __syncthreads();
             }
         }
-        shared_scratch[tid] = partial;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+
+        // Inter-barrier: publish k writes, reset counters[0] for v.
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+
+        // ------- Sub-pool 2: v_proj -------
+        if (v_proj_scale != nullptr) {
+            const uint8_t* slab_packed =
+                reinterpret_cast<const uint8_t*>(v_proj_w);
+            for (;;) {
+                __shared__ unsigned int row_base_s;
+                if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                __syncthreads();
+                const int row_base = static_cast<int>(row_base_s);
+                if (row_base >= Hkv * d) break;
+
+                const int rhs_row = row_base + wave_id * 16 + lane_row;
+                const bool in_range = rhs_row < Hkv * d;
+                const uint8_t* slab_row = in_range
+                    ? slab_packed +
+                      static_cast<size_t>(rhs_row) * (hidden / 2)
+                    : nullptr;
+                qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                    slab_row,
+                    static_cast<const hip_bfloat16*>(v_proj_scale),
+                    static_cast<const hip_bfloat16*>(v_proj_zero),
+                    rhs_row, in_range,
+                    x_norm_lds, hidden,
+                    gsc_kv, int4_group_size, lane_row);
+                if (lane_half == 0 && in_range) {
+                    workspace[OFF_V_RAW + rhs_row] =
+                        bf16_round_rne_f32(acc[0]);
+                }
+                __syncthreads();
+            }
+        } else {
+            // BF16 fallback for v_proj.
+            for (;;) {
+                __shared__ unsigned int my_row_s;
+                if (tid == 0) my_row_s = atomicAdd(&counters[0], 1u);
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_s);
+                if (my_row >= Hkv * d) break;
+                const T* w_row =
+                    v_proj_w + static_cast<size_t>(my_row) * hidden;
+                float partial = 0.0f;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    workspace[OFF_V_RAW + my_row] =
+                        bf16_round_rne_f32(shared_scratch[0]);
+                }
+                __syncthreads();
+            }
+        }
+    } else
+#endif
+    {
+        for (;;) {
+            __shared__ unsigned int my_row_s;
+            if (tid == 0) {
+                my_row_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_s);
+            if (my_row >= kv_total_rows) break;
+
+            // First Hkv*d rows belong to k_proj, next Hkv*d to v_proj.
+            const bool is_v = my_row >= Hkv * d;
+            const int proj_row = is_v ? (my_row - Hkv * d) : my_row;
+            const T* w_slab = is_v ? v_proj_w : k_proj_w;
+            const hip_bfloat16* i4_scale = is_v ? v_proj_scale : k_proj_scale;
+            const hip_bfloat16* i4_zero  = is_v ? v_proj_zero  : k_proj_zero;
+            const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + proj_row;
+
+            float partial = 0.0f;
+            if (i4_scale != nullptr) {
+                partial = int4_dq8_matvec_partial(
+                    reinterpret_cast<const uint8_t*>(w_slab),
+                    i4_scale, i4_zero, x_norm_lds,
+                    proj_row, hidden, int4_group_size,
+                    tid, block_size);
+            } else {
+                const T* w_row = w_slab + static_cast<size_t>(proj_row) * hidden;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += load_as_float<T>(w_row, col) * x_norm_lds[col];
+                }
+            }
+            shared_scratch[tid] = partial;
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                __syncthreads();
+            }
+            if (tid == 0) {
+                workspace[dst_off] = bf16_round_rne_f32(shared_scratch[0]);
+            }
             __syncthreads();
         }
-        if (tid == 0) {
-            workspace[dst_off] = bf16_round_rne_f32(shared_scratch[0]);
-        }
-        __syncthreads();
     }
 
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
@@ -1166,46 +1358,96 @@ __global__ void qwen36_moe_attn_step_kernel(
         const int qd = H * d;
         const bool o_int4 = (o_proj_scale != nullptr);
 
-        for (;;) {
-            __shared__ unsigned int my_row_s;
-            if (tid == 0) {
-                my_row_s = atomicAdd(&counters[0], 1u);
-            }
-            __syncthreads();
-            const int my_row = static_cast<int>(my_row_s);
-            if (my_row >= hidden) break;
-
-            float partial = 0.0f;
+        bool wmma_handled_oproj = false;
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+        if constexpr (USE_WMMA) {
             if (o_int4) {
-                partial = int4_dq8_matvec_partial(
-                    reinterpret_cast<const uint8_t*>(o_proj_w),
-                    static_cast<const hip_bfloat16*>(o_proj_scale),
-                    static_cast<const hip_bfloat16*>(o_proj_zero),
-                    workspace + OFF_GATED,
-                    my_row, qd, int4_group_size,
-                    tid, block_size);
-            } else {
-                const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
-                for (int j = tid; j < qd; j += block_size) {
-                    partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+                const int gsc_o = qd / int4_group_size;
+                const int wave_id = tid >> 5;
+                const int lane_in_wave = tid & 31;
+                const int lane_row = lane_in_wave & 15;
+                const int lane_half = lane_in_wave >> 4;
+                const float* gated_lds_f32 = workspace + OFF_GATED;
+                const uint8_t* slab_packed =
+                    reinterpret_cast<const uint8_t*>(o_proj_w);
+                for (;;) {
+                    __shared__ unsigned int row_base_s;
+                    if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                    __syncthreads();
+                    const int row_base = static_cast<int>(row_base_s);
+                    if (row_base >= hidden) break;
+
+                    const int rhs_row = row_base + wave_id * 16 + lane_row;
+                    const bool in_range = rhs_row < hidden;
+                    const uint8_t* slab_row = in_range
+                        ? slab_packed +
+                          static_cast<size_t>(rhs_row) * (qd / 2)
+                        : nullptr;
+                    qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                        slab_row,
+                        static_cast<const hip_bfloat16*>(o_proj_scale),
+                        static_cast<const hip_bfloat16*>(o_proj_zero),
+                        rhs_row, in_range,
+                        gated_lds_f32, qd,
+                        gsc_o, int4_group_size, lane_row);
+                    if (lane_half == 0 && in_range) {
+                        const float o_out  = bf16_round_rne_f32(acc[0]);
+                        const float in_f   =
+                            load_as_float<T>(input_hidden, rhs_row);
+                        const float result = bf16_round_rne_f32(in_f + o_out);
+                        workspace[OFF_O_OUT + rhs_row] = result;
+                        if (stage == 5) {
+                            output[rhs_row] = static_cast<T>(result);
+                        }
+                    }
+                    __syncthreads();
                 }
+                wmma_handled_oproj = true;
             }
-            shared_scratch[tid] = partial;
-            __syncthreads();
-            for (int s = block_size / 2; s > 0; s >>= 1) {
-                if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        }
+#endif
+        if (!wmma_handled_oproj) {
+            for (;;) {
+                __shared__ unsigned int my_row_s;
+                if (tid == 0) {
+                    my_row_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_s);
+                if (my_row >= hidden) break;
+
+                float partial = 0.0f;
+                if (o_int4) {
+                    partial = int4_dq8_matvec_partial(
+                        reinterpret_cast<const uint8_t*>(o_proj_w),
+                        static_cast<const hip_bfloat16*>(o_proj_scale),
+                        static_cast<const hip_bfloat16*>(o_proj_zero),
+                        workspace + OFF_GATED,
+                        my_row, qd, int4_group_size,
+                        tid, block_size);
+                } else {
+                    const T* w_row = o_proj_w + static_cast<size_t>(my_row) * qd;
+                    for (int j = tid; j < qd; j += block_size) {
+                        partial += load_as_float<T>(w_row, j) * workspace[OFF_GATED + j];
+                    }
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    const float o_out  = bf16_round_rne_f32(shared_scratch[0]);
+                    const float in_f   = load_as_float<T>(input_hidden, my_row);
+                    const float result = bf16_round_rne_f32(in_f + o_out);
+                    workspace[OFF_O_OUT + my_row] = result;
+                    if (stage == 5) {
+                        output[my_row] = static_cast<T>(result);
+                    }
+                }
                 __syncthreads();
             }
-            if (tid == 0) {
-                const float o_out  = bf16_round_rne_f32(shared_scratch[0]);
-                const float in_f   = load_as_float<T>(input_hidden, my_row);
-                const float result = bf16_round_rne_f32(in_f + o_out);
-                workspace[OFF_O_OUT + my_row] = result;
-                if (stage == 5) {
-                    output[my_row] = static_cast<T>(result);
-                }
-            }
-            __syncthreads();
         }
     }
 }
