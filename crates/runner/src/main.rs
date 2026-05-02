@@ -2869,6 +2869,24 @@ fn run_gemma4(
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
+    if entry.backend == Backend::Cuda {
+        if !matches!(model_variant, ModelVariant::Gemma4_E2B) {
+            anyhow::bail!("Gemma 4 CUDA v1 supports only --model gemma4-e2b on sm86");
+        }
+        if cli.int4 {
+            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 only; --int4 is not wired");
+        }
+        if cli.fp8_runtime {
+            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 only; --fp8-runtime is not wired");
+        }
+        if cli.kv_fp8 {
+            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 KV only; --kv-fp8 is not wired");
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("Gemma 4 CUDA v1 supports only --batch-size=1");
+        }
+    }
+
     if cli.fp8_runtime && cli.int4 {
         anyhow::bail!(
             "Gemma 4 --fp8-runtime cannot combine with --int4 (the INT4 kernel \
@@ -2981,10 +2999,7 @@ fn run_gemma4(
     let kv_dtype_bytes: u64 = if cli.kv_fp8 { 1 } else { 2 };
     let scale_bytes_per_seq: u64 = if cli.kv_fp8 {
         // 2 (K + V) * num_kv_heads * max_t * 4 B per owned layer.
-        2 * (t.num_key_value_heads as u64)
-            * (context_tokens as u64)
-            * 4
-            * owned_layers
+        2 * (t.num_key_value_heads as u64) * (context_tokens as u64) * 4 * owned_layers
     } else {
         0
     };
