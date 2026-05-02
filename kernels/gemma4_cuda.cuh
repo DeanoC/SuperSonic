@@ -66,6 +66,41 @@ __device__ inline __nv_bfloat16 g4_from_float<__nv_bfloat16>(float value) {
     return __nv_bfloat16(value);
 }
 
+template <typename T>
+__device__ inline void g4_load_pair_as_float(
+    const T* __restrict__ ptr,
+    float& out0,
+    float& out1
+) {
+    out0 = g4_to_float(ptr[0]);
+    out1 = g4_to_float(ptr[1]);
+}
+
+template <>
+__device__ inline void g4_load_pair_as_float<__half>(
+    const __half* __restrict__ ptr,
+    float& out0,
+    float& out1
+) {
+    const __half2 packed = *reinterpret_cast<const __half2*>(ptr);
+    const float2 unpacked = __half22float2(packed);
+    out0 = unpacked.x;
+    out1 = unpacked.y;
+}
+
+template <>
+__device__ inline void g4_load_pair_as_float<__nv_bfloat16>(
+    const __nv_bfloat16* __restrict__ ptr,
+    float& out0,
+    float& out1
+) {
+    const __nv_bfloat162 packed =
+        *reinterpret_cast<const __nv_bfloat162*>(ptr);
+    const float2 unpacked = __bfloat1622float2(packed);
+    out0 = unpacked.x;
+    out1 = unpacked.y;
+}
+
 // -----------------------------------------------------------------------------
 // INT4 dequant helpers.
 //
@@ -2648,6 +2683,53 @@ struct Gemma4FP8ScaleDesc {
     int         block_size;
 };
 
+enum {
+    G4_PROFILE_A0_LOAD = 0,
+    G4_PROFILE_A1_INPUT_NORM = 1,
+    G4_PROFILE_A2_QKV = 2,
+    G4_PROFILE_A3_QK_ROPE_KV = 3,
+    G4_PROFILE_A4_SCORES = 4,
+    G4_PROFILE_A5_SOFTMAX = 5,
+    G4_PROFILE_A6_VALUE = 6,
+    G4_PROFILE_A7_OPROJ = 7,
+    G4_PROFILE_A8_POST_ATTN_NORM = 8,
+    G4_PROFILE_A9_ATTN_RESID = 9,
+    G4_PROFILE_B0_LOAD = 10,
+    G4_PROFILE_B1_PRE_FF_NORM = 11,
+    G4_PROFILE_B2_GATE_UP = 12,
+    G4_PROFILE_B3_GELU_UP = 13,
+    G4_PROFILE_B4_DOWN = 14,
+    G4_PROFILE_B5_POST_FF_NORM = 15,
+    G4_PROFILE_B6_PRE_PLE_RESID = 16,
+    G4_PROFILE_B7_PLE_GATE = 17,
+    G4_PROFILE_B8_PLE_ACT = 18,
+    G4_PROFILE_B9_PLE_PROJ = 19,
+    G4_PROFILE_B10_PLE_NORM = 20,
+    G4_PROFILE_B11_FINAL_RESID = 21,
+    G4_PROFILE_FUSED_INPUT = 22,
+    G4_PROFILE_ARGMAX_TAIL = 23,
+    G4_PROFILE_PHASES = 24
+};
+
+__device__ inline unsigned long long g4_profile_begin(
+    unsigned long long* __restrict__ profile_cycles
+) {
+    if (profile_cycles != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+        return clock64();
+    }
+    return 0ull;
+}
+
+__device__ inline void g4_profile_end(
+    unsigned long long* __restrict__ profile_cycles,
+    int phase,
+    unsigned long long start
+) {
+    if (profile_cycles != nullptr && blockIdx.x == 0 && threadIdx.x == 0) {
+        atomicAdd(&profile_cycles[phase], clock64() - start);
+    }
+}
+
 template <typename T>
 __device__ void g4_persistent_decode_body(
     int num_layers,
@@ -2665,6 +2747,7 @@ __device__ void g4_persistent_decode_body(
     unsigned int* __restrict__ matvec_counter,
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag,
+    unsigned long long* __restrict__ profile_cycles,
     float* __restrict__ lds
 ) {
     const int tid = threadIdx.x;
@@ -2672,9 +2755,7 @@ __device__ void g4_persistent_decode_body(
     const int nb = gridDim.x;
 
     // LDS layout: lds[0..bs] for block-wide reductions, lds[bs..bs+256] for
-    // the FP8-runtime weight-dequant LUT. Bridge always allocates the full
-    // `(bs + 256) * 4 B` so the layout is constant whether `fp8_scales` is
-    // null or not.
+    // the FP8-runtime weight-dequant LUT.
     float* fp8_lut = lds + bs;
     if (fp8_scales != nullptr) {
         if (tid < 256) {
@@ -2753,19 +2834,24 @@ __device__ void g4_persistent_decode_body(
         float* oproj_normed = oproj_f32 + hidden_size;
 
         // A0: load hidden_io BF16 → hidden_f32 (residual).
+        unsigned long long g4_prof = g4_profile_begin(profile_cycles);
         for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
             hidden_f32[c] = g4_to_float(hidden_io[c]);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A0_LOAD, g4_prof);
 
         // A1: input_norm on block 0.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0) {
             g4_block_rms_norm_f32<T>(normed_f32, hidden_f32, input_norm_w,
                                       hidden_size, eps, lds);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A1_INPUT_NORM, g4_prof);
 
         // A2: work-stealing QKV matmul (reset counter first).
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -2846,12 +2932,14 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A2_QKV, g4_prof);
 
         float* q_f32 = proj_f32;
         float* k_f32 = proj_f32 + q_dim;
         float* v_f32 = proj_f32 + q_dim + kv_dim;
 
         // A3: q/k/v norms + RoPE + KV append (block 0 only).
+        g4_prof = g4_profile_begin(profile_cycles);
         if (!shared_kv && blockIdx.x == 0) {
             g4_block_rms_norm_per_head_f32<T>(q_f32, q_norm_w,
                 num_q_heads, head_dim, eps, lds);
@@ -2882,8 +2970,10 @@ __device__ void g4_persistent_decode_body(
                 num_q_heads, head_dim, rotary_dim, position);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A3_QK_ROPE_KV, g4_prof);
 
         // A4: attention scores.
+        g4_prof = g4_profile_begin(profile_cycles);
         const int kv_len = position + 1;
         const int last = kv_len - 1;
         const int min_t = (sliding_window > 0) ? max(0, last - sliding_window + 1) : 0;
@@ -2926,8 +3016,10 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A4_SCORES, g4_prof);
 
         // A5: softmax per q head.
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int q_h = blockIdx.x; q_h < num_q_heads; q_h += nb) {
             float* row = scores_f32 + static_cast<size_t>(q_h) * max_T;
             float pm = -INFINITY;
@@ -2958,8 +3050,10 @@ __device__ void g4_persistent_decode_body(
             __syncthreads();
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A5_SOFTMAX, g4_prof);
 
         // A6: value aggregation.
+        g4_prof = g4_profile_begin(profile_cycles);
         {
             const int total_items = num_q_heads * head_dim;
             const uint8_t* v_cache_fp8 = use_fp8_kv
@@ -2992,8 +3086,10 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A6_VALUE, g4_prof);
 
         // A7: work-stealing o_proj.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -3043,19 +3139,24 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A7_OPROJ, g4_prof);
 
         // A8: post_attn_norm on block 0.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0) {
             g4_block_rms_norm_f32<T>(oproj_normed, oproj_f32, post_attn_norm_w,
                                       hidden_size, eps, lds);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A8_POST_ATTN_NORM, g4_prof);
 
         // A9: residual add + BF16 store → hidden_io (= h_mid).
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
             hidden_io[c] = g4_from_float<T>(hidden_f32[c] + oproj_normed[c]);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_A9_ATTN_RESID, g4_prof);
 
         // =========================================================
         // Phase B — MLP + PLE. Mirrors g4_fused_mlp_ple_kernel.
@@ -3101,19 +3202,24 @@ __device__ void g4_persistent_decode_body(
         float* b_normed_ple   = b_projected + hidden_size;
 
         // B0: load h_mid BF16 → b_hidden_f32.
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
             b_hidden_f32[c] = g4_to_float(hidden_io[c]);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B0_LOAD, g4_prof);
 
         // B1: pre_ff_norm on block 0.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0) {
             g4_block_rms_norm_f32<T>(b_normed_ff, b_hidden_f32, pre_ff_norm_w,
                                       hidden_size, eps, lds);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B1_PRE_FF_NORM, g4_prof);
 
         // B2: work-stealing gate+up matmul.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -3155,10 +3261,9 @@ __device__ void g4_persistent_decode_body(
                 } else {
                     const T* wr = w_bf16 + static_cast<size_t>(weight_row) * hidden_size;
                     for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0 = g4_to_float(wr[c]);
-                        float w1 = g4_to_float(wr[c+1]);
-                        float w2 = g4_to_float(wr[c+2]);
-                        float w3 = g4_to_float(wr[c+3]);
+                        float w0, w1, w2, w3;
+                        g4_load_pair_as_float(wr + c, w0, w1);
+                        g4_load_pair_as_float(wr + c + 2, w2, w3);
                         p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
                            + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
                     }
@@ -3171,8 +3276,10 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B2_GATE_UP, g4_prof);
 
         // B3: gated_proj[i] = gelu(gate[i]) * up[i].
+        g4_prof = g4_profile_begin(profile_cycles);
         {
             const float* gate_slot = b_gate_up;
             const float* up_slot = b_gate_up + intermediate_size;
@@ -3182,8 +3289,10 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B3_GELU_UP, g4_prof);
 
         // B4: work-stealing down_proj.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -3192,18 +3301,35 @@ __device__ void g4_persistent_decode_body(
         // B4 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            constexpr int warps_per_row = 2;
+            constexpr int rows_per_block = 256 / (32 * warps_per_row);
+            const int group_id = warp_id / warps_per_row;
+            const int group_lane = (warp_id % warps_per_row) * warpSize + lane;
             const int vd4 = intermediate_size & ~3;
+            __shared__ unsigned int claimed_rows[rows_per_block];
             while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(hidden_size)) break;
+                if (group_lane == 0) {
+                    claimed_rows[group_id] = atomicAdd(matvec_counter, 1u);
+                }
+                __syncthreads();
+
+                const unsigned int row = claimed_rows[group_id];
+                bool any_active = false;
+                for (int i = 0; i < rows_per_block; ++i) {
+                    any_active = any_active ||
+                        claimed_rows[i] < static_cast<unsigned int>(hidden_size);
+                }
+                if (!any_active) break;
 
                 float p = 0.0f;
-                if (use_fp8_w) {
+                const bool active = row < static_cast<unsigned int>(hidden_size);
+                if (active && use_fp8_w) {
                     const void* wbase = static_cast<const void*>(down_proj_w);
                     const void* sbase = Sfp8.down_proj_scale;
-                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+                    for (int c = group_lane * 4;
+                         c < vd4;
+                         c += warps_per_row * warpSize * 4) {
                         float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c,   intermediate_size, fp8_block_size, fp8_lut);
                         float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+1, intermediate_size, fp8_block_size, fp8_lut);
                         float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, row, c+2, intermediate_size, fp8_block_size, fp8_lut);
@@ -3211,45 +3337,65 @@ __device__ void g4_persistent_decode_body(
                         p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
                            + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
                     }
-                    for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
+                    for (int c = vd4 + group_lane;
+                         c < intermediate_size;
+                         c += warps_per_row * warpSize) {
                         p += g4_fp8_dequant_weight_lut(wbase, sbase, row, c, intermediate_size, fp8_block_size, fp8_lut)
                              * b_gated_proj[c];
                     }
-                } else {
+                } else if (active) {
                     const T* wr = down_proj_w +
                         static_cast<size_t>(row) * intermediate_size;
-                    for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0 = g4_to_float(wr[c]);
-                        float w1 = g4_to_float(wr[c+1]);
-                        float w2 = g4_to_float(wr[c+2]);
-                        float w3 = g4_to_float(wr[c+3]);
+                    for (int c = group_lane * 4;
+                         c < vd4;
+                         c += warps_per_row * warpSize * 4) {
+                        float w0, w1, w2, w3;
+                        g4_load_pair_as_float(wr + c, w0, w1);
+                        g4_load_pair_as_float(wr + c + 2, w2, w3);
                         p += w0 * b_gated_proj[c]   + w1 * b_gated_proj[c+1]
                            + w2 * b_gated_proj[c+2] + w3 * b_gated_proj[c+3];
                     }
-                    for (int c = vd4 + lane; c < intermediate_size; c += warpSize) {
+                    for (int c = vd4 + group_lane;
+                         c < intermediate_size;
+                         c += warps_per_row * warpSize) {
                         p += g4_to_float(wr[c]) * b_gated_proj[c];
                     }
                 }
-                float result = g4_wave_reduce_sum_f32(p);
-                if (lane == 0) b_down_out[row] = result;
+                const float warp_sum = g4_wave_reduce_sum_f32(p);
+                if (lane == 0) lds[warp_id] = warp_sum;
+                __syncthreads();
+                if (active && group_lane == 0) {
+                    float result = 0.0f;
+                    for (int w = 0; w < warps_per_row; ++w) {
+                        result += lds[group_id * warps_per_row + w];
+                    }
+                    b_down_out[row] = result;
+                }
+                __syncthreads();
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B4_DOWN, g4_prof);
 
         // B5: post_ff_norm on block 0.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0) {
             g4_block_rms_norm_f32<T>(b_normed_down, b_down_out, post_ff_norm_w,
                                       hidden_size, eps, lds);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B5_POST_FF_NORM, g4_prof);
 
         // B6: h_pre_ple = b_hidden_f32 + b_normed_down.
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
             b_h_pre_ple[c] = b_hidden_f32[c] + b_normed_down[c];
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B6_PRE_PLE_RESID, g4_prof);
 
         // B7: work-stealing per_layer_input_gate matvec.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -3285,10 +3431,9 @@ __device__ void g4_persistent_decode_body(
                     const T* wr = pli_gate_w +
                         static_cast<size_t>(row) * hidden_size;
                     for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0 = g4_to_float(wr[c]);
-                        float w1 = g4_to_float(wr[c+1]);
-                        float w2 = g4_to_float(wr[c+2]);
-                        float w3 = g4_to_float(wr[c+3]);
+                        float w0, w1, w2, w3;
+                        g4_load_pair_as_float(wr + c, w0, w1);
+                        g4_load_pair_as_float(wr + c + 2, w2, w3);
                         p += w0 * b_h_pre_ple[c]   + w1 * b_h_pre_ple[c+1]
                            + w2 * b_h_pre_ple[c+2] + w3 * b_h_pre_ple[c+3];
                     }
@@ -3301,15 +3446,19 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B7_PLE_GATE, g4_prof);
 
         // B8: gated_act = gelu(gated_ple) * per_layer_input.
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int i = tid + blockIdx.x * bs; i < ple_hidden; i += bs * nb) {
             const float g = g4_gelu_tanh_scalar(b_gated_ple[i]);
             b_gated_act[i] = g * g4_to_float(per_layer_input[i]);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B8_PLE_ACT, g4_prof);
 
         // B9: work-stealing per_layer_projection matvec.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0 && tid == 0) {
             __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
         }
@@ -3345,10 +3494,9 @@ __device__ void g4_persistent_decode_body(
                     const T* wr = pli_proj_w +
                         static_cast<size_t>(row) * ple_hidden;
                     for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0 = g4_to_float(wr[c]);
-                        float w1 = g4_to_float(wr[c+1]);
-                        float w2 = g4_to_float(wr[c+2]);
-                        float w3 = g4_to_float(wr[c+3]);
+                        float w0, w1, w2, w3;
+                        g4_load_pair_as_float(wr + c, w0, w1);
+                        g4_load_pair_as_float(wr + c + 2, w2, w3);
                         p += w0 * b_gated_act[c]   + w1 * b_gated_act[c+1]
                            + w2 * b_gated_act[c+2] + w3 * b_gated_act[c+3];
                     }
@@ -3361,21 +3509,26 @@ __device__ void g4_persistent_decode_body(
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B9_PLE_PROJ, g4_prof);
 
         // B10: post_per_layer_input_norm on block 0.
+        g4_prof = g4_profile_begin(profile_cycles);
         if (blockIdx.x == 0) {
             g4_block_rms_norm_f32<T>(b_normed_ple, b_projected,
                                       pli_post_norm_w,
                                       hidden_size, eps, lds);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B10_PLE_NORM, g4_prof);
 
         // B11: hidden_io = bf16((h_pre_ple + normed_ple) * layer_scalar).
+        g4_prof = g4_profile_begin(profile_cycles);
         for (int c = tid + blockIdx.x * bs; c < hidden_size; c += bs * nb) {
             const float v = (b_h_pre_ple[c] + b_normed_ple[c]) * layer_scalar;
             hidden_io[c] = g4_from_float<T>(v);
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
+        g4_profile_end(profile_cycles, G4_PROFILE_B11_FINAL_RESID, g4_prof);
     }
 }
 
@@ -3395,13 +3548,15 @@ __global__ void g4_persistent_decode_kernel(
     float* __restrict__ workspace,
     unsigned int* __restrict__ matvec_counter,
     unsigned int* __restrict__ barrier_counter,
-    unsigned int* __restrict__ barrier_flag
+    unsigned int* __restrict__ barrier_flag,
+    unsigned long long* __restrict__ profile_cycles
 ) __launch_bounds__(256, 1) {
     extern __shared__ float lds[];
     g4_persistent_decode_body<T>(
         num_layers, hidden_size, ple_hidden, position, eps, scale,
         layers, kv_fp8_descs, fp8_scales, hidden_io, per_layer_inputs,
-        workspace, matvec_counter, barrier_counter, barrier_flag, lds);
+        workspace, matvec_counter, barrier_counter, barrier_flag,
+        profile_cycles, lds);
 }
 
 template <typename T>
@@ -3416,6 +3571,7 @@ __device__ void g4_final_norm_lm_head_argmax_body(
     unsigned int* __restrict__ out_token,
     unsigned int* __restrict__ barrier_counter,
     unsigned int* __restrict__ barrier_flag,
+    unsigned long long* __restrict__ profile_cycles,
     float* __restrict__ lds
 ) {
     const int tid = threadIdx.x;
@@ -3428,6 +3584,7 @@ __device__ void g4_final_norm_lm_head_argmax_body(
     float* partial_idx_bits = partial_vals + nb;
     float* reduce_idx_bits = partial_idx_bits + nb;
 
+    unsigned long long g4_prof = g4_profile_begin(profile_cycles);
     if (blockIdx.x == 0) {
         for (int c = tid; c < hidden_size; c += bs) {
             hidden_f32[c] = g4_to_float(hidden_io[c]);
@@ -3450,10 +3607,9 @@ __device__ void g4_final_norm_lm_head_argmax_body(
         const T* wr = lm_head_w + static_cast<size_t>(row) * hidden_size;
         float p = 0.0f;
         for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-            const float w0 = g4_to_float(wr[c]);
-            const float w1 = g4_to_float(wr[c + 1]);
-            const float w2 = g4_to_float(wr[c + 2]);
-            const float w3 = g4_to_float(wr[c + 3]);
+            float w0, w1, w2, w3;
+            g4_load_pair_as_float(wr + c, w0, w1);
+            g4_load_pair_as_float(wr + c + 2, w2, w3);
             p += w0 * normed_f32[c]
                + w1 * normed_f32[c + 1]
                + w2 * normed_f32[c + 2]
@@ -3541,6 +3697,7 @@ __device__ void g4_final_norm_lm_head_argmax_body(
             out_token[0] = __float_as_uint(reduce_idx_bits[0]);
         }
     }
+    g4_profile_end(profile_cycles, G4_PROFILE_ARGMAX_TAIL, g4_prof);
 }
 
 template <typename T>
@@ -3575,7 +3732,8 @@ __global__ void g4_persistent_decode_fused_input_kernel(
     unsigned int* __restrict__ barrier_flag,
     const T* __restrict__ final_norm_w,
     const T* __restrict__ lm_head_w,
-    unsigned int* __restrict__ out_token
+    unsigned int* __restrict__ out_token,
+    unsigned long long* __restrict__ profile_cycles
 ) __launch_bounds__(256, 1) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3583,6 +3741,7 @@ __global__ void g4_persistent_decode_fused_input_kernel(
     const int total = num_layers * ple_hidden;
     extern __shared__ float lds[];
 
+    unsigned long long g4_prof = g4_profile_begin(profile_cycles);
     if (token_id >= static_cast<unsigned int>(vocab_size)) {
         for (int i = tid + blockIdx.x * bs; i < hidden_size; i += bs * nb) {
             hidden_io[i] = g4_from_float<T>(0.0f);
@@ -3676,17 +3835,20 @@ __global__ void g4_persistent_decode_fused_input_kernel(
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
     }
+    g4_profile_end(profile_cycles, G4_PROFILE_FUSED_INPUT, g4_prof);
 
     g4_persistent_decode_body<T>(
         num_layers, hidden_size, ple_hidden, position, eps, scale,
         layers, kv_fp8_descs, fp8_scales, hidden_io, per_layer_inputs,
-        workspace, matvec_counter, barrier_counter, barrier_flag, lds);
+        workspace, matvec_counter, barrier_counter, barrier_flag,
+        profile_cycles, lds);
 
     if (out_token != nullptr) {
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_final_norm_lm_head_argmax_body<T>(
             hidden_size, vocab_size, eps, hidden_io, final_norm_w, lm_head_w,
-            workspace, out_token, barrier_counter, barrier_flag, lds);
+            workspace, out_token, barrier_counter, barrier_flag,
+            profile_cycles, lds);
     }
 }
 
@@ -3706,7 +3868,7 @@ __global__ void g4_final_norm_lm_head_argmax_kernel(
     extern __shared__ float lds[];
     g4_final_norm_lm_head_argmax_body<T>(
         hidden_size, vocab_size, eps, hidden_io, final_norm_w, lm_head_w,
-        workspace, out_token, barrier_counter, barrier_flag, lds);
+        workspace, out_token, barrier_counter, barrier_flag, nullptr, lds);
 }
 
 // =============================================================================
