@@ -3541,6 +3541,114 @@ __global__ void g4_persistent_decode_fused_input_kernel(
         workspace, matvec_counter, barrier_counter, barrier_flag, lds);
 }
 
+template <typename T>
+__global__ void g4_final_norm_lm_head_argmax_kernel(
+    int hidden_size,
+    int vocab_size,
+    float eps,
+    const T* __restrict__ hidden_io,
+    const T* __restrict__ final_norm_w,
+    const T* __restrict__ lm_head_w,
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ out_token,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_flag
+) __launch_bounds__(256, 1) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+    extern __shared__ float lds[];
+
+    float* hidden_f32 = workspace;
+    float* normed_f32 = hidden_f32 + hidden_size;
+    float* partial_vals = normed_f32 + hidden_size;
+    float* partial_idx_bits = partial_vals + nb;
+    float* reduce_idx_bits = partial_idx_bits + nb;
+
+    if (blockIdx.x == 0) {
+        for (int c = tid; c < hidden_size; c += bs) {
+            hidden_f32[c] = g4_to_float(hidden_io[c]);
+        }
+        __syncthreads();
+        g4_block_rms_norm_f32<T>(
+            normed_f32, hidden_f32, final_norm_w, hidden_size, eps, lds);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    float best = -INFINITY;
+    unsigned int best_idx = 0u;
+    const int lane = tid % warpSize;
+    const int vd4 = hidden_size & ~3;
+    for (int row = blockIdx.x; row < vocab_size; row += nb) {
+        const T* wr = lm_head_w + static_cast<size_t>(row) * hidden_size;
+        float p = 0.0f;
+        for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+            const float w0 = g4_to_float(wr[c]);
+            const float w1 = g4_to_float(wr[c + 1]);
+            const float w2 = g4_to_float(wr[c + 2]);
+            const float w3 = g4_to_float(wr[c + 3]);
+            p += w0 * normed_f32[c]
+               + w1 * normed_f32[c + 1]
+               + w2 * normed_f32[c + 2]
+               + w3 * normed_f32[c + 3];
+        }
+        for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+            p += g4_to_float(wr[c]) * normed_f32[c];
+        }
+        const float result = g4_wave_reduce_sum_f32(p);
+        if (lane == 0) {
+            // Match the validated logits path: the standalone matvec rounds
+            // each logit to BF16 before host argmax/softcap.
+            const float rounded = g4_to_float(g4_from_float<T>(result));
+            const unsigned int urow = static_cast<unsigned int>(row);
+            if (rounded > best || (rounded == best && urow < best_idx)) {
+                best = rounded;
+                best_idx = urow;
+            }
+        }
+    }
+
+    if (tid == 0) {
+        partial_vals[blockIdx.x] = best;
+        partial_idx_bits[blockIdx.x] = __uint_as_float(best_idx);
+    }
+    g4_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    if (blockIdx.x == 0) {
+        float block_best = -INFINITY;
+        unsigned int block_best_idx = 0u;
+        for (int i = tid; i < nb; i += bs) {
+            const float v = partial_vals[i];
+            const unsigned int idx = __float_as_uint(partial_idx_bits[i]);
+            if (v > block_best || (v == block_best && idx < block_best_idx)) {
+                block_best = v;
+                block_best_idx = idx;
+            }
+        }
+        lds[tid] = block_best;
+        reduce_idx_bits[tid] = __uint_as_float(block_best_idx);
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                const float other_v = lds[tid + s];
+                const unsigned int other_idx =
+                    __float_as_uint(reduce_idx_bits[tid + s]);
+                const unsigned int cur_idx =
+                    __float_as_uint(reduce_idx_bits[tid]);
+                if (other_v > lds[tid] ||
+                    (other_v == lds[tid] && other_idx < cur_idx)) {
+                    lds[tid] = other_v;
+                    reduce_idx_bits[tid] = __uint_as_float(other_idx);
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            out_token[0] = __float_as_uint(reduce_idx_bits[0]);
+        }
+    }
+}
+
 // =============================================================================
 // Persistent decode megakernel — batched variant (Phase 2).
 //

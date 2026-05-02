@@ -779,6 +779,42 @@ int persistent_decode_fused_input_device(
 }
 
 template <typename T>
+int final_norm_lm_head_argmax_device(int device_ordinal,
+                                     int hidden_size,
+                                     int vocab_size,
+                                     float eps,
+                                     const void* hidden_io,
+                                     const void* final_norm_w,
+                                     const void* lm_head_w,
+                                     void* workspace,
+                                     unsigned int* out_token,
+                                     unsigned int* barrier_counter,
+                                     unsigned int* barrier_flag) {
+    ScopedCudaDevice scoped(device_ordinal);
+
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 731;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = BLOCK * sizeof(float);
+
+    if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 732;
+    if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 733;
+
+    g4_final_norm_lm_head_argmax_kernel<T><<<dim3(num_blocks), dim3(BLOCK), lds_bytes, 0>>>(
+        hidden_size, vocab_size, eps,
+        static_cast<const T*>(hidden_io),
+        static_cast<const T*>(final_norm_w),
+        static_cast<const T*>(lm_head_w),
+        static_cast<float*>(workspace),
+        out_token, barrier_counter, barrier_flag);
+    if (cudaGetLastError() != cudaSuccess) return 734;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 735;
+    return 0;
+}
+
+template <typename T>
 int persistent_decode_batch_device(int device_ordinal,
                                    int num_layers, int hidden_size, int ple_hidden,
                                    float eps, float scale,
@@ -1500,6 +1536,31 @@ extern "C" int supersonic_gemma4_cuda_persistent_decode_fused_input(
     default: return 720;
     }
     #undef G4_PERSIST_FUSED_INPUT_ARGS
+}
+
+extern "C" int supersonic_gemma4_cuda_final_norm_lm_head_argmax(
+    int dtype, size_t device_ordinal,
+    size_t hidden_size, size_t vocab_size, float eps,
+    const void* hidden_io,
+    const void* final_norm_w,
+    const void* lm_head_w,
+    void* workspace,
+    unsigned int* out_token,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_FINAL_ARGMAX_ARGS                                             \
+        static_cast<int>(device_ordinal),                                    \
+        static_cast<int>(hidden_size), static_cast<int>(vocab_size), eps,    \
+        hidden_io, final_norm_w, lm_head_w, workspace, out_token,            \
+        barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return final_norm_lm_head_argmax_device<__half>(G4_FINAL_ARGMAX_ARGS);
+    case 1: return final_norm_lm_head_argmax_device<float>(G4_FINAL_ARGMAX_ARGS);
+    case 2: return final_norm_lm_head_argmax_device<__nv_bfloat16>(G4_FINAL_ARGMAX_ARGS);
+    default: return 730;
+    }
+    #undef G4_FINAL_ARGMAX_ARGS
 }
 
 extern "C" int supersonic_gemma4_cuda_persistent_decode_batch(
