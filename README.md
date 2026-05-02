@@ -78,7 +78,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
 | gemma4-e4b       | ✅⁶  |  —   |      —      |   —    |
-| phi4-mini        | ✅⁷  | ✅⁸  |     ✅⁹     |   —    |
+| phi4-mini        | ✅⁷  | ✅⁸  |     ✅⁹     |  ✅¹²  |
 
 ¹ CDNA single-sequence decode uses the persistent megakernel by default.
   `--force-replay-decode` remains available as the slower GPU-prefill
@@ -104,6 +104,9 @@ see [docs/dflash.md](docs/dflash.md).
    existing HIP golden-token outputs with zero GPU replay delta.
 ¹¹ Qwen3.5 KV-FP8 uses replayed GPU prefill for the single-sequence path and
    matches the existing HIP golden-token outputs with zero GPU replay delta.
+¹² Phi-4-mini KV-FP8 uses the correctness-first single-block CDNA fallback and
+   matches the PyTorch oracle tokens; logit drift is higher than BF16 but below
+   the INT4 lane observed during bring-up.
 
 ### CUDA on `sm86`
 
