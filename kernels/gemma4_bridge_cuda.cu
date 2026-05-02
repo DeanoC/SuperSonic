@@ -4,6 +4,7 @@
 #include "gemma4_cuda.cuh"
 
 #include <cstdlib>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <stdint.h>
@@ -19,6 +20,111 @@ struct ScopedCudaDevice {
     }
     ~ScopedCudaDevice() { if (changed && previous >= 0) cudaSetDevice(previous); }
 };
+
+const char* const G4_PROFILE_LABELS[G4_PROFILE_PHASES] = {
+    "A0_load_hidden",
+    "A1_input_norm",
+    "A2_qkv_matvec",
+    "A3_qk_rope_kv",
+    "A4_attn_scores",
+    "A5_softmax",
+    "A6_value",
+    "A7_o_proj",
+    "A8_post_attn_norm",
+    "A9_attn_resid",
+    "B0_load_hidden",
+    "B1_pre_ff_norm",
+    "B2_gate_up",
+    "B3_gelu_up",
+    "B4_down",
+    "B5_post_ff_norm",
+    "B6_pre_ple_resid",
+    "B7_ple_gate",
+    "B8_ple_act",
+    "B9_ple_proj",
+    "B10_ple_norm",
+    "B11_final_resid",
+    "fused_input",
+    "argmax_tail",
+};
+
+struct Gemma4CudaProfileState {
+    std::mutex mutex;
+    bool checked_env = false;
+    bool enabled = false;
+    int clock_khz = 0;
+    unsigned long long launches = 0;
+    unsigned long long totals[G4_PROFILE_PHASES] = {};
+
+    bool is_enabled() {
+        if (!checked_env) {
+            const char* env = std::getenv("SUPERSONIC_GEMMA4_CUDA_PROFILE");
+            enabled = env != nullptr && env[0] != '\0' && env[0] != '0';
+            checked_env = true;
+        }
+        return enabled;
+    }
+
+    unsigned long long* buffer(int device_ordinal) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!is_enabled()) return nullptr;
+        if (clock_khz == 0) {
+            cudaDeviceGetAttribute(
+                &clock_khz, cudaDevAttrClockRate, device_ordinal);
+        }
+        unsigned long long* launch_cycles = nullptr;
+        if (cudaMalloc(&launch_cycles,
+                       sizeof(unsigned long long) * G4_PROFILE_PHASES) != cudaSuccess) {
+            return nullptr;
+        }
+        if (cudaMemset(launch_cycles, 0,
+                       sizeof(unsigned long long) * G4_PROFILE_PHASES) != cudaSuccess) {
+            cudaFree(launch_cycles);
+            return nullptr;
+        }
+        return launch_cycles;
+    }
+
+    void collect(unsigned long long* ptr) {
+        if (ptr == nullptr) return;
+        unsigned long long tmp[G4_PROFILE_PHASES] = {};
+        if (cudaMemcpy(tmp, ptr, sizeof(tmp), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaFree(ptr);
+            return;
+        }
+        cudaFree(ptr);
+        std::lock_guard<std::mutex> lock(mutex);
+        for (int i = 0; i < G4_PROFILE_PHASES; ++i) {
+            totals[i] += tmp[i];
+        }
+        launches += 1;
+    }
+
+    ~Gemma4CudaProfileState() {
+        if (!checked_env || !enabled || launches == 0) {
+            return;
+        }
+        unsigned long long total = 0;
+        for (int i = 0; i < G4_PROFILE_PHASES; ++i) total += totals[i];
+        std::fprintf(stderr,
+            "[gemma4-cuda-profile] launches=%llu total_cycles=%llu clock_khz=%d\n",
+            launches, total, clock_khz);
+        for (int i = 0; i < G4_PROFILE_PHASES; ++i) {
+            if (totals[i] == 0) continue;
+            const double pct = total == 0
+                ? 0.0
+                : (100.0 * static_cast<double>(totals[i]) / static_cast<double>(total));
+            const double approx_ms = clock_khz > 0
+                ? static_cast<double>(totals[i]) / static_cast<double>(clock_khz)
+                : 0.0;
+            std::fprintf(stderr,
+                "[gemma4-cuda-profile] %-18s cycles=%llu approx_ms=%.3f pct=%.2f\n",
+                G4_PROFILE_LABELS[i], totals[i], approx_ms, pct);
+        }
+    }
+};
+
+Gemma4CudaProfileState g4_cuda_profile;
 
 // ---- RMSNorm (Gemma variant: no (w+1) offset) ----
 
@@ -707,6 +813,7 @@ int persistent_decode_device(int device_ordinal,
 
     if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 702;
     if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 703;
+    unsigned long long* profile_cycles = g4_cuda_profile.buffer(device_ordinal);
 
     g4_persistent_decode_kernel<T><<<dim3(num_blocks), dim3(BLOCK), lds_bytes, 0>>>(
         num_layers, hidden_size, ple_hidden, position, eps, scale,
@@ -716,9 +823,10 @@ int persistent_decode_device(int device_ordinal,
         static_cast<T*>(hidden_io),
         static_cast<const T*>(per_layer_inputs),
         static_cast<float*>(workspace),
-        matvec_counter, barrier_counter, barrier_flag);
+        matvec_counter, barrier_counter, barrier_flag, profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 704;
     if (cudaDeviceSynchronize() != cudaSuccess) return 705;
+    g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
 
@@ -755,6 +863,7 @@ int persistent_decode_fused_input_device(
 
     if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 722;
     if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 723;
+    unsigned long long* profile_cycles = g4_cuda_profile.buffer(device_ordinal);
 
     g4_persistent_decode_fused_input_kernel<T><<<dim3(num_blocks), dim3(BLOCK), lds_bytes, 0>>>(
         num_layers, hidden_size, ple_hidden, vocab_size, token_id, position,
@@ -773,9 +882,10 @@ int persistent_decode_fused_input_device(
         static_cast<T*>(per_layer_inputs),
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag,
-        nullptr, nullptr, nullptr);
+        nullptr, nullptr, nullptr, profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 724;
     if (cudaDeviceSynchronize() != cudaSuccess) return 725;
+    g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
 
@@ -813,6 +923,7 @@ int persistent_decode_fused_input_argmax_device(
 
     if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 742;
     if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 743;
+    unsigned long long* profile_cycles = g4_cuda_profile.buffer(device_ordinal);
 
     g4_persistent_decode_fused_input_kernel<T><<<dim3(num_blocks), dim3(BLOCK), lds_bytes, 0>>>(
         num_layers, hidden_size, ple_hidden, vocab_size, token_id, position,
@@ -833,9 +944,11 @@ int persistent_decode_fused_input_argmax_device(
         matvec_counter, barrier_counter, barrier_flag,
         static_cast<const T*>(final_norm_w),
         static_cast<const T*>(lm_head_w),
-        out_token);
+        out_token,
+        profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 744;
     if (cudaDeviceSynchronize() != cudaSuccess) return 745;
+    g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
 
@@ -858,7 +971,7 @@ int final_norm_lm_head_argmax_device(int device_ordinal,
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
     constexpr int BLOCK = 256;
-    const size_t lds_bytes = BLOCK * sizeof(float);
+    const size_t lds_bytes = (BLOCK + 256) * sizeof(float);
 
     if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 732;
     if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 733;
