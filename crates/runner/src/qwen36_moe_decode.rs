@@ -193,6 +193,52 @@ pub struct LayerBuffers {
     pub ffn: FfnLayerBuffers,
 }
 
+/// Multi-token-prediction (MTP) head weights for Qwen3.6-MoE
+/// self-speculative decode (Phase 6 of the perf roadmap). The MTP block
+/// is structurally one full-attention MoE layer plus three small
+/// "fusion" RMSNorms (`pre_fc_norm_hidden`, `pre_fc_norm_embedding`,
+/// `norm`) and a fusion linear (`fc`), sharing `embed_tokens` and
+/// `lm_head` with the base model. See `oracle/qwen36_moe_mtp_oracle.py`
+/// for the full forward equation.
+///
+/// All 19 tensors are BF16 in the published FP8 release (no FP8
+/// dequant or INT4 calibration this round — the MTP block is one
+/// layer's worth of compute and BF16 vs INT4 is a wash). The total
+/// weight footprint is ~1.6 GiB BF16; comfortably fits alongside the
+/// 17 GiB INT4 base bake on a 24 GiB 7900 XTX.
+pub struct MtpLayerBuffers {
+    /// Fusion linears + norms (top-level `mtp.*` tensors).
+    pub pre_fc_norm_hidden_w: GpuBuffer,    // [hidden]
+    pub pre_fc_norm_embedding_w: GpuBuffer, // [hidden]
+    pub fc_w: GpuBuffer,                    // [hidden, 2*hidden]
+    pub norm_w: GpuBuffer,                  // [hidden]
+
+    /// Single-layer full-attn block (`mtp.layers.0.*`).
+    pub input_norm_w: GpuBuffer,            // [hidden]
+    pub post_attn_norm_w: GpuBuffer,        // [hidden]
+    pub q_proj_w: GpuBuffer,                // [2*H*d, hidden]
+    pub k_proj_w: GpuBuffer,                // [Hkv*d, hidden]
+    pub v_proj_w: GpuBuffer,                // [Hkv*d, hidden]
+    pub o_proj_w: GpuBuffer,                // [hidden, H*d]
+    pub q_norm_w: GpuBuffer,                // [head_dim]
+    pub k_norm_w: GpuBuffer,                // [head_dim]
+
+    /// MoE FFN sub-block (`mtp.layers.0.mlp.*`).
+    pub gate_w: GpuBuffer,                  // [num_experts, hidden]
+    pub gate_up_proj_w: GpuBuffer,          // [num_experts, 2*I, hidden]
+    pub down_proj_w: GpuBuffer,             // [num_experts, hidden, I]
+    pub shared_gate_proj_w: GpuBuffer,      // [Is, hidden]
+    pub shared_up_proj_w: GpuBuffer,        // [Is, hidden]
+    pub shared_down_proj_w: GpuBuffer,      // [hidden, Is]
+    pub shared_expert_gate_w: GpuBuffer,    // [1, hidden]
+
+    /// Per-step KV cache for the MTP layer's self-attention. Separate
+    /// from the base layers' KV caches per the vLLM reference (each
+    /// MTP draft step appends to this buffer at increasing positions;
+    /// step k attends to K/V from steps 0..k-1).
+    pub kv_cache: Option<FullAttnKvCache>,
+}
+
 impl LayerBuffers {
     pub fn is_full_attn(&self) -> bool {
         matches!(self.attn, AttnLayerBuffers::Full { .. })

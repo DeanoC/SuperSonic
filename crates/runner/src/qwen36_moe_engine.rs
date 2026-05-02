@@ -30,7 +30,7 @@ use crate::qwen36_moe_decode::{
     host_final_norm_lm_head_f32, run_chained_decode, run_chained_decode_fast,
     sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
     FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
-    MultiLayerGeom, XorshiftRng,
+    MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -724,6 +724,7 @@ pub fn run(
         cli.max_new_tokens.max(1),
         sampling,
         cli.emit_stage_timings,
+        cli.speculative_decode,
     )?;
     Ok(())
 }
@@ -947,6 +948,127 @@ fn load_layer_buffers(
     Ok(LayerBuffers { attn, ffn })
 }
 
+/// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.
+/// Used by Phase 6 self-speculative decode (`oracle/qwen36_moe_mtp_oracle.py`
+/// is the bit-exact PyTorch reference).
+///
+/// Returns `Ok(Some(buffers))` when the bake has all 19 `mtp.*` tensors,
+/// `Ok(None)` when the bake is pre-PR-#84 and lacks them (production
+/// decode is unaffected; only the speculative-decode path is unavailable),
+/// or `Err(...)` when the bake is partially-MTP (anomaly — some tensors
+/// present, others missing — should never happen in the wild).
+///
+/// `kv_max_t > 0` allocates a per-layer KV cache for the MTP block —
+/// separate from the base layers' KV caches per the vLLM reference.
+fn load_mtp_buffers(
+    store: &BakedStore,
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    kv_max_t: usize,
+) -> Result<Option<MtpLayerBuffers>> {
+    // The 19 names we expect. If `mtp.fc.weight` is absent we treat the
+    // entire MTP block as missing; if it's present we require all 19.
+    let probe = "mtp.fc.weight";
+    if !store.contains(probe) {
+        return Ok(None);
+    }
+
+    let required = [
+        "mtp.fc.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.mlp.gate.weight",
+        "mtp.layers.0.mlp.experts.gate_up_proj",
+        "mtp.layers.0.mlp.experts.down_proj",
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|n| !store.contains(n))
+        .collect();
+    if !missing.is_empty() {
+        return Err(anyhow!(
+            "bake has `{probe}` but is missing {} of the other 18 mtp.* tensors \
+             (e.g. {}); refusing to load a partial MTP block. Re-bake against \
+             `oracle/bake_int4.py` (see GitHub issue #87 for the producer \
+             workflow).",
+            missing.len(),
+            missing.first().copied().unwrap_or("<none>")
+        ));
+    }
+
+    let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
+    let kv_cache = if kv_max_t > 0 {
+        let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+            .context("alloc mtp kv_cache_k")?;
+        let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+            .context("alloc mtp kv_cache_v")?;
+        Some(FullAttnKvCache {
+            k,
+            v,
+            kv_max_t: kv_max_t as i32,
+        })
+    } else {
+        None
+    };
+
+    Ok(Some(MtpLayerBuffers {
+        pre_fc_norm_hidden_w: load_to_gpu(store, ordinal, "mtp.pre_fc_norm_hidden.weight")?,
+        pre_fc_norm_embedding_w: load_to_gpu(store, ordinal, "mtp.pre_fc_norm_embedding.weight")?,
+        fc_w: load_to_gpu(store, ordinal, "mtp.fc.weight")?,
+        norm_w: load_to_gpu(store, ordinal, "mtp.norm.weight")?,
+        input_norm_w: load_to_gpu(store, ordinal, "mtp.layers.0.input_layernorm.weight")?,
+        post_attn_norm_w: load_to_gpu(
+            store,
+            ordinal,
+            "mtp.layers.0.post_attention_layernorm.weight",
+        )?,
+        q_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.q_proj.weight")?,
+        k_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.k_proj.weight")?,
+        v_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.v_proj.weight")?,
+        o_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.o_proj.weight")?,
+        q_norm_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.q_norm.weight")?,
+        k_norm_w: load_to_gpu(store, ordinal, "mtp.layers.0.self_attn.k_norm.weight")?,
+        gate_w: load_to_gpu(store, ordinal, "mtp.layers.0.mlp.gate.weight")?,
+        gate_up_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.mlp.experts.gate_up_proj")?,
+        down_proj_w: load_to_gpu(store, ordinal, "mtp.layers.0.mlp.experts.down_proj")?,
+        shared_gate_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        )?,
+        shared_up_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        )?,
+        shared_down_proj_w: load_to_gpu(
+            store,
+            ordinal,
+            "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        )?,
+        shared_expert_gate_w: load_to_gpu(
+            store,
+            ordinal,
+            "mtp.layers.0.mlp.shared_expert_gate.weight",
+        )?,
+        kv_cache,
+    }))
+}
+
 /// Look up one row of the embedding table on the host. For the
 /// "first decode token" smoke path we use token 0 (or BOS if defined) so
 /// the path runs end-to-end without a tokenizer. The full embed_tokens
@@ -1007,6 +1129,7 @@ fn decode_text(
     max_new: usize,
     sampling: SamplingParams,
     emit_stage_timings: bool,
+    speculative_decode: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1108,6 +1231,51 @@ fn decode_text(
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
     }
+
+    // Phase 6 self-speculative decode: load the multi-token-prediction
+    // (MTP) head from the bake when --speculative-decode is set.
+    //
+    // The buffers cost ~1.6 GiB BF16 + a per-MTP-layer KV cache, which
+    // matters on memory-tight 24 GiB configs (the 17 GiB INT4 base bake
+    // already fills most of VRAM; an extra 1.6 GiB unused buffer can
+    // tip larger context_size / max_new runs into OOM). So we only load
+    // when the user opts in via `--speculative-decode`. When the flag
+    // isn't set, MTP weights are skipped entirely — production decode
+    // gets the full VRAM headroom.
+    //
+    // The loader still returns Ok(None) gracefully if the bake is pre-
+    // PR-#84 and lacks mtp.* tensors. Erroring out loudly when the user
+    // explicitly asked for speculative decode but the bake can't support
+    // it is the right move — silent fallback to non-speculative would
+    // hide the bake-staleness from a downstream perf-sensitive user.
+    //
+    // Phase 6.2c+ wires the consumer side into the decode loop.
+    let _mtp_buffers = if speculative_decode {
+        match load_mtp_buffers(&store, ordinal, &geom, kv_max_t)
+            .context("load MTP head from bake")?
+        {
+            Some(mtp) => {
+                println!(
+                    "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
+                     weights ready, draft/verify path NOT YET WIRED in \
+                     this build (Phase 6.2c+ will land it). Decode \
+                     behaviour and throughput are unchanged from the \
+                     non-speculative path until then."
+                );
+                Some(mtp)
+            }
+            None => {
+                anyhow::bail!(
+                    "--speculative-decode requested but the bake doesn't \
+                     include mtp.* tensors. Re-bake against the post-#84 \
+                     `oracle/bake_int4.py`, or pull the new release tarball \
+                     once the producer workflow at GitHub issue #87 lands."
+                );
+            }
+        }
+    } else {
+        None
+    };
 
     // Upload final_norm + dequantized lm_head to the GPU once. The
     // GPU lm_head kernel (`qwen36_moe::lm_head_launch`) does
