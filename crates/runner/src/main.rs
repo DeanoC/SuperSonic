@@ -1258,16 +1258,23 @@ fn main() -> Result<()> {
                 | ModelVariant::Phi4_Mini
         ) {
             anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
+                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B BF16/INT4/FP8-runtime, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
             );
         }
-        if (cli.fp8_runtime && !matches!(model_variant, ModelVariant::Phi4_Mini))
+        let qwen35_model = matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_0_8B
+                | ModelVariant::Qwen3_5_2B
+                | ModelVariant::Qwen3_5_4B
+                | ModelVariant::Qwen3_5_9B
+        );
+        if (cli.fp8_runtime && !(qwen35_model || matches!(model_variant, ModelVariant::Phi4_Mini)))
             || cli.kv_fp8
             || cli.q4km
             || cli.q4km_gptq
         {
             anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only BF16 and INT4 Qwen3.5 lanes, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
+                "HIP gfx942 bring-up currently validates only BF16/INT4/FP8-runtime Qwen3.5 lanes, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
             );
         }
         if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B) && !cli.int4 {
