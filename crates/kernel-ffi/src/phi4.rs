@@ -212,6 +212,8 @@ extern "C" {
         batch_size: usize,
         batch_descs: *const Phi4BatchSeqDesc,
         int4_scales: *const Phi4INT4ScaleDesc,
+        layer_trace: *mut f32,
+        layer_trace_components: usize,
     ) -> c_int;
 }
 
@@ -252,6 +254,8 @@ extern "C" {
         batch_size: usize,
         batch_descs: *const Phi4BatchSeqDesc,
         int4_scales: *const Phi4INT4ScaleDesc,
+        layer_trace: *mut f32,
+        layer_trace_components: usize,
     ) -> c_int;
 }
 
@@ -368,6 +372,8 @@ pub fn persistent_decode(
     batch_size: usize,
     batch_descs: Option<&GpuBuffer>,
     int4_scale_descs: Option<&GpuBuffer>,
+    layer_trace: Option<&mut GpuBuffer>,
+    layer_trace_components: usize,
 ) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
@@ -391,6 +397,9 @@ pub fn persistent_decode(
     let int4_ptr = int4_scale_descs
         .map(|b| b.as_ptr() as *const Phi4INT4ScaleDesc)
         .unwrap_or(std::ptr::null());
+    let layer_trace_ptr = layer_trace
+        .map(|b| b.as_mut_ptr() as *mut f32)
+        .unwrap_or(std::ptr::null_mut());
 
     let status = match backend {
         Backend::Hip => {
@@ -418,6 +427,8 @@ pub fn persistent_decode(
                     batch_size,
                     batch_descs_ptr,
                     int4_ptr,
+                    layer_trace_ptr,
+                    layer_trace_components,
                 )
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -452,6 +463,8 @@ pub fn persistent_decode(
                     batch_size,
                     batch_descs_ptr,
                     int4_ptr,
+                    layer_trace_ptr,
+                    layer_trace_components,
                 )
             }
             #[cfg(not(supersonic_backend_cuda))]

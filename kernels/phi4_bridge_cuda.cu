@@ -68,7 +68,9 @@ int persistent_decode_phi4_device(
     const void* kv_fp8_descs,
     int batch_size,
     const void* batch_descs,
-    const void* int4_scales
+    const void* int4_scales,
+    float* layer_trace,
+    int layer_trace_components
 ) {
     ScopedHipDevice scoped(device_ordinal);
 
@@ -109,7 +111,9 @@ int persistent_decode_phi4_device(
         static_cast<const Phi4KVCacheFp8Desc*>(kv_fp8_descs),
         batch_size,
         static_cast<const Phi4BatchSeqDesc*>(batch_descs),
-        static_cast<const Phi4INT4ScaleDesc*>(int4_scales));
+        static_cast<const Phi4INT4ScaleDesc*>(int4_scales),
+        layer_trace,
+        layer_trace_components);
     cudaError_t launch_err = cudaGetLastError();
     cudaError_t sync_err = cudaDeviceSynchronize();
     if (launch_err != cudaSuccess) return 254;
@@ -142,7 +146,9 @@ extern "C" int phi4_cuda_persistent_decode(
     const void* kv_fp8_descs,
     size_t batch_size,
     const void* batch_descs,
-    const void* int4_scales) {
+    const void* int4_scales,
+    float* layer_trace,
+    size_t layer_trace_components) {
     switch (dtype) {
     case 2:
         return persistent_decode_phi4_device<__nv_bfloat16>(
@@ -160,7 +166,9 @@ extern "C" int phi4_cuda_persistent_decode(
             kv_fp8_descs,
             static_cast<int>(batch_size),
             batch_descs,
-            int4_scales);
+            int4_scales,
+            layer_trace,
+            static_cast<int>(layer_trace_components));
     default:
         return 256;
     }

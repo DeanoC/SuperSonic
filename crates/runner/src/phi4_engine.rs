@@ -402,6 +402,7 @@ pub fn run_phi4(
     }
     let debug_dump_hidden = std::env::var("SUPERSONIC_PHI4_DUMP_HIDDEN").ok();
     let debug_dump_layer_components = std::env::var("SUPERSONIC_PHI4_DUMP_LAYER_COMPONENTS").ok();
+    let debug_dump_layer_trace = std::env::var("SUPERSONIC_PHI4_DUMP_LAYER_TRACE").ok();
     let debug_dump_logits = std::env::var("SUPERSONIC_PHI4_DUMP_LOGITS").ok();
     let debug_dump_direct_argmax = std::env::var("SUPERSONIC_PHI4_DUMP_DIRECT_ARGMAX").ok();
     let cuda_argmax_f32_accum = std::env::var_os("SUPERSONIC_PHI4_CUDA_ARGMAX_F32ACCUM").is_some();
@@ -447,6 +448,20 @@ pub fn run_phi4(
         .map_err(|e| anyhow!("alloc normed_buf: {e}"))?;
     let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[config.vocab_size])
         .map_err(|e| anyhow!("alloc logits_buf: {e}"))?;
+    const PHI4_TRACE_COMPONENTS: usize = 10;
+    let layer_trace_floats = PHI4_TRACE_COMPONENTS * hidden_size + 3 * intermediate_size;
+    let mut layer_trace_buf = if debug_dump_layer_trace.is_some() {
+        Some(
+            GpuBuffer::zeros(
+                ordinal,
+                ScalarType::F32,
+                &[num_layers * layer_trace_floats],
+            )
+            .map_err(|e| anyhow!("alloc layer_trace_buf: {e}"))?,
+        )
+    } else {
+        None
+    };
 
     eprintln!(
         "[phi4] workspace_floats={} (proj_buf={} attn_scratch={} kv_max_cap={})",
@@ -587,6 +602,10 @@ pub fn run_phi4(
             .map_err(|e| anyhow!("clear workspace at step {step}: {e}"))?;
         gpu_hal::memset_zeros(ordinal, sync_buf.as_mut_ptr(), sync_buf.len_bytes())
             .map_err(|e| anyhow!("reset sync_buf at step {step}: {e}"))?;
+        if let Some(trace) = layer_trace_buf.as_mut() {
+            gpu_hal::memset_zeros(ordinal, trace.as_mut_ptr(), trace.len_bytes())
+                .map_err(|e| anyhow!("clear layer_trace_buf at step {step}: {e}"))?;
+        }
 
         let debug_component_kernel_input =
             if debug_dump_layer_components.is_some() && step == prompt_ids.len() - 1 {
@@ -627,8 +646,74 @@ pub fn run_phi4(
             1,
             None,
             int4_scale_device.as_ref(),
+            if debug_dump_layer_trace.is_some() && step == prompt_ids.len() - 1 {
+                layer_trace_buf.as_mut()
+            } else {
+                None
+            },
+            PHI4_TRACE_COMPONENTS,
         )
         .map_err(|e| anyhow!("phi4 persistent_decode at step {step}: {e}"))?;
+
+        if let (Some(ref path), Some(trace_buf)) =
+            (&debug_dump_layer_trace, layer_trace_buf.as_ref())
+        {
+            if step == prompt_ids.len() - 1 {
+                let trace_bytes = trace_buf
+                    .to_host_bytes()
+                    .map_err(|e| anyhow!("debug layer trace D2H at step {step}: {e}"))?;
+                let trace_f32: Vec<f32> = trace_bytes
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let mut layers_json = Vec::with_capacity(launch_layers);
+                for layer in 0..launch_layers {
+                    let base = layer * layer_trace_floats;
+                    layers_json.push(serde_json::json!({
+                        "layer": layer + 1,
+                        "layer_input": &trace_f32[base..base + hidden_size],
+                        "post_attn_hidden": &trace_f32[base + hidden_size..base + 2 * hidden_size],
+                        "post_attn_normed": &trace_f32[base + 2 * hidden_size..base + 3 * hidden_size],
+                        "mlp_out": &trace_f32[base + 3 * hidden_size..base + 4 * hidden_size],
+                        "final_hidden": &trace_f32[base + 4 * hidden_size..base + 5 * hidden_size],
+                        "gate_up": &trace_f32[base + 5 * hidden_size..base + 5 * hidden_size + intermediate_size],
+                        "gate_raw": &trace_f32[base + 5 * hidden_size + intermediate_size..base + 5 * hidden_size + 2 * intermediate_size],
+                        "up_raw": &trace_f32[base + 5 * hidden_size + 2 * intermediate_size..base + 5 * hidden_size + 3 * intermediate_size],
+                        "attn_flat": &trace_f32[base + 5 * hidden_size + 3 * intermediate_size..base + 6 * hidden_size + 3 * intermediate_size],
+                        "down_raw": &trace_f32[base + 6 * hidden_size + 3 * intermediate_size..base + 7 * hidden_size + 3 * intermediate_size],
+                        "q_raw": &trace_f32[base + 7 * hidden_size + 3 * intermediate_size..base + 8 * hidden_size + 3 * intermediate_size],
+                        "k_raw": &trace_f32[base + 8 * hidden_size + 3 * intermediate_size..base + 8 * hidden_size + 3 * intermediate_size + config.num_key_value_heads * config.head_dim()],
+                        "v_raw": &trace_f32[base + 9 * hidden_size + 3 * intermediate_size..base + 9 * hidden_size + 3 * intermediate_size + config.num_key_value_heads * config.head_dim()],
+                    }));
+                }
+                let payload = serde_json::json!({
+                    "step": step,
+                    "prompt_tokens": prompt_ids.len(),
+                    "layers": launch_layers,
+                    "components": [
+                        "layer_input",
+                        "post_attn_hidden",
+                        "post_attn_normed",
+                        "attn_flat",
+                        "gate_raw",
+                        "up_raw",
+                        "gate_up",
+                        "down_raw",
+                        "q_raw",
+                        "k_raw",
+                        "v_raw",
+                        "mlp_out",
+                        "final_hidden",
+                    ],
+                    "hidden_size": hidden_size,
+                    "intermediate_size": intermediate_size,
+                    "layer_trace": layers_json,
+                });
+                std::fs::write(path, serde_json::to_vec(&payload)?)
+                    .map_err(|e| anyhow!("write layer trace dump {path}: {e}"))?;
+                eprintln!("[phi4-debug] wrote layer trace dump to {path}");
+            }
+        }
 
         if let Some(ref path) = debug_dump_hidden {
             if step == prompt_ids.len() - 1 {
