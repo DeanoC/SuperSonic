@@ -42,6 +42,9 @@ use runner::qwen36_moe_mtp::{
     alloc_mtp_chain_scratch, alloc_mtp_forward_scratch, run_mtp_draft_chain,
     run_mtp_draft_step, run_mtp_layer_step,
 };
+use runner::qwen36_moe_speculative::{
+    run_speculative_decode_step, SpeculativeStepResult,
+};
 use safetensors::SafeTensors;
 use serde_json::Value;
 
@@ -599,4 +602,150 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
             /* max_abs */ 1.0, /* cos_sim_floor */ 0.999,
         );
     }
+}
+
+/// Phase 6.3c integration test: validate `run_speculative_decode_step`
+/// orchestration end-to-end using the real MTP chain on the loaded
+/// `mtp.*` weights, plus a controlled mock `base_step` closure that
+/// returns canned predictions. The mock is what makes this testable
+/// on the local 24 GiB box without needing the full ~17 GiB INT4 base
+/// model loaded — we just need to confirm the driver's verify loop +
+/// accept-prefix logic produces the right `emitted_tokens` for known
+/// mock-prediction patterns.
+///
+/// Three passes cover the three accept-prefix outcomes:
+///   - Pass 1: mock agrees with all drafts → full-accept + bonus.
+///   - Pass 2: mock disagrees on draft index 1 → partial-accept.
+///   - Pass 3: mock disagrees immediately → zero-accept.
+#[test]
+fn qwen36_moe_speculative_driver_orchestration() {
+    if !is_backend_compiled(Backend::Hip) {
+        eprintln!("skip: HIP backend not compiled");
+        return;
+    }
+    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MTP_ORACLE_JSON") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
+        return;
+    };
+    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+        return;
+    };
+    let model_dir = PathBuf::from(model_dir);
+
+    let raw = std::fs::read_to_string(&json_path).expect("read mtp oracle json");
+    let json: Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
+    let geom = parse_geom(&json);
+    let base_seq_len = json["base_seq_len"].as_i64().unwrap() as i32;
+    let base_next_token_id = json["base_next_token_id"].as_i64().unwrap() as u32;
+    let h_base_bytes = b64(json["h_base_step0_bf16"].as_str().unwrap());
+    let want_drafts: Vec<u32> = json["draft_token_ids"]
+        .as_array().expect("draft_token_ids")
+        .iter().map(|v| v.as_u64().expect("u64") as u32).collect();
+    let k = want_drafts.len();
+    eprintln!("[spec] K={k} oracle drafts={want_drafts:?}");
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+
+    eprintln!("[spec] loading mtp.* + embed_tokens + tied lm_head ...");
+    let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
+    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, k.max(1))
+        .expect("load mtp buffers");
+    let embed_w = shards
+        .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
+        .expect("load embed_tokens.weight");
+    let lm_head_w = shards
+        .load_bf16_to_gpu(ordinal, "lm_head.weight")
+        .expect("load lm_head.weight");
+
+    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, k.max(1))
+        .expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
+        .expect("alloc chain scratch");
+
+    let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
+
+    // ---- Pass 1: full-accept ----
+    let bonus_token_pass1: u32 = 999;
+    let mut step_idx = 0usize;
+    let want_drafts_p1 = want_drafts.clone();
+    let synth_fh_p1 = synth_fh.clone();
+    let base_step_p1 = move |_pos: i32, _input: u32|
+        -> anyhow::Result<(u32, Vec<u8>)>
+    {
+        let predicted = if step_idx < want_drafts_p1.len() {
+            want_drafts_p1[step_idx]
+        } else {
+            bonus_token_pass1
+        };
+        step_idx += 1;
+        Ok((predicted, synth_fh_p1.clone()))
+    };
+    eprintln!("[spec] pass 1 (full-accept)");
+    let r1 = run_speculative_decode_step(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        base_step_p1,
+    ).expect("pass 1 run");
+    let mut want1 = want_drafts.clone();
+    want1.push(bonus_token_pass1);
+    assert_eq!(r1.emitted_tokens, want1);
+    assert_eq!(r1.n_accepted, k);
+    eprintln!("[spec] pass 1: emitted={:?} n_accepted={}", r1.emitted_tokens, r1.n_accepted);
+
+    // ---- Pass 2: partial-accept (k>=2 only) ----
+    if k >= 2 {
+        let bad_pred: u32 = 12345;
+        let mut step_idx = 0usize;
+        let first_match = want_drafts[0];
+        let synth_fh_p2 = synth_fh.clone();
+        let base_step_p2 = move |_pos: i32, _input: u32|
+            -> anyhow::Result<(u32, Vec<u8>)>
+        {
+            let predicted = if step_idx == 0 { first_match } else { bad_pred };
+            step_idx += 1;
+            Ok((predicted, synth_fh_p2.clone()))
+        };
+        eprintln!("[spec] pass 2 (reject at k=1)");
+        let r2 = run_speculative_decode_step(
+            ordinal, &geom, &mut mtp,
+            &mut forward_scratch, &mut chain_scratch,
+            &embed_w, &lm_head_w,
+            &h_base_bytes, base_next_token_id, base_seq_len, k,
+            base_step_p2,
+        ).expect("pass 2 run");
+        assert_eq!(r2.emitted_tokens, vec![want_drafts[0], bad_pred]);
+        assert_eq!(r2.n_accepted, 1);
+        eprintln!("[spec] pass 2: emitted={:?} n_accepted={}", r2.emitted_tokens, r2.n_accepted);
+    } else {
+        eprintln!("[spec] pass 2 skipped (K={k} too small)");
+    }
+
+    // ---- Pass 3: zero-accept (immediate reject) ----
+    let bad_pred: u32 = 67890;
+    let synth_fh_p3 = synth_fh.clone();
+    let base_step_p3 = move |_pos: i32, _input: u32|
+        -> anyhow::Result<(u32, Vec<u8>)>
+    {
+        Ok((bad_pred, synth_fh_p3.clone()))
+    };
+    eprintln!("[spec] pass 3 (reject at k=0)");
+    let r3 = run_speculative_decode_step(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        base_step_p3,
+    ).expect("pass 3 run");
+    assert_eq!(r3.emitted_tokens, vec![bad_pred]);
+    assert_eq!(r3.n_accepted, 0);
+    eprintln!("[spec] pass 3: emitted={:?} n_accepted={}", r3.emitted_tokens, r3.n_accepted);
+
+    // The driver should produce a final-hidden buffer of the right size
+    // regardless of which pass ran.
+    assert_eq!(r3.final_hidden_bytes.len(), (geom.hidden as usize) * 2);
+    let _ = SpeculativeStepResult { ..r3 };
 }
