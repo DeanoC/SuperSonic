@@ -40,8 +40,7 @@ Four backend surfaces are validated today:
   (40 layers, 256 experts, top-8 routing, ~3B active per token; HF
   release ships in FP8). The published source weights total ~64 GiB
   on disk, so BF16 cannot run inside 24 GiB. INT4-GPTQ is the only
-  HIP lane: the bake is ~16.9 GiB on-disk and ~21 GiB at runtime (KV
-  + scratch). Calibration needs more host RAM than typical 7900 XTX
+  HIP lane: the bake is ~16.9 GiB on-disk and ~21 GiB at runtime (KV and scratch). Calibration needs more host RAM than typical 7900 XTX
   rigs carry, so consumers pull the published bake from GitHub
   releases (see [docs/bake-distribution.md](docs/bake-distribution.md));
   producer workflow is unchanged. `--fp8-runtime` and `--kv-fp8` are
