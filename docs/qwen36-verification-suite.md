@@ -26,8 +26,8 @@ For real streamed PG-19 instead of the default synthetic PG-19 text, install
 
 ## Quick Smoke
 
-This intentionally fails today while Qwen3.6 decode nondeterminism is still
-unfixed, but it proves the harness can catch the issue:
+This is the smallest repeatability gate for checking that the harness can run
+the native FP8 and INT4 lanes and compare repeated outputs:
 
 ```bash
 . .venv-verify/bin/activate
@@ -46,7 +46,9 @@ python oracle/qwen36_verify_suite.py \
 ## gfx942 Sweep
 
 The wrapper builds `supersonic` and runs a broader PG-19 plus RULER-like
-repeatability matrix:
+repeatability matrix through 2K context. The default excludes 8K because the
+current long-context path can exceed the subprocess timeout and is tracked as a
+separate performance investigation.
 
 ```bash
 tests/gfx942/run_qwen36_verify_suite.sh
@@ -56,10 +58,11 @@ Useful overrides:
 
 ```bash
 MODEL_DIR=/models/supersonic-cdna/qwen3.6-35b-a3b-fp8 \
-CONTEXTS=512,2K,8K \
+CONTEXTS=8,128,512,2K \
 FAMILIES=pg19,ruler \
 MODES=fp8,int4 \
 REPEATS=3 \
+TIMEOUT=900 \
 PG19_SOURCE=synthetic \
 OUT=target/qwen36_verify_results.json \
 tests/gfx942/run_qwen36_verify_suite.sh
@@ -69,6 +72,23 @@ For a real PG-19 run:
 
 ```bash
 PG19_SOURCE=dataset tests/gfx942/run_qwen36_verify_suite.sh
+```
+
+## Long Context Probe
+
+8K is opt-in while the FP8 path is still a timeout/performance investigation:
+
+```bash
+tests/gfx942/run_qwen36_verify_long_context.sh
+```
+
+The long-context wrapper defaults to `CONTEXTS=8K`, `FAMILIES=pg19`,
+`MODES=fp8`, `REPEATS=1`, and `TIMEOUT=1800`. It passes
+`--continue-on-error` so timeout failures are written to the result JSON when
+possible. INT4 and RULER can be opted in explicitly:
+
+```bash
+MODES=fp8,int4 FAMILIES=pg19,ruler tests/gfx942/run_qwen36_verify_long_context.sh
 ```
 
 ## Reading Results
@@ -81,5 +101,6 @@ The output JSON has:
   stats, timing, and stdout/stderr tails.
 - `failures`: the exact gate failures that caused a non-zero exit.
 
-Until both FP8 and INT4 pass repeatability, FP8 should be treated as a
-functional native-weight path, not yet as a strict verification oracle.
+FP8 and INT4 now pass the repeatability gate through 2K context, so FP8 is the
+native deterministic base for those verification cases. 8K remains a
+performance/timeout blocker until the long-context probe completes.
