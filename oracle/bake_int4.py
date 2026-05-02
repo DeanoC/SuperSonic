@@ -32,6 +32,7 @@ import gc
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1213,6 +1214,278 @@ def load_raw_tensor(model_dir: Path, name: str) -> torch.Tensor | None:
     return None
 
 
+class RawTensorLoader:
+    def __init__(self, model_dir: Path):
+        from safetensors import safe_open
+
+        self.model_dir = model_dir
+        self.safe_open = safe_open
+        index = model_dir / "model.safetensors.index.json"
+        if index.exists():
+            idx = json.loads(index.read_text())
+            self.weight_map: dict[str, str] = dict(idx["weight_map"])
+        else:
+            self.weight_map = {}
+            for p in [model_dir / "model.safetensors", *model_dir.glob("model*.safetensors")]:
+                if not p.exists():
+                    continue
+                with safe_open(str(p), framework="pt", device="cpu") as f:
+                    for k in f.keys():
+                        self.weight_map[k] = p.name
+        self._handles: dict[str, Any] = {}
+
+    def get(self, name: str) -> torch.Tensor | None:
+        shard = self.weight_map.get(name)
+        if shard is None:
+            return None
+        handle = self._handles.get(shard)
+        if handle is None:
+            handle = self.safe_open(str(self.model_dir / shard), framework="pt", device="cpu")
+            self._handles[shard] = handle
+        return handle.get_tensor(name)
+
+
+def dequant_fp8_blocks(
+    w: torch.Tensor,
+    scale_inv: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    if w.dim() != 2 or scale_inv.dim() != 2:
+        raise ValueError(
+            f"FP8 dequant expects 2D tensors, got weight={tuple(w.shape)} "
+            f"scale={tuple(scale_inv.shape)}"
+        )
+    rows, cols = w.shape
+    scale_rows, scale_cols = scale_inv.shape
+    out = torch.empty((rows, cols), dtype=torch.bfloat16)
+    w_f = w.to(torch.float32)
+    s_f = scale_inv.to(torch.float32)
+    for sr in range(scale_rows):
+        r0 = sr * block_size
+        r1 = min(r0 + block_size, rows)
+        for sc in range(scale_cols):
+            c0 = sc * block_size
+            c1 = min(c0 + block_size, cols)
+            out[r0:r1, c0:c1] = (w_f[r0:r1, c0:c1] * s_f[sr, sc]).to(torch.bfloat16)
+    return out
+
+
+def dequant_fp8_tensor(w: torch.Tensor, scale_inv: torch.Tensor) -> torch.Tensor:
+    if w.dim() == 2:
+        return dequant_fp8_blocks(w.detach().cpu(), scale_inv.detach().cpu())
+    if w.dim() == 3 and scale_inv.dim() == 3:
+        return torch.stack(
+            [
+                dequant_fp8_blocks(w[e].detach().cpu(), scale_inv[e].detach().cpu())
+                for e in range(w.shape[0])
+            ],
+            dim=0,
+        )
+    raise ValueError(
+        f"unsupported FP8 dequant shape: weight={tuple(w.shape)} "
+        f"scale={tuple(scale_inv.shape)}"
+    )
+
+
+def _device_map_target(model: nn.Module, name: str) -> str | int | torch.device | None:
+    """Return the Accelerate device-map target for a parameter, if present."""
+    device_map = getattr(model, "hf_device_map", None)
+    if not device_map:
+        return None
+    parts = name.split(".")
+    for i in range(len(parts), -1, -1):
+        prefix = ".".join(parts[:i])
+        if prefix in device_map:
+            return device_map[prefix]
+    return None
+
+
+def _torch_device_from_target(target: str | int | torch.device) -> torch.device | None:
+    if isinstance(target, torch.device):
+        return target
+    if isinstance(target, int):
+        return torch.device("cuda", target)
+    if target == "disk":
+        return None
+    return torch.device(target)
+
+
+def set_module_parameter(model: nn.Module, name: str, value: torch.Tensor) -> bool:
+    parts = name.split(".")
+    module = model
+    for part in parts[:-1]:
+        module = getattr(module, part)
+    old = module._parameters[parts[-1]]
+    if old is not None and old.device.type != "meta":
+        target_device = old.device
+    else:
+        mapped = _device_map_target(model, name)
+        target_device = _torch_device_from_target(mapped) if mapped is not None else None
+    if target_device is None:
+        log(
+            f"[bake-int4] WARNING: {name} is offloaded/meta; leaving FP8 "
+            "parameter in place to preserve Accelerate placement"
+        )
+        return False
+    module._parameters[parts[-1]] = nn.Parameter(
+        value.to(device=target_device, dtype=torch.bfloat16),
+        requires_grad=old.requires_grad if old is not None else False,
+    )
+    return True
+
+
+def load_fused_expert_bf16(
+    model_dir: Path,
+    raw_keys: set[str],
+    raw_base: str,
+    kind: str,
+    loader: RawTensorLoader | None = None,
+) -> torch.Tensor:
+    expert_re = re.compile(rf"^{re.escape(raw_base)}\.(\d+)\.")
+    expert_ids = sorted({
+        int(m.group(1))
+        for k in raw_keys
+        if (m := expert_re.match(k)) is not None
+    })
+    if not expert_ids:
+        raise KeyError(f"no raw experts found under {raw_base}")
+    chunks: list[torch.Tensor] = []
+    for expert_id in expert_ids:
+        base = f"{raw_base}.{expert_id}"
+        if kind == "gate_up_proj":
+            gate = load_raw_tensor_bf16(model_dir, f"{base}.gate_proj.weight", loader)
+            up = load_raw_tensor_bf16(model_dir, f"{base}.up_proj.weight", loader)
+            chunks.append(torch.cat([gate, up], dim=0).unsqueeze(0))
+            del gate, up
+        elif kind == "down_proj":
+            down = load_raw_tensor_bf16(model_dir, f"{base}.down_proj.weight", loader)
+            chunks.append(down.unsqueeze(0))
+            del down
+        else:
+            raise ValueError(f"unknown fused expert kind {kind}")
+    out = torch.cat(chunks, dim=0)
+    del chunks
+    return out
+
+
+def dequantize_remaining_fp8_parameters(
+    model: nn.Module,
+    model_dir: Path,
+    raw_keys: set[str],
+) -> int:
+    named_params = dict(model.named_parameters())
+    loader = RawTensorLoader(model_dir)
+    fp8_names = [name for name, param in named_params.items() if param.dtype == torch.float8_e4m3fn]
+    if fp8_names:
+        log(f"[bake-int4] dequantizing {len(fp8_names)} remaining FP8 parameter(s)")
+    converted = 0
+    processed = 0
+    for name, param in list(named_params.items()):
+        if param.dtype != torch.float8_e4m3fn:
+            continue
+        processed += 1
+        scale = named_params.get(f"{name}_scale_inv")
+        if scale is not None:
+            bf16 = dequant_fp8_tensor(param, scale).to(torch.bfloat16)
+        elif name.endswith(".mlp.experts.gate_up_proj") or name.endswith(".mlp.experts.down_proj"):
+            raw_name = name
+            if raw_name.startswith("model.layers."):
+                raw_name = raw_name.replace("model.layers.", "model.language_model.layers.", 1)
+            kind = raw_name.rsplit(".", 1)[1]
+            raw_base = raw_name.rsplit(".", 1)[0]
+            bf16 = load_fused_expert_bf16(model_dir, raw_keys, raw_base, kind, loader)
+        else:
+            log(f"[bake-int4] WARNING: FP8 parameter {name} has no scale_inv; leaving as-is")
+            continue
+        if set_module_parameter(model, name, bf16):
+            converted += 1
+        if converted and (converted % 10 == 0 or processed == len(fp8_names)):
+            log(f"[bake-int4]   dequantized {converted}/{len(fp8_names)} FP8 parameter(s)")
+        del bf16
+    if converted:
+        _release_host_memory()
+    return converted
+
+
+def load_raw_tensor_bf16(
+    model_dir: Path,
+    name: str,
+    loader: RawTensorLoader | None = None,
+) -> torch.Tensor:
+    t = loader.get(name) if loader is not None else load_raw_tensor(model_dir, name)
+    if t is None:
+        raise KeyError(f"raw tensor not found: {name}")
+    scale_name = f"{name}_scale_inv"
+    scale = loader.get(scale_name) if loader is not None else load_raw_tensor(model_dir, scale_name)
+    if scale is not None and t.dim() == 2:
+        return dequant_fp8_blocks(t, scale)
+    return t.to(torch.bfloat16)
+
+
+def stream_mtp_tensors(
+    writer: "StreamingPackageWriter",
+    model_dir: Path,
+    raw_keys: set[str],
+) -> int:
+    """Stream Qwen3.6 MoE MTP tensors in runtime layout.
+
+    HF stores the MTP MoE experts as per-expert `gate_proj`/`up_proj`/
+    `down_proj` FP8 tensors. Runtime code uses the same fused expert layout as
+    the main decoder layers: one `[E, 2*moe_int, hidden]` gate/up slab and one
+    `[E, hidden, moe_int]` down slab.
+    """
+    expert_re = re.compile(r"^mtp\.layers\.0\.mlp\.experts\.(\d+)\.")
+    passthrough = sorted(
+        k for k in raw_keys
+        if k.startswith("mtp.")
+        and not k.endswith("_scale_inv")
+        and expert_re.match(k) is None
+    )
+    loader = RawTensorLoader(model_dir)
+    written = 0
+    for raw_name in passthrough:
+        if writer.has(raw_name):
+            continue
+        t = load_raw_tensor_bf16(model_dir, raw_name, loader).detach().to(device="cpu")
+        b = bf16_to_bytes(t)
+        writer.write_tensor(raw_name, b, list(t.shape), "bf16", LAYOUT_RAW)
+        written += 1
+        del t, b
+
+    expert_ids = sorted({
+        int(m.group(1))
+        for k in raw_keys
+        if (m := expert_re.match(k)) is not None
+    })
+    if expert_ids:
+        gate_up_chunks: list[torch.Tensor] = []
+        down_chunks: list[torch.Tensor] = []
+        for expert_id in expert_ids:
+            base = f"mtp.layers.0.mlp.experts.{expert_id}"
+            gate = load_raw_tensor_bf16(model_dir, f"{base}.gate_proj.weight", loader)
+            up = load_raw_tensor_bf16(model_dir, f"{base}.up_proj.weight", loader)
+            down = load_raw_tensor_bf16(model_dir, f"{base}.down_proj.weight", loader)
+            gate_up_chunks.append(torch.cat([gate, up], dim=0).unsqueeze(0))
+            down_chunks.append(down.unsqueeze(0))
+            del gate, up, down
+
+        fused_specs = [
+            ("mtp.layers.0.mlp.experts.gate_up_proj", torch.cat(gate_up_chunks, dim=0)),
+            ("mtp.layers.0.mlp.experts.down_proj", torch.cat(down_chunks, dim=0)),
+        ]
+        for raw_name, fused in fused_specs:
+            if writer.has(raw_name):
+                continue
+            b = bf16_to_bytes(fused)
+            writer.write_tensor(raw_name, b, list(fused.shape), "bf16", LAYOUT_RAW)
+            written += 1
+            del fused, b
+        del gate_up_chunks, down_chunks
+
+    _release_host_memory()
+    return written
+
+
 def _build_name_map(hf_keys: list[str], raw_keys: set[str]) -> dict[str, str]:
     """
     Map each HF state-dict name to its safetensors name. HF flattens some
@@ -1395,15 +1668,28 @@ def main() -> None:
             "model. Use a CUDA/ROCm GPU if available.")
 
     # --- Load model + tokenizer ---
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     log(f"[bake-int4] loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     log(f"[bake-int4] loading model (bf16) from {model_dir}")
+    raw_keys = _load_raw_tensor_names(model_dir)
 
     load_kwargs: dict[str, Any] = {
         "torch_dtype": torch.bfloat16,
         "trust_remote_code": True,
     }
+    hf_config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+    quant_cfg = getattr(hf_config, "quantization_config", None)
+    quant_method = (
+        quant_cfg.get("quant_method")
+        if isinstance(quant_cfg, dict)
+        else getattr(quant_cfg, "quant_method", None)
+    )
+    if quant_method == "fp8":
+        from transformers import FineGrainedFP8Config
+
+        load_kwargs["quantization_config"] = FineGrainedFP8Config(dequantize=True)
+        log("[bake-int4] source checkpoint is FP8; dequantizing to BF16 at load")
     if args.device_map:
         load_kwargs["device_map"] = args.device_map
         log(f"[bake-int4] device_map={args.device_map!r}")
@@ -1421,6 +1707,9 @@ def main() -> None:
         log(f"[bake-int4] offload_folder={args.offload_folder}")
 
     model = AutoModelForCausalLM.from_pretrained(str(model_dir), **load_kwargs)
+    converted_fp8 = dequantize_remaining_fp8_parameters(model, model_dir, raw_keys)
+    if converted_fp8:
+        log(f"[bake-int4] dequantized {converted_fp8} remaining FP8 parameter(s) to BF16")
     if args.device_map is None:
         model = model.to(device)
     model.eval()
@@ -1429,7 +1718,6 @@ def main() -> None:
     # safetensors key set. HuggingFace's AutoModelForCausalLM may flatten
     # nested modules (e.g. drop ".language_model." for Qwen3.5), so the
     # state_dict names don't always match what the Rust loader expects.
-    raw_keys = _load_raw_tensor_names(model_dir)
     # Anchor the prefix on ".embed_tokens.weight" — some checkpoints also
     # include an "mtp.layers.*" multi-token-prediction module, so matching
     # on ".layers.0." alone picks the wrong one.
@@ -1447,6 +1735,12 @@ def main() -> None:
     if weight_prefix is None:
         raise SystemExit("could not infer weight prefix from safetensors keys")
     log(f"[bake-int4] canonical weight prefix (from safetensors): {weight_prefix!r}")
+    model_family = (
+        "qwen36-moe"
+        if any(".mlp.experts." in k for k in raw_keys)
+        else "qwen35"
+    )
+    log(f"[bake-int4] model_family={model_family!r}")
 
     # Avoid `model.state_dict()` here — under `device_map="auto"` it gathers
     # every offloaded param onto CPU at once, which on a 35B model easily
@@ -1534,7 +1828,7 @@ def main() -> None:
     # `__exit__` closes the file handle but skips manifest emission so a
     # downstream bake-consumer can't accidentally read a half-written package
     # as if it were complete.
-    with StreamingPackageWriter(out_dir, model_family="qwen35") as writer:
+    with StreamingPackageWriter(out_dir, model_family=model_family) as writer:
         # --- GPTQ ---
         t0 = time.perf_counter()
         stats = quantize_model(
@@ -1613,29 +1907,9 @@ def main() -> None:
         # raw BF16 — no INT4 calibration this round; the MTP block is
         # one layer's worth of compute and BF16 vs INT4 is a wash for
         # speculative-decode draft pass throughput.
-        mtp_raw_keys = sorted(
-            k for k in raw_keys if k.startswith("mtp.")
-        )
-        for raw_name in mtp_raw_keys:
-            if writer.has(raw_name):
-                continue
-            t = load_raw_tensor(model_dir, raw_name)
-            if t is None:
-                log(f"[bake-int4] WARNING mtp passthrough: failed to load "
-                    f"{raw_name} — skipping")
-                continue
-            t = t.detach().to(device="cpu")
-            shape = list(t.shape)
-            # MTP tensors don't match any of `classify_tensor`'s
-            # weight_prefix.layers.* patterns, so they fall through to
-            # LAYOUT_RAW. Explicit here for clarity.
-            layout = LAYOUT_RAW
-            dtype_str = torch_dtype_to_str(t.dtype)
-            b, final_shape, final_dtype = apply_layout(t, shape, layout, dtype_str)
-            writer.write_tensor(raw_name, b, final_shape, final_dtype, layout)
-            del t, b
-        if mtp_raw_keys:
-            log(f"[bake-int4] passed through {len(mtp_raw_keys)} mtp.* "
+        mtp_written = stream_mtp_tensors(writer, model_dir, raw_keys)
+        if mtp_written:
+            log(f"[bake-int4] passed through {mtp_written} mtp.* "
                 f"tensor(s) (BF16 raw)")
 
         # When `lm_head.weight` is tied to `embed_tokens.weight`, the HF state
