@@ -733,6 +733,19 @@ static REGISTRY: &[RegistryEntry] = &[
     },
     RegistryEntry {
         model: ModelVariant::Phi4_Mini,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 8 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Phi4(Phi4KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Phi4_Mini,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
         vram: VramBudget {
@@ -922,6 +935,7 @@ mod tests {
             ModelVariant::Qwen3_6_35B_A3B,
             ModelVariant::Gemma4_E2B,
             ModelVariant::Gemma4_E4B,
+            ModelVariant::Phi4_Mini,
         ] {
             assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx942).is_some());
         }
