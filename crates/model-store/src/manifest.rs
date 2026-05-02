@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 
 pub const FORMAT_VERSION: u32 = 2;
 pub const CONVERTER_VERSION: u32 = 1;
+// Phase 6.1 (this PR) extends the baker to capture `mtp.*` tensors for
+// Qwen3.6-MoE self-speculative decode. The change is purely additive —
+// existing bakes don't have MTP tensors but the production decode path
+// doesn't read them, so the bake is still valid. Bump CONVERTER_VERSION
+// when the runtime starts CONSUMING the MTP weights (Phase 6.2+).
 
 /// Describes the layout transformation applied to a tensor at bake time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

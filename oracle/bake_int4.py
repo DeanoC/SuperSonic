@@ -1603,6 +1603,41 @@ def main() -> None:
         ]
         eligible.sort()
 
+        # ------------------------------------------------------------------
+        # Phase 6.1: pass-through `mtp.*` tensors (multi-token-prediction
+        # head) directly from safetensors. HF's `Qwen3_5MoeForCausalLM`
+        # strips them via `_keys_to_ignore_on_load_unexpected = [r"^mtp.*"]`,
+        # so `named_parameters()` doesn't see them, but the bake reader
+        # (`crates/model-store/src/baker.rs`) does include them in the
+        # raw_keys filter (PR shipped alongside this change). Stored as
+        # raw BF16 — no INT4 calibration this round; the MTP block is
+        # one layer's worth of compute and BF16 vs INT4 is a wash for
+        # speculative-decode draft pass throughput.
+        mtp_raw_keys = sorted(
+            k for k in raw_keys if k.startswith("mtp.")
+        )
+        for raw_name in mtp_raw_keys:
+            if writer.has(raw_name):
+                continue
+            t = load_raw_tensor(model_dir, raw_name)
+            if t is None:
+                log(f"[bake-int4] WARNING mtp passthrough: failed to load "
+                    f"{raw_name} — skipping")
+                continue
+            t = t.detach().to(device="cpu")
+            shape = list(t.shape)
+            # MTP tensors don't match any of `classify_tensor`'s
+            # weight_prefix.layers.* patterns, so they fall through to
+            # LAYOUT_RAW. Explicit here for clarity.
+            layout = LAYOUT_RAW
+            dtype_str = torch_dtype_to_str(t.dtype)
+            b, final_shape, final_dtype = apply_layout(t, shape, layout, dtype_str)
+            writer.write_tensor(raw_name, b, final_shape, final_dtype, layout)
+            del t, b
+        if mtp_raw_keys:
+            log(f"[bake-int4] passed through {len(mtp_raw_keys)} mtp.* "
+                f"tensor(s) (BF16 raw)")
+
         # When `lm_head.weight` is tied to `embed_tokens.weight`, the HF state
         # dict entry usually has no safetensors counterpart and the eligible
         # loop above skips it. But if quantize_model just ran GPTQ on

@@ -176,7 +176,17 @@ pub fn bake_qwen35(
                     && (weight_name.starts_with(&format!("{weight_prefix}."))
                         || weight_name == "lm_head.weight");
             }
-            name.starts_with(&format!("{weight_prefix}.")) || *name == "lm_head.weight"
+            // Phase 6.1: also include `mtp.*` (multi-token prediction
+            // head — used by Qwen3.6 self-speculative decode). The MTP
+            // block in 35B-A3B is structurally one full-attention MoE
+            // layer plus three small fusion layernorms and a fusion
+            // linear (`mtp.fc`). HuggingFace's `Qwen3_5MoeForCausalLM`
+            // strips these (`_keys_to_ignore_on_load_unexpected =
+            // [r"^mtp.*"]`); the bake reads them directly from
+            // safetensors so the runtime can drive a draft pass.
+            name.starts_with(&format!("{weight_prefix}."))
+                || *name == "lm_head.weight"
+                || name.starts_with("mtp.")
         })
         .cloned()
         .collect();
