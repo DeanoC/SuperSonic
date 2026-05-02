@@ -30,19 +30,14 @@
 
 use base64::Engine;
 use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
-use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc,
-    Qwen36MoePersistentGeom,
-};
 use runner::qwen36_moe_decode::{
-    bf16_bytes_to_f32, ffn_workspace_floats, full_attn_workspace_floats, host_final_norm_lm_head,
-    is_full_attn_layer, run_chained_decode, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
-    FullAttnInt4Sidecars, LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom,
+    bf16_bytes_to_f32, host_final_norm_lm_head, is_full_attn_layer, run_chained_decode,
+    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
+    LinearAttnInt4Sidecars, MultiLayerGeom,
 };
+use runner::qwen36_moe_persistent_decode::PersistentScratch;
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
-use std::ffi::c_void;
-use std::os::raw::c_int;
 
 fn b64(input: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -518,7 +513,8 @@ fn multilayer_chained_decode_matches_oracle() {
 // =============================================================================
 // Phase 3e: persistent decode megakernel parity test.
 //
-// Drives `kernel_ffi::qwen36_moe::persistent_decode_launch` with the same
+// Drives the production
+// `runner::qwen36_moe_persistent_decode::PersistentScratch` with the same
 // fixtures the chained-decode test uses, then asserts the final hidden
 // matches the chained path nearly bit-for-bit. The two paths run the
 // IDENTICAL `__device__` phase functions (extracted in Phase 3a-3d) — only
@@ -526,161 +522,12 @@ fn multilayer_chained_decode_matches_oracle() {
 // launches, with `reset_counters_16` between phases inside the
 // megakernel). So the comparison floor is very tight (cos_sim ≥ 0.99999,
 // max_abs ≤ 1e-3).
+//
+// This test also validates the production module's `PersistentScratch`
+// path that the engine's `--persistent-decode` flag (Phase 3e.2) uses —
+// any regression in `build_layer_descs` / `build_int4_descs` /
+// `PersistentScratch::run` here will trip the engine path too.
 // =============================================================================
-
-/// Build the parallel `Qwen36MoeDecodeLayerDesc` array from the live
-/// `Vec<LayerBuffers>`. All weight pointers come straight from the
-/// GpuBuffers; null pointers indicate "tensor stays BF16" (the persistent
-/// kernel reads INT4 sidecars from the parallel `Qwen36MoeInt4ScaleDesc`
-/// array — this struct only carries the `*_w` slot pointers).
-fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLayerDesc> {
-    use std::ptr;
-    let mut descs = Vec::with_capacity(layers.len());
-    for (li, l) in layers.iter_mut().enumerate() {
-        let mut d = Qwen36MoeDecodeLayerDesc::default();
-        d.layer_idx = li as c_int;
-        d.is_full_attention = if l.is_full_attn() { 1 } else { 0 };
-        match &mut l.attn {
-            AttnLayerBuffers::Full {
-                input_norm_w,
-                q_proj_w,
-                k_proj_w,
-                v_proj_w,
-                q_norm_w,
-                k_norm_w,
-                o_proj_w,
-                kv_cache,
-                ..
-            } => {
-                d.input_norm_w = input_norm_w.as_ptr() as *const c_void;
-                d.q_proj_w = q_proj_w.as_ptr() as *const c_void;
-                d.k_proj_w = k_proj_w.as_ptr() as *const c_void;
-                d.v_proj_w = v_proj_w.as_ptr() as *const c_void;
-                d.q_norm_w = q_norm_w.as_ptr() as *const c_void;
-                d.k_norm_w = k_norm_w.as_ptr() as *const c_void;
-                d.o_proj_w = o_proj_w.as_ptr() as *const c_void;
-                if let Some(c) = kv_cache.as_mut() {
-                    d.kv_cache_k = c.k.as_mut_ptr();
-                    d.kv_cache_v = c.v.as_mut_ptr();
-                    d.kv_max_t = c.kv_max_t;
-                }
-            }
-            AttnLayerBuffers::Linear {
-                input_norm_w,
-                in_proj_qkv_w,
-                in_proj_z_w,
-                in_proj_a_w,
-                in_proj_b_w,
-                conv1d_w,
-                dt_bias,
-                a_log,
-                norm_w,
-                out_proj_w,
-                conv_state,
-                recurrent_state,
-                ..
-            } => {
-                d.input_norm_w = input_norm_w.as_ptr() as *const c_void;
-                d.linear_in_proj_qkv_w = in_proj_qkv_w.as_ptr() as *const c_void;
-                d.linear_in_proj_z_w = in_proj_z_w.as_ptr() as *const c_void;
-                d.linear_in_proj_a_w = in_proj_a_w.as_ptr() as *const c_void;
-                d.linear_in_proj_b_w = in_proj_b_w.as_ptr() as *const c_void;
-                d.linear_conv1d_w = conv1d_w.as_ptr() as *const c_void;
-                d.linear_dt_bias = dt_bias.as_ptr() as *const c_void;
-                d.linear_a_log_exp = a_log.as_ptr() as *const c_void;
-                d.linear_norm_w = norm_w.as_ptr() as *const c_void;
-                d.linear_out_proj_w = out_proj_w.as_ptr() as *const c_void;
-                d.linear_conv_state = conv_state.as_mut_ptr();
-                d.linear_recurrent_state = recurrent_state.as_mut_ptr();
-            }
-        }
-        // FFN block.
-        d.post_attn_norm_w = l.ffn.post_attn_norm_w.as_ptr() as *const c_void;
-        d.router_w = l.ffn.gate_w.as_ptr() as *const c_void;
-        d.experts_gate_up_w = l.ffn.gate_up_proj_w.as_ptr() as *const c_void;
-        d.experts_down_w = l.ffn.down_proj_w.as_ptr() as *const c_void;
-        d.shared_expert_gate_proj_w = l.ffn.shared_gate_proj_w.as_ptr() as *const c_void;
-        d.shared_expert_up_proj_w = l.ffn.shared_up_proj_w.as_ptr() as *const c_void;
-        d.shared_expert_down_proj_w = l.ffn.shared_down_proj_w.as_ptr() as *const c_void;
-        d.shared_expert_gate_w = l.ffn.shared_expert_gate_w.as_ptr() as *const c_void;
-        // Geometry fields are duplicated across layers to match the Rust
-        // descriptor struct (the kernel uses the launch-level geometry
-        // constants instead — these are reserved for sanity checks).
-        let _ = ptr::null::<c_void>();
-        descs.push(d);
-    }
-    descs
-}
-
-/// Build the parallel `Qwen36MoeInt4ScaleDesc` array. Returns `None` when
-/// none of the layers carry INT4 sidecars (the BF16 fixture path).
-fn build_int4_descs(layers: &[LayerBuffers]) -> Option<Vec<Qwen36MoeInt4ScaleDesc>> {
-    let any_int4 = layers.iter().any(|l| {
-        let attn_q = match &l.attn {
-            AttnLayerBuffers::Full { int4, .. } => int4.is_some(),
-            AttnLayerBuffers::Linear { int4, .. } => int4.is_some(),
-        };
-        attn_q || l.ffn.int4.is_some()
-    });
-    if !any_int4 {
-        return None;
-    }
-    let mut int4 = Vec::with_capacity(layers.len());
-    for l in layers.iter() {
-        let mut d = Qwen36MoeInt4ScaleDesc::default();
-        match &l.attn {
-            AttnLayerBuffers::Full { int4: Some(s), .. } => {
-                d.q_proj_scale = s.q_proj_scale.as_ptr() as *const c_void;
-                d.q_proj_zero = s.q_proj_zero.as_ptr() as *const c_void;
-                d.k_proj_scale = s.k_proj_scale.as_ptr() as *const c_void;
-                d.k_proj_zero = s.k_proj_zero.as_ptr() as *const c_void;
-                d.v_proj_scale = s.v_proj_scale.as_ptr() as *const c_void;
-                d.v_proj_zero = s.v_proj_zero.as_ptr() as *const c_void;
-                d.o_proj_scale = s.o_proj_scale.as_ptr() as *const c_void;
-                d.o_proj_zero = s.o_proj_zero.as_ptr() as *const c_void;
-                d.group_size = s.group_size;
-            }
-            AttnLayerBuffers::Linear { int4: Some(s), .. } => {
-                d.linear_in_proj_qkv_scale = s.in_proj_qkv_scale.as_ptr() as *const c_void;
-                d.linear_in_proj_qkv_zero = s.in_proj_qkv_zero.as_ptr() as *const c_void;
-                d.linear_in_proj_z_scale = s.in_proj_z_scale.as_ptr() as *const c_void;
-                d.linear_in_proj_z_zero = s.in_proj_z_zero.as_ptr() as *const c_void;
-                d.linear_out_proj_scale = s.out_proj_scale.as_ptr() as *const c_void;
-                d.linear_out_proj_zero = s.out_proj_zero.as_ptr() as *const c_void;
-                d.group_size = s.group_size;
-            }
-            _ => {}
-        }
-        if let Some(s) = &l.ffn.int4 {
-            d.experts_gate_up_scale = s.gate_up_proj_scale.as_ptr() as *const c_void;
-            d.experts_gate_up_zero = s.gate_up_proj_zero.as_ptr() as *const c_void;
-            d.experts_down_scale = s.down_proj_scale.as_ptr() as *const c_void;
-            d.experts_down_zero = s.down_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_gate_proj_scale = s.shared_gate_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_gate_proj_zero = s.shared_gate_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_up_proj_scale = s.shared_up_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_up_proj_zero = s.shared_up_proj_zero.as_ptr() as *const c_void;
-            d.shared_expert_down_proj_scale = s.shared_down_proj_scale.as_ptr() as *const c_void;
-            d.shared_expert_down_proj_zero = s.shared_down_proj_zero.as_ptr() as *const c_void;
-            d.group_size = s.group_size;
-        }
-        int4.push(d);
-    }
-    Some(int4)
-}
-
-/// Upload the descriptor Vec to a device buffer as opaque U8 bytes. Same
-/// pattern as the existing stub-launch test (`hip_stub_launch_walks_descriptor_array`).
-fn upload_descs<T: Sized>(ordinal: usize, descs: &[T], label: &str) -> GpuBuffer {
-    let per = std::mem::size_of::<T>();
-    let mut bytes = Vec::with_capacity(per * descs.len());
-    for d in descs {
-        let p = d as *const T as *const u8;
-        bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(p, per) });
-    }
-    GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], &bytes)
-        .unwrap_or_else(|e| panic!("upload {label}: {e}"))
-}
 
 #[test]
 fn multilayer_persistent_decode_matches_chained() {
@@ -761,74 +608,13 @@ fn multilayer_persistent_decode_matches_chained() {
     restore_linear_attn_state(ordinal, &mut layers, &snapshot)
         .expect("restore_linear_attn_state");
 
-    // ---- Persistent megakernel run ----
-    let descs = build_layer_descs(&mut layers);
-    let int4_descs = build_int4_descs(&layers);
-    let descs_dev = upload_descs(ordinal, &descs, "layer descriptors");
-    let int4_dev = int4_descs
-        .as_ref()
-        .map(|v| upload_descs(ordinal, v, "int4 scale descriptors"));
-
-    let hidden = geom.hidden as usize;
-    let mut hidden_ping = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[hidden],
-        &initial_hidden,
-    )
-    .expect("alloc hidden_ping");
-    let mut hidden_pong =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).expect("alloc hidden_pong");
-
-    let ws_floats = full_attn_workspace_floats(&geom).max(ffn_workspace_floats(&geom));
-    let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ws_floats])
-        .expect("alloc workspace");
-    let mut ffn_topk_idx_scratch =
-        GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
-            .expect("alloc ffn_topk_idx_scratch");
-    let mut sync_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync_buf");
-
-    let pgeom = Qwen36MoePersistentGeom {
-        hidden: geom.hidden,
-        num_heads: geom.num_attention_heads,
-        num_kv_heads: geom.num_kv_heads,
-        head_dim: geom.head_dim,
-        rotary_dim: geom.rotary_dim,
-        num_k_heads: geom.num_k_heads,
-        num_v_heads: geom.num_v_heads,
-        head_k_dim: geom.head_k_dim,
-        head_v_dim: geom.head_v_dim,
-        conv_kernel_dim: geom.conv_kernel_dim,
-        num_experts: geom.num_experts,
-        moe_intermediate: geom.moe_intermediate,
-        shared_intermediate: geom.shared_intermediate,
-        top_k: geom.top_k,
-        rope_theta: geom.rope_theta,
-        rms_norm_eps: geom.rms_norm_eps,
-    };
-
-    persistent_decode_launch(
-        ordinal,
-        ScalarType::BF16,
-        pgeom,
-        position,
-        &descs_dev,
-        int4_dev.as_ref(),
-        geom.num_layers as usize,
-        &mut hidden_ping,
-        &mut hidden_pong,
-        &mut workspace,
-        &mut ffn_topk_idx_scratch,
-        &mut sync_buf,
-    )
-    .expect("persistent_decode_launch");
-
-    // After even num_layers (the synthetic fixture's 4 layers, the prod
-    // 35B-A3B's 40), the final hidden lands back in `hidden_ping`.
-    let persistent_final = hidden_ping
-        .to_host_bytes()
-        .expect("download persistent final hidden");
+    // ---- Persistent megakernel run via the production wrapper ----
+    let mut scratch = PersistentScratch::new(ordinal, &geom, &mut layers)
+        .expect("alloc PersistentScratch");
+    let persistent_outputs = scratch
+        .run(ordinal, &initial_hidden, position)
+        .expect("PersistentScratch::run");
+    let persistent_final = persistent_outputs.final_hidden_bytes;
 
     // The persistent kernel runs the IDENTICAL `__device__` phase
     // functions (full_attn_phase / linear_attn_phase / ffn_phase) the

@@ -12,6 +12,7 @@ mod qwen35_dflash_engine;
 mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod qwen36_moe_mtp;
+mod qwen36_moe_persistent_decode;
 mod qwen36_moe_speculative;
 mod qwen36_moe_state;
 mod registry;
@@ -417,6 +418,26 @@ pub(crate) struct Cli {
     /// Bit-identical greedy output to the per-step path.
     #[arg(long)]
     batched_spec_verify: bool,
+
+    /// Phase 3e.2: route the Qwen3.6-MoE decode chain through the
+    /// persistent megakernel
+    /// (`kernels/qwen36_moe_persistent/persistent_decode.hip`,
+    /// PR #126) instead of the chained per-step launcher.
+    ///
+    /// One cooperative HIP launch processes all 40 layers ({attn or
+    /// linear-attn, FFN}) per token vs. 80 step launches in the
+    /// chained path — recovers ~30 µs × 80 = ~2.4 ms of HIP launch
+    /// overhead per token (~9% of the 27 ms chain time on local
+    /// 7900 XTX bring-up). Bit-identical greedy output to the chained
+    /// path (gated by the
+    /// `multilayer_persistent_decode_matches_chained` parity test).
+    ///
+    /// Currently HIP/qwen3.6-MoE only and only on the non-speculative
+    /// decode path. Combining with `--speculative-decode` falls back to
+    /// the chained path for the verify-loop chains; the persistent path
+    /// gates a follow-up after spec-verify perf is in.
+    #[arg(long)]
+    persistent_decode: bool,
 
     /// Emit the generated suffix as a JSON string for benchmark harnesses.
     #[arg(long)]
