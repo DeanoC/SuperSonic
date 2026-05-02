@@ -1155,6 +1155,37 @@ __device__ inline void g4_block_rms_norm_f32(
     __syncthreads();
 }
 
+template <typename T>
+__device__ inline void g4_block_rms_norm_t_to_f32(
+    float* __restrict__ dst,
+    const T* __restrict__ src,
+    const T* __restrict__ weight,
+    int dim,
+    float eps,
+    float* __restrict__ lds_scratch
+) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    float sq = 0.0f;
+    for (int c = tid; c < dim; c += bs) {
+        const float v = g4_to_float(src[c]);
+        sq += v * v;
+    }
+    lds_scratch[tid] = sq;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) lds_scratch[tid] += lds_scratch[tid + s];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(lds_scratch[0] / static_cast<float>(dim) + eps);
+    const bool has_weight = (weight != nullptr);
+    for (int c = tid; c < dim; c += bs) {
+        const float w = has_weight ? g4_to_float(weight[c]) : 1.0f;
+        dst[c] = g4_to_float(src[c]) * inv * w;
+    }
+    __syncthreads();
+}
+
 // Per-head block RMS norm over a contiguous `[num_heads * head_dim]` F32 buffer.
 // Block 0 walks each head sequentially and normalizes it with the shared
 // `weight[head_dim]` tensor (or null for no-weight v_norm). All threads of the
@@ -3578,20 +3609,15 @@ __device__ void g4_final_norm_lm_head_argmax_body(
     const int bs = blockDim.x;
     const int nb = gridDim.x;
 
-    float* hidden_f32 = workspace;
-    float* normed_f32 = hidden_f32 + hidden_size;
+    float* normed_f32 = workspace;
     float* partial_vals = normed_f32 + hidden_size;
     float* partial_idx_bits = partial_vals + nb;
     float* reduce_idx_bits = partial_idx_bits + nb;
 
     unsigned long long g4_prof = g4_profile_begin(profile_cycles);
     if (blockIdx.x == 0) {
-        for (int c = tid; c < hidden_size; c += bs) {
-            hidden_f32[c] = g4_to_float(hidden_io[c]);
-        }
-        __syncthreads();
-        g4_block_rms_norm_f32<T>(
-            normed_f32, hidden_f32, final_norm_w, hidden_size, eps, lds);
+        g4_block_rms_norm_t_to_f32<T>(
+            normed_f32, hidden_io, final_norm_w, hidden_size, eps, lds);
     }
     g4_grid_barrier(barrier_counter, barrier_flag, nb);
 
