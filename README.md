@@ -120,6 +120,7 @@ see [docs/dflash.md](docs/dflash.md).
 | qwen3.5-2b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-4b       |  ✅  |  ✅  |      ✅     |   ✅   |
 | qwen3.5-9b       |  ✅¹ |  ✅  |      ✅     |   ✅¹  |
+| gemma4-e2b       |  ✅³ |  —   |      —      |    —   |
 | phi4-mini        |  ✅² |  ✅² |      ✅²    |   ⏳²  |
 
 ¹ `qwen3.5-9b` BF16 and KV-FP8 use the `bakes-v2` BF16 release artifact for
@@ -134,12 +135,15 @@ see [docs/dflash.md](docs/dflash.md).
   [docs/phi4-cuda-parity.md](docs/phi4-cuda-parity.md). FP8-runtime uses the
   downloadable FP8-native bake and passes the PyTorch oracle on CUDA. FP8-KV
   has descriptor/kernel hooks but still needs CUDA bake/validation work.
+³ Gemma 4 CUDA v1 is native `gemma4-e2b` BF16 only and requires
+  `--batch-size=1`. `gemma4-e4b`, `--int4`, `--fp8-runtime`, and `--kv-fp8`
+  are intentionally not registered for CUDA yet.
 
 CUDA support is validated on NVIDIA `sm86` hardware (RTX 3090-class) with
 hand-maintained CUDA sources and no generic fallback backend. Qwen3.5 BF16,
 INT4, FP8-runtime, and KV-FP8 lanes are now at parity with the HIP matrix for
-0.8B, 2B, and 4B, and `phi4-mini` BF16/FP8-runtime have native CUDA
-persistent-decode lanes. `phi4-mini` INT4 now matches the kernel-accurate
+0.8B, 2B, and 4B; `gemma4-e2b` BF16 and `phi4-mini` BF16/FP8-runtime have
+native CUDA persistent-decode lanes. `phi4-mini` INT4 now matches the kernel-accurate
 deterministic corpus oracle; the live PyTorch oracle is advisory for that lane
 because BF16 accumulation choices change near-tie generations. The former
 Qwen3.5 9B CUDA artifact gap is closed: BF16, INT4 GPTQ, and FP8-native release

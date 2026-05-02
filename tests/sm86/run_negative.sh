@@ -57,6 +57,18 @@ run_fail() {
     echo ""
 }
 
+run_fail_without() {
+    local label="$1"
+    local expected="$2"
+    local forbidden="$3"
+    shift 3
+    run_fail "$label" "$expected" "$@"
+    if grep -Fq -- "$forbidden" "$TMPOUT"; then
+        echo "FAIL: unexpected error substring found: $forbidden"
+        return 1
+    fi
+}
+
 COMMON_0_8B=(
     --backend cuda
     --model qwen3.5-0.8b
@@ -98,6 +110,39 @@ run_fail "Test 4: unknown CUDA override stays explicit on unsupported model" \
     --backend cuda \
     --allow-untested-gpu sm999 \
     --model gemma4-e2b \
+    --model-dir "$MODEL_DIR_4B" \
+    --prompt "Hello" \
+    --max-new-tokens 1
+
+COMMON_GEMMA_E2B=(
+    --backend cuda
+    --model gemma4-e2b
+    --model-dir "$MODEL_DIR_4B"
+    --prompt "Hello"
+    --max-new-tokens 1
+)
+
+run_fail_without "Test 5: Gemma CUDA rejects INT4" \
+    "Gemma 4 CUDA v1 supports BF16 only; --int4 is not wired" \
+    "CUDA --int4 currently supports only Qwen3.5 on sm86" \
+    "${COMMON_GEMMA_E2B[@]}" --int4
+
+run_fail "Test 6: Gemma CUDA rejects FP8 runtime" \
+    "Gemma 4 CUDA v1 supports BF16 only; --fp8-runtime is not wired" \
+    "${COMMON_GEMMA_E2B[@]}" --fp8-runtime
+
+run_fail "Test 7: Gemma CUDA rejects KV-FP8" \
+    "Gemma 4 CUDA v1 supports BF16 KV only; --kv-fp8 is not wired" \
+    "${COMMON_GEMMA_E2B[@]}" --kv-fp8
+
+run_fail "Test 8: Gemma CUDA rejects batch size > 1" \
+    "Gemma 4 CUDA v1 supports only --batch-size=1" \
+    "${COMMON_GEMMA_E2B[@]}" --batch-size 2
+
+run_fail "Test 9: Gemma E4B has no CUDA v1 registry entry" \
+    "No optimized kernel for model=gemma4-e4b backend=CUDA arch=sm86" \
+    --backend cuda \
+    --model gemma4-e4b \
     --model-dir "$MODEL_DIR_4B" \
     --prompt "Hello" \
     --max-new-tokens 1

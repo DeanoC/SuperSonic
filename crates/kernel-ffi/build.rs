@@ -308,6 +308,11 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             "phi4_cuda.o",
             "building Phi-4 CUDA bridge",
         ),
+        (
+            "gemma4_bridge_cuda.cu",
+            "gemma4_cuda.o",
+            "building Gemma 4 CUDA bridge",
+        ),
     ];
     let archs = detect_cuda_archs();
     println!(
@@ -418,6 +423,8 @@ fn main() {
         "certified_kv_bridge_cuda.cu",
         "phi4_cuda.cuh",
         "phi4_bridge_cuda.cu",
+        "gemma4_cuda.cuh",
+        "gemma4_bridge_cuda.cu",
     ] {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }

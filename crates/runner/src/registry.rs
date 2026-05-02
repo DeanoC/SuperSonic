@@ -690,6 +690,19 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Gemma4_E2B,
+        backend: Backend::Cuda,
+        arch: GpuArch::Sm86,
+        vram: VramBudget {
+            fixed_bytes: 11 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Gemma4_E4B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx942,
@@ -893,6 +906,12 @@ mod tests {
     #[test]
     fn cuda_sm86_registry_includes_phi4_mini() {
         assert!(lookup(&ModelVariant::Phi4_Mini, &Backend::Cuda, &GpuArch::Sm86).is_some());
+    }
+
+    #[test]
+    fn cuda_sm86_registry_includes_gemma4_e2b_only() {
+        assert!(lookup(&ModelVariant::Gemma4_E2B, &Backend::Cuda, &GpuArch::Sm86).is_some());
+        assert!(lookup(&ModelVariant::Gemma4_E4B, &Backend::Cuda, &GpuArch::Sm86).is_none());
     }
 
     #[test]

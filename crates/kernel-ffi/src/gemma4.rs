@@ -12,8 +12,9 @@ use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
-#[cfg(supersonic_backend_hip)]
+#[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 unsafe extern "C" {
+    #[cfg_attr(supersonic_backend_cuda, link_name = "supersonic_gemma4_cuda_rms_norm")]
     fn supersonic_gemma4_hip_rms_norm(
         dtype: c_int,
         device_ordinal: usize,
@@ -24,6 +25,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(supersonic_backend_cuda, link_name = "supersonic_gemma4_cuda_matvec")]
     fn supersonic_gemma4_hip_matvec(
         dtype: c_int,
         device_ordinal: usize,
@@ -35,6 +37,10 @@ unsafe extern "C" {
         row_counter: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_gelu_tanh_gate_mul"
+    )]
     fn supersonic_gemma4_hip_gelu_tanh_gate_mul(
         dtype: c_int,
         device_ordinal: usize,
@@ -44,6 +50,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_rope_decode"
+    )]
     fn supersonic_gemma4_hip_rope_decode(
         dtype: c_int,
         device_ordinal: usize,
@@ -56,6 +66,10 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_swa_attn_decode"
+    )]
     fn supersonic_gemma4_hip_swa_attn_decode(
         dtype: c_int,
         device_ordinal: usize,
@@ -73,6 +87,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_kv_append"
+    )]
     fn supersonic_gemma4_hip_kv_append(
         dtype: c_int,
         device_ordinal: usize,
@@ -86,6 +104,10 @@ unsafe extern "C" {
         v_cache: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_rms_norm_rows"
+    )]
     fn supersonic_gemma4_hip_rms_norm_rows(
         dtype: c_int,
         device_ordinal: usize,
@@ -97,6 +119,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_matvec_batched"
+    )]
     fn supersonic_gemma4_hip_matvec_batched(
         dtype: c_int,
         device_ordinal: usize,
@@ -109,6 +135,10 @@ unsafe extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_matvec_int4"
+    )]
     fn supersonic_gemma4_hip_matvec_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -123,6 +153,10 @@ unsafe extern "C" {
         row_counter: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_matvec_batched_int4"
+    )]
     fn supersonic_gemma4_hip_matvec_batched_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -138,6 +172,10 @@ unsafe extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_rope_prefill"
+    )]
     fn supersonic_gemma4_hip_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -151,6 +189,10 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_kv_append_prefill"
+    )]
     fn supersonic_gemma4_hip_kv_append_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -165,6 +207,10 @@ unsafe extern "C" {
         v_cache: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_attn_prefill"
+    )]
     fn supersonic_gemma4_hip_attn_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -183,6 +229,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_add_residual"
+    )]
     fn supersonic_gemma4_hip_add_residual(
         dtype: c_int,
         device_ordinal: usize,
@@ -192,6 +242,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_add_scaled_residual"
+    )]
     fn supersonic_gemma4_hip_add_scaled_residual(
         dtype: c_int,
         device_ordinal: usize,
@@ -202,6 +256,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_scalar_mul_inplace"
+    )]
     fn supersonic_gemma4_hip_scalar_mul_inplace(
         dtype: c_int,
         device_ordinal: usize,
@@ -210,6 +268,10 @@ unsafe extern "C" {
         x: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_fused_attn_block"
+    )]
     fn supersonic_gemma4_hip_fused_attn_block(
         dtype: c_int,
         device_ordinal: usize,
@@ -244,6 +306,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_fused_attn_block_int4"
+    )]
     fn supersonic_gemma4_hip_fused_attn_block_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -287,6 +353,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_fused_mlp_ple_int4"
+    )]
     fn supersonic_gemma4_hip_fused_mlp_ple_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -323,6 +393,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_fused_mlp_ple"
+    )]
     fn supersonic_gemma4_hip_fused_mlp_ple(
         dtype: c_int,
         device_ordinal: usize,
@@ -348,6 +422,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_gather_layer_slice"
+    )]
     fn supersonic_gemma4_hip_gather_layer_slice(
         dtype: c_int,
         device_ordinal: usize,
@@ -359,6 +437,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_embed_gather_scaled"
+    )]
     fn supersonic_gemma4_hip_embed_gather_scaled(
         dtype: c_int,
         device_ordinal: usize,
@@ -371,6 +453,10 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_persistent_decode_int4"
+    )]
     fn supersonic_gemma4_hip_persistent_decode_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -390,6 +476,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_persistent_decode"
+    )]
     fn supersonic_gemma4_hip_persistent_decode(
         dtype: c_int,
         device_ordinal: usize,
@@ -410,6 +500,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_persistent_decode_batch"
+    )]
     fn supersonic_gemma4_hip_persistent_decode_batch(
         dtype: c_int,
         device_ordinal: usize,
@@ -430,6 +524,10 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg_attr(
+        supersonic_backend_cuda,
+        link_name = "supersonic_gemma4_cuda_persistent_decode_batch_int4"
+    )]
     fn supersonic_gemma4_hip_persistent_decode_batch_int4(
         dtype: c_int,
         device_ordinal: usize,
@@ -452,7 +550,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-#[cfg(not(supersonic_backend_hip))]
+#[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
 macro_rules! gemma4_stub {
     ($(fn $name:ident ( $($arg:ident : $ty:ty),* $(,)? ) -> c_int;)+) => {
         $(
@@ -465,7 +563,7 @@ macro_rules! gemma4_stub {
     };
 }
 
-#[cfg(not(supersonic_backend_hip))]
+#[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
 gemma4_stub! {
     fn supersonic_gemma4_hip_rms_norm(dtype: c_int, device_ordinal: usize, n_cols: usize, eps: f32, xs: *const c_void, weight: *const c_void, out: *mut c_void) -> c_int;
     fn supersonic_gemma4_hip_matvec(dtype: c_int, device_ordinal: usize, in_dim: usize, out_dim: usize, x: *const c_void, w: *const c_void, out: *mut c_void, row_counter: *mut c_uint) -> c_int;
@@ -520,9 +618,10 @@ pub fn rms_norm(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 rms_norm failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 rms_norm failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -566,9 +665,10 @@ pub fn rms_norm_per_row(
             )
         };
         if status != 0 {
-            return Err(GpuError::backend(Backend::Hip, format!(
-                "gemma4 rms_norm_per_row failed at row {row} with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Hip,
+                format!("gemma4 rms_norm_per_row failed at row {row} with status {status}"),
+            ));
         }
     }
     Ok(())
@@ -600,9 +700,10 @@ pub fn matvec(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 matvec failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 matvec failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -641,9 +742,10 @@ pub fn matvec_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 matvec_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 matvec_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -681,9 +783,10 @@ pub fn matvec_batched_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 matvec_batched_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 matvec_batched_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -709,9 +812,10 @@ pub fn gelu_tanh_gate_mul(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 gelu_tanh_gate_mul failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 gelu_tanh_gate_mul failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -745,9 +849,10 @@ pub fn rope_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 rope_decode failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 rope_decode failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -798,9 +903,10 @@ pub fn swa_attn_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 swa_attn_decode failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 swa_attn_decode failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -836,9 +942,10 @@ pub fn kv_append(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 kv_append failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 kv_append failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -880,9 +987,10 @@ pub fn rms_norm_rows(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 rms_norm_rows failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 rms_norm_rows failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -914,9 +1022,10 @@ pub fn matvec_batched(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 matvec_batched failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 matvec_batched failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -952,9 +1061,10 @@ pub fn rope_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 rope_prefill failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 rope_prefill failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -991,9 +1101,10 @@ pub fn kv_append_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 kv_append_prefill failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 kv_append_prefill failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1043,9 +1154,10 @@ pub fn attn_prefill(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 attn_prefill failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 attn_prefill failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1070,9 +1182,10 @@ pub fn add_residual(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 add_residual failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 add_residual failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1100,9 +1213,10 @@ pub fn add_scaled_residual(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 add_scaled_residual failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 add_scaled_residual failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1128,9 +1242,10 @@ pub fn scalar_mul_inplace(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 scalar_mul_inplace failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 scalar_mul_inplace failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1233,9 +1348,10 @@ pub fn fused_attn_block(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 fused_attn_block failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 fused_attn_block failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1355,9 +1471,10 @@ pub fn fused_attn_block_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 fused_attn_block_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 fused_attn_block_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1448,9 +1565,10 @@ pub fn fused_mlp_ple_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 fused_mlp_ple_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 fused_mlp_ple_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1522,9 +1640,10 @@ pub fn fused_mlp_ple(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 fused_mlp_ple failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 fused_mlp_ple failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1556,9 +1675,10 @@ pub fn gather_layer_slice(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 gather_layer_slice failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 gather_layer_slice failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1593,9 +1713,10 @@ pub fn embed_gather_scaled(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 embed_gather_scaled failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 embed_gather_scaled failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1893,12 +2014,8 @@ pub fn persistent_decode(
     eps: f32,
     scale: f32,
 ) -> Result<(), GpuError> {
-    let kv_fp8_ptr = kv_fp8_descs
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
-    let fp8_scales_ptr = fp8_scales
-        .map(|b| b.as_ptr())
-        .unwrap_or(std::ptr::null());
+    let kv_fp8_ptr = kv_fp8_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    let fp8_scales_ptr = fp8_scales.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let status = unsafe {
         supersonic_gemma4_hip_persistent_decode(
             dtype.kernel_dtype_code(),
@@ -1921,9 +2038,10 @@ pub fn persistent_decode(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 persistent_decode failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1971,10 +2089,13 @@ pub fn persistent_decode_batch(
     scale: f32,
 ) -> Result<(), GpuError> {
     if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode_batch: batch_size {batch_size} out of range [1, {}]",
-            crate::layer_desc::MAX_BATCH_SIZE
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!(
+                "gemma4 persistent_decode_batch: batch_size {batch_size} out of range [1, {}]",
+                crate::layer_desc::MAX_BATCH_SIZE
+            ),
+        ));
     }
     let status = unsafe {
         supersonic_gemma4_hip_persistent_decode_batch(
@@ -1998,9 +2119,10 @@ pub fn persistent_decode_batch(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode_batch failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 persistent_decode_batch failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2059,9 +2181,10 @@ pub fn persistent_decode_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 persistent_decode_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2096,10 +2219,13 @@ pub fn persistent_decode_batch_int4(
     scale: f32,
 ) -> Result<(), GpuError> {
     if batch_size == 0 || batch_size > crate::layer_desc::MAX_BATCH_SIZE {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode_batch_int4: batch_size {batch_size} out of range [1, {}]",
-            crate::layer_desc::MAX_BATCH_SIZE
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!(
+                "gemma4 persistent_decode_batch_int4: batch_size {batch_size} out of range [1, {}]",
+                crate::layer_desc::MAX_BATCH_SIZE
+            ),
+        ));
     }
     let status = unsafe {
         supersonic_gemma4_hip_persistent_decode_batch_int4(
@@ -2124,9 +2250,10 @@ pub fn persistent_decode_batch_int4(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Hip, format!(
-            "gemma4 persistent_decode_batch_int4 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Hip,
+            format!("gemma4 persistent_decode_batch_int4 failed with status {status}"),
+        ));
     }
     Ok(())
 }
