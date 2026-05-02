@@ -3707,4 +3707,142 @@ void qwen36_moe_lm_head_wmma_kernel(
 #endif
 }
 
+// =============================================================================
+// Qwen3.6-MoE multi-token-prediction (MTP) pre-fusion kernel — Phase 6.2c.1.
+//
+// Reproduces the vLLM `Qwen3NextMultiTokenPredictor.forward` "pre-fusion"
+// stage byte-for-byte through the BF16 rounding boundary. This is the part
+// of the MTP draft step that runs BEFORE the (single-layer) MoE block:
+//
+//   e_norm = rmsnorm(embed_tokens[next_token_id], pre_fc_norm_embedding, eps)
+//   h_norm = rmsnorm(h_base, pre_fc_norm_hidden, eps)
+//   fused  = mtp.fc @ cat([e_norm, h_norm], dim=-1)            # cat: e first
+//
+// Numerics match `oracle/qwen36_moe_mtp_oracle.py`: RMSNorm reduction in F32,
+// `(1 + gain)` HF Qwen3_5MoeRMSNorm unit offset, BF16-round at every store.
+// `mtp.fc.weight` is `[hidden, 2*hidden]` in HF row-major; first half of each
+// row coefficients e_norm, second half h_norm (vLLM cat order).
+//
+// Inputs (all BF16, `ordinal`-resident):
+//   e_in                     [hidden]            — host-extracted embedding row
+//   h_base                   [hidden]            — base model's last hidden state
+//   pre_fc_norm_embedding_w  [hidden]
+//   pre_fc_norm_hidden_w     [hidden]
+//   fc_w                     [hidden, 2*hidden]
+//
+// Outputs (all BF16, written by the kernel):
+//   e_norm_out               [hidden]
+//   h_norm_out               [hidden]
+//   fused_out                [hidden]
+//
+// Block strategy: single block, block_size=256. Memory budget at hidden=2048:
+//   shared_scratch [block_size]  F32 → 1 KiB
+//   e_norm_lds     [hidden]      F32 → 8 KiB (BF16-rounded post-RMSNorm)
+//   h_norm_lds     [hidden]      F32 → 8 KiB (BF16-rounded post-RMSNorm)
+// Total: 17 KiB / 64 KiB CU cap. Comfortably under.
+//
+// Phase G (the matmul) is the cost driver: hidden output rows × 2*hidden
+// reduction = ~8.4M FMAs. Striped across 256 threads → ~32K FMAs/thread.
+// At hidden=2048 the kernel completes in ~30-50 µs; the speculative loop
+// runs it once per draft step, so absolute cost is small. Multi-block
+// work-stealing on the matmul phase is a future optimization (would need
+// grid_barrier between Phases F and G).
+//
+// Used by `mtp_pre_fusion_launch` in `crates/kernel-ffi/src/qwen36_moe.rs`.
+// =============================================================================
+template <typename T>
+__global__ void qwen36_moe_mtp_pre_fusion_kernel(
+    int                    hidden,
+    float                  rms_norm_eps,
+    const T*  __restrict__ e_in,                      // [hidden]
+    const T*  __restrict__ h_base,                    // [hidden]
+    const T*  __restrict__ pre_fc_norm_embedding_w,   // [hidden]
+    const T*  __restrict__ pre_fc_norm_hidden_w,      // [hidden]
+    const T*  __restrict__ fc_w,                      // [hidden, 2*hidden]
+    T*        __restrict__ e_norm_out,                // [hidden]
+    T*        __restrict__ h_norm_out,                // [hidden]
+    T*        __restrict__ fused_out                  // [hidden]
+) {
+    const int tid        = threadIdx.x;
+    const int block_size = blockDim.x;
+
+    extern __shared__ unsigned char lds_raw[];
+    float* shared_scratch = reinterpret_cast<float*>(lds_raw);
+    float* e_norm_lds     = shared_scratch + block_size;
+    float* h_norm_lds     = e_norm_lds + hidden;
+
+    // -- Phase A: load e_in, accumulate partial squared sum ----------------
+    float partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        const float v = load_as_float<T>(e_in, col);
+        e_norm_lds[col] = v;
+        partial_sq += v * v;
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float e_inv_rms;
+    if (tid == 0) {
+        e_inv_rms =
+            rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // -- Phase B: apply `(1 + w)` RMSNorm to e, BF16-round, store ---------
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = load_as_float<T>(pre_fc_norm_embedding_w, col);
+        const float val = bf16_round_rne_f32(e_norm_lds[col] * e_inv_rms * (1.0f + w));
+        e_norm_lds[col] = val;
+        e_norm_out[col] = static_cast<T>(val);
+    }
+    __syncthreads();
+
+    // -- Phase C: load h_base, accumulate partial squared sum --------------
+    partial_sq = 0.0f;
+    for (int col = tid; col < hidden; col += block_size) {
+        const float v = load_as_float<T>(h_base, col);
+        h_norm_lds[col] = v;
+        partial_sq += v * v;
+    }
+    shared_scratch[tid] = partial_sq;
+    __syncthreads();
+    for (int s = block_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+        __syncthreads();
+    }
+    __shared__ float h_inv_rms;
+    if (tid == 0) {
+        h_inv_rms =
+            rsqrtf(shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+    }
+    __syncthreads();
+
+    // -- Phase D: apply `(1 + w)` RMSNorm to h, BF16-round, store ---------
+    for (int col = tid; col < hidden; col += block_size) {
+        const float w = load_as_float<T>(pre_fc_norm_hidden_w, col);
+        const float val = bf16_round_rne_f32(h_norm_lds[col] * h_inv_rms * (1.0f + w));
+        h_norm_lds[col] = val;
+        h_norm_out[col] = static_cast<T>(val);
+    }
+    __syncthreads();
+
+    // -- Phase E: matmul fc_w @ cat([e_norm, h_norm]) → fused -------------
+    // fc_w[row, k]    for k in [0, hidden)        → e_norm[k] coefficients
+    // fc_w[row, k]    for k in [hidden, 2*hidden) → h_norm[k - hidden] coefficients
+    for (int row = tid; row < hidden; row += block_size) {
+        const T* w_row = fc_w + static_cast<size_t>(row) * 2 * hidden;
+        float acc = 0.0f;
+        for (int k = 0; k < hidden; ++k) {
+            acc += load_as_float<T>(w_row, k) * e_norm_lds[k];
+        }
+        for (int k = 0; k < hidden; ++k) {
+            acc += load_as_float<T>(w_row, hidden + k) * h_norm_lds[k];
+        }
+        fused_out[row] = static_cast<T>(bf16_round_rne_f32(acc));
+    }
+}
+
 } // namespace qwen36_moe

@@ -474,6 +474,27 @@ extern "C" {
         logits: *mut c_void,
         counter: *mut c_uint,
     ) -> c_int;
+
+    /// FFI bridge for the MTP pre-fusion kernel (Phase 6.2c.1). Single-block
+    /// launch: BF16 RMSNorms over `e_in` and `h_base` followed by a
+    /// `mtp.fc @ cat([e_norm, h_norm])` matvec into `fused_out`. All buffers
+    /// must be device-resident on `device_ordinal` and BF16. See
+    /// `qwen36_moe_hip_mtp_pre_fusion_launch` in `kernels/qwen36_moe_bridge.cpp`
+    /// for the error code matrix.
+    pub fn qwen36_moe_hip_mtp_pre_fusion_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden: c_int,
+        rms_norm_eps: f32,
+        e_in: *const c_void,
+        h_base: *const c_void,
+        pre_fc_norm_embedding_w: *const c_void,
+        pre_fc_norm_hidden_w: *const c_void,
+        fc_w: *const c_void,
+        e_norm_out: *mut c_void,
+        h_norm_out: *mut c_void,
+        fused_out: *mut c_void,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -1316,6 +1337,104 @@ pub fn lm_head_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe lm_head_launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Safe wrapper for the GPU MTP pre-fusion kernel (Phase 6.2c.1).
+///
+/// Computes the byte-for-byte equivalent of vLLM's
+/// `Qwen3NextMultiTokenPredictor` pre-fusion stage:
+///
+/// ```text
+/// e_norm = rmsnorm(e_in,   pre_fc_norm_embedding_w, eps)   # [hidden]
+/// h_norm = rmsnorm(h_base, pre_fc_norm_hidden_w,    eps)   # [hidden]
+/// fused  = mtp.fc @ cat([e_norm, h_norm], dim=-1)          # [hidden]
+/// ```
+///
+/// All buffers are BF16 and must live on `ordinal`. The caller pre-extracts
+/// the embedding row (`embed_tokens.weight[next_token_id, :]`) on the host
+/// before calling — the kernel doesn't do the gather. `e_norm_out` and
+/// `h_norm_out` are produced too (cheap, useful for downstream stages and
+/// for parity testing); pass scratch buffers if you don't need them
+/// kept around.
+///
+/// Shapes:
+///   - `e_in`, `h_base`, `pre_fc_norm_embedding_w`, `pre_fc_norm_hidden_w`,
+///     `e_norm_out`, `h_norm_out`, `fused_out`: `[hidden]`
+///   - `fc_w`: `[hidden, 2 * hidden]` (HF row-major; first half coefficients
+///     `e_norm`, second half coefficients `h_norm`).
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_pre_fusion_launch(
+    ordinal: usize,
+    hidden: i32,
+    rms_norm_eps: f32,
+    e_in_buf: &GpuBuffer,
+    h_base_buf: &GpuBuffer,
+    pre_fc_norm_embedding_w_buf: &GpuBuffer,
+    pre_fc_norm_hidden_w_buf: &GpuBuffer,
+    fc_w_buf: &GpuBuffer,
+    e_norm_out_buf: &mut GpuBuffer,
+    h_norm_out_buf: &mut GpuBuffer,
+    fused_out_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if hidden <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::mtp_pre_fusion_launch: positive hidden required, got {hidden}"
+        )));
+    }
+    let block_size: i32 = 256;
+    if hidden % block_size != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::mtp_pre_fusion_launch: hidden ({hidden}) must be a \
+             multiple of block_size ({block_size}) — the per-block reduction \
+             across hidden assumes that"
+        )));
+    }
+
+    let backend = fc_w_buf.backend();
+    let status: c_int = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_mtp_pre_fusion_launch(
+                    /* dtype = bf16 */ 2,
+                    ordinal,
+                    hidden as c_int,
+                    rms_norm_eps,
+                    e_in_buf.as_ptr(),
+                    h_base_buf.as_ptr(),
+                    pre_fc_norm_embedding_w_buf.as_ptr(),
+                    pre_fc_norm_hidden_w_buf.as_ptr(),
+                    fc_w_buf.as_ptr(),
+                    e_norm_out_buf.as_mut_ptr(),
+                    h_norm_out_buf.as_mut_ptr(),
+                    fused_out_buf.as_mut_ptr(),
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::mtp_pre_fusion_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::mtp_pre_fusion_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::mtp_pre_fusion_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe mtp_pre_fusion_launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -5407,5 +5526,186 @@ mod tests {
                  in case it's a real ordering bug"
             );
         }
+    }
+
+    // ---- Phase 6.2c.1: MTP pre-fusion parity vs the Python oracle ---------
+    //
+    // Validates that `mtp_pre_fusion_launch` reproduces the
+    // `Qwen3NextMultiTokenPredictor` pre-fusion stage byte-for-byte through
+    // the BF16 rounding boundary. Reads the `qwen36-moe-mtp-oracle-v1`
+    // fixture produced by `oracle/qwen36_moe_mtp_oracle.py`, feeds the
+    // step-0 inputs (h_base, embed_tokens row, mtp.fc, two RMSNorm gains)
+    // into the kernel, and compares the three outputs (e_norm, h_norm,
+    // fused) against the oracle's intermediates.
+    //
+    // To run:
+    //   .venv-bake/bin/python oracle/qwen36_moe_mtp_oracle.py \
+    //     --model-dir /path/to/Qwen3.6-35B-A3B \
+    //     --num-speculative-tokens 1 --seed 42 \
+    //     --out /tmp/qwen36_mtp.json
+    //   SUPERSONIC_QWEN36_MTP_ORACLE_JSON=/tmp/qwen36_mtp.json \
+    //     cargo test --release -p kernel-ffi qwen36_moe_mtp_pre_fusion
+    //
+    // Without the env var the test prints a clear skip message and exits.
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_mtp_pre_fusion_matches_oracle() {
+        use gpu_hal::{copy_d2h, set_backend, Backend, GpuBuffer, ScalarType};
+
+        let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MTP_ORACLE_JSON") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set. Generate \
+                 a fixture with `python oracle/qwen36_moe_mtp_oracle.py \
+                 --model-dir <Qwen3.6-35B-A3B> --num-speculative-tokens 1 \
+                 --out /tmp/qwen36_mtp.json` and re-run."
+            );
+            return;
+        };
+        let raw = std::fs::read_to_string(&json_path)
+            .unwrap_or_else(|e| panic!("read mtp oracle json {json_path}: {e}"));
+        let json: serde_json::Value =
+            serde_json::from_str(&raw).expect("mtp oracle json parse");
+
+        assert_eq!(
+            json["schema"].as_str().unwrap_or(""), "qwen36-moe-mtp-oracle-v1",
+            "MTP parity test expects schema qwen36-moe-mtp-oracle-v1; \
+             regenerate the fixture if the oracle has bumped its schema."
+        );
+
+        let cfg = &json["config"];
+        let hidden = cfg["hidden"].as_i64().expect("config.hidden") as i32;
+        let rms_norm_eps =
+            cfg["rms_norm_eps"].as_f64().expect("config.rms_norm_eps") as f32;
+
+        let prefusion = &json["prefusion_weights"];
+        assert!(
+            prefusion.is_object(),
+            "oracle JSON missing `prefusion_weights` block — regenerate with \
+             the Phase 6.2c.1 oracle (it adds fc_w + RMSNorm gains)"
+        );
+        let fc_w_bytes = b64_decode(
+            prefusion["fc_w_bf16"].as_str().expect("prefusion_weights.fc_w_bf16"),
+        );
+        let pre_fc_norm_embedding_w_bytes = b64_decode(
+            prefusion["pre_fc_norm_embedding_w_bf16"]
+                .as_str().expect("prefusion_weights.pre_fc_norm_embedding_w_bf16"),
+        );
+        let pre_fc_norm_hidden_w_bytes = b64_decode(
+            prefusion["pre_fc_norm_hidden_w_bf16"]
+                .as_str().expect("prefusion_weights.pre_fc_norm_hidden_w_bf16"),
+        );
+
+        let h_base_bytes = b64_decode(
+            json["h_base_step0_bf16"].as_str().expect("h_base_step0_bf16"),
+        );
+
+        let step0 = &json["steps"][0];
+        let e_in_bytes = b64_decode(
+            step0["input_token_embed_bf16"]
+                .as_str().expect("steps[0].input_token_embed_bf16"),
+        );
+        let want_e_norm_bytes = b64_decode(
+            step0["e_norm_bf16"].as_str().expect("steps[0].e_norm_bf16"),
+        );
+        let want_h_norm_bytes = b64_decode(
+            step0["h_norm_bf16"].as_str().expect("steps[0].h_norm_bf16"),
+        );
+        let want_fused_bytes = b64_decode(
+            step0["fused_bf16"].as_str().expect("steps[0].fused_bf16"),
+        );
+
+        let hidden_usz = hidden as usize;
+        assert_eq!(e_in_bytes.len(), hidden_usz * 2, "e_in shape");
+        assert_eq!(h_base_bytes.len(), hidden_usz * 2, "h_base shape");
+        assert_eq!(
+            pre_fc_norm_embedding_w_bytes.len(), hidden_usz * 2,
+            "pre_fc_norm_embedding_w shape"
+        );
+        assert_eq!(
+            pre_fc_norm_hidden_w_bytes.len(), hidden_usz * 2,
+            "pre_fc_norm_hidden_w shape"
+        );
+        assert_eq!(
+            fc_w_bytes.len(), hidden_usz * 2 * hidden_usz * 2,
+            "fc_w shape: expected [hidden, 2*hidden] BF16"
+        );
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        let e_in_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_usz], &e_in_bytes,
+        ).expect("upload e_in");
+        let h_base_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_usz], &h_base_bytes,
+        ).expect("upload h_base");
+        let pre_fc_norm_embedding_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_usz], &pre_fc_norm_embedding_w_bytes,
+        ).expect("upload pre_fc_norm_embedding_w");
+        let pre_fc_norm_hidden_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[hidden_usz], &pre_fc_norm_hidden_w_bytes,
+        ).expect("upload pre_fc_norm_hidden_w");
+        let fc_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16,
+            &[hidden_usz, 2 * hidden_usz], &fc_w_bytes,
+        ).expect("upload fc_w");
+        let mut e_norm_out_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[hidden_usz],
+        ).expect("alloc e_norm_out");
+        let mut h_norm_out_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[hidden_usz],
+        ).expect("alloc h_norm_out");
+        let mut fused_out_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[hidden_usz],
+        ).expect("alloc fused_out");
+
+        super::mtp_pre_fusion_launch(
+            ordinal, hidden, rms_norm_eps,
+            &e_in_buf, &h_base_buf,
+            &pre_fc_norm_embedding_w_buf, &pre_fc_norm_hidden_w_buf,
+            &fc_w_buf,
+            &mut e_norm_out_buf, &mut h_norm_out_buf, &mut fused_out_buf,
+        ).expect("mtp_pre_fusion launch");
+
+        let mut got_e_norm = vec![0u8; hidden_usz * 2];
+        let mut got_h_norm = vec![0u8; hidden_usz * 2];
+        let mut got_fused = vec![0u8; hidden_usz * 2];
+        copy_d2h(
+            ordinal, got_e_norm.as_mut_ptr() as *mut _,
+            e_norm_out_buf.as_ptr(), got_e_norm.len(),
+        ).expect("d2h e_norm");
+        copy_d2h(
+            ordinal, got_h_norm.as_mut_ptr() as *mut _,
+            h_norm_out_buf.as_ptr(), got_h_norm.len(),
+        ).expect("d2h h_norm");
+        copy_d2h(
+            ordinal, got_fused.as_mut_ptr() as *mut _,
+            fused_out_buf.as_ptr(), got_fused.len(),
+        ).expect("d2h fused");
+
+        // The two RMSNorm outputs go through one BF16 round each — single
+        // `(x * inv_rms * (1+w))` pass — so they should be effectively
+        // bit-exact against PyTorch (modulo the F32 reduction tree, which
+        // the kernel matches via the same single-block sum). max_abs ≤ 1
+        // ULP-of-BF16 at any reasonable magnitude is comfortable.
+        assert_parity(
+            "mtp.e_norm",
+            &got_e_norm, &want_e_norm_bytes,
+            /* max_abs */ 1e-2, /* cos_sim_floor */ 0.99999,
+        );
+        assert_parity(
+            "mtp.h_norm",
+            &got_h_norm, &want_h_norm_bytes,
+            1e-2, 0.99999,
+        );
+        // fused is a `[hidden, 2*hidden]` matvec; F32 accumulation order on
+        // the GPU differs from PyTorch's per-row reduction tree. cos_sim
+        // ≥ 0.999 is the bar the other Qwen3.6-MoE matvec parity tests use
+        // (FFN, lm_head), and it's well within the BF16 rounding floor.
+        assert_parity(
+            "mtp.fused",
+            &got_fused, &want_fused_bytes,
+            /* max_abs */ 5e-2, /* cos_sim_floor */ 0.999,
+        );
     }
 }
