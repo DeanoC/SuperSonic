@@ -270,7 +270,7 @@ pub struct DecodeOutputs {
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
 /// (the largest stage). Mirrors `parity_workspace_floats` in the per-block
 /// test file: 6*H*d + 4*Hkv*d + hidden.
-pub(crate) fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
+pub fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let h = geom.num_attention_heads as usize;
     let hkv = geom.num_kv_heads as usize;
     let d = geom.head_dim as usize;
@@ -290,7 +290,7 @@ pub(crate) fn full_attn_output_elems(geom: &MultiLayerGeom) -> usize {
 /// the size used in the per-block test file. Only the linear-specific terms
 /// matter — the larger of the two attn workspaces drives the shared scratch
 /// allocation in `run_chained_decode`.
-fn linear_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
+pub fn linear_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let k = geom.num_k_heads as usize;
     let v = geom.num_v_heads as usize;
     let kd = geom.head_k_dim as usize;
@@ -320,7 +320,7 @@ fn linear_attn_output_elems(geom: &MultiLayerGeom) -> usize {
 /// The per-expert scratch slabs (`EXPERT_GU`, `EXPERT_MID`) are sized
 /// `k * 2*I` and `k * I` respectively so all `top_k` experts can run
 /// G/H/I concurrently (one block-group per expert).
-pub(crate) fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
+pub fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
     let k = geom.top_k as usize;

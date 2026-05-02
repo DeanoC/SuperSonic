@@ -226,6 +226,60 @@ extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    /// Phase 3e: persistent decode megakernel launcher. One cooperative
+    /// HIP launch processes all `num_layers` of {attn or linear-attn, FFN}
+    /// — replaces 80 step launches/token with 1 (the lm_head still
+    /// launches separately at this stage).
+    ///
+    /// See `kernels/qwen36_moe_persistent/persistent_decode.hip` for the
+    /// kernel and `kernels/qwen36_moe_bridge.cpp::qwen36_moe_hip_persistent_decode_launch`
+    /// for the launcher.
+    ///
+    /// Caller responsibilities:
+    /// - `hidden_ping` is uploaded with the initial hidden BF16 bytes; the
+    ///   final hidden lands back in `hidden_ping` after even `num_layers`
+    ///   (the bridge rejects odd `num_layers`).
+    /// - `int4_scales` is null for BF16 baked models, non-null for INT4
+    ///   bakes (one entry per layer, parallel to `layers`).
+    /// - `workspace` is at least
+    ///   `max(attn_workspace_floats(geom), ffn_workspace_floats(geom))` F32
+    ///   entries — same as the chained driver.
+    /// - `ffn_topk_idx_scratch` is a small `[top_k]` i32 buffer (the FFN
+    ///   phase only writes it at stage 1, but the parameter must be valid).
+    /// - sync_buf layout: counters[0..16] u32 + barrier_counter at +64 +
+    ///   barrier_flag at +68 (96 bytes total, zeroed by the bridge).
+    pub fn qwen36_moe_hip_persistent_decode_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: c_int,
+        layers: *const Qwen36MoeDecodeLayerDesc,
+        int4_scales: *const Qwen36MoeInt4ScaleDesc,
+        hidden: c_int,
+        num_heads: c_int,
+        num_kv_heads: c_int,
+        head_dim: c_int,
+        rotary_dim: c_int,
+        num_k_heads: c_int,
+        num_v_heads: c_int,
+        head_k_dim: c_int,
+        head_v_dim: c_int,
+        conv_kernel_dim: c_int,
+        num_experts: c_int,
+        moe_intermediate: c_int,
+        shared_intermediate: c_int,
+        top_k: c_int,
+        rope_theta: f32,
+        rms_norm_eps: f32,
+        position: c_int,
+        hidden_ping: *mut c_void,
+        hidden_pong: *mut c_void,
+        workspace: *mut f32,
+        ffn_topk_idx_scratch: *mut c_int,
+        counters: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     /// PR 4b2 staged single-layer attention parity launcher. Runs the
     /// full-attention path through `stage` (1..=5) and writes the matching
     /// intermediate to `output`:
@@ -594,6 +648,138 @@ pub fn stub_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe stub launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Geometry constants for the persistent decode megakernel — packed into
+/// one struct to keep [`persistent_decode_launch`]'s arg list tractable.
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen36MoePersistentGeom {
+    pub hidden: i32,
+    pub num_heads: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub rotary_dim: i32,
+    pub num_k_heads: i32,
+    pub num_v_heads: i32,
+    pub head_k_dim: i32,
+    pub head_v_dim: i32,
+    pub conv_kernel_dim: i32,
+    pub num_experts: i32,
+    pub moe_intermediate: i32,
+    pub shared_intermediate: i32,
+    pub top_k: i32,
+    pub rope_theta: f32,
+    pub rms_norm_eps: f32,
+}
+
+/// Phase 3e safe wrapper for the persistent decode megakernel. Replaces
+/// the chained 80 step-kernel launches/token with one cooperative HIP
+/// launch.
+///
+/// Caller responsibilities:
+/// - `layers_device` is a device-resident array of
+///   [`Qwen36MoeDecodeLayerDesc`] (`num_layers` entries). Even
+///   `num_layers` only — the bridge enforces this.
+/// - `int4_scales_device` is null for BF16 bakes, or a device-resident
+///   array of [`Qwen36MoeInt4ScaleDesc`] (parallel to `layers_device`).
+/// - `hidden_ping` is uploaded with the BF16 initial hidden bytes; the
+///   final hidden lands back in `hidden_ping` after `num_layers`.
+/// - `workspace` (F32) sized for `max(attn_workspace_floats(geom),
+///   ffn_workspace_floats(geom))`.
+/// - `ffn_topk_idx_scratch` is a small `[top_k]` i32 buffer (used only
+///   internally by the FFN phase at stage 1; we run stage 5 so it's
+///   inert, but must be valid).
+/// - `sync_buf` is at least 96 zeroed bytes (counters[0..16] + barrier
+///   counter/flag); the bridge defensively re-zeros it on entry.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    geom: Qwen36MoePersistentGeom,
+    position: i32,
+    layers_device: &GpuBuffer,
+    int4_scales_device: Option<&GpuBuffer>,
+    num_layers: usize,
+    hidden_ping: &mut GpuBuffer,
+    hidden_pong: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    ffn_topk_idx_scratch: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::persistent_decode_launch: only BF16 wired, got {dtype:?}"
+        )));
+    }
+    let backend = layers_device.backend();
+    let counters = sync_buf.as_mut_ptr() as *mut c_uint;
+    let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
+    let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
+    let int4_ptr: *const Qwen36MoeInt4ScaleDesc = int4_scales_device
+        .map(|b| b.as_ptr() as *const Qwen36MoeInt4ScaleDesc)
+        .unwrap_or(std::ptr::null());
+
+    let status: c_int = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_persistent_decode_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    num_layers as c_int,
+                    layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
+                    int4_ptr,
+                    geom.hidden,
+                    geom.num_heads,
+                    geom.num_kv_heads,
+                    geom.head_dim,
+                    geom.rotary_dim,
+                    geom.num_k_heads,
+                    geom.num_v_heads,
+                    geom.head_k_dim,
+                    geom.head_v_dim,
+                    geom.conv_kernel_dim,
+                    geom.num_experts,
+                    geom.moe_intermediate,
+                    geom.shared_intermediate,
+                    geom.top_k,
+                    geom.rope_theta,
+                    geom.rms_norm_eps,
+                    position,
+                    hidden_ping.as_mut_ptr(),
+                    hidden_pong.as_mut_ptr(),
+                    workspace.as_mut_ptr() as *mut f32,
+                    ffn_topk_idx_scratch.as_mut_ptr() as *mut c_int,
+                    counters,
+                    barrier_counter,
+                    barrier_flag,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::persistent_decode_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::persistent_decode_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::persistent_decode_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe persistent decode launch failed with status {status}"),
         ));
     }
     Ok(())

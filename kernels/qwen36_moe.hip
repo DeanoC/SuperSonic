@@ -114,6 +114,45 @@ struct DecodeLayerDesc {
     int         norm_topk_prob;
 };
 
+// -- Int4 scale/zero parallel struct (mirror of Rust Qwen36MoeInt4ScaleDesc) -
+//
+// Phase 3e: read alongside DecodeLayerDesc by the persistent megakernel.
+// Each `*_scale` / `*_zero` pair is consulted independently per tensor — a
+// null `*_scale` keeps that tensor on the BF16 path. `group_size` applies
+// uniformly across all INT4 tensors in the descriptor; 0 disables INT4
+// entirely (matches the BF16 bake).
+struct Int4ScaleDesc {
+    const void* q_proj_scale;
+    const void* q_proj_zero;
+    const void* k_proj_scale;
+    const void* k_proj_zero;
+    const void* v_proj_scale;
+    const void* v_proj_zero;
+    const void* o_proj_scale;
+    const void* o_proj_zero;
+
+    const void* linear_in_proj_qkv_scale;
+    const void* linear_in_proj_qkv_zero;
+    const void* linear_in_proj_z_scale;
+    const void* linear_in_proj_z_zero;
+    const void* linear_out_proj_scale;
+    const void* linear_out_proj_zero;
+
+    const void* experts_gate_up_scale;
+    const void* experts_gate_up_zero;
+    const void* experts_down_scale;
+    const void* experts_down_zero;
+
+    const void* shared_expert_gate_proj_scale;
+    const void* shared_expert_gate_proj_zero;
+    const void* shared_expert_up_proj_scale;
+    const void* shared_expert_up_proj_zero;
+    const void* shared_expert_down_proj_scale;
+    const void* shared_expert_down_proj_zero;
+
+    int group_size;
+};
+
 // `grid_barrier` and `grid_barrier_reset_counter` live in
 // `qwen36_moe_persistent/helpers.cuh` (Phase 3a).
 
