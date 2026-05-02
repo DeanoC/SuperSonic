@@ -3746,6 +3746,210 @@ void qwen36_moe_lm_head_wmma_kernel(
 }
 
 // =============================================================================
+// Phase 6.4a: BATCHED RDNA3 WMMA BF16 lm_head GEMV (wave32, 16x16x16 f32-acc),
+// one-wavefront-per-16-vocab-tile, M = K input rows in a single WMMA op.
+//
+// Companion to `qwen36_moe_lm_head_wmma_kernel` above; same numerics
+// boundary, but processes `m` ≤ 16 input rows in one WMMA tile instead
+// of the single-token M=1 case. Used by the speculative decode driver
+// (Phase 6.4b/c will wire it in) to amortize the 970 MiB lm_head BF16
+// weight read across K verify-step queries — at K=3 the batched call
+// is ~1.5× the cost of single-M (vs 3× sequential), saving ~2 ms /
+// spec step on the local 7900 XTX.
+//
+// Layout:
+//   final_hidden  [m, hidden]      BF16 (K input rows)
+//   final_norm_w  [hidden]         BF16 (shared across all m rows)
+//   lm_head_w     [vocab, hidden]  BF16
+//   logits        [m, vocab]       BF16 (K logit rows)
+//   x_normed_out  [m, hidden]      BF16, nullable (K post-RMSNorm rows)
+//
+// Grid : (ceil(vocab / 16), 1, 1)
+// Block: 32 threads = one wave32
+//
+// Per-block phases:
+//   A: K-batched RMSNorm — iterate m rows, RMSNorm each into LDS at
+//      offset `r * hidden` (BF16-rounded, F32→BF16 once).
+//   B: K-loop, one WMMA tile per K-slab. A operand is 16 rows × 16
+//      cols where the first `m` rows carry real activations and rows
+//      m..15 zero-fill (the WMMA fires the same number of muls; only
+//      the first m output rows are read out). B operand same as
+//      single-M kernel — 16 vocab rows × 16 K elements.
+//   C: Each lane_half writes 8 acc entries to output rows
+//      `2*i + lane_half`; rows ≥ m are skipped.
+//
+// Constraints:
+//   - m ∈ [1, 16]. Anything larger needs row-tiling on the grid Y axis
+//     (mirrors `supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel`
+//     in `kernels/full_attention_4b.hip`); not needed for the K=3
+//     speculative case.
+//   - `x_normed_out` (when non-null) is sized for `m * hidden` BF16
+//     elements. Only block 0 (the first vocab tile) writes to it,
+//     same single-write contract as the single-M kernel.
+// =============================================================================
+
+template <typename T>
+__global__ __launch_bounds__(32, 4)
+void qwen36_moe_lm_head_batched_wmma_kernel(
+    int                                  m,                // 1..=16
+    const T*               __restrict__ final_hidden,    // [m, hidden] BF16
+    const T*               __restrict__ final_norm_w,    // [hidden]    BF16
+    const T*               __restrict__ lm_head_w,       // [vocab, hidden] BF16
+    T*                     __restrict__ logits,          // [m, vocab]  BF16
+    T*                     __restrict__ x_normed_out,    // [m, hidden] BF16, nullable
+    int                                  hidden,
+    int                                  vocab,
+    float                                rms_norm_eps) {
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+    const int lane = threadIdx.x;          // 0..31
+    const int lane_row = lane & 15;        // 0..15
+    const int lane_half = lane >> 4;       // 0 / 1
+    const int tile_col = blockIdx.x * 16;
+
+    // LDS layout:
+    //   shared_scratch [32]            F32  — RMSNorm wave reduction (reused per row)
+    //   x_norm_lds_u16 [m * hidden]    u16  — K BF16-rounded RMSNorm outputs
+    extern __shared__ unsigned char lds_raw[];
+    float*    shared_scratch = reinterpret_cast<float*>(lds_raw);
+    uint16_t* x_norm_lds_u16 = reinterpret_cast<uint16_t*>(shared_scratch + 32);
+
+    const bool export_x_normed = (x_normed_out != nullptr) && (blockIdx.x == 0);
+    uint16_t* x_normed_out_u16 = reinterpret_cast<uint16_t*>(x_normed_out);
+
+    // -- Phase A: per-row RMSNorm of final_hidden, K rows ------------------
+    for (int row = 0; row < m; ++row) {
+        const T* row_in = final_hidden + static_cast<size_t>(row) * hidden;
+        uint16_t* row_lds = x_norm_lds_u16 + static_cast<size_t>(row) * hidden;
+        uint16_t* row_export =
+            export_x_normed
+                ? (x_normed_out_u16 + static_cast<size_t>(row) * hidden)
+                : nullptr;
+
+        float partial_sq = 0.0f;
+        for (int col = lane; col < hidden; col += 32) {
+            const float v = load_as_float<T>(row_in, col);
+            partial_sq += v * v;
+        }
+        shared_scratch[lane] = partial_sq;
+        __syncthreads();
+        for (int s = 16; s > 0; s >>= 1) {
+            if (lane < s) shared_scratch[lane] += shared_scratch[lane + s];
+            __syncthreads();
+        }
+        const float inv_rms = rsqrtf(
+            shared_scratch[0] / static_cast<float>(hidden) + rms_norm_eps);
+
+        // `(1.0 + w)` HF unit offset, BF16-round, store as BF16 bit pattern.
+        // RMSNorm gain is shared across K rows, so the same `final_norm_w`
+        // is read K times. PCIe-resident reads are cached after the first
+        // pass — the redundant re-reads cost ~few µs total at hidden=2048.
+        for (int col = lane; col < hidden; col += 32) {
+            const float vh = load_as_float<T>(row_in, col);
+            const float vw = load_as_float<T>(final_norm_w, col);
+            const float val = bf16_round_rne_f32(vh * inv_rms * (1.0f + vw));
+            uint32_t bits;
+            __builtin_memcpy(&bits, &val, 4);
+            const uint16_t hi = static_cast<uint16_t>(bits >> 16);
+            row_lds[col] = hi;
+            if (row_export != nullptr) {
+                row_export[col] = hi;
+            }
+        }
+        __syncthreads();
+    }
+
+    // -- Phase B: WMMA K-loop, M=m × hidden contraction × 16 vocab ----------
+    const int rhs_row_idx = tile_col + lane_row;
+    const bool rhs_in_range = rhs_row_idx < vocab;
+
+    const uint16_t* lm_head_w_u16 = reinterpret_cast<const uint16_t*>(lm_head_w);
+    const size_t rhs_row_base = static_cast<size_t>(rhs_row_idx) * hidden;
+
+    qwen36_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = hidden & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        // A operand: row `lane_row` of the M×16 tile. Real for rows 0..m-1;
+        // zero-padded for rows m..15. The WMMA still issues 4096 muls;
+        // bandwidth-bound on the B operand, so the M-padding is free.
+        qwen36_short16 a;
+        if (lane_row < m) {
+            const uint16_t* row_lds = x_norm_lds_u16
+                + static_cast<size_t>(lane_row) * hidden;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a[i] = static_cast<short>(row_lds[kk + i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        qwen36_short16 b;
+        if (rhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                b[i] = static_cast<short>(lm_head_w_u16[rhs_row_base + kk + i]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) b[i] = 0;
+        }
+
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    // K tail (defensive — hidden=2048 is /16 in production).
+    if (k_main != hidden) {
+        qwen36_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        qwen36_short16 b = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+        if (lane_row < m) {
+            const uint16_t* row_lds = x_norm_lds_u16
+                + static_cast<size_t>(lane_row) * hidden;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < hidden) a[i] = static_cast<short>(row_lds[kc]);
+            }
+        }
+        if (rhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                int kc = k_main + i;
+                if (kc < hidden) {
+                    b[i] = static_cast<short>(lm_head_w_u16[rhs_row_base + kc]);
+                }
+            }
+        }
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+    }
+
+    // -- Phase C: write all m output rows ---------------------------------
+    // RDNA3 wave32 WMMA acc layout: acc[i] -> C[2*i + lane_half, lane_row].
+    // Each lane_half handles 8 output rows (0,2,4,...,14 for half=0; 1,3,
+    // 5,...,15 for half=1). Skip rows ≥ m (zero-padded inputs produce
+    // zero outputs but writing them would corrupt logits beyond `m`).
+    const int out_col = tile_col + lane_row;
+    if (out_col < vocab) {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int out_row = 2 * i + lane_half;
+            if (out_row < m) {
+                const float val = bf16_round_rne_f32(acc[i]);
+                logits[static_cast<size_t>(out_row) * vocab + out_col] =
+                    static_cast<T>(val);
+            }
+        }
+    }
+#else
+    (void)m;
+    (void)final_hidden; (void)final_norm_w; (void)lm_head_w;
+    (void)logits; (void)x_normed_out;
+    (void)hidden; (void)vocab; (void)rms_norm_eps;
+#endif
+}
+
+// =============================================================================
 // Qwen3.6-MoE multi-token-prediction (MTP) pre-fusion kernel — Phase 6.2c.1.
 //
 // Reproduces the vLLM `Qwen3NextMultiTokenPredictor.forward` "pre-fusion"

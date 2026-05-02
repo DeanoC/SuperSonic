@@ -480,6 +480,28 @@ extern "C" {
         counter: *mut c_uint,
     ) -> c_int;
 
+    /// FFI bridge for the batched lm_head WMMA kernel (Phase 6.4a). Wraps
+    /// `qwen36_moe_lm_head_batched_wmma_kernel`. `m` is the runtime batch
+    /// size (1..16); for `m == 1` the single-M path
+    /// (`qwen36_moe_hip_lm_head_launch`) is faster — use the batched
+    /// launcher when `m >= 2` to amortize the lm_head BF16 weight read.
+    /// WMMA-only (gfx11xx); returns status 138 on unsupported hardware
+    /// or `hidden % 16 != 0` so the caller can fall back to a per-row
+    /// loop over the single-M launcher.
+    pub fn qwen36_moe_hip_lm_head_batched_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        m: c_int,
+        hidden: c_int,
+        vocab: c_int,
+        rms_norm_eps: f32,
+        final_hidden: *const c_void,
+        final_norm_w: *const c_void,
+        lm_head_w: *const c_void,
+        logits: *mut c_void,
+        x_normed_out: *mut c_void,
+    ) -> c_int;
+
     /// FFI bridge for the MTP pre-fusion kernel (Phase 6.2c.1). Single-block
     /// launch: BF16 RMSNorms over `e_in` and `h_base` followed by a
     /// `mtp.fc @ cat([e_norm, h_norm])` matvec into `fused_out`. All buffers
@@ -1369,6 +1391,119 @@ pub fn lm_head_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe lm_head_launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Safe wrapper for the batched lm_head WMMA kernel (Phase 6.4a).
+///
+/// Processes `m` input rows in a single WMMA tile per vocab block,
+/// amortizing the lm_head BF16 weight read across the batch.
+/// Companion to [`lm_head_launch`] — call this when `m >= 2`; for
+/// `m == 1` the single-M kernel is faster (no LDS overhead for the
+/// row dimension).
+///
+/// Buffer shapes (all on `ordinal`, BF16):
+///   - `final_hidden_buf`: `[m, hidden]`
+///   - `final_norm_w_buf`: `[hidden]` — shared across all `m` rows.
+///   - `lm_head_w_buf`:    `[vocab, hidden]`
+///   - `logits_buf`:       `[m, vocab]` — output.
+///   - `x_normed_out_buf`: optional `[m, hidden]` post-RMSNorm capture
+///     (Phase 6.4b's batched MTP path will use this).
+///
+/// Constraints:
+///   - `m` ∈ \[1, 16]. For `m > 16` the caller must tile rows.
+///   - `hidden % 16 == 0` (the WMMA K-loop assumes 16-element slabs).
+///   - HIP backend with WMMA BF16 support (gfx11xx). Returns a
+///     descriptive error on unsupported configs so the caller can
+///     fall back to a per-row loop over `lm_head_launch`.
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_batched_launch(
+    ordinal: usize,
+    m: i32,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+) -> Result<(), GpuError> {
+    if hidden <= 0 || vocab <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::lm_head_batched_launch: positive dims required, \
+             got hidden={hidden} vocab={vocab}"
+        )));
+    }
+    if !(1..=16).contains(&m) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::lm_head_batched_launch: m must be in 1..=16 (got \
+             {m}). For larger batches, tile across the M dimension."
+        )));
+    }
+    if hidden % 16 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::lm_head_batched_launch: hidden ({hidden}) must be a \
+             multiple of 16 — the WMMA K-loop assumes 16-element slabs"
+        )));
+    }
+
+    let backend = lm_head_w_buf.backend();
+    let x_normed_ptr = x_normed_out_buf
+        .map(|b| b.as_mut_ptr())
+        .unwrap_or(std::ptr::null_mut());
+    let status: c_int = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen36_moe_hip_lm_head_batched_launch(
+                    /* dtype = bf16 */ 2,
+                    ordinal,
+                    m as c_int,
+                    hidden as c_int,
+                    vocab as c_int,
+                    rms_norm_eps,
+                    final_hidden_buf.as_ptr(),
+                    final_norm_w_buf.as_ptr(),
+                    lm_head_w_buf.as_ptr(),
+                    logits_buf.as_mut_ptr(),
+                    x_normed_ptr,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                return Err(GpuError::InvalidArg(
+                    "qwen36_moe::lm_head_batched_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::lm_head_batched_launch: CUDA backend not yet wired".into(),
+            ));
+        }
+        Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::lm_head_batched_launch: Metal backend not yet wired".into(),
+            ));
+        }
+    };
+    if status == 138 {
+        return Err(GpuError::backend(
+            backend,
+            format!(
+                "qwen36_moe::lm_head_batched_launch: WMMA-BF16 path \
+                 unsupported on this device or hidden % 16 != 0 — fall \
+                 back to a per-row loop over `lm_head_launch`"
+            ),
+        ));
+    }
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe lm_head_batched_launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -5563,6 +5698,156 @@ mod tests {
                 "[lm_head parity] argmax differs (got={got_top} want={want_top}) — \
                  expected at high enough cos_sim with near-tied logits, but logging \
                  in case it's a real ordering bug"
+            );
+        }
+    }
+
+    /// Phase 6.4a parity: batched lm_head (M=K) vs K sequential single-M
+    /// `lm_head_launch` calls. The batched kernel must produce the same
+    /// logits as K independent single-M calls modulo BF16 F32-accumulation
+    /// order (cos_sim ≥ 0.999 per row).
+    ///
+    /// Synthesizes a small vocab/hidden problem so the test runs in
+    /// milliseconds. Real-shape (vocab=248k, hidden=2048) coverage comes
+    /// once Phase 6.4b wires the kernel into the speculative driver and
+    /// exercises it via the engine path.
+    #[cfg(supersonic_backend_hip)]
+    #[test]
+    fn qwen36_moe_lm_head_batched_matches_sequential() {
+        use gpu_hal::{copy_d2h, set_backend, Backend, GpuBuffer, ScalarType};
+
+        set_backend(Backend::Hip);
+        let ordinal = 0usize;
+
+        const M: i32 = 3; // K=3 matches the speculative-decode default
+        const HIDDEN: i32 = 256;
+        const VOCAB: i32 = 512;
+        const EPS: f32 = 1e-6;
+
+        // Deterministic seeded data — same xorshift the single-M test uses.
+        fn xorshift(state: &mut u32) -> f32 {
+            let mut x = *state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *state = x;
+            ((x & 0xFFFFFF) as f32 / 0xFFFFFF as f32) * 2.0 - 1.0
+        }
+        let mut rng = 0xBADCAFEu32;
+        let bf16_round = |v: f32| -> u16 {
+            let bits = v.to_bits();
+            let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
+            ((bits.wrapping_add(rounding_bias)) >> 16) as u16
+        };
+
+        // [M, HIDDEN] BF16 input, [HIDDEN] norm, [VOCAB, HIDDEN] lm_head.
+        let final_hidden_f32: Vec<f32> =
+            (0..(M * HIDDEN)).map(|_| xorshift(&mut rng) * 0.5).collect();
+        let final_norm_w_f32: Vec<f32> =
+            (0..HIDDEN).map(|_| xorshift(&mut rng) * 0.02).collect();
+        let scale = 1.0 / (HIDDEN as f32).sqrt();
+        let lm_head_f32: Vec<f32> = (0..(VOCAB as usize * HIDDEN as usize))
+            .map(|_| xorshift(&mut rng) * scale)
+            .collect();
+
+        let to_bf16_bytes = |xs: &[f32]| -> Vec<u8> {
+            let mut out = Vec::with_capacity(xs.len() * 2);
+            for &v in xs {
+                let b = bf16_round(v);
+                out.push((b & 0xFF) as u8);
+                out.push((b >> 8) as u8);
+            }
+            out
+        };
+        let final_hidden_bytes = to_bf16_bytes(&final_hidden_f32);
+        let final_norm_w_bytes = to_bf16_bytes(&final_norm_w_f32);
+        let lm_head_bytes = to_bf16_bytes(&lm_head_f32);
+
+        let final_norm_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[HIDDEN as usize], &final_norm_w_bytes,
+        ).expect("upload final_norm_w");
+        let lm_head_w_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16,
+            &[VOCAB as usize, HIDDEN as usize], &lm_head_bytes,
+        ).expect("upload lm_head_w");
+
+        // ---- Reference: K sequential single-M lm_head_launch calls -------
+        let mut want_logits_per_row: Vec<Vec<u8>> = Vec::with_capacity(M as usize);
+        for row in 0..M as usize {
+            let row_bytes = &final_hidden_bytes[row * HIDDEN as usize * 2
+                ..(row + 1) * HIDDEN as usize * 2];
+            let row_buf = GpuBuffer::from_host_bytes(
+                ordinal, ScalarType::BF16, &[HIDDEN as usize], row_bytes,
+            ).expect("upload final_hidden row");
+            let mut logits_buf = GpuBuffer::zeros(
+                ordinal, ScalarType::BF16, &[VOCAB as usize],
+            ).expect("alloc logits");
+            let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+                .expect("alloc counter");
+            super::lm_head_launch(
+                ordinal, HIDDEN, VOCAB, EPS,
+                &row_buf, &final_norm_w_buf, &lm_head_w_buf,
+                &mut logits_buf, None, &mut counter_buf,
+            ).expect("single-M lm_head launch");
+            let mut row_logits = vec![0u8; VOCAB as usize * 2];
+            copy_d2h(
+                ordinal, row_logits.as_mut_ptr() as *mut _,
+                logits_buf.as_ptr(), row_logits.len(),
+            ).expect("d2h single-M logits");
+            want_logits_per_row.push(row_logits);
+        }
+
+        // ---- Batched: one launch produces all K rows ---------------------
+        let final_hidden_buf = GpuBuffer::from_host_bytes(
+            ordinal, ScalarType::BF16, &[M as usize, HIDDEN as usize],
+            &final_hidden_bytes,
+        ).expect("upload [m, hidden]");
+        let mut batched_logits_buf = GpuBuffer::zeros(
+            ordinal, ScalarType::BF16, &[M as usize, VOCAB as usize],
+        ).expect("alloc [m, vocab] logits");
+
+        super::lm_head_batched_launch(
+            ordinal, M, HIDDEN, VOCAB, EPS,
+            &final_hidden_buf, &final_norm_w_buf, &lm_head_w_buf,
+            &mut batched_logits_buf, None,
+        ).expect("batched lm_head launch");
+
+        let batched_bytes = batched_logits_buf
+            .to_host_bytes()
+            .expect("d2h batched logits");
+        assert_eq!(
+            batched_bytes.len(), M as usize * VOCAB as usize * 2,
+            "batched logits size"
+        );
+
+        // ---- Compare per-row -----------------------------------------------
+        for row in 0..M as usize {
+            let want = &want_logits_per_row[row];
+            let got = &batched_bytes[row * VOCAB as usize * 2
+                ..(row + 1) * VOCAB as usize * 2];
+            let want_f = bf16_bytes_to_f32(want);
+            let got_f = bf16_bytes_to_f32(got);
+
+            let mut max_abs = 0.0f32;
+            let mut dot = 0.0f64;
+            let mut want_sq = 0.0f64;
+            let mut got_sq = 0.0f64;
+            for (g, w) in got_f.iter().zip(want_f.iter()) {
+                let d = (g - w).abs();
+                if d > max_abs { max_abs = d; }
+                dot += (*g as f64) * (*w as f64);
+                got_sq += (*g as f64).powi(2);
+                want_sq += (*w as f64).powi(2);
+            }
+            let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
+            eprintln!(
+                "[lm_head batched parity row {row}] max_abs={max_abs:.5e} \
+                 cos_sim={cos_sim:.7}"
+            );
+            assert!(
+                cos_sim >= 0.999,
+                "row {row}: cos_sim {cos_sim:.7} below 0.999 floor — \
+                 batched WMMA divergence vs single-M reference"
             );
         }
     }

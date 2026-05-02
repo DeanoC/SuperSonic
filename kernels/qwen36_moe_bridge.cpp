@@ -864,6 +864,74 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     return 0;
 }
 
+// Phase 6.4a: batched lm_head launcher (M = K input rows in one call).
+//
+// Wraps `qwen36_moe_lm_head_batched_wmma_kernel`. Mirrors the single-M
+// WMMA path in `qwen36_moe_hip_lm_head_launch` above, except `m` is a
+// runtime parameter (1..16) and the kernel processes M input rows
+// in a single WMMA tile per vocab block. WMMA-only (gfx11xx + bf16);
+// callers that need a fallback should call the single-M launch in a
+// loop. Status codes match the single-M launcher.
+extern "C" int qwen36_moe_hip_lm_head_batched_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           m,                     // 1..=16
+    int           hidden,
+    int           vocab,
+    float         rms_norm_eps,
+    const void*   final_hidden,          // [m, hidden] BF16
+    const void*   final_norm_w,          // [hidden]    BF16
+    const void*   lm_head_w,             // [vocab, hidden] BF16
+    void*         logits,                // [m, vocab]  BF16
+    void*         x_normed_out) {        // [m, hidden] BF16, nullable
+    if (dtype != 2) return 130;            // bf16 only
+    if (hidden <= 0 || vocab <= 0) return 132;
+    if (m < 1 || m > 16) return 134;
+    if (final_hidden == nullptr || final_norm_w == nullptr ||
+        lm_head_w == nullptr || logits == nullptr) {
+        return 133;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+    const int ordinal_int = static_cast<int>(device_ordinal);
+
+    // Batched WMMA path requires gfx11xx + hidden % 16 == 0.
+    if (!device_supports_wmma_bf16(ordinal_int) || (hidden % 16 != 0)) {
+        // Phase 6.4a only ships the WMMA kernel — non-WMMA hosts should
+        // call the single-M launcher K times. Returning 138 (unsupported
+        // hardware/dim combination) makes the failure mode explicit.
+        return 138;
+    }
+
+    constexpr int wmma_block_size = 32;
+    const int grid_x = (vocab + 15) / 16;
+    // LDS: 32 F32 reduction scratch + m * hidden u16 BF16-rounded inputs.
+    const size_t lds_bytes =
+        static_cast<size_t>(wmma_block_size) * sizeof(float) +
+        static_cast<size_t>(m) * static_cast<size_t>(hidden) * sizeof(uint16_t);
+
+    hipLaunchKernelGGL(
+        qwen36_moe::qwen36_moe_lm_head_batched_wmma_kernel<hip_bfloat16>,
+        dim3(static_cast<unsigned int>(grid_x)),
+        dim3(static_cast<unsigned int>(wmma_block_size)),
+        lds_bytes, 0,
+        m,
+        static_cast<const hip_bfloat16*>(final_hidden),
+        static_cast<const hip_bfloat16*>(final_norm_w),
+        static_cast<const hip_bfloat16*>(lm_head_w),
+        static_cast<hip_bfloat16*>(logits),
+        static_cast<hip_bfloat16*>(x_normed_out),
+        hidden,
+        vocab,
+        rms_norm_eps);
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
+
 // MTP pre-fusion launcher (Phase 6.2c.1).
 //
 // Single-block kernel: 256 threads, ~17 KiB LDS at hidden=2048. Computes
