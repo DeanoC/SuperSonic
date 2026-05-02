@@ -852,3 +852,68 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// MTP pre-fusion launcher (Phase 6.2c.1).
+//
+// Single-block kernel: 256 threads, ~17 KiB LDS at hidden=2048. Computes
+//   e_norm = rmsnorm(e_in,   pre_fc_norm_embedding_w, eps)
+//   h_norm = rmsnorm(h_base, pre_fc_norm_hidden_w,    eps)
+//   fused  = mtp.fc @ cat([e_norm, h_norm], dim=-1)
+// All BF16-rounded to match the Phase 6.2a Python oracle byte-for-byte
+// through the rounding boundary. Status codes match the lm_head launcher.
+extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           hidden,
+    float         rms_norm_eps,
+    const void*   e_in,
+    const void*   h_base,
+    const void*   pre_fc_norm_embedding_w,
+    const void*   pre_fc_norm_hidden_w,
+    const void*   fc_w,
+    void*         e_norm_out,
+    void*         h_norm_out,
+    void*         fused_out) {
+    if (dtype != 2) return 130;            // only bf16 supported
+    if (hidden <= 0) return 132;
+    if (e_in == nullptr || h_base == nullptr ||
+        pre_fc_norm_embedding_w == nullptr || pre_fc_norm_hidden_w == nullptr ||
+        fc_w == nullptr ||
+        e_norm_out == nullptr || h_norm_out == nullptr || fused_out == nullptr) {
+        return 133;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    constexpr int block_size = 256;
+    if (hidden % block_size != 0) {
+        // The block-reduction loop assumes hidden % block_size == 0 (no
+        // tail elements after the strided pass). 35B-A3B has hidden=2048
+        // which divides cleanly; reject anything else loudly.
+        return 134;
+    }
+
+    // shared_scratch [block_size] + e_norm_lds [hidden] + h_norm_lds [hidden],
+    // all F32. = (256 + 2*2048) * 4 = 17,408 bytes at hidden=2048.
+    const size_t lds_bytes =
+        static_cast<size_t>(block_size + 2 * hidden) * sizeof(float);
+
+    hipLaunchKernelGGL(
+        qwen36_moe::qwen36_moe_mtp_pre_fusion_kernel<hip_bfloat16>,
+        dim3(1), dim3(block_size), lds_bytes, 0,
+        hidden, rms_norm_eps,
+        static_cast<const hip_bfloat16*>(e_in),
+        static_cast<const hip_bfloat16*>(h_base),
+        static_cast<const hip_bfloat16*>(pre_fc_norm_embedding_w),
+        static_cast<const hip_bfloat16*>(pre_fc_norm_hidden_w),
+        static_cast<const hip_bfloat16*>(fc_w),
+        static_cast<hip_bfloat16*>(e_norm_out),
+        static_cast<hip_bfloat16*>(h_norm_out),
+        static_cast<hip_bfloat16*>(fused_out));
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}

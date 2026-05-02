@@ -343,11 +343,17 @@ def main():
             past_kv=mtp_kv,
             device=args.device,
         )
+        # Per-step embed row for the input token. Lets the SuperSonic-side
+        # parity test feed the same `e_in` the oracle saw (avoids re-loading
+        # 970 MiB of `embed_tokens.weight` on the Rust side just to gather
+        # one row).
+        input_embed_row = embed_w[next_tok : next_tok + 1].squeeze(0).to(torch.bfloat16)
         steps.append(dict(
             step=k,
             position=base_seq_len + k,
             input_token_id=next_tok,
             draft_token_id=out["next_tok"],
+            input_token_embed_bf16=b64_bf16(input_embed_row),
             e_norm_bf16=b64_bf16(out["e_norm"].squeeze(0)),
             h_norm_bf16=b64_bf16(out["h_norm"].squeeze(0)),
             fused_bf16=b64_bf16(out["fused"].squeeze(0)),
@@ -373,6 +379,16 @@ def main():
         rng2.standard_normal((1, hidden)).astype(np.float32) * 0.5
     ).to(torch.bfloat16).squeeze(0)  # [hidden]
 
+    # Pre-fusion weights — the SuperSonic kernel under test (Phase 6.2c.1)
+    # reads exactly these three tensors, so dumping them into the JSON keeps
+    # the parity test self-contained (no need to re-open safetensors on the
+    # Rust side just to load 16 MiB of fc_w + 8 KiB of norm gains).
+    prefusion_weights = dict(
+        fc_w_bf16=b64_bf16(fc_w),                       # [hidden, 2*hidden]
+        pre_fc_norm_embedding_w_bf16=b64_bf16(pre_fc_e),  # [hidden]
+        pre_fc_norm_hidden_w_bf16=b64_bf16(pre_fc_h),     # [hidden]
+    )
+
     fixture = dict(
         schema="qwen36-moe-mtp-oracle-v1",
         mode="synthetic",
@@ -394,6 +410,7 @@ def main():
         base_seq_len=base_seq_len,
         base_next_token_id=base_next_tok,
         h_base_step0_bf16=b64_bf16(h_base_step0),
+        prefusion_weights=prefusion_weights,
         draft_token_ids=[s["draft_token_id"] for s in steps],
         steps=steps,
     )
