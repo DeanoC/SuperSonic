@@ -399,6 +399,25 @@ pub(crate) struct Cli {
     #[arg(long)]
     speculative_decode: bool,
 
+    /// Enable batched-K speculative verify (Phase 6.4c.2 experimental).
+    ///
+    /// When set together with --speculative-decode, the engine routes
+    /// the verify path through `run_speculative_decode_step_batched`
+    /// + `LinearAttnSnapshot` save/restore instead of the per-step
+    /// closure with early termination. The batched path runs all K+1
+    /// verify chains, batches the K+1 lm_head GEMVs into one launch
+    /// (Phase 6.4a kernel), and on rejection restores linear-attn
+    /// state to the pre-spec snapshot then replays the accepted
+    /// prefix sequentially.
+    ///
+    /// Trade-off: net win when MTP accept rate is high (fewer total
+    /// base steps per emitted token); net loss when it's low (the
+    /// always-K+1 chains + replay outweigh batched lm_head savings).
+    /// Default off — opt in to measure on a specific workload.
+    /// Bit-identical greedy output to the per-step path.
+    #[arg(long)]
+    batched_spec_verify: bool,
+
     /// Emit the generated suffix as a JSON string for benchmark harnesses.
     #[arg(long)]
     emit_generated_json: bool,
