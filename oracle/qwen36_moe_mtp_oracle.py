@@ -66,6 +66,7 @@ import numpy as np
 import torch
 from safetensors import safe_open
 from transformers import AutoConfig
+from transformers.cache_utils import DynamicCache
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDecoderLayer,
     Qwen3_5MoeTextRotaryEmbedding,
@@ -123,11 +124,28 @@ def build_mtp_layer(text_cfg, mtp_state: dict[str, torch.Tensor], device: str):
 
     HF instantiates the layer with random init; we immediately overwrite
     via `load_state_dict`. This avoids loading the full 35B base model.
+
+    The MTP block is conceptually layer 0 of its own single-layer "model"
+    — vLLM's KV cache for the MTP head is keyed by layer_idx=0. Force the
+    layer to use layer_idx=0 by spoofing `layer_types[0] = "full_attention"`
+    in a deep-copy of the config; without this, instantiating with the
+    base model's first full-attn index (e.g. 3) would force the
+    `DynamicCache.update(..., layer_idx=3)` call to pad indices 0..2
+    with empty placeholders, which is wasteful but also bumps cache
+    `seen_tokens` indexing in subtle ways across HF transformers
+    versions.
     """
-    layer_idx = find_full_attention_layer_idx(text_cfg)
-    layer = Qwen3_5MoeDecoderLayer(text_cfg, layer_idx=layer_idx)
+    import copy
+    modified_cfg = copy.deepcopy(text_cfg)
+    # Force the first slot to "full_attention" so layer_idx=0 selects
+    # the full-attn variant (Qwen3_5MoeAttention).
+    modified_cfg.layer_types = ["full_attention"] + list(
+        modified_cfg.layer_types[1:]
+    )
+
+    layer = Qwen3_5MoeDecoderLayer(modified_cfg, layer_idx=0)
     layer = layer.to(torch.bfloat16).to(device).eval()
-    rotary = Qwen3_5MoeTextRotaryEmbedding(text_cfg).to(device).eval()
+    rotary = Qwen3_5MoeTextRotaryEmbedding(modified_cfg).to(device).eval()
 
     # Drop the `mtp.layers.0.` prefix and check expected names.
     prefix = "mtp.layers.0."
@@ -200,11 +218,13 @@ def mtp_step(
 
     if isinstance(layer_out, tuple):
         attn_out_3d = layer_out[0]
-        new_kv = layer_out[1] if len(layer_out) > 1 else past_kv
     else:
         attn_out_3d = layer_out
-        new_kv = past_kv
     attn_out = attn_out_3d.squeeze(1)  # [1, hidden]
+    # The HF layer mutates `past_kv` in place (cache.update inside
+    # Qwen3_5MoeAttention) — there's no "new" cache to thread through.
+    # The caller's persistent `DynamicCache` instance has just grown by
+    # one position.
 
     h_post = rmsnorm(attn_out, norm_w, eps)
     logits = torch.nn.functional.linear(h_post.to(torch.bfloat16), lm_head_weight)
@@ -221,7 +241,6 @@ def mtp_step(
         h_post=h_post,
         logits=logits,
         next_tok=next_tok,
-        new_past_kv=new_kv,
     )
 
 
@@ -300,7 +319,12 @@ def main():
 
     print(f"[mtp-oracle] running {args.num_speculative_tokens} draft step(s) "
           f"from base_seq_len={base_seq_len}, base_next_token={base_next_tok}...")
-    past_kv = None
+    # Persistent KV cache for the MTP layer — HF's attention mutates it in
+    # place via `cache.update(...)` so all K draft steps share one
+    # `DynamicCache` instance. Step k+1's attention reads K/V that
+    # accumulated through steps 0..k (matching vLLM's MTP behaviour: each
+    # draft step appends to the same single-layer MTP KV buffer).
+    mtp_kv = DynamicCache()
     next_tok = base_next_tok
     steps = []
     for k in range(args.num_speculative_tokens):
@@ -316,7 +340,7 @@ def main():
             norm_w=norm_w,
             lm_head_weight=lm_head_w,
             eps=eps,
-            past_kv=past_kv,
+            past_kv=mtp_kv,
             device=args.device,
         )
         steps.append(dict(
@@ -331,7 +355,8 @@ def main():
             h_post_bf16=b64_bf16(out["h_post"].squeeze(0)),
             logits_bf16=b64_bf16(out["logits"].squeeze(0)),
         ))
-        past_kv = out["new_past_kv"]
+        # `mtp_kv` has been mutated in place by mtp_layer.forward —
+        # nothing to thread through, just the recurrent h_base/next_tok.
         h_base = out["h_post"]
         next_tok = out["next_tok"]
 
