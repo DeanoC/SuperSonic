@@ -26,11 +26,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 DEFAULT_PROMPTS = [
     "The quick brown fox",
@@ -256,6 +258,156 @@ def build_oracle_model(model_dir: Path, bake_dir: Path, device: torch.device):
     return tokenizer, model
 
 
+def install_deterministic_projection_oracle(
+    model,
+    include_lm_head: bool = False,
+    attention_mode: str = "hybrid",
+) -> dict:
+    """Patch decode math to use kernel-style F32 ops plus BF16 boundaries.
+
+    Phi-4 CUDA trace replay validates projections with deterministic F32 dot
+    products and BF16 output boundaries. This opt-in oracle mode also patches
+    Phi-style RMSNorm and SwiGLU boundaries so the HF loop does not keep using
+    live PyTorch BF16 choices around those projections.
+    """
+
+    patched_linear = 0
+    patched_norm = 0
+    patched_mlp = 0
+    patched_attn = 0
+    patched_names: list[str] = []
+
+    def deterministic_linear_forward(module: nn.Linear, x: torch.Tensor) -> torch.Tensor:
+        out = F.linear(
+            x.float(),
+            module.weight.float(),
+            module.bias.float() if module.bias is not None else None,
+        )
+        return out.to(torch.bfloat16)
+
+    def deterministic_rms_norm_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        src = hidden_states.float()
+        variance = src.pow(2).mean(-1, keepdim=True)
+        out = src * torch.rsqrt(variance + module.variance_epsilon) * module.weight.float()
+        return out.to(torch.bfloat16)
+
+    def deterministic_mlp_forward(module: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_up = module.gate_up_proj(hidden_states)
+        gate, up = gate_up.chunk(2, dim=-1)
+        silu = gate.float() / (1.0 + torch.exp(-gate.float()))
+        up_states = (silu * up.float()).to(torch.bfloat16)
+        return module.down_proj(up_states)
+
+    def deterministic_attention_forward(
+        module: nn.Module,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
+        past_key_values=None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        from transformers.models.phi3.modeling_phi3 import apply_rotary_pos_emb, repeat_kv
+
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, module.head_dim)
+        qkv = module.qkv_proj(hidden_states)
+        query_pos = module.config.num_attention_heads * module.head_dim
+        kv_pos = module.num_key_value_heads * module.head_dim
+        query_states = qkv[..., :query_pos]
+        key_states = qkv[..., query_pos : query_pos + kv_pos]
+        value_states = qkv[..., query_pos + kv_pos :]
+
+        query_states = query_states.view(hidden_shape).transpose(1, 2)
+        key_states = key_states.view(hidden_shape).transpose(1, 2)
+        value_states = value_states.view(hidden_shape).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        query_states = query_states.to(torch.bfloat16)
+        key_states = key_states.to(torch.bfloat16)
+        value_states = value_states.to(torch.bfloat16)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states,
+                value_states,
+                module.layer_idx,
+            )
+
+        key_states = repeat_kv(key_states, module.num_key_value_groups)
+        value_states = repeat_kv(value_states, module.num_key_value_groups)
+        q_f32 = query_states.float()
+        k_f32 = key_states.float()
+        v_f32 = value_states.float()
+        use_loop_attention = (
+            q_f32.shape[2] == 1
+            and getattr(module, "_supersonic_loop_attention", attention_mode == "loop")
+        )
+        if use_loop_attention:
+            score_rows = []
+            for pos in range(k_f32.shape[2]):
+                score = torch.zeros_like(q_f32[:, :, 0, 0])
+                for dim in range(module.head_dim):
+                    score = score + q_f32[:, :, 0, dim] * k_f32[:, :, pos, dim]
+                score_rows.append(score * module.scaling)
+            attn_weights = torch.stack(score_rows, dim=-1).unsqueeze(2)
+        else:
+            attn_weights = torch.matmul(q_f32, k_f32.transpose(2, 3)) * module.scaling
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+        attn_probs = torch.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        if use_loop_attention:
+            acc = torch.zeros_like(v_f32[:, :, 0:1, :])
+            for pos in range(v_f32.shape[2]):
+                acc = acc + attn_probs[:, :, :, pos : pos + 1] * v_f32[:, :, pos : pos + 1, :]
+            attn_output = acc.to(torch.bfloat16)
+        else:
+            attn_output = torch.matmul(attn_probs, v_f32).to(torch.bfloat16)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
+        return module.o_proj(attn_output), attn_probs.to(torch.bfloat16)
+
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        if name == "lm_head" and not include_lm_head:
+            continue
+        module.forward = types.MethodType(deterministic_linear_forward, module)
+        patched_linear += 1
+        patched_names.append(name)
+
+    for name, module in model.named_modules():
+        if hasattr(module, "variance_epsilon") and hasattr(module, "weight"):
+            module.forward = types.MethodType(deterministic_rms_norm_forward, module)
+            patched_norm += 1
+            patched_names.append(name)
+        if hasattr(module, "gate_up_proj") and hasattr(module, "down_proj"):
+            module.forward = types.MethodType(deterministic_mlp_forward, module)
+            patched_mlp += 1
+            patched_names.append(name)
+        if hasattr(module, "qkv_proj") and hasattr(module, "o_proj"):
+            module._supersonic_attention_mode = attention_mode
+            module._supersonic_loop_attention = attention_mode == "loop"
+            module.forward = types.MethodType(deterministic_attention_forward, module)
+            patched_attn += 1
+            patched_names.append(name)
+
+    return {
+        "enabled": True,
+        "patched_linear_modules": patched_linear,
+        "patched_rms_norm_modules": patched_norm,
+        "patched_mlp_modules": patched_mlp,
+        "patched_attention_modules": patched_attn,
+        "patched_lm_head": include_lm_head,
+        "attention_mode": attention_mode,
+        "patched_module_names": patched_names,
+        "semantics": (
+            "Linear/RMSNorm/attention/SwiGLU use F32 arithmetic with explicit "
+            "BF16 output rounding at kernel-style boundaries"
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Greedy decode for comparison
 # ---------------------------------------------------------------------------
@@ -295,9 +447,13 @@ def topk_payload(logits: torch.Tensor, tokenizer, top_k: int) -> list[dict]:
     ]
 
 
+@torch.no_grad()
 def python_greedy(tokenizer, model, prompt: str, max_new_tokens: int,
                   device: torch.device, top_k: int = 16) -> tuple[list[int], str, list[list[dict]]]:
     ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+    for module in model.modules():
+        if getattr(module, "_supersonic_attention_mode", None) == "hybrid":
+            module._supersonic_loop_attention = ids.shape[1] >= 10
     eos_token_ids = collect_eos_token_ids(tokenizer, model)
     past = None
     next_id = None
@@ -364,6 +520,24 @@ def rust_greedy(binary: Path, model_variant: str, model_dir: Path,
         else:
             text_lines.append(line)
     return tokens, "\n".join(text_lines)
+
+
+def configure_torch_backend(disable_bf16_reduced_precision_reduction: bool) -> dict:
+    if disable_bf16_reduced_precision_reduction and hasattr(
+        torch.backends.cuda.matmul,
+        "allow_bf16_reduced_precision_reduction",
+    ):
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+    return {
+        "cuda_available": bool(torch.cuda.is_available()),
+        "allow_tf32": getattr(torch.backends.cuda.matmul, "allow_tf32", None),
+        "allow_bf16_reduced_precision_reduction": getattr(
+            torch.backends.cuda.matmul,
+            "allow_bf16_reduced_precision_reduction",
+            None,
+        ),
+    }
 
 
 def rust_materialized_diagnostics(binary: Path, model_variant: str, model_dir: Path,
@@ -481,11 +655,27 @@ def parse_args() -> argparse.Namespace:
                    help="On token mismatch, rerun Rust with materialized logits and include top-k diagnostics.")
     p.add_argument("--diagnostic-top-k", type=int, default=16)
     p.add_argument("--near-tie-threshold", type=float, default=0.5)
+    p.add_argument("--disable-bf16-reduced-precision-reduction", action="store_true",
+                   help="Force torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction=False "
+                        "before loading the oracle model. Useful for Phi-4 CUDA accumulation diagnostics.")
+    p.add_argument("--deterministic-projection-oracle", action="store_true",
+                   help="Patch Python nn.Linear projections to use F32 matmul plus BF16 output rounding. "
+                        "Intended for Phi-4 CUDA INT4 parity diagnostics.")
+    p.add_argument("--deterministic-lm-head", action="store_true",
+                   help="With --deterministic-projection-oracle, also patch lm_head. "
+                        "By default only decoder math is patched.")
+    p.add_argument("--deterministic-attention-mode",
+                   choices=["matmul", "loop", "hybrid"],
+                   default="hybrid",
+                   help="Attention reduction mode for --deterministic-projection-oracle. "
+                        "hybrid uses explicit decode-order loops for longer KV contexts.")
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    torch_backend = configure_torch_backend(args.disable_bf16_reduced_precision_reduction)
+    log(f"[oracle] torch_backend={torch_backend}")
     device = torch.device(
         args.device if args.device
         else ("cuda" if torch.cuda.is_available() else "cpu")
@@ -504,6 +694,22 @@ def main() -> int:
         log(f"ERROR: bake dir not found: {bake_dir}")
         return 2
     tokenizer, model = build_oracle_model(args.model_dir, bake_dir, device)
+    projection_oracle = {"enabled": False}
+    if args.deterministic_projection_oracle:
+        projection_oracle = install_deterministic_projection_oracle(
+            model,
+            include_lm_head=args.deterministic_lm_head,
+            attention_mode=args.deterministic_attention_mode,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        log(
+            "[oracle] deterministic_projection_oracle="
+            f"{projection_oracle['patched_linear_modules']} linear, "
+            f"{projection_oracle['patched_rms_norm_modules']} rms_norm, "
+            f"{projection_oracle['patched_attention_modules']} attention, "
+            f"{projection_oracle['patched_mlp_modules']} mlp modules patched"
+        )
 
     results: list[dict] = []
     matches = 0
@@ -566,6 +772,8 @@ def main() -> int:
         args.report.write_text(json.dumps({
             "matches": matches,
             "total": len(prompts),
+            "torch_backend": torch_backend,
+            "deterministic_projection_oracle": projection_oracle,
             "results": results,
         }, indent=2))
         log(f"[corpus] detailed report: {args.report}")

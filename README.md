@@ -71,18 +71,24 @@ see [docs/dflash.md](docs/dflash.md).
   9B CUDA KV-FP8 lane is blocked on the same bake. INT4 and FP8-runtime bakes
   are already published and validated on `sm86`.
 ² `phi4-mini` BF16 CUDA is wired and validated on `sm86` with the CPU oracle.
-  INT4 uses the downloadable bake and passes the reconstructed-bake corpus
-  oracle on CUDA. FP8-runtime uses the downloadable FP8-native bake and passes
-  the PyTorch oracle on CUDA. FP8-KV has descriptor/kernel hooks but still needs
-  CUDA bake/validation work.
+  INT4 uses the downloadable bake and passes the `12/12` reconstructed-bake
+  corpus with the kernel-accurate deterministic Python oracle. The live
+  PyTorch BF16 oracle remains `10/12`, which layer replay diagnostics attribute
+  to PyTorch BF16 accumulation sensitivity. See
+  [docs/phi4-cuda-parity.md](docs/phi4-cuda-parity.md). FP8-runtime uses the
+  downloadable FP8-native bake and passes the PyTorch oracle on CUDA. FP8-KV
+  has descriptor/kernel hooks but still needs CUDA bake/validation work.
 
 CUDA support is validated on NVIDIA `sm86` hardware (RTX 3090-class) with
 hand-maintained CUDA sources and no generic fallback backend. Qwen3.5 BF16,
 INT4, FP8-runtime, and KV-FP8 lanes are now at parity with the HIP matrix for
 0.8B, 2B, and 4B, and `phi4-mini` BF16/FP8-runtime have native CUDA
-persistent-decode lanes. The remaining Qwen3.5 9B gap is artifact
-availability: the BF16 bake still needs to be produced and uploaded, and the
-9B KV-FP8 lane becomes available after that bake exists.
+persistent-decode lanes. `phi4-mini` INT4 now matches the kernel-accurate
+deterministic corpus oracle; the live PyTorch oracle is advisory for that lane
+because BF16 accumulation choices change near-tie generations. The remaining
+Qwen3.5 9B gap is artifact availability: the BF16 bake still needs to be
+produced and uploaded, and the 9B KV-FP8 lane becomes available after that bake
+exists.
 
 CUDA KV-FP8 notes:
 

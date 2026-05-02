@@ -3877,7 +3877,9 @@ __global__ void phi4_persistent_decode_kernel(
     const Phi4KVCacheFp8Desc* __restrict__ kv_fp8,          // nullptr for BF16 KV, else [num_layers]
     int batch_size,                      // 1 for single-sequence, >1 for batched
     const Phi4BatchSeqDesc* __restrict__ batch_descs,  // nullptr for single, else [num_layers]
-    const Phi4INT4ScaleDesc* __restrict__ int4_scales  // nullptr for non-INT4, else [num_layers]
+    const Phi4INT4ScaleDesc* __restrict__ int4_scales,  // nullptr for non-INT4, else [num_layers]
+    float* __restrict__ layer_trace,      // optional packed per-layer trace for batch 0
+    int layer_trace_components
 ) __attribute__((launch_bounds(256, 1))) {
     const int tid = threadIdx.x;
     const int bs = blockDim.x;
@@ -3929,6 +3931,11 @@ __global__ void phi4_persistent_decode_kernel(
 
     for (int layer = 0; layer < num_layers; ++layer) {
         const Phi4DecodeLayerDesc& L = layers[layer];
+        const size_t trace_layer_floats =
+            static_cast<size_t>(layer_trace_components) * hidden_dim + 3 * intermediate_size;
+        float* trace_base = layer_trace != nullptr
+            ? layer_trace + static_cast<size_t>(layer) * trace_layer_floats
+            : nullptr;
 
         // Match the component path's BF16 hidden-state boundaries: each layer
         // starts from BF16-hidden activations rather than carrying full F32
@@ -3938,6 +3945,12 @@ __global__ void phi4_persistent_decode_kernel(
                 for (int c = tid; c < hidden_dim; c += bs) {
                     hidden_f32[b * hidden_dim + c] =
                         bf16_round_rne_f32_finite(hidden_f32[b * hidden_dim + c]);
+                }
+                __syncthreads();
+            }
+            if (trace_base != nullptr && layer_trace_components >= 1) {
+                for (int c = tid; c < hidden_dim; c += bs) {
+                    trace_base[c] = hidden_f32[c];
                 }
                 __syncthreads();
             }
@@ -4136,6 +4149,19 @@ __global__ void phi4_persistent_decode_kernel(
                 float* v_f32 = proj_b + L.q_out_dim + L.k_out_dim;
 
                 // Step B: (QK-norm stripped — Phi-4-mini does not apply Q/K-norm.)
+                if (b == 0 && trace_base != nullptr && layer_trace_components >= 10) {
+                    float* trace_q_raw = trace_base + 7 * hidden_dim + 3 * intermediate_size;
+                    float* trace_k_raw = trace_base + 8 * hidden_dim + 3 * intermediate_size;
+                    float* trace_v_raw = trace_base + 9 * hidden_dim + 3 * intermediate_size;
+                    for (int c = tid; c < L.q_out_dim; c += bs) {
+                        trace_q_raw[c] = q_f32[c];
+                    }
+                    for (int c = tid; c < L.k_out_dim; c += bs) {
+                        trace_k_raw[c] = k_f32[c];
+                        trace_v_raw[c] = v_f32[c];
+                    }
+                    __syncthreads();
+                }
 
                 // Step C: RoPE (partial, first rot_dim dims of head_dim)
                 if (cos_table != nullptr && rot_dim > 0) {
@@ -4404,6 +4430,13 @@ __global__ void phi4_persistent_decode_kernel(
                 // Phi-4 has no SwiGLU gate on the attention output — attn_flat
                 // flows straight into o_proj. (Qwen3.5 had a sigmoid(gate) *
                 // attn step here; Phi-4 is plain GQA.)
+                if (trace_base != nullptr && layer_trace_components >= 6) {
+                    float* trace_attn_flat = trace_base + 5 * hidden_dim + 3 * intermediate_size;
+                    for (int c = tid; c < attn_size; c += bs) {
+                        trace_attn_flat[c] = attn_flat[c];
+                    }
+                    __syncthreads();
+                }
 
                 } // end if (blockIdx.x == 0)
                 // Grid barrier: block 0 wrote attn_flat, all blocks need it for o_proj
@@ -4524,6 +4557,13 @@ __global__ void phi4_persistent_decode_kernel(
                 }
                 __syncthreads();
             }
+            if (trace_base != nullptr && layer_trace_components >= 2) {
+                float* trace_post = trace_base + hidden_dim;
+                for (int c = tid; c < hidden_dim; c += bs) {
+                    trace_post[c] = hidden_f32[c];
+                }
+                __syncthreads();
+            }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
@@ -4556,6 +4596,14 @@ __global__ void phi4_persistent_decode_kernel(
             }
         }
         grid_barrier(barrier_counter, barrier_flag, nb);
+
+        if (blockIdx.x == 0 && trace_base != nullptr && layer_trace_components >= 3) {
+            float* trace_normed = trace_base + 2 * hidden_dim;
+            for (int c = tid; c < hidden_dim; c += bs) {
+                trace_normed[c] = normed[c];
+            }
+            __syncthreads();
+        }
 
         // All blocks: cache B normed vectors in LDS for fast projection reads
         for (int b = 0; b < B; b++)
@@ -4702,6 +4750,10 @@ __global__ void phi4_persistent_decode_kernel(
                     float g = wave_reduce_sum_f32(gp[b]);
                     float u = wave_reduce_sum_f32(up[b]);
                     if (lane_p == 0) {
+                        if (b == 0 && trace_base != nullptr && layer_trace_components >= 7) {
+                            trace_base[5 * hidden_dim + intermediate_size + my_row] = g;
+                            trace_base[5 * hidden_dim + 2 * intermediate_size + my_row] = u;
+                        }
                         float gr = bf16_round_rne_f32_finite(g);
                         float ur = bf16_round_rne_f32_finite(u);
                         float silu = gr / (1.0f + expf(-gr));
@@ -4712,6 +4764,15 @@ __global__ void phi4_persistent_decode_kernel(
             }
         }
         __syncthreads();
+        grid_barrier(barrier_counter, barrier_flag, nb);
+
+        if (blockIdx.x == 0 && trace_base != nullptr && layer_trace_components >= 6) {
+            float* trace_gate_up = trace_base + 5 * hidden_dim;
+            for (int c = tid; c < intermediate_size; c += bs) {
+                trace_gate_up[c] = gate_up[c];
+            }
+            __syncthreads();
+        }
         grid_barrier(barrier_counter, barrier_flag, nb);
 
         // === MLP down_proj (all blocks work-steal, per-sequence) ===
@@ -4787,6 +4848,11 @@ __global__ void phi4_persistent_decode_kernel(
                     }
                     float result = wave_reduce_sum_f32(p);
                     if (lane_d == 0) {
+                        if (b == 0 && trace_base != nullptr && layer_trace_components >= 7) {
+                            float* trace_down_raw =
+                                trace_base + 6 * hidden_dim + 3 * intermediate_size;
+                            trace_down_raw[my_row] = result;
+                        }
                         float add = bf16_round_rne_f32_finite(result);
                         mlp_out[b * hidden_dim + my_row] = add;
                         hidden_f32[b * hidden_dim + my_row] =
@@ -4800,6 +4866,22 @@ __global__ void phi4_persistent_decode_kernel(
         } // end for (b) down_proj batch loop
 
         // Residual add for MLP is fused into down_proj above.
+        if (blockIdx.x == 0 && trace_base != nullptr) {
+            if (layer_trace_components >= 4) {
+                float* trace_mlp = trace_base + 3 * hidden_dim;
+                for (int c = tid; c < hidden_dim; c += bs) {
+                    trace_mlp[c] = mlp_out[c];
+                }
+            }
+            if (layer_trace_components >= 5) {
+                float* trace_final = trace_base + 4 * hidden_dim;
+                for (int c = tid; c < hidden_dim; c += bs) {
+                    trace_final[c] = hidden_f32[c];
+                }
+            }
+            __syncthreads();
+        }
+        grid_barrier(barrier_counter, barrier_flag, nb);
     }
 
     // Write back F32 → BF16 for all batch items
