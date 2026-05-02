@@ -1270,9 +1270,6 @@ fn main() -> Result<()> {
         if matches!(model_variant, ModelVariant::Gemma4_E4B) && cli.int4 {
             anyhow::bail!("HIP gfx942 Gemma 4 E4B bring-up currently validates only BF16");
         }
-        if matches!(model_variant, ModelVariant::Phi4_Mini) && cli.int4 {
-            anyhow::bail!("HIP gfx942 Phi-4-mini bring-up currently validates only BF16");
-        }
         if cli.batch_size != 1 {
             anyhow::bail!("HIP gfx942 bring-up currently supports only --batch-size 1");
         }
