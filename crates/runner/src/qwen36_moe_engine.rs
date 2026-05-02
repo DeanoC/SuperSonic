@@ -754,6 +754,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.speculative_decode,
         cli.fp8_runtime,
         cli.batched_spec_verify,
+        cli.persistent_decode,
     )?;
     Ok(())
 }
@@ -1373,6 +1374,7 @@ fn decode_text(
     speculative_decode: bool,
     fp8_runtime: bool,
     batched_spec_verify: bool,
+    persistent_decode: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1683,6 +1685,34 @@ fn decode_text(
         );
     }
 
+    // Phase 3e.2: pre-allocate the persistent megakernel's scratch
+    // (descriptor array + ping/pong residual + workspace + sync_buf) once
+    // before the decode loop. Reused for every step. Disabled when
+    // `--speculative-decode` is set since the spec verify loop runs
+    // multiple chains per step and isn't yet wired to the persistent
+    // path.
+    let mut persistent_scratch = if persistent_decode && !speculative_decode {
+        let scratch =
+            crate::qwen36_moe_persistent_decode::PersistentScratch::new(ordinal, &geom, &mut layers)
+                .context("alloc PersistentScratch for --persistent-decode")?;
+        println!(
+            "  --persistent-decode: megakernel scratch allocated \
+             (descs={}KiB, workspace={}KiB, ping/pong={}KiB)",
+            scratch.layer_descs_dev.len_bytes() / 1024,
+            scratch.workspace.len_bytes() / 1024,
+            scratch.hidden_ping.len_bytes() / 1024,
+        );
+        Some(scratch)
+    } else if persistent_decode && speculative_decode {
+        eprintln!(
+            "  --persistent-decode: ignored when --speculative-decode is set \
+             (verify loop not yet wired to persistent path; falling back to chained)"
+        );
+        None
+    } else {
+        None
+    };
+
     println!(
         "  decoding {} prompt token{} + generating ≤{} new token{}…",
         prompt_ids.len(),
@@ -1769,15 +1799,23 @@ fn decode_text(
         // the wall-clock around this call stays correct either way
         // because `run_chained_decode_fast` ends with a D2H copy that
         // implicitly drains the queue.
-        let outputs = run_chained_decode_fast(
-            ordinal,
-            &geom,
-            &mut layers,
-            &initial_hidden,
-            position,
-            emit_stage_timings,
-        )
-        .with_context(|| format!("chained decode (step {step}, position {position})"))?;
+        let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
+            scratch
+                .run(ordinal, &initial_hidden, position)
+                .with_context(|| {
+                    format!("persistent decode (step {step}, position {position})")
+                })?
+        } else {
+            run_chained_decode_fast(
+                ordinal,
+                &geom,
+                &mut layers,
+                &initial_hidden,
+                position,
+                emit_stage_timings,
+            )
+            .with_context(|| format!("chained decode (step {step}, position {position})"))?
+        };
         let t_chain_step = t1.elapsed();
         position += 1;
 
