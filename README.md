@@ -120,8 +120,8 @@ see [docs/dflash.md](docs/dflash.md).
 
 ¹ `qwen3.5-9b` BF16 and KV-FP8 use the `bakes-v2` BF16 release artifact for
   release-backed downloads. `bakes-v2` also publishes `qwen3.5-9b` INT4 GPTQ
-  and FP8-native artifacts, and the release-backed download paths have been
-  smoke-tested on `sm86`.
+  and FP8-native artifacts; BF16, KV-FP8, INT4 GPTQ, and FP8-runtime
+  release-backed paths have all been smoke-tested on `sm86`.
 ² `phi4-mini` BF16 CUDA is wired and validated on `sm86` with the CPU oracle.
   INT4 uses the downloadable bake and passes the `12/12` reconstructed-bake
   corpus with the kernel-accurate deterministic Python oracle. The live
@@ -139,8 +139,8 @@ persistent-decode lanes. `phi4-mini` INT4 now matches the kernel-accurate
 deterministic corpus oracle; the live PyTorch oracle is advisory for that lane
 because BF16 accumulation choices change near-tie generations. The former
 Qwen3.5 9B CUDA artifact gap is closed: BF16, INT4 GPTQ, and FP8-native release
-bakes are present in `bakes-v2`, so the BF16-dependent 9B KV-FP8 lane can use
-the same release-backed BF16 weights.
+bakes are present in `bakes-v2`, and the BF16-dependent 9B KV-FP8 lane has
+been smoke-tested with the same release-backed BF16 weights.
 
 CUDA KV-FP8 notes:
 
