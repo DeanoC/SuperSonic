@@ -1187,6 +1187,35 @@ fn decode_text(
 ) -> Result<()> {
     use std::io::Write as _;
 
+    // Greedy-only gate for speculative decode. The Phase 6.3 protocol
+    // verifies MTP drafts via greedy argmax against the base model's
+    // logits — extending it to non-greedy sampling needs rejection
+    // sampling (Speculative Decoding §3 in vLLM's reference), which
+    // hasn't been implemented. Reject up front rather than silently
+    // mix `argmax` (verify) with `sample_bf16_logits` (regular sample),
+    // which would emit a different distribution than plain decode and
+    // break reproducibility.
+    //
+    // `sample_bf16_logits` falls back to argmax when `temperature <= 0`
+    // (or `top_k == 1`), so any non-trivial sampling configuration —
+    // any of `temperature > 0`, `top_k != 1`, `top_p < 1.0` — counts
+    // as non-greedy and is rejected here.
+    if speculative_decode {
+        let is_greedy = sampling.temperature <= 0.0
+            || sampling.top_k == 1;
+        if !is_greedy {
+            anyhow::bail!(
+                "--speculative-decode currently supports greedy sampling \
+                 only (temperature ≤ 0 or top_k == 1). Got temperature={}, \
+                 top_k={}, top_p={}. Phase 6.4 will add sampling-consistent \
+                 verification (rejection sampling); until then, re-run with \
+                 `--temperature 0` for speculative decode, or drop \
+                 `--speculative-decode` for non-greedy sampling.",
+                sampling.temperature, sampling.top_k, sampling.top_p
+            );
+        }
+    }
+
     let weight_prefix = report.kernel_params.weight_prefix;
 
     // Tokenizer first — without it we can't tokenize the prompt or stream
@@ -1639,7 +1668,13 @@ fn decode_text(
             let headroom = max_new - generated_ids.len();
             let dynamic_k = NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
             let h_base = outputs.final_hidden_bytes.clone();
-            let spec_t0 = std::time::Instant::now();
+            // P2: thread spec-verify timings into the engine-level
+            // accumulators so `--emit-stage-timings` reports honest
+            // per-token costs under speculative decode. Without these
+            // captures, every base step inside the verify loop would
+            // be invisible to `gen_steps` / `t_chain` / `t_lm_head`,
+            // making the speculative path look ~K+1× faster than it
+            // really is on stage-timings dashboards.
             let result = run_speculative_decode_step(
                 ordinal,
                 &geom,
@@ -1653,6 +1688,7 @@ fn decode_text(
                 position,
                 dynamic_k,
                 |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
+                    let t_chain_start = std::time::Instant::now();
                     let initial_hidden = lookup_embed_row(
                         &store,
                         weight_prefix,
@@ -1667,6 +1703,12 @@ fn decode_text(
                         pos,
                         emit_stage_timings,
                     )?;
+                    t_chain += t_chain_start.elapsed();
+                    t_chain_full_attn_us += outputs.kernel_full_attn_us;
+                    t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
+                    t_chain_ffn_us += outputs.kernel_ffn_us;
+
+                    let t_lm_head_start = std::time::Instant::now();
                     gpu_hal::copy_h2d(
                         ordinal,
                         final_hidden_buf.as_mut_ptr(),
@@ -1688,6 +1730,16 @@ fn decode_text(
                     let logits_bytes = logits_buf
                         .to_host_bytes()
                         .context("d2h logits from spec verify lm_head")?;
+                    t_lm_head += t_lm_head_start.elapsed();
+                    // Each verify base step counts as one decode step
+                    // for the per-token average — emitted_tokens.len()
+                    // tokens are committed per spec call, and
+                    // closure-call-count == emitted_tokens.len() in
+                    // both the partial-accept and full-accept (with
+                    // bonus) cases. Bumping here is equivalent to
+                    // "one closure call = one decode step worth of
+                    // base work."
+                    gen_steps += 1;
                     Ok((
                         argmax_bf16_logits(&logits_bytes),
                         outputs.final_hidden_bytes,
@@ -1695,8 +1747,6 @@ fn decode_text(
                 },
             )
             .context("speculative decode step")?;
-            let spec_elapsed = spec_t0.elapsed();
-            let _ = spec_elapsed; // future timing accumulator (Phase 6.4 perf)
 
             // Append emitted tokens. Honour `max_new` and EOS by
             // breaking out cleanly mid-emission.
