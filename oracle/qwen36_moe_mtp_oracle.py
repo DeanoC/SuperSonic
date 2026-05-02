@@ -212,8 +212,8 @@ def load_raw_tensor_bf16(
         raise KeyError(f"raw tensor not found: {name}")
     scale_name = f"{name}_scale_inv"
     scale = loader.get(scale_name) if loader is not None else None
-    if scale is not None and t.dim() == 2:
-        return dequant_fp8_blocks(t, scale)
+    if scale is not None:
+        return dequant_fp8_tensor(t, scale)
     return t.to(torch.bfloat16)
 
 
@@ -272,6 +272,7 @@ def dequantize_remaining_fp8_parameters(
     as FP8 parameters without registered scale tensors. Rebuild those from raw
     per-expert safetensors so real-prefill matches the BF16 reference model."""
     named_params = dict(model.named_parameters())
+    named_buffers = dict(model.named_buffers())
     fp8_names = [n for n, p in named_params.items() if p.dtype == torch.float8_e4m3fn]
     if fp8_names:
         print(f"[mtp-oracle] dequantizing {len(fp8_names)} remaining FP8 parameter(s)...")
@@ -281,6 +282,8 @@ def dequantize_remaining_fp8_parameters(
         if param.dtype != torch.float8_e4m3fn:
             continue
         scale = named_params.get(f"{name}_scale_inv")
+        if scale is None:
+            scale = named_buffers.get(f"{name}_scale_inv")
         if scale is not None:
             bf16 = dequant_fp8_tensor(param, scale).to(torch.bfloat16)
         elif name.endswith(".mlp.experts.gate_up_proj") or name.endswith(".mlp.experts.down_proj"):
