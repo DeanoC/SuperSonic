@@ -618,7 +618,13 @@ where
             break;
         }
     }
-    if emitted.len() == num_drafts {
+    // Use `n_accepted == num_drafts` (NOT `emitted.len() == num_drafts`)
+    // to detect full-accept — at K=2 with rejection at the last index,
+    // both branches exit with `emitted.len() == 2`, but only the
+    // full-accept branch has `n_accepted == 2`. Using `len()` would
+    // misclassify the last-index rejection as full-accept and
+    // append a bogus bonus token.
+    if n_accepted == num_drafts {
         // All K drafts accepted; emit the bonus.
         let bonus = predictions[num_drafts].0;
         emitted.push(bonus);

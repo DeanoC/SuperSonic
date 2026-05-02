@@ -959,3 +959,123 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     eprintln!("[spec batched] pass 4 (K=0): emitted={:?} n_accepted={}",
         r4.emitted_tokens, r4.n_accepted);
 }
+
+/// Phase 6.4b regression: rejection at the FINAL draft index must NOT
+/// append a bonus token. Earlier the full-accept branch fired off
+/// `emitted.len() == num_drafts`, which is also true after a
+/// last-index rejection (both exit the loop with K elements in
+/// `emitted`) — so K=1 with reject-at-0 and K=2 with reject-at-1
+/// silently appended a bogus bonus.
+///
+/// Synthetic-only: uses a mock closure to drive the driver against
+/// canned predictions. K is forced to a value smaller than the
+/// oracle's `draft_token_ids` to exercise the K=1 / K=2 boundary
+/// cases the full-K=3 fixture wouldn't trigger.
+#[test]
+fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
+    if !is_backend_compiled(Backend::Hip) {
+        eprintln!("skip: HIP backend not compiled");
+        return;
+    }
+    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MTP_ORACLE_JSON") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
+        return;
+    };
+    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+        return;
+    };
+    let model_dir = PathBuf::from(model_dir);
+
+    let raw = std::fs::read_to_string(&json_path).expect("read mtp oracle json");
+    let json: Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
+    let geom = parse_geom(&json);
+    let base_seq_len = json["base_seq_len"].as_i64().unwrap() as i32;
+    let base_next_token_id = json["base_next_token_id"].as_i64().unwrap() as u32;
+    let h_base_bytes = b64(json["h_base_step0_bf16"].as_str().unwrap());
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
+    let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, 4)
+        .expect("load mtp buffers");
+    let embed_w = shards
+        .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
+        .expect("load embed_tokens.weight");
+    let lm_head_w = shards
+        .load_bf16_to_gpu(ordinal, "lm_head.weight")
+        .expect("load lm_head.weight");
+    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, 4)
+        .expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
+        .expect("alloc chain scratch");
+    let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
+
+    // ---- K=1, reject at k=0 (the only and final index) ----
+    // Pre-fix: emitted=[bad_pred], len()==1==K → fired full-accept
+    // branch, appended bonus → emitted=[bad_pred, bogus_bonus].
+    // Post-fix: n_accepted=0 != K → no bonus, emitted=[bad_pred].
+    let bad_pred_k1: u32 = 7777;
+    let synth_fh_k1 = synth_fh.clone();
+    let mut k1_calls = 0usize;
+    let base_step_k1 = move |inputs: &[(i32, u32)]|
+        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+    {
+        assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
+        k1_calls += 1;
+        // K+1 = 2 predictions: index 0 mismatches drafts[0],
+        // index 1 (bonus) is filler — must NOT appear in emitted.
+        Ok(vec![
+            (bad_pred_k1, synth_fh_k1.clone()),
+            (99999, synth_fh_k1.clone()),
+        ])
+    };
+    let r_k1 = run_speculative_decode_step_batched(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 1,
+        base_step_k1,
+    ).expect("K=1 reject-at-0");
+    assert_eq!(r_k1.emitted_tokens, vec![bad_pred_k1],
+        "K=1 reject-at-0 emits ONLY corrected, NOT bonus");
+    assert_eq!(r_k1.n_accepted, 0);
+    eprintln!("[spec batched reject-at-last] K=1: emitted={:?} n_accepted={}",
+        r_k1.emitted_tokens, r_k1.n_accepted);
+
+    // ---- K=2, reject at k=1 (the FINAL index) ----
+    // Pre-fix: drafts[0] accepted then drafts[1] rejected → emitted
+    // ends at len=2=K → fired full-accept branch → appended bonus →
+    // emitted=[drafts[0], bad_pred, bogus_bonus].
+    // Post-fix: n_accepted=1 != K=2 → no bonus, emitted=[drafts[0],
+    // bad_pred].
+    let oracle_drafts: Vec<u32> = json["draft_token_ids"]
+        .as_array().expect("draft_token_ids")
+        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+    let first_match = oracle_drafts[0];
+    let bad_pred_k2: u32 = 8888;
+    let synth_fh_k2 = synth_fh.clone();
+    let base_step_k2 = move |inputs: &[(i32, u32)]|
+        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+    {
+        assert_eq!(inputs.len(), 3, "K=2 → K+1=3 verify inputs");
+        Ok(vec![
+            (first_match, synth_fh_k2.clone()),    // accepts drafts[0]
+            (bad_pred_k2, synth_fh_k2.clone()),    // rejects drafts[1]
+            (99999, synth_fh_k2.clone()),          // bonus filler
+        ])
+    };
+    let r_k2 = run_speculative_decode_step_batched(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 2,
+        base_step_k2,
+    ).expect("K=2 reject-at-1");
+    assert_eq!(r_k2.emitted_tokens, vec![first_match, bad_pred_k2],
+        "K=2 reject-at-final emits drafts[0]+corrected, NOT bonus");
+    assert_eq!(r_k2.n_accepted, 1);
+    eprintln!("[spec batched reject-at-last] K=2: emitted={:?} n_accepted={}",
+        r_k2.emitted_tokens, r_k2.n_accepted);
+}
