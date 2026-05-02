@@ -1936,21 +1936,63 @@ impl Gemma4Engine {
         let vocab_size = self.tcfg.vocab_size;
         let eps = self.tcfg.rms_norm_eps as f32;
 
-        self.run_decode_body_seq(seq_idx, input_token_id, pos)?;
-        g4::final_norm_lm_head_argmax(
-            device,
-            dtype,
-            &self.decode_hidden_io,
-            &self.final_norm_w,
-            &self.lm_head_w,
-            &mut self.mega_workspace,
-            &mut self.decode_next_token,
-            &mut self.mega_barrier_counter,
-            &mut self.mega_barrier_flag,
-            hidden_size,
-            vocab_size,
-            eps,
-        )?;
+        if let Some(embed_tokens_per_layer_w) = self.embed_tokens_per_layer_w.as_ref() {
+            let ple_hidden = self.tcfg.hidden_size_per_layer_input;
+            let num_layers = self.tcfg.num_hidden_layers;
+            let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+            let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
+            let ple_scale = (ple_hidden as f32).sqrt();
+            let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
+            g4::persistent_decode_fused_input_argmax(
+                device,
+                dtype,
+                &self.layers_gpu[seq_idx],
+                &self.lm_head_w,
+                embed_tokens_per_layer_w,
+                &self.per_layer_model_projection_w,
+                &self.per_layer_projection_norm_w,
+                &self.final_norm_w,
+                &self.lm_head_w,
+                &mut self.decode_hidden_io,
+                &mut self.decode_pli_proj,
+                &mut self.decode_pli_normed,
+                &mut self.decode_ple_raw,
+                &mut self.decode_pli,
+                &mut self.mega_workspace,
+                &mut self.decode_next_token,
+                &mut self.mega_matvec_counter,
+                &mut self.mega_barrier_counter,
+                &mut self.mega_barrier_flag,
+                num_layers,
+                hidden_size,
+                ple_hidden,
+                vocab_size,
+                input_token_id,
+                pos,
+                eps,
+                1.0f32,
+                embed_scale,
+                proj_scale,
+                ple_scale,
+                combine_scale,
+            )?;
+        } else {
+            self.run_decode_body_seq(seq_idx, input_token_id, pos)?;
+            g4::final_norm_lm_head_argmax(
+                device,
+                dtype,
+                &self.decode_hidden_io,
+                &self.final_norm_w,
+                &self.lm_head_w,
+                &mut self.mega_workspace,
+                &mut self.decode_next_token,
+                &mut self.mega_barrier_counter,
+                &mut self.mega_barrier_flag,
+                hidden_size,
+                vocab_size,
+                eps,
+            )?;
+        }
         let mut token_bytes = [0u8; 4];
         gpu_hal::copy_d2h(
             device,
