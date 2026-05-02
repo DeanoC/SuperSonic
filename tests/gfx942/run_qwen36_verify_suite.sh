@@ -3,7 +3,7 @@ set -euo pipefail
 
 MODEL_DIR="${MODEL_DIR:-/models/supersonic-cdna/qwen3.6-35b-a3b-fp8}"
 BINARY="${BINARY:-target/release/supersonic}"
-CONTEXTS="${CONTEXTS:-8,128,512,2K}"
+CONTEXTS="${CONTEXTS:-128,512,2K}"
 FAMILIES="${FAMILIES:-pg19,ruler}"
 MODES="${MODES:-fp8,int4}"
 REPEATS="${REPEATS:-3}"

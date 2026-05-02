@@ -46,9 +46,10 @@ python oracle/qwen36_verify_suite.py \
 ## gfx942 Sweep
 
 The wrapper builds `supersonic` and runs a broader PG-19 plus RULER-like
-repeatability matrix through 2K context. The default excludes 8K because the
-current long-context path can exceed the subprocess timeout and is tracked as a
-separate performance investigation.
+repeatability matrix from 128 tokens through 2K context. The default excludes
+8-token contexts because the fixed RULER prompts are longer than 8 tokens, and
+excludes 8K because the current long-context path can exceed the subprocess
+timeout and is tracked as a separate performance investigation.
 
 ```bash
 tests/gfx942/run_qwen36_verify_suite.sh
@@ -58,7 +59,7 @@ Useful overrides:
 
 ```bash
 MODEL_DIR=/models/supersonic-cdna/qwen3.6-35b-a3b-fp8 \
-CONTEXTS=8,128,512,2K \
+CONTEXTS=128,512,2K \
 FAMILIES=pg19,ruler \
 MODES=fp8,int4 \
 REPEATS=3 \
