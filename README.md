@@ -80,13 +80,12 @@ see [docs/dflash.md](docs/dflash.md).
 | gemma4-e4b       |  —   |  —   |      —      |   —    |
 | phi4-mini        |  —   |  —   |      —      |   —    |
 
-¹ CDNA bring-up currently uses replayed GPU prefill for single-sequence decode.
-  The RDNA persistent decode megakernel compiles on `gfx942`, but its wave64
-  correctness is still under validation and is available only via the explicit
-  debug path `--force-kernel-decode`.
-² INT4 uses the published GPTQ bake and the same replayed GPU prefill
-  correctness path. The PyTorch oracle is BF16-only, so INT4 bring-up checks
-  exact agreement between native decode and replayed GPU prefill.
+¹ CDNA single-sequence decode uses the persistent megakernel by default.
+  `--force-replay-decode` remains available as the slower GPU-prefill
+  reference path.
+² INT4 uses the published GPTQ bake. The PyTorch oracle is BF16-only, so INT4
+  bring-up checks exact token agreement and BF16-scale logit drift against
+  replayed GPU prefill.
 
 ### CUDA on `sm86`
 

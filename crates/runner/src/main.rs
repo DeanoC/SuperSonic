@@ -2152,9 +2152,7 @@ fn main() -> Result<()> {
         && !cli.force_component_decode
         && !cli.kv_fp8
         && use_4b_kernel
-        && (cli.force_replay_decode
-            || cuda_qwen2b_replay_default
-            || (backend == Backend::Hip && gpu_arch == GpuArch::Gfx942));
+        && (cli.force_replay_decode || cuda_qwen2b_replay_default);
     let replay_kv_fp8_enabled =
         use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
     let component_single_decode_enabled =
@@ -2167,8 +2165,7 @@ fn main() -> Result<()> {
     let kernel_single_decode_enabled = cli.batch_size == 1
         && use_4b_kernel
         && !cli.force_replay_decode
-        && !cli.force_component_decode
-        && (!(backend == Backend::Hip && gpu_arch == GpuArch::Gfx942) || cli.force_kernel_decode);
+        && !cli.force_component_decode;
     let cuda_08b_hero_enabled = cuda_08b_hero_candidate;
     let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
     let cuda_fast_greedy_enabled = backend == Backend::Cuda
@@ -2206,10 +2203,6 @@ fn main() -> Result<()> {
         if cuda_qwen2b_replay_default {
             eprintln!(
                 "[decode] single-sequence CUDA qwen3.5-2b uses replayed GPU prefill for correctness"
-            );
-        } else if backend == Backend::Hip && gpu_arch == GpuArch::Gfx942 {
-            eprintln!(
-                "[decode] single-sequence HIP gfx942 uses replayed GPU prefill while the wave64 persistent kernel is under validation"
             );
         } else {
             eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
