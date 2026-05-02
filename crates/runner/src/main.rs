@@ -70,6 +70,24 @@ impl Gemma4Runtime {
         }
     }
 
+    fn decode_step_batch_greedy_cuda(
+        &mut self,
+        input_tokens: &[u32],
+        positions: &[usize],
+    ) -> anyhow::Result<Option<Vec<u32>>> {
+        match self {
+            Self::Bf16(e) => {
+                if input_tokens.len() == 1 && positions.len() == 1 {
+                    Ok(e.decode_step_seq_greedy_cuda(0, input_tokens[0], positions[0])?
+                        .map(|tok| vec![tok]))
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::Int4(_) => Ok(None),
+        }
+    }
+
     /// Replicate seq 0's K/V cache contents into every other sequence's
     /// caches. Applies to both BF16 and INT4 engines.
     fn replicate_seq0_kv(&mut self) -> anyhow::Result<()> {
@@ -3247,9 +3265,18 @@ fn run_gemma4(
         }
         let pos = seqlen_start + step;
         let positions: Vec<usize> = vec![pos; batch_size];
-        let logits_per_seq = engine.decode_step_batch(&next_tokens, &positions)?;
+        let fast_sampled = if oracle_output.is_none() {
+            engine.decode_step_batch_greedy_cuda(&next_tokens, &positions)?
+        } else {
+            None
+        };
+        let logits_per_seq = if fast_sampled.is_none() {
+            Some(engine.decode_step_batch(&next_tokens, &positions)?)
+        } else {
+            None
+        };
 
-        if let Some(ref oracle) = oracle_output {
+        if let (Some(ref oracle), Some(ref logits_per_seq)) = (&oracle_output, &logits_per_seq) {
             if step < oracle.decode_logits.len() {
                 let oracle_logits = &oracle.decode_logits[step];
                 // Always compare against sequence 0 (canonical run).
@@ -3283,7 +3310,14 @@ fn run_gemma4(
             if seq_done[b] {
                 continue;
             }
-            let sampled = Gemma4Runtime::greedy_sample(&logits_per_seq[b]);
+            let sampled = if let Some(ref sampled_tokens) = fast_sampled {
+                sampled_tokens[b]
+            } else {
+                let logits_per_seq = logits_per_seq
+                    .as_ref()
+                    .expect("full logits populated when fast sampling is unavailable");
+                Gemma4Runtime::greedy_sample(&logits_per_seq[b])
+            };
             generated_per_seq[b].push(next_tokens[b]);
             next_tokens[b] = sampled;
         }

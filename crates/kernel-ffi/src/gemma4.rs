@@ -535,6 +535,23 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg(supersonic_backend_cuda)]
+    #[link_name = "supersonic_gemma4_cuda_final_norm_lm_head_argmax"]
+    fn supersonic_gemma4_cuda_final_norm_lm_head_argmax(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden_size: usize,
+        vocab_size: usize,
+        eps: f32,
+        hidden_io: *const c_void,
+        final_norm_w: *const c_void,
+        lm_head_w: *const c_void,
+        workspace: *mut c_void,
+        out_token: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     #[cfg_attr(
         supersonic_backend_cuda,
         link_name = "supersonic_gemma4_cuda_persistent_decode_batch"
@@ -2206,6 +2223,79 @@ pub fn persistent_decode_fused_input(
         );
         Err(GpuError::InvalidArg(
             "gemma4 persistent_decode_fused_input requires a CUDA build".into(),
+        ))
+    }
+}
+
+/// CUDA-only final RMSNorm + LM-head greedy argmax. This deliberately returns
+/// only the selected token, so validation paths that need full logits should
+/// keep using `rms_norm` + `matvec`.
+#[allow(clippy::too_many_arguments)]
+pub fn final_norm_lm_head_argmax(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden_io: &GpuBuffer,
+    final_norm_w: &GpuBuffer,
+    lm_head_w: &GpuBuffer,
+    workspace: &mut GpuBuffer,
+    out_token: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    hidden_size: usize,
+    vocab_size: usize,
+    eps: f32,
+) -> Result<(), GpuError> {
+    if hidden_io.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "gemma4 final_norm_lm_head_argmax is CUDA-only".into(),
+        ));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    {
+        let status = unsafe {
+            supersonic_gemma4_cuda_final_norm_lm_head_argmax(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                hidden_size,
+                vocab_size,
+                eps,
+                hidden_io.as_ptr(),
+                final_norm_w.as_ptr(),
+                lm_head_w.as_ptr(),
+                workspace.as_mut_ptr(),
+                out_token.as_mut_ptr() as *mut c_uint,
+                barrier_counter.as_mut_ptr() as *mut c_uint,
+                barrier_flag.as_mut_ptr() as *mut c_uint,
+            )
+        };
+        if status != 0 {
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("gemma4 final_norm_lm_head_argmax failed with status {status}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            dtype,
+            hidden_io,
+            final_norm_w,
+            lm_head_w,
+            workspace,
+            out_token,
+            barrier_counter,
+            barrier_flag,
+            hidden_size,
+            vocab_size,
+            eps,
+        );
+        Err(GpuError::InvalidArg(
+            "gemma4 final_norm_lm_head_argmax requires a CUDA build".into(),
         ))
     }
 }

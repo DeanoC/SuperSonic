@@ -591,6 +591,7 @@ pub struct Gemma4Engine {
     decode_pli: GpuBuffer,
     decode_post_norm: GpuBuffer,
     decode_logits: GpuBuffer,
+    decode_next_token: GpuBuffer,
 
     /// Per-(seq, layer) F32 absmax scale buffers for FP8 KV cache. Populated
     /// only when `--kv-fp8` is active (alloc path lands in the engine-wiring
@@ -1112,6 +1113,7 @@ impl Gemma4Engine {
         )?;
         let decode_post_norm = GpuBuffer::zeros(device, dtype, &[tcfg.hidden_size])?;
         let decode_logits = GpuBuffer::zeros(device, dtype, &[tcfg.vocab_size])?;
+        let decode_next_token = GpuBuffer::zeros(device, ScalarType::U32, &[1])?;
 
         Ok(Self {
             tcfg,
@@ -1150,6 +1152,7 @@ impl Gemma4Engine {
             decode_pli,
             decode_post_norm,
             decode_logits,
+            decode_next_token,
             kv_scale_k: if kv_fp8 { Some(kv_scale_k_buf) } else { None },
             kv_scale_v: if kv_fp8 { Some(kv_scale_v_buf) } else { None },
             kv_fp8_descs_gpu,
@@ -1781,16 +1784,12 @@ impl Gemma4Engine {
         self.decode_step_seq(0, input_token_id, pos)
     }
 
-    /// Run one decode step on sequence `seq_idx` via the persistent
-    /// megakernel. Writes a new K/V slot at `pos` in every non-shared layer
-    /// of that sequence's caches; shared layers read the source's cache via
-    /// descriptor aliasing. Returns softcapped logits.
-    pub fn decode_step_seq(
+    fn run_decode_body_seq(
         &mut self,
         seq_idx: usize,
         input_token_id: u32,
         pos: usize,
-    ) -> Result<Vec<f32>> {
+    ) -> Result<()> {
         if seq_idx >= self.batch_size {
             bail!(
                 "decode_step_seq: seq_idx {seq_idx} >= batch_size {}",
@@ -1870,6 +1869,26 @@ impl Gemma4Engine {
                 1.0f32,
             )?;
         }
+        Ok(())
+    }
+
+    /// Run one decode step on sequence `seq_idx` via the persistent
+    /// megakernel. Writes a new K/V slot at `pos` in every non-shared layer
+    /// of that sequence's caches; shared layers read the source's cache via
+    /// descriptor aliasing. Returns softcapped logits.
+    pub fn decode_step_seq(
+        &mut self,
+        seq_idx: usize,
+        input_token_id: u32,
+        pos: usize,
+    ) -> Result<Vec<f32>> {
+        let device = self.device;
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+        let vocab_size = self.tcfg.vocab_size;
+
+        self.run_decode_body_seq(seq_idx, input_token_id, pos)?;
 
         g4::rms_norm(
             device,
@@ -1896,6 +1915,51 @@ impl Gemma4Engine {
             *v = cap * (*v / cap).tanh();
         }
         Ok(logits_host)
+    }
+
+    /// CUDA fast path for greedy generation. Runs the normal single-sequence
+    /// decode body, then computes final RMSNorm + LM-head argmax on GPU and
+    /// downloads only the selected token. Returns `None` when the current
+    /// engine/backend should use the full-logits path instead.
+    pub fn decode_step_seq_greedy_cuda(
+        &mut self,
+        seq_idx: usize,
+        input_token_id: u32,
+        pos: usize,
+    ) -> Result<Option<u32>> {
+        if gpu_hal::current_backend() != Backend::Cuda || self.batch_size != 1 || seq_idx != 0 {
+            return Ok(None);
+        }
+        let device = self.device;
+        let dtype = ScalarType::BF16;
+        let hidden_size = self.tcfg.hidden_size;
+        let vocab_size = self.tcfg.vocab_size;
+        let eps = self.tcfg.rms_norm_eps as f32;
+
+        self.run_decode_body_seq(seq_idx, input_token_id, pos)?;
+        g4::final_norm_lm_head_argmax(
+            device,
+            dtype,
+            &self.decode_hidden_io,
+            &self.final_norm_w,
+            &self.lm_head_w,
+            &mut self.mega_workspace,
+            &mut self.decode_next_token,
+            &mut self.mega_barrier_counter,
+            &mut self.mega_barrier_flag,
+            hidden_size,
+            vocab_size,
+            eps,
+        )?;
+        let mut token_bytes = [0u8; 4];
+        gpu_hal::copy_d2h(
+            device,
+            token_bytes.as_mut_ptr() as *mut c_void,
+            self.decode_next_token.as_ptr(),
+            token_bytes.len(),
+        )
+        .map_err(|e| anyhow!("download decode next token: {e}"))?;
+        Ok(Some(u32::from_le_bytes(token_bytes)))
     }
 
     /// Run one decode step on every sequence in the batch and return one set
