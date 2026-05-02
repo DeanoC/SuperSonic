@@ -71,10 +71,10 @@ see [docs/dflash.md](docs/dflash.md).
 
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
 |------------------|:----:|:----:|:-----------:|:------:|
-| qwen3.5-0.8b     | ✅¹  | ✅²  |     ✅¹⁰    |   —    |
-| qwen3.5-2b       | ✅¹  | ✅²  |     ✅¹⁰    |   —    |
-| qwen3.5-4b       | ✅¹  | ✅²  |     ✅¹⁰    |   —    |
-| qwen3.5-9b       | ✅¹  | ✅²  |     ✅¹⁰    |   —    |
+| qwen3.5-0.8b     | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
+| qwen3.5-2b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
+| qwen3.5-4b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
+| qwen3.5-9b       | ✅¹  | ✅²  |     ✅¹⁰    |  ✅¹¹  |
 | qwen3.6-35b-a3b  |  —   | ✅⁴  |      —      |   —    |
 | gemma4-e2b       | ✅³  | ✅⁵  |      —      |   —    |
 | gemma4-e4b       | ✅⁶  |  —   |      —      |   —    |
@@ -102,6 +102,8 @@ see [docs/dflash.md](docs/dflash.md).
   correctness-first single-block CDNA fallback as BF16.
 ¹⁰ Qwen3.5 FP8-runtime uses the published FP8-native bakes and matches the
    existing HIP golden-token outputs with zero GPU replay delta.
+¹¹ Qwen3.5 KV-FP8 uses replayed GPU prefill for the single-sequence path and
+   matches the existing HIP golden-token outputs with zero GPU replay delta.
 
 ### CUDA on `sm86`
 

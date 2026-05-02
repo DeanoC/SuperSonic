@@ -1258,7 +1258,7 @@ fn main() -> Result<()> {
                 | ModelVariant::Phi4_Mini
         ) {
             anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B BF16/INT4/FP8-runtime, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
+                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B BF16/INT4/FP8-runtime/KV-FP8, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
             );
         }
         let qwen35_model = matches!(
@@ -1269,12 +1269,12 @@ fn main() -> Result<()> {
                 | ModelVariant::Qwen3_5_9B
         );
         if (cli.fp8_runtime && !(qwen35_model || matches!(model_variant, ModelVariant::Phi4_Mini)))
-            || cli.kv_fp8
+            || (cli.kv_fp8 && !qwen35_model)
             || cli.q4km
             || cli.q4km_gptq
         {
             anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only BF16/INT4/FP8-runtime Qwen3.5 lanes, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
+                "HIP gfx942 bring-up currently validates only BF16/INT4/FP8-runtime/KV-FP8 Qwen3.5 lanes, Qwen3.6 35B A3B INT4, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime"
             );
         }
         if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B) && !cli.int4 {
@@ -2246,15 +2246,15 @@ fn main() -> Result<()> {
             eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
         }
     } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
-        eprintln!("[decode] single-sequence CUDA KV-FP8 uses replayed GPU prefill for correctness");
+        eprintln!("[decode] single-sequence KV-FP8 uses replayed GPU prefill for correctness");
     } else if cli.batch_size > 1 && use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] batched CUDA KV-FP8 uses the persistent kernel path");
+        eprintln!("[decode] batched KV-FP8 uses the persistent kernel path");
     } else if component_single_decode_enabled {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the component decode path");
     } else if cli.batch_size == 1 && use_4b_kernel && cli.force_kernel_decode {
         eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
     } else if cli.batch_size == 1 && use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] WARNING: single-sequence CUDA KV-FP8 uses the b=1 kernel path");
+        eprintln!("[decode] WARNING: single-sequence KV-FP8 uses the b=1 kernel path");
     } else if cuda_08b_hero_enabled {
         eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
     } else if cuda_fast_greedy_enabled {
