@@ -1687,28 +1687,35 @@ fn decode_text(
 
     // Phase 3e.2: pre-allocate the persistent megakernel's scratch
     // (descriptor array + ping/pong residual + workspace + sync_buf) once
-    // before the decode loop. Reused for every step. Disabled when
-    // `--speculative-decode` is set since the spec verify loop runs
-    // multiple chains per step and isn't yet wired to the persistent
-    // path.
-    let mut persistent_scratch = if persistent_decode && !speculative_decode {
+    // before the decode loop. Reused for every step.
+    //
+    // Phase 3e.3: also enabled under `--speculative-decode`. Each verify
+    // chain (K+1 of them per spec iter, plus replay chains on partial-
+    // accept) currently pays the same 80 step-launch overhead as a plain
+    // base step, so the persistent path saves the same ~2.7 ms/chain
+    // there as on the plain decode path. The persistent kernel mutates
+    // linear-attn state in-place via cached descriptor pointers, so the
+    // existing `save_linear_attn_state` / `restore_linear_attn_state`
+    // round-trip works transparently — the kernel reads the latest state
+    // through the same pointers after the host D2D-copies fresh state
+    // back into the LayerBuffer slots.
+    let mut persistent_scratch = if persistent_decode {
         let scratch =
             crate::qwen36_moe_persistent_decode::PersistentScratch::new(ordinal, &geom, &mut layers)
                 .context("alloc PersistentScratch for --persistent-decode")?;
         println!(
             "  --persistent-decode: megakernel scratch allocated \
-             (descs={}KiB, workspace={}KiB, ping/pong={}KiB)",
+             (descs={}KiB, workspace={}KiB, ping/pong={}KiB){}",
             scratch.layer_descs_dev.len_bytes() / 1024,
             scratch.workspace.len_bytes() / 1024,
             scratch.hidden_ping.len_bytes() / 1024,
+            if speculative_decode {
+                " — also routes spec-verify chains through persistent"
+            } else {
+                ""
+            },
         );
         Some(scratch)
-    } else if persistent_decode && speculative_decode {
-        eprintln!(
-            "  --persistent-decode: ignored when --speculative-decode is set \
-             (verify loop not yet wired to persistent path; falling back to chained)"
-        );
-        None
     } else {
         None
     };
@@ -1993,14 +2000,19 @@ fn decode_text(
                             t_embed += t_embed_start.elapsed();
 
                             let t_chain_start = std::time::Instant::now();
-                            let chain_outputs = run_chained_decode_fast(
-                                ordinal,
-                                &geom,
-                                &mut layers,
-                                &initial_hidden,
-                                pos,
-                                emit_stage_timings,
-                            )?;
+                            let chain_outputs =
+                                if let Some(scratch) = persistent_scratch.as_mut() {
+                                    scratch.run(ordinal, &initial_hidden, pos)?
+                                } else {
+                                    run_chained_decode_fast(
+                                        ordinal,
+                                        &geom,
+                                        &mut layers,
+                                        &initial_hidden,
+                                        pos,
+                                        emit_stage_timings,
+                                    )?
+                                };
                             t_chain += t_chain_start.elapsed();
                             t_chain_full_attn_us += chain_outputs.kernel_full_attn_us;
                             t_chain_linear_attn_us += chain_outputs.kernel_linear_attn_us;
@@ -2080,14 +2092,18 @@ fn decode_text(
                         )?;
                         t_embed += t_embed_start.elapsed();
                         let t_chain_start = std::time::Instant::now();
-                        let replay_outputs = run_chained_decode_fast(
-                            ordinal,
-                            &geom,
-                            &mut layers,
-                            &initial_hidden,
-                            pos,
-                            emit_stage_timings,
-                        )?;
+                        let replay_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
+                            scratch.run(ordinal, &initial_hidden, pos)?
+                        } else {
+                            run_chained_decode_fast(
+                                ordinal,
+                                &geom,
+                                &mut layers,
+                                &initial_hidden,
+                                pos,
+                                emit_stage_timings,
+                            )?
+                        };
                         t_chain += t_chain_start.elapsed();
                         // Per-kernel-class breakdown for replay chains
                         // contributes to the same accumulators as the
@@ -2132,14 +2148,18 @@ fn decode_text(
                         t_embed += t_embed_start.elapsed();
 
                         let t_chain_start = std::time::Instant::now();
-                        let outputs = run_chained_decode_fast(
-                            ordinal,
-                            &geom,
-                            &mut layers,
-                            &initial_hidden,
-                            pos,
-                            emit_stage_timings,
-                        )?;
+                        let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
+                            scratch.run(ordinal, &initial_hidden, pos)?
+                        } else {
+                            run_chained_decode_fast(
+                                ordinal,
+                                &geom,
+                                &mut layers,
+                                &initial_hidden,
+                                pos,
+                                emit_stage_timings,
+                            )?
+                        };
                         t_chain += t_chain_start.elapsed();
                         t_chain_full_attn_us += outputs.kernel_full_attn_us;
                         t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
