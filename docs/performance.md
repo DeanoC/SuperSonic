@@ -153,6 +153,7 @@ optimisation arc:
 | PR #78  | linear-attn INT4 WMMA              |    29.9  |  33.5 |      +167% |
 | PR #79  | full-attn INT4 WMMA                |    28.3  |  35.3 |      +180% |
 | PR #80  | defer per-step bridge syncs        |    26.5  |  37.7 |      +199% |
+| PR #128 | persistent megakernel (Phase 3e.2; opt-in via `--persistent-decode`) | ~24.0 | ~41.7 | +231% |
 
 Architectural notes:
 
@@ -190,12 +191,38 @@ Remaining wedges (looking forward):
   matrix is ~2 MiB per layer and the kernel reads/writes it five times
   per step. WMMA can't help; further wins would need a state-layout
   redesign or fused-state kernel.
-- **Persistent megakernel** (Phase 3 in the roadmap) is now a
-  smaller wedge than originally projected, since PR #80 already
-  reclaimed ~80 syncs/token of launch overhead. Folding the 80 launches
-  into one cooperative kernel still has architectural value as a
-  prerequisite for speculative-decode verification but the absolute
-  ms reclaim is now ~1-2 ms.
+- **Persistent megakernel landed** (Phase 3a-e + 3e.2, PRs #118 → #128).
+  Opt-in via `--persistent-decode`. One cooperative HIP launch processes
+  all 40 layers per token instead of 80 step launches. Bit-exact greedy
+  output to the chained baseline (gated by
+  `multilayer_persistent_decode_matches_chained` parity test on synthetic
+  fixtures and by the verify suite's `chained_vs_persistent` SHA256 gate
+  on real PG-19/RULER prompts). Local 7900 XTX A/B on the production
+  35B-A3B INT4 bake — verify-suite `chained_vs_persistent` sweep
+  across PG-19 + RULER prompts at 128 / 512 / 2K context, 2 repeats
+  each, INT4 mode. All 6 cases logits/hidden/generated_ids
+  byte-identical between paths.
+  | Family | Context | Chain ms (chained → persistent) | Δ chain | Δ total |
+  |---|---|---:|---:|---:|
+  | PG-19  |   128 | 30.96 → 28.35 | +8.4% | +7.9% |
+  | PG-19  |   512 | 35.81 → 33.05 | +7.7% | +7.5% |
+  | PG-19  |    2K | 54.87 → 52.42 | +4.5% | +4.5% |
+  | RULER  |   128 | 31.43 → 29.15 | +7.3% | +6.7% |
+  | RULER  |   512 | 35.60 → 32.88 | +7.6% | +7.3% |
+  | RULER  |    2K | 54.33 → 51.47 | +5.3% | +5.2% |
+  Absolute reclaim is ~2.5-2.9 ms/token across all cases (the chained
+  path's HIP launch overhead: 80 launches × ~30 µs). Relative
+  speedup shrinks at longer context because chain compute grows with
+  context while launch overhead stays per-token-constant.
+  Phase 3e.3 (PR follow-up) routes the speculative-decode verify
+  chains through the same path. Spec + persistent A/B on the 8-token
+  fox prompt × 32 gen: chain 29.59 → 26.65 ms (+9.9%), total
+  31.22 → 28.22 ms (**32.0 → 35.4 tok/s, +10.7%**), generation
+  bit-identical to spec + chained.
+- **`--persistent-decode` is intentionally opt-in** until the
+  multi-prompt sweep above is widened to FP8 mode + longer
+  contexts (4K, 8K) and merged. Default decode path is still
+  chained until that data lands.
 - **Speculative decode** is the realistic path to 100+ tok/s — needs a
   draft head (MTP/Eagle) and a verification kernel that batches K
   candidates × layers in one launch.
