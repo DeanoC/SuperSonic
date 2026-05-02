@@ -419,6 +419,13 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
         shared_intermediate <= 0 || top_k <= 0 || top_k > num_experts) {
         return 132;
     }
+    // The concurrent-experts FFN dispatch (qwen36_moe_ffn_step_kernel)
+    // uses 2*top_k counter slots, and the host-side sync_buf reserves 16
+    // u32 slots before barrier_counter at +64. Pushing past slot 15 (i.e.
+    // top_k > 8) would clobber barrier state and likely hang. The safe
+    // wrapper in `kernel-ffi/src/qwen36_moe.rs::ffn_step_launch` enforces
+    // the same cap; this is the bridge-side belt-and-braces.
+    if (top_k > 8) return 138;
     if (input_hidden == nullptr || post_attn_norm_w == nullptr ||
         gate_w == nullptr || output == nullptr || output_idx == nullptr ||
         workspace == nullptr || counters == nullptr ||

@@ -1053,6 +1053,22 @@ pub fn ffn_step_launch(
             params.top_k, params.num_experts,
         )));
     }
+    // The concurrent-experts G/H/I dispatch uses counters[0..2*top_k] for
+    // per-group work-stealing (Phase G slots [0..top_k), Phase I slots
+    // [top_k..2*top_k)). The sync_buf carries 16 u32 counter slots before
+    // barrier_counter at +64; pushing past slot 15 corrupts barrier state
+    // and can hang the kernel, so cap top_k at the layout's hard limit. If
+    // a future model needs top_k > 8 we'll grow sync_buf in lockstep.
+    const MAX_TOP_K: i32 = 8;
+    if params.top_k > MAX_TOP_K {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: top_k ({}) exceeds the FFN \
+             concurrent-experts dispatch limit ({MAX_TOP_K}); the 16-slot \
+             sync_buf reserves 2*top_k counter slots before barrier_counter \
+             at +64, so top_k > {MAX_TOP_K} would overrun into barrier state",
+            params.top_k,
+        )));
+    }
     // Only stage 1 is wired through PR 4b4 step 2; stage 2..=5 will land in
     // follow-up commits to this PR.
 
