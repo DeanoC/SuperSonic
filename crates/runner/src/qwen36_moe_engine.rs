@@ -724,6 +724,7 @@ pub fn run(
         cli.max_new_tokens.max(1),
         sampling,
         cli.emit_stage_timings,
+        cli.speculative_decode,
     )?;
     Ok(())
 }
@@ -1128,6 +1129,7 @@ fn decode_text(
     max_new: usize,
     sampling: SamplingParams,
     emit_stage_timings: bool,
+    speculative_decode: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1231,35 +1233,45 @@ fn decode_text(
     }
 
     // Phase 6 self-speculative decode: load the multi-token-prediction
-    // (MTP) head from the bake if present. Returns None when the bake is
-    // pre-PR-#84 (the published v2-int4-gptq tarball as of 2026-05-02
-    // doesn't have mtp.* tensors; a re-bake against the post-#84 baker
-    // is tracked at GitHub issue #87). Production decode is unaffected
-    // when MTP is missing — only the speculative path is unavailable.
+    // (MTP) head from the bake when --speculative-decode is set.
     //
-    // The buffers are loaded but not yet consumed: Phase 6.2c wires the
-    // MTP forward pass into the decode loop. Loading here is cheap (~1.6
-    // GiB BF16, mostly the per-expert gate_up/down) and lets the engine
-    // surface MTP availability at startup so users get a clear signal
-    // about which features their bake supports.
-    let _mtp_buffers = match load_mtp_buffers(&store, ordinal, &geom, kv_max_t)
-        .context("load MTP head from bake")?
-    {
-        Some(mtp) => {
-            println!(
-                "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                 self-speculative decode capable (Phase 6.2c+)."
-            );
-            Some(mtp)
+    // The buffers cost ~1.6 GiB BF16 + a per-MTP-layer KV cache, which
+    // matters on memory-tight 24 GiB configs (the 17 GiB INT4 base bake
+    // already fills most of VRAM; an extra 1.6 GiB unused buffer can
+    // tip larger context_size / max_new runs into OOM). So we only load
+    // when the user opts in via `--speculative-decode`. When the flag
+    // isn't set, MTP weights are skipped entirely — production decode
+    // gets the full VRAM headroom.
+    //
+    // The loader still returns Ok(None) gracefully if the bake is pre-
+    // PR-#84 and lacks mtp.* tensors. Erroring out loudly when the user
+    // explicitly asked for speculative decode but the bake can't support
+    // it is the right move — silent fallback to non-speculative would
+    // hide the bake-staleness from a downstream perf-sensitive user.
+    //
+    // Phase 6.2c+ wires the consumer side into the decode loop.
+    let _mtp_buffers = if speculative_decode {
+        match load_mtp_buffers(&store, ordinal, &geom, kv_max_t)
+            .context("load MTP head from bake")?
+        {
+            Some(mtp) => {
+                println!(
+                    "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
+                     self-speculative decode enabled."
+                );
+                Some(mtp)
+            }
+            None => {
+                anyhow::bail!(
+                    "--speculative-decode requested but the bake doesn't \
+                     include mtp.* tensors. Re-bake against the post-#84 \
+                     `oracle/bake_int4.py`, or pull the new release tarball \
+                     once the producer workflow at GitHub issue #87 lands."
+                );
+            }
         }
-        None => {
-            println!(
-                "  MTP head: bake doesn't include mtp.* tensors — \
-                 self-speculative decode unavailable (re-bake against \
-                 post-#84 baker; tracked at GitHub issue #87)."
-            );
-            None
-        }
+    } else {
+        None
     };
 
     // Upload final_norm + dequantized lm_head to the GPU once. The

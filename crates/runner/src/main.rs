@@ -382,6 +382,20 @@ pub(crate) struct Cli {
     #[arg(long)]
     emit_stage_timings: bool,
 
+    /// Enable Qwen3.6-MoE self-speculative decode (Phase 6).
+    ///
+    /// When set, the engine loads the multi-token-prediction (MTP) head
+    /// from the bake (an extra ~1.6 GiB BF16 + per-MTP-layer KV cache).
+    /// Wiring lands incrementally — Phase 6.2b (this PR) just loads the
+    /// buffers; Phase 6.2c+ wires the actual draft pass and verification.
+    /// When unset (default), MTP weights aren't loaded and self-spec
+    /// decode isn't available, but ~1.6 GiB of VRAM stays free for KV
+    /// cache and scratch on memory-tight 24 GiB configurations.
+    ///
+    /// Currently HIP/qwen3.6-MoE only; ignored for other model families.
+    #[arg(long)]
+    speculative_decode: bool,
+
     /// Emit the generated suffix as a JSON string for benchmark harnesses.
     #[arg(long)]
     emit_generated_json: bool,
