@@ -1446,6 +1446,7 @@ fn decode_text(
             &final_norm_w_buf,
             &lm_head_w_buf,
             &mut logits_buf,
+            None, // base decode doesn't capture h_post — that's MTP-only
             &mut counter_buf,
         )
         .context("gpu lm_head launch")?;

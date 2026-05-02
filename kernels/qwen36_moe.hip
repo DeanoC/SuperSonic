@@ -3485,6 +3485,14 @@ __global__ void qwen36_moe_lm_head_kernel(
     const T*               __restrict__ final_norm_w,    // [hidden] BF16
     const T*               __restrict__ lm_head_w,       // [vocab, hidden] BF16
     T*                     __restrict__ logits,          // [vocab] BF16
+    // Optional output: BF16-rounded post-RMSNorm hidden state. Used by
+    // the Qwen3.6-MoE self-speculative MTP path (Phase 6.2c.3) to capture
+    // `h_post` for the recurrent feed into the next draft step. Pass
+    // null to skip — the base-model decode path doesn't need it. Only
+    // block 0 writes (RMSNorm is computed redundantly per block, so all
+    // blocks' values agree bit-for-bit; gating on block 0 saves the 95
+    // other blocks' worth of redundant global writes).
+    T*                     __restrict__ x_normed_out,    // [hidden] BF16, nullable
     unsigned int*          __restrict__ counter,         // [1] u32
     int                                  hidden,
     int                                  vocab,
@@ -3516,9 +3524,14 @@ __global__ void qwen36_moe_lm_head_kernel(
 
     // Apply `(1.0 + w)` HF Qwen3_5MoeRMSNorm unit offset, BF16-round each
     // x_normed element so the matmul reads what PyTorch reads.
+    const bool export_x_normed = (x_normed_out != nullptr) && (blockIdx.x == 0);
     for (int col = tid; col < hidden; col += block_size) {
         const float w = load_as_float<T>(final_norm_w, col);
-        x_norm_lds[col] = bf16_round_rne_f32(x_norm_lds[col] * inv_rms * (1.0f + w));
+        const float val = bf16_round_rne_f32(x_norm_lds[col] * inv_rms * (1.0f + w));
+        x_norm_lds[col] = val;
+        if (export_x_normed) {
+            x_normed_out[col] = static_cast<T>(val);
+        }
     }
     __syncthreads();
 
@@ -3590,6 +3603,10 @@ void qwen36_moe_lm_head_wmma_kernel(
     const T*               __restrict__ final_norm_w,    // [hidden] BF16
     const T*               __restrict__ lm_head_w,       // [vocab, hidden] BF16
     T*                     __restrict__ logits,          // [vocab] BF16
+    // Optional output: BF16-rounded post-RMSNorm hidden state. See the
+    // scalar-kernel comment above; only block 0 (the first vocab tile)
+    // emits, the rest skip to avoid 15k redundant global writes.
+    T*                     __restrict__ x_normed_out,    // [hidden] BF16, nullable
     int                                  hidden,
     int                                  vocab,
     float                                rms_norm_eps) {
@@ -3625,13 +3642,20 @@ void qwen36_moe_lm_head_wmma_kernel(
 
     // Apply `(1.0 + w)` HF unit offset, BF16-round, store as BF16 bit pattern
     // (top 16 bits of the F32) so the WMMA A loads can read it as `short`.
+    const bool export_x_normed = (x_normed_out != nullptr) && (blockIdx.x == 0);
+    uint16_t* x_normed_out_u16 =
+        reinterpret_cast<uint16_t*>(x_normed_out);
     for (int col = lane; col < hidden; col += 32) {
         const float vh = load_as_float<T>(final_hidden, col);
         const float vw = load_as_float<T>(final_norm_w, col);
         const float val = bf16_round_rne_f32(vh * inv_rms * (1.0f + vw));
         uint32_t bits;
         __builtin_memcpy(&bits, &val, 4);
-        x_norm_lds_u16[col] = static_cast<uint16_t>(bits >> 16);
+        const uint16_t hi = static_cast<uint16_t>(bits >> 16);
+        x_norm_lds_u16[col] = hi;
+        if (export_x_normed) {
+            x_normed_out_u16[col] = hi;
+        }
     }
     __syncthreads();
 
@@ -3716,7 +3740,8 @@ void qwen36_moe_lm_head_wmma_kernel(
     }
 #else
     (void)final_hidden; (void)final_norm_w; (void)lm_head_w;
-    (void)logits; (void)hidden; (void)vocab; (void)rms_norm_eps;
+    (void)logits; (void)x_normed_out;
+    (void)hidden; (void)vocab; (void)rms_norm_eps;
 #endif
 }
 

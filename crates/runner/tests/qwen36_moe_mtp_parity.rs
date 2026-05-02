@@ -38,7 +38,9 @@ use base64::Engine;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use memmap2::Mmap;
 use runner::qwen36_moe_decode::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
-use runner::qwen36_moe_mtp::{alloc_mtp_forward_scratch, run_mtp_layer_step};
+use runner::qwen36_moe_mtp::{
+    alloc_mtp_forward_scratch, run_mtp_draft_step, run_mtp_layer_step,
+};
 use safetensors::SafeTensors;
 use serde_json::Value;
 
@@ -292,8 +294,21 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
         out_buf.as_ptr(), got_bytes.len(),
     ).expect("d2h out");
 
-    let got = bf16_bytes_to_f32(&got_bytes);
-    let want = bf16_bytes_to_f32(&want_bytes);
+    assert_parity("mtp.attn_out", &got_bytes, &want_bytes, 0.05, 0.999);
+}
+
+/// BF16-vs-BF16 parity helper: cosine similarity ≥ `cos_sim_floor` and
+/// max-abs ≤ `max_abs_tol`. Same envelope as the multilayer parity test.
+fn assert_parity(
+    label: &str,
+    got_bytes: &[u8],
+    want_bytes: &[u8],
+    max_abs_tol: f32,
+    cos_sim_floor: f64,
+) {
+    assert_eq!(got_bytes.len(), want_bytes.len(), "{label}: byte length mismatch");
+    let got = bf16_bytes_to_f32(got_bytes);
+    let want = bf16_bytes_to_f32(want_bytes);
     let n = got.len();
     let mut max_abs = 0.0f32;
     let mut sum_abs = 0.0f32;
@@ -313,20 +328,125 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
     let cos_sim = dot / (got_sq.sqrt() * want_sq.sqrt() + 1e-30);
     let mean_abs = sum_abs / n as f32;
     eprintln!(
-        "[mtp parity attn_out] n={n} exact={exact} max_abs={max_abs:.5e} \
+        "[mtp parity {label}] n={n} exact={exact} max_abs={max_abs:.5e} \
          mean_abs={mean_abs:.5e} cos_sim={cos_sim:.7}"
     );
+    assert!(
+        max_abs <= max_abs_tol,
+        "{label}: max_abs {max_abs:.5e} exceeds {max_abs_tol:.5e}"
+    );
+    assert!(
+        cos_sim >= cos_sim_floor,
+        "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}"
+    );
+}
 
-    // Same envelope as the multi-layer parity test: cos_sim ≥ 0.999, max
-    // abs ≤ 0.05 BF16 (the per-block tests' ULP envelope at hidden=2048
-    // matvec scale).
-    assert!(
-        cos_sim >= 0.999,
-        "MTP layer cos_sim {cos_sim:.7} below floor 0.999 — likely a \
-         kernel/weights/cache_pos mismatch, not BF16 noise"
+/// Phase 6.2c.3 end-to-end parity for the draft-step tail (post-norm +
+/// tied lm_head + argmax). Validates `h_post`, `logits`, and the
+/// greedy `draft_token_id` against the oracle's step-0 dump.
+///
+/// Loads the tied `lm_head.weight` (~970 MiB BF16) from the model_dir
+/// in addition to the `mtp.*` tensors the layer-forward test already
+/// loads — total GPU footprint ~2.6 GiB, fits on the 24 GiB local box.
+#[test]
+fn qwen36_moe_mtp_draft_step_matches_oracle() {
+    if !is_backend_compiled(Backend::Hip) {
+        eprintln!("skip: HIP backend not compiled");
+        return;
+    }
+    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MTP_ORACLE_JSON") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
+        return;
+    };
+    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+        return;
+    };
+    let model_dir = PathBuf::from(model_dir);
+
+    let raw = std::fs::read_to_string(&json_path).expect("read mtp oracle json");
+    let json: Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
+    assert_eq!(
+        json["schema"].as_str().unwrap_or(""),
+        "qwen36-moe-mtp-oracle-v1",
+        "oracle JSON schema mismatch — regenerate with the Phase 6.2a oracle."
     );
-    assert!(
-        max_abs <= 0.05,
-        "MTP layer max_abs {max_abs:.5e} exceeds 0.05 envelope"
+    let geom = parse_geom(&json);
+    let base_seq_len = json["base_seq_len"].as_i64().unwrap() as i32;
+    let step0 = &json["steps"][0];
+    let fused_bytes = b64(step0["fused_bf16"].as_str().unwrap());
+    let want_h_post = b64(step0["h_post_bf16"].as_str().unwrap());
+    let want_logits = b64(step0["logits_bf16"].as_str().unwrap());
+    let want_draft = step0["draft_token_id"].as_u64().unwrap() as u32;
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+
+    eprintln!(
+        "[mtp draft] loading mtp.* + tied lm_head.weight from {} ...",
+        model_dir.display()
     );
+    let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
+    let kv_max_t = 4usize;
+    let mut mtp = load_mtp_buffers_from_safetensors(&shards, ordinal, &geom, kv_max_t)
+        .expect("load mtp buffers");
+    let lm_head_w = shards
+        .load_bf16_to_gpu(ordinal, "lm_head.weight")
+        .expect("load lm_head.weight");
+
+    let mut scratch = alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
+        .expect("alloc mtp scratch");
+
+    let fused_buf = GpuBuffer::from_host_bytes(
+        ordinal, ScalarType::BF16, &[geom.hidden as usize], &fused_bytes,
+    ).expect("upload fused");
+    let mut out_buf = GpuBuffer::zeros(
+        ordinal, ScalarType::BF16, &[geom.hidden as usize],
+    ).expect("alloc out");
+    let mut h_post_buf = GpuBuffer::zeros(
+        ordinal, ScalarType::BF16, &[geom.hidden as usize],
+    ).expect("alloc h_post");
+
+    eprintln!(
+        "[mtp draft] running draft step (position={base_seq_len}, cache_pos=0)..."
+    );
+    let result = run_mtp_draft_step(
+        ordinal, &geom, &mut mtp,
+        /* position */ base_seq_len,
+        /* cache_pos */ 0,
+        &lm_head_w,
+        &fused_buf, &mut out_buf, &mut h_post_buf,
+        &mut scratch,
+    ).expect("run_mtp_draft_step");
+
+    // h_post: RMSNorm output × `(1 + gain)`. With learned gains the
+    // peak magnitude can land near 8-16, where BF16 ULP is 0.06-0.13.
+    // Cos_sim picks up systematic divergence; the max-abs envelope
+    // here is the per-block parity tests' standard 0.1 BF16 cap.
+    assert_parity(
+        "mtp.h_post",
+        &result.h_post_bytes, &want_h_post,
+        /* max_abs */ 0.1, /* cos_sim_floor */ 0.999,
+    );
+    // logits: full vocab, multiplies through 970 MiB of lm_head BF16.
+    // F32 accumulation order differs from PyTorch — same envelope as
+    // `qwen36_moe_lm_head_matches_host_f32_reference`'s ≥ 0.999 floor.
+    assert_parity(
+        "mtp.logits",
+        &result.logits_bytes, &want_logits,
+        /* max_abs */ 0.10, /* cos_sim_floor */ 0.999,
+    );
+    if result.draft_token_id == want_draft {
+        eprintln!("[mtp draft] draft_token_id={want_draft} (greedy argmax matches oracle)");
+    } else {
+        // Near-tied logits under BF16 + F32-accum noise can flip the
+        // argmax even at 4-nines cos_sim. Log loudly but don't fail —
+        // matches the relaxed lm_head test's behavior.
+        eprintln!(
+            "[mtp draft] draft_token_id={} differs from oracle's {} — \
+             check the gap between top-1 and top-2 logits; expected when \
+             they're within ~1 BF16 ULP",
+            result.draft_token_id, want_draft
+        );
+    }
 }
