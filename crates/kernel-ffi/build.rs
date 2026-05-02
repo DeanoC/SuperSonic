@@ -418,6 +418,7 @@ fn main() {
         "qwen36_moe_persistent/full_attn_phase.cuh",
         "qwen36_moe_persistent/linear_attn_phase.cuh",
         "qwen36_moe_persistent/ffn_phase.cuh",
+        "qwen36_moe_persistent/persistent_decode.hip",
         "full_attention_cuda.cuh",
         "full_attention_4b_cuda.cuh",
         "prefill_helpers_cuda.cuh",

@@ -8,6 +8,12 @@
 
 #include "qwen36_moe.hip"
 
+// Phase 3e: persistent decode megakernel template + launcher. Lives in its
+// own file under `qwen36_moe_persistent/` per the design doc (#117).
+// Includes the phase headers and references qwen36_moe::{DecodeLayerDesc,
+// Int4ScaleDesc} from qwen36_moe.hip above.
+#include "qwen36_moe_persistent/persistent_decode.hip"
+
 #include <cstdlib>
 #include <hip/hip_runtime.h>
 #include <mutex>
@@ -1006,6 +1012,153 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
         static_cast<hip_bfloat16*>(e_norm_out),
         static_cast<hip_bfloat16*>(h_norm_out),
         static_cast<hip_bfloat16*>(fused_out));
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
+
+// =============================================================================
+// Phase 3e: persistent decode megakernel launcher.
+//
+// Walks the layer descriptor array in a single cooperative HIP launch,
+// dispatching attn or linear-attn (selected per-layer by
+// `desc.is_full_attention`) followed by FFN, with `grid_barrier` between
+// phases. Replaces 81 step-kernel launches/token (40 attn + 40 ffn + 1
+// lm_head; lm_head still launches separately at this stage) with one.
+//
+// Returns:
+//   0   on success
+//   100..200  config-validation errors (see body)
+//   254 if `hipGetLastError` reports a launch failure
+//   255 if `hipDeviceSynchronize` reports a kernel failure
+//
+// Caller responsibility:
+//   - `hidden_ping` is uploaded with the initial hidden BF16 bytes; the
+//     final hidden lands back in `hidden_ping` after even `num_layers`.
+//   - `int4_scales` is null for BF16 baked models, non-null for INT4
+//     baked models. Each per-layer entry's per-tensor scale/zero pointers
+//     are independent — null pair keeps that tensor on the BF16 path.
+//   - `workspace`, `counters`, `barrier_counter`, `barrier_flag` are all
+//     pre-allocated on device. `counters` is the first 16 u32s of a
+//     96-byte sync_buf (counters[0..16], barrier_counter at +64,
+//     barrier_flag at +68). Caller zeros the whole sync_buf before launch
+//     (this fn also zeros the entire 96 bytes defensively).
+
+extern "C" int qwen36_moe_hip_persistent_decode_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           num_layers,
+    const qwen36_moe::DecodeLayerDesc* layers,
+    const qwen36_moe::Int4ScaleDesc*   int4_scales,    // nullable
+    int           hidden,
+    int           num_heads,
+    int           num_kv_heads,
+    int           head_dim,
+    int           rotary_dim,
+    int           num_k_heads,
+    int           num_v_heads,
+    int           head_k_dim,
+    int           head_v_dim,
+    int           conv_kernel_dim,
+    int           num_experts,
+    int           moe_intermediate,
+    int           shared_intermediate,
+    int           top_k,
+    float         rope_theta,
+    float         rms_norm_eps,
+    int           position,
+    void*         hidden_ping,
+    void*         hidden_pong,
+    float*        workspace,
+    int*          ffn_topk_idx_scratch,
+    unsigned int* counters,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag) {
+    if (dtype != 2) return 130;
+    if (num_layers <= 0 || num_layers > 1024) return 131;
+    // Residual ping-pong: the kernel does TWO swaps per layer (one
+    // between attn/ffn, one at end-of-layer), so each iteration leaves
+    // `in_buf == hidden_ping`. The final hidden therefore always lands
+    // in `hidden_ping`. Both even and odd `num_layers` are valid; the
+    // caller downloads `hidden_ping` for the result.
+    if (layers == nullptr) return 133;
+    if (hidden <= 0 || num_experts <= 0 || top_k <= 0) return 134;
+    // FFN's concurrent-experts dispatch uses counters[group_id] for Phase G
+    // and counters[top_k + group_id] for Phase I — i.e., 2*top_k slots.
+    // sync_buf provisions exactly 16 u32 counters (also matches
+    // reset_counters_16's clear width), so top_k must be ≤ 8.
+    if (top_k > 8) return 135;
+    if (hidden_ping == nullptr || hidden_pong == nullptr) return 136;
+    if (workspace == nullptr || ffn_topk_idx_scratch == nullptr) return 137;
+    if (counters == nullptr || barrier_counter == nullptr ||
+        barrier_flag == nullptr) {
+        return 138;
+    }
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    constexpr int block_size = 256;
+
+    // Zero the full 96-byte sync_buf before launch — counters[0..16] (64
+    // bytes) + barrier_counter (4) + barrier_flag (4) + 24 bytes of pad.
+    if (hipMemsetAsync(counters, 0, 96) != hipSuccess) {
+        return 200;
+    }
+
+    const size_t lds_bytes =
+        static_cast<size_t>(hidden + block_size) * sizeof(float);
+
+    // WMMA gate. Full-attn / linear-attn / ffn phase headers all gate
+    // their WMMA paths individually on `*_scale != nullptr` plus
+    // `int4_group_size > 0`. The kernel-level template parameter
+    // `USE_WMMA` only enables that path; per-tensor BF16 still falls
+    // through to the scalar reduction. So the gate just asks "is this
+    // device WMMA-capable, and is INT4 quant in play anywhere".
+    const bool use_wmma =
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal)) &&
+        (int4_scales != nullptr);
+
+    if (use_wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, true>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, layers, int4_scales,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            rope_theta, rms_norm_eps, position,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            counters, barrier_counter, barrier_flag);
+    } else {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_persistent_decode_kernel<hip_bfloat16, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            num_layers, layers, int4_scales,
+            hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
+            num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
+            num_experts, moe_intermediate, shared_intermediate, top_k,
+            rope_theta, rms_norm_eps, position,
+            static_cast<hip_bfloat16*>(hidden_ping),
+            static_cast<hip_bfloat16*>(hidden_pong),
+            workspace, ffn_topk_idx_scratch,
+            counters, barrier_counter, barrier_flag);
+    }
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
