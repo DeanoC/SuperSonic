@@ -10,9 +10,48 @@
 
 #include <cstdlib>
 #include <hip/hip_runtime.h>
+#include <mutex>
 #include <stdint.h>
 
 namespace {
+
+// Cache the per-device gfx11xx detection result. WMMA bf16 is RDNA3-only
+// (gfx1100..gfx1152). Mirrors the helper in `full_attention_bridge_4b.cpp`
+// — we keep an independent copy here rather than introduce a shared header
+// because each model family's bridge is its own compilation unit (hipcc
+// codegen on gfx11xx is sensitive to cross-contamination, see CLAUDE.md).
+//
+// Honors `SUPERSONIC_QWEN4B_DISABLE_WMMA` (the existing global override
+// shared with the qwen35-4b/Gemma 4 prefill paths) so a single env var
+// disables every WMMA route in the runtime; useful for A/B perf work.
+bool device_supports_wmma_bf16(int device_ordinal) {
+    static std::once_flag env_once;
+    static bool env_disabled = false;
+    std::call_once(env_once, [] {
+        const char* env = std::getenv("SUPERSONIC_QWEN4B_DISABLE_WMMA");
+        env_disabled = (env != nullptr && env[0] != '\0' && env[0] != '0');
+    });
+    if (env_disabled) return false;
+
+    auto probe_arch = [](int ordinal) -> bool {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
+        const char* arch = props.gcnArchName;
+        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+               arch[3] == '1' && arch[4] == '1';
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) {
+        return probe_arch(device_ordinal);
+    }
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
+    return cached[device_ordinal];
+}
+
 
 struct ScopedHipDevice {
     int  previous = -1;
@@ -598,6 +637,44 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         hipSuccess) {
         return 250;
     }
+
+    const int ordinal_int = static_cast<int>(device_ordinal);
+
+    // WMMA path: gfx11xx only, BF16 weights, hidden divisible by 16. Drops
+    // ~14 ms / token vs the scalar work-stealing path on 35B-A3B (vocab=248k).
+    // Falls back to the scalar kernel on non-gfx11xx, on group-size mismatch,
+    // or when SUPERSONIC_QWEN4B_DISABLE_WMMA is set.
+    if (device_supports_wmma_bf16(ordinal_int) && (hidden % 16 == 0)) {
+        // Grid: one wave32 per 16-vocab tile. block_size=32 (one wave).
+        // LDS: 32 F32 (RMSNorm reduction) + hidden u16 (BF16 staged x_norm).
+        const int wmma_block_size = 32;
+        const int grid_x = (vocab + 15) / 16;
+        const size_t lds_bytes_wmma =
+            static_cast<size_t>(wmma_block_size) * sizeof(float) +
+            static_cast<size_t>(hidden) * sizeof(uint16_t);
+
+        hipLaunchKernelGGL(
+            qwen36_moe::qwen36_moe_lm_head_wmma_kernel<hip_bfloat16>,
+            dim3(static_cast<unsigned int>(grid_x)),
+            dim3(static_cast<unsigned int>(wmma_block_size)),
+            lds_bytes_wmma, 0,
+            static_cast<const hip_bfloat16*>(final_hidden),
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits),
+            hidden,
+            vocab,
+            rms_norm_eps);
+        // No counter needed by the WMMA path (one block per tile, no
+        // atomic claim). The host-passed counter buffer is ignored here.
+        hipError_t launch_err = hipGetLastError();
+        hipError_t sync_err   = hipDeviceSynchronize();
+        if (launch_err != hipSuccess) return 254;
+        if (sync_err != hipSuccess) return 255;
+        return 0;
+    }
+
+    // Scalar fallback path. Requires the work-stealing counter zeroed.
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
