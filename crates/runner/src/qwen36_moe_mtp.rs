@@ -24,9 +24,9 @@
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2d, copy_d2h, GpuBuffer, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, ffn_step_launch, lm_head_launch, Qwen36MoeAttnStepInt4,
-    Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
-    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+    attn_step_launch, ffn_step_launch, lm_head_launch, mtp_pre_fusion_launch,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights,
+    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
 
 use crate::qwen36_moe_decode::{
@@ -431,4 +431,193 @@ fn argmax_bf16_logits(bytes: &[u8], vocab: usize) -> u32 {
         }
     }
     best_idx
+}
+
+// ============================================================================
+// Phase 6.3a: K-step recurrent MTP draft chain
+// ----------------------------------------------------------------------------
+// Wraps `run_mtp_draft_step` in a loop to produce K candidate tokens for the
+// speculative driver. Each step:
+//
+//   1. Look up `embed_tokens[next_token_id]` → e_in (D2D copy of one row).
+//   2. `mtp_pre_fusion_launch(e_in, h_base) → fused`.
+//   3. `run_mtp_draft_step(fused, position=base_position+k, cache_pos=k) →
+//       (draft_token, h_post, logits)`.
+//   4. Recurrence: `h_base ← h_post`, `next_token_id ← draft_token`.
+//
+// The base-model verification + accept-prefix logic + KV rollback live in
+// follow-up sub-PRs (Phase 6.3b/6.3c) — this primitive is just the draft
+// generator, validated against the oracle's `draft_token_ids` list.
+// ============================================================================
+
+/// Pre-allocated buffers for the recurrent MTP draft chain, separate from
+/// [`MtpForwardScratch`] so the speculative driver can size each pool
+/// independently. All buffers are `[hidden]` BF16 unless noted; allocate
+/// once per speculative pass and reuse across all `K` steps.
+pub struct MtpChainScratch {
+    /// `[hidden]` BF16 — per-step embedding row (host-D2D'd from
+    /// `embed_tokens.weight[next_token_id, :]`).
+    pub e_in: GpuBuffer,
+    /// `[hidden]` BF16 — output of the pre-fusion kernel; input to the
+    /// MTP layer forward.
+    pub fused: GpuBuffer,
+    /// `[hidden]` BF16 — pre-fusion side product (e_norm). Captured for
+    /// optional parity diagnostics; the chain doesn't read it.
+    pub e_norm: GpuBuffer,
+    /// `[hidden]` BF16 — pre-fusion side product (h_norm).
+    pub h_norm: GpuBuffer,
+    /// `[hidden]` BF16 — layer forward output (vLLM's "out"; input to
+    /// the post-norm + lm_head). Aliased into `run_mtp_draft_step`.
+    pub out: GpuBuffer,
+    /// `[hidden]` BF16 — recurrent state: post-RMSNorm hidden of the
+    /// previous step. Becomes the next step's `h_base`.
+    pub h_post: GpuBuffer,
+}
+
+/// Allocate a fresh chain scratch sized for `geom`.
+pub fn alloc_mtp_chain_scratch(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+) -> Result<MtpChainScratch> {
+    let h = geom.hidden as usize;
+    Ok(MtpChainScratch {
+        e_in: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain e_in")?,
+        fused: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain fused")?,
+        e_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain e_norm")?,
+        h_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain h_norm")?,
+        out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain out")?,
+        h_post: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain h_post")?,
+    })
+}
+
+/// Per-step record returned by [`run_mtp_draft_chain`].
+pub struct MtpDraftRecord {
+    /// Greedy-argmax draft token at this step.
+    pub draft_token_id: u32,
+    /// `[vocab]` BF16 logits — kept for downstream sampling / parity
+    /// diagnostics. Allocated fresh per step (not reused) since the
+    /// driver may want to inspect the full distribution per draft.
+    pub logits_bytes: Vec<u8>,
+}
+
+/// Run `num_drafts` recurrent MTP draft steps, returning the draft
+/// token + logits for each. The MTP per-session KV cache lives in
+/// `mtp.kv_cache` and is written sequentially at slots `0..num_drafts`,
+/// so call this with a freshly allocated cache (or one re-zeroed by
+/// the driver between speculative passes).
+///
+/// `base_position` is the absolute RoPE position of the base model's
+/// last sampled token; the chain uses `base_position + k` for step k's
+/// RoPE rotation. `first_token_id` is that sampled token (the seed for
+/// the recurrence). `h_base_in` is the hidden state at the base
+/// model's lm_head input (post the base's final RMSNorm); per
+/// vLLM the MTP fuses `embed[next_tok]` with the previous decoder's
+/// `h_base`, so we feed the base-model post-norm hidden as h_base_0.
+///
+/// `embed_w_buf` is `embed_tokens.weight` `[vocab, hidden]` BF16 on
+/// device — usually already loaded for the base engine. `lm_head_w_buf`
+/// is the tied `lm_head.weight` (same buffer). `forward_scratch` and
+/// `chain_scratch` come from [`alloc_mtp_forward_scratch`] and
+/// [`alloc_mtp_chain_scratch`] respectively.
+#[allow(clippy::too_many_arguments)]
+pub fn run_mtp_draft_chain(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    mtp: &mut MtpLayerBuffers,
+    base_position: i32,
+    h_base_in: &GpuBuffer,
+    first_token_id: u32,
+    num_drafts: usize,
+    embed_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    forward_scratch: &mut MtpForwardScratch,
+    chain_scratch: &mut MtpChainScratch,
+) -> Result<Vec<MtpDraftRecord>> {
+    if num_drafts == 0 {
+        return Ok(Vec::new());
+    }
+    let hidden = geom.hidden as usize;
+    let vocab = geom.vocab as usize;
+
+    // Seed h_base from the caller's buffer. The chain ping-pongs between
+    // chain_scratch.h_post (k → k+1) and a transient view of h_base_in
+    // (only at step 0); after step 0 the scratch buffer owns h_base.
+    // Easiest: copy h_base_in into h_post once, then loop reads h_post
+    // as the per-step h_base.
+    copy_d2d(
+        ordinal,
+        chain_scratch.h_post.as_mut_ptr(),
+        h_base_in.as_ptr(),
+        hidden * 2,
+    )
+    .context("mtp chain: seed h_base into h_post")?;
+
+    let mut next_token_id = first_token_id;
+    let mut records: Vec<MtpDraftRecord> = Vec::with_capacity(num_drafts);
+
+    for k in 0..num_drafts {
+        // 1. Embed lookup: copy one [hidden]-BF16 row of `embed_w_buf`
+        //    into `e_in`. `embed_w_buf` is `[vocab, hidden]` BF16
+        //    row-major; row `next_token_id` lives at byte offset
+        //    `next_token_id * hidden * 2`.
+        if (next_token_id as usize) >= vocab {
+            return Err(anyhow!(
+                "mtp chain step {k}: next_token_id {next_token_id} ≥ \
+                 vocab {vocab} — invalid token id from previous step's argmax"
+            ));
+        }
+        let row_offset_bytes = (next_token_id as usize) * hidden * 2;
+        let src = unsafe {
+            (embed_w_buf.as_ptr() as *const u8).add(row_offset_bytes) as *const _
+        };
+        copy_d2d(
+            ordinal,
+            chain_scratch.e_in.as_mut_ptr(),
+            src,
+            hidden * 2,
+        )
+        .with_context(|| format!("mtp chain step {k}: embed lookup"))?;
+
+        // 2. Pre-fusion: e_norm + h_norm + mtp.fc → fused. Reads h_post
+        //    (carrying the previous step's recurrent state, or h_base_in
+        //    at step 0).
+        mtp_pre_fusion_launch(
+            ordinal,
+            geom.hidden,
+            geom.rms_norm_eps,
+            &chain_scratch.e_in,
+            &chain_scratch.h_post,
+            &mtp.pre_fc_norm_embedding_w,
+            &mtp.pre_fc_norm_hidden_w,
+            &mtp.fc_w,
+            &mut chain_scratch.e_norm,
+            &mut chain_scratch.h_norm,
+            &mut chain_scratch.fused,
+        )
+        .with_context(|| format!("mtp chain step {k}: pre-fusion"))?;
+
+        // 3. Layer + post-norm + lm_head + argmax. position = absolute
+        //    RoPE position; cache_pos = step index `k` (fresh per-MTP
+        //    session cache).
+        let outputs = run_mtp_draft_step(
+            ordinal,
+            geom,
+            mtp,
+            base_position + (k as i32),
+            k as i32,
+            lm_head_w_buf,
+            &chain_scratch.fused,
+            &mut chain_scratch.out,
+            &mut chain_scratch.h_post, // overwritten in place — recurrence
+            forward_scratch,
+        )
+        .with_context(|| format!("mtp chain step {k}: draft step"))?;
+
+        next_token_id = outputs.draft_token_id;
+        records.push(MtpDraftRecord {
+            draft_token_id: outputs.draft_token_id,
+            logits_bytes: outputs.logits_bytes,
+        });
+    }
+    Ok(records)
 }
