@@ -1257,7 +1257,10 @@ fn decode_text(
             Some(mtp) => {
                 println!(
                     "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                     self-speculative decode enabled."
+                     weights ready, draft/verify path NOT YET WIRED in \
+                     this build (Phase 6.2c+ will land it). Decode \
+                     behaviour and throughput are unchanged from the \
+                     non-speculative path until then."
                 );
                 Some(mtp)
             }
