@@ -270,7 +270,7 @@ pub struct DecodeOutputs {
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
 /// (the largest stage). Mirrors `parity_workspace_floats` in the per-block
 /// test file: 6*H*d + 4*Hkv*d + hidden.
-fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
+pub(crate) fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let h = geom.num_attention_heads as usize;
     let hkv = geom.num_kv_heads as usize;
     let d = geom.head_dim as usize;
@@ -279,7 +279,7 @@ fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
 
 /// BF16 elements sufficient for the full-attn parity launcher's largest
 /// stage (stage 3 publishes q_rot || k_rot, the widest output).
-fn full_attn_output_elems(geom: &MultiLayerGeom) -> usize {
+pub(crate) fn full_attn_output_elems(geom: &MultiLayerGeom) -> usize {
     let h = geom.num_attention_heads as usize;
     let hkv = geom.num_kv_heads as usize;
     let d = geom.head_dim as usize;
@@ -320,7 +320,7 @@ fn linear_attn_output_elems(geom: &MultiLayerGeom) -> usize {
 /// The per-expert scratch slabs (`EXPERT_GU`, `EXPERT_MID`) are sized
 /// `k * 2*I` and `k * I` respectively so all `top_k` experts can run
 /// G/H/I concurrently (one block-group per expert).
-fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
+pub(crate) fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     let hidden = geom.hidden as usize;
     let e = geom.num_experts as usize;
     let k = geom.top_k as usize;
@@ -331,7 +331,7 @@ fn ffn_workspace_floats(geom: &MultiLayerGeom) -> usize {
 
 /// FFN output BF16 elements — stage 5 publishes `[hidden]`, which is also
 /// the upper bound (stages 2..=4 fit in a strict subset).
-fn ffn_output_elems(geom: &MultiLayerGeom) -> usize {
+pub(crate) fn ffn_output_elems(geom: &MultiLayerGeom) -> usize {
     geom.hidden as usize
 }
 
@@ -345,7 +345,7 @@ fn ffn_output_elems(geom: &MultiLayerGeom) -> usize {
 ///   barrier_counter      bytes 64..67
 ///   barrier_flag         bytes 68..71
 ///   (padding to 96 bytes for alignment headroom)
-fn reset_sync_buf(ordinal: usize, sync_buf: &mut GpuBuffer) -> Result<(), GpuError> {
+pub(crate) fn reset_sync_buf(ordinal: usize, sync_buf: &mut GpuBuffer) -> Result<(), GpuError> {
     memset_zeros(ordinal, sync_buf.as_mut_ptr(), 96)
 }
 
@@ -632,6 +632,7 @@ pub fn run_chained_decode_with_options(
                     rope_theta: geom.rope_theta,
                     rms_norm_eps: geom.rms_norm_eps,
                     position,
+                    cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
                 };
                 let (kv_k_ptr, kv_v_ptr, kv_max_t) = match kv_cache {
                     Some(c) => (c.k.as_mut_ptr(), c.v.as_mut_ptr(), c.kv_max_t),
