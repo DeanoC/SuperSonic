@@ -28,12 +28,16 @@ import math
 import re
 import sys
 import time
+import struct
 from pathlib import Path
 from typing import Any
 
-import numpy as np
-import torch
-from safetensors import safe_open
+try:
+    import torch
+    from safetensors import safe_open
+except ModuleNotFoundError:
+    torch = None
+    safe_open = None
 
 # -- constants mirrored from crates/model-store/src/manifest.rs --
 FORMAT_VERSION = 2
@@ -50,6 +54,10 @@ BLOCK_SIZE = 128
 MAX_E4M3 = 448.0  # finite max of float8_e4m3fn
 
 LAYER_RE = re.compile(r"^model\.language_model\.layers\.(\d+)\.")
+QWEN36_EXPERT_RE = re.compile(
+    r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(\d+)\."
+    r"(gate_proj|up_proj|down_proj)\.weight(?:_scale_inv)?$"
+)
 
 
 def log(msg: str) -> None:
@@ -316,6 +324,202 @@ class StreamingTensorWriter:
         log(f"[bake-fp8] wrote {self.cursor / (1024 * 1024):.1f} MiB to {self.weights_path}")
 
 
+class RawSafeTensorIndex:
+    def __init__(self, model_dir: Path) -> None:
+        self.model_dir = model_dir
+        weight_map_path = model_dir / "model.safetensors.index.json"
+        if weight_map_path.exists():
+            wm = json.load(open(weight_map_path)).get("weight_map", {})
+            self.weight_map = {str(k): str(v) for k, v in wm.items()}
+            shard_names = sorted(set(self.weight_map.values()))
+        else:
+            shard_names = [p.name for p in sorted(model_dir.glob("*.safetensors"))]
+            self.weight_map = {}
+        if not shard_names:
+            raise SystemExit(f"no .safetensors found in {model_dir}")
+
+        self.shards: dict[str, tuple[int, dict[str, Any]]] = {}
+        for shard_name in shard_names:
+            path = model_dir / shard_name
+            with path.open("rb") as f:
+                header_len = struct.unpack("<Q", f.read(8))[0]
+                header = json.loads(f.read(header_len))
+            tensors = {k: v for k, v in header.items() if k != "__metadata__"}
+            self.shards[shard_name] = (8 + header_len, tensors)
+            if not self.weight_map:
+                for k in tensors:
+                    self.weight_map[k] = shard_name
+
+    def keys(self) -> list[str]:
+        return list(self.weight_map)
+
+    def meta(self, name: str) -> dict[str, Any]:
+        shard = self.weight_map[name]
+        return self.shards[shard][1][name]
+
+    def raw_bytes(self, name: str) -> bytes:
+        shard = self.weight_map[name]
+        data_start, tensors = self.shards[shard]
+        meta = tensors[name]
+        start, end = meta["data_offsets"]
+        with (self.model_dir / shard).open("rb") as f:
+            f.seek(data_start + start)
+            return f.read(end - start)
+
+
+def _bf16_to_f32_bits(u16: int) -> float:
+    return struct.unpack("<f", struct.pack("<I", u16 << 16))[0]
+
+
+def _f32_to_bf16_bytes(x: float) -> bytes:
+    bits = struct.unpack("<I", struct.pack("<f", x))[0]
+    bits += 0x7FFF + ((bits >> 16) & 1)
+    return struct.pack("<H", (bits >> 16) & 0xFFFF)
+
+
+def _a_log_raw_to_exp_bf16(raw: bytes, dtype: str) -> bytes:
+    out = bytearray()
+    if dtype == "BF16":
+        for i in range(0, len(raw), 2):
+            v = _bf16_to_f32_bits(struct.unpack_from("<H", raw, i)[0])
+            out.extend(_f32_to_bf16_bytes(math.exp(v)))
+        return bytes(out)
+    if dtype == "F32":
+        for i in range(0, len(raw), 4):
+            v = struct.unpack_from("<f", raw, i)[0]
+            out.extend(_f32_to_bf16_bytes(math.exp(v)))
+        return bytes(out)
+    raise SystemExit(f"A_log raw fallback supports BF16/F32 only, got {dtype}")
+
+
+def _safetensors_dtype_to_manifest(dtype: str) -> str:
+    return {
+        "BF16": "bf16",
+        "F32": "f32",
+        "F16": "f16",
+        "U8": "u8",
+        "F8_E4M3": "f8_e4m3",
+    }[dtype]
+
+
+def bake_qwen36_fp8_raw(model_dir: Path, out_dir: Path, block_size: int) -> None:
+    """Dependency-free FP8-native bake for Qwen3.6-MoE checkpoints."""
+    if block_size != BLOCK_SIZE:
+        raise SystemExit("raw qwen36 FP8 bake currently requires block_size=128")
+    config_path = model_dir / "config.json"
+    model_family = detect_model_family(config_path)
+    if model_family != "qwen36-moe":
+        raise SystemExit("raw fallback only supports qwen36-moe FP8 checkpoints")
+    linear_idx = linear_attn_layer_indices(config_path)
+    raw = RawSafeTensorIndex(model_dir)
+    keys = raw.keys()
+    log(f"[bake-fp8/raw] {len(set(raw.weight_map.values()))} shard(s), {len(keys)} tensors")
+
+    weight_prefix = "model.language_model"
+    eligible = sorted(n for n in keys if n.startswith(f"{weight_prefix}.") or n == "lm_head.weight")
+    writer = StreamingTensorWriter(out_dir)
+
+    per_layer: dict[int, set[int]] = {}
+    skip_names: set[str] = set()
+    for name in keys:
+        m = QWEN36_EXPERT_RE.match(name)
+        if not m:
+            continue
+        layer = int(m.group(1))
+        expert = int(m.group(2))
+        per_layer.setdefault(layer, set()).add(expert)
+        skip_names.add(name)
+
+    log(f"[bake-fp8/raw] qwen36-moe fused experts: {len(per_layer)} layer(s)")
+    for layer in sorted(per_layer):
+        experts = sorted(per_layer[layer])
+        base = f"{weight_prefix}.layers.{layer}.mlp.experts"
+        gate_up = bytearray()
+        gate_up_scale = bytearray()
+        down = bytearray()
+        down_scale = bytearray()
+        gate_shape = up_shape = down_shape = None
+        gate_scale_shape = up_scale_shape = down_scale_shape = None
+        for expert in experts:
+            eb = f"{base}.{expert}"
+            gate_n = f"{eb}.gate_proj.weight"
+            up_n = f"{eb}.up_proj.weight"
+            down_n = f"{eb}.down_proj.weight"
+            gate_m = raw.meta(gate_n)
+            up_m = raw.meta(up_n)
+            down_m = raw.meta(down_n)
+            if gate_m["dtype"] != "F8_E4M3" or up_m["dtype"] != "F8_E4M3" or down_m["dtype"] != "F8_E4M3":
+                raise SystemExit(f"qwen36 raw FP8 experts must be F8_E4M3 at layer={layer} expert={expert}")
+            gate_shape, up_shape, down_shape = gate_m["shape"], up_m["shape"], down_m["shape"]
+            gate_up.extend(raw.raw_bytes(gate_n))
+            gate_up.extend(raw.raw_bytes(up_n))
+            down.extend(raw.raw_bytes(down_n))
+            gate_s = f"{gate_n}_scale_inv"
+            up_s = f"{up_n}_scale_inv"
+            down_s = f"{down_n}_scale_inv"
+            gate_scale_shape = raw.meta(gate_s)["shape"]
+            up_scale_shape = raw.meta(up_s)["shape"]
+            down_scale_shape = raw.meta(down_s)["shape"]
+            gate_up_scale.extend(raw.raw_bytes(gate_s))
+            gate_up_scale.extend(raw.raw_bytes(up_s))
+            down_scale.extend(raw.raw_bytes(down_s))
+
+        writer.add(
+            f"{base}.gate_up_proj",
+            bytes(gate_up),
+            [len(experts), gate_shape[0] + up_shape[0], gate_shape[1]],
+            "f8_e4m3",
+            LAYOUT_FP8_NATIVE,
+        )
+        writer.add(
+            f"{base}.gate_up_proj_scale_inv",
+            bytes(gate_up_scale),
+            [len(experts), gate_scale_shape[0] + up_scale_shape[0], gate_scale_shape[1]],
+            "bf16",
+            LAYOUT_RAW,
+        )
+        writer.add(
+            f"{base}.down_proj",
+            bytes(down),
+            [len(experts), down_shape[0], down_shape[1]],
+            "f8_e4m3",
+            LAYOUT_FP8_NATIVE,
+        )
+        writer.add(
+            f"{base}.down_proj_scale_inv",
+            bytes(down_scale),
+            [len(experts), down_scale_shape[0], down_scale_shape[1]],
+            "bf16",
+            LAYOUT_RAW,
+        )
+        log(f"[bake-fp8/raw]   layer {layer}: fused {len(experts)} experts")
+
+    n_skip = 0
+    for name in eligible:
+        if name in skip_names:
+            continue
+        meta = raw.meta(name)
+        shape = list(meta["shape"])
+        dtype = meta["dtype"]
+        data = raw.raw_bytes(name)
+        layout = classify_layout(name, tuple(shape), linear_idx)
+        if layout == LAYOUT_DEPTHWISE_CONV_SQUEEZED:
+            shape = [shape[0], shape[2]]
+        elif layout == LAYOUT_HEAD_BIAS_RESHAPED:
+            shape = [1, 1, shape[0]]
+        elif layout == LAYOUT_HEAD_EXP_RESHAPED:
+            data = _a_log_raw_to_exp_bf16(data, dtype)
+            shape = [1, 1, shape[0]]
+            dtype = "BF16"
+        elif dtype == "F8_E4M3" and is_fp8_quant_target(name, tuple(shape), block_size):
+            layout = LAYOUT_FP8_NATIVE
+        writer.add(name, data, shape, _safetensors_dtype_to_manifest(dtype), layout)
+        n_skip += 1
+
+    writer.close(model_family=model_family)
+    log(f"[bake-fp8/raw] wrote {n_skip} non-fused tensors. Output: {out_dir}")
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -360,6 +564,12 @@ def main() -> None:
         raise SystemExit(f"missing config.json under {model_dir}")
     model_family = args.model_family or detect_model_family(config_path)
     log(f"[bake-fp8] model_family={model_family}")
+    if (torch is None or safe_open is None) and model_family == "qwen36-moe":
+        log("[bake-fp8] torch/safetensors not available; using raw qwen36 FP8 path")
+        bake_qwen36_fp8_raw(model_dir, out_dir, block_size)
+        return
+    if torch is None or safe_open is None:
+        raise SystemExit("bake_fp8.py needs torch+safetensors for non-qwen36 FP8 bakes")
     linear_idx = linear_attn_layer_indices(config_path)
     log(f"[bake-fp8] linear-attn layer indices ({len(linear_idx)}): "
         f"{sorted(linear_idx)[:8]}{' ...' if len(linear_idx) > 8 else ''}")
@@ -386,11 +596,112 @@ def main() -> None:
             open_shards[idx] = h
         return h
 
+    def load_tensor(name: str) -> torch.Tensor:
+        shard_idx = index[name]
+        return get_handle(shard_idx).get_tensor(name)
+
+    def fuse_qwen36_experts() -> set[str]:
+        """Emit runtime-fused Qwen3.6-MoE expert slabs.
+
+        The published FP8 checkpoint stores experts as
+        `experts.{id}.{gate,up,down}_proj.weight` plus per-expert
+        `*_scale_inv`. SuperSonic's qwen36 runtime consumes the same fused
+        names as the INT4 bake: `experts.gate_up_proj` and
+        `experts.down_proj`, each with one fused `_scale_inv` sidecar.
+        """
+        if model_family != "qwen36-moe":
+            return set()
+
+        per_layer: dict[int, set[int]] = {}
+        skipped: set[str] = set()
+        for name in index:
+            m = QWEN36_EXPERT_RE.match(name)
+            if not m:
+                continue
+            layer = int(m.group(1))
+            expert = int(m.group(2))
+            per_layer.setdefault(layer, set()).add(expert)
+            skipped.add(name)
+
+        if not per_layer:
+            return skipped
+
+        log(f"[bake-fp8] qwen36-moe fused experts: {len(per_layer)} layer(s)")
+        for layer in sorted(per_layer):
+            experts = sorted(per_layer[layer])
+            base = f"model.language_model.layers.{layer}.mlp.experts"
+
+            gate_up_bytes = bytearray()
+            gate_up_scale_chunks: list[torch.Tensor] = []
+            down_bytes = bytearray()
+            down_scale_chunks: list[torch.Tensor] = []
+
+            for expert in experts:
+                eb = f"{base}.{expert}"
+                gate = load_tensor(f"{eb}.gate_proj.weight")
+                up = load_tensor(f"{eb}.up_proj.weight")
+                down = load_tensor(f"{eb}.down_proj.weight")
+                if gate.dtype != torch.float8_e4m3fn or up.dtype != torch.float8_e4m3fn or down.dtype != torch.float8_e4m3fn:
+                    raise SystemExit(
+                        f"qwen36 FP8 fused expert source must be float8_e4m3fn "
+                        f"(layer={layer}, expert={expert})"
+                    )
+                gate_up_bytes.extend(tensor_to_bytes(gate, "f8_e4m3"))
+                gate_up_bytes.extend(tensor_to_bytes(up, "f8_e4m3"))
+                down_bytes.extend(tensor_to_bytes(down, "f8_e4m3"))
+
+                gate_s = load_tensor(f"{eb}.gate_proj.weight_scale_inv").to(torch.bfloat16)
+                up_s = load_tensor(f"{eb}.up_proj.weight_scale_inv").to(torch.bfloat16)
+                down_s = load_tensor(f"{eb}.down_proj.weight_scale_inv").to(torch.bfloat16)
+                gate_up_scale_chunks.append(torch.cat([gate_s, up_s], dim=0).unsqueeze(0))
+                down_scale_chunks.append(down_s.unsqueeze(0))
+
+            gate_shape = [len(experts), int(gate.shape[0] + up.shape[0]), int(gate.shape[1])]
+            down_shape = [len(experts), int(down.shape[0]), int(down.shape[1])]
+            writer.add(
+                f"{base}.gate_up_proj",
+                bytes(gate_up_bytes),
+                gate_shape,
+                "f8_e4m3",
+                LAYOUT_FP8_NATIVE,
+            )
+            gate_up_scale = torch.cat(gate_up_scale_chunks, dim=0).contiguous()
+            writer.add(
+                f"{base}.gate_up_proj_scale_inv",
+                tensor_to_bytes(gate_up_scale, "bf16"),
+                list(gate_up_scale.shape),
+                "bf16",
+                LAYOUT_RAW,
+            )
+            writer.add(
+                f"{base}.down_proj",
+                bytes(down_bytes),
+                down_shape,
+                "f8_e4m3",
+                LAYOUT_FP8_NATIVE,
+            )
+            down_scale = torch.cat(down_scale_chunks, dim=0).contiguous()
+            writer.add(
+                f"{base}.down_proj_scale_inv",
+                tensor_to_bytes(down_scale, "bf16"),
+                list(down_scale.shape),
+                "bf16",
+                LAYOUT_RAW,
+            )
+            log(f"[bake-fp8]   layer {layer}: fused {len(experts)} experts")
+            del gate_up_bytes, down_bytes, gate_up_scale_chunks, down_scale_chunks
+            del gate_up_scale, down_scale
+
+        return skipped
+
     t0 = time.perf_counter()
     n_quant = 0
     n_skip = 0
     try:
+        skip_names = fuse_qwen36_experts()
         for name in eligible:
+            if name in skip_names:
+                continue
             shard_idx = index[name]
             handle = get_handle(shard_idx)
             t = handle.get_tensor(name)
