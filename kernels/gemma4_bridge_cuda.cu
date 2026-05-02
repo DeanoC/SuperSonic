@@ -772,9 +772,70 @@ int persistent_decode_fused_input_device(
         static_cast<T*>(ple_raw),
         static_cast<T*>(per_layer_inputs),
         static_cast<float*>(workspace),
-        matvec_counter, barrier_counter, barrier_flag);
+        matvec_counter, barrier_counter, barrier_flag,
+        nullptr, nullptr, nullptr);
     if (cudaGetLastError() != cudaSuccess) return 724;
     if (cudaDeviceSynchronize() != cudaSuccess) return 725;
+    return 0;
+}
+
+template <typename T>
+int persistent_decode_fused_input_argmax_device(
+    int device_ordinal,
+    int num_layers, int hidden_size, int ple_hidden, int vocab_size,
+    unsigned int token_id, int position, float eps, float scale,
+    float embed_scale, float proj_scale, float ple_scale, float combine_scale,
+    const void* layers,
+    const void* embed_tokens,
+    const void* embed_tokens_per_layer,
+    const void* per_layer_model_projection_w,
+    const void* per_layer_projection_norm_w,
+    const void* final_norm_w,
+    const void* lm_head_w,
+    void* hidden_io,
+    void* pli_proj,
+    void* pli_normed,
+    void* ple_raw,
+    void* per_layer_inputs,
+    void* workspace,
+    unsigned int* out_token,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag) {
+    ScopedCudaDevice scoped(device_ordinal);
+
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 741;
+    const int num_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    constexpr int BLOCK = 256;
+    const size_t lds_bytes = (BLOCK + 256) * sizeof(float);
+
+    if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 742;
+    if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 743;
+
+    g4_persistent_decode_fused_input_kernel<T><<<dim3(num_blocks), dim3(BLOCK), lds_bytes, 0>>>(
+        num_layers, hidden_size, ple_hidden, vocab_size, token_id, position,
+        eps, scale, embed_scale, proj_scale, ple_scale, combine_scale,
+        static_cast<const Gemma4DecodeLayerDesc*>(layers),
+        nullptr,
+        nullptr,
+        static_cast<const T*>(embed_tokens),
+        static_cast<const T*>(embed_tokens_per_layer),
+        static_cast<const T*>(per_layer_model_projection_w),
+        static_cast<const T*>(per_layer_projection_norm_w),
+        static_cast<T*>(hidden_io),
+        static_cast<T*>(pli_proj),
+        static_cast<T*>(pli_normed),
+        static_cast<T*>(ple_raw),
+        static_cast<T*>(per_layer_inputs),
+        static_cast<float*>(workspace),
+        matvec_counter, barrier_counter, barrier_flag,
+        static_cast<const T*>(final_norm_w),
+        static_cast<const T*>(lm_head_w),
+        out_token);
+    if (cudaGetLastError() != cudaSuccess) return 744;
+    if (cudaDeviceSynchronize() != cudaSuccess) return 745;
     return 0;
 }
 
@@ -1536,6 +1597,49 @@ extern "C" int supersonic_gemma4_cuda_persistent_decode_fused_input(
     default: return 720;
     }
     #undef G4_PERSIST_FUSED_INPUT_ARGS
+}
+
+extern "C" int supersonic_gemma4_cuda_persistent_decode_fused_input_argmax(
+    int dtype, size_t device_ordinal,
+    size_t num_layers, size_t hidden_size, size_t ple_hidden, size_t vocab_size,
+    unsigned int token_id, size_t position, float eps, float scale,
+    float embed_scale, float proj_scale, float ple_scale, float combine_scale,
+    const void* layers,
+    const void* embed_tokens,
+    const void* embed_tokens_per_layer,
+    const void* per_layer_model_projection_w,
+    const void* per_layer_projection_norm_w,
+    const void* final_norm_w,
+    const void* lm_head_w,
+    void* hidden_io,
+    void* pli_proj,
+    void* pli_normed,
+    void* ple_raw,
+    void* per_layer_inputs,
+    void* workspace,
+    unsigned int* out_token,
+    unsigned int* matvec_counter,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag
+) {
+    #define G4_PERSIST_FUSED_INPUT_ARGMAX_ARGS                               \
+        static_cast<int>(device_ordinal),                                    \
+        static_cast<int>(num_layers), static_cast<int>(hidden_size),         \
+        static_cast<int>(ple_hidden), static_cast<int>(vocab_size),          \
+        token_id, static_cast<int>(position), eps, scale,                    \
+        embed_scale, proj_scale, ple_scale, combine_scale,                   \
+        layers, embed_tokens, embed_tokens_per_layer,                        \
+        per_layer_model_projection_w, per_layer_projection_norm_w,           \
+        final_norm_w, lm_head_w, hidden_io, pli_proj, pli_normed, ple_raw,   \
+        per_layer_inputs, workspace, out_token,                              \
+        matvec_counter, barrier_counter, barrier_flag
+    switch (dtype) {
+    case 0: return persistent_decode_fused_input_argmax_device<__half>(G4_PERSIST_FUSED_INPUT_ARGMAX_ARGS);
+    case 1: return persistent_decode_fused_input_argmax_device<float>(G4_PERSIST_FUSED_INPUT_ARGMAX_ARGS);
+    case 2: return persistent_decode_fused_input_argmax_device<__nv_bfloat16>(G4_PERSIST_FUSED_INPUT_ARGMAX_ARGS);
+    default: return 740;
+    }
+    #undef G4_PERSIST_FUSED_INPUT_ARGMAX_ARGS
 }
 
 extern "C" int supersonic_gemma4_cuda_final_norm_lm_head_argmax(
