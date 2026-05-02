@@ -1688,13 +1688,21 @@ fn decode_text(
                 position,
                 dynamic_k,
                 |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                    let t_chain_start = std::time::Instant::now();
+                    // Embed lookup is its own stage in the timing
+                    // breakdown — bundling it into `t_chain` (as the
+                    // first cut of this closure did) systematically
+                    // inflates `chain_ms_avg` and deflates
+                    // `embed_ms_avg` as the MTP accept rate rises.
+                    let t_embed_start = std::time::Instant::now();
                     let initial_hidden = lookup_embed_row(
                         &store,
                         weight_prefix,
                         input as usize,
                         geom.hidden as usize,
                     )?;
+                    t_embed += t_embed_start.elapsed();
+
+                    let t_chain_start = std::time::Instant::now();
                     let outputs = run_chained_decode_fast(
                         ordinal,
                         &geom,
