@@ -316,10 +316,17 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
             counters, barrier_counter, barrier_flag);
     }
 
+    // Async dispatch: skip the per-launch `hipDeviceSynchronize` so the host
+    // can queue the next step launch without blocking. The default stream
+    // serializes all kernel launches and D2D copies in this engine, and
+    // `run_chained_decode`'s final D2H copy of `final_hidden_bytes`
+    // implicitly drains the queue — so per-step sync is redundant. Saves
+    // ~30 µs/launch × 80 launches/token = ~2.4 ms/token. Runtime kernel
+    // errors (illegal memory access etc.) defer to that final D2H copy
+    // instead of the immediate per-step return; launch-config errors are
+    // still caught here via `hipGetLastError`.
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
     if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
     return 0;
 }
 
@@ -498,10 +505,10 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
             workspace, counters, barrier_counter, barrier_flag);
     }
 
+    // Async dispatch: see attn_step_launch above for the rationale (default
+    // stream serializes; chain-end D2H is the implicit barrier).
     hipError_t launch_err_lin = hipGetLastError();
-    hipError_t sync_err_lin   = hipDeviceSynchronize();
     if (launch_err_lin != hipSuccess) return 254;
-    if (sync_err_lin != hipSuccess) return 255;
     return 0;
 }
 
@@ -693,10 +700,9 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
             workspace, counters, barrier_counter, barrier_flag);
     }
 
+    // Async dispatch: see attn_step_launch above for the rationale.
     hipError_t launch_err_ffn = hipGetLastError();
-    hipError_t sync_err_ffn   = hipDeviceSynchronize();
     if (launch_err_ffn != hipSuccess) return 254;
-    if (sync_err_ffn != hipSuccess) return 255;
     return 0;
 }
 
