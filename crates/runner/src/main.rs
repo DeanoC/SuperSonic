@@ -1236,13 +1236,19 @@ fn main() -> Result<()> {
                 | ModelVariant::Qwen3_5_2B
                 | ModelVariant::Qwen3_5_4B
                 | ModelVariant::Qwen3_5_9B
+                | ModelVariant::Gemma4_E2B
         ) {
-            anyhow::bail!("HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B");
+            anyhow::bail!(
+                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B and Gemma 4 E2B BF16"
+            );
         }
         if cli.fp8_runtime || cli.kv_fp8 || cli.q4km || cli.q4km_gptq {
             anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only BF16 and INT4 Qwen3.5 lanes"
+                "HIP gfx942 bring-up currently validates only BF16 and INT4 Qwen3.5 lanes, plus Gemma 4 E2B BF16"
             );
+        }
+        if matches!(model_variant, ModelVariant::Gemma4_E2B) && cli.int4 {
+            anyhow::bail!("HIP gfx942 Gemma 4 E2B bring-up currently validates only BF16");
         }
         if cli.batch_size != 1 {
             anyhow::bail!("HIP gfx942 bring-up currently supports only --batch-size 1");
