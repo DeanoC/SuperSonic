@@ -500,6 +500,41 @@ unsafe extern "C" {
         barrier_flag: *mut c_uint,
     ) -> c_int;
 
+    #[cfg(supersonic_backend_cuda)]
+    #[link_name = "supersonic_gemma4_cuda_persistent_decode_fused_input"]
+    fn supersonic_gemma4_cuda_persistent_decode_fused_input(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: usize,
+        hidden_size: usize,
+        ple_hidden: usize,
+        vocab_size: usize,
+        token_id: c_uint,
+        position: usize,
+        eps: f32,
+        scale: f32,
+        embed_scale: f32,
+        proj_scale: f32,
+        ple_scale: f32,
+        combine_scale: f32,
+        layers: *const c_void,
+        kv_fp8_descs: *const c_void,
+        fp8_scales: *const c_void,
+        embed_tokens: *const c_void,
+        embed_tokens_per_layer: *const c_void,
+        per_layer_model_projection_w: *const c_void,
+        per_layer_projection_norm_w: *const c_void,
+        hidden_io: *mut c_void,
+        pli_proj: *mut c_void,
+        pli_normed: *mut c_void,
+        ple_raw: *mut c_void,
+        per_layer_inputs: *mut c_void,
+        workspace: *mut c_void,
+        matvec_counter: *mut c_uint,
+        barrier_counter: *mut c_uint,
+        barrier_flag: *mut c_uint,
+    ) -> c_int;
+
     #[cfg_attr(
         supersonic_backend_cuda,
         link_name = "supersonic_gemma4_cuda_persistent_decode_batch"
@@ -2044,6 +2079,135 @@ pub fn persistent_decode(
         ));
     }
     Ok(())
+}
+
+/// CUDA-only fused input-staging + persistent decode path for Gemma 4 BF16
+/// single-token decode. The caller keeps the staging buffers alive so the same
+/// memory can be reused by the fallback multi-launch path.
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_fused_input(
+    ordinal: usize,
+    dtype: ScalarType,
+    layers: &GpuBuffer,
+    kv_fp8_descs: Option<&GpuBuffer>,
+    fp8_scales: Option<&GpuBuffer>,
+    embed_tokens: &GpuBuffer,
+    embed_tokens_per_layer: &GpuBuffer,
+    per_layer_model_projection_w: &GpuBuffer,
+    per_layer_projection_norm_w: &GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    pli_proj: &mut GpuBuffer,
+    pli_normed: &mut GpuBuffer,
+    ple_raw: &mut GpuBuffer,
+    per_layer_inputs: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    barrier_counter: &mut GpuBuffer,
+    barrier_flag: &mut GpuBuffer,
+    num_layers: usize,
+    hidden_size: usize,
+    ple_hidden: usize,
+    vocab_size: usize,
+    token_id: u32,
+    position: usize,
+    eps: f32,
+    scale: f32,
+    embed_scale: f32,
+    proj_scale: f32,
+    ple_scale: f32,
+    combine_scale: f32,
+) -> Result<(), GpuError> {
+    if hidden_io.backend() != Backend::Cuda {
+        return Err(GpuError::InvalidArg(
+            "gemma4 persistent_decode_fused_input is CUDA-only".into(),
+        ));
+    }
+
+    #[cfg(supersonic_backend_cuda)]
+    {
+        let kv_fp8_ptr = kv_fp8_descs.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let fp8_scales_ptr = fp8_scales.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+        let status = unsafe {
+            supersonic_gemma4_cuda_persistent_decode_fused_input(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                num_layers,
+                hidden_size,
+                ple_hidden,
+                vocab_size,
+                token_id as c_uint,
+                position,
+                eps,
+                scale,
+                embed_scale,
+                proj_scale,
+                ple_scale,
+                combine_scale,
+                layers.as_ptr(),
+                kv_fp8_ptr,
+                fp8_scales_ptr,
+                embed_tokens.as_ptr(),
+                embed_tokens_per_layer.as_ptr(),
+                per_layer_model_projection_w.as_ptr(),
+                per_layer_projection_norm_w.as_ptr(),
+                hidden_io.as_mut_ptr(),
+                pli_proj.as_mut_ptr(),
+                pli_normed.as_mut_ptr(),
+                ple_raw.as_mut_ptr(),
+                per_layer_inputs.as_mut_ptr(),
+                workspace.as_mut_ptr(),
+                matvec_counter.as_mut_ptr() as *mut c_uint,
+                barrier_counter.as_mut_ptr() as *mut c_uint,
+                barrier_flag.as_mut_ptr() as *mut c_uint,
+            )
+        };
+        if status != 0 {
+            return Err(GpuError::backend(
+                Backend::Cuda,
+                format!("gemma4 persistent_decode_fused_input failed with status {status}"),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(supersonic_backend_cuda))]
+    {
+        let _ = (
+            ordinal,
+            dtype,
+            layers,
+            kv_fp8_descs,
+            fp8_scales,
+            embed_tokens,
+            embed_tokens_per_layer,
+            per_layer_model_projection_w,
+            per_layer_projection_norm_w,
+            hidden_io,
+            pli_proj,
+            pli_normed,
+            ple_raw,
+            per_layer_inputs,
+            workspace,
+            matvec_counter,
+            barrier_counter,
+            barrier_flag,
+            num_layers,
+            hidden_size,
+            ple_hidden,
+            vocab_size,
+            token_id,
+            position,
+            eps,
+            scale,
+            embed_scale,
+            proj_scale,
+            ple_scale,
+            combine_scale,
+        );
+        Err(GpuError::InvalidArg(
+            "gemma4 persistent_decode_fused_input requires a CUDA build".into(),
+        ))
+    }
 }
 
 /// Batched variant of [`persistent_decode`] — runs `batch_size` parallel

@@ -19,7 +19,7 @@ use std::path::Path;
 use ::gemma4::config::{AttnKind, Config, TextConfig};
 use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
 use kernel_ffi::gemma4::{
@@ -538,6 +538,7 @@ pub struct Gemma4Engine {
 
     layers: Vec<LayerWeights>,
     lm_head_w: GpuBuffer, // tied to embed_tokens on E2B/E4B
+    embed_tokens_per_layer_w: Option<GpuBuffer>,
     final_norm_w: GpuBuffer,
     per_layer_model_projection_w: GpuBuffer,
     per_layer_projection_norm_w: GpuBuffer,
@@ -771,6 +772,24 @@ impl Gemma4Engine {
             device,
             &format!("{weight_prefix}.per_layer_projection_norm.weight"),
         )?;
+        let use_cuda_fused_input = gpu_hal::current_backend() == Backend::Cuda
+            && batch_size == 1
+            && !kv_fp8
+            && !fp8_runtime;
+        let embed_tokens_per_layer_w = if use_cuda_fused_input {
+            let name = format!("{weight_prefix}.embed_tokens_per_layer.weight");
+            match loader.load_bf16_to_gpu(device, &name) {
+                Ok(buf) => Some(buf),
+                Err(e) => {
+                    eprintln!(
+                        "[gemma4] CUDA fused input staging disabled: failed to load {name}: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let num_kv_heads = tcfg.num_key_value_heads;
         let num_q_heads = tcfg.num_attention_heads;
@@ -1103,6 +1122,7 @@ impl Gemma4Engine {
             batch_size,
             layers,
             lm_head_w,
+            embed_tokens_per_layer_w,
             final_norm_w,
             per_layer_model_projection_w,
             per_layer_projection_norm_w,
@@ -1788,29 +1808,68 @@ impl Gemma4Engine {
         let num_layers = self.tcfg.num_hidden_layers;
         let vocab_size = self.tcfg.vocab_size;
 
-        self.prepare_single_decode_inputs(input_token_id)?;
+        if let Some(embed_tokens_per_layer_w) = self.embed_tokens_per_layer_w.as_ref() {
+            let embed_scale = bf16::from_f32((hidden_size as f32).sqrt()).to_f32();
+            let proj_scale = bf16::from_f32((hidden_size as f32).powf(-0.5)).to_f32();
+            let ple_scale = (ple_hidden as f32).sqrt();
+            let combine_scale = bf16::from_f32(2.0f32.powf(-0.5)).to_f32();
+            g4::persistent_decode_fused_input(
+                device,
+                dtype,
+                &self.layers_gpu[seq_idx],
+                None,
+                None,
+                &self.lm_head_w,
+                embed_tokens_per_layer_w,
+                &self.per_layer_model_projection_w,
+                &self.per_layer_projection_norm_w,
+                &mut self.decode_hidden_io,
+                &mut self.decode_pli_proj,
+                &mut self.decode_pli_normed,
+                &mut self.decode_ple_raw,
+                &mut self.decode_pli,
+                &mut self.mega_workspace,
+                &mut self.mega_matvec_counter,
+                &mut self.mega_barrier_counter,
+                &mut self.mega_barrier_flag,
+                num_layers,
+                hidden_size,
+                ple_hidden,
+                vocab_size,
+                input_token_id,
+                pos,
+                eps,
+                1.0f32,
+                embed_scale,
+                proj_scale,
+                ple_scale,
+                combine_scale,
+            )?;
+        } else {
+            self.prepare_single_decode_inputs(input_token_id)?;
 
-        g4::persistent_decode(
-            device,
-            dtype,
-            &self.layers_gpu[seq_idx],
-            self.kv_fp8_descs_gpu
-                .as_ref()
-                .map(|v| &v[seq_idx]),
-            self.fp8_scale_descs_gpu.as_ref(),
-            &mut self.decode_hidden_io,
-            &self.decode_pli,
-            &mut self.mega_workspace,
-            &mut self.mega_matvec_counter,
-            &mut self.mega_barrier_counter,
-            &mut self.mega_barrier_flag,
-            num_layers,
-            hidden_size,
-            ple_hidden,
-            pos,
-            eps,
-            1.0f32,
-        )?;
+            g4::persistent_decode(
+                device,
+                dtype,
+                &self.layers_gpu[seq_idx],
+                self.kv_fp8_descs_gpu
+                    .as_ref()
+                    .map(|v| &v[seq_idx]),
+                self.fp8_scale_descs_gpu.as_ref(),
+                &mut self.decode_hidden_io,
+                &self.decode_pli,
+                &mut self.mega_workspace,
+                &mut self.mega_matvec_counter,
+                &mut self.mega_barrier_counter,
+                &mut self.mega_barrier_flag,
+                num_layers,
+                hidden_size,
+                ple_hidden,
+                pos,
+                eps,
+                1.0f32,
+            )?;
+        }
 
         g4::rms_norm(
             device,
