@@ -435,11 +435,17 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
         &mut scratch,
     ).expect("run_mtp_draft_step");
 
-    // h_post + logits envelopes are loose (1.0) because real-prefill
-    // state produces larger magnitudes than synthetic noise. cos_sim
-    // catches kernel divergence; max-abs catches catastrophic
-    // mismatches without tripping on BF16 rounding at any realistic
-    // magnitude (1 BF16 ULP at magnitude 64 is 0.5).
+    // h_post + logits envelopes are loose (max_abs ≤ 1.0) because
+    // real-prefill state produces larger magnitudes than synthetic
+    // noise — 1 BF16 ULP at magnitude 64 is 0.5. cos_sim catches
+    // kernel divergence; max_abs is a guard rail.
+    //
+    // The two cos_sim floors differ by tensor size:
+    //   h_post  is `[hidden=2048]`   → 0.998 floor (small-tensor noise:
+    //     once_upon's per-element BF16 rounding lands at cos_sim 0.9988)
+    //   logits  is `[vocab=248320]`  → 0.999 floor (per-element rounding
+    //     averages out across 121× more elements; all fixtures hit
+    //     ≥ 0.9994)
     assert_parity(
         "mtp.h_post",
         &result.h_post_bytes, &want_h_post,
@@ -448,7 +454,7 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
     assert_parity(
         "mtp.logits",
         &result.logits_bytes, &want_logits,
-        /* max_abs */ 1.0, /* cos_sim_floor */ 0.998,
+        /* max_abs */ 1.0, /* cos_sim_floor */ 0.999,
     );
     if result.draft_token_id == want_draft {
         eprintln!("[mtp draft] draft_token_id={want_draft} (greedy argmax matches oracle)");
@@ -575,22 +581,22 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
 
     // Per-step logits parity. Token agreement is enforced above, so
     // every step's `e_in` matches the oracle and the per-step logits
-    // should hold cos_sim ≥ 0.999. The max-abs envelope is loose:
-    // peak logit magnitudes from real-prefill state can land at
-    // 30-64 (vs ~8-16 for synthetic noise), where 1 BF16 ULP is
-    // 0.25-0.5. The cos_sim floor catches kernel divergence; max-abs
-    // catches truly catastrophic mismatches without tripping on
-    // BF16 rounding at any realistic logit magnitude.
+    // should hold cos_sim ≥ 0.999 (vocab=248320 averages out per-
+    // element BF16 rounding). The max-abs envelope is loose: peak
+    // logit magnitudes from real-prefill state can land at 30-64
+    // (vs ~8-16 for synthetic noise), where 1 BF16 ULP is 0.25-0.5.
+    // cos_sim is the meaningful divergence signal — max_abs is the
+    // guard rail against catastrophic mismatches.
     //
-    // Observed across the local fixtures (Phase 6.3a + #88 real-
-    // prefill set): max_abs ≤ 0.531, cos_sim ≥ 0.9992.
+    // Observed across the local fixtures (synthetic K=3 + #88
+    // real-prefill set): max_abs ≤ 0.778, cos_sim ≥ 0.9992.
     for (i, want_step) in json["steps"].as_array().expect("steps").iter().enumerate() {
         if i >= k { break; }
         let want_logits = b64(want_step["logits_bf16"].as_str().unwrap());
         assert_parity(
             &format!("mtp.chain.step{i}.logits"),
             &records[i].logits_bytes, &want_logits,
-            /* max_abs */ 1.0, /* cos_sim_floor */ 0.998,
+            /* max_abs */ 1.0, /* cos_sim_floor */ 0.999,
         );
     }
 }
