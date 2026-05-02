@@ -109,6 +109,7 @@ impl fmt::Display for ModelVariant {
 pub enum GpuArch {
     Gfx1100,
     Gfx1150,
+    Gfx942,
     Sm86,
     AppleM4,
     Unknown(String),
@@ -117,9 +118,10 @@ pub enum GpuArch {
 impl GpuArch {
     pub fn from_backend_name(backend: &Backend, name: &str) -> Self {
         match backend {
-            Backend::Hip => match name.trim() {
+            Backend::Hip => match name.trim().split(':').next().unwrap_or(name.trim()) {
                 "gfx1100" => Self::Gfx1100,
                 "gfx1150" => Self::Gfx1150,
+                "gfx942" => Self::Gfx942,
                 other => Self::Unknown(other.to_owned()),
             },
             Backend::Cuda => match name.trim() {
@@ -139,6 +141,7 @@ impl fmt::Display for GpuArch {
         match self {
             Self::Gfx1100 => write!(f, "gfx1100"),
             Self::Gfx1150 => write!(f, "gfx1150"),
+            Self::Gfx942 => write!(f, "gfx942"),
             Self::Sm86 => write!(f, "sm86"),
             Self::AppleM4 => write!(f, "apple-m4"),
             Self::Unknown(s) => write!(f, "{s}"),
@@ -164,7 +167,7 @@ pub struct ArchProfile {
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
         let memory = match arch {
-            GpuArch::Gfx1100 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
+            GpuArch::Gfx1100 | GpuArch::Gfx942 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
             GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
             GpuArch::Unknown(_) => MemoryArchitecture::Discrete,
         };
@@ -428,6 +431,54 @@ static REGISTRY: &[RegistryEntry] = &[
         arch: GpuArch::Gfx1150,
         vram: VramBudget {
             fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 2 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx942,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Qwen35(Qwen35KernelParams {
@@ -782,6 +833,29 @@ mod tests {
         ] {
             assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx1100).is_some());
         }
+    }
+
+    #[test]
+    fn hip_gfx942_registry_includes_cdna_targets() {
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Hip, "gfx942"),
+            GpuArch::Gfx942
+        );
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Hip, "gfx942:sramecc+:xnack-"),
+            GpuArch::Gfx942
+        );
+        let profile = ArchProfile::for_arch(&GpuArch::Gfx942);
+        assert_eq!(profile.memory, MemoryArchitecture::Discrete);
+        assert_eq!(profile.buffer_policy, BufferPolicy::all_default());
+        for model in [
+            ModelVariant::Qwen3_5_0_8B,
+            ModelVariant::Qwen3_5_2B,
+            ModelVariant::Qwen3_5_4B,
+        ] {
+            assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx942).is_some());
+        }
+        assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Hip, &GpuArch::Gfx942).is_none());
     }
 
     #[test]
