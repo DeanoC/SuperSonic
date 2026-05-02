@@ -368,44 +368,92 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    hipLaunchKernelGGL(qwen36_moe::qwen36_moe_linear_step_kernel<hip_bfloat16>,
-                       dim3(static_cast<unsigned int>(num_blocks)),
-                       dim3(block_size),
-                       lds_bytes, 0,
-                       stage,
-                       hidden,
-                       num_k_heads,
-                       num_v_heads,
-                       head_k_dim,
-                       head_v_dim,
-                       conv_kernel_dim,
-                       rms_norm_eps,
-                       static_cast<const hip_bfloat16*>(input_hidden),
-                       static_cast<const hip_bfloat16*>(input_norm_w),
-                       static_cast<const hip_bfloat16*>(in_proj_qkv_w),
-                       static_cast<const hip_bfloat16*>(in_proj_z_w),
-                       static_cast<const hip_bfloat16*>(in_proj_a_w),
-                       static_cast<const hip_bfloat16*>(in_proj_b_w),
-                       static_cast<const hip_bfloat16*>(conv1d_w),
-                       static_cast<const hip_bfloat16*>(conv1d_bias),
-                       static_cast<const hip_bfloat16*>(dt_bias),
-                       static_cast<const hip_bfloat16*>(a_log),
-                       static_cast<const hip_bfloat16*>(norm_w),
-                       static_cast<const hip_bfloat16*>(out_proj_w),
-                       static_cast<hip_bfloat16*>(conv_state),
-                       recurrent_state,
-                       int4_group_size,
-                       static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
-                       static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
-                       static_cast<const hip_bfloat16*>(in_proj_z_scale),
-                       static_cast<const hip_bfloat16*>(in_proj_z_zero),
-                       static_cast<const hip_bfloat16*>(out_proj_scale),
-                       static_cast<const hip_bfloat16*>(out_proj_zero),
-                       static_cast<hip_bfloat16*>(output),
-                       workspace,
-                       counters,
-                       barrier_counter,
-                       barrier_flag);
+    // WMMA path requires gfx11xx + INT4 weights on at least one of the big
+    // matmuls (qkv/z/out_proj) + dim divisibility (hidden % 16 == 0,
+    // int4_group_size % 16 == 0). Sub-pools handle short rhs_row ranges
+    // via per-lane `in_range` checks so non-16-aligned qkv_dim / val_dim
+    // / hidden output dims still work; the only hard requirement is that
+    // the K-chunk size (16) divides hidden and the quant group_size.
+    // 35B-A3B (hidden=2048, group_size=128) satisfies both.
+    const bool any_int4_routed_lin =
+        (in_proj_qkv_scale != nullptr) ||
+        (in_proj_z_scale   != nullptr) ||
+        (out_proj_scale    != nullptr);
+    const bool wmma_dims_ok_lin =
+        (hidden % 16 == 0) &&
+        (int4_group_size > 0) &&
+        (int4_group_size % 16 == 0);
+    const bool use_wmma_lin =
+        any_int4_routed_lin &&
+        wmma_dims_ok_lin &&
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+
+    if (use_wmma_lin) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_linear_step_kernel<hip_bfloat16, true>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            stage,
+            hidden, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+            conv_kernel_dim, rms_norm_eps,
+            static_cast<const hip_bfloat16*>(input_hidden),
+            static_cast<const hip_bfloat16*>(input_norm_w),
+            static_cast<const hip_bfloat16*>(in_proj_qkv_w),
+            static_cast<const hip_bfloat16*>(in_proj_z_w),
+            static_cast<const hip_bfloat16*>(in_proj_a_w),
+            static_cast<const hip_bfloat16*>(in_proj_b_w),
+            static_cast<const hip_bfloat16*>(conv1d_w),
+            static_cast<const hip_bfloat16*>(conv1d_bias),
+            static_cast<const hip_bfloat16*>(dt_bias),
+            static_cast<const hip_bfloat16*>(a_log),
+            static_cast<const hip_bfloat16*>(norm_w),
+            static_cast<const hip_bfloat16*>(out_proj_w),
+            static_cast<hip_bfloat16*>(conv_state),
+            recurrent_state,
+            int4_group_size,
+            static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
+            static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
+            static_cast<const hip_bfloat16*>(in_proj_z_scale),
+            static_cast<const hip_bfloat16*>(in_proj_z_zero),
+            static_cast<const hip_bfloat16*>(out_proj_scale),
+            static_cast<const hip_bfloat16*>(out_proj_zero),
+            static_cast<hip_bfloat16*>(output),
+            workspace, counters, barrier_counter, barrier_flag);
+    } else {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_linear_step_kernel<hip_bfloat16, false>),
+            dim3(static_cast<unsigned int>(num_blocks)),
+            dim3(block_size),
+            lds_bytes, 0,
+            stage,
+            hidden, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
+            conv_kernel_dim, rms_norm_eps,
+            static_cast<const hip_bfloat16*>(input_hidden),
+            static_cast<const hip_bfloat16*>(input_norm_w),
+            static_cast<const hip_bfloat16*>(in_proj_qkv_w),
+            static_cast<const hip_bfloat16*>(in_proj_z_w),
+            static_cast<const hip_bfloat16*>(in_proj_a_w),
+            static_cast<const hip_bfloat16*>(in_proj_b_w),
+            static_cast<const hip_bfloat16*>(conv1d_w),
+            static_cast<const hip_bfloat16*>(conv1d_bias),
+            static_cast<const hip_bfloat16*>(dt_bias),
+            static_cast<const hip_bfloat16*>(a_log),
+            static_cast<const hip_bfloat16*>(norm_w),
+            static_cast<const hip_bfloat16*>(out_proj_w),
+            static_cast<hip_bfloat16*>(conv_state),
+            recurrent_state,
+            int4_group_size,
+            static_cast<const hip_bfloat16*>(in_proj_qkv_scale),
+            static_cast<const hip_bfloat16*>(in_proj_qkv_zero),
+            static_cast<const hip_bfloat16*>(in_proj_z_scale),
+            static_cast<const hip_bfloat16*>(in_proj_z_zero),
+            static_cast<const hip_bfloat16*>(out_proj_scale),
+            static_cast<const hip_bfloat16*>(out_proj_zero),
+            static_cast<hip_bfloat16*>(output),
+            workspace, counters, barrier_counter, barrier_flag);
+    }
+
     hipError_t launch_err_lin = hipGetLastError();
     hipError_t sync_err_lin   = hipDeviceSynchronize();
     if (launch_err_lin != hipSuccess) return 254;
