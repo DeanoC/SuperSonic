@@ -31,7 +31,10 @@ use crate::qwen36_moe_decode::{
     FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
     LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
-use crate::qwen36_moe_speculative::run_speculative_decode_step;
+use crate::qwen36_moe_speculative::{
+    run_speculative_decode_step, run_speculative_decode_step_batched,
+};
+use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
 const GIB: f64 = (1024 * 1024 * 1024) as f64;
@@ -755,6 +758,7 @@ pub fn run(
         sampling,
         cli.emit_stage_timings,
         cli.speculative_decode,
+        cli.batched_spec_verify,
     )?;
     Ok(())
 }
@@ -1184,6 +1188,7 @@ fn decode_text(
     sampling: SamplingParams,
     emit_stage_timings: bool,
     speculative_decode: bool,
+    batched_spec_verify: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1452,6 +1457,29 @@ fn decode_text(
         None
     };
 
+    // Phase 6.4c.2: pre-allocate the linear-attn state snapshot when
+    // `--batched-spec-verify` is set. The snapshot's shadow buffers
+    // are sized once against the live `layers` vec; per-spec-iter
+    // updates use `refresh_linear_attn_state` (D2D copies only).
+    // Restoration on partial-accept overwrites the live state then
+    // we replay the accepted draft sequence sequentially to advance
+    // state to the post-accepted-prefix point.
+    let mut linear_attn_snapshot = if speculative_decode && batched_spec_verify {
+        Some(
+            crate::qwen36_moe_state::save_linear_attn_state(ordinal, &layers)
+                .context("alloc linear-attn state snapshot for batched spec verify")?,
+        )
+    } else {
+        None
+    };
+    if linear_attn_snapshot.is_some() {
+        println!(
+            "  --batched-spec-verify: linear-attn state snapshot allocated \
+             (K+1 chains run per spec iter; restore + replay accepted prefix \
+             on partial accept)"
+        );
+    }
+
     println!(
         "  decoding {} prompt token{} + generating ≤{} new token{}…",
         prompt_ids.len(),
@@ -1675,86 +1703,213 @@ fn decode_text(
             // be invisible to `gen_steps` / `t_chain` / `t_lm_head`,
             // making the speculative path look ~K+1× faster than it
             // really is on stage-timings dashboards.
-            let result = run_speculative_decode_step(
-                ordinal,
-                &geom,
-                mtp,
-                fwd_scratch,
-                chain_scratch,
-                embed_w,
-                &lm_head_w_buf,
-                &h_base,
-                next_token,
-                position,
-                dynamic_k,
-                |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                    // Embed lookup is its own stage in the timing
-                    // breakdown — bundling it into `t_chain` (as the
-                    // first cut of this closure did) systematically
-                    // inflates `chain_ms_avg` and deflates
-                    // `embed_ms_avg` as the MTP accept rate rises.
-                    let t_embed_start = std::time::Instant::now();
-                    let initial_hidden = lookup_embed_row(
-                        &store,
-                        weight_prefix,
-                        input as usize,
-                        geom.hidden as usize,
-                    )?;
-                    t_embed += t_embed_start.elapsed();
+            //
+            // Phase 6.4c.2: route through the BATCHED driver when
+            // `--batched-spec-verify` is set. The batched closure runs
+            // K+1 chains sequentially (state mutates through them),
+            // accumulates K+1 final_hidden bytes, runs ONE batched
+            // lm_head over [K+1, hidden], does K+1 host argmaxes. On
+            // partial-accept the engine restores linear-attn state
+            // from the pre-spec snapshot then replays the accepted
+            // prefix sequentially to advance state correctly.
+            let result = if let Some(snapshot) = linear_attn_snapshot.as_mut() {
+                refresh_linear_attn_state(ordinal, &layers, snapshot)
+                    .context("refresh linear-attn snapshot before batched verify")?;
 
-                    let t_chain_start = std::time::Instant::now();
-                    let outputs = run_chained_decode_fast(
-                        ordinal,
-                        &geom,
-                        &mut layers,
-                        &initial_hidden,
-                        pos,
-                        emit_stage_timings,
-                    )?;
-                    t_chain += t_chain_start.elapsed();
-                    t_chain_full_attn_us += outputs.kernel_full_attn_us;
-                    t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
-                    t_chain_ffn_us += outputs.kernel_ffn_us;
+                let r = run_speculative_decode_step_batched(
+                    ordinal,
+                    &geom,
+                    mtp,
+                    fwd_scratch,
+                    chain_scratch,
+                    embed_w,
+                    &lm_head_w_buf,
+                    &h_base,
+                    next_token,
+                    position,
+                    dynamic_k,
+                    |inputs| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+                        let n = inputs.len();
+                        if n == 0 {
+                            return Ok(Vec::new());
+                        }
+                        let hidden = geom.hidden as usize;
 
-                    let t_lm_head_start = std::time::Instant::now();
-                    gpu_hal::copy_h2d(
-                        ordinal,
-                        final_hidden_buf.as_mut_ptr(),
-                        outputs.final_hidden_bytes.as_ptr() as *const _,
-                        outputs.final_hidden_bytes.len(),
-                    )?;
-                    kernel_ffi::qwen36_moe::lm_head_launch(
-                        ordinal,
-                        geom.hidden,
-                        geom.vocab,
-                        geom.rms_norm_eps,
-                        &final_hidden_buf,
-                        &final_norm_w_buf,
-                        &lm_head_w_buf,
-                        &mut logits_buf,
-                        None,
-                        &mut counter_buf,
-                    )?;
-                    let logits_bytes = logits_buf
-                        .to_host_bytes()
-                        .context("d2h logits from spec verify lm_head")?;
-                    t_lm_head += t_lm_head_start.elapsed();
-                    // Each verify base step counts as one decode step
-                    // for the per-token average — emitted_tokens.len()
-                    // tokens are committed per spec call, and
-                    // closure-call-count == emitted_tokens.len() in
-                    // both the partial-accept and full-accept (with
-                    // bonus) cases. Bumping here is equivalent to
-                    // "one closure call = one decode step worth of
-                    // base work."
-                    gen_steps += 1;
-                    Ok((
-                        argmax_bf16_logits(&logits_bytes),
-                        outputs.final_hidden_bytes,
-                    ))
-                },
-            )
-            .context("speculative decode step")?;
+                        // K+1 sequential chains, accumulate final_hiddens.
+                        let mut final_hiddens: Vec<Vec<u8>> = Vec::with_capacity(n);
+                        for &(pos, input) in inputs {
+                            let t_embed_start = std::time::Instant::now();
+                            let initial_hidden = lookup_embed_row(
+                                &store, weight_prefix,
+                                input as usize, geom.hidden as usize,
+                            )?;
+                            t_embed += t_embed_start.elapsed();
+
+                            let t_chain_start = std::time::Instant::now();
+                            let chain_outputs = run_chained_decode_fast(
+                                ordinal, &geom, &mut layers,
+                                &initial_hidden, pos, emit_stage_timings,
+                            )?;
+                            t_chain += t_chain_start.elapsed();
+                            t_chain_full_attn_us += chain_outputs.kernel_full_attn_us;
+                            t_chain_linear_attn_us += chain_outputs.kernel_linear_attn_us;
+                            t_chain_ffn_us += chain_outputs.kernel_ffn_us;
+                            gen_steps += 1;
+                            final_hiddens.push(chain_outputs.final_hidden_bytes);
+                        }
+
+                        // ONE batched lm_head over [n, hidden].
+                        let t_lm_head_start = std::time::Instant::now();
+                        let mut concat = Vec::with_capacity(n * hidden * 2);
+                        for fh in &final_hiddens {
+                            concat.extend_from_slice(fh);
+                        }
+                        let fh_buf = gpu_hal::GpuBuffer::from_host_bytes(
+                            ordinal, gpu_hal::ScalarType::BF16,
+                            &[n, hidden], &concat,
+                        )?;
+                        let mut logits_buf_b = gpu_hal::GpuBuffer::zeros(
+                            ordinal, gpu_hal::ScalarType::BF16,
+                            &[n, geom.vocab as usize],
+                        )?;
+                        kernel_ffi::qwen36_moe::lm_head_batched_launch(
+                            ordinal, n as i32, geom.hidden, geom.vocab,
+                            geom.rms_norm_eps,
+                            &fh_buf, &final_norm_w_buf, &lm_head_w_buf,
+                            &mut logits_buf_b, None,
+                        )?;
+                        let logits_bytes = logits_buf_b
+                            .to_host_bytes()
+                            .context("d2h batched logits")?;
+                        t_lm_head += t_lm_head_start.elapsed();
+
+                        let row_bytes = geom.vocab as usize * 2;
+                        let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
+                        for (i, fh) in final_hiddens.into_iter().enumerate() {
+                            let row = &logits_bytes[i * row_bytes..(i + 1) * row_bytes];
+                            results.push((argmax_bf16_logits(row), fh));
+                        }
+                        Ok(results)
+                    },
+                )
+                .context("batched speculative decode step")?;
+
+                // State mgmt: on partial-accept, restore + replay the
+                // accepted prefix to advance linear-attn state correctly.
+                // Full-accept (n_accepted == dynamic_k) needs no fixup —
+                // K+1 chains advanced state through K+1 inputs which is
+                // exactly what we committed (drafts + bonus's input was
+                // drafts[K-1], one more chain's worth advances naturally
+                // when next iter feeds the bonus token).
+                if r.n_accepted < dynamic_k {
+                    restore_linear_attn_state(ordinal, &mut layers, snapshot)
+                        .context("restore linear-attn state after partial-accept")?;
+                    // Replay (j+1) chains: first_token at `position`,
+                    // then the j accepted drafts at `position+1..position+j`.
+                    let mut replay: Vec<(i32, u32)> = Vec::with_capacity(r.n_accepted + 1);
+                    replay.push((position, next_token));
+                    for (i, &tok) in r.emitted_tokens.iter().take(r.n_accepted).enumerate() {
+                        replay.push((position + 1 + i as i32, tok));
+                    }
+                    for &(pos, input) in &replay {
+                        let t_embed_start = std::time::Instant::now();
+                        let initial_hidden = lookup_embed_row(
+                            &store, weight_prefix,
+                            input as usize, geom.hidden as usize,
+                        )?;
+                        t_embed += t_embed_start.elapsed();
+                        let t_chain_start = std::time::Instant::now();
+                        let _ = run_chained_decode_fast(
+                            ordinal, &geom, &mut layers,
+                            &initial_hidden, pos, emit_stage_timings,
+                        )?;
+                        t_chain += t_chain_start.elapsed();
+                        gen_steps += 1;
+                    }
+                }
+                r
+            } else {
+                run_speculative_decode_step(
+                    ordinal,
+                    &geom,
+                    mtp,
+                    fwd_scratch,
+                    chain_scratch,
+                    embed_w,
+                    &lm_head_w_buf,
+                    &h_base,
+                    next_token,
+                    position,
+                    dynamic_k,
+                    |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
+                        // Embed lookup is its own stage in the timing
+                        // breakdown — bundling it into `t_chain` (as the
+                        // first cut of this closure did) systematically
+                        // inflates `chain_ms_avg` and deflates
+                        // `embed_ms_avg` as the MTP accept rate rises.
+                        let t_embed_start = std::time::Instant::now();
+                        let initial_hidden = lookup_embed_row(
+                            &store,
+                            weight_prefix,
+                            input as usize,
+                            geom.hidden as usize,
+                        )?;
+                        t_embed += t_embed_start.elapsed();
+
+                        let t_chain_start = std::time::Instant::now();
+                        let outputs = run_chained_decode_fast(
+                            ordinal,
+                            &geom,
+                            &mut layers,
+                            &initial_hidden,
+                            pos,
+                            emit_stage_timings,
+                        )?;
+                        t_chain += t_chain_start.elapsed();
+                        t_chain_full_attn_us += outputs.kernel_full_attn_us;
+                        t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
+                        t_chain_ffn_us += outputs.kernel_ffn_us;
+
+                        let t_lm_head_start = std::time::Instant::now();
+                        gpu_hal::copy_h2d(
+                            ordinal,
+                            final_hidden_buf.as_mut_ptr(),
+                            outputs.final_hidden_bytes.as_ptr() as *const _,
+                            outputs.final_hidden_bytes.len(),
+                        )?;
+                        kernel_ffi::qwen36_moe::lm_head_launch(
+                            ordinal,
+                            geom.hidden,
+                            geom.vocab,
+                            geom.rms_norm_eps,
+                            &final_hidden_buf,
+                            &final_norm_w_buf,
+                            &lm_head_w_buf,
+                            &mut logits_buf,
+                            None,
+                            &mut counter_buf,
+                        )?;
+                        let logits_bytes = logits_buf
+                            .to_host_bytes()
+                            .context("d2h logits from spec verify lm_head")?;
+                        t_lm_head += t_lm_head_start.elapsed();
+                        // Each verify base step counts as one decode step
+                        // for the per-token average — emitted_tokens.len()
+                        // tokens are committed per spec call, and
+                        // closure-call-count == emitted_tokens.len() in
+                        // both the partial-accept and full-accept (with
+                        // bonus) cases. Bumping here is equivalent to
+                        // "one closure call = one decode step worth of
+                        // base work."
+                        gen_steps += 1;
+                        Ok((
+                            argmax_bf16_logits(&logits_bytes),
+                            outputs.final_hidden_bytes,
+                        ))
+                    },
+                )
+                .context("speculative decode step")?
+            };
 
             // Append emitted tokens. Honour `max_new` and EOS by
             // breaking out cleanly mid-emission.
