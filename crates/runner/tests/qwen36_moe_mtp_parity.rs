@@ -533,40 +533,46 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
     let got_drafts: Vec<u32> = records.iter().map(|r| r.draft_token_id).collect();
     eprintln!("[mtp chain] got: {got_drafts:?}  want: {want_drafts:?}");
 
-    // Step-by-step parity. Argmax on BF16 logits with F32-accum drift
-    // can flip near-tied entries (the single-step parity test logs but
-    // doesn't fail on this) — but in the chain a flip propagates
-    // forward (the next step's e_in is `embed[wrong_token]`), so a
-    // single mismatch can cascade. Track the "first-divergence" index
-    // and assert ≥ 1 step matches; if all K match, that's the strong
-    // signal speculative decode wants.
-    let first_divergence = got_drafts.iter()
+    // Token-level parity. The chain MUST reproduce the oracle's draft
+    // sequence bit-for-bit on the test fixture: argmax-flip cascading
+    // is the failure mode this test exists to catch (a single flipped
+    // token at step k makes step k+1's `e_in = embed[wrong_token]`,
+    // which derails the rest of the chain). On the local fixture the
+    // kernel is stable enough that BF16 rounding doesn't flip any
+    // top-1 across K=3 steps; if a future fixture lands on a near-tied
+    // top-1 and legitimately flips, that's a real signal worth
+    // investigating before relaxing — Phase 6.2c.3's single-step test
+    // tolerates the same flip class because at that level there's no
+    // cascade to worry about.
+    assert_eq!(records.len(), k, "chain returned wrong number of records");
+    if let Some(idx) = got_drafts.iter()
         .zip(want_drafts.iter())
-        .position(|(g, w)| g != w);
-    let agreed = first_divergence.unwrap_or(k);
-    eprintln!("[mtp chain] {agreed}/{k} steps agree before first divergence");
+        .position(|(g, w)| g != w)
+    {
+        panic!(
+            "MTP chain diverges at step {idx}: got {} want {} \
+             (full got={got_drafts:?} want={want_drafts:?}). A flipped \
+             argmax at step {idx} cascades through the rest of the \
+             chain because `e_in[step{}]` reads `embed_tokens[\
+             wrong_token]`. Investigate the per-step logit gap before \
+             relaxing.",
+            got_drafts[idx], want_drafts[idx], idx + 1
+        );
+    }
 
-    // Compare the per-step logits against the oracle even past the
-    // first-divergence point — in the divergence cases the K-th step
-    // ran on the wrong token so logits will diverge wholesale, but for
-    // the agreed prefix we can confirm the kernel chain is stable.
+    // Per-step logits parity. Token agreement is enforced above, so
+    // every step's `e_in` matches the oracle and logits should hold
+    // cos_sim ≥ 0.999 across the full K. Magnitudes drift up across
+    // recurrent steps (BF16 rounding compounds), so the max-abs
+    // envelope is widened to 0.15 — same envelope Phase 6.2c.3's
+    // draft-step parity uses for its lm_head logits.
     for (i, want_step) in json["steps"].as_array().expect("steps").iter().enumerate() {
-        if i >= agreed { break; }
+        if i >= k { break; }
         let want_logits = b64(want_step["logits_bf16"].as_str().unwrap());
-        // Logits magnitudes drift up across recurrent steps as the chain
-        // amplifies any single-step BF16 rounding into the next h_base;
-        // 1 BF16 ULP at peak-logit magnitudes is ~0.13. Match the
-        // "happy-path" tolerance loosely — cos_sim is the strong signal.
         assert_parity(
             &format!("mtp.chain.step{i}.logits"),
             &records[i].logits_bytes, &want_logits,
             /* max_abs */ 0.15, /* cos_sim_floor */ 0.999,
         );
     }
-
-    // The chain ran without panicking and produced K records — that's
-    // the structural guarantee. Bit-level token agreement is the
-    // happy-path bonus; if argmax-flip cascading causes a divergence we
-    // just log it (matches the single-step test's tolerance).
-    assert_eq!(records.len(), k, "chain returned wrong number of records");
 }
