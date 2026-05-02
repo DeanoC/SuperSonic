@@ -117,8 +117,9 @@ see [docs/dflash.md](docs/dflash.md).
 
 ¹ `qwen3.5-9b` BF16 needs the BF16 bake uploaded before that lane is available
   from release-backed downloads. `--kv-fp8` depends on the BF16 weights, so the
-  9B CUDA KV-FP8 lane is blocked on the same bake. INT4 and FP8-runtime bakes
-  are already published and validated on `sm86`.
+  9B CUDA KV-FP8 lane is blocked on the same bake. The `bakes-v2` release
+  already publishes `qwen3.5-9b` INT4 GPTQ and FP8-native artifacts, and both
+  release-backed download paths have been smoke-tested on `sm86`.
 ² `phi4-mini` BF16 CUDA is wired and validated on `sm86` with the CPU oracle.
   INT4 uses the downloadable bake and passes the `12/12` reconstructed-bake
   corpus with the kernel-accurate deterministic Python oracle. The live
@@ -135,9 +136,10 @@ INT4, FP8-runtime, and KV-FP8 lanes are now at parity with the HIP matrix for
 persistent-decode lanes. `phi4-mini` INT4 now matches the kernel-accurate
 deterministic corpus oracle; the live PyTorch oracle is advisory for that lane
 because BF16 accumulation choices change near-tie generations. The remaining
-Qwen3.5 9B gap is artifact availability: the BF16 bake still needs to be
-produced and uploaded, and the 9B KV-FP8 lane becomes available after that bake
-exists.
+Qwen3.5 9B CUDA gap is limited to BF16 artifact availability: the INT4 GPTQ
+and FP8-native release bakes are present and decode on `sm86`, while the BF16
+bake still needs to be produced and uploaded. The 9B KV-FP8 lane becomes
+available after that BF16 bake exists.
 
 CUDA KV-FP8 notes:
 
