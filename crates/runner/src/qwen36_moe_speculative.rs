@@ -452,6 +452,194 @@ where
     })
 }
 
+// ============================================================================
+// Phase 6.4b: batched-K speculative driver
+// ----------------------------------------------------------------------------
+// Same protocol as `run_speculative_decode_step` but the verify side runs
+// all K+1 base steps via a single closure call instead of K+1 sequential
+// closure calls. Lets the closure amortize work across K (notably:
+// `qwen36_moe::lm_head_batched_launch` runs ONE batched lm_head over K+1
+// inputs instead of K+1 single-M GEMVs, saving ~1.5 ms × K of weight
+// reads at vocab=248k).
+//
+// Trade-off vs the per-step driver:
+//   - Per-step: early termination on first mismatch — closure called only
+//     j+1 times (j = accept count). Strictly cheaper when the accept
+//     rate is low.
+//   - Batched: always K+1 closure calls. Wins when accept rate is high
+//     enough that the per-step path wouldn't have terminated early
+//     anyway, OR when batched lm_head + amortized weight reads
+//     dominate.
+//
+// On the local "quick brown fox" / "Once upon a time" / "def factorial"
+// fixtures we measured 100% accept across K=3 — full clean win for
+// batched. On lower-accept-rate prompts the win narrows or inverts; the
+// engine exposes both paths so a flag-controlled switch is possible.
+// ============================================================================
+
+/// Run one speculative-decode iteration with a batched verify
+/// closure. See [`run_speculative_decode_step`] for the protocol;
+/// the only difference is the closure shape:
+///
+/// ```ignore
+/// F: FnOnce(&[(i32, u32)]) -> Result<Vec<(u32, Vec<u8>)>>
+/// ```
+///
+/// The closure receives K+1 `(position, input_token)` pairs:
+///   - `[0]`: `(base_position, first_token_id)` — the just-sampled
+///     token's verify slot, predicting `drafts[0]`.
+///   - `[i]` for `i in 1..=K`: `(base_position+i, drafts[i-1])` —
+///     each accepted draft's slot, predicting the next position.
+///
+/// And returns K+1 `(predicted_next_token, final_hidden_bytes)` tuples
+/// in the same order. The driver applies [`accept_prefix_greedy`]
+/// against the K predictions for `drafts` (with the K-th prediction
+/// as the bonus when all accepted).
+///
+/// Implementations should run the K+1 base chains internally and use
+/// `qwen36_moe::lm_head_batched_launch` to fold the K+1 lm_head GEMVs
+/// into one launch for the actual perf payoff.
+#[allow(clippy::too_many_arguments)]
+pub fn run_speculative_decode_step_batched<F>(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    mtp: &mut MtpLayerBuffers,
+    forward_scratch: &mut MtpForwardScratch,
+    chain_scratch: &mut MtpChainScratch,
+    embed_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    h_base_in: &[u8],
+    first_token_id: u32,
+    base_position: i32,
+    num_drafts: usize,
+    base_step_batched: F,
+) -> Result<SpeculativeStepResult>
+where
+    F: FnOnce(&[(i32, u32)]) -> Result<Vec<(u32, Vec<u8>)>>,
+{
+    let hidden = geom.hidden as usize;
+    if h_base_in.len() != hidden * 2 {
+        anyhow::bail!(
+            "run_speculative_decode_step_batched: h_base_in.len() {} != \
+             hidden*2 ({}) BF16 bytes",
+            h_base_in.len(),
+            hidden * 2
+        );
+    }
+    if num_drafts == 0 {
+        // K=0 degenerate: single base step. Same fallback as the
+        // per-step driver — preserves the "always emit ≥1 token"
+        // contract for engine forward progress.
+        let outputs = base_step_batched(&[(base_position, first_token_id)])
+            .context("speculative_batched: K=0 fallback base step")?;
+        if outputs.len() != 1 {
+            anyhow::bail!(
+                "speculative_batched: K=0 closure returned {} outputs, \
+                 expected exactly 1",
+                outputs.len()
+            );
+        }
+        let (predicted, fh) = outputs.into_iter().next().unwrap();
+        return Ok(SpeculativeStepResult {
+            emitted_tokens: vec![predicted],
+            n_accepted: 0,
+            final_hidden_bytes: fh,
+        });
+    }
+
+    // --- 1. Upload h_base for the MTP chain. ---
+    let h_base_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[hidden],
+        h_base_in,
+    )
+    .context("speculative_batched: upload h_base")?;
+
+    // --- 2. Generate K MTP drafts. ---
+    let drafts_records = run_mtp_draft_chain(
+        ordinal,
+        geom,
+        mtp,
+        base_position,
+        &h_base_buf,
+        first_token_id,
+        num_drafts,
+        embed_w_buf,
+        lm_head_w_buf,
+        forward_scratch,
+        chain_scratch,
+    )
+    .context("speculative_batched: MTP draft chain")?;
+    let drafts: Vec<u32> = drafts_records.iter().map(|r| r.draft_token_id).collect();
+
+    // --- 3. Build K+1 verify (position, input) pairs. ---
+    let mut verify_inputs: Vec<(i32, u32)> = Vec::with_capacity(num_drafts + 1);
+    verify_inputs.push((base_position, first_token_id));
+    for k in 0..num_drafts {
+        verify_inputs.push((base_position + (k as i32) + 1, drafts[k]));
+    }
+
+    // --- 4. Run the batched closure once. ---
+    let predictions = base_step_batched(&verify_inputs)
+        .context("speculative_batched: batched verify closure")?;
+    if predictions.len() != num_drafts + 1 {
+        anyhow::bail!(
+            "speculative_batched: closure returned {} predictions for \
+             {} verify inputs (expected {})",
+            predictions.len(),
+            num_drafts + 1,
+            num_drafts + 1
+        );
+    }
+
+    // --- 5. Walk accept-prefix logic over the K+1 predictions. ---
+    //
+    // predictions[i].0 is the base's predicted-next-token after feeding
+    // verify_inputs[i]. predictions[0..K] are compared to drafts[0..K];
+    // predictions[K] is the bonus when all accepted.
+    let mut emitted: Vec<u32> = Vec::with_capacity(num_drafts + 1);
+    let mut n_accepted: usize = 0;
+    let mut final_hidden_idx: usize = 0;
+    for k in 0..num_drafts {
+        let predicted = predictions[k].0;
+        if predicted == drafts[k] {
+            emitted.push(drafts[k]);
+            n_accepted = k + 1;
+            final_hidden_idx = k + 1;
+        } else {
+            // Reject: corrected token is `predicted`. The relevant
+            // final-hidden for the recurrent feed is the source
+            // hidden of the corrected token — that's
+            // `predictions[k].1`, computed when the closure ran the
+            // base on (verify_inputs[k]).
+            emitted.push(predicted);
+            final_hidden_idx = k;
+            break;
+        }
+    }
+    if emitted.len() == num_drafts {
+        // All K drafts accepted; emit the bonus.
+        let bonus = predictions[num_drafts].0;
+        emitted.push(bonus);
+        final_hidden_idx = num_drafts;
+    }
+
+    // Take the chosen final_hidden_bytes by destructuring
+    // `predictions` to avoid an extra clone.
+    let final_hidden_bytes = predictions
+        .into_iter()
+        .nth(final_hidden_idx)
+        .map(|(_, fh)| fh)
+        .expect("final_hidden_idx is valid — closure returned K+1 entries");
+
+    Ok(SpeculativeStepResult {
+        emitted_tokens: emitted,
+        n_accepted,
+        final_hidden_bytes,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

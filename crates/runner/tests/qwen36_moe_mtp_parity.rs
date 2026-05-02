@@ -43,7 +43,7 @@ use runner::qwen36_moe_mtp::{
     run_mtp_draft_step, run_mtp_layer_step,
 };
 use runner::qwen36_moe_speculative::{
-    run_speculative_decode_step, SpeculativeStepResult,
+    run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
 };
 use safetensors::SafeTensors;
 use serde_json::Value;
@@ -785,4 +785,177 @@ fn qwen36_moe_speculative_driver_orchestration() {
     assert_eq!(r4.n_accepted, 0);
     assert_eq!(r4.final_hidden_bytes.len(), (geom.hidden as usize) * 2);
     eprintln!("[spec] pass 4: emitted={:?} n_accepted={}", r4.emitted_tokens, r4.n_accepted);
+}
+
+/// Phase 6.4b orchestration test for the batched closure variant.
+/// Same accept-prefix logic as the per-step driver, but the closure
+/// is called ONCE with K+1 (position, input) pairs and returns K+1
+/// predictions in one go. Mocks the closure with canned predictions
+/// to cover full-accept, partial-accept, and zero-accept paths.
+///
+/// IMPORTANT: this orchestration test uses a mock base closure so
+/// the linear-attn-state-pollution issue (real chains advancing
+/// state past the rejection point) does NOT show here — that's a
+/// real-engine concern Phase 6.4c will address. The orchestration
+/// itself (accept-prefix walk, final_hidden_bytes selection) is
+/// what's under test.
+#[test]
+fn qwen36_moe_speculative_driver_orchestration_batched() {
+    if !is_backend_compiled(Backend::Hip) {
+        eprintln!("skip: HIP backend not compiled");
+        return;
+    }
+    let Ok(json_path) = std::env::var("SUPERSONIC_QWEN36_MTP_ORACLE_JSON") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
+        return;
+    };
+    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+        return;
+    };
+    let model_dir = PathBuf::from(model_dir);
+
+    let raw = std::fs::read_to_string(&json_path).expect("read mtp oracle json");
+    let json: Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
+    let geom = parse_geom(&json);
+    let base_seq_len = json["base_seq_len"].as_i64().unwrap() as i32;
+    let base_next_token_id = json["base_next_token_id"].as_i64().unwrap() as u32;
+    let h_base_bytes = b64(json["h_base_step0_bf16"].as_str().unwrap());
+    let want_drafts: Vec<u32> = json["draft_token_ids"]
+        .as_array().expect("draft_token_ids")
+        .iter().map(|v| v.as_u64().expect("u64") as u32).collect();
+    let k = want_drafts.len();
+    eprintln!("[spec batched] K={k} oracle drafts={want_drafts:?}");
+
+    set_backend(Backend::Hip);
+    let ordinal = 0usize;
+
+    let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
+    let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
+        .expect("load mtp buffers");
+    let embed_w = shards
+        .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
+        .expect("load embed_tokens.weight");
+    let lm_head_w = shards
+        .load_bf16_to_gpu(ordinal, "lm_head.weight")
+        .expect("load lm_head.weight");
+    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, k.max(1))
+        .expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
+        .expect("alloc chain scratch");
+
+    let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
+
+    // ---- Pass 1: full-accept (K matches + bonus) ----
+    let bonus_token: u32 = 999;
+    let want_drafts_p1 = want_drafts.clone();
+    let synth_fh_p1 = synth_fh.clone();
+    let base_step_batched_p1 = move |inputs: &[(i32, u32)]|
+        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+    {
+        assert_eq!(inputs.len(), k + 1, "expected K+1 inputs");
+        // Predictions: drafts[0..K] match, then bonus for K-th.
+        let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+        for i in 0..k {
+            out.push((want_drafts_p1[i], synth_fh_p1.clone()));
+        }
+        out.push((bonus_token, synth_fh_p1.clone()));
+        Ok(out)
+    };
+    let r1 = run_speculative_decode_step_batched(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        base_step_batched_p1,
+    ).expect("pass 1 batched");
+    let mut want1 = want_drafts.clone();
+    want1.push(bonus_token);
+    assert_eq!(r1.emitted_tokens, want1, "full-accept emit");
+    assert_eq!(r1.n_accepted, k);
+    eprintln!("[spec batched] pass 1: emitted={:?} n_accepted={}",
+        r1.emitted_tokens, r1.n_accepted);
+
+    // ---- Pass 2: partial-accept (reject at k=1, K≥2) ----
+    if k >= 2 {
+        let bad_pred: u32 = 12345;
+        let first_match = want_drafts[0];
+        let synth_fh_p2 = synth_fh.clone();
+        let base_step_batched_p2 = move |inputs: &[(i32, u32)]|
+            -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+        {
+            assert_eq!(inputs.len(), k + 1);
+            let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+            // Index 0 matches drafts[0]
+            out.push((first_match, synth_fh_p2.clone()));
+            // Index 1 mismatches drafts[1] → reject.
+            out.push((bad_pred, synth_fh_p2.clone()));
+            // Remaining filler (would not be inspected by accept-prefix
+            // logic but must exist to satisfy the contract).
+            for _ in 2..(k + 1) {
+                out.push((0u32, synth_fh_p2.clone()));
+            }
+            Ok(out)
+        };
+        let r2 = run_speculative_decode_step_batched(
+            ordinal, &geom, &mut mtp,
+            &mut forward_scratch, &mut chain_scratch,
+            &embed_w, &lm_head_w,
+            &h_base_bytes, base_next_token_id, base_seq_len, k,
+            base_step_batched_p2,
+        ).expect("pass 2 batched");
+        assert_eq!(r2.emitted_tokens, vec![want_drafts[0], bad_pred],
+            "partial-accept emit drafts[0] + corrected");
+        assert_eq!(r2.n_accepted, 1);
+        eprintln!("[spec batched] pass 2: emitted={:?} n_accepted={}",
+            r2.emitted_tokens, r2.n_accepted);
+    }
+
+    // ---- Pass 3: zero-accept (immediate reject at k=0) ----
+    let bad_pred: u32 = 67890;
+    let synth_fh_p3 = synth_fh.clone();
+    let base_step_batched_p3 = move |inputs: &[(i32, u32)]|
+        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+    {
+        assert_eq!(inputs.len(), k + 1);
+        let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+        out.push((bad_pred, synth_fh_p3.clone())); // immediate reject
+        for _ in 1..(k + 1) {
+            out.push((0u32, synth_fh_p3.clone()));
+        }
+        Ok(out)
+    };
+    let r3 = run_speculative_decode_step_batched(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        base_step_batched_p3,
+    ).expect("pass 3 batched");
+    assert_eq!(r3.emitted_tokens, vec![bad_pred]);
+    assert_eq!(r3.n_accepted, 0);
+    eprintln!("[spec batched] pass 3: emitted={:?} n_accepted={}",
+        r3.emitted_tokens, r3.n_accepted);
+
+    // ---- Pass 4: K=0 fallback ----
+    let k0_pred: u32 = 4242;
+    let synth_fh_p4 = synth_fh.clone();
+    let base_step_batched_p4 = move |inputs: &[(i32, u32)]|
+        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
+    {
+        assert_eq!(inputs.len(), 1, "K=0 fallback runs exactly one base step");
+        Ok(vec![(k0_pred, synth_fh_p4.clone())])
+    };
+    let r4 = run_speculative_decode_step_batched(
+        ordinal, &geom, &mut mtp,
+        &mut forward_scratch, &mut chain_scratch,
+        &embed_w, &lm_head_w,
+        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 0,
+        base_step_batched_p4,
+    ).expect("pass 4 batched");
+    assert_eq!(r4.emitted_tokens, vec![k0_pred]);
+    assert_eq!(r4.n_accepted, 0);
+    eprintln!("[spec batched] pass 4 (K=0): emitted={:?} n_accepted={}",
+        r4.emitted_tokens, r4.n_accepted);
 }
