@@ -1,9 +1,30 @@
 //! Qwen3.6-MoE self-speculative decoding — Phase 6.3 building blocks.
 //!
 //! This module hosts the orchestration layer that ties the MTP draft
-//! chain (`crate::qwen36_moe_mtp`) to the base-model verifier. The
-//! current contents are pure-logic helpers — the GPU-bound speculative
-//! driver that wires this into `decode_text` lands in Phase 6.3c.
+//! chain (`crate::qwen36_moe_mtp`) to the base-model verifier.
+//!
+//! Phase 6.3b shipped the pure-logic accept-prefix helpers
+//! ([`accept_prefix_greedy`], [`accept_prefix_greedy_partial`]).
+//! Phase 6.3c (this module after the next round) adds
+//! [`run_speculative_decode_step`], which orchestrates one full
+//! speculative iteration: MTP draft chain → sequential base
+//! verification with early termination → accept-prefix → emitted
+//! tokens. The base stepper is injected as a callback so the
+//! orchestration is testable with a mock that doesn't need the
+//! full Qwen3.6-MoE model loaded; engine wiring under
+//! `--speculative-decode` is Phase 6.3d.
+//!
+//! ## Performance note
+//!
+//! Sequential verification has zero amortized speedup over plain
+//! greedy decode: each accepted draft still requires one base step
+//! (to produce the next prediction), and rejected drafts incur a
+//! base step too (for the rejection check). Total base steps per
+//! emitted token stays at 1.0 on average. The actual throughput
+//! win comes from Phase 6.4's batched verification kernel, which
+//! runs all K verify steps in a single base call (multi-query
+//! attention). Phase 6.3 builds the protocol and validates
+//! correctness; Phase 6.4 makes it fast.
 //!
 //! Speculative decoding (greedy) at a glance:
 //!
@@ -204,6 +225,231 @@ pub fn accept_prefix_greedy_partial(
         accepted_drafts: drafts.to_vec(),
         corrected_token: base_predictions[drafts.len()],
     }
+}
+
+// ============================================================================
+// Phase 6.3c: speculative-decode driver (orchestration only)
+// ----------------------------------------------------------------------------
+// `run_speculative_decode_step` runs one full speculative iteration:
+//
+//   1. Upload h_base (last base step's final-hidden) to GPU.
+//   2. Run K-step MTP draft chain → K candidate tokens.
+//   3. Sequential base verification with early termination on first
+//      mismatch. Each verify iter is one base decode step at the
+//      corresponding position, fed via the caller-supplied
+//      `base_step` closure.
+//   4. Apply the accept-prefix logic from Phase 6.3b.
+//   5. Return the emitted tokens + n_accepted + final-hidden bytes
+//      (so the next speculative step has a fresh `h_base`).
+//
+// The `base_step` callback abstraction is what makes this testable
+// without the full Qwen3.6-MoE model loaded. The real engine wraps
+// `lookup_embed_row` + `run_chained_decode_fast` + `lm_head_launch`
+// + host argmax in the closure; tests pass a mock that returns canned
+// predictions and synthesised final-hidden bytes.
+// ============================================================================
+
+use anyhow::{Context, Result};
+use gpu_hal::{GpuBuffer, ScalarType};
+
+use crate::qwen36_moe_decode::{MtpLayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe_mtp::{
+    run_mtp_draft_chain, MtpChainScratch, MtpForwardScratch,
+};
+
+/// Result of one speculative-decode step.
+#[derive(Debug, Clone)]
+pub struct SpeculativeStepResult {
+    /// Tokens to commit this step, in order. Always length 1..=K+1
+    /// (always at least one token: the corrected/bonus token).
+    pub emitted_tokens: Vec<u32>,
+    /// Number of MTP drafts accepted (0..=K). Exposed for stats /
+    /// `--emit-stage-timings` / acceptance-rate logging.
+    pub n_accepted: usize,
+    /// `[hidden]` BF16 little-endian — the final-hidden bytes from
+    /// the LAST base decode step that ran during this iteration.
+    /// Becomes the next speculative step's `h_base` per the vLLM
+    /// recurrent equation.
+    pub final_hidden_bytes: Vec<u8>,
+}
+
+/// Run one speculative-decode iteration.
+///
+/// ## Inputs
+///
+/// - `mtp`, `forward_scratch`, `chain_scratch`, `embed_w_buf`,
+///   `lm_head_w_buf`: same as [`run_mtp_draft_chain`] (Phase 6.3a).
+/// - `h_base_in`: `[hidden]` BF16 — the LAST base step's final-hidden
+///   bytes (the input to the base's lm_head that produced
+///   `first_token_id`). Becomes MTP's `h_base` for step 0.
+/// - `first_token_id`: the token the base just sampled (= `T_{p+1}`
+///   in the docstring above). Becomes MTP's `next_token_id` at
+///   step 0 and the base verifier's first input.
+/// - `base_position`: absolute base position of `first_token_id` —
+///   the cache slot it WILL be written to when the verify loop
+///   feeds it. Per the engine convention, this equals
+///   `decode_text`'s `position` value AFTER the regular sample
+///   that produced `first_token_id`.
+/// - `num_drafts` (K): how many MTP drafts to generate.
+///
+/// ## `base_step` closure contract
+///
+/// Each call advances the base by one step:
+///
+///   `(predicted_next_token, final_hidden_bytes) = base_step(position, input_token)`
+///
+/// where:
+///   - `position`: cache slot to write `input_token`'s K/V into.
+///     The implementation must run the base chain at `position`
+///     and produce logits for `position + 1`.
+///   - `input_token`: token id to embed and feed at `position`.
+///   - `predicted_next_token`: greedy argmax over the produced
+///     logits (= base's prediction for `position + 1`).
+///   - `final_hidden_bytes`: `[hidden]` BF16 — the chain output the
+///     lm_head consumed.  Used both for the next speculative step's
+///     `h_base` and for diagnostics.
+///
+/// The closure is called K times when all drafts are accepted (the
+/// K-th call produces the bonus prediction), or `j+1` times when the
+/// j-th draft is rejected (j in 0..K-1).
+///
+/// ## Output
+///
+/// `emitted_tokens` is `accepted_drafts ++ [corrected_or_bonus]`,
+/// always non-empty. Caller appends to `generated_ids` and advances
+/// `position` by `emitted_tokens.len()`.
+///
+/// ## Performance
+///
+/// Sequential verification has zero amortized speedup over plain
+/// greedy decode: each iter still runs one full base step. The MTP
+/// chain is the only "free" compute (~K layers vs the base's
+/// 40 layers per step). Phase 6.4's batched verification kernel
+/// is what delivers throughput.
+#[allow(clippy::too_many_arguments)]
+pub fn run_speculative_decode_step<F>(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    mtp: &mut MtpLayerBuffers,
+    forward_scratch: &mut MtpForwardScratch,
+    chain_scratch: &mut MtpChainScratch,
+    embed_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    h_base_in: &[u8],
+    first_token_id: u32,
+    base_position: i32,
+    num_drafts: usize,
+    mut base_step: F,
+) -> Result<SpeculativeStepResult>
+where
+    F: FnMut(i32, u32) -> Result<(u32, Vec<u8>)>,
+{
+    let hidden = geom.hidden as usize;
+    if h_base_in.len() != hidden * 2 {
+        anyhow::bail!(
+            "run_speculative_decode_step: h_base_in.len() {} != \
+             hidden*2 ({}) BF16 bytes",
+            h_base_in.len(),
+            hidden * 2
+        );
+    }
+    if num_drafts == 0 {
+        // K=0 degenerate: no MTP work, but the contract still requires
+        // we emit one token (the function is documented as always
+        // returning a non-empty `emitted_tokens` so the caller's
+        // `position += emitted.len()` advances). Run a single base
+        // step at `base_position` with `first_token_id` — exactly
+        // what plain greedy decode would do for this token. This
+        // keeps the speculative driver a safe drop-in even when a
+        // tunable disables speculation, avoiding the stalled-loop
+        // failure mode the `--speculative-decode --num-speculative
+        // -tokens=0` knob would otherwise hit.
+        let (predicted, fh) = base_step(base_position, first_token_id)
+            .context("speculative: K=0 fallback base step")?;
+        return Ok(SpeculativeStepResult {
+            emitted_tokens: vec![predicted],
+            n_accepted: 0,
+            final_hidden_bytes: fh,
+        });
+    }
+
+    // --- 1. Upload h_base for the MTP chain. ---
+    let h_base_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[hidden],
+        h_base_in,
+    )
+    .context("speculative: upload h_base")?;
+
+    // --- 2. Generate K MTP drafts. ---
+    let drafts_records = run_mtp_draft_chain(
+        ordinal,
+        geom,
+        mtp,
+        base_position,
+        &h_base_buf,
+        first_token_id,
+        num_drafts,
+        embed_w_buf,
+        lm_head_w_buf,
+        forward_scratch,
+        chain_scratch,
+    )
+    .context("speculative: MTP draft chain")?;
+    let drafts: Vec<u32> = drafts_records.iter().map(|r| r.draft_token_id).collect();
+
+    // --- 3. Sequential verify with early termination. ---
+    //
+    // Iter k (k in 0..K):
+    //   feed `input_k` at position `base_position + k`,
+    //   read `predicted_k` = base's prediction for `base_position + k + 1`,
+    //   compare to drafts[k].
+    //
+    // input_0 = first_token_id (= T_{base_position}, just sampled).
+    // input_k (k > 0) = drafts[k-1] (the just-accepted token).
+    //
+    // First mismatch at k: emit drafts[..k] ++ [predicted_k]; n_accepted = k.
+    // No mismatch through k = K-1: emit drafts[..K] ++ [bonus]; n_accepted = K.
+    //   The bonus is computed by an extra base step at position
+    //   `base_position + K` with input = drafts[K-1] — the K+1-th
+    //   call to `base_step`.
+
+    let mut emitted: Vec<u32> = Vec::with_capacity(num_drafts + 1);
+    let mut last_final_hidden: Vec<u8> = h_base_in.to_vec();
+    let mut input = first_token_id;
+
+    for k in 0..num_drafts {
+        let pos = base_position + (k as i32);
+        let (predicted, fh) = base_step(pos, input)
+            .with_context(|| format!("speculative: base verify k={k} pos={pos}"))?;
+        last_final_hidden = fh;
+        if predicted == drafts[k] {
+            // Accept drafts[k]. Carry forward as next iter's input.
+            emitted.push(drafts[k]);
+            input = drafts[k];
+        } else {
+            // Reject. predicted replaces drafts[k]; stop here.
+            emitted.push(predicted);
+            return Ok(SpeculativeStepResult {
+                emitted_tokens: emitted,
+                n_accepted: k,
+                final_hidden_bytes: last_final_hidden,
+            });
+        }
+    }
+
+    // All K drafts accepted. Bonus base step at position p+K with
+    // input = drafts[K-1] (= last accepted token).
+    let pos = base_position + (num_drafts as i32);
+    let (bonus, fh) = base_step(pos, input)
+        .with_context(|| format!("speculative: bonus base step pos={pos}"))?;
+    emitted.push(bonus);
+    Ok(SpeculativeStepResult {
+        emitted_tokens: emitted,
+        n_accepted: num_drafts,
+        final_hidden_bytes: fh,
+    })
 }
 
 #[cfg(test)]
