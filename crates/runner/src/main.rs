@@ -700,6 +700,47 @@ pub(crate) struct Cli {
     /// checkpoint's `dflash_config.target_layer_ids`.
     #[arg(long)]
     dflash_tap_layers: Option<String>,
+
+    /// Path to the SpecPrefill (arXiv 2502.02789) draft model directory
+    /// (e.g. `/mnt/data/models/Qwen3.5-0.8B`). Presence of this flag
+    /// enables sparse target prefill via the speculator's importance
+    /// signal. Currently only supported for `--model qwen3.5-9b`.
+    #[arg(long)]
+    specprefill_draft_dir: Option<PathBuf>,
+
+    /// SpecPrefill keep ratio per chunk: fraction of tokens kept by the
+    /// chunked top-K selection. Phase A2 measurements pin 0.50 as the
+    /// quality-stable default on Qwen3.5-9B (cossim ≥ 0.927, argmax
+    /// match). Range: [0.05, 1.0].
+    #[arg(long, default_value = "0.50")]
+    specprefill_keep_ratio: f32,
+
+    /// SpecPrefill chunk size for top-K selection (paper §3.4).
+    #[arg(long, default_value = "32")]
+    specprefill_chunk_size: usize,
+
+    /// SpecPrefill 1-D average-pool window for score smoothing. Must be
+    /// odd. Paper uses 5-10.
+    #[arg(long, default_value = "5")]
+    specprefill_pool_window: usize,
+
+    /// SpecPrefill look-ahead decode steps on the draft (paper §3.3
+    /// default 4). Total query rows harvested = lookahead + 1.
+    #[arg(long, default_value = "4")]
+    specprefill_lookahead: usize,
+
+    /// SpecPrefill always-keep prefix (BOS + system) length.
+    #[arg(long, default_value = "4")]
+    specprefill_always_keep_prefix: usize,
+
+    /// SpecPrefill always-keep suffix (final query) length.
+    #[arg(long, default_value = "4")]
+    specprefill_always_keep_suffix: usize,
+
+    /// Free the draft weights after selection runs and before the target
+    /// prefill, to claw back ~1.6 GiB on a tight 24 GiB budget.
+    #[arg(long, default_value_t = false)]
+    specprefill_unload_draft: bool,
 }
 
 fn effective_fixed_vram(
