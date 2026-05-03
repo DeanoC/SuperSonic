@@ -276,9 +276,11 @@ Add a validation block early in the function body (after the existing `int4_scal
                     li, kf.kv_scale_k, kf.kv_scale_v);
                 return 1;
             }
-            if (full && both && d.kv_shadow_k != nullptr && d.kv_shadow_v == nullptr) {
+            if (full && both && ((d.kv_shadow_k != nullptr) != (d.kv_shadow_v != nullptr))) {
                 fprintf(stderr,
-                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_k/v must agree\n", li);
+                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_k/v must agree "
+                    "(got %p / %p)\n",
+                    li, d.kv_shadow_k, d.kv_shadow_v);
                 return 1;
             }
         }
@@ -289,24 +291,28 @@ Add a validation block early in the function body (after the existing `int4_scal
 
 Stop here. The launcher takes the param and validates it but does not yet pass it to the kernel — Task 5 adds the kernel param and updates the `hipLaunchCooperativeKernel` arg tuple atomically. If you push a half-update here, the kernel reads garbage at the new arg position. Confirm via `grep -n "hipLaunchCooperativeKernel" kernels/qwen36_moe_bridge.cpp` that the kernel arg tuple is unchanged in this commit.
 
-- [ ] **Step 4: Update existing safe-wrapper callers**
+- [ ] **Step 4: Update existing call sites of the extern**
 
-Grep for callers of `qwen36_moe_hip_persistent_decode_launch` in Rust:
+Grep for callers of the extern (not the safe wrapper) in Rust:
 
 ```bash
 grep -rn "qwen36_moe_hip_persistent_decode_launch" crates/
 ```
 
-Every call site needs `std::ptr::null()` passed for `kv_fp8_descs` for now. The single non-test caller is `crates/runner/src/qwen36_moe_persistent_decode.rs`. Update its launch call to:
+The only direct call site is the safe wrapper `persistent_decode_launch` in `crates/kernel-ffi/src/qwen36_moe.rs` (around line 817 — inside an `unsafe { ... }` block). The runner does NOT call the extern directly; it calls the safe wrapper. Update the unsafe extern invocation to pass null for the new param, between `int4_ptr` and `geom.hidden`:
 
 ```rust
-kernel_ffi::qwen36_moe::qwen36_moe_hip_persistent_decode_launch(
-    // ... existing args up to int4_scales ...
-    int4_scales_ptr,
-    std::ptr::null::<kernel_ffi::qwen36_moe::Qwen36MoeKVCacheFp8Desc>(),
-    // ... remaining args ...
+qwen36_moe_hip_persistent_decode_launch(
+    dtype.kernel_dtype_code(),
+    // ... ordinal, num_layers, layers_device.as_ptr() ...
+    int4_ptr,
+    std::ptr::null::<Qwen36MoeKVCacheFp8Desc>(),
+    geom.hidden,
+    // ... rest of args unchanged ...
 )
 ```
+
+Do NOT extend the safe wrapper signature in this task — keep the wrapper's external API stable. Task 11 extends the wrapper signature to accept `kv_fp8_descs_device: Option<&GpuBuffer>` and threads it down to this same call site, replacing the null. The runner crate `crates/runner/src/qwen36_moe_persistent_decode.rs` calls `persistent_decode_launch` (the wrapper), so no runner-side changes land in this commit.
 
 - [ ] **Step 5: Build everything that depends on the FFI**
 
@@ -316,10 +322,11 @@ Expected: clean build. No silent missing-arg errors.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/kernel-ffi/src/qwen36_moe.rs kernels/qwen36_moe_bridge.cpp \
-        crates/runner/src/qwen36_moe_persistent_decode.rs
+git add crates/kernel-ffi/src/qwen36_moe.rs kernels/qwen36_moe_bridge.cpp
 git commit -m "qwen36-moe-fp8: thread KVCacheFp8Desc through persistent_decode_launch (null at runtime)"
 ```
+
+(The runner crate is unchanged in this commit — its calls go through the unchanged safe wrapper. Task 11 extends the wrapper signature.)
 
 ---
 
@@ -1095,16 +1102,43 @@ desc.kv_shadow_start = layer.kv_shadow_start;
 
 For linear-attn layers leave them at the `Default::default()` zero values (null + -1).
 
-- [ ] **Step 6: Pass the new pointer into the launcher**
+- [ ] **Step 6: Extend the safe wrapper signature and pass the new pointer**
 
-Replace the placeholder `std::ptr::null::<Qwen36MoeKVCacheFp8Desc>()` from Task 4 with:
+Task 4 left the safe wrapper `persistent_decode_launch` in `crates/kernel-ffi/src/qwen36_moe.rs` hardcoding `std::ptr::null::<Qwen36MoeKVCacheFp8Desc>()` at the unsafe extern call site (around line 817). Replace that hardcoded null in two parts:
+
+(a) Extend `pub fn persistent_decode_launch(...)`'s signature with a new arg, between `int4_scales_device: Option<&GpuBuffer>` and `num_layers: usize`:
 
 ```rust
-kv_fp8_descs_device
-    .as_ref()
-    .map(|b| b.as_ptr() as *const kernel_ffi::qwen36_moe::Qwen36MoeKVCacheFp8Desc)
-    .unwrap_or(std::ptr::null()),
+    kv_fp8_descs_device: Option<&GpuBuffer>,
 ```
+
+(b) Inside the wrapper body, after the existing `let int4_ptr: *const Qwen36MoeInt4ScaleDesc = ...` line, add:
+
+```rust
+    let kv_fp8_ptr: *const Qwen36MoeKVCacheFp8Desc = kv_fp8_descs_device
+        .map(|b| b.as_ptr() as *const Qwen36MoeKVCacheFp8Desc)
+        .unwrap_or(std::ptr::null());
+```
+
+(c) In the unsafe `qwen36_moe_hip_persistent_decode_launch(...)` call inside the wrapper, replace `std::ptr::null::<Qwen36MoeKVCacheFp8Desc>()` with `kv_fp8_ptr`.
+
+Then in `crates/runner/src/qwen36_moe_persistent_decode.rs`, update the call to `persistent_decode_launch` to pass the new arg:
+
+```rust
+persistent_decode_launch(
+    ordinal,
+    dtype,
+    geom,
+    position,
+    layers_device,
+    int4_scales_device.as_ref(),
+    kv_fp8_descs_device.as_ref(),  // NEW
+    num_layers,
+    /* … rest unchanged … */
+)
+```
+
+Where `kv_fp8_descs_device` is the `Option<GpuBuffer>` built in Step 4.
 
 - [ ] **Step 7: Advance `kv_shadow_start` per decode step**
 
