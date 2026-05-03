@@ -39,7 +39,7 @@ use gemma4_runtime::{
     check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
     Gemma4Runtime, Gemma4Startup,
 };
-use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags};
+use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags, validate_specprefill_flags};
 use qwen35::loader::WeightLoader;
 use qwen35::state::{LayerState, ModelState};
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
@@ -1036,6 +1036,7 @@ fn main() -> Result<()> {
     // Run before family dispatch so DFlash flags are not silently ignored by
     // non-Qwen branches.
     validate_dflash_flags(&cli, &model_variant)?;
+    validate_specprefill_flags(&cli, &model_variant)?;
 
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),

@@ -82,6 +82,51 @@ pub(crate) fn validate_dflash_flags(cli: &Cli, model_variant: &ModelVariant) -> 
     Ok(())
 }
 
+pub(crate) fn validate_specprefill_flags(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+) -> Result<()> {
+    let any_specprefill_flag = cli.specprefill_draft_dir.is_some()
+        || cli.specprefill_unload_draft;
+    if cli.specprefill_draft_dir.is_some() {
+        if !matches!(model_variant, ModelVariant::Qwen3_5_9B) {
+            anyhow::bail!(
+                "--specprefill-draft-dir is only supported on --model qwen3.5-9b in Phase C \
+                 (got {model_variant})."
+            );
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("SpecPrefill requires --batch-size 1");
+        }
+        if cli.dflash {
+            anyhow::bail!("--specprefill-* and --dflash cannot be combined");
+        }
+        if !(0.05..=1.0).contains(&cli.specprefill_keep_ratio) {
+            anyhow::bail!(
+                "--specprefill-keep-ratio must be in [0.05, 1.0] (got {})",
+                cli.specprefill_keep_ratio
+            );
+        }
+        if cli.specprefill_pool_window % 2 != 1 || cli.specprefill_pool_window == 0 {
+            anyhow::bail!(
+                "--specprefill-pool-window must be odd and > 0 (got {})",
+                cli.specprefill_pool_window
+            );
+        }
+        if cli.specprefill_lookahead < 1 || cli.specprefill_lookahead > 16 {
+            anyhow::bail!(
+                "--specprefill-lookahead must be in [1, 16] (got {})",
+                cli.specprefill_lookahead
+            );
+        }
+    } else if any_specprefill_flag {
+        anyhow::bail!(
+            "--specprefill-* flags require --specprefill-draft-dir (no specprefill is configured)"
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_gfx942_policy(
     cli: &Cli,
     model_variant: &ModelVariant,
