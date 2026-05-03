@@ -1034,7 +1034,7 @@ pub struct PrefillWithLookaheadResult {
     /// number of vec entries equals the number of full-attention layers
     /// in the speculator.
     pub layer_scores: Vec<LookaheadLayerScores>,
-    /// Equals `lookahead + 1` — the number of query rows scored.
+    /// The number of query rows scored (passed-in `lookahead_count`; typically `paper_N + 1`).
     pub lookahead_count: usize,
 }
 
@@ -1052,6 +1052,9 @@ pub struct PrefillWithLookaheadResult {
 /// 1` where `lookahead` is the paper's N (default 4).
 ///
 /// Post-conditions:
+/// - `state` is mutated by the prefill: the KV cache is populated for the
+///   first `prompt_len - 1` tokens. Caller must NOT reuse `state` for normal
+///   decode without resetting it first.
 /// - The `decode_engine`'s state has been mutated by `lookahead_count`
 ///   decode steps. Caller must NOT reuse it for further decoding without
 ///   resetting/recreating the state.
