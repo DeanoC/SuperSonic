@@ -26,7 +26,8 @@
 - `kernels/qwen36_moe_bridge.cpp` — extend persistent_decode_launch to accept KV-FP8 desc; bridge validation; bump static_assert size bound
 - `crates/kernel-ffi/src/qwen36_moe.rs` — add `Qwen36MoeKVCacheFp8Desc`, append sidecar fields to `Qwen36MoeDecodeLayerDesc`, extend `qwen36_moe_hip_persistent_decode_launch` extern, add launcher wrapper
 - `crates/qwen36_moe/src/state.rs` — extend account/layout for FP8 KV scales + sidecar
-- `crates/runner/src/qwen36_moe_state.rs` — actually allocate FP8 KV + scale + sidecar buffers per full-attn layer
+- `crates/runner/src/qwen36_moe_decode.rs` — extend `FullAttnKvCache` struct with KV-FP8 scale + sidecar fields
+- `crates/runner/src/qwen36_moe_engine.rs` — branched allocation in `load_layer_buffers` (the `qwen36_moe_state.rs` file holds linear-attn snapshot helpers, NOT the per-layer KV cache)
 - `crates/runner/src/qwen36_moe_persistent_decode.rs` — build `Qwen36MoeKVCacheFp8Desc[]` and thread sidecar pointers into `Qwen36MoeDecodeLayerDesc`
 - `crates/runner/src/qwen36_moe_engine.rs` — gate `--kv-fp8` (require `--persistent-decode`), pass FP8 KV state through
 - `crates/runner/src/main.rs` — CLI gates: gfx1100 + qwen3.6 + `--kv-fp8` allow; gfx1100 + `--fp8-runtime` reject
