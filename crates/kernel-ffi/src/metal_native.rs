@@ -623,9 +623,10 @@ impl MetalBatchGuard {
         }
         let status = unsafe { supersonic_metal_batch_begin() };
         if status != 0 {
-            return Err(GpuError::backend(Backend::Metal, format!(
-                "metal native batch begin failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Metal,
+                format!("metal native batch begin failed with status {status}"),
+            ));
         }
         Ok(Self { active: true })
     }
@@ -637,9 +638,10 @@ impl MetalBatchGuard {
         self.active = false;
         let status = unsafe { supersonic_metal_batch_end() };
         if status != 0 {
-            return Err(GpuError::backend(Backend::Metal, format!(
-                "metal native batch end failed with status {status}"
-            )));
+            return Err(GpuError::backend(
+                Backend::Metal,
+                format!("metal native batch end failed with status {status}"),
+            ));
         }
         Ok(())
     }
@@ -659,9 +661,10 @@ impl Drop for MetalBatchGuard {
 pub(crate) fn flush_batch() -> Result<(), GpuError> {
     let status = unsafe { supersonic_metal_batch_flush() };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native batch flush failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native batch flush failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -673,13 +676,18 @@ pub(crate) fn batch_is_active() -> bool {
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
-    let label = CString::new(label)
-        .map_err(|_| GpuError::backend(Backend::Metal, "metal native batch label contains NUL byte".to_string()))?;
+    let label = CString::new(label).map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "metal native batch label contains NUL byte".to_string(),
+        )
+    })?;
     let status = unsafe { supersonic_metal_batch_set_label(label.as_ptr()) };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native batch set label failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native batch set label failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -693,9 +701,10 @@ pub(crate) fn copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Re
     }
     let status = unsafe { supersonic_metal_copy_d2d(src, dst, bytes) };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native copy_d2d failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native copy_d2d failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -775,9 +784,10 @@ pub(crate) fn lm_head_argmax_bf16_with_partials(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native lm_head_argmax_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native lm_head_argmax_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -807,9 +817,10 @@ pub(crate) fn argmax_bf16(
     let status =
         unsafe { supersonic_metal_argmax_bf16(n, logits.as_ptr(), out_index.as_mut_ptr()) };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native argmax_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native argmax_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -853,9 +864,10 @@ pub(crate) fn embedding_lookup_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native embedding_lookup_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native embedding_lookup_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -893,9 +905,10 @@ pub(crate) fn matmul_rhs_transposed_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native matmul_rhs_transposed_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -933,9 +946,12 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled failed with status {status}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -972,9 +988,10 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_bf16_gemv_m1 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native matmul_rhs_transposed_bf16_gemv_m1 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1016,9 +1033,10 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_residual_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native matmul_rhs_transposed_residual_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1071,9 +1089,10 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_int4_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native matmul_rhs_transposed_int4_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1126,9 +1145,12 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_int4_bf16_gemv_m1 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native matmul_rhs_transposed_int4_bf16_gemv_m1 failed with status {status}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -1180,9 +1202,12 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
             "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled failed with status {status}"
-        )));
+        ),
+        ));
     }
     Ok(())
 }
@@ -1220,9 +1245,10 @@ pub(crate) fn matmul_rhs_transposed_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native matmul_rhs_transposed_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native matmul_rhs_transposed_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1283,9 +1309,10 @@ pub(crate) fn qwen_linear_projections_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_projections_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_linear_projections_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1330,9 +1357,10 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_mlp_gate_up_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_mlp_gate_up_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1374,9 +1402,10 @@ pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_mlp_gate_up_swiglu_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_mlp_gate_up_swiglu_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1421,9 +1450,10 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_mlp_down_residual_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_mlp_down_residual_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1484,9 +1514,10 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_out_residual_f32_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_linear_out_residual_f32_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1547,9 +1578,10 @@ pub(crate) fn qwen_linear_out_residual_bf16_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_out_residual_bf16_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_linear_out_residual_bf16_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1602,9 +1634,10 @@ pub(crate) fn qwen_full_projections_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_full_projections_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_full_projections_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1694,9 +1727,10 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native full_attention_prefill_bf16_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native full_attention_prefill_bf16_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1757,9 +1791,10 @@ pub(crate) fn full_attention_decode_bf16_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native full_attention_decode_bf16_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native full_attention_decode_bf16_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1797,9 +1832,10 @@ pub(crate) fn rms_norm_rows_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native rms_norm_rows_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native rms_norm_rows_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1848,9 +1884,10 @@ pub(crate) fn rms_norm_rope_rows_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native rms_norm_rope_rows_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native rms_norm_rope_rows_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1900,9 +1937,10 @@ pub(crate) fn rms_norm_rows_f32(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native rms_norm_rows_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native rms_norm_rows_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1942,9 +1980,10 @@ pub(crate) fn rms_norm_gated_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native rms_norm_gated_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native rms_norm_gated_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -1998,9 +2037,10 @@ pub(crate) fn rms_norm_gated_f32(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native rms_norm_gated_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native rms_norm_gated_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2038,9 +2078,10 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native linear_prefill_conv_pack_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native linear_prefill_conv_pack_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2088,9 +2129,10 @@ pub(crate) fn l2norm(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native l2norm failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native l2norm failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2139,9 +2181,10 @@ pub(crate) fn element_add(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native element_add failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native element_add failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2190,9 +2233,10 @@ pub(crate) fn sigmoid_mul(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native sigmoid_mul failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native sigmoid_mul failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2230,9 +2274,10 @@ pub(crate) fn full_attention_gate_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native full_attention_gate_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native full_attention_gate_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2281,9 +2326,10 @@ pub(crate) fn swiglu_mul(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native swiglu_mul failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native swiglu_mul failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2335,9 +2381,10 @@ pub(crate) fn cast(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native cast failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native cast failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2386,9 +2433,10 @@ pub(crate) fn mul_scalar(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native mul_scalar failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native mul_scalar failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2443,9 +2491,10 @@ pub(crate) fn transpose_shd_hsd(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native transpose_shd_hsd failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native transpose_shd_hsd failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2503,9 +2552,10 @@ pub(crate) fn apply_rope_prefill(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native apply_rope_prefill failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native apply_rope_prefill failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2542,9 +2592,10 @@ pub(crate) fn transpose_pad_conv(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native transpose_pad_conv failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native transpose_pad_conv failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2589,9 +2640,10 @@ pub(crate) fn extract_conv_state(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native extract_conv_state failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native extract_conv_state failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2668,9 +2720,10 @@ pub(crate) fn split_qkv(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native split_qkv failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native split_qkv failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2737,9 +2790,10 @@ pub(crate) fn split_qgate(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native split_qgate failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native split_qgate failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2811,9 +2865,10 @@ pub(crate) fn repeat_interleave_heads(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native repeat_interleave_heads failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native repeat_interleave_heads failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2870,9 +2925,10 @@ pub(crate) fn compute_beta_g_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native compute_beta_g_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native compute_beta_g_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -2942,9 +2998,10 @@ pub(crate) fn delta_recurrent_prefill_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native delta_recurrent_prefill_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native delta_recurrent_prefill_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3011,9 +3068,10 @@ pub(crate) fn linear_decode_apply_parts_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native linear_decode_apply_parts_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native linear_decode_apply_parts_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3086,9 +3144,10 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_prep_bf16_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen_linear_prep_bf16_f32 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3153,9 +3212,12 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_prep_decode_apply_bf16_f32 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native qwen_linear_prep_decode_apply_bf16_f32 failed with status {status}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -3220,9 +3282,12 @@ pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native qwen_linear_decode_apply_inplace_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native qwen_linear_decode_apply_inplace_bf16 failed with status {status}"
+            ),
+        ));
     }
     Ok(())
 }
@@ -3255,9 +3320,10 @@ pub(crate) fn conv_state_update_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native conv_state_update_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native conv_state_update_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3316,9 +3382,10 @@ pub(crate) fn linear_conv_value_decay_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native linear_conv_value_decay_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native linear_conv_value_decay_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3378,9 +3445,10 @@ pub(crate) fn linear_conv_value_decay_update_bf16(
         )
     };
     if status != 0 {
-        return Err(GpuError::backend(Backend::Metal, format!(
-            "metal native linear_conv_value_decay_update_bf16 failed with status {status}"
-        )));
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native linear_conv_value_decay_update_bf16 failed with status {status}"),
+        ));
     }
     Ok(())
 }
@@ -3417,7 +3485,8 @@ pub(crate) fn copy_d2d(
     _dst: *mut c_void,
     _bytes: usize,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native copy_d2d is not compiled".into(),
     ))
 }
@@ -3438,7 +3507,8 @@ pub(crate) fn linear_decode_apply_parts_f32(
     _initial_state: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native linear_decode_apply_parts_f32 is not compiled".into(),
     ))
 }
@@ -3461,7 +3531,8 @@ pub(crate) fn qwen_linear_prep_bf16_f32(
     _q_scaled: &mut GpuBuffer,
     _k_normed: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_prep_bf16_f32 is not compiled".into(),
     ))
 }
@@ -3481,7 +3552,8 @@ pub(crate) fn qwen_linear_prep_decode_apply_bf16_f32(
     _initial_state: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_prep_decode_apply_bf16_f32 is not compiled".into(),
     ))
 }
@@ -3501,7 +3573,8 @@ pub(crate) fn qwen_linear_decode_apply_inplace_bf16(
     _state: &mut GpuBuffer,
     _attn_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_decode_apply_inplace_bf16 is not compiled".into(),
     ))
 }
@@ -3513,7 +3586,8 @@ pub(crate) fn conv_state_update_bf16(
     _qkv: &GpuBuffer,
     _state: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native conv_state_update_bf16 is not compiled".into(),
     ))
 }
@@ -3532,7 +3606,8 @@ pub(crate) fn linear_conv_value_decay_bf16(
     _a_log_exp: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native linear_conv_value_decay_bf16 is not compiled".into(),
     ))
 }
@@ -3552,7 +3627,8 @@ pub(crate) fn linear_conv_value_decay_update_bf16(
     _a_log_exp: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native linear_conv_value_decay_update_bf16 is not compiled".into(),
     ))
 }
@@ -3566,7 +3642,8 @@ pub(crate) fn embedding_lookup_bf16(
     _indexes: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native embedding_lookup_bf16 is not compiled".into(),
     ))
 }
@@ -3581,7 +3658,8 @@ pub(crate) fn matmul_rhs_transposed_bf16(
     _rhs: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_bf16 is not compiled".into(),
     ))
 }
@@ -3594,7 +3672,8 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1(
     _rhs: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_bf16_gemv_m1 is not compiled".into(),
     ))
 }
@@ -3607,7 +3686,8 @@ pub(crate) fn matmul_rhs_transposed_bf16_gemv_m1_tiled(
     _rhs: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_bf16_gemv_m1_tiled is not compiled".into(),
     ))
 }
@@ -3623,7 +3703,8 @@ pub(crate) fn matmul_rhs_transposed_residual_bf16(
     _residual: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_residual_bf16 is not compiled".into(),
     ))
 }
@@ -3642,7 +3723,8 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16(
     _zero: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16 is not compiled".into(),
     ))
 }
@@ -3659,7 +3741,8 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1(
     _zero: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16_gemv_m1 is not compiled".into(),
     ))
 }
@@ -3676,7 +3759,8 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     _zero: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled is not compiled".into(),
     ))
 }
@@ -3691,7 +3775,8 @@ pub(crate) fn matmul_rhs_transposed_f32(
     _rhs: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native matmul_rhs_transposed_f32 is not compiled".into(),
     ))
 }
@@ -3713,7 +3798,8 @@ pub(crate) fn qwen_linear_projections_bf16(
     _a_out: &mut GpuBuffer,
     _b_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_projections_bf16 is not compiled".into(),
     ))
 }
@@ -3729,7 +3815,8 @@ pub(crate) fn qwen_mlp_gate_up_bf16(
     _gate_out: &mut GpuBuffer,
     _up_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_mlp_gate_up_bf16 is not compiled".into(),
     ))
 }
@@ -3744,7 +3831,8 @@ pub(crate) fn qwen_mlp_gate_up_swiglu_bf16(
     _up_weight: &GpuBuffer,
     _mlp_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_mlp_gate_up_swiglu_bf16 is not compiled".into(),
     ))
 }
@@ -3760,7 +3848,8 @@ pub(crate) fn qwen_mlp_down_residual_bf16(
     _residual: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_mlp_down_residual_bf16 is not compiled".into(),
     ))
 }
@@ -3779,7 +3868,8 @@ pub(crate) fn qwen_linear_out_residual_f32_bf16(
     _residual: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_out_residual_f32_bf16 is not compiled".into(),
     ))
 }
@@ -3798,7 +3888,8 @@ pub(crate) fn qwen_linear_out_residual_bf16_bf16(
     _residual: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_linear_out_residual_bf16_bf16 is not compiled".into(),
     ))
 }
@@ -3817,7 +3908,8 @@ pub(crate) fn qwen_full_projections_bf16(
     _k_out: &mut GpuBuffer,
     _v_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native qwen_full_projections_bf16 is not compiled".into(),
     ))
 }
@@ -3830,7 +3922,8 @@ pub(crate) fn lm_head_argmax_bf16(
     _in_dim: usize,
     _vocab_size: usize,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native lm_head_argmax_bf16 is not compiled".into(),
     ))
 }
@@ -3841,7 +3934,8 @@ pub(crate) fn argmax_bf16(
     _out_index: &mut GpuBuffer,
     _n: usize,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native argmax_bf16 is not compiled".into(),
     ))
 }
@@ -3860,7 +3954,8 @@ pub(crate) fn full_attention_prefill_bf16_f32(
     _value: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native full_attention_prefill_bf16_f32 is not compiled".into(),
     ))
 }
@@ -3881,7 +3976,8 @@ pub(crate) fn full_attention_prefill_strided_bf16_f32(
     _value: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native full_attention_prefill_strided_bf16_f32 is not compiled".into(),
     ))
 }
@@ -3900,7 +3996,8 @@ pub(crate) fn full_attention_decode_bf16_f32(
     _value: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native full_attention_decode_bf16_f32 is not compiled".into(),
     ))
 }
@@ -3915,7 +4012,8 @@ pub(crate) fn rms_norm_rows_bf16(
     _weight: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native rms_norm_rows_bf16 is not compiled".into(),
     ))
 }
@@ -3934,7 +4032,8 @@ pub(crate) fn rms_norm_rope_rows_bf16(
     _sin: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native rms_norm_rope_rows_bf16 is not compiled".into(),
     ))
 }
@@ -3949,7 +4048,8 @@ pub(crate) fn rms_norm_rows_f32(
     _weight: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native rms_norm_rows_f32 is not compiled".into(),
     ))
 }
@@ -3964,7 +4064,8 @@ pub(crate) fn rms_norm_gated_bf16(
     _weight: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native rms_norm_gated_bf16 is not compiled".into(),
     ))
 }
@@ -3979,7 +4080,8 @@ pub(crate) fn rms_norm_gated_f32(
     _weight: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native rms_norm_gated_f32 is not compiled".into(),
     ))
 }
@@ -3994,7 +4096,8 @@ pub(crate) fn linear_prefill_conv_pack_bf16(
     _weights: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native linear_prefill_conv_pack_bf16 is not compiled".into(),
     ))
 }
@@ -4008,7 +4111,8 @@ pub(crate) fn l2norm(
     _input: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native l2norm is not compiled".into(),
     ))
 }
@@ -4021,7 +4125,8 @@ pub(crate) fn element_add(
     _rhs: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native element_add is not compiled".into(),
     ))
 }
@@ -4034,7 +4139,8 @@ pub(crate) fn sigmoid_mul(
     _gate: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native sigmoid_mul is not compiled".into(),
     ))
 }
@@ -4046,7 +4152,8 @@ pub(crate) fn full_attention_gate_bf16(
     _gate: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native full_attention_gate_bf16 is not compiled".into(),
     ))
 }
@@ -4059,7 +4166,8 @@ pub(crate) fn swiglu_mul(
     _up: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native swiglu_mul is not compiled".into(),
     ))
 }
@@ -4072,7 +4180,10 @@ pub(crate) fn cast(
     _input: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, "metal native cast is not compiled".into()))
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native cast is not compiled".into(),
+    ))
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
@@ -4083,7 +4194,8 @@ pub(crate) fn mul_scalar(
     _input: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native mul_scalar is not compiled".into(),
     ))
 }
@@ -4097,7 +4209,8 @@ pub(crate) fn transpose_shd_hsd(
     _src: &GpuBuffer,
     _dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native transpose_shd_hsd is not compiled".into(),
     ))
 }
@@ -4114,7 +4227,8 @@ pub(crate) fn apply_rope_prefill(
     _pos_offset: usize,
     _data: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native apply_rope_prefill is not compiled".into(),
     ))
 }
@@ -4128,7 +4242,8 @@ pub(crate) fn transpose_pad_conv(
     _src: &GpuBuffer,
     _dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native transpose_pad_conv is not compiled".into(),
     ))
 }
@@ -4142,7 +4257,8 @@ pub(crate) fn extract_conv_state(
     _src: &GpuBuffer,
     _dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native extract_conv_state is not compiled".into(),
     ))
 }
@@ -4158,7 +4274,8 @@ pub(crate) fn split_qkv(
     _k: &mut GpuBuffer,
     _v: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native split_qkv is not compiled".into(),
     ))
 }
@@ -4173,7 +4290,8 @@ pub(crate) fn split_qgate(
     _query_out: &mut GpuBuffer,
     _gate_out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native split_qgate is not compiled".into(),
     ))
 }
@@ -4188,7 +4306,8 @@ pub(crate) fn repeat_interleave_heads(
     _src: &GpuBuffer,
     _dst: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native repeat_interleave_heads is not compiled".into(),
     ))
 }
@@ -4204,7 +4323,8 @@ pub(crate) fn compute_beta_g_f32(
     _beta: &mut GpuBuffer,
     _g: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native compute_beta_g_f32 is not compiled".into(),
     ))
 }
@@ -4223,7 +4343,8 @@ pub(crate) fn delta_recurrent_prefill_f32(
     _g: &GpuBuffer,
     _out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    Err(GpuError::backend(Backend::Metal, 
+    Err(GpuError::backend(
+        Backend::Metal,
         "metal native delta_recurrent_prefill_f32 is not compiled".into(),
     ))
 }

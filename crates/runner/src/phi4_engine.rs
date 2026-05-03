@@ -452,12 +452,8 @@ pub fn run_phi4(
     let layer_trace_floats = PHI4_TRACE_COMPONENTS * hidden_size + 3 * intermediate_size;
     let mut layer_trace_buf = if debug_dump_layer_trace.is_some() {
         Some(
-            GpuBuffer::zeros(
-                ordinal,
-                ScalarType::F32,
-                &[num_layers * layer_trace_floats],
-            )
-            .map_err(|e| anyhow!("alloc layer_trace_buf: {e}"))?,
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_layers * layer_trace_floats])
+                .map_err(|e| anyhow!("alloc layer_trace_buf: {e}"))?,
         )
     } else {
         None

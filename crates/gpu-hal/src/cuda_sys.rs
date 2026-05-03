@@ -4,6 +4,49 @@ pub(crate) const CUDA_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 pub(crate) const CUDA_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
 
+pub(crate) const CUDA_MEM_ACCESS_FLAGS_PROT_READ_WRITE: c_uint = 3;
+pub(crate) const CUDA_MEM_ALLOCATION_TYPE_PINNED: c_uint = 1;
+pub(crate) const CUDA_MEM_HANDLE_TYPE_NONE: c_uint = 0;
+pub(crate) const CUDA_MEM_LOCATION_TYPE_DEVICE: c_uint = 1;
+pub(crate) const CUDA_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: c_uint = 1;
+
+pub(crate) type CuDevice = c_int;
+pub(crate) type CuDevicePtr = u64;
+pub(crate) type CuMemGenericAllocationHandle = u64;
+pub(crate) type CuResult = c_int;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CuMemLocation {
+    pub type_: c_uint,
+    pub id: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CuMemAccessDesc {
+    pub location: CuMemLocation,
+    pub flags: c_uint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CuMemAllocationPropAllocFlags {
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CuMemAllocationProp {
+    pub type_: c_uint,
+    pub requested_handle_types: c_uint,
+    pub location: CuMemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub alloc_flags: CuMemAllocationPropAllocFlags,
+}
+
 #[allow(non_snake_case)]
 #[repr(C)]
 pub(crate) struct CudaDeviceProp {
@@ -125,4 +168,45 @@ unsafe extern "C" {
     pub(crate) fn cudaMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
     pub(crate) fn cudaDeviceSynchronize() -> c_int;
     pub(crate) fn cudaGetDeviceProperties(prop: *mut CudaDeviceProp, device: c_int) -> c_int;
+}
+
+#[cfg(supersonic_backend_cuda)]
+#[link(name = "cuda")]
+unsafe extern "C" {
+    pub(crate) fn cuInit(flags: c_uint) -> CuResult;
+    pub(crate) fn cuDeviceGet(device: *mut CuDevice, ordinal: c_int) -> CuResult;
+    pub(crate) fn cuMemAddressReserve(
+        ptr: *mut CuDevicePtr,
+        size: usize,
+        alignment: usize,
+        addr: CuDevicePtr,
+        flags: u64,
+    ) -> CuResult;
+    pub(crate) fn cuMemAddressFree(ptr: CuDevicePtr, size: usize) -> CuResult;
+    pub(crate) fn cuMemCreate(
+        handle: *mut CuMemGenericAllocationHandle,
+        size: usize,
+        prop: *const CuMemAllocationProp,
+        flags: u64,
+    ) -> CuResult;
+    pub(crate) fn cuMemRelease(handle: CuMemGenericAllocationHandle) -> CuResult;
+    pub(crate) fn cuMemGetAllocationGranularity(
+        granularity: *mut usize,
+        prop: *const CuMemAllocationProp,
+        option: c_uint,
+    ) -> CuResult;
+    pub(crate) fn cuMemMap(
+        ptr: CuDevicePtr,
+        size: usize,
+        offset: usize,
+        handle: CuMemGenericAllocationHandle,
+        flags: u64,
+    ) -> CuResult;
+    pub(crate) fn cuMemUnmap(ptr: CuDevicePtr, size: usize) -> CuResult;
+    pub(crate) fn cuMemSetAccess(
+        ptr: CuDevicePtr,
+        size: usize,
+        desc: *const CuMemAccessDesc,
+        count: usize,
+    ) -> CuResult;
 }

@@ -9,6 +9,7 @@ mod hip_sys;
 mod metal_sys;
 mod ops;
 mod scalar_type;
+mod vmm;
 
 pub use backend::{
     compiled_backends, current_backend, current_buffer_policy, current_memory_architecture,
@@ -19,8 +20,12 @@ pub use backend::{
 pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::GpuError;
 pub use ops::{
-    copy_d2d, copy_d2h, copy_h2d, hal_profile_reset, hal_profile_set_enabled,
-    hal_profile_snapshot, memset_zeros, query_device_info, set_device, sync, GpuEvent,
-    HalProfileEntry, HalProfileSnapshot,
+    copy_d2d, copy_d2h, copy_h2d, hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot,
+    memset_zeros, query_device_info, set_device, sync, GpuEvent, HalProfileEntry,
+    HalProfileSnapshot,
 };
 pub use scalar_type::ScalarType;
+pub use vmm::{
+    vmm_is_supported, VirtualAllocation, VirtualAllocationRole, VirtualAllocationStats,
+    VirtualArena, VirtualArenaStats, VirtualBacking, VirtualBuffer, VirtualBufferStats,
+};

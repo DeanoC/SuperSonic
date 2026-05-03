@@ -6,6 +6,7 @@ use crate::backend::Backend;
 pub enum GpuError {
     Backend { backend: Backend, message: String },
     InvalidArg(String),
+    Unsupported(String),
 }
 
 impl GpuError {
@@ -19,6 +20,7 @@ impl fmt::Display for GpuError {
         match self {
             Self::Backend { backend, message } => write!(f, "{backend} error: {message}"),
             Self::InvalidArg(msg) => write!(f, "invalid argument: {msg}"),
+            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }

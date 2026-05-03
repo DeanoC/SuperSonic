@@ -2300,17 +2300,17 @@ impl DecodeEngine {
             return Ok((out_k, out_v, prefix_len));
         }
 
-        let cache_k = ls
-            .kv_cache_k
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing K cache"))?;
-        let cache_v = ls
-            .kv_cache_v
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing V cache"))?;
-        let cap = cache_k.shape()[2];
+        let cap = ls.kv_capacity();
 
         if let (Some(scale_k), Some(scale_v)) = (ls.kv_scale_k.as_ref(), ls.kv_scale_v.as_ref()) {
+            let cache_k = ls
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing FP8 K cache"))?;
+            let cache_v = ls
+                .kv_cache_v
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing FP8 V cache"))?;
             let k_bytes = cache_k
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} fp8 K cache D2H: {e}"))?;
@@ -2343,7 +2343,45 @@ impl DecodeEngine {
             }
             out_k = f32_to_bf16_bytes_host(deq_k);
             out_v = f32_to_bf16_bytes_host(deq_v);
+        } else if ls.has_virtual_kv_cache() {
+            let packed_kv = ls
+                .virtual_kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing virtual K cache"))?;
+            let k_bytes = packed_kv
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {layer_idx} virtual BF16 K cache D2H: {e}"))?;
+            let v_bytes = if let Some(v_cache) = ls.virtual_kv_cache_v.as_ref() {
+                v_cache.to_host_bytes().map_err(|e| {
+                    anyhow::anyhow!("layer {layer_idx} virtual BF16 V cache D2H: {e}")
+                })?
+            } else {
+                k_bytes.clone()
+            };
+            let v_base = if ls.virtual_kv_cache_v.is_some() {
+                0
+            } else {
+                k_bytes.len() / 2
+            };
+            let src_head_stride = cap * head_dim * elem_bytes;
+            let dst_head_stride = prefix_len * head_dim * elem_bytes;
+            let copy_bytes = prefix_len * head_dim * elem_bytes;
+            for h in 0..num_kv_heads {
+                let src = h * src_head_stride;
+                let dst = h * dst_head_stride;
+                out_k[dst..dst + copy_bytes].copy_from_slice(&k_bytes[src..src + copy_bytes]);
+                out_v[dst..dst + copy_bytes]
+                    .copy_from_slice(&v_bytes[v_base + src..v_base + src + copy_bytes]);
+            }
         } else {
+            let cache_k = ls
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing BF16 K cache"))?;
+            let cache_v = ls
+                .kv_cache_v
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} missing BF16 V cache"))?;
             let k_bytes = cache_k
                 .to_host_bytes()
                 .map_err(|e| anyhow::anyhow!("layer {layer_idx} BF16 K cache D2H: {e}"))?;
@@ -2383,6 +2421,19 @@ impl DecodeEngine {
     ) -> Result<(Vec<u8>, Vec<u8>, usize)> {
         let state = self.state_for_batch(batch_index);
         self.assemble_full_attention_prefix_cache_bf16_host_for_state(state, layer_idx)
+    }
+
+    pub fn full_attention_prefix_cache_snapshots_bf16_host(
+        &self,
+    ) -> Result<Vec<(usize, Vec<u8>, Vec<u8>, usize)>> {
+        let mut snapshots = Vec::new();
+        for idx in 0..self.weights.config.num_hidden_layers {
+            if self.weights.config.is_full_attention(idx) {
+                let (k, v, len) = self.full_attention_prefix_cache_bf16_host(idx, 0)?;
+                snapshots.push((idx, k, v, len));
+            }
+        }
+        Ok(snapshots)
     }
 
     pub fn trace_full_attention_stages_from_hidden(
@@ -4308,6 +4359,11 @@ impl DecodeEngine {
         certified_kv_decode: Option<CertifiedKvDecodeParams>,
         mut timings: Option<&mut DecodeStageTimings>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
+        if self.state.layers[idx].has_virtual_kv_cache() {
+            anyhow::bail!(
+                "component full-attention decode for layer {idx} requires legacy dense KV buffers; disable SUPERSONIC_VMM_KV for this debug/component path"
+            );
+        }
         let hidden_dim = self.weights.config.hidden_size;
         let num_q_heads = self.weights.config.num_attention_heads;
         let num_kv_heads = self.weights.config.num_key_value_heads;
@@ -9843,11 +9899,87 @@ impl DecodeEngine {
     }
 
     pub fn set_decode_context_limit(&mut self, context_tokens: usize) {
-        self.decode_context_limit = Some(context_tokens.max(1));
+        let context_tokens = context_tokens.max(1);
+        self.decode_context_limit = Some(context_tokens);
+        self.maybe_enable_virtual_bf16_kv(context_tokens);
     }
 
     pub fn kv_fp8_enabled(&self) -> bool {
         self.kv_fp8
+    }
+
+    pub fn virtual_kv_memory_stats(&self) -> qwen35::state::VirtualKvMemoryStats {
+        self.state.virtual_kv_memory_stats()
+    }
+
+    pub fn virtual_kv_memory_stats_by_layer(
+        &self,
+    ) -> Vec<(usize, qwen35::state::VirtualKvMemoryStats)> {
+        self.state.virtual_kv_memory_stats_by_layer()
+    }
+
+    pub fn evict_virtual_kv_to_host(&mut self) -> Result<()> {
+        if std::env::var_os("SUPERSONIC_VMM_KV_RESTORE_TO_VMM").is_some() {
+            self.state
+                .evict_virtual_kv_to_host(&self.weights.config)
+                .map_err(|e| anyhow::anyhow!("evict virtual KV to host: {e}"))
+        } else {
+            let snapshots = self.full_attention_prefix_cache_snapshots_bf16_host()?;
+            self.state
+                .evict_virtual_kv_to_host_from_snapshots(&self.weights.config, snapshots)
+                .map_err(|e| anyhow::anyhow!("evict virtual KV to host: {e}"))
+        }
+    }
+
+    pub fn restore_virtual_kv_from_host(&mut self) -> Result<()> {
+        self.state
+            .restore_virtual_kv_from_host()
+            .map_err(|e| anyhow::anyhow!("restore virtual KV from host: {e}"))
+    }
+
+    pub fn restore_virtual_kv_from_host_to_vmm(&mut self) -> Result<()> {
+        self.state
+            .restore_virtual_kv_from_host_to_vmm()
+            .map_err(|e| anyhow::anyhow!("restore virtual KV from host to VMM: {e}"))
+    }
+
+    fn maybe_enable_virtual_bf16_kv(&mut self, context_tokens: usize) {
+        let env = std::env::var("SUPERSONIC_VMM_KV").ok();
+        if env.as_deref() == Some("0") {
+            return;
+        }
+        if self.kv_fp8 || self.batch_size != 1 {
+            return;
+        }
+        let backend = self.hidden_io.backend();
+        if self.use_4b_kernel {
+            if env.as_deref() == Some("1") {
+                eprintln!(
+                    "[vmm] requested by SUPERSONIC_VMM_KV=1 but backend={backend} device={} is using the 4B/component decode path, which does not support virtual KV yet; using dense KV allocator",
+                    self.ordinal
+                );
+            }
+            return;
+        }
+        if backend != gpu_hal::Backend::Hip && env.as_deref() != Some("1") {
+            return;
+        }
+        let supported = gpu_hal::vmm_is_supported(backend, self.ordinal);
+        if !supported {
+            if env.as_deref() == Some("1") {
+                eprintln!(
+                    "[vmm] requested by SUPERSONIC_VMM_KV=1 but backend={backend} device={} does not support VMM; using dense KV allocator",
+                    self.ordinal
+                );
+            }
+            return;
+        }
+        self.state
+            .enable_virtual_bf16_kv(&self.weights.config, context_tokens);
+        eprintln!(
+            "[vmm] Qwen3.5 BF16 dense KV uses reserved virtual memory for {} tokens",
+            context_tokens
+        );
     }
 
     /// Verify the engine's attn_scratch budget covers the current largest

@@ -47,9 +47,14 @@ fn round_trip_under_policy(policy: BufferPolicy, src_kind: BufferKind, dst_kind:
     let n_elems = 4096;
     let host = host_bf16_pattern(n_elems);
 
-    let src =
-        GpuBuffer::from_host_bytes_with_kind(ordinal, ScalarType::BF16, &[n_elems], &host, src_kind)
-            .expect("alloc + H2D src");
+    let src = GpuBuffer::from_host_bytes_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[n_elems],
+        &host,
+        src_kind,
+    )
+    .expect("alloc + H2D src");
     let mut dst = GpuBuffer::zeros_with_kind(ordinal, ScalarType::BF16, &[n_elems], dst_kind)
         .expect("alloc dst");
 

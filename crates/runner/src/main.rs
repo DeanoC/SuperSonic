@@ -78,8 +78,10 @@ impl Gemma4Runtime {
         match self {
             Self::Bf16(e) => {
                 if input_tokens.len() == 1 && positions.len() == 1 {
-                    Ok(e.decode_step_seq_greedy_cuda(0, input_tokens[0], positions[0])?
-                        .map(|tok| vec![tok]))
+                    Ok(
+                        e.decode_step_seq_greedy_cuda(0, input_tokens[0], positions[0])?
+                            .map(|tok| vec![tok]),
+                    )
                 } else {
                     Ok(None)
                 }
@@ -1347,7 +1349,8 @@ fn main() -> Result<()> {
                 "HIP gfx942 bring-up currently validates only BF16/INT4/FP8-runtime/KV-FP8 Qwen3.5 lanes, Qwen3.6 35B A3B INT4/FP8-runtime, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime/KV-FP8"
             );
         }
-        if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B) && !(cli.int4 || cli.fp8_runtime) {
+        if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B) && !(cli.int4 || cli.fp8_runtime)
+        {
             anyhow::bail!(
                 "HIP gfx942 Qwen3.6 35B A3B bring-up currently validates only --int4 or --fp8-runtime"
             );
@@ -1871,6 +1874,7 @@ fn main() -> Result<()> {
         cli.kv_fp8,
         cli.batch_size,
     )?;
+    engine.set_decode_context_limit(context_tokens);
     let allow_host_lm_head_rescore =
         cli.no_bake && !engine.weights().is_fp8 && !engine.weights().is_int4;
 
@@ -1955,6 +1959,137 @@ fn main() -> Result<()> {
             first,
         )
     };
+
+    let virtual_kv_stats = engine.virtual_kv_memory_stats();
+    if virtual_kv_stats.layers > 0 {
+        let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+        let pct = if virtual_kv_stats.reserved_bytes > 0 {
+            100.0 * virtual_kv_stats.resident_bytes as f64 / virtual_kv_stats.reserved_bytes as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[vmm] virtual KV logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB ({pct:.1}%) mappings={} layers={}",
+            mib(virtual_kv_stats.logical_bytes),
+            mib(virtual_kv_stats.resident_bytes),
+            mib(virtual_kv_stats.reserved_bytes),
+            virtual_kv_stats.mappings,
+            virtual_kv_stats.layers
+        );
+        if std::env::var_os("SUPERSONIC_VMM_KV_STATS").is_some() {
+            for (layer_idx, stats) in engine.virtual_kv_memory_stats_by_layer() {
+                let layer_pct = if stats.reserved_bytes > 0 {
+                    100.0 * stats.resident_bytes as f64 / stats.reserved_bytes as f64
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "[vmm] layer={layer_idx} logical={:.2}MiB logical_resident={:.2}MiB backup={:.2}MiB resident={:.2}MiB reserved={:.2}MiB ({layer_pct:.1}%) mappings={}",
+                    mib(stats.logical_bytes),
+                    mib(stats.logical_resident_bytes),
+                    mib(stats.logical_backup_bytes),
+                    mib(stats.resident_bytes),
+                    mib(stats.reserved_bytes),
+                    stats.mappings
+                );
+            }
+        }
+    }
+
+    if std::env::var_os("SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL").is_some() {
+        let before = engine.virtual_kv_memory_stats();
+        if before.layers == 0 {
+            eprintln!("[vmm] SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL set but virtual KV is inactive");
+        } else {
+            let verify_bytes = std::env::var_os("SUPERSONIC_VMM_KV_VERIFY_EVICT_BYTES").is_some();
+            let kv_before = if verify_bytes {
+                Some(engine.full_attention_prefix_cache_snapshots_bf16_host()?)
+            } else {
+                None
+            };
+            engine.evict_virtual_kv_to_host()?;
+            let evicted = engine.virtual_kv_memory_stats();
+            let mib = |bytes: usize| bytes as f64 / (1024.0 * 1024.0);
+            eprintln!(
+                "[vmm] evicted virtual KV to host logical_backup={:.2}MiB resident={:.2}MiB reserved={:.2}MiB mappings={}",
+                mib(evicted.logical_backup_bytes),
+                mib(evicted.resident_bytes),
+                mib(evicted.reserved_bytes),
+                evicted.mappings
+            );
+            if std::env::var_os("SUPERSONIC_VMM_KV_RESTORE_TO_VMM").is_some() {
+                engine.restore_virtual_kv_from_host_to_vmm()?;
+            } else {
+                engine.restore_virtual_kv_from_host()?;
+            }
+            if let Some(kv_before) = kv_before {
+                let kv_after = engine.full_attention_prefix_cache_snapshots_bf16_host()?;
+                let mut mismatch = None;
+                for (
+                    (before_layer, before_k, before_v, before_len),
+                    (after_layer, after_k, after_v, after_len),
+                ) in kv_before.iter().zip(kv_after.iter())
+                {
+                    if before_layer != after_layer || before_len != after_len {
+                        mismatch = Some(format!(
+                            "layer/id mismatch before={before_layer}:{before_len} after={after_layer}:{after_len}"
+                        ));
+                        break;
+                    }
+                    let k_diff = before_k
+                        .iter()
+                        .zip(after_k.iter())
+                        .position(|(a, b)| a != b);
+                    let v_diff = before_v
+                        .iter()
+                        .zip(after_v.iter())
+                        .position(|(a, b)| a != b);
+                    if before_k.len() != after_k.len() || before_v.len() != after_v.len() {
+                        mismatch = Some(format!(
+                            "layer={before_layer} len mismatch k {}->{} v {}->{}",
+                            before_k.len(),
+                            after_k.len(),
+                            before_v.len(),
+                            after_v.len()
+                        ));
+                        break;
+                    }
+                    if k_diff.is_some() || v_diff.is_some() {
+                        let sample = |before: &[u8], after: &[u8], diff: Option<usize>| {
+                            let start = diff.unwrap_or(0);
+                            let end = (start + 16).min(before.len()).min(after.len());
+                            format!(
+                                "before={:?} after={:?}",
+                                &before[start..end],
+                                &after[start..end]
+                            )
+                        };
+                        mismatch = Some(format!(
+                            "layer={before_layer} first_k_diff={:?} first_v_diff={:?} k_sample={} v_sample={}",
+                            k_diff,
+                            v_diff,
+                            sample(before_k, after_k, k_diff),
+                            sample(before_v, after_v, v_diff)
+                        ));
+                        break;
+                    }
+                }
+                if let Some(mismatch) = mismatch {
+                    eprintln!(
+                        "[vmm] warning: virtual KV eviction byte-restore mismatch: {mismatch}"
+                    );
+                }
+            }
+            let restored = engine.virtual_kv_memory_stats();
+            eprintln!(
+                "[vmm] restored virtual KV from host logical_resident={:.2}MiB resident={:.2}MiB reserved={:.2}MiB mappings={}",
+                mib(restored.logical_resident_bytes),
+                mib(restored.resident_bytes),
+                mib(restored.reserved_bytes),
+                restored.mappings
+            );
+        }
+    }
 
     // Optionally run oracle for validation
     let oracle_output = if cli.validate {

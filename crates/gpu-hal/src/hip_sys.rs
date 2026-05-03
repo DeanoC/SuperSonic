@@ -1,4 +1,4 @@
-use std::ffi::{c_int, c_uint, c_void};
+use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
 
 pub(crate) const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
@@ -8,10 +8,52 @@ pub(crate) const HIP_HOST_REGISTER_MAPPED: c_uint = 0x2;
 // hipHostMalloc flag bits (matching hip_runtime_api.h).
 pub(crate) const HIP_HOST_MALLOC_MAPPED: c_uint = 0x2;
 
+pub(crate) const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: c_uint = 3;
+pub(crate) const HIP_MEM_ALLOCATION_TYPE_PINNED: c_uint = 1;
+pub(crate) const HIP_MEM_HANDLE_TYPE_NONE: c_uint = 0;
+pub(crate) const HIP_MEM_LOCATION_TYPE_DEVICE: c_uint = 1;
+pub(crate) const HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED: c_uint = 1;
+pub(crate) const HIP_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: c_int = 89;
+
+pub(crate) type HipMemGenericAllocationHandle = *mut c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct HipMemLocation {
+    pub type_: c_uint,
+    pub id: c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct HipMemAccessDesc {
+    pub location: HipMemLocation,
+    pub flags: c_uint,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct HipMemAllocationPropAllocFlags {
+    pub compression_type: u8,
+    pub gpu_direct_rdma_capable: u8,
+    pub usage: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct HipMemAllocationProp {
+    pub type_: c_uint,
+    pub requested_handle_type: c_uint,
+    pub location: HipMemLocation,
+    pub win32_handle_meta_data: *mut c_void,
+    pub alloc_flags: HipMemAllocationPropAllocFlags,
+}
+
 #[link(name = "amdhip64")]
 unsafe extern "C" {
     pub(crate) fn hipGetDevice(device: *mut c_int) -> c_int;
     pub(crate) fn hipSetDevice(device: c_int) -> c_int;
+    pub(crate) fn hipDeviceGetAttribute(pi: *mut c_int, attr: c_int, device_id: c_int) -> c_int;
     pub(crate) fn hipMalloc(ptr: *mut *mut c_void, size: usize) -> c_int;
     pub(crate) fn hipFree(ptr: *mut c_void) -> c_int;
     pub(crate) fn hipHostMalloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> c_int;
@@ -28,6 +70,40 @@ unsafe extern "C" {
         kind: c_int,
     ) -> c_int;
     pub(crate) fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
+    pub(crate) fn hipMemAddressReserve(
+        ptr: *mut *mut c_void,
+        size: usize,
+        alignment: usize,
+        addr: *mut c_void,
+        flags: c_ulonglong,
+    ) -> c_int;
+    pub(crate) fn hipMemAddressFree(dev_ptr: *mut c_void, size: usize) -> c_int;
+    pub(crate) fn hipMemCreate(
+        handle: *mut HipMemGenericAllocationHandle,
+        size: usize,
+        prop: *const HipMemAllocationProp,
+        flags: c_ulonglong,
+    ) -> c_int;
+    pub(crate) fn hipMemRelease(handle: HipMemGenericAllocationHandle) -> c_int;
+    pub(crate) fn hipMemGetAllocationGranularity(
+        granularity: *mut usize,
+        prop: *const HipMemAllocationProp,
+        option: c_uint,
+    ) -> c_int;
+    pub(crate) fn hipMemMap(
+        ptr: *mut c_void,
+        size: usize,
+        offset: usize,
+        handle: HipMemGenericAllocationHandle,
+        flags: c_ulonglong,
+    ) -> c_int;
+    pub(crate) fn hipMemUnmap(ptr: *mut c_void, size: usize) -> c_int;
+    pub(crate) fn hipMemSetAccess(
+        ptr: *mut c_void,
+        size: usize,
+        desc: *const HipMemAccessDesc,
+        count: usize,
+    ) -> c_int;
     pub(crate) fn hipDeviceSynchronize() -> c_int;
     pub(crate) fn hipEventCreate(event: *mut *mut c_void) -> c_int;
     pub(crate) fn hipEventDestroy(event: *mut c_void) -> c_int;

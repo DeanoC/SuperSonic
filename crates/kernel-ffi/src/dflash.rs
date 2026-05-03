@@ -27,9 +27,16 @@ unsafe extern "C" {
 
 fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     match backend {
-        Backend::Hip => GpuError::backend(Backend::Hip, format!("{what} failed with status {status}")),
-        Backend::Cuda => GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}")),
-        Backend::Metal => GpuError::backend(Backend::Metal, format!("{what} failed with status {status}")),
+        Backend::Hip => {
+            GpuError::backend(Backend::Hip, format!("{what} failed with status {status}"))
+        }
+        Backend::Cuda => {
+            GpuError::backend(Backend::Cuda, format!("{what} failed with status {status}"))
+        }
+        Backend::Metal => GpuError::backend(
+            Backend::Metal,
+            format!("{what} failed with status {status}"),
+        ),
     }
 }
 

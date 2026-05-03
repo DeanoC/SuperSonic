@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
-use gpu_hal::{GpuBuffer, ScalarType};
+use gpu_hal::{
+    copy_h2d, sync, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
+};
 use memmap2::Mmap;
 
 use crate::manifest::{LayoutTag, Manifest, TensorMeta};
@@ -107,11 +109,84 @@ impl BakedStore {
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &meta.shape, slice)?;
         Ok(buf)
     }
+
+    /// Load a tensor into a role-tagged virtual allocation.
+    ///
+    /// This is the low-level entry point for virtual weights and MoE expert
+    /// islands: the allocation keeps a stable virtual address, exposes logical
+    /// versus page-resident accounting through `VirtualArena`, and can later be
+    /// evicted/restored by the HAL policy layer.
+    pub fn load_to_virtual_arena(
+        &self,
+        arena: &mut VirtualArena,
+        name: &str,
+        role: VirtualAllocationRole,
+    ) -> Result<usize, Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+
+        let start = meta.offset as usize;
+        let end = start + meta.byte_len as usize;
+        if end > self.data_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
+                name, meta.offset, meta.byte_len, self.data_len,
+            )));
+        }
+
+        let slice =
+            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
+        let dtype = parse_dtype(&meta.dtype)?;
+        let expected_len = meta
+            .shape
+            .iter()
+            .try_fold(dtype.size_in_bytes(), |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{}' shape {:?} overflows byte-size calculation",
+                    name, meta.shape
+                ))
+            })?;
+        if slice.len() != expected_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' manifest byte_len={} does not match dtype={} shape={:?} expected_bytes={}",
+                name,
+                slice.len(),
+                meta.dtype,
+                meta.shape,
+                expected_len,
+            )));
+        }
+        let ordinal = arena.device_ordinal();
+        let id = arena.reserve(name.to_string(), role, dtype, &meta.shape)?;
+        let allocation = arena
+            .allocation_mut(id)
+            .ok_or_else(|| Error::Other(format!("virtual allocation id {id} disappeared")))?;
+        let buffer = allocation.buffer_mut();
+        buffer.map_prefix_bytes(buffer.len_bytes())?;
+        copy_h2d(
+            ordinal,
+            buffer.as_mut_ptr(),
+            slice.as_ptr() as *const _,
+            slice.len(),
+        )?;
+        sync(ordinal)?;
+        Ok(id)
+    }
+
+    /// Convenience constructor for a virtual arena using this store's common
+    /// CPU-backup residency policy.
+    pub fn virtual_weight_arena(ordinal: usize) -> VirtualArena {
+        VirtualArena::new(ordinal, VirtualBacking::CpuBackup)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
 
     /// End-to-end loadability test against a real Qwen3.6-MoE bake.
     /// Skipped when `SUPERSONIC_QWEN36_MOE_BAKE_DIR` is unset so CI / non-bake
@@ -136,15 +211,25 @@ mod tests {
         let lm = store
             .meta("lm_head.weight")
             .expect("lm_head.weight missing");
-        assert_eq!(lm.layout, LayoutTag::Int4Quantized,
-                   "lm_head should be INT4 in this bake");
+        assert_eq!(
+            lm.layout,
+            LayoutTag::Int4Quantized,
+            "lm_head should be INT4 in this bake"
+        );
         assert_eq!(lm.shape.len(), 2, "lm_head shape should be 2D");
-        assert_eq!(lm.shape[1], 2048 / 2,
-                   "lm_head INT4 column count = hidden/2 (2 nibbles per byte)");
-        assert!(store.contains("lm_head.weight_int4_scale"),
-                "lm_head.weight_int4_scale missing");
-        assert!(store.contains("lm_head.weight_int4_zero"),
-                "lm_head.weight_int4_zero missing");
+        assert_eq!(
+            lm.shape[1],
+            2048 / 2,
+            "lm_head INT4 column count = hidden/2 (2 nibbles per byte)"
+        );
+        assert!(
+            store.contains("lm_head.weight_int4_scale"),
+            "lm_head.weight_int4_scale missing"
+        );
+        assert!(
+            store.contains("lm_head.weight_int4_zero"),
+            "lm_head.weight_int4_zero missing"
+        );
 
         // 2. Per-layer MoE expert presence. The bake must have all 40 layers
         //    of fused expert weight, each with packed nibbles + scale + zero.
@@ -154,19 +239,17 @@ mod tests {
                 let base = format!("{lp}.{kind}");
                 let scale = format!("{base}_int4_scale");
                 let zero = format!("{base}_int4_zero");
-                assert!(store.contains(&base),
-                        "missing fused expert tensor: {base}");
-                assert!(store.contains(&scale),
-                        "missing scale sidecar: {scale}");
-                assert!(store.contains(&zero),
-                        "missing zero sidecar: {zero}");
+                assert!(store.contains(&base), "missing fused expert tensor: {base}");
+                assert!(store.contains(&scale), "missing scale sidecar: {scale}");
+                assert!(store.contains(&zero), "missing zero sidecar: {zero}");
                 let m = store.meta(&base).unwrap();
-                assert_eq!(m.layout, LayoutTag::Int4Quantized,
-                           "{base} should be Int4Quantized");
-                assert_eq!(m.shape.len(), 3,
-                           "{base} should be 3D [E, rows, cols/2]");
-                assert_eq!(m.shape[0], 256,
-                           "{base} num_experts must be 256");
+                assert_eq!(
+                    m.layout,
+                    LayoutTag::Int4Quantized,
+                    "{base} should be Int4Quantized"
+                );
+                assert_eq!(m.shape.len(), 3, "{base} should be 3D [E, rows, cols/2]");
+                assert_eq!(m.shape[0], 256, "{base} num_experts must be 256");
             }
         }
 
@@ -179,7 +262,8 @@ mod tests {
                 format!("{lp}.mlp.gate.weight"),
                 format!("{lp}.mlp.shared_expert_gate.weight"),
             ] {
-                let m = store.meta(&n)
+                let m = store
+                    .meta(&n)
                     .unwrap_or_else(|| panic!("missing raw tensor: {n}"));
                 assert_eq!(m.layout, LayoutTag::Raw, "{n} should be Raw layout");
                 assert_eq!(m.dtype, "bf16", "{n} should be bf16");
@@ -193,33 +277,177 @@ mod tests {
         //     internal mmap accessor.
         let weights_path = crate::weights_bin_path(bake_dir);
         let weights_len = std::fs::metadata(&weights_path)
-            .expect("stat weights.bin").len();
+            .expect("stat weights.bin")
+            .len();
         for (name, _) in store.index.iter().take(20) {
             let m = store.meta(name).unwrap();
             let end = m.offset + m.byte_len;
-            assert!(end <= weights_len,
-                    "{name}: offset+len {end} > weights.bin len {weights_len}");
+            assert!(
+                end <= weights_len,
+                "{name}: offset+len {end} > weights.bin len {weights_len}"
+            );
             // raw_bytes() should succeed and have the right length.
-            let bytes = store.raw_bytes(name)
+            let bytes = store
+                .raw_bytes(name)
                 .unwrap_or_else(|| panic!("raw_bytes returned None for {name}"));
-            assert_eq!(bytes.len() as u64, m.byte_len,
-                       "{name}: raw_bytes length disagrees with manifest");
+            assert_eq!(
+                bytes.len() as u64,
+                m.byte_len,
+                "{name}: raw_bytes length disagrees with manifest"
+            );
         }
 
         // 5. Quick bake-quality smoke: lm_head's INT4 scale must not be all
         //    zero. A run that died mid-quant could leave us with a stub
         //    scale tensor that would silently produce zero logits.
-        let scale_bytes = store.raw_bytes("lm_head.weight_int4_scale")
+        let scale_bytes = store
+            .raw_bytes("lm_head.weight_int4_scale")
             .expect("lm_head scale bytes");
         let nonzero = scale_bytes.iter().filter(|&&b| b != 0).count();
-        assert!(nonzero > scale_bytes.len() / 4,
-                "lm_head scale looks suspicious: {nonzero}/{} bytes nonzero",
-                scale_bytes.len());
+        assert!(
+            nonzero > scale_bytes.len() / 4,
+            "lm_head scale looks suspicious: {nonzero}/{} bytes nonzero",
+            scale_bytes.len()
+        );
 
         eprintln!(
             "[bake-validate] OK — {} tensors, weights.bin {} MiB",
             store.index.len(),
             weights_len / (1024 * 1024),
         );
+    }
+
+    #[test]
+    fn virtual_arena_loads_baked_weight_and_expert_tensors() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        let weights = (0..8192)
+            .map(|idx| (idx as u8).wrapping_mul(13).wrapping_add(7))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::weights_bin_path(bake_dir), &weights).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            tensors: vec![
+                TensorMeta {
+                    name: "lm_head.weight".to_string(),
+                    shape: vec![4096],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Int4Quantized,
+                    offset: 0,
+                    byte_len: 4096,
+                },
+                TensorMeta {
+                    name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                    shape: vec![4096],
+                    dtype: "u8".to_string(),
+                    layout: LayoutTag::Int4Quantized,
+                    offset: 4096,
+                    byte_len: 4096,
+                },
+            ],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let weight_id = store
+            .load_to_virtual_arena(
+                &mut arena,
+                "lm_head.weight",
+                gpu_hal::VirtualAllocationRole::Weights,
+            )
+            .expect("load virtual weight");
+        let expert_id = store
+            .load_to_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("load virtual expert");
+
+        let stats = arena.stats();
+        assert_eq!(stats.allocations, 2);
+        assert_eq!(stats.logical_bytes, 8192);
+        assert_eq!(stats.logical_resident_bytes, 8192);
+        assert!(stats.resident_bytes >= stats.logical_resident_bytes);
+
+        let weight = arena
+            .allocation(weight_id)
+            .expect("weight allocation")
+            .buffer()
+            .to_host_bytes()
+            .expect("read virtual weight");
+        let expert = arena
+            .allocation(expert_id)
+            .expect("expert allocation")
+            .buffer()
+            .to_host_bytes()
+            .expect("read virtual expert");
+        assert_eq!(weight, weights[..4096]);
+        assert_eq!(expert, weights[4096..]);
+    }
+
+    #[test]
+    fn virtual_arena_rejects_manifest_byte_len_mismatch() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        std::fs::write(crate::weights_bin_path(bake_dir), vec![0u8; 4]).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            tensors: vec![TensorMeta {
+                name: "bad.weight".to_string(),
+                shape: vec![2],
+                dtype: "bf16".to_string(),
+                layout: LayoutTag::Raw,
+                offset: 0,
+                byte_len: 2,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let err = store
+            .load_to_virtual_arena(
+                &mut arena,
+                "bad.weight",
+                gpu_hal::VirtualAllocationRole::Weights,
+            )
+            .expect_err("byte length mismatch should be rejected");
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(arena.stats().allocations, 0);
     }
 }

@@ -25,8 +25,8 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2d, copy_d2h, GpuBuffer, ScalarType};
 use kernel_ffi::qwen36_moe::{
     attn_step_launch, ffn_step_launch, lm_head_launch, mtp_pre_fusion_launch,
-    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights,
-    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
 
 use crate::qwen36_moe_decode::{
@@ -101,12 +101,8 @@ pub fn alloc_mtp_forward_scratch(
     } else {
         0
     };
-    let attn_output = GpuBuffer::zeros(
-        ordinal,
-        ScalarType::BF16,
-        &[full_attn_output_elems(geom)],
-    )
-    .context("alloc mtp attn_output")?;
+    let attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[full_attn_output_elems(geom)])
+        .context("alloc mtp attn_output")?;
     let attn_workspace = GpuBuffer::zeros(
         ordinal,
         ScalarType::F32,
@@ -119,18 +115,14 @@ pub fn alloc_mtp_forward_scratch(
         .context("alloc mtp ffn_output")?;
     let ffn_output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
         .context("alloc mtp ffn_output_idx")?;
-    let ffn_workspace = GpuBuffer::zeros(
-        ordinal,
-        ScalarType::F32,
-        &[ffn_workspace_floats(geom)],
-    )
-    .context("alloc mtp ffn_workspace")?;
-    let sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
-        .context("alloc mtp sync_buf")?;
+    let ffn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+        .context("alloc mtp ffn_workspace")?;
+    let sync_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc mtp sync_buf")?;
     let logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
         .context("alloc mtp logits")?;
-    let lm_head_counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-        .context("alloc mtp lm_head_counter")?;
+    let lm_head_counter =
+        GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).context("alloc mtp lm_head_counter")?;
 
     Ok(MtpForwardScratch {
         attn_output,
@@ -190,13 +182,15 @@ pub fn run_mtp_layer_step(
     // but for `cache_pos > 0` it makes every draft step attend only to
     // itself instead of accumulated prior K/V. Reject up front rather
     // than ship a silent correctness bug.
-    let kv = mtp.kv_cache.as_mut().ok_or_else(|| anyhow!(
-        "run_mtp_layer_step: MtpLayerBuffers.kv_cache is None — MTP \
+    let kv = mtp.kv_cache.as_mut().ok_or_else(|| {
+        anyhow!(
+            "run_mtp_layer_step: MtpLayerBuffers.kv_cache is None — MTP \
          self-attention requires an allocated cache. Construct the \
          buffers via `load_mtp_buffers(..., kv_max_t > 0)` (Phase 6.2b \
          loader); without it the kernel falls back to kv_len=1 which \
          produces wrong outputs for any `cache_pos > 0`."
-    ))?;
+        )
+    })?;
     if cache_pos >= kv.kv_max_t {
         return Err(anyhow!(
             "run_mtp_layer_step: cache_pos {cache_pos} ≥ kv_max_t {} — \
@@ -208,8 +202,7 @@ pub fn run_mtp_layer_step(
     let hidden = geom.hidden as usize;
 
     // ---- attention ----------------------------------------------------
-    reset_sync_buf(ordinal, &mut scratch.sync_buf)
-        .context("reset sync_buf (mtp attn)")?;
+    reset_sync_buf(ordinal, &mut scratch.sync_buf).context("reset sync_buf (mtp attn)")?;
     let kv_k_ptr = kv.k.as_mut_ptr();
     let kv_v_ptr = kv.v.as_mut_ptr();
     let kv_max_t = kv.kv_max_t;
@@ -267,8 +260,7 @@ pub fn run_mtp_layer_step(
     .context("mtp d2d attn_output -> attn_residual")?;
 
     // ---- FFN ----------------------------------------------------------
-    reset_sync_buf(ordinal, &mut scratch.sync_buf)
-        .context("reset sync_buf (mtp ffn)")?;
+    reset_sync_buf(ordinal, &mut scratch.sync_buf).context("reset sync_buf (mtp ffn)")?;
     let ffn_params = Qwen36MoeFfnStepParams {
         stage: 5,
         hidden: geom.hidden,
@@ -475,18 +467,19 @@ pub struct MtpChainScratch {
 }
 
 /// Allocate a fresh chain scratch sized for `geom`.
-pub fn alloc_mtp_chain_scratch(
-    ordinal: usize,
-    geom: &MultiLayerGeom,
-) -> Result<MtpChainScratch> {
+pub fn alloc_mtp_chain_scratch(ordinal: usize, geom: &MultiLayerGeom) -> Result<MtpChainScratch> {
     let h = geom.hidden as usize;
     Ok(MtpChainScratch {
         e_in: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain e_in")?,
-        fused: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain fused")?,
-        e_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain e_norm")?,
-        h_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain h_norm")?,
+        fused: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h])
+            .context("alloc mtp chain fused")?,
+        e_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h])
+            .context("alloc mtp chain e_norm")?,
+        h_norm: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h])
+            .context("alloc mtp chain h_norm")?,
         out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain out")?,
-        h_post: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h]).context("alloc mtp chain h_post")?,
+        h_post: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h])
+            .context("alloc mtp chain h_post")?,
     })
 }
 
@@ -567,16 +560,9 @@ pub fn run_mtp_draft_chain(
             ));
         }
         let row_offset_bytes = (next_token_id as usize) * hidden * 2;
-        let src = unsafe {
-            (embed_w_buf.as_ptr() as *const u8).add(row_offset_bytes) as *const _
-        };
-        copy_d2d(
-            ordinal,
-            chain_scratch.e_in.as_mut_ptr(),
-            src,
-            hidden * 2,
-        )
-        .with_context(|| format!("mtp chain step {k}: embed lookup"))?;
+        let src = unsafe { (embed_w_buf.as_ptr() as *const u8).add(row_offset_bytes) as *const _ };
+        copy_d2d(ordinal, chain_scratch.e_in.as_mut_ptr(), src, hidden * 2)
+            .with_context(|| format!("mtp chain step {k}: embed lookup"))?;
 
         // 2. Pre-fusion: e_norm + h_norm + mtp.fc → fused. Reads h_post
         //    (carrying the previous step's recurrent state, or h_base_in
