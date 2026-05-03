@@ -113,6 +113,15 @@ __device__ inline void qwen36_moe_attn_step_device(
     (void)rotary_dim;
     (void)rope_theta;
     // `position` is now read in Phase G when KV cache is enabled.
+    // KV-FP8 sidecar params are wired through but unused until Tasks 6/7
+    // add the FP8 quant/dequant logic. Suppress unused-parameter warnings
+    // so a future -Wall flag during Task 6 development doesn't drown in
+    // pre-existing noise.
+    (void)kv_scale_k;
+    (void)kv_scale_v;
+    (void)kv_shadow_k;
+    (void)kv_shadow_v;
+    (void)kv_shadow_start;
 
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
