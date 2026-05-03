@@ -173,6 +173,32 @@ impl Default for Qwen36MoeInt4ScaleDesc {
     }
 }
 
+/// Per-layer KV cache FP8 scale pointers for Qwen3.6-MoE.
+///
+/// Parallel struct to [`Qwen36MoeDecodeLayerDesc`] — one entry per layer.
+/// Linear-attention layers leave both pointers null. When KV-FP8 is off,
+/// the entire `*const Qwen36MoeKVCacheFp8Desc` array argument is null.
+///
+/// Mirrors the qwen35 `KVCacheFp8Desc` shape: F32 absmax scale per
+/// (kv_head, position).
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Qwen36MoeKVCacheFp8Desc {
+    /// `[num_kv_heads, kv_max_t]` F32. Null for linear-attn layers.
+    pub kv_scale_k: *mut c_void,
+    /// `[num_kv_heads, kv_max_t]` F32. Null for linear-attn layers.
+    pub kv_scale_v: *mut c_void,
+}
+
+unsafe impl Send for Qwen36MoeKVCacheFp8Desc {}
+unsafe impl Sync for Qwen36MoeKVCacheFp8Desc {}
+
+impl Default for Qwen36MoeKVCacheFp8Desc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
 /// Per-sequence batched-decode state, parallel to the layer descriptor
 /// array. Only the first `batch_size` slots are read.
 #[repr(C)]
