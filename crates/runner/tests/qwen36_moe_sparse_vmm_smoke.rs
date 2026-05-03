@@ -56,6 +56,7 @@ fn run_qwen36_moe(
         .env("SUPERSONIC_VMM_MOE_ISLANDS", "1")
         .env_remove("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS")
         .env_remove("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON")
+        .env_remove("SUPERSONIC_VMM_KV")
         .args([
             "--backend",
             "hip",
@@ -171,6 +172,30 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
         summary["peak_resident_bytes"].as_u64().unwrap()
             < summary["reserved_bytes"].as_u64().unwrap(),
         "sparse resident bytes should stay below full VA reservation: {summary:?}"
+    );
+    let moe_resident = summary["moe_resident_bytes"]
+        .as_u64()
+        .expect("sparse telemetry summary should report MoE resident bytes");
+    let kv_resident = summary["kv_resident_bytes"]
+        .as_u64()
+        .expect("sparse telemetry summary should report KV resident bytes");
+    let total_resident = summary["total_vmm_resident_bytes"]
+        .as_u64()
+        .expect("sparse telemetry summary should report total VMM resident bytes");
+    assert!(
+        summary["kv_layers"].as_u64().unwrap() > 0 && kv_resident > 0,
+        "HIP sparse smoke should exercise Qwen3.6 KV VMM accounting: {summary:?}"
+    );
+    assert_eq!(
+        total_resident,
+        moe_resident + kv_resident,
+        "total VMM resident bytes should include MoE and KV residents: {summary:?}"
+    );
+    assert_eq!(
+        summary["total_vmm_reserved_bytes"].as_u64().unwrap(),
+        summary["moe_reserved_bytes"].as_u64().unwrap()
+            + summary["kv_reserved_bytes"].as_u64().unwrap(),
+        "total VMM reserved bytes should include MoE and KV reservations: {summary:?}"
     );
     assert!(
         summary["misses"].as_u64().unwrap() > 0 && summary["uploaded_bytes"].as_u64().unwrap() > 0,

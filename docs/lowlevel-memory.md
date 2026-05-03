@@ -75,9 +75,11 @@ Current scope:
   MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
   uploads, evictions, resident slices, resident pages, page-backed slice count,
   resident physical bytes, the active sparse decode path
-  (`segmented_persistent` or `chained`), plus summary peaks. This is intended
-  for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts instead
-  of relying on one-token smoke numbers.
+  (`segmented_persistent` or `chained`), plus summary peaks. The summary also
+  reports MoE-only, KV-only, and total VMM logical/resident/reserved bytes so
+  benchmark scripts can measure resident VRAM without scraping stderr. This is
+  intended for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts
+  instead of relying on one-token smoke numbers.
 - On the HIP/gfx1100 validation machine, page-budgeted sparse MoE passed the
   two-token Qwen3.6-MoE smoke at the default 256-expert cap, the smallest
   top-k-sized 8-expert cap, and a 320-expert cap (`640` resident VMM pages).
