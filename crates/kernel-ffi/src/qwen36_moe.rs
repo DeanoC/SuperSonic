@@ -778,6 +778,7 @@ pub fn persistent_decode_launch(
     position: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
+    kv_fp8_descs_device: Option<&GpuBuffer>,
     num_layers: usize,
     hidden_ping: &mut GpuBuffer,
     hidden_pong: &mut GpuBuffer,
@@ -797,6 +798,9 @@ pub fn persistent_decode_launch(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
     let int4_ptr: *const Qwen36MoeInt4ScaleDesc = int4_scales_device
         .map(|b| b.as_ptr() as *const Qwen36MoeInt4ScaleDesc)
+        .unwrap_or(std::ptr::null());
+    let kv_fp8_ptr: *const Qwen36MoeKVCacheFp8Desc = kv_fp8_descs_device
+        .map(|b| b.as_ptr() as *const Qwen36MoeKVCacheFp8Desc)
         .unwrap_or(std::ptr::null());
 
     // Fold pointers default to null; the kernel skips the lm_head phase
@@ -821,7 +825,7 @@ pub fn persistent_decode_launch(
                     num_layers as c_int,
                     layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
                     int4_ptr,
-                    std::ptr::null::<Qwen36MoeKVCacheFp8Desc>(),
+                    kv_fp8_ptr,
                     geom.hidden,
                     geom.num_heads,
                     geom.num_kv_heads,

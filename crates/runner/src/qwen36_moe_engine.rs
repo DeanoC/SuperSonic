@@ -152,11 +152,20 @@ pub fn run_qwen36_moe_dry_run(
     let checkpoint = CheckpointAccount::from_config(&config.text_config);
     let int4_projected_bytes = checkpoint.project_int4_total_bytes(&config.text_config, 128);
 
-    // The 4th arg is the FP8 KV BF16 sidecar window. Task 11 will replace
-    // this `None` with the env-var-derived window once `--kv-fp8` is gated
-    // through the engine; until then we accept the smaller (no-sidecar)
-    // VRAM estimate.
-    let layout = StateLayout::new(context_size, batch_size, kv_fp8, None);
+    // The sidecar window is consulted only when --kv-fp8 is on AND the
+    // env-var helper is enabled. v1 forces the runtime allocation to
+    // window=kv_max_t (matches the kernel hard-coding); the env helper
+    // would only matter for VRAM accounting if the kernel grew a
+    // kv_shadow_window arg later.
+    let sidecar_window = if kv_fp8
+        && qwen35::state::kv_fp8_bf16_sidecar_enabled()
+    {
+        Some(qwen35::state::kv_fp8_bf16_sidecar_window_tokens()
+            .unwrap_or(context_size))
+    } else {
+        None
+    };
+    let layout = StateLayout::new(context_size, batch_size, kv_fp8, sidecar_window);
     let state = StateAccount::from_config(&config.text_config, layout);
 
     let bake = inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal);
@@ -770,6 +779,14 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
     } else {
         (max_new, ContextSizeSource::MaxNewTokensOnly)
     };
+    if cli.kv_fp8 && cli.no_persistent_decode {
+        anyhow::bail!(
+            "--kv-fp8 for Qwen3.6-35B-A3B requires the persistent megakernel; \
+             remove --no-persistent-decode (persistent is on by default). The \
+             back-compat step kernels stay BF16-KV."
+        );
+    }
+
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
         entry,
@@ -844,6 +861,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         // back-compat); `--no-persistent-decode` is the documented
         // opt-out for A/B comparison or bisecting megakernel regressions.
         !cli.no_persistent_decode,
+        cli.kv_fp8,
     )?;
     Ok(())
 }
@@ -1608,6 +1626,7 @@ fn decode_text(
     fp8_runtime: bool,
     batched_spec_verify: bool,
     persistent_decode: bool,
+    kv_fp8: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1757,7 +1776,7 @@ fn decode_text(
             weight_prefix,
             weight_mode,
             kv_max_t,
-            false, // Task 11 will switch to cli.kv_fp8
+            kv_fp8,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
@@ -2084,6 +2103,24 @@ fn decode_text(
         };
         let t_chain_step = t1.elapsed();
         position += 1;
+
+        // Advance the KV-FP8 sidecar shadow cursor on the first step that
+        // lands in the persistent path. Sidecar window is forced equal to
+        // kv_max_t in v1 (full sidecar) — once the first position lands,
+        // kv_shadow_start stays at 0 forever. A future windowed-mode kernel
+        // arg would advance this cursor as old positions roll out of the window.
+        if persistent_scratch.is_some() {
+            for layer in layers.iter_mut() {
+                if let AttnLayerBuffers::Full {
+                    kv_cache: Some(c), ..
+                } = &mut layer.attn
+                {
+                    if c.kv_shadow_k.is_some() && c.kv_shadow_start < 0 {
+                        c.kv_shadow_start = 0;
+                    }
+                }
+            }
+        }
 
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {
@@ -2607,7 +2644,7 @@ fn load_lm_head_bf16(
 /// callable so the path stays exercised. Currently unused but documents the
 /// minimal one-step decode shape.
 #[allow(dead_code)]
-fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
+fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> Result<u32> {
     let weight_prefix = report.kernel_params.weight_prefix;
 
     // Pick the bake. INT4 is the realistic path on 24 GiB VRAM.
@@ -2665,7 +2702,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             weight_prefix,
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
-            false, // Task 11 will switch to cli.kv_fp8
+            kv_fp8,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
