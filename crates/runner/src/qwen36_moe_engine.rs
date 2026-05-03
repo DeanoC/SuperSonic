@@ -1086,6 +1086,8 @@ struct MoeSparseTelemetry {
     dump_path: Option<PathBuf>,
     steps: Vec<serde_json::Value>,
     peak_resident_slices: usize,
+    peak_resident_pages: usize,
+    peak_page_backed_slices: usize,
     peak_resident_bytes: usize,
     peak_logical_resident_bytes: usize,
 }
@@ -1100,6 +1102,8 @@ impl MoeSparseTelemetry {
             dump_path,
             steps: Vec::new(),
             peak_resident_slices: 0,
+            peak_resident_pages: 0,
+            peak_page_backed_slices: 0,
             peak_resident_bytes: 0,
             peak_logical_resident_bytes: 0,
         }))
@@ -1114,6 +1118,10 @@ impl MoeSparseTelemetry {
         after: MoeSparseTelemetrySnapshot,
     ) {
         self.peak_resident_slices = self.peak_resident_slices.max(after.stats.resident_slices);
+        self.peak_resident_pages = self.peak_resident_pages.max(after.stats.resident_pages);
+        self.peak_page_backed_slices = self
+            .peak_page_backed_slices
+            .max(after.stats.page_backed_slices);
         self.peak_resident_bytes = self.peak_resident_bytes.max(after.arena.resident_bytes);
         self.peak_logical_resident_bytes = self
             .peak_logical_resident_bytes
@@ -1130,12 +1138,17 @@ impl MoeSparseTelemetry {
             "delta": {
                 "hits": after.stats.hits.saturating_sub(before.stats.hits),
                 "misses": after.stats.misses.saturating_sub(before.stats.misses),
+                "page_hits": after.stats.page_hits.saturating_sub(before.stats.page_hits),
+                "page_misses": after.stats.page_misses.saturating_sub(before.stats.page_misses),
                 "evicted_slices": after.stats.evicted_slices.saturating_sub(before.stats.evicted_slices),
+                "evicted_pages": after.stats.evicted_pages.saturating_sub(before.stats.evicted_pages),
                 "uploaded_bytes": after.stats.uploaded_bytes.saturating_sub(before.stats.uploaded_bytes),
                 "unmapped_bytes": after.stats.unmapped_bytes.saturating_sub(before.stats.unmapped_bytes),
             },
             "resident": {
                 "slices": after.stats.resident_slices,
+                "pages": after.stats.resident_pages,
+                "page_backed_slices": after.stats.page_backed_slices,
                 "logical_bytes": after.arena.logical_resident_bytes,
                 "physical_bytes": after.arena.resident_bytes,
                 "mappings": after.arena.mapping_count,
@@ -1143,7 +1156,10 @@ impl MoeSparseTelemetry {
             "cumulative": {
                 "hits": after.stats.hits,
                 "misses": after.stats.misses,
+                "page_hits": after.stats.page_hits,
+                "page_misses": after.stats.page_misses,
                 "evicted_slices": after.stats.evicted_slices,
+                "evicted_pages": after.stats.evicted_pages,
                 "uploaded_bytes": after.stats.uploaded_bytes,
                 "unmapped_bytes": after.stats.unmapped_bytes,
             }
@@ -1159,15 +1175,23 @@ impl MoeSparseTelemetry {
             "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
             "summary": {
                 "registered_tensors": final_snapshot.stats.registered_tensors,
+                "max_resident_pages": manager.max_resident_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
+                "final_resident_pages": final_snapshot.stats.resident_pages,
+                "final_page_backed_slices": final_snapshot.stats.page_backed_slices,
                 "peak_resident_slices": self.peak_resident_slices,
+                "peak_resident_pages": self.peak_resident_pages,
+                "peak_page_backed_slices": self.peak_page_backed_slices,
                 "peak_resident_bytes": self.peak_resident_bytes,
                 "peak_logical_resident_bytes": self.peak_logical_resident_bytes,
                 "reserved_bytes": final_snapshot.arena.reserved_bytes,
                 "logical_bytes": final_snapshot.arena.logical_bytes,
                 "hits": final_snapshot.stats.hits,
                 "misses": final_snapshot.stats.misses,
+                "page_hits": final_snapshot.stats.page_hits,
+                "page_misses": final_snapshot.stats.page_misses,
                 "evicted_slices": final_snapshot.stats.evicted_slices,
+                "evicted_pages": final_snapshot.stats.evicted_pages,
                 "uploaded_bytes": final_snapshot.stats.uploaded_bytes,
                 "unmapped_bytes": final_snapshot.stats.unmapped_bytes,
             },
@@ -1981,10 +2005,7 @@ fn decode_text(
         if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, backend, weight_mode, ordinal)? {
             unreachable!("forced VMM expert check should either return true or error");
         }
-        let max_resident_slices = cap_experts
-            .checked_mul(2)
-            .ok_or_else(|| anyhow!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS overflows slice cap"))?;
-        let config = MoeExpertResidencyConfig::new(max_resident_slices)?;
+        let config = MoeExpertResidencyConfig::new(1)?;
         let mut manager = MoeExpertResidencyManager::new(ordinal, config);
         let layers = load_all_layer_buffers(
             &store,
@@ -1998,14 +2019,20 @@ fn decode_text(
             Some(&mut manager),
         )
         .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
+        let max_resident_pages = manager
+            .page_budget_for_routed_experts(cap_experts)
+            .context("derive sparse MoE page budget from routed expert tensor layout")?;
+        manager
+            .set_max_resident_pages(max_resident_pages)
+            .context("apply sparse MoE page budget")?;
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
             "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_slices={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
             backend,
             residency_stats.registered_tensors,
-            max_resident_slices,
+            max_resident_pages,
             arena_stats.logical_bytes as f64 / MIB,
             arena_stats.resident_bytes as f64 / MIB,
             arena_stats.reserved_bytes as f64 / MIB,
@@ -2883,13 +2910,21 @@ fn decode_text(
         if let Some(telemetry) = moe_sparse_telemetry.as_ref() {
             println!(
                 "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
-                 hits={} misses={} evicted_slices={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 resident_pages={} peak_pages={} page_backed_slices={} \
+                 hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
+                 uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB",
                 residency.resident_slices,
                 telemetry.peak_resident_slices,
+                residency.resident_pages,
+                telemetry.peak_resident_pages,
+                residency.page_backed_slices,
                 residency.hits,
                 residency.misses,
+                residency.page_hits,
+                residency.page_misses,
                 residency.evicted_slices,
+                residency.evicted_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
@@ -2899,12 +2934,19 @@ fn decode_text(
             telemetry.write_json(manager, &generated_ids)?;
         } else {
             println!(
-                "  [vmm] MoE island residency: resident_slices={} hits={} misses={} \
-                 evicted_slices={} uploaded={:.2}MiB unmapped={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
+                 page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
+                 evicted_slices={} evicted_pages={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 resident={:.2}MiB reserved={:.2}MiB",
                 residency.resident_slices,
+                residency.resident_pages,
+                residency.page_backed_slices,
                 residency.hits,
                 residency.misses,
+                residency.page_hits,
+                residency.page_misses,
                 residency.evicted_slices,
+                residency.evicted_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
