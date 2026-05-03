@@ -1810,13 +1810,37 @@ fn decode_text(
         // the wall-clock around this call stays correct either way
         // because `run_chained_decode_fast` ends with a D2H copy that
         // implicitly drains the queue.
+        // Phase 3f: on generation steps when the persistent path is
+        // active, fold final RMSnorm + lm_head GEMV into the
+        // megakernel — saves the separate `lm_head_launch` (one launch
+        // + ~30 µs) and the H2D round-trip that staged final_hidden
+        // into final_hidden_buf. The host then D2Hs `logits_buf`
+        // directly. On prefill steps logits aren't needed; on the
+        // chained path the explicit lm_head_launch path stays.
+        let is_gen_step = step + 1 >= prompt_ids.len();
+        let fold = if is_gen_step {
+            Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
+                final_norm_w: &final_norm_w_buf,
+                lm_head_w: &lm_head_w_buf,
+                logits_out: &mut logits_buf,
+                vocab: geom.vocab,
+            })
+        } else {
+            None
+        };
+        let lm_head_folded;
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
+            lm_head_folded = fold.is_some();
             scratch
-                .run(ordinal, &initial_hidden, position)
+                .run(ordinal, &initial_hidden, position, fold)
                 .with_context(|| {
                     format!("persistent decode (step {step}, position {position})")
                 })?
         } else {
+            // Chained path doesn't support the fold; lm_head still
+            // launches separately below on gen steps.
+            lm_head_folded = false;
+            drop(fold);
             run_chained_decode_fast(
                 ordinal,
                 &geom,
@@ -1846,33 +1870,34 @@ fn decode_text(
             );
         }
 
-        // Generation step: final_norm + lm_head GEMV on the GPU
-        // (`kernel_ffi::qwen36_moe::lm_head_launch`). H2D the freshly
-        // produced final_hidden into the persistent `final_hidden_buf`
-        // — `run_chained_decode` already D2H'd it for diagnostics; the
-        // re-upload is ~4 KB, microseconds at PCIe Gen4 speeds — then
-        // launch the kernel + D2H the BF16 logits.
+        // Generation step: when the megakernel didn't fold lm_head
+        // (chained path), launch the standalone final RMSnorm +
+        // lm_head GEMV here. When folded (persistent + gen), skip the
+        // launch — `logits_buf` is already populated by the
+        // megakernel.
         let t2 = std::time::Instant::now();
-        gpu_hal::copy_h2d(
-            ordinal,
-            final_hidden_buf.as_mut_ptr(),
-            outputs.final_hidden_bytes.as_ptr() as *const _,
-            outputs.final_hidden_bytes.len(),
-        )
-        .context("h2d final_hidden -> final_hidden_buf")?;
-        kernel_ffi::qwen36_moe::lm_head_launch(
-            ordinal,
-            geom.hidden,
-            geom.vocab,
-            geom.rms_norm_eps,
-            &final_hidden_buf,
-            &final_norm_w_buf,
-            &lm_head_w_buf,
-            &mut logits_buf,
-            None, // base decode doesn't capture h_post — that's MTP-only
-            &mut counter_buf,
-        )
-        .context("gpu lm_head launch")?;
+        if !lm_head_folded {
+            gpu_hal::copy_h2d(
+                ordinal,
+                final_hidden_buf.as_mut_ptr(),
+                outputs.final_hidden_bytes.as_ptr() as *const _,
+                outputs.final_hidden_bytes.len(),
+            )
+            .context("h2d final_hidden -> final_hidden_buf")?;
+            kernel_ffi::qwen36_moe::lm_head_launch(
+                ordinal,
+                geom.hidden,
+                geom.vocab,
+                geom.rms_norm_eps,
+                &final_hidden_buf,
+                &final_norm_w_buf,
+                &lm_head_w_buf,
+                &mut logits_buf,
+                None, // base decode doesn't capture h_post — that's MTP-only
+                &mut counter_buf,
+            )
+            .context("gpu lm_head launch")?;
+        }
         let logits = logits_buf
             .to_host_bytes()
             .context("d2h logits from GPU lm_head")?;
@@ -2006,7 +2031,7 @@ fn decode_text(
                             let t_chain_start = std::time::Instant::now();
                             let chain_outputs =
                                 if let Some(scratch) = persistent_scratch.as_mut() {
-                                    scratch.run(ordinal, &initial_hidden, pos)?
+                                    scratch.run(ordinal, &initial_hidden, pos, None)?
                                 } else {
                                     run_chained_decode_fast(
                                         ordinal,
@@ -2097,7 +2122,7 @@ fn decode_text(
                         t_embed += t_embed_start.elapsed();
                         let t_chain_start = std::time::Instant::now();
                         let replay_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos)?
+                            scratch.run(ordinal, &initial_hidden, pos, None)?
                         } else {
                             run_chained_decode_fast(
                                 ordinal,
@@ -2153,7 +2178,7 @@ fn decode_text(
 
                         let t_chain_start = std::time::Instant::now();
                         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos)?
+                            scratch.run(ordinal, &initial_hidden, pos, None)?
                         } else {
                             run_chained_decode_fast(
                                 ordinal,

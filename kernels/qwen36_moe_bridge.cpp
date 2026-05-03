@@ -1067,6 +1067,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     int           moe_intermediate,
     int           shared_intermediate,
     int           top_k,
+    int           vocab,                  // 0 ⇒ skip lm_head fold (prefill)
     float         rope_theta,
     float         rms_norm_eps,
     int           position,
@@ -1074,6 +1075,13 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     void*         hidden_pong,
     float*        workspace,
     int*          ffn_topk_idx_scratch,
+    // Phase 3f folded final RMSnorm + lm_head GEMV. All three are
+    // device pointers; nullptr triple ⇒ skip the fold (prefill steps).
+    // The engine sets these on gen steps; production logits then come
+    // out of the megakernel directly with no separate launch.
+    const void*   final_norm_w,           // [hidden] BF16, nullable
+    const void*   lm_head_w,              // [vocab, hidden] BF16, nullable
+    void*         logits_out,             // [vocab] BF16, nullable
     unsigned int* counters,
     unsigned int* barrier_counter,
     unsigned int* barrier_flag) {
@@ -1097,6 +1105,15 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
         barrier_flag == nullptr) {
         return 138;
     }
+    // Phase 3f lm_head fold: either all three buffers + vocab>0
+    // (engine wants logits) or all four off (prefill / fold-disabled).
+    // Mixed state would silently skip lm_head while pretending to do
+    // it — reject up front so the caller catches the misuse.
+    const bool lm_head_on = (final_norm_w != nullptr) || (lm_head_w != nullptr) ||
+                            (logits_out != nullptr) || (vocab > 0);
+    const bool lm_head_complete = (final_norm_w != nullptr) && (lm_head_w != nullptr) &&
+                                  (logits_out != nullptr) && (vocab > 0);
+    if (lm_head_on && !lm_head_complete) return 139;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -1118,15 +1135,28 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     const size_t lds_bytes =
         static_cast<size_t>(hidden + block_size) * sizeof(float);
 
-    // WMMA gate. Full-attn / linear-attn / ffn phase headers all gate
-    // their WMMA paths individually on `*_scale != nullptr` plus
-    // `int4_group_size > 0`. The kernel-level template parameter
-    // `USE_WMMA` only enables that path; per-tensor BF16 still falls
-    // through to the scalar reduction. So the gate just asks "is this
-    // device WMMA-capable, and is INT4 quant in play anywhere".
+    // WMMA gate. Two phase classes have different requirements here:
+    //
+    //  * Layer phases (full_attn / linear_attn / ffn) self-gate the
+    //    WMMA tile path on per-tensor `*_scale != nullptr` — only INT4
+    //    weights need the dequant-to-LDS WMMA pattern; BF16 weights
+    //    fall through to the scalar reduction inside the same template.
+    //    Setting `USE_WMMA=true` on a pure-BF16 model produces
+    //    identical output to `USE_WMMA=false` (extra branches compile
+    //    in but never fire at runtime).
+    //
+    //  * Phase 3f folded lm_head uses BF16 weights directly (the
+    //    engine pre-dequants INT4 lm_head to BF16 at startup) — its
+    //    WMMA path runs unconditionally when the template parameter
+    //    is true, regardless of `int4_scales`.
+    //
+    // Pre-3f the bridge AND'd `int4_scales != nullptr` into the gate,
+    // mirroring "INT4 in play anywhere" semantics. After 3f that
+    // would force BF16-only models onto the scalar lm_head fallback
+    // even on WMMA-capable hardware (Codex P1 review on PR #140), so
+    // the gate now asks only "is the device WMMA-capable".
     const bool use_wmma =
-        device_supports_wmma_bf16(static_cast<int>(device_ordinal)) &&
-        (int4_scales != nullptr);
+        device_supports_wmma_bf16(static_cast<int>(device_ordinal));
 
     if (use_wmma) {
         hipLaunchKernelGGL(
@@ -1138,10 +1168,13 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
-            rope_theta, rms_norm_eps, position,
+            vocab, rope_theta, rms_norm_eps, position,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
             counters, barrier_counter, barrier_flag);
     } else {
         hipLaunchKernelGGL(
@@ -1153,10 +1186,13 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
-            rope_theta, rms_norm_eps, position,
+            vocab, rope_theta, rms_norm_eps, position,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,
+            static_cast<const hip_bfloat16*>(final_norm_w),
+            static_cast<const hip_bfloat16*>(lm_head_w),
+            static_cast<hip_bfloat16*>(logits_out),
             counters, barrier_counter, barrier_flag);
     }
 
