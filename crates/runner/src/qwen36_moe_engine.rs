@@ -36,8 +36,8 @@ use crate::qwen36_moe_speculative::{
 };
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::qwen36_moe_telemetry::{
-    MoeIslandPrefetchMode, MoeRouteTelemetry, MoeSparseTelemetry, MoeSparseTelemetrySnapshot,
-    MoeTransitionPredictor,
+    print_and_write_moe_residency_summary, MoeIslandPrefetchMode, MoeRouteTelemetry,
+    MoeSparseTelemetry, MoeSparseTelemetrySnapshot, MoeTransitionPredictor,
 };
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
@@ -1014,89 +1014,13 @@ fn decode_text(
         println!("  Generated ids: {generated_ids:?}");
     }
     if let Some(manager) = _moe_expert_residency.as_ref() {
-        let residency = manager.stats();
-        let arena = manager.arena().stats();
-        let total_resident_bytes = arena.resident_bytes + virtual_kv_stats.resident_bytes;
-        let total_reserved_bytes = arena.reserved_bytes + virtual_kv_stats.reserved_bytes;
-        if let Some(telemetry) = moe_sparse_telemetry.as_ref() {
-            println!(
-                "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
-                 resident_pages={} peak_pages={} page_backed_slices={} \
-                 hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
-                 prefetch_requests={} prefetch_hits={} prefetch_misses={} \
-                 prefetch_page_hits={} prefetch_page_misses={} \
-                 prefetch_skipped={} prefetch_skipped_pages={} \
-                 uploaded={:.2}MiB unmapped={:.2}MiB \
-                 resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
-                 kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
-                residency.resident_slices,
-                telemetry.peak_resident_slices,
-                residency.resident_pages,
-                telemetry.peak_resident_pages,
-                residency.page_backed_slices,
-                residency.hits,
-                residency.misses,
-                residency.page_hits,
-                residency.page_misses,
-                residency.evicted_slices,
-                residency.evicted_pages,
-                residency.prefetch_requests,
-                residency.prefetch_hits,
-                residency.prefetch_misses,
-                residency.prefetch_page_hits,
-                residency.prefetch_page_misses,
-                residency.prefetch_skipped,
-                residency.prefetch_skipped_pages,
-                residency.uploaded_bytes as f64 / MIB,
-                residency.unmapped_bytes as f64 / MIB,
-                arena.resident_bytes as f64 / MIB,
-                telemetry.peak_resident_bytes as f64 / MIB,
-                arena.reserved_bytes as f64 / MIB,
-                virtual_kv_stats.resident_bytes as f64 / MIB,
-                total_resident_bytes as f64 / MIB,
-                total_reserved_bytes as f64 / MIB,
-            );
-            telemetry.write_json(
-                manager,
-                virtual_kv_stats,
-                &generated_ids,
-                moe_route_telemetry.as_ref(),
-            )?;
-        } else {
-            println!(
-                "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
-                 page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
-                 evicted_slices={} evicted_pages={} prefetch_requests={} \
-                 prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
-                 prefetch_page_misses={} prefetch_skipped={} prefetch_skipped_pages={} \
-                 uploaded={:.2}MiB unmapped={:.2}MiB \
-                 resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
-                 total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
-                residency.resident_slices,
-                residency.resident_pages,
-                residency.page_backed_slices,
-                residency.hits,
-                residency.misses,
-                residency.page_hits,
-                residency.page_misses,
-                residency.evicted_slices,
-                residency.evicted_pages,
-                residency.prefetch_requests,
-                residency.prefetch_hits,
-                residency.prefetch_misses,
-                residency.prefetch_page_hits,
-                residency.prefetch_page_misses,
-                residency.prefetch_skipped,
-                residency.prefetch_skipped_pages,
-                residency.uploaded_bytes as f64 / MIB,
-                residency.unmapped_bytes as f64 / MIB,
-                arena.resident_bytes as f64 / MIB,
-                arena.reserved_bytes as f64 / MIB,
-                virtual_kv_stats.resident_bytes as f64 / MIB,
-                total_resident_bytes as f64 / MIB,
-                total_reserved_bytes as f64 / MIB,
-            );
-        }
+        print_and_write_moe_residency_summary(
+            manager,
+            virtual_kv_stats,
+            &generated_ids,
+            moe_route_telemetry.as_ref(),
+            moe_sparse_telemetry.as_ref(),
+        )?;
     }
     stage_timings.print_if_requested(emit_stage_timings);
 
