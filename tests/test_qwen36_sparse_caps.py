@@ -59,6 +59,17 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
             ],
         )
 
+    def test_fmt_rank_transition_pct_uses_current_rank_denominator(self):
+        fmt = bench_qwen36_sparse_caps.fmt_rank_transition_pct
+        summary = {
+            "observations_by_rank": [10, 5],
+            "repeated_previous_rank_by_current_rank": [[3, 2], [1, 4]],
+        }
+        self.assertEqual(fmt(summary, current_rank=0, previous_rank=0), "30.0%")
+        self.assertEqual(fmt(summary, current_rank=0, previous_rank=1), "20.0%")
+        self.assertEqual(fmt(summary, current_rank=1, previous_rank=1), "80.0%")
+        self.assertEqual(fmt({}, current_rank=0, previous_rank=0), "-")
+
 
 if __name__ == "__main__":
     unittest.main()
