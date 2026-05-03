@@ -33,7 +33,7 @@ use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_decode::{
     bf16_bytes_to_f32, host_final_norm_lm_head, is_full_attn_layer, run_chained_decode,
     AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom,
+    LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
 };
 use runner::qwen36_moe_persistent_decode::PersistentScratch;
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
@@ -415,8 +415,8 @@ fn build_ffn_layer(
             &b64_field(weights, "gate_w"),
             "gate_w",
         ),
-        gate_up_proj_w,
-        down_proj_w,
+        gate_up_proj_w: ResidentWeight::Dense(gate_up_proj_w),
+        down_proj_w: ResidentWeight::Dense(down_proj_w),
         shared_gate_proj_w,
         shared_up_proj_w,
         shared_down_proj_w,
