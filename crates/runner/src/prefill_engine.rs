@@ -1182,6 +1182,8 @@ fn prefill_inner(
                     ordinal,
                     kv_chunk_size,
                     /* commit_kv_filled */ true,
+                    kept_positions
+                        .map(|k| &k[chunk_start..chunk_start + chunk_len]),  // NEW
                 )?;
             } else {
                 let mut no_debug_trace = None;
@@ -1739,6 +1741,7 @@ fn metal_v2_decode_step_body(
                 ordinal,
                 kv_chunk_size,
                 /* commit_kv_filled */ true,
+                None,  // NEW: metal v2 decode never sparsifies
             )?;
         } else {
             let mut no_debug_trace = None;
@@ -1965,6 +1968,7 @@ fn prefill_full_attention_layer(
     ordinal: usize,
     kv_chunk_size: usize,
     commit_kv_filled: bool,
+    kept_positions_chunk: Option<&[u32]>,  // NEW
 ) -> Result<()> {
     let fw = weights.layers[idx]
         .full
@@ -1991,6 +1995,25 @@ fn prefill_full_attention_layer(
     let rotary_dim = config.rotary_dim();
     let elem_bytes = ScalarType::BF16.size_in_bytes();
     let kv_len = chunk_start + chunk_len; // total KV length after this chunk
+
+    let pos_ids_buf: Option<GpuBuffer> = if let Some(kept) = kept_positions_chunk {
+        if kept.len() != chunk_len {
+            return Err(anyhow::anyhow!(
+                "layer {idx}: kept_positions_chunk has {} entries but chunk_len is {chunk_len}",
+                kept.len()
+            ));
+        }
+        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[kept.len()])
+            .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids alloc: {e}"))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(kept.as_ptr() as *const u8, kept.len() * 4)
+        };
+        copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
+            .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids upload: {e}"))?;
+        Some(buf)
+    } else {
+        None
+    };
 
     // 1. Q projection
     let mut q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_proj_dim])
@@ -2112,33 +2135,66 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
     }
 
-    // 6. RoPE on query and K — use pos_offset = chunk_start for correct position indexing
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        chunk_len,
-        num_q_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        chunk_start,
-        &mut query_buf,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        chunk_len,
-        num_kv_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        chunk_start,
-        &mut scratch.proj_buf2,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+    // 6. RoPE on query — use pos_offset = chunk_start for the dense path,
+    //    or apply_rope_prefill_indirect with the kept positions for SpecPrefill.
+    if let Some(pos_ids) = pos_ids_buf.as_ref() {
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut query_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE (indirect): {e}"))?;
+    } else {
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            chunk_start,
+            &mut query_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
+    }
+    if let Some(pos_ids) = pos_ids_buf.as_ref() {
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE (indirect): {e}"))?;
+    } else {
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            chunk_start,
+            &mut scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+    }
 
     // 7. V projection
     let mut v_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, kv_dim])
