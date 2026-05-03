@@ -15,6 +15,7 @@ mod qwen35_dflash_engine;
 mod qwen35_runtime;
 mod qwen36_moe_decode;
 mod qwen36_moe_engine;
+mod qwen36_moe_layers;
 mod qwen36_moe_mtp;
 mod qwen36_moe_persistent_decode;
 mod qwen36_moe_prefetch;
