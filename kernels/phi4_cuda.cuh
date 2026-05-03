@@ -160,7 +160,7 @@ __device__ inline uint8_t float_to_fp8_e4m3(float val) {
     uint8_t sign = 0;
     if (val < 0.0f) { sign = 0x80; val = -val; }
     // Clamp to max representable E4M3 value
-    if (val >= 448.0f) return sign | 0x7E;  // max normal: exp=14, mantissa=6 → 2^7*(1+6/8)=448
+    if (val >= 448.0f) return sign | 0x7E;  // max normal: stored-exp=15, mantissa=6 → 2^8*(1+6/8)=448
     if (val < 1.52587890625e-2f * 0.125f) return sign;  // too small → ±0
     // Subnormal range: val < 2^(-6) = 0.015625
     if (val < 0.015625f) {
