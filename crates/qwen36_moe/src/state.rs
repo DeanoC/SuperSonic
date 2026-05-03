@@ -17,14 +17,39 @@ pub struct StateLayout {
     pub kv_dtype_bytes: u64,
     pub context_tokens: u64,
     pub batch_size: u64,
+    /// Bytes per (head, position) for the F32 KV scale tables. 4 when
+    /// kv_fp8 is on (FP8 path needs per-(head, pos) F32 scales for K and
+    /// for V), 0 otherwise.
+    pub kv_fp8_scale_bytes_per_token: u64,
+    /// Bytes per (head, position) element for the BF16 sidecar. 2 when
+    /// kv_fp8 is on AND a sidecar window is configured, 0 otherwise.
+    pub kv_fp8_sidecar_bytes_per_token: u64,
+    /// Number of positions covered by the BF16 sidecar (per layer per
+    /// kv_head). 0 when the sidecar is disabled. v1 forces this to
+    /// equal `context_tokens` when the sidecar is on.
+    pub kv_fp8_sidecar_window: u64,
 }
 
 impl StateLayout {
-    pub fn new(context_tokens: usize, batch_size: usize, kv_fp8: bool) -> Self {
+    pub fn new(
+        context_tokens: usize,
+        batch_size: usize,
+        kv_fp8: bool,
+        kv_fp8_sidecar_window: Option<usize>,
+    ) -> Self {
         Self {
             kv_dtype_bytes: if kv_fp8 { 1 } else { 2 },
             context_tokens: context_tokens as u64,
             batch_size: batch_size as u64,
+            kv_fp8_scale_bytes_per_token: if kv_fp8 { 4 } else { 0 },
+            kv_fp8_sidecar_bytes_per_token: match (kv_fp8, kv_fp8_sidecar_window) {
+                (true, Some(_)) => 2,
+                _ => 0,
+            },
+            kv_fp8_sidecar_window: match (kv_fp8, kv_fp8_sidecar_window) {
+                (true, Some(w)) => w as u64,
+                _ => 0,
+            },
         }
     }
 }
@@ -37,9 +62,28 @@ impl StateAccount {
         let n_full = config.num_full_attention_layers() as u64;
         let n_linear = config.num_linear_attention_layers() as u64;
 
-        let kv_bytes_per_layer_per_token = 2 * kv_heads * head_dim * layout.kv_dtype_bytes;
-        let full_kv_bytes =
-            n_full * kv_bytes_per_layer_per_token * layout.context_tokens * layout.batch_size;
+        // Per-layer KV bytes:
+        //   FP8 path: 2 (K+V) * kv_heads * head_dim * 1 byte (FP8 E4M3)
+        //   BF16 path: 2 (K+V) * kv_heads * head_dim * 2 bytes (BF16)
+        let kv_bytes_per_layer_per_token =
+            2 * kv_heads * head_dim * layout.kv_dtype_bytes;
+        // Per-layer scale bytes (FP8 only): 2 (K+V) * kv_heads * 4 bytes
+        // F32 per (head, position). Independent of head_dim.
+        let kv_scale_bytes_per_layer_per_token =
+            2 * kv_heads * layout.kv_fp8_scale_bytes_per_token;
+        // Per-layer BF16 sidecar bytes (FP8 + sidecar enabled only):
+        // 2 (K+V) * kv_heads * head_dim * 2 bytes per (head, position),
+        // total across the configured window.
+        let kv_sidecar_bytes_per_layer = 2
+            * kv_heads
+            * head_dim
+            * layout.kv_fp8_sidecar_window
+            * layout.kv_fp8_sidecar_bytes_per_token;
+        let full_kv_bytes = n_full
+            * (kv_bytes_per_layer_per_token + kv_scale_bytes_per_layer_per_token)
+            * layout.context_tokens
+            * layout.batch_size
+            + n_full * kv_sidecar_bytes_per_layer * layout.batch_size;
 
         let lin_qkv_dim = (config.linear_num_key_heads * config.linear_key_head_dim
             + config.linear_num_key_heads * config.linear_key_head_dim
@@ -133,7 +177,7 @@ mod tests {
     #[test]
     fn kv_cache_sizing_at_4k_context_under_5gib() {
         let cfg = config_35b_a3b();
-        let layout = StateLayout::new(4096, 1, false);
+        let layout = StateLayout::new(4096, 1, false, None);
         let acct = StateAccount::from_config(&cfg, layout);
         // 10 full layers × 2 KV heads × 256 head_dim × 4096 ctx × 2 BF16 × 2 (K+V)
         let expected_kv = 10u64 * 2 * 256 * 4096 * 2 * 2;
@@ -145,7 +189,7 @@ mod tests {
     #[test]
     fn moe_scratch_is_well_under_a_megabyte() {
         let cfg = config_35b_a3b();
-        let layout = StateLayout::new(4096, 1, false);
+        let layout = StateLayout::new(4096, 1, false, None);
         let acct = StateAccount::from_config(&cfg, layout);
         // scratch is per-step, batch=1: ~router(1024) + topk(80) + work(144) +
         // expert acc (4096) ≈ tiny.
@@ -153,10 +197,31 @@ mod tests {
     }
 
     #[test]
-    fn fp8_kv_halves_full_kv_bytes() {
+    fn fp8_kv_sizes_relative_to_bf16() {
         let cfg = config_35b_a3b();
-        let bf16 = StateAccount::from_config(&cfg, StateLayout::new(4096, 1, false)).full_kv_bytes;
-        let fp8 = StateAccount::from_config(&cfg, StateLayout::new(4096, 1, true)).full_kv_bytes;
-        assert_eq!(bf16, 2 * fp8);
+        let bf16 = StateAccount::from_config(
+            &cfg,
+            StateLayout::new(4096, 1, false, None),
+        )
+        .full_kv_bytes;
+        let fp8_no_sidecar = StateAccount::from_config(
+            &cfg,
+            StateLayout::new(4096, 1, true, None),
+        )
+        .full_kv_bytes;
+        let fp8_with_sidecar = StateAccount::from_config(
+            &cfg,
+            StateLayout::new(4096, 1, true, Some(4096)),
+        )
+        .full_kv_bytes;
+        // FP8 cache (no sidecar): half the cache plus a small per-token scale.
+        // Strictly less than BF16, but greater than half.
+        assert!(fp8_no_sidecar < bf16);
+        assert!(fp8_no_sidecar > bf16 / 2);
+        // FP8 + full-window sidecar: cache (half BF16) + scales + a BF16
+        // sidecar of the same shape. Strictly more than BF16 alone, less
+        // than 2× BF16.
+        assert!(fp8_with_sidecar > bf16);
+        assert!(fp8_with_sidecar < 2 * bf16);
     }
 }

@@ -152,7 +152,7 @@ pub fn run_qwen36_moe_dry_run(
     let checkpoint = CheckpointAccount::from_config(&config.text_config);
     let int4_projected_bytes = checkpoint.project_int4_total_bytes(&config.text_config, 128);
 
-    let layout = StateLayout::new(context_size, batch_size, kv_fp8);
+    let layout = StateLayout::new(context_size, batch_size, kv_fp8, None);
     let state = StateAccount::from_config(&config.text_config, layout);
 
     let bake = inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal);
