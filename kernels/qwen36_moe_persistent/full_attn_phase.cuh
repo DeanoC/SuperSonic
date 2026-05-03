@@ -884,6 +884,9 @@ __device__ inline void qwen36_moe_attn_step_device(
             // workspace[OFF_SCORES + hq * kv_max_t + t].
             const int score_base = OFF_SCORES + hq * kv_max_t;
             const bool use_fp8_kv = (kv_scale_k != nullptr);
+            // The bridge guarantees kv_shadow_k/v are paired (or both
+            // null), so checking only kv_shadow_k here is sufficient and
+            // matches the kv_shadow_v check on the V read side.
             const bool sidecar_active =
                 (kv_shadow_k != nullptr && kv_shadow_start >= 0);
             const T* shadow_k = sidecar_active ? static_cast<const T*>(kv_shadow_k) : nullptr;
@@ -901,6 +904,12 @@ __device__ inline void qwen36_moe_attn_step_device(
                     if (!use_fp8_kv) {
                         k = static_cast<float>(kv_cache_k[t * Hkv * d + h_kv * d + i]);
                     } else if (use_sidecar) {
+                        // Sidecar window is forced equal to kv_max_t in v1
+                        // (full sidecar). If a future change shrinks the
+                        // window, add a kv_shadow_window kernel arg and
+                        // replace kv_max_t in the offset below — must
+                        // stay in sync with the write site at line 822
+                        // and the V read site below.
                         const int shadow_slot = t - kv_shadow_start;
                         k = static_cast<float>(
                             shadow_k[h_kv * kv_max_t * d + shadow_slot * d + i]);
@@ -963,6 +972,11 @@ __device__ inline void qwen36_moe_attn_step_device(
                     if (!use_fp8_kv_v) {
                         v = static_cast<float>(kv_cache_v[t * Hkv * d + h_kv * d + i]);
                     } else if (use_sidecar) {
+                        // Sidecar window is forced equal to kv_max_t in v1
+                        // (full sidecar). If a future change shrinks the
+                        // window, see the K-side comment for the
+                        // kv_shadow_window arg threading — all three
+                        // sidecar offset sites must stay in sync.
                         const int shadow_slot = t - kv_shadow_start;
                         v = static_cast<float>(
                             shadow_v[h_kv * kv_max_t * d + shadow_slot * d + i]);
