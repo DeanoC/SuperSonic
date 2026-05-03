@@ -215,28 +215,8 @@ pub fn run_specprefill(
     target_engine.set_decode_context_limit(context_tokens);
 
     // ---- Target sparse prefill ----
-    // `weights()` and `rotary()` borrow `&self`, while `state_mut()` borrows
-    // `&mut self`.  They refer to disjoint fields of `DecodeEngine`, so we
-    // use raw pointers to allow the three simultaneous borrows.  This is safe
-    // because the fields do not alias and neither `prefill_kept` nor any
-    // of the accessors performs any interior mutation of the other fields.
     let prefill_start = Instant::now();
-    let weights_ptr = target_engine.weights() as *const _;
-    let rotary_ptr  = target_engine.rotary()  as *const _;
-    let prefill_result = crate::prefill_engine::prefill_kept(
-        // SAFETY: weights and rotary are separate fields from state; no
-        // concurrent mutation occurs during this synchronous call.
-        unsafe { &*weights_ptr },
-        target_engine.state_mut(),
-        unsafe { &*rotary_ptr },
-        &prompt_ids,
-        &kept_positions,
-        ordinal,
-        params.kv_chunk_size,
-        cli.prefill_chunk_size,
-        cli.kv_fp8,
-        params.use_4b_kernel,
-    )?;
+    let prefill_result = target_engine.prefill_kept_native(&prompt_ids, &kept_positions)?;
     eprintln!(
         "[specprefill] target prefill done in {:.0}ms",
         prefill_start.elapsed().as_millis()

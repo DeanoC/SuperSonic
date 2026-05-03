@@ -10296,6 +10296,32 @@ impl DecodeEngine {
         Ok(result)
     }
 
+    /// SpecPrefill (arXiv 2502.02789) target sparse prefill via the engine's
+    /// own state/weights/rotary. See `prefill_engine::prefill_kept` for the
+    /// `kept_positions` invariants.
+    pub fn prefill_kept_native(
+        &mut self,
+        prompt_ids: &[u32],
+        kept_positions: &[u32],
+    ) -> Result<prefill_engine::PrefillResult> {
+        let result = prefill_engine::prefill_kept(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            kept_positions,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill_kept: {e}"))?;
+        Ok(result)
+    }
+
     pub fn prefill_native_with_target_nll(
         &mut self,
         prompt_ids: &[u32],
