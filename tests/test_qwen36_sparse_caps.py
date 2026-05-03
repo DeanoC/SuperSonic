@@ -11,6 +11,12 @@ SPEC.loader.exec_module(bench_qwen36_sparse_caps)
 
 
 class Qwen36SparseCapBenchTests(unittest.TestCase):
+    def assert_cases_equal(self, actual, expected):
+        self.assertEqual(
+            [(case.label, case.cap, case.prefetch_mode, case.prefetch_ranks) for case in actual],
+            expected,
+        )
+
     def test_parse_prefetch_rank_policy_accepts_none_rank_and_all(self):
         parse = bench_qwen36_sparse_caps.parse_prefetch_rank_policy
         self.assertEqual(parse("none"), ("none", None))
@@ -33,29 +39,72 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse("-1")
 
+    def test_parse_prefetch_mode_policies_accepts_aliases_and_dedupes(self):
+        parse = bench_qwen36_sparse_caps.parse_prefetch_mode_policies
+        self.assertEqual(
+            parse("disabled,previous-token,previous_token,previous-token-resident"),
+            [
+                ("none", None),
+                ("previous-token", "previous-token"),
+                ("previous-token-resident", "previous-token-resident"),
+            ],
+        )
+        with self.assertRaises(ValueError):
+            parse("unknown")
+
     def test_build_cases_expands_prefetch_rank_sweep_per_cap(self):
         build_cases = bench_qwen36_sparse_caps.build_cases
-        self.assertEqual(
-            build_cases([8, 320], "none,1,all", None),
+        self.assert_cases_equal(
+            build_cases([8, 320], None, "none,1,all", "previous-token", None),
             [
-                ("dense", None, None),
-                ("cap8-none", 8, None),
-                ("cap8-r1", 8, "1"),
-                ("cap8-all", 8, "all"),
-                ("cap320-none", 320, None),
-                ("cap320-r1", 320, "1"),
-                ("cap320-all", 320, "all"),
+                ("dense", None, None, None),
+                ("cap8-none", 8, None, None),
+                ("cap8-r1", 8, "previous-token", "1"),
+                ("cap8-all", 8, "previous-token", "all"),
+                ("cap320-none", 320, None, None),
+                ("cap320-r1", 320, "previous-token", "1"),
+                ("cap320-all", 320, "previous-token", "all"),
             ],
         )
 
     def test_build_cases_preserves_single_policy_mode(self):
         build_cases = bench_qwen36_sparse_caps.build_cases
-        self.assertEqual(
-            build_cases([64, 128], None, "4"),
+        self.assert_cases_equal(
+            build_cases([64, 128], None, None, "previous-token-resident", "4"),
             [
-                ("dense", None, None),
-                ("cap64", 64, "4"),
-                ("cap128", 128, "4"),
+                ("dense", None, None, None),
+                ("cap64", 64, "previous-token-resident", "4"),
+                ("cap128", 128, "previous-token-resident", "4"),
+            ],
+        )
+
+    def test_build_cases_expands_mode_and_rank_sweeps(self):
+        build_cases = bench_qwen36_sparse_caps.build_cases
+        self.assert_cases_equal(
+            build_cases(
+                [320],
+                "disabled,previous-token,previous-token-resident",
+                "none,1,all",
+                None,
+                None,
+            ),
+            [
+                ("dense", None, None, None),
+                ("cap320-none", 320, None, None),
+                ("cap320-previous-token-r1", 320, "previous-token", "1"),
+                ("cap320-previous-token-all", 320, "previous-token", "all"),
+                (
+                    "cap320-previous-token-resident-r1",
+                    320,
+                    "previous-token-resident",
+                    "1",
+                ),
+                (
+                    "cap320-previous-token-resident-all",
+                    320,
+                    "previous-token-resident",
+                    "all",
+                ),
             ],
         )
 
