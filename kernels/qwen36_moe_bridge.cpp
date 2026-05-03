@@ -78,10 +78,12 @@ struct ScopedHipDevice {
 // Pin Rust↔C++ struct layout. If this fails at compile time, someone
 // reordered fields on one side without the other. Update both sides
 // together.
-static_assert(sizeof(qwen36_moe::DecodeLayerDesc) >= 256,
-              "Qwen36MoeDecodeLayerDesc shrunk unexpectedly");
-static_assert(sizeof(qwen36_moe::DecodeLayerDesc) <= 512,
-              "Qwen36MoeDecodeLayerDesc grew unexpectedly");
+static_assert(sizeof(qwen36_moe::DecodeLayerDesc) == 344,
+              "Qwen36MoeDecodeLayerDesc size drift — Rust side is pinned to 344 bytes; "
+              "if you appended a field, update both sides in the same commit");
+
+static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
+              "Qwen36MoeKVCacheFp8Desc layout drift — must be exactly 2 pointers");
 
 } // namespace
 
