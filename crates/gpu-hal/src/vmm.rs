@@ -378,11 +378,6 @@ impl VirtualBuffer {
             ops::sync(self.device_ordinal)?;
         }
         for (seg_offset, seg_len) in self.missing_segments(aligned_offset, aligned_end) {
-            let prefix_end = self.contiguous_prefix_end();
-            if seg_offset == prefix_end && prefix_end > 0 {
-                self.remap_contiguous_prefix(seg_offset + seg_len)?;
-                continue;
-            }
             let mapping = hal_profile_time("vmm_map", seg_len, || {
                 map_physical(
                     self.backend,
@@ -434,6 +429,60 @@ impl VirtualBuffer {
     pub fn evict_discard(&mut self) -> Result<()> {
         ops::sync(self.device_ordinal)?;
         self.unmap_all_discard()
+    }
+
+    /// Unmap any resident physical mappings that overlap the requested byte
+    /// range, without first copying data to the CPU backup image.
+    ///
+    /// The actual unmapped ranges are VMM-page aligned and may be wider than
+    /// the logical range. Callers that maintain their own backing store should
+    /// treat every returned range as non-resident.
+    pub fn unmap_range_discard(
+        &mut self,
+        offset: usize,
+        len: usize,
+    ) -> Result<Vec<(usize, usize)>> {
+        if len == 0 || self.mappings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "virtual unmap range overflows: offset={offset} len={len}"
+            ))
+        })?;
+        if end > self.reserved_bytes {
+            return Err(GpuError::InvalidArg(format!(
+                "virtual unmap range [{offset}, {end}) exceeds reservation {}",
+                self.reserved_bytes
+            )));
+        }
+
+        let aligned_offset = align_down(offset, self.granularity);
+        let aligned_end = align_up(end, self.granularity);
+        ops::sync(self.device_ordinal)?;
+
+        let mut kept = Vec::with_capacity(self.mappings.len());
+        let mut removed = Vec::new();
+        for mapping in self.mappings.drain(..) {
+            let map_end = mapping.offset + mapping.len;
+            if ranges_overlap(mapping.offset, map_end, aligned_offset, aligned_end) {
+                let removed_range = (mapping.offset, mapping.len);
+                hal_profile_time("vmm_unmap", mapping.len, || {
+                    unmap_and_release(self.backend, self.device_ordinal, self.ptr, mapping)
+                })?;
+                removed.push(removed_range);
+            } else {
+                kept.push(mapping);
+            }
+        }
+        self.mappings = kept;
+        self.mapped_bytes = self
+            .mappings
+            .iter()
+            .map(|mapping| mapping.offset + mapping.len)
+            .max()
+            .unwrap_or(0);
+        Ok(removed)
     }
 
     fn unmap_all_discard(&mut self) -> Result<()> {
@@ -740,76 +789,6 @@ impl VirtualBuffer {
         }
         self.missing_segments(offset, end).is_empty()
     }
-
-    fn contiguous_prefix_end(&self) -> usize {
-        let mut ranges: Vec<(usize, usize)> = self
-            .mappings
-            .iter()
-            .map(|mapping| (mapping.offset, mapping.offset + mapping.len))
-            .collect();
-        ranges.sort_by_key(|(start, _)| *start);
-
-        let mut cursor = 0;
-        for (start, end) in ranges {
-            if start > cursor {
-                break;
-            }
-            cursor = cursor.max(end);
-        }
-        cursor
-    }
-
-    fn remap_contiguous_prefix(&mut self, new_end: usize) -> Result<()> {
-        let old_end = self.contiguous_prefix_end();
-        if old_end == 0 || new_end <= old_end {
-            return Ok(());
-        }
-
-        let mut old = vec![0u8; old_end];
-        ops::copy_d2h(
-            self.device_ordinal,
-            old.as_mut_ptr() as *mut c_void,
-            self.ptr.as_ptr(),
-            old.len(),
-        )?;
-        ops::sync(self.device_ordinal)?;
-
-        let mut i = 0;
-        while i < self.mappings.len() {
-            let map_end = self.mappings[i].offset + self.mappings[i].len;
-            if self.mappings[i].offset < old_end && map_end <= old_end {
-                let mapping = self.mappings.remove(i);
-                hal_profile_time("vmm_unmap", mapping.len, || {
-                    unmap_and_release(self.backend, self.device_ordinal, self.ptr, mapping)
-                })?;
-            } else {
-                i += 1;
-            }
-        }
-
-        let mapping = hal_profile_time("vmm_map", new_end, || {
-            map_physical(
-                self.backend,
-                self.device_ordinal,
-                self.ptr,
-                0,
-                new_end,
-                0,
-                new_end,
-            )
-        })?;
-        self.mappings.push(mapping);
-        self.mapped_bytes = self.mapped_bytes.max(new_end);
-        ops::memset_zeros(self.device_ordinal, self.ptr.as_ptr(), new_end)?;
-        ops::sync(self.device_ordinal)?;
-        ops::copy_h2d(
-            self.device_ordinal,
-            self.ptr.as_ptr(),
-            old.as_ptr() as *const c_void,
-            old.len(),
-        )?;
-        Ok(())
-    }
 }
 
 pub fn vmm_is_supported(backend: Backend, ordinal: usize) -> bool {
@@ -847,6 +826,10 @@ fn align_up(value: usize, alignment: usize) -> usize {
 fn align_down(value: usize, alignment: usize) -> usize {
     debug_assert!(alignment > 0);
     (value / alignment) * alignment
+}
+
+fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
+    a_start < b_end && b_start < a_end
 }
 
 const VMM_BACKUP_COPY_CHUNK_BYTES: usize = usize::MAX;
@@ -901,6 +884,7 @@ fn allocation_prop_cuda(ordinal: usize) -> CuMemAllocationProp {
             compression_type: 0,
             gpu_direct_rdma_capable: 0,
             usage: 0,
+            reserved: [0; 4],
         },
     }
 }

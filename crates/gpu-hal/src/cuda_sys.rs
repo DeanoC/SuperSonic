@@ -35,6 +35,7 @@ pub(crate) struct CuMemAllocationPropAllocFlags {
     pub compression_type: u8,
     pub gpu_direct_rdma_capable: u8,
     pub usage: u16,
+    pub reserved: [u8; 4],
 }
 
 #[repr(C)]

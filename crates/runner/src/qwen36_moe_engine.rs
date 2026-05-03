@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole};
+use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::{Config, TextConfig};
@@ -27,9 +27,13 @@ use qwen36_moe::weights::{
 
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
-    run_chained_decode_fast, sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars,
-    FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
-    MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
+    run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits,
+    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
+    LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, ResidentWeight,
+    XorshiftRng,
+};
+use crate::qwen36_moe_residency::{
+    MoeExpertKey, MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -856,6 +860,8 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.speculative_decode,
         cli.fp8_runtime,
         cli.batched_spec_verify,
+        entry.backend,
+        cli.device,
         // Phase 3e.4: persistent decode is now the default. The legacy
         // `--persistent-decode` flag is a hidden no-op (kept for harness
         // back-compat); `--no-persistent-decode` is the documented
@@ -960,6 +966,59 @@ fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuff
         .with_context(|| format!("BakedStore::load_to_gpu({name})"))
 }
 
+fn load_to_resident_weight(
+    store: &BakedStore,
+    ordinal: usize,
+    name: &str,
+) -> Result<ResidentWeight> {
+    load_to_gpu(store, ordinal, name).map(ResidentWeight::Dense)
+}
+
+fn load_to_virtual_resident_weight(
+    store: &BakedStore,
+    arena: &mut VirtualArena,
+    name: &str,
+) -> Result<ResidentWeight> {
+    let resolved = resolve_qwen36_store_name(store, name);
+    let id = store
+        .load_to_virtual_arena(arena, resolved.as_ref(), VirtualAllocationRole::MoeExpert)
+        .with_context(|| format!("BakedStore::load_to_virtual_arena({name})"))?;
+    let allocation = arena
+        .allocation(id)
+        .ok_or_else(|| anyhow!("virtual allocation id {id} disappeared after loading {name}"))?;
+    let buffer = allocation.buffer();
+    Ok(ResidentWeight::Virtual {
+        allocation_id: id,
+        ptr: buffer.as_ptr(),
+        dtype: buffer.dtype(),
+        shape: buffer.shape().to_vec(),
+        len_bytes: buffer.len_bytes(),
+    })
+}
+
+fn load_to_sparse_resident_weight(
+    store: &BakedStore,
+    manager: &mut MoeExpertResidencyManager,
+    layer_idx: usize,
+    projection: MoeExpertProjection,
+    name: &str,
+    expert_count: usize,
+) -> Result<ResidentWeight> {
+    let resolved = resolve_qwen36_store_name(store, name);
+    manager
+        .register_tensor(
+            store,
+            layer_idx,
+            projection,
+            resolved.as_ref(),
+            expert_count,
+        )
+        .with_context(|| format!("reserve sparse MoE expert tensor {name}"))?;
+    manager
+        .resident_weight(layer_idx, projection)
+        .with_context(|| format!("build sparse resident weight for {name}"))
+}
+
 fn store_contains_qwen36(store: &BakedStore, name: &str) -> bool {
     store.contains(resolve_qwen36_store_name(store, name).as_ref())
 }
@@ -997,6 +1056,184 @@ enum Qwen36WeightMode {
     Fp8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoeExpertVmmMode {
+    Auto,
+    Disabled,
+    Force,
+}
+
+impl MoeExpertVmmMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok().as_deref() {
+            None => Ok(Self::Auto),
+            Some("0") => Ok(Self::Disabled),
+            Some("1") => Ok(Self::Force),
+            Some(other) => Err(anyhow!(
+                "SUPERSONIC_VMM_MOE_ISLANDS must be unset, 0, or 1; got {other:?}"
+            )),
+        }
+    }
+}
+
+fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
+    let Some(raw) = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok() else {
+        return Ok(None);
+    };
+    let cap = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={raw:?} as positive integer")
+    })?;
+    if cap == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS must be > 0");
+    }
+    Ok(Some(cap))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MoeSparseTelemetrySnapshot {
+    stats: crate::qwen36_moe_residency::MoeExpertResidencyStats,
+    arena: gpu_hal::VirtualArenaStats,
+}
+
+impl MoeSparseTelemetrySnapshot {
+    fn capture(manager: &MoeExpertResidencyManager) -> Self {
+        Self {
+            stats: manager.stats(),
+            arena: manager.arena().stats(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MoeSparseTelemetry {
+    dump_path: Option<PathBuf>,
+    decode_path: &'static str,
+    steps: Vec<serde_json::Value>,
+    peak_resident_slices: usize,
+    peak_resident_pages: usize,
+    peak_page_backed_slices: usize,
+    peak_resident_bytes: usize,
+    peak_logical_resident_bytes: usize,
+}
+
+impl MoeSparseTelemetry {
+    fn from_env(active: bool, persistent_decode: bool) -> Result<Option<Self>> {
+        if !active {
+            return Ok(None);
+        }
+        let dump_path = std::env::var_os("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON").map(PathBuf::from);
+        Ok(Some(Self {
+            dump_path,
+            decode_path: if persistent_decode {
+                "segmented_persistent"
+            } else {
+                "chained"
+            },
+            steps: Vec::new(),
+            peak_resident_slices: 0,
+            peak_resident_pages: 0,
+            peak_page_backed_slices: 0,
+            peak_resident_bytes: 0,
+            peak_logical_resident_bytes: 0,
+        }))
+    }
+
+    fn record_step(
+        &mut self,
+        step: usize,
+        position: i32,
+        is_generation_step: bool,
+        before: MoeSparseTelemetrySnapshot,
+        after: MoeSparseTelemetrySnapshot,
+    ) {
+        self.peak_resident_slices = self.peak_resident_slices.max(after.stats.resident_slices);
+        self.peak_resident_pages = self.peak_resident_pages.max(after.stats.resident_pages);
+        self.peak_page_backed_slices = self
+            .peak_page_backed_slices
+            .max(after.stats.page_backed_slices);
+        self.peak_resident_bytes = self.peak_resident_bytes.max(after.arena.resident_bytes);
+        self.peak_logical_resident_bytes = self
+            .peak_logical_resident_bytes
+            .max(after.arena.logical_resident_bytes);
+
+        if self.dump_path.is_none() {
+            return;
+        }
+
+        self.steps.push(serde_json::json!({
+            "step": step,
+            "position": position,
+            "kind": if is_generation_step { "generate" } else { "prefill" },
+            "delta": {
+                "hits": after.stats.hits.saturating_sub(before.stats.hits),
+                "misses": after.stats.misses.saturating_sub(before.stats.misses),
+                "page_hits": after.stats.page_hits.saturating_sub(before.stats.page_hits),
+                "page_misses": after.stats.page_misses.saturating_sub(before.stats.page_misses),
+                "evicted_slices": after.stats.evicted_slices.saturating_sub(before.stats.evicted_slices),
+                "evicted_pages": after.stats.evicted_pages.saturating_sub(before.stats.evicted_pages),
+                "uploaded_bytes": after.stats.uploaded_bytes.saturating_sub(before.stats.uploaded_bytes),
+                "unmapped_bytes": after.stats.unmapped_bytes.saturating_sub(before.stats.unmapped_bytes),
+            },
+            "resident": {
+                "slices": after.stats.resident_slices,
+                "pages": after.stats.resident_pages,
+                "page_backed_slices": after.stats.page_backed_slices,
+                "logical_bytes": after.arena.logical_resident_bytes,
+                "physical_bytes": after.arena.resident_bytes,
+                "mappings": after.arena.mapping_count,
+            },
+            "cumulative": {
+                "hits": after.stats.hits,
+                "misses": after.stats.misses,
+                "page_hits": after.stats.page_hits,
+                "page_misses": after.stats.page_misses,
+                "evicted_slices": after.stats.evicted_slices,
+                "evicted_pages": after.stats.evicted_pages,
+                "uploaded_bytes": after.stats.uploaded_bytes,
+                "unmapped_bytes": after.stats.unmapped_bytes,
+            }
+        }));
+    }
+
+    fn write_json(&self, manager: &MoeExpertResidencyManager, generated_ids: &[u32]) -> Result<()> {
+        let Some(path) = self.dump_path.as_ref() else {
+            return Ok(());
+        };
+        let final_snapshot = MoeSparseTelemetrySnapshot::capture(manager);
+        let payload = serde_json::json!({
+            "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
+            "summary": {
+                "decode_path": self.decode_path,
+                "registered_tensors": final_snapshot.stats.registered_tensors,
+                "max_resident_pages": manager.max_resident_pages(),
+                "final_resident_slices": final_snapshot.stats.resident_slices,
+                "final_resident_pages": final_snapshot.stats.resident_pages,
+                "final_page_backed_slices": final_snapshot.stats.page_backed_slices,
+                "peak_resident_slices": self.peak_resident_slices,
+                "peak_resident_pages": self.peak_resident_pages,
+                "peak_page_backed_slices": self.peak_page_backed_slices,
+                "peak_resident_bytes": self.peak_resident_bytes,
+                "peak_logical_resident_bytes": self.peak_logical_resident_bytes,
+                "reserved_bytes": final_snapshot.arena.reserved_bytes,
+                "logical_bytes": final_snapshot.arena.logical_bytes,
+                "hits": final_snapshot.stats.hits,
+                "misses": final_snapshot.stats.misses,
+                "page_hits": final_snapshot.stats.page_hits,
+                "page_misses": final_snapshot.stats.page_misses,
+                "evicted_slices": final_snapshot.stats.evicted_slices,
+                "evicted_pages": final_snapshot.stats.evicted_pages,
+                "uploaded_bytes": final_snapshot.stats.uploaded_bytes,
+                "unmapped_bytes": final_snapshot.stats.unmapped_bytes,
+            },
+            "generated_ids": generated_ids,
+            "steps": self.steps,
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("write MoE sparse VMM telemetry to {}", path.display()))
+    }
+}
+
 /// Build one layer's worth of GPU-resident weight + state buffers from a
 /// BakedStore. Decides full-attn vs linear-attn by consulting the config's
 /// `layer_types` (every 4th layer is full per the standard hybrid pattern).
@@ -1026,6 +1263,8 @@ fn load_layer_buffers(
     // sidecar (gated by `qwen35::state::kv_fp8_bf16_sidecar_*` env
     // helpers).
     kv_fp8: bool,
+    mut expert_arena: Option<&mut VirtualArena>,
+    mut expert_residency: Option<&mut MoeExpertResidencyManager>,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -1405,8 +1644,48 @@ fn load_layer_buffers(
         gate_w: load_to_gpu(store, ordinal, &format!("{mp}.gate.weight"))?,
         // Note: experts.gate_up_proj / experts.down_proj have NO `.weight`
         // suffix in the published checkpoint — see expected_tensor_specs.
-        gate_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?,
-        down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj"))?,
+        gate_up_proj_w: if let Some(manager) = expert_residency.as_mut() {
+            load_to_sparse_resident_weight(
+                store,
+                &mut **manager,
+                layer_idx,
+                MoeExpertProjection::GateUp,
+                &format!("{mp}.experts.gate_up_proj"),
+                geom.num_experts as usize,
+            )?
+        } else {
+            match expert_arena.as_mut() {
+                Some(arena) => load_to_virtual_resident_weight(
+                    store,
+                    &mut **arena,
+                    &format!("{mp}.experts.gate_up_proj"),
+                )?,
+                None => {
+                    load_to_resident_weight(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?
+                }
+            }
+        },
+        down_proj_w: if let Some(manager) = expert_residency.as_mut() {
+            load_to_sparse_resident_weight(
+                store,
+                &mut **manager,
+                layer_idx,
+                MoeExpertProjection::Down,
+                &format!("{mp}.experts.down_proj"),
+                geom.num_experts as usize,
+            )?
+        } else {
+            match expert_arena.as_mut() {
+                Some(arena) => load_to_virtual_resident_weight(
+                    store,
+                    &mut **arena,
+                    &format!("{mp}.experts.down_proj"),
+                )?,
+                None => {
+                    load_to_resident_weight(store, ordinal, &format!("{mp}.experts.down_proj"))?
+                }
+            }
+        },
         shared_gate_proj_w: load_to_gpu(
             store,
             ordinal,
@@ -1431,6 +1710,68 @@ fn load_layer_buffers(
     };
 
     Ok(LayerBuffers { attn, ffn })
+}
+
+fn load_all_layer_buffers(
+    store: &BakedStore,
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    weight_mode: Qwen36WeightMode,
+    kv_max_t: usize,
+    kv_fp8: bool,
+    mut expert_arena: Option<&mut VirtualArena>,
+    mut expert_residency: Option<&mut MoeExpertResidencyManager>,
+) -> Result<Vec<LayerBuffers>> {
+    let mut layers = Vec::with_capacity(geom.num_layers as usize);
+    for li in 0..geom.num_layers as usize {
+        let layer = load_layer_buffers(
+            store,
+            ordinal,
+            li,
+            geom,
+            text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            kv_fp8,
+            expert_arena.as_deref_mut(),
+            expert_residency.as_deref_mut(),
+        )
+        .with_context(|| format!("load layer {li} weights"))?;
+        layers.push(layer);
+    }
+    Ok(layers)
+}
+
+fn should_try_moe_expert_vmm(
+    mode: MoeExpertVmmMode,
+    backend: Backend,
+    weight_mode: Qwen36WeightMode,
+    ordinal: usize,
+) -> Result<bool> {
+    if mode == MoeExpertVmmMode::Disabled {
+        return Ok(false);
+    }
+    if weight_mode != Qwen36WeightMode::Int4 {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requires Qwen3.6-MoE INT4 weights; got {weight_mode:?}"
+            );
+        }
+        return Ok(false);
+    }
+    let supported = gpu_hal::vmm_is_supported(backend, ordinal);
+    if !supported {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but backend={backend} VMM is unsupported on device {ordinal}"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.
@@ -1626,6 +1967,8 @@ fn decode_text(
     speculative_decode: bool,
     fp8_runtime: bool,
     batched_spec_verify: bool,
+    backend: Backend,
+    ordinal: usize,
     persistent_decode: bool,
     kv_fp8: bool,
     dump_last_logits: bool,
@@ -1749,15 +2092,13 @@ fn decode_text(
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
-    set_backend(Backend::Hip);
-    let ordinal = 0usize;
+    set_backend(backend);
 
     // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
     // generously here since per-layer KV is small (10 full-attn layers ×
     // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
     let kv_max_t = prompt_ids.len() + max_new;
 
-    let mut layers = Vec::with_capacity(geom.num_layers as usize);
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
@@ -1768,22 +2109,148 @@ fn decode_text(
         },
         kv_max_t,
     );
-    for li in 0..geom.num_layers as usize {
-        let layer = load_layer_buffers(
+
+    let moe_vmm_mode = MoeExpertVmmMode::from_env()?;
+    let moe_island_cap_experts = moe_island_cap_experts_from_env()?;
+    if moe_island_cap_experts.is_some() && speculative_decode {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
+        );
+    }
+    if moe_island_cap_experts.is_some() && moe_vmm_mode == MoeExpertVmmMode::Disabled {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS requires VMM expert slabs; unset SUPERSONIC_VMM_MOE_ISLANDS=0"
+        );
+    }
+    let mut _moe_expert_arena = None;
+    let mut _moe_expert_residency = None;
+    let sparse_moe_requested = moe_island_cap_experts.is_some();
+    let mut moe_sparse_telemetry =
+        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode)?;
+    if let Some(path) = moe_sparse_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.dump_path.as_ref())
+    {
+        println!(
+            "  [vmm] sparse MoE residency telemetry will be written to {}",
+            path.display()
+        );
+    }
+    let mut layers = if let Some(cap_experts) = moe_island_cap_experts {
+        if cap_experts < geom.top_k as usize {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={cap_experts} is smaller than model top_k={}; \
+                 sparse decode needs at least one layer's routed experts resident",
+                geom.top_k
+            );
+        }
+        if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, backend, weight_mode, ordinal)? {
+            unreachable!("forced VMM expert check should either return true or error");
+        }
+        let config = MoeExpertResidencyConfig::new(1)?;
+        let mut manager = MoeExpertResidencyManager::new(ordinal, config);
+        let layers = load_all_layer_buffers(
             &store,
             ordinal,
-            li,
             &geom,
             &report.config.text_config,
             weight_prefix,
             weight_mode,
             kv_max_t,
             kv_fp8,
+            None,
+            Some(&mut manager),
         )
-        .with_context(|| format!("load layer {li} weights"))?;
-        layers.push(layer);
-    }
-
+        .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
+        let max_resident_pages = manager
+            .page_budget_for_routed_experts(cap_experts)
+            .context("derive sparse MoE page budget from routed expert tensor layout")?;
+        manager
+            .set_max_resident_pages(max_resident_pages)
+            .context("apply sparse MoE page budget")?;
+        let arena_stats = manager.arena().stats();
+        let residency_stats = manager.stats();
+        println!(
+            "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
+             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+            backend,
+            residency_stats.registered_tensors,
+            max_resident_pages,
+            arena_stats.logical_bytes as f64 / MIB,
+            arena_stats.resident_bytes as f64 / MIB,
+            arena_stats.reserved_bytes as f64 / MIB,
+        );
+        if persistent_decode {
+            println!(
+                "  [vmm] sparse MoE residency will use segmented persistent decode \
+                 (router prefetch + FFN resume per layer)"
+            );
+        }
+        _moe_expert_residency = Some(manager);
+        layers
+    } else if should_try_moe_expert_vmm(moe_vmm_mode, backend, weight_mode, ordinal)? {
+        let mut arena = BakedStore::virtual_weight_arena(ordinal);
+        match load_all_layer_buffers(
+            &store,
+            ordinal,
+            &geom,
+            &report.config.text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            kv_fp8,
+            Some(&mut arena),
+            None,
+        ) {
+            Ok(layers) => {
+                let stats = arena.stats();
+                println!(
+                    "  [vmm] Qwen3.6-MoE routed expert slabs active on backend={} device {ordinal}: \
+                     allocations={} mappings={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                    backend,
+                    stats.allocations,
+                    stats.mapping_count,
+                    stats.logical_bytes as f64 / MIB,
+                    stats.resident_bytes as f64 / MIB,
+                    stats.reserved_bytes as f64 / MIB,
+                );
+                _moe_expert_arena = Some(arena);
+                layers
+            }
+            Err(err) if moe_vmm_mode == MoeExpertVmmMode::Auto => {
+                eprintln!(
+                    "[vmm] Qwen3.6-MoE routed expert VMM load failed ({err:#}); falling back to dense expert buffers"
+                );
+                drop(arena);
+                load_all_layer_buffers(
+                    &store,
+                    ordinal,
+                    &geom,
+                    &report.config.text_config,
+                    weight_prefix,
+                    weight_mode,
+                    kv_max_t,
+                    kv_fp8,
+                    None,
+                    None,
+                )?
+            }
+            Err(err) => return Err(err.context("load Qwen3.6-MoE routed experts into VMM")),
+        }
+    } else {
+        load_all_layer_buffers(
+            &store,
+            ordinal,
+            &geom,
+            &report.config.text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            kv_fp8,
+            None,
+            None,
+        )?
+    };
     // Phase 6 self-speculative decode: load the multi-token-prediction
     // (MTP) head from the bake when --speculative-decode is set.
     //
@@ -2085,26 +2552,114 @@ fn decode_text(
             None
         };
         let lm_head_folded;
+        let moe_telemetry_before = _moe_expert_residency
+            .as_ref()
+            .map(MoeSparseTelemetrySnapshot::capture);
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-            lm_head_folded = fold.is_some();
-            scratch
-                .run(ordinal, &initial_hidden, position, fold)
-                .with_context(|| format!("persistent decode (step {step}, position {position})"))?
+            if let Some(manager) = _moe_expert_residency.as_mut() {
+                // Sparse VMM needs a host remap point after each layer's
+                // router top-k is known. The segmented persistent path keeps
+                // the persistent phase bodies but skips folded lm_head; the
+                // standalone lm_head launch below consumes final_hidden_bytes.
+                lm_head_folded = false;
+                drop(fold);
+                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
+                    for &expert_idx in topk {
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::GateUp,
+                            },
+                        )?;
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::Down,
+                            },
+                        )?;
+                    }
+                    Ok(())
+                };
+                scratch
+                    .run_sparse_with_expert_prefetch(
+                        ordinal,
+                        &initial_hidden,
+                        position,
+                        &mut prefetch,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "segmented persistent sparse decode (step {step}, position {position})"
+                        )
+                    })?
+            } else {
+                lm_head_folded = fold.is_some();
+                scratch
+                    .run(ordinal, &initial_hidden, position, fold)
+                    .with_context(|| {
+                        format!("persistent decode (step {step}, position {position})")
+                    })?
+            }
         } else {
             // Chained path doesn't support the fold; lm_head still
             // launches separately below on gen steps.
             lm_head_folded = false;
             drop(fold);
-            run_chained_decode_fast(
-                ordinal,
-                &geom,
-                &mut layers,
-                &initial_hidden,
-                position,
-                emit_stage_timings,
-            )
+            if let Some(manager) = _moe_expert_residency.as_mut() {
+                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
+                    for &expert_idx in topk {
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::GateUp,
+                            },
+                        )?;
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::Down,
+                            },
+                        )?;
+                    }
+                    Ok(())
+                };
+                run_chained_decode_fast_with_expert_prefetch(
+                    ordinal,
+                    &geom,
+                    &mut layers,
+                    &initial_hidden,
+                    position,
+                    emit_stage_timings,
+                    &mut prefetch,
+                )
+            } else {
+                run_chained_decode_fast(
+                    ordinal,
+                    &geom,
+                    &mut layers,
+                    &initial_hidden,
+                    position,
+                    emit_stage_timings,
+                )
+            }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
+        if let (Some(telemetry), Some(before), Some(manager)) = (
+            moe_sparse_telemetry.as_mut(),
+            moe_telemetry_before,
+            _moe_expert_residency.as_ref(),
+        ) {
+            let after = MoeSparseTelemetrySnapshot::capture(manager);
+            telemetry.record_step(step, position, is_gen_step, before, after);
+        }
         let t_chain_step = t1.elapsed();
         position += 1;
 
@@ -2577,6 +3132,56 @@ fn decode_text(
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
     }
+    if let Some(manager) = _moe_expert_residency.as_ref() {
+        let residency = manager.stats();
+        let arena = manager.arena().stats();
+        if let Some(telemetry) = moe_sparse_telemetry.as_ref() {
+            println!(
+                "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
+                 resident_pages={} peak_pages={} page_backed_slices={} \
+                 hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
+                 uploaded={:.2}MiB unmapped={:.2}MiB \
+                 resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB",
+                residency.resident_slices,
+                telemetry.peak_resident_slices,
+                residency.resident_pages,
+                telemetry.peak_resident_pages,
+                residency.page_backed_slices,
+                residency.hits,
+                residency.misses,
+                residency.page_hits,
+                residency.page_misses,
+                residency.evicted_slices,
+                residency.evicted_pages,
+                residency.uploaded_bytes as f64 / MIB,
+                residency.unmapped_bytes as f64 / MIB,
+                arena.resident_bytes as f64 / MIB,
+                telemetry.peak_resident_bytes as f64 / MIB,
+                arena.reserved_bytes as f64 / MIB,
+            );
+            telemetry.write_json(manager, &generated_ids)?;
+        } else {
+            println!(
+                "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
+                 page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
+                 evicted_slices={} evicted_pages={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 resident={:.2}MiB reserved={:.2}MiB",
+                residency.resident_slices,
+                residency.resident_pages,
+                residency.page_backed_slices,
+                residency.hits,
+                residency.misses,
+                residency.page_hits,
+                residency.page_misses,
+                residency.evicted_slices,
+                residency.evicted_pages,
+                residency.uploaded_bytes as f64 / MIB,
+                residency.unmapped_bytes as f64 / MIB,
+                arena.resident_bytes as f64 / MIB,
+                arena.reserved_bytes as f64 / MIB,
+            );
+        }
+    }
     if emit_stage_timings && gen_steps > 0 {
         let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let chain_ms = to_ms(t_chain);
@@ -2727,6 +3332,8 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
             kv_fp8,
+            None,
+            None,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

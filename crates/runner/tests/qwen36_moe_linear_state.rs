@@ -18,6 +18,7 @@ use anyhow::Result;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_decode::{
     AttnLayerBuffers, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
+    ResidentWeight,
 };
 use runner::qwen36_moe_state::{
     refresh_linear_attn_state, restore_linear_attn_state, save_linear_attn_state,
@@ -76,8 +77,8 @@ fn make_linear_layer(
         ffn: FfnLayerBuffers {
             post_attn_norm_w: stub_bf16(ordinal)?,
             gate_w: stub_bf16(ordinal)?,
-            gate_up_proj_w: stub_u8(ordinal)?,
-            down_proj_w: stub_u8(ordinal)?,
+            gate_up_proj_w: ResidentWeight::Dense(stub_u8(ordinal)?),
+            down_proj_w: ResidentWeight::Dense(stub_u8(ordinal)?),
             shared_gate_proj_w: stub_u8(ordinal)?,
             shared_up_proj_w: stub_u8(ordinal)?,
             shared_down_proj_w: stub_u8(ordinal)?,
@@ -127,8 +128,8 @@ fn make_full_layer(ordinal: usize) -> Result<LayerBuffers> {
         ffn: FfnLayerBuffers {
             post_attn_norm_w: stub_bf16(ordinal)?,
             gate_w: stub_bf16(ordinal)?,
-            gate_up_proj_w: stub_u8(ordinal)?,
-            down_proj_w: stub_u8(ordinal)?,
+            gate_up_proj_w: ResidentWeight::Dense(stub_u8(ordinal)?),
+            down_proj_w: ResidentWeight::Dense(stub_u8(ordinal)?),
             shared_gate_proj_w: stub_u8(ordinal)?,
             shared_up_proj_w: stub_u8(ordinal)?,
             shared_down_proj_w: stub_u8(ordinal)?,

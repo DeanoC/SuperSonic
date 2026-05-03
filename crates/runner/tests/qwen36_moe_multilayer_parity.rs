@@ -33,7 +33,7 @@ use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_decode::{
     bf16_bytes_to_f32, host_final_norm_lm_head, is_full_attn_layer, run_chained_decode,
     AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom,
+    LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
 };
 use runner::qwen36_moe_persistent_decode::PersistentScratch;
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
@@ -415,8 +415,8 @@ fn build_ffn_layer(
             &b64_field(weights, "gate_w"),
             "gate_w",
         ),
-        gate_up_proj_w,
-        down_proj_w,
+        gate_up_proj_w: ResidentWeight::Dense(gate_up_proj_w),
+        down_proj_w: ResidentWeight::Dense(down_proj_w),
         shared_gate_proj_w,
         shared_up_proj_w,
         shared_down_proj_w,
@@ -742,6 +742,23 @@ fn multilayer_persistent_decode_matches_chained() {
     assert_parity_bf16(
         "persistent vs chained final_hidden",
         &persistent_final,
+        &chained.final_hidden_bytes,
+        1e-3,
+        0.99999,
+    );
+
+    // Segmented persistent is the sparse-VMM orchestration: each layer runs
+    // attention + router top-k, returns to the host for remap, then resumes
+    // that layer's FFN. With a no-op remap callback it must match the same
+    // chained reference.
+    restore_linear_attn_state(ordinal, &mut layers, &snapshot)
+        .expect("restore_linear_attn_state before segmented persistent");
+    let segmented_outputs = scratch
+        .run_sparse_with_expert_prefetch(ordinal, &initial_hidden, position, |_layer, _topk| Ok(()))
+        .expect("PersistentScratch::run_sparse_with_expert_prefetch");
+    assert_parity_bf16(
+        "segmented persistent sparse vs chained final_hidden",
+        &segmented_outputs.final_hidden_bytes,
         &chained.final_hidden_bytes,
         1e-3,
         0.99999,

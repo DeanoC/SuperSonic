@@ -29,8 +29,9 @@
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc,
-    Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
+    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeDecodeLayerDesc,
+    Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom,
+    Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
 };
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -79,8 +80,9 @@ pub struct PersistentScratch {
     /// F32 shared scratch sized for `max(full_attn, linear_attn, ffn)`
     /// workspace footprints.
     pub workspace: GpuBuffer,
-    /// `[top_k]` i32 — only consumed by the FFN phase at stage 1; passed
-    /// to satisfy the kernel signature (its body never derefs at stage 5).
+    /// `[top_k]` i32. The full megakernel keeps this as internal FFN
+    /// scratch; segmented sparse-VMM decode downloads it after router-only
+    /// launches to know which expert pages to remap.
     pub ffn_topk_idx_scratch: GpuBuffer,
     /// 96-byte sync_buf: counters[0..16] + barrier_counter (+64) +
     /// barrier_flag (+68). Bridge zeros it on every launch.
@@ -92,11 +94,7 @@ impl PersistentScratch {
     /// `layers` only for descriptor construction (mutable state pointers
     /// are cached into the descs); subsequent [`Self::run`] calls don't
     /// need `&mut layers`.
-    pub fn new(
-        ordinal: usize,
-        geom: &MultiLayerGeom,
-        layers: &mut [LayerBuffers],
-    ) -> Result<Self> {
+    pub fn new(ordinal: usize, geom: &MultiLayerGeom, layers: &mut [LayerBuffers]) -> Result<Self> {
         let num_layers = layers.len();
         let descs = build_layer_descs(layers);
         let layer_descs_dev =
@@ -268,6 +266,128 @@ impl PersistentScratch {
             kernel_linear_attn_us: 0,
             kernel_ffn_us: 0,
         })
+    }
+
+    /// Sparse MoE residency variant. Each layer is split into:
+    ///
+    /// 1. attention/linear-attention + router top-k
+    /// 2. host VMM remap for the routed experts
+    /// 3. FFN completion for that layer
+    ///
+    /// This keeps the persistent phase bodies in use while preserving the
+    /// host-side remap point required by HIP VMM. The folded lm_head phase is
+    /// intentionally not run here; callers keep using the standalone
+    /// `lm_head_launch` path after downloading `final_hidden_bytes`.
+    pub fn run_sparse_with_expert_prefetch<F>(
+        &mut self,
+        ordinal: usize,
+        initial_hidden_bytes: &[u8],
+        position: i32,
+        mut prefetch: F,
+    ) -> Result<DecodeOutputs>
+    where
+        F: FnMut(usize, &[usize]) -> Result<()>,
+    {
+        let hidden_bytes = self.geom.hidden as usize * 2;
+        if initial_hidden_bytes.len() != hidden_bytes {
+            return Err(anyhow!(
+                "initial_hidden_bytes len {} != expected {} (hidden*2 BF16 bytes)",
+                initial_hidden_bytes.len(),
+                hidden_bytes,
+            ));
+        }
+        copy_h2d(
+            ordinal,
+            self.hidden_ping.as_mut_ptr(),
+            initial_hidden_bytes.as_ptr() as *const _,
+            hidden_bytes,
+        )
+        .context("h2d initial_hidden -> hidden_ping")?;
+
+        let t_launch = std::time::Instant::now();
+        for layer_idx in 0..self.num_layers {
+            persistent_decode_launch_range(
+                ordinal,
+                ScalarType::BF16,
+                self.geom,
+                layer_idx,
+                layer_idx + 1,
+                Qwen36MoePersistentMode::RouterOnly,
+                position,
+                &self.layer_descs_dev,
+                self.int4_scales_dev.as_ref(),
+                self.kv_fp8_descs_dev.as_ref(),
+                self.num_layers,
+                &mut self.hidden_ping,
+                &mut self.hidden_pong,
+                &mut self.workspace,
+                &mut self.ffn_topk_idx_scratch,
+                &mut self.sync_buf,
+                None,
+            )
+            .map_err(|e: GpuError| anyhow!(e))
+            .with_context(|| format!("persistent router-only launch (layer {layer_idx})"))?;
+
+            let topk = self
+                .download_topk_indices(ordinal)
+                .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
+            prefetch(layer_idx, &topk)
+                .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
+
+            persistent_decode_launch_range(
+                ordinal,
+                ScalarType::BF16,
+                self.geom,
+                layer_idx,
+                layer_idx + 1,
+                Qwen36MoePersistentMode::FfnOnly,
+                position,
+                &self.layer_descs_dev,
+                self.int4_scales_dev.as_ref(),
+                self.kv_fp8_descs_dev.as_ref(),
+                self.num_layers,
+                &mut self.hidden_ping,
+                &mut self.hidden_pong,
+                &mut self.workspace,
+                &mut self.ffn_topk_idx_scratch,
+                &mut self.sync_buf,
+                None,
+            )
+            .map_err(|e: GpuError| anyhow!(e))
+            .with_context(|| format!("persistent ffn-only launch (layer {layer_idx})"))?;
+        }
+        let elapsed_us = t_launch.elapsed().as_micros() as u64;
+
+        let mut final_hidden_bytes = vec![0u8; hidden_bytes];
+        copy_d2h(
+            ordinal,
+            final_hidden_bytes.as_mut_ptr() as *mut _,
+            self.hidden_ping.as_ptr(),
+            hidden_bytes,
+        )
+        .context("d2h hidden_ping -> final_hidden_bytes")?;
+
+        Ok(DecodeOutputs {
+            final_hidden_bytes,
+            per_layer_attn_out: Vec::new(),
+            per_layer_ffn_out: Vec::new(),
+            kernel_full_attn_us: elapsed_us,
+            kernel_linear_attn_us: 0,
+            kernel_ffn_us: 0,
+        })
+    }
+
+    fn download_topk_indices(&self, ordinal: usize) -> Result<Vec<usize>> {
+        let top_k = self.geom.top_k as usize;
+        let mut host = vec![0u32; top_k];
+        copy_d2h(
+            ordinal,
+            host.as_mut_ptr() as *mut _,
+            self.ffn_topk_idx_scratch.as_ptr(),
+            top_k * std::mem::size_of::<u32>(),
+        )
+        .context("d2h ffn_topk_idx_scratch")?;
+        Ok(host.into_iter().map(|idx| idx as usize).collect())
     }
 }
 
@@ -457,4 +577,101 @@ pub fn upload_descs<T: Sized>(ordinal: usize, descs: &[T]) -> Result<GpuBuffer, 
         bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(p, per) });
     }
     GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen36_moe_decode::{FfnLayerBuffers, ResidentWeight};
+    use gpu_hal::{Backend, VirtualAllocationRole, VirtualArena, VirtualBacking};
+
+    fn stub_bf16(ordinal: usize) -> Result<GpuBuffer> {
+        Ok(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1])?)
+    }
+
+    fn stub_u8(ordinal: usize) -> Result<GpuBuffer> {
+        Ok(GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?)
+    }
+
+    #[test]
+    fn layer_desc_uses_virtual_expert_weight_pointers() {
+        if !gpu_hal::is_backend_compiled(Backend::Hip) {
+            eprintln!("skip: HIP backend not compiled");
+            return;
+        }
+        gpu_hal::set_backend(Backend::Hip);
+        let ordinal = 0usize;
+        if !gpu_hal::vmm_is_supported(Backend::Hip, ordinal) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let mut arena = VirtualArena::new(ordinal, VirtualBacking::CpuBackup);
+        let gate_up_id = arena
+            .reserve(
+                "test.gate_up_proj",
+                VirtualAllocationRole::MoeExpert,
+                ScalarType::U8,
+                &[4096],
+            )
+            .expect("reserve virtual gate_up");
+        let down_id = arena
+            .reserve(
+                "test.down_proj",
+                VirtualAllocationRole::MoeExpert,
+                ScalarType::U8,
+                &[4096],
+            )
+            .expect("reserve virtual down");
+        let gate_up_buf = arena.allocation(gate_up_id).unwrap().buffer();
+        let down_buf = arena.allocation(down_id).unwrap().buffer();
+        let gate_up_ptr = gate_up_buf.as_ptr();
+        let down_ptr = down_buf.as_ptr();
+
+        let mut layers = vec![LayerBuffers {
+            attn: AttnLayerBuffers::Linear {
+                input_norm_w: stub_bf16(ordinal).unwrap(),
+                in_proj_qkv_w: stub_u8(ordinal).unwrap(),
+                in_proj_z_w: stub_u8(ordinal).unwrap(),
+                in_proj_a_w: stub_bf16(ordinal).unwrap(),
+                in_proj_b_w: stub_bf16(ordinal).unwrap(),
+                conv1d_w: stub_bf16(ordinal).unwrap(),
+                conv1d_bias: None,
+                dt_bias: stub_bf16(ordinal).unwrap(),
+                a_log: stub_bf16(ordinal).unwrap(),
+                norm_w: stub_bf16(ordinal).unwrap(),
+                out_proj_w: stub_u8(ordinal).unwrap(),
+                conv_state: stub_bf16(ordinal).unwrap(),
+                recurrent_state: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1]).unwrap(),
+                int4: None,
+            },
+            ffn: FfnLayerBuffers {
+                post_attn_norm_w: stub_bf16(ordinal).unwrap(),
+                gate_w: stub_bf16(ordinal).unwrap(),
+                gate_up_proj_w: ResidentWeight::Virtual {
+                    allocation_id: gate_up_id,
+                    ptr: gate_up_ptr,
+                    dtype: gate_up_buf.dtype(),
+                    shape: gate_up_buf.shape().to_vec(),
+                    len_bytes: gate_up_buf.len_bytes(),
+                },
+                down_proj_w: ResidentWeight::Virtual {
+                    allocation_id: down_id,
+                    ptr: down_ptr,
+                    dtype: down_buf.dtype(),
+                    shape: down_buf.shape().to_vec(),
+                    len_bytes: down_buf.len_bytes(),
+                },
+                shared_gate_proj_w: stub_u8(ordinal).unwrap(),
+                shared_up_proj_w: stub_u8(ordinal).unwrap(),
+                shared_down_proj_w: stub_u8(ordinal).unwrap(),
+                shared_expert_gate_w: stub_bf16(ordinal).unwrap(),
+                int4: None,
+            },
+        }];
+
+        let descs = build_layer_descs(&mut layers);
+        assert_eq!(descs[0].experts_gate_up_w, gate_up_ptr);
+        assert_eq!(descs[0].experts_down_w, down_ptr);
+    }
 }

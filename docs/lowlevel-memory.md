@@ -7,9 +7,10 @@ the existing allocator.
 
 The first consumer is Qwen3.5 BF16 dense KV in single-sequence mode. When a
 context limit is known and VMM support probes successfully, full-attention K/V
-caches reserve stable virtual addresses for the full context. On the current
-HIP path Qwen uses separate K and V reservations per full-attention layer.
-HIP VMM mappings use a conservative 2 MiB minimum page size even when ROCm
+caches reserve stable virtual addresses for the full context. On HIP and CUDA,
+Qwen uses separate K and V reservations per full-attention layer. CUDA remains
+opt-in with `SUPERSONIC_VMM_KV=1` for this first runtime lane. HIP VMM mappings
+use a conservative 2 MiB minimum page size even when ROCm
 reports a smaller recommended granularity; raw HIP repro tests showed repeated
 sub-2 MiB remap/restore corrupts earlier mappings on gfx1100, while the same
 sequence with 2 MiB mappings survives. The floor can be overridden for
@@ -29,8 +30,9 @@ by allocation role.
 
 Current scope:
 
-- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV and
-  for Qwen3.6-MoE FP8 KV (opt-in via `SUPERSONIC_VMM_KV=1` on either).
+- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV, for
+  Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active,
+  and for Qwen3.6-MoE FP8 KV (opt-in via `SUPERSONIC_VMM_KV=1`).
 - Disabled for certified-KV, batch decode, Qwen3.5 4B/component decode,
   DFlash cloned states, Gemma4, and Llama3.1. Qwen3.5 KV-FP8 also remains
   disabled — enabling it is a separate effort.
@@ -40,22 +42,64 @@ Current scope:
   ([num_kv_heads, kv_max_t, head_dim]) stay as dense `GpuBuffer` for v1.
   See Tasks 9–11 of `docs/superpowers/plans/2026-05-03-qwen36-moe-fp8-kv-fp8.md`.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
-  `model-store::BakedStore::load_to_virtual_arena`. This is the first real
-  virtual-weight/MoE-island path: it uses the bake mmap as the source of truth,
-  assigns allocation roles (`Weights` or `MoeExpert`), maps stable VMM
-  addresses, and uploads tensor bytes into those mappings. This is not yet a
-  decode-active weight path; existing Qwen3.6-MoE decode descriptors still own
-  and consume dense `GpuBuffer` weights.
+  `model-store::BakedStore::load_to_virtual_arena`. `BakedStore` also exposes
+  split reserve/upload APIs so a tensor can reserve a stable virtual base while
+  only selected byte ranges are made resident.
+- Qwen3.6-MoE has a sparse routed-expert residency manager in
+  `runner::qwen36_moe_residency`. It reserves the fused
+  `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` slabs, pins the VMM
+  backing pages that contain routed `(layer, expert, projection)` slices from
+  the mmap-backed bake, evicts with a bounded page-LRU policy, and invalidates
+  every logical resident slice covered by an unmapped VMM page.
+- Qwen3.6-MoE sparse expert residency is backend-aware at the VMM policy layer
+  and is unit-tested on supported HIP/CUDA VMM backends. Full Qwen3.6-MoE
+  decode kernels are still HIP-only; CUDA runtime decode remains blocked before
+  kernel launch.
+- `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` activates router-driven sparse MoE
+  islands for Qwen3.6-MoE INT4 decode. With persistent decode enabled (the
+  default), SuperSonic uses a segmented persistent path: each layer first runs
+  attention or linear attention plus FFN router top-k, returns to the host to
+  pin the selected experts' gate/up and down slices, then resumes that layer's
+  FFN against the stable virtual slab pointers. If persistent decode is
+  explicitly disabled, the chained path uses the same host remap point by
+  running FFN stage 1 before the stage-5 FFN launch. The cap is expressed in
+  experts; after all sparse expert tensors are registered, SuperSonic derives
+  the VMM page budget from the actual worst-case gate/up and down page
+  footprint for one routed expert. Logical slice hit/miss counters still track
+  router demand; page hit/miss counters track physical residency. Sparse
+  islands copy the full VMM backing page for any touched expert slice, so every
+  expert sharing that resident page contains real bake data rather than zero
+  fill.
+- `SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON=/path/report.json` records sparse
+  MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
+  uploads, evictions, resident slices, resident pages, page-backed slice count,
+  resident physical bytes, the active sparse decode path
+  (`segmented_persistent` or `chained`), plus summary peaks. This is intended
+  for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts instead
+  of relying on one-token smoke numbers.
+- On the HIP/gfx1100 validation machine, page-budgeted sparse MoE passed the
+  two-token Qwen3.6-MoE smoke at the default 256-expert cap, the smallest
+  top-k-sized 8-expert cap, and a 320-expert cap (`640` resident VMM pages).
+  The earlier high-cap page-not-present fault was tied to slice-budgeting more
+  logical residents than the physical VMM page working set could represent.
 - `SUPERSONIC_VMM_WEIGHT_PROBE=1` makes Qwen3.6-MoE dry-run load
   `lm_head.weight` into a virtual `Weights` allocation when an INT4 bake is
   present.
 - `SUPERSONIC_VMM_MOE_ISLAND_PROBE=1` or
   `SUPERSONIC_VMM_MOE_ISLAND_PROBE_LAYERS=N` makes Qwen3.6-MoE dry-run load
   the first N layers' fused expert slabs into virtual `MoeExpert` allocations
-  and report logical/resident/reserved bytes. This is a residency probe only;
-  decode still uses the existing `GpuBuffer` descriptors.
+  and report logical/resident/reserved bytes without running decode.
+- `SUPERSONIC_VMM_MOE_ISLANDS=0` disables Qwen3.6-MoE decode-active virtual
+  expert slabs. When unset, Qwen3.6-MoE INT4 decode auto-enables them on
+  supported HIP devices and falls back to dense expert buffers if VMM loading
+  fails. `SUPERSONIC_VMM_MOE_ISLANDS=1` makes unsupported or failed VMM expert
+  loading a hard error.
+- `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` switches Qwen3.6-MoE INT4 decode from
+  fully resident virtual expert slabs to sparse router-prefetched islands with
+  at most `N` experts' two routed projections tracked resident at once.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 integration.
 - `SUPERSONIC_VMM_KV=1` requests it and logs if the backend cannot support it.
+  HIP may auto-enable when unset; CUDA requires this explicit opt-in.
 - `SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1` backs virtual KV to host RAM after
   prefill, unmaps the device pages, reports zero resident bytes, then restores
   decode state before decode. By default this uses a compact logical-prefix
@@ -70,18 +114,39 @@ The HAL type also carries explicit `CpuBackup` versus `Discard` backing tags.
 The Qwen3.5 dense KV proof reserves VMM-backed caches and uses compact CPU
 logical backups for the opt-in eviction policy. The lower-level HAL still
 exercises real D2H backup, unmap/release, remap, and H2D restore in focused HIP
-tests.
+and CUDA tests.
 
 ## Validation Snapshot
 
-The branch was validated on HIP/gfx1100 with ROCm VMM support:
+The branch was validated on HIP/gfx1100 with ROCm VMM support. CUDA coverage
+uses the same HAL VMM primitives and the Qwen3.5 ignored smoke test can be run
+on CUDA devices with `SUPERSONIC_VMM_KV=1`:
 
 - Raw HIP VMM repro: repeated sub-2 MiB remap/restore corrupts earlier mappings
   on gfx1100; the same sequence passes with a 2 MiB mapping floor.
 - HAL arena tests:
   `SUPERSONIC_BACKENDS=hip cargo test -p gpu-hal --test vmm_round_trip vmm_arena_ -- --nocapture`
+- CUDA HAL VMM primitive tests:
+  `SUPERSONIC_BACKENDS=cuda cargo test -p gpu-hal --test cuda_vmm_round_trip -- --nocapture`
 - Baked tensor VMM upload test:
   `SUPERSONIC_BACKENDS=hip cargo test -p model-store virtual_arena_loads_baked_weight_and_expert_tensors -- --nocapture`
+- Qwen3.6-MoE sparse residency manager tests:
+  `SUPERSONIC_BACKENDS=hip cargo test -p runner qwen36_moe_residency -- --nocapture`
+- CUDA Qwen3.6-MoE sparse residency manager tests:
+  `SUPERSONIC_BACKENDS=cuda cargo test -p runner qwen36_moe_residency -- --nocapture`
+- Qwen3.6-MoE sparse router-prefetch smoke:
+  `SUPERSONIC_BACKENDS=hip SUPERSONIC_VMM_MOE_ISLANDS=1 SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=8 cargo run --release --bin supersonic -- --backend hip --model qwen3.6-35b-a3b --model-dir /mnt/data/models/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1`
+  generated `[11]` and reported `resident=32.00MiB` for the 15 GiB routed
+  expert VA reservation after the run. With persistent decode left at its
+  default, the run reports segmented persistent sparse decode.
+- Qwen3.6-MoE sparse-vs-dense VMM e2e gate:
+  `SUPERSONIC_BACKENDS=hip SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_sparse_vmm_smoke -- --ignored --nocapture`
+  compares dense virtual expert slabs with sparse router-prefetched slabs over
+  multiple generated tokens and validates the telemetry JSON cap/peak fields.
+  The default test cap is 256 experts; override with
+  `SUPERSONIC_TEST_QWEN36_MOE_SPARSE_CAP_EXPERTS=8` for the smallest
+  top-k-sized residency window, or with a larger value when investigating HIP
+  live-mapping limits.
 - Qwen3.5 virtual KV e2e with eviction and restore-to-VMM:
   `SUPERSONIC_VMM_KV=1 SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1 SUPERSONIC_VMM_KV_RESTORE_TO_VMM=1 ... --validate`
   passed and kept stable VMM pointers through decode.

@@ -2881,48 +2881,39 @@ __device__ void g4_persistent_decode_body(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_A1_INPUT_NORM, g4_prof);
 
-        // A2: work-stealing QKV matmul (reset counter first).
+        // A2: static QKV matmul. Q/K/V rows all have hidden_size inputs, so
+        // static row assignment avoids per-row atomic claims.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // Wave-per-row QKV matmul: each wave independently steals a row via
-        // atomicAdd + __shfl broadcast, accumulates with 4-wide BF16 loads
-        // (or per-block FP8 dequant when use_fp8_w), reduces with wave
-        // shuffle. No __syncthreads per row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const int total_qkv = shared_kv ? q_dim : (q_dim + 2 * kv_dim);
             const int vd4 = hidden_size & ~3;
-            while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(total_qkv)) break;
-
+            for (int row = blockIdx.x * warps_per_block + warp_id;
+                 row < total_qkv;
+                 row += nb * warps_per_block) {
                 int weight_row;
                 const T* w_bf16;
                 const void* wbase_fp8 = nullptr;
                 const void* sbase_fp8 = nullptr;
-                if (row < static_cast<unsigned int>(q_dim)) {
+                if (row < q_dim) {
                     w_bf16 = q_proj_w;
-                    weight_row = static_cast<int>(row);
+                    weight_row = row;
                     if (use_fp8_w) {
                         wbase_fp8 = static_cast<const void*>(q_proj_w);
                         sbase_fp8 = Sfp8.q_proj_scale;
                     }
-                } else if (row < static_cast<unsigned int>(q_dim + kv_dim)) {
+                } else if (row < q_dim + kv_dim) {
                     w_bf16 = k_proj_w;
-                    weight_row = static_cast<int>(row - q_dim);
+                    weight_row = row - q_dim;
                     if (use_fp8_w) {
                         wbase_fp8 = static_cast<const void*>(k_proj_w);
                         sbase_fp8 = Sfp8.k_proj_scale;
                     }
                 } else {
                     w_bf16 = v_proj_w;
-                    weight_row = static_cast<int>(row - q_dim - kv_dim);
+                    weight_row = row - q_dim - kv_dim;
                     if (use_fp8_w) {
                         wbase_fp8 = static_cast<const void*>(v_proj_w);
                         sbase_fp8 = Sfp8.v_proj_scale;
@@ -3011,16 +3002,21 @@ __device__ void g4_persistent_decode_body(
         const int num_q_per_kv = num_q_heads / num_kv_heads;
         {
             const int total_items = num_q_heads * kv_len;
+            const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const uint8_t* k_cache_fp8 = use_fp8_kv
                 ? reinterpret_cast<const uint8_t*>(L.kv_cache_k)
                 : nullptr;
-            for (int item = blockIdx.x * bs + tid;
-                 item < total_items; item += nb * bs) {
+            for (int item = blockIdx.x * warps_per_block + warp_id;
+                 item < total_items; item += nb * warps_per_block) {
                 const int t = item % kv_len;
                 const int q_h = item / kv_len;
-                float val;
+                float val = -INFINITY;
                 if (t < min_t) {
-                    val = -INFINITY;
+                    if (lane == 0) {
+                        scores_f32[static_cast<size_t>(q_h) * max_T + t] = val;
+                    }
                 } else {
                     const int kv_h = q_h / num_q_per_kv;
                     const float* qr = q_f32 +
@@ -3031,19 +3027,21 @@ __device__ void g4_persistent_decode_body(
                             (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
                         const float k_s =
                             kv_scale_k[static_cast<size_t>(kv_h) * max_T + t];
-                        for (int d = 0; d < head_dim; ++d) {
+                        for (int d = lane; d < head_dim; d += warpSize) {
                             acc += qr[d] * (g4_fp8_e4m3_to_float(kr_fp8[d]) * k_s);
                         }
                     } else {
                         const T* kr = k_cache +
                             (static_cast<size_t>(kv_h) * max_T + t) * head_dim;
-                        for (int d = 0; d < head_dim; ++d) {
+                        for (int d = lane; d < head_dim; d += warpSize) {
                             acc += qr[d] * g4_to_float(kr[d]);
                         }
                     }
-                    val = acc * scale;
+                    val = g4_wave_reduce_sum_f32(acc) * scale;
+                    if (lane == 0) {
+                        scores_f32[static_cast<size_t>(q_h) * max_T + t] = val;
+                    }
                 }
-                scores_f32[static_cast<size_t>(q_h) * max_T + t] = val;
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -3119,22 +3117,16 @@ __device__ void g4_persistent_decode_body(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_A6_VALUE, g4_prof);
 
-        // A7: work-stealing o_proj.
+        // A7: static o_proj matvec.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // A7 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const int vd4 = q_dim & ~3;
-            while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(hidden_size)) break;
+            for (int row = blockIdx.x * warps_per_block + warp_id;
+                 row < hidden_size;
+                 row += nb * warps_per_block) {
                 float p = 0.0f;
                 if (use_fp8_w) {
                     const void* wbase = static_cast<const void*>(o_proj_w);
@@ -3249,23 +3241,17 @@ __device__ void g4_persistent_decode_body(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_B1_PRE_FF_NORM, g4_prof);
 
-        // B2: work-stealing gate+up matmul.
+        // B2: static gate+up matmul. All gate/up rows have the same width, so
+        // static row assignment avoids per-row atomic claims.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // B2 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const int vd4 = hidden_size & ~3;
-            while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(intermediate_size)) break;
-
+            for (int row = blockIdx.x * warps_per_block + warp_id;
+                 row < intermediate_size;
+                 row += nb * warps_per_block) {
                 const int weight_row = static_cast<int>(row);
                 float gate_p = 0.0f;
                 float up_p = 0.0f;
@@ -3423,23 +3409,16 @@ __device__ void g4_persistent_decode_body(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_B6_PRE_PLE_RESID, g4_prof);
 
-        // B7: work-stealing per_layer_input_gate matvec.
+        // B7: static per_layer_input_gate matvec.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // B7 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const int vd4 = hidden_size & ~3;
-            while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(ple_hidden)) break;
-
+            for (int row = blockIdx.x * warps_per_block + warp_id;
+                 row < ple_hidden;
+                 row += nb * warps_per_block) {
                 float p = 0.0f;
                 if (use_fp8_w) {
                     const void* wbase = static_cast<const void*>(pli_gate_w);
@@ -3486,23 +3465,16 @@ __device__ void g4_persistent_decode_body(
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_B8_PLE_ACT, g4_prof);
 
-        // B9: work-stealing per_layer_projection matvec.
+        // B9: static per_layer_projection matvec.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // B9 wave-per-row.
         {
             const int lane = tid % warpSize;
+            const int warp_id = tid / warpSize;
+            const int warps_per_block = bs / warpSize;
             const int vd4 = ple_hidden & ~3;
-            while (true) {
-                unsigned int row;
-                if (lane == 0) row = atomicAdd(matvec_counter, 1u);
-                row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(hidden_size)) break;
-
+            for (int row = blockIdx.x * warps_per_block + warp_id;
+                 row < hidden_size;
+                 row += nb * warps_per_block) {
                 float p = 0.0f;
                 if (use_fp8_w) {
                     const void* wbase = static_cast<const void*>(pli_proj_w);

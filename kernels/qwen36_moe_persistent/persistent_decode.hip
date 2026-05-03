@@ -92,6 +92,12 @@ __device__ inline void reset_counters_16(
     grid_barrier(barrier_counter, barrier_flag, num_blocks);
 }
 
+enum PersistentDecodeMode {
+    PERSISTENT_MODE_FULL = 0,
+    PERSISTENT_MODE_ROUTER_ONLY = 1,
+    PERSISTENT_MODE_FFN_ONLY = 2,
+};
+
 // Persistent decode kernel template. Instantiated by the bridge for
 // (T=hip_bfloat16, USE_WMMA={true,false}) at launch time based on
 // `device_supports_wmma_bf16(ordinal)` + dim divisibility.
@@ -106,6 +112,9 @@ __device__ inline void reset_counters_16(
 template <typename T, bool USE_WMMA>
 __global__ void qwen36_moe_persistent_decode_kernel(
     int                                  num_layers,
+    int                                  start_layer,
+    int                                  end_layer_exclusive,
+    int                                  mode,
     const DecodeLayerDesc* __restrict__  layers,
     const Int4ScaleDesc*   __restrict__  int4_scales,           // nullable
     const KVCacheFp8Desc*  __restrict__  kv_fp8_descs,          // nullable
@@ -149,7 +158,45 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     T* in_buf  = hidden_ping;
     T* out_buf = hidden_pong;
 
-    for (int li = 0; li < num_layers; ++li) {
+    if (mode == PERSISTENT_MODE_FFN_ONLY) {
+        const DecodeLayerDesc& d = layers[start_layer];
+        const Int4ScaleDesc* i4 =
+            (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
+        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+
+        qwen36_moe_ffn_step_device<T, USE_WMMA>(
+            /*stage*/ 5,
+            hidden, num_experts,
+            moe_intermediate, shared_intermediate, top_k,
+            rms_norm_eps,
+            hidden_pong,
+            static_cast<const T*>(d.post_attn_norm_w),
+            static_cast<const T*>(d.router_w),
+            static_cast<const T*>(d.experts_gate_up_w),
+            static_cast<const T*>(d.experts_down_w),
+            static_cast<const T*>(d.shared_expert_gate_proj_w),
+            static_cast<const T*>(d.shared_expert_up_proj_w),
+            static_cast<const T*>(d.shared_expert_down_proj_w),
+            static_cast<const T*>(d.shared_expert_gate_w),
+            i4_gs,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_gate_up_zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_scale)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->experts_down_zero)     : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_gate_proj_zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_scale)   : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_up_proj_zero)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->shared_expert_down_proj_zero)  : nullptr,
+            hidden_ping,
+            ffn_topk_idx_scratch,
+            workspace,
+            counters, barrier_counter, barrier_flag);
+        return;
+    }
+
+    for (int li = start_layer; li < end_layer_exclusive; ++li) {
         const DecodeLayerDesc& d = layers[li];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[li] : nullptr;
@@ -237,8 +284,9 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         out_buf = tmp;
 
         // ---- FFN ----
+        const int ffn_stage = (mode == PERSISTENT_MODE_ROUTER_ONLY) ? 1 : 5;
         qwen36_moe_ffn_step_device<T, USE_WMMA>(
-            /*stage*/ 5,
+            ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
             rms_norm_eps,
@@ -266,6 +314,13 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             ffn_topk_idx_scratch,
             workspace,
             counters, barrier_counter, barrier_flag);
+
+        if (mode == PERSISTENT_MODE_ROUTER_ONLY) {
+            // The post-attention hidden stays in hidden_pong. The host can
+            // read ffn_topk_idx_scratch, remap sparse expert pages, then
+            // resume this layer with PERSISTENT_MODE_FFN_ONLY.
+            return;
+        }
 
         // Reset counters before the next layer's attn (which only touches
         // counters[0], so resetting all 16 is over-conservative but still

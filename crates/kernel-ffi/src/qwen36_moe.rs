@@ -294,6 +294,9 @@ extern "C" {
         dtype: c_int,
         device_ordinal: usize,
         num_layers: c_int,
+        start_layer: c_int,
+        end_layer_exclusive: c_int,
+        mode: c_int,
         layers: *const Qwen36MoeDecodeLayerDesc,
         int4_scales: *const Qwen36MoeInt4ScaleDesc,
         // Null when KV-FP8 is off globally. Otherwise an array of
@@ -770,11 +773,69 @@ pub struct Qwen36MoePersistentLmHeadFold<'a> {
     pub vocab: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36MoePersistentMode {
+    Full,
+    RouterOnly,
+    FfnOnly,
+}
+
+impl Qwen36MoePersistentMode {
+    fn as_ffi(self) -> c_int {
+        match self {
+            Self::Full => 0,
+            Self::RouterOnly => 1,
+            Self::FfnOnly => 2,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn persistent_decode_launch(
     ordinal: usize,
     dtype: ScalarType,
     geom: Qwen36MoePersistentGeom,
+    position: i32,
+    layers_device: &GpuBuffer,
+    int4_scales_device: Option<&GpuBuffer>,
+    kv_fp8_descs_device: Option<&GpuBuffer>,
+    num_layers: usize,
+    hidden_ping: &mut GpuBuffer,
+    hidden_pong: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    ffn_topk_idx_scratch: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    lm_head_fold: Option<Qwen36MoePersistentLmHeadFold<'_>>,
+) -> Result<(), GpuError> {
+    persistent_decode_launch_range(
+        ordinal,
+        dtype,
+        geom,
+        0,
+        num_layers,
+        Qwen36MoePersistentMode::Full,
+        position,
+        layers_device,
+        int4_scales_device,
+        kv_fp8_descs_device,
+        num_layers,
+        hidden_ping,
+        hidden_pong,
+        workspace,
+        ffn_topk_idx_scratch,
+        sync_buf,
+        lm_head_fold,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn persistent_decode_launch_range(
+    ordinal: usize,
+    dtype: ScalarType,
+    geom: Qwen36MoePersistentGeom,
+    start_layer: usize,
+    end_layer_exclusive: usize,
+    mode: Qwen36MoePersistentMode,
     position: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
@@ -823,6 +884,9 @@ pub fn persistent_decode_launch(
                     dtype.kernel_dtype_code(),
                     ordinal,
                     num_layers as c_int,
+                    start_layer as c_int,
+                    end_layer_exclusive as c_int,
+                    mode.as_ffi(),
                     layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
                     int4_ptr,
                     kv_fp8_ptr,
