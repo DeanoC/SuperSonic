@@ -9,6 +9,8 @@ use crate::qwen36_moe_residency::{MoeExpertResidencyConfig, MoeExpertResidencyMa
 use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry, VirtualKvStats};
 
 const MIB: f64 = (1024 * 1024) as f64;
+pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_RANKS: usize = 4;
+pub(crate) const DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeExpertVmmMode {
@@ -39,10 +41,13 @@ pub(crate) struct Qwen36DecodeLayers {
 pub(crate) struct MoeRuntimeConfig {
     pub(crate) vmm_mode: MoeExpertVmmMode,
     pub(crate) island_cap_experts: Option<usize>,
+    pub(crate) protected_experts: Option<usize>,
     pub(crate) sparse_requested: bool,
     pub(crate) prefetch_mode: MoeIslandPrefetchMode,
     pub(crate) prefetch_ranks: usize,
     pub(crate) transition_min_observations: u32,
+    pub(crate) async_prefetch: bool,
+    pub(crate) async_staging_pages: usize,
     pub(crate) sparse_telemetry: Option<MoeSparseTelemetry>,
 }
 
@@ -64,6 +69,23 @@ pub(crate) fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS must be > 0");
     }
     Ok(Some(cap))
+}
+
+pub(crate) fn moe_island_protected_experts_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS={raw:?} as non-negative integer")
+    })?;
+    Ok((value > 0).then_some(value))
+}
+
+pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
+    moe_island_protected_experts_from_env_value(raw.as_deref())
 }
 
 pub(crate) fn moe_island_prefetch_ranks_from_env_value(
@@ -103,11 +125,25 @@ pub(crate) fn moe_island_prefetch_ranks_from_env_value(
     }
 }
 
-pub(crate) fn moe_island_prefetch_ranks_from_env(
+pub(crate) fn moe_island_prefetch_mode_from_env_for_sparse(
+    sparse_moe_requested: bool,
+) -> Result<MoeIslandPrefetchMode> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH").ok();
+    match raw.as_deref() {
+        None if sparse_moe_requested => Ok(MoeIslandPrefetchMode::Transition),
+        _ => MoeIslandPrefetchMode::from_env_value(raw.as_deref()),
+    }
+}
+
+pub(crate) fn moe_island_prefetch_ranks_from_env_for_sparse(
     mode: MoeIslandPrefetchMode,
     top_k: usize,
+    sparse_moe_requested: bool,
 ) -> Result<usize> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
+        return Ok(DEFAULT_SPARSE_MOE_PREFETCH_RANKS.min(top_k));
+    }
     moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
 }
 
@@ -133,20 +169,59 @@ pub(crate) fn moe_island_prefetch_transition_min_observations_from_env_value(
     })
 }
 
-pub(crate) fn moe_island_prefetch_transition_min_observations(
+pub(crate) fn moe_island_prefetch_transition_min_observations_for_sparse(
     mode: MoeIslandPrefetchMode,
+    sparse_moe_requested: bool,
 ) -> Result<u32> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
+        return Ok(DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS);
+    }
     moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
+}
+
+pub(crate) fn moe_island_async_prefetch_from_env_value(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
+        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn moe_island_async_prefetch_from_env() -> Result<bool> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH").ok();
+    moe_island_async_prefetch_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_async_staging_pages_from_env_value(raw: Option<&str>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(4);
+    };
+    let pages = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES={raw:?} as positive integer")
+    })?;
+    if pages == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES must be > 0");
+    }
+    Ok(pages)
+}
+
+pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES").ok();
+    moe_island_async_staging_pages_from_env_value(raw.as_deref())
 }
 
 pub(crate) fn prepare_moe_runtime_config(
     speculative_decode: bool,
     persistent_decode: bool,
+    backend: Backend,
     top_k: usize,
 ) -> Result<MoeRuntimeConfig> {
     let vmm_mode = MoeExpertVmmMode::from_env()?;
     let island_cap_experts = moe_island_cap_experts_from_env()?;
+    let protected_experts = moe_island_protected_experts_from_env()?;
     if island_cap_experts.is_some() && speculative_decode {
         anyhow::bail!(
             "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
@@ -159,12 +234,39 @@ pub(crate) fn prepare_moe_runtime_config(
     }
 
     let sparse_requested = island_cap_experts.is_some();
-    let prefetch_mode = MoeIslandPrefetchMode::from_env()?;
-    let prefetch_ranks = moe_island_prefetch_ranks_from_env(prefetch_mode, top_k)?;
-    let transition_min_observations =
-        moe_island_prefetch_transition_min_observations(prefetch_mode)?;
+    let prefetch_mode = moe_island_prefetch_mode_from_env_for_sparse(sparse_requested)?;
+    let prefetch_ranks =
+        moe_island_prefetch_ranks_from_env_for_sparse(prefetch_mode, top_k, sparse_requested)?;
+    let transition_min_observations = moe_island_prefetch_transition_min_observations_for_sparse(
+        prefetch_mode,
+        sparse_requested,
+    )?;
+    let async_prefetch = moe_island_async_prefetch_from_env()?;
+    let async_staging_pages = moe_island_async_staging_pages_from_env()?;
     if prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    if async_prefetch {
+        if !sparse_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if backend != Backend::Hip {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 is HIP-only in v1; backend={backend}"
+            );
+        }
+        if prefetch_mode == MoeIslandPrefetchMode::Disabled {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 requires SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, previous-token-resident, or transition"
+            );
+        }
+    }
+    if protected_experts.is_some() && !sparse_requested {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+        );
     }
 
     let sparse_telemetry = MoeSparseTelemetry::from_env(
@@ -186,10 +288,13 @@ pub(crate) fn prepare_moe_runtime_config(
     Ok(MoeRuntimeConfig {
         vmm_mode,
         island_cap_experts,
+        protected_experts,
         sparse_requested,
         prefetch_mode,
         prefetch_ranks,
         transition_min_observations,
+        async_prefetch,
+        async_staging_pages,
         sparse_telemetry,
     })
 }
@@ -279,9 +384,12 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
     kv_vmm: bool,
     moe_vmm_mode: MoeExpertVmmMode,
     moe_island_cap_experts: Option<usize>,
+    moe_island_protected_experts: Option<usize>,
     moe_prefetch_mode: MoeIslandPrefetchMode,
     moe_prefetch_ranks: usize,
     moe_transition_min_observations: u32,
+    moe_async_prefetch: bool,
+    moe_async_staging_pages: usize,
     persistent_decode: bool,
 ) -> Result<Qwen36DecodeLayers> {
     if let Some(cap_experts) = moe_island_cap_experts {
@@ -323,14 +431,32 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
+        if moe_async_prefetch {
+            manager
+                .enable_async_prefetch(moe_async_staging_pages)
+                .context("enable sparse MoE async prefetch")?;
+        }
+        let max_protected_pages = if let Some(protected_experts) = moe_island_protected_experts {
+            let pages = manager
+                .page_budget_for_routed_experts(protected_experts)
+                .context(
+                    "derive sparse MoE protected page budget from routed expert tensor layout",
+                )?
+                .min(max_resident_pages);
+            manager.set_max_protected_pages(pages);
+            pages
+        } else {
+            0
+        };
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
             "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+             tensors={} max_pages={} protected_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
             backend,
             residency_stats.registered_tensors,
             max_resident_pages,
+            max_protected_pages,
             arena_stats.logical_bytes as f64 / MIB,
             arena_stats.resident_bytes as f64 / MIB,
             arena_stats.reserved_bytes as f64 / MIB,
@@ -354,6 +480,11 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                      min_observations={moe_transition_min_observations}"
                 );
             }
+        }
+        if moe_async_prefetch {
+            println!(
+                "  [vmm] sparse MoE async page-in active (staging_pages={moe_async_staging_pages})"
+            );
         }
         return Ok(Qwen36DecodeLayers {
             layers,

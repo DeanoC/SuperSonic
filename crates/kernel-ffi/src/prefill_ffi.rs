@@ -679,6 +679,33 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_apply_rope_prefill_indirect(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rot: usize,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        pos_ids: *const c_int,
+        data: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_lookahead_attention_scores(
+        dtype: c_int,
+        device_ordinal: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        lookahead_count: usize,
+        kv_len: usize,
+        head_dim: usize,
+        scale: f32,
+        q: *const c_void,
+        k: *const c_void,
+        scores: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_transpose_shd_hsd(
         dtype: c_int,
         device_ordinal: usize,
@@ -2823,6 +2850,183 @@ pub fn apply_rope_prefill(
     };
     if status != 0 {
         return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
+    }
+    Ok(())
+}
+
+/// SpecPrefill (arXiv 2502.02789): apply RoPE in-place using a per-token
+/// position-ID array. `pos_ids[slot]` selects the cos/sin table row each
+/// token gets rotated by, instead of using `slot` directly.
+///
+/// Layout:
+///   - `data`: `[seq_len, num_heads, head_dim]` of `dtype` — modified in place.
+///   - `cos_table` / `sin_table`: `[max_positions, half_rot]` of `dtype`.
+///     Pre-built for the full prompt's position range; the kernel just
+///     gathers from row `pos_ids[slot]`.
+///   - `pos_ids`: `[seq_len]` `i32` — the original prompt position each
+///     compacted slot belongs to. All values must be in `[0, max_positions)`.
+///
+/// Parity guarantee: when `pos_ids = [0, 1, ..., seq_len-1]`, output is
+/// byte-identical to [`apply_rope_prefill`] with `pos_offset=0`. See
+/// `crates/runner/tests/specprefill_rope_indirect_parity.rs`.
+///
+/// HIP-only at this stage; the CUDA path returns status 316. Metal stubs
+/// return -1.
+pub fn apply_rope_prefill_indirect(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    pos_ids: &GpuBuffer,
+    data: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    // Position IDs are stored as `ScalarType::U32` (4-byte unsigned) on the
+    // host side because gpu-hal doesn't carry an i32 variant; the kernel
+    // reinterprets the buffer as `const int*` (signed). This is safe
+    // because position IDs are always non-negative and well below 2^31.
+    if pos_ids.dtype() != ScalarType::U32 {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect: pos_ids must be ScalarType::U32 (treated as i32 \
+             by the kernel), got {:?}",
+            pos_ids.dtype()
+        )));
+    }
+    if pos_ids.elem_count() < seq_len {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect: pos_ids has {} elements but seq_len is {}",
+            pos_ids.elem_count(),
+            seq_len
+        )));
+    }
+    let half_rot = rotary_dim / 2;
+    let status = unsafe {
+        supersonic_qwen35_hip_apply_rope_prefill_indirect(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_heads,
+            head_dim,
+            half_rot,
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            pos_ids.as_ptr() as *const c_int,
+            data.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// SpecPrefill (arXiv 2502.02789): per-row softmax(Q · Kᵀ) for the last
+/// `lookahead_count` query rows of a single full-attention layer.
+/// Computes the importance signal the host-side selection consumes.
+///
+/// Layouts:
+/// - `q`: BF16 `[lookahead_count, q_heads, head_dim]` (post-RoPE)
+/// - `k`: BF16 `[kv_heads, kv_len, head_dim]`
+/// - `scores`: F32 `[q_heads, lookahead_count, kv_len]` (output)
+///
+/// `q_heads` must be a multiple of `kv_heads` (GQA broadcasting handled
+/// inside the kernel via `num_kv_groups = q_heads / kv_heads`).
+pub fn lookahead_attention_scores(
+    ordinal: usize,
+    dtype: ScalarType,
+    q_heads: usize,
+    kv_heads: usize,
+    lookahead_count: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    scores: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if !matches!(dtype, ScalarType::BF16 | ScalarType::F16) {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: dtype must be ScalarType::BF16 or ScalarType::F16, got {:?}",
+            dtype
+        )));
+    }
+    if q_heads == 0 || kv_heads == 0 || lookahead_count == 0 || kv_len == 0 || head_dim == 0 {
+        return Err(ffi_error(
+            "lookahead_attention_scores: all dimensions must be > 0".into(),
+        ));
+    }
+    if q_heads % kv_heads != 0 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: q_heads ({q_heads}) must be a multiple of kv_heads ({kv_heads})"
+        )));
+    }
+    // gfx1100 LDS is 64 KiB per block; the kernel allocates kv_len * f32
+    // for the per-row exponentials. We cap at 32 KiB (8000 tokens) to
+    // leave room for compiler-allocated shared memory. Long prompts
+    // beyond this need a tiled/online-softmax kernel — Phase D work.
+    const MAX_KV_LEN_LOOKAHEAD: usize = 8 * 1024;
+    if kv_len > MAX_KV_LEN_LOOKAHEAD {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: kv_len ({kv_len}) exceeds the LDS-bounded \
+             maximum of {MAX_KV_LEN_LOOKAHEAD}. Long prompts need a tiled scoring \
+             kernel — currently a Phase C limitation. Reduce prompt length or use \
+             a smaller --specprefill-keep-ratio so the speculator's K cache fits."
+        )));
+    }
+    let expected_q = lookahead_count * q_heads * head_dim;
+    if q.elem_count() < expected_q {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: q has {} elems, expected >= {}",
+            q.elem_count(),
+            expected_q
+        )));
+    }
+    let expected_k = kv_heads * kv_len * head_dim;
+    if k.elem_count() < expected_k {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: k has {} elems, expected >= {}",
+            k.elem_count(),
+            expected_k
+        )));
+    }
+    if scores.dtype() != ScalarType::F32 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: scores must be ScalarType::F32, got {:?}",
+            scores.dtype()
+        )));
+    }
+    let expected_scores = q_heads * lookahead_count * kv_len;
+    if scores.elem_count() < expected_scores {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: scores has {} elems, expected >= {}",
+            scores.elem_count(),
+            expected_scores
+        )));
+    }
+    let status = unsafe {
+        supersonic_qwen35_hip_lookahead_attention_scores(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            q_heads,
+            kv_heads,
+            lookahead_count,
+            kv_len,
+            head_dim,
+            scale,
+            q.as_ptr(),
+            k.as_ptr(),
+            scores.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores failed: {status}"
+        )));
     }
     Ok(())
 }

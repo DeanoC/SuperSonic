@@ -567,6 +567,61 @@ pub fn free_host_pinned(backend: Backend, ordinal: usize, ptr: *mut c_void, len_
     }
 }
 
+/// Safe RAII wrapper around backend pinned host memory.
+pub struct PinnedHostBuffer {
+    backend: Backend,
+    ordinal: usize,
+    ptr: NonNull<c_void>,
+    len_bytes: usize,
+}
+
+unsafe impl Send for PinnedHostBuffer {}
+unsafe impl Sync for PinnedHostBuffer {}
+
+impl PinnedHostBuffer {
+    pub fn new(ordinal: usize, len_bytes: usize) -> Result<Self> {
+        let backend = current_backend();
+        let ptr = alloc_host_pinned(ordinal, len_bytes)?;
+        Ok(Self {
+            backend,
+            ordinal,
+            ptr,
+            len_bytes,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len_bytes
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.ptr.as_ptr()
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut c_void {
+        self.ptr.as_ptr()
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr() as *const u8, self.len_bytes) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr() as *mut u8, self.len_bytes) }
+    }
+}
+
+impl Drop for PinnedHostBuffer {
+    fn drop(&mut self) {
+        free_host_pinned(
+            self.backend,
+            self.ordinal,
+            self.ptr.as_ptr(),
+            self.len_bytes,
+        );
+    }
+}
+
 /// Allocate `len_bytes` of device memory, zeroed. Same allocator-dispatch
 /// behavior as [`alloc`].
 pub(crate) fn alloc_zeros(
@@ -691,6 +746,49 @@ pub fn copy_h2d(ordinal: usize, dst: *mut c_void, src: *const c_void, len: usize
                 });
             }
             Ok(())
+        })
+    })
+}
+
+pub fn copy_h2d_async(
+    ordinal: usize,
+    stream: &GpuStream,
+    dst: *mut c_void,
+    src: *const c_void,
+    len: usize,
+) -> Result<()> {
+    if dst.is_null() || src.is_null() || len == 0 {
+        return Err(GpuError::InvalidArg(
+            "copy_h2d_async: null pointer or zero len".into(),
+        ));
+    }
+    if stream.ordinal != ordinal {
+        return Err(GpuError::InvalidArg(
+            "copy_h2d_async requires stream on matching device".into(),
+        ));
+    }
+    hal_profile_time("copy_h2d_async", len, || {
+        with_device_impl(stream.backend, ordinal, || match stream.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe {
+                        hipMemcpyAsync(dst, src, len, HIP_MEMCPY_HOST_TO_DEVICE, stream.raw)
+                    };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipMemcpyAsync(H2D)", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "copy_h2d_async is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "copy_h2d_async is not implemented for Metal".into(),
+            )),
         })
     })
 }
@@ -833,6 +931,46 @@ pub fn memset_zeros(ordinal: usize, dst: *mut c_void, len: usize) -> Result<()> 
     })
 }
 
+pub fn memset_zeros_async(
+    ordinal: usize,
+    stream: &GpuStream,
+    dst: *mut c_void,
+    len: usize,
+) -> Result<()> {
+    if dst.is_null() || len == 0 {
+        return Err(GpuError::InvalidArg(
+            "memset_zeros_async: null pointer or zero len".into(),
+        ));
+    }
+    if stream.ordinal != ordinal {
+        return Err(GpuError::InvalidArg(
+            "memset_zeros_async requires stream on matching device".into(),
+        ));
+    }
+    hal_profile_time("memset_zeros_async", len, || {
+        with_device_impl(stream.backend, ordinal, || match stream.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipMemsetAsync(dst, 0, len, stream.raw) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipMemsetAsync", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "memset_zeros_async is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "memset_zeros_async is not implemented for Metal".into(),
+            )),
+        })
+    })
+}
+
 /// Synchronize the device (block until all pending work completes).
 pub fn sync(ordinal: usize) -> Result<()> {
     hal_profile_time("sync", 0, || {
@@ -879,6 +1017,126 @@ pub struct GpuEvent {
     backend: Backend,
     ordinal: usize,
     raw: *mut c_void,
+}
+
+/// RAII wrapper around a non-blocking backend stream.
+pub struct GpuStream {
+    backend: Backend,
+    ordinal: usize,
+    raw: *mut c_void,
+}
+
+unsafe impl Send for GpuStream {}
+
+impl GpuStream {
+    pub fn new_nonblocking(ordinal: usize) -> Result<Self> {
+        let backend = current_backend();
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        with_device_impl(backend, ordinal, || match backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status =
+                        unsafe { hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) };
+                    if status != 0 {
+                        return Err(backend_error(
+                            Backend::Hip,
+                            "hipStreamCreateWithFlags",
+                            status,
+                        ));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "GpuStream is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "GpuStream is not implemented for Metal".into(),
+            )),
+        })?;
+        Ok(Self {
+            backend,
+            ordinal,
+            raw,
+        })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipStreamSynchronize(self.raw) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipStreamSynchronize", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "GpuStream is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "GpuStream is not implemented for Metal".into(),
+            )),
+        })
+    }
+
+    pub fn wait_event(&self, event: &GpuEvent) -> Result<()> {
+        if self.backend != event.backend || self.ordinal != event.ordinal {
+            return Err(GpuError::InvalidArg(
+                "GpuStream::wait_event requires matching backend/device".into(),
+            ));
+        }
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipStreamWaitEvent(self.raw, event.raw, 0) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipStreamWaitEvent", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "GpuStream::wait_event is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "GpuStream::wait_event is not implemented for Metal".into(),
+            )),
+        })
+    }
+}
+
+impl Drop for GpuStream {
+    fn drop(&mut self) {
+        if self.raw.is_null() {
+            return;
+        }
+        let _ = with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipStreamDestroy(self.raw) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipStreamDestroy", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda | Backend::Metal => Ok(()),
+        });
+    }
 }
 
 impl GpuEvent {
@@ -931,6 +1189,60 @@ impl GpuEvent {
                 "GpuEvent is not implemented for CUDA yet".into(),
             )),
             Backend::Metal => Err(GpuError::InvalidArg(
+                "GpuEvent is not implemented for Metal yet".into(),
+            )),
+        })
+    }
+
+    pub fn record_on_stream(&self, stream: &GpuStream) -> Result<()> {
+        if self.backend != stream.backend || self.ordinal != stream.ordinal {
+            return Err(GpuError::InvalidArg(
+                "GpuEvent::record_on_stream requires matching backend/device".into(),
+            ));
+        }
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventRecord(self.raw, stream.raw) };
+                    if status != 0 {
+                        return Err(backend_error(Backend::Hip, "hipEventRecord", status));
+                    }
+                    Ok(())
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "GpuEvent is not implemented for Metal yet".into(),
+            )),
+        })
+    }
+
+    pub fn query(&self) -> Result<bool> {
+        with_device_impl(self.backend, self.ordinal, || match self.backend {
+            Backend::Hip => {
+                #[cfg(supersonic_backend_hip)]
+                {
+                    let status = unsafe { hipEventQuery(self.raw) };
+                    if status == 0 {
+                        Ok(true)
+                    } else if status == HIP_ERROR_NOT_READY {
+                        Ok(false)
+                    } else {
+                        Err(backend_error(Backend::Hip, "hipEventQuery", status))
+                    }
+                }
+                #[cfg(not(supersonic_backend_hip))]
+                Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "GpuEvent is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
                 "GpuEvent is not implemented for Metal yet".into(),
             )),
         })

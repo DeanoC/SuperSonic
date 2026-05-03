@@ -200,8 +200,12 @@ fn decode_text(
         kv_max_t,
     );
 
-    let mut moe_runtime =
-        prepare_moe_runtime_config(speculative_decode, persistent_decode, geom.top_k as usize)?;
+    let mut moe_runtime = prepare_moe_runtime_config(
+        speculative_decode,
+        persistent_decode,
+        backend,
+        geom.top_k as usize,
+    )?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     let loaded_layers = load_decode_layers_with_vmm_strategy(
         &store,
@@ -216,9 +220,12 @@ fn decode_text(
         kv_vmm,
         moe_runtime.vmm_mode,
         moe_runtime.island_cap_experts,
+        moe_runtime.protected_experts,
         moe_runtime.prefetch_mode,
         moe_runtime.prefetch_ranks,
         moe_runtime.transition_min_observations,
+        moe_runtime.async_prefetch,
+        moe_runtime.async_staging_pages,
         persistent_decode,
     )?;
     let mut layers = loaded_layers.layers;

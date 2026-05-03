@@ -60,6 +60,87 @@ int apply_rope_prefill_device(int device_ordinal,
     return 0;
 }
 
+// ---- apply_rope_prefill_indirect (SpecPrefill — arXiv 2502.02789) ----
+
+template <typename T>
+int apply_rope_prefill_indirect_device(int device_ordinal,
+                                       int seq_len, int num_heads, int head_dim, int half_rot,
+                                       const void* cos_table, const void* sin_table,
+                                       const int* pos_ids, void* data) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(seq_len) * num_heads * half_rot;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_apply_rope_prefill_indirect_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        seq_len, num_heads, head_dim, half_rot,
+        static_cast<const T*>(cos_table),
+        static_cast<const T*>(sin_table),
+        pos_ids,
+        static_cast<T*>(data));
+    if (hipGetLastError() != hipSuccess) return 313;
+    if (hipDeviceSynchronize() != hipSuccess) return 314;
+    return 0;
+}
+
+// ---- lookahead_attention_scores (SpecPrefill — arXiv 2502.02789) ----
+
+template <typename T>
+int lookahead_attention_scores_device(int device_ordinal,
+                                      int q_heads, int kv_heads,
+                                      int lookahead_count, int kv_len, int head_dim,
+                                      float scale,
+                                      const void* q, const void* k, void* scores) {
+    if (q_heads <= 0 || kv_heads <= 0 || lookahead_count <= 0 || kv_len <= 0 || head_dim <= 0) {
+        return 318; // invalid shape
+    }
+    if (q_heads % kv_heads != 0) {
+        return 319; // q_heads must be a multiple of kv_heads
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    // Query the device's wavefront size so we launch exactly one full
+    // wave: 32 threads on wave32 (gfx1100, RDNA3), 64 on wave64
+    // (gfx9xx, RDNA1/2). This avoids divergent __syncthreads()
+    // participation that would happen with a fixed block size when
+    // the kernel uses `if (lane >= warpSize) return;` followed by
+    // block-wide barriers.
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device_ordinal) != hipSuccess) {
+        return 323; // device-properties query failed
+    }
+    const int wave = prop.warpSize;
+    if (wave != 32 && wave != 64) {
+        return 324; // unexpected wavefront size
+    }
+    const int num_kv_groups = q_heads / kv_heads;
+    const dim3 grid(static_cast<unsigned int>(q_heads * lookahead_count));
+    const dim3 block(static_cast<unsigned int>(wave));
+    const size_t shared_bytes = static_cast<size_t>(kv_len) * sizeof(float);
+    // Per-block dynamic shared memory cap. gfx1100 has 64 KiB LDS but
+    // some is used by other allocations; 32 KiB is a conservative bound
+    // that gives ~8000 tokens of headroom (32768 / 4 = 8192). Long
+    // prompts above this limit need a tiled / online-softmax kernel
+    // that doesn't store the per-row exponentials in LDS — out of
+    // scope for Phase C. Bail loudly so the caller gets a clear error
+    // instead of a runtime kernel-launch failure.
+    constexpr size_t kMaxSharedBytes = 32 * 1024;
+    if (shared_bytes > kMaxSharedBytes) {
+        return 325; // kv_len exceeds shared-mem budget
+    }
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_lookahead_attention_scores_kernel<T>),
+        grid, block, shared_bytes, 0,
+        q_heads, kv_heads, lookahead_count, kv_len, head_dim, num_kv_groups,
+        scale,
+        static_cast<const T*>(q),
+        static_cast<const T*>(k),
+        static_cast<float*>(scores));
+    if (hipGetLastError() != hipSuccess) return 316;
+    if (hipDeviceSynchronize() != hipSuccess) return 317;
+    return 0;
+}
+
 // ---- transpose [S,H,D] -> [H,S,D] ----
 
 template <typename T>
@@ -308,6 +389,51 @@ extern "C" int supersonic_qwen35_hip_apply_rope_prefill(
                 static_cast<int>(seq_len), static_cast<int>(num_heads),
                 static_cast<int>(head_dim), static_cast<int>(half_rot),
                 cos_table, sin_table, data);
+    default: return 310;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_apply_rope_prefill_indirect(
+    int dtype, size_t device_ordinal,
+    size_t seq_len, size_t num_heads, size_t head_dim, size_t half_rot,
+    const void* cos_table, const void* sin_table,
+    const int* pos_ids, void* data
+) {
+    switch (dtype) {
+    case 0: return apply_rope_prefill_indirect_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    case 1: return apply_rope_prefill_indirect_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    case 2: return apply_rope_prefill_indirect_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    default: return 315;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
+    int dtype, size_t device_ordinal,
+    size_t q_heads, size_t kv_heads,
+    size_t lookahead_count, size_t kv_len, size_t head_dim,
+    float scale,
+    const void* q, const void* k, void* scores
+) {
+    switch (dtype) {
+    case 0: return lookahead_attention_scores_device<half>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(lookahead_count), static_cast<int>(kv_len),
+                static_cast<int>(head_dim), scale, q, k, scores);
+    case 2: return lookahead_attention_scores_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(lookahead_count), static_cast<int>(kv_len),
+                static_cast<int>(head_dim), scale, q, k, scores);
     default: return 310;
     }
 }

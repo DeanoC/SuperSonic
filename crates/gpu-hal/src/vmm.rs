@@ -401,6 +401,45 @@ impl VirtualBuffer {
         Ok(())
     }
 
+    /// Map a byte range without synchronizing the device or clearing the new
+    /// physical pages. This is only for callers that can prove no in-flight
+    /// kernel can touch the newly mapped range and will initialize it before
+    /// publishing it as resident.
+    pub fn map_range_bytes_no_sync(&mut self, offset: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let end = offset.checked_add(len).ok_or_else(|| {
+            GpuError::InvalidArg(format!(
+                "virtual map range overflows: offset={offset} len={len}"
+            ))
+        })?;
+        if end > self.reserved_bytes {
+            return Err(GpuError::InvalidArg(format!(
+                "virtual map range [{offset}, {end}) exceeds reservation {}",
+                self.reserved_bytes
+            )));
+        }
+        let aligned_offset = align_down(offset, self.granularity);
+        let aligned_end = align_up(end, self.granularity);
+        for (seg_offset, seg_len) in self.missing_segments(aligned_offset, aligned_end) {
+            let mapping = hal_profile_time("vmm_map_no_sync", seg_len, || {
+                map_physical(
+                    self.backend,
+                    self.device_ordinal,
+                    self.ptr,
+                    seg_offset,
+                    seg_len,
+                    seg_offset,
+                    seg_len,
+                )
+            })?;
+            self.mappings.push(mapping);
+            self.mapped_bytes = self.mapped_bytes.max(seg_offset + seg_len);
+        }
+        Ok(())
+    }
+
     pub fn unmap_all(&mut self) -> Result<()> {
         if self.mapped_bytes == 0 && self.mappings.is_empty() {
             return Ok(());

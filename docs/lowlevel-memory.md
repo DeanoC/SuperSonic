@@ -125,6 +125,26 @@ Current scope:
   rank (default 32), then prefetches only ranks with observed repeats. Candidate
   ordering uses repeat probability and still honors
   `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS` as the maximum candidate count.
+  When `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` is set and the prefetch env vars are
+  left unset, sparse islands default to `transition`, rank limit 4, and
+  min-observations 1. On the local gfx1100 24 GiB validation machine,
+  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=1888` held a 1008-token decode bounded at
+  about 7.4 GiB MoE resident VMM, while `1920` crossed the practical
+  `hipMemCreate` allocation boundary on a shorter smoke.
+- `SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1` makes sparse prefetch page-in use a
+  HIP nonblocking stream and pinned host staging. This v1 path requires
+  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS`, HIP, and one of the prefetch policies
+  above. Pending pages count against the sparse page cap, are promoted before
+  demand use, and never evict resident demand pages. Use
+  `SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES=N` to override the default 4
+  pinned VMM pages.
+- `SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS=N` enables a protected sparse MoE
+  eviction band. Demand-loaded routed experts that repeat from the previous
+  token are marked protected after both projections are resident. The page
+  budget is derived from `N` routed experts and capped by
+  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS`; eviction chooses unprotected LRU pages
+  first and only evicts protected pages when the whole sparse island is
+  protected. This does not upload speculative pages.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.
