@@ -416,129 +416,138 @@ mod tests {
         tmp
     }
 
-    fn require_hip_vmm() -> bool {
-        gpu_hal::set_backend(Backend::Hip);
-        if !gpu_hal::vmm_is_supported(Backend::Hip, 0) {
-            eprintln!("skip: HIP VMM unsupported on this device/runtime");
-            return false;
+    fn vmm_backends() -> [Backend; 2] {
+        [Backend::Hip, Backend::Cuda]
+    }
+
+    fn with_supported_vmm_backend(test_name: &str, mut f: impl FnMut(Backend)) {
+        for backend in vmm_backends() {
+            gpu_hal::set_backend(backend);
+            if !gpu_hal::vmm_is_supported(backend, 0) {
+                eprintln!("skip: {backend} VMM unsupported on this device/runtime for {test_name}");
+                continue;
+            }
+            f(backend);
         }
-        true
     }
 
     #[test]
     fn reserves_expert_slab_without_resident_pages() {
-        if !require_hip_vmm() {
-            return;
-        }
-        let tmp = synthetic_store(4, 4096);
-        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
-        let mut manager =
-            MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
-        let reservation = manager
-            .register_tensor(
-                &store,
-                0,
-                MoeExpertProjection::GateUp,
-                "model.layers.0.mlp.experts.gate_up_proj",
-                4,
-            )
-            .expect("register tensor");
+        with_supported_vmm_backend("reserves_expert_slab_without_resident_pages", |_backend| {
+            let tmp = synthetic_store(4, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
+            let reservation = manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    4,
+                )
+                .expect("register tensor");
 
-        assert_eq!(reservation.expert_count, 4);
-        assert_eq!(reservation.expert_bytes, 4096);
-        let arena_stats = manager.arena().stats();
-        assert_eq!(arena_stats.allocations, 1);
-        assert_eq!(arena_stats.logical_bytes, 16 * 1024);
-        assert_eq!(arena_stats.logical_resident_bytes, 0);
-        assert_eq!(arena_stats.mapping_count, 0);
+            assert_eq!(reservation.expert_count, 4);
+            assert_eq!(reservation.expert_bytes, 4096);
+            let arena_stats = manager.arena().stats();
+            assert_eq!(arena_stats.allocations, 1);
+            assert_eq!(arena_stats.logical_bytes, 16 * 1024);
+            assert_eq!(arena_stats.logical_resident_bytes, 0);
+            assert_eq!(arena_stats.mapping_count, 0);
+        });
     }
 
     #[test]
     fn lru_eviction_invalidates_page_overlapping_slices() {
-        if !require_hip_vmm() {
-            return;
-        }
-        let tmp = synthetic_store(4, 4096);
-        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
-        let mut manager =
-            MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
-        manager
-            .register_tensor(
-                &store,
-                0,
-                MoeExpertProjection::GateUp,
-                "model.layers.0.mlp.experts.gate_up_proj",
-                4,
-            )
-            .expect("register tensor");
+        with_supported_vmm_backend(
+            "lru_eviction_invalidates_page_overlapping_slices",
+            |_backend| {
+                let tmp = synthetic_store(4, 4096);
+                let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+                let mut manager =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        4,
+                    )
+                    .expect("register tensor");
 
-        let e0 = MoeExpertKey {
-            layer_idx: 0,
-            expert_idx: 0,
-            projection: MoeExpertProjection::GateUp,
-        };
-        let e1 = MoeExpertKey {
-            layer_idx: 0,
-            expert_idx: 1,
-            projection: MoeExpertProjection::GateUp,
-        };
-        manager.ensure_resident(&store, e0).expect("load expert 0");
-        assert!(manager.is_resident(e0));
-        assert_eq!(manager.stats().resident_slices, 1);
+                let e0 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 0,
+                    projection: MoeExpertProjection::GateUp,
+                };
+                let e1 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 1,
+                    projection: MoeExpertProjection::GateUp,
+                };
+                manager.ensure_resident(&store, e0).expect("load expert 0");
+                assert!(manager.is_resident(e0));
+                assert_eq!(manager.stats().resident_slices, 1);
 
-        manager.ensure_resident(&store, e1).expect("load expert 1");
-        assert!(!manager.is_resident(e0));
-        assert!(manager.is_resident(e1));
-        assert_eq!(manager.stats().resident_slices, 1);
-        assert_eq!(manager.stats().misses, 2);
-        assert_eq!(manager.stats().evicted_slices, 1);
+                manager.ensure_resident(&store, e1).expect("load expert 1");
+                assert!(!manager.is_resident(e0));
+                assert!(manager.is_resident(e1));
+                assert_eq!(manager.stats().resident_slices, 1);
+                assert_eq!(manager.stats().misses, 2);
+                assert_eq!(manager.stats().evicted_slices, 1);
 
-        let allocation_id = manager
-            .resident_weight(0, MoeExpertProjection::GateUp)
-            .expect("resident weight")
-            .allocation_id()
-            .expect("virtual allocation");
-        let bytes = manager
-            .arena()
-            .allocation(allocation_id)
-            .expect("allocation")
-            .buffer()
-            .to_host_range_bytes(4096, 4096)
-            .expect("read expert 1");
-        assert!(bytes.iter().all(|b| *b == 2));
+                let allocation_id = manager
+                    .resident_weight(0, MoeExpertProjection::GateUp)
+                    .expect("resident weight")
+                    .allocation_id()
+                    .expect("virtual allocation");
+                let bytes = manager
+                    .arena()
+                    .allocation(allocation_id)
+                    .expect("allocation")
+                    .buffer()
+                    .to_host_range_bytes(4096, 4096)
+                    .expect("read expert 1");
+                assert!(bytes.iter().all(|b| *b == 2));
+            },
+        );
     }
 
     #[test]
     fn store_range_upload_keeps_stable_virtual_pointer() {
-        if !require_hip_vmm() {
-            return;
-        }
-        let tmp = synthetic_store(2, 4096);
-        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
-        let mut arena = VirtualArena::new(0, VirtualBacking::Discard);
-        let id = store
-            .reserve_virtual_arena(
-                &mut arena,
-                "model.layers.0.mlp.experts.gate_up_proj",
-                VirtualAllocationRole::MoeExpert,
-            )
-            .expect("reserve tensor");
-        let ptr = arena.allocation(id).expect("allocation").buffer().as_ptr();
-        store
-            .load_range_to_virtual_arena(
-                &mut arena,
-                id,
-                "model.layers.0.mlp.experts.gate_up_proj",
-                4096,
-                4096,
-            )
-            .expect("upload expert 1");
-        let allocation = arena.allocation(id).expect("allocation after upload");
-        assert_eq!(allocation.buffer().as_ptr(), ptr);
-        let bytes = allocation
-            .buffer()
-            .to_host_range_bytes(4096, 4096)
-            .expect("read expert 1");
-        assert!(bytes.iter().all(|b| *b == 2));
+        with_supported_vmm_backend(
+            "store_range_upload_keeps_stable_virtual_pointer",
+            |_backend| {
+                let tmp = synthetic_store(2, 4096);
+                let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+                let mut arena = VirtualArena::new(0, VirtualBacking::Discard);
+                let id = store
+                    .reserve_virtual_arena(
+                        &mut arena,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        VirtualAllocationRole::MoeExpert,
+                    )
+                    .expect("reserve tensor");
+                let ptr = arena.allocation(id).expect("allocation").buffer().as_ptr();
+                store
+                    .load_range_to_virtual_arena(
+                        &mut arena,
+                        id,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        4096,
+                        4096,
+                    )
+                    .expect("upload expert 1");
+                let allocation = arena.allocation(id).expect("allocation after upload");
+                assert_eq!(allocation.buffer().as_ptr(), ptr);
+                let bytes = allocation
+                    .buffer()
+                    .to_host_range_bytes(4096, 4096)
+                    .expect("read expert 1");
+                assert!(bytes.iter().all(|b| *b == 2));
+            },
+        );
     }
 }
