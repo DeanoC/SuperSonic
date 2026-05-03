@@ -17,6 +17,7 @@ mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod qwen36_moe_mtp;
 mod qwen36_moe_persistent_decode;
+mod qwen36_moe_prefetch;
 mod qwen36_moe_residency;
 mod qwen36_moe_speculative;
 mod qwen36_moe_state;
