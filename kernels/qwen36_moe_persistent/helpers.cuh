@@ -312,38 +312,37 @@ __device__ inline float fp8_e4m3_to_float(uint8_t byte) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
+// Convert F32 to FP8 E4M3 byte (inverse of fp8_e4m3_to_float).
+// Verbatim port of full_attention_4b.hip:205-232 — keeps KV-FP8 quant
+// bit-exact with the reference 4B path so existing parity tests apply.
+// Clamps to representable range [-448, 448], rounds to nearest.
 __device__ inline uint8_t float_to_fp8_e4m3(float val) {
-    if (val != val) return 0x7Fu; // NaN → max positive (matches CUDA __nv_fp8_e4m3 saturation)
-    if (val ==  INFINITY) return 0x7Eu;
-    if (val == -INFINITY) return 0xFEu;
-    const uint8_t sign = (val < 0.f) ? 0x80u : 0x00u;
-    float a = fabsf(val);
-    if (a > 448.0f) a = 448.0f;
-    if (a == 0.0f) return sign;
-    int e_unbiased;
-    float m = frexpf(a, &e_unbiased);
-    int exp_field = e_unbiased - 1 + 7;
-    uint32_t mant_field;
-    if (exp_field <= 0) {
-        const float scale = ldexpf(1.0f, -6 - exp_field);
-        const float mant_f = a * scale;
-        mant_field = static_cast<uint32_t>(mant_f + 0.5f);
-        if (mant_field >= 8u) {
-            mant_field -= 8u;
-            exp_field = 1;
-        } else {
-            exp_field = 0;
-        }
-    } else {
-        const float mant_f = (m * 2.0f - 1.0f) * 8.0f;
-        mant_field = static_cast<uint32_t>(mant_f + 0.5f);
-        if (mant_field >= 8u) {
-            mant_field -= 8u;
-            exp_field += 1;
-        }
+    uint8_t sign = 0;
+    if (val < 0.0f) { sign = 0x80; val = -val; }
+    // Clamp to max representable E4M3 value
+    if (val >= 448.0f) return sign | 0x7E;  // max normal: exp=14, mantissa=6 → 2^7*(1+6/8)=448
+    if (val < 1.52587890625e-2f * 0.125f) return sign;  // too small → ±0
+    // Subnormal range: val < 2^(-6) = 0.015625
+    if (val < 0.015625f) {
+        int mantissa = __float2int_rn(val / 1.52587890625e-2f * 8.0f);
+        if (mantissa < 0) mantissa = 0;
+        if (mantissa >= 8) return sign | 0x08;  // rounds up to the smallest normal
+        return sign | static_cast<uint8_t>(mantissa);
     }
-    if (exp_field >= 0xF) return sign | 0x7Eu;
-    return static_cast<uint8_t>(sign | (exp_field << 3) | (mant_field & 0x7u));
+    // Normal range
+    float log2_val = log2f(val);
+    int exp = static_cast<int>(floorf(log2_val)) + 7;
+    if (exp < 1) exp = 1;
+    if (exp > 14) exp = 14;  // would be NaN range — clamp
+    float pow2 = exp2f(static_cast<float>(exp - 7));
+    int mantissa = __float2int_rn((val / pow2 - 1.0f) * 8.0f);
+    if (mantissa < 0) mantissa = 0;
+    if (mantissa >= 8) {
+        mantissa = 0;
+        exp += 1;
+        if (exp > 14) return sign | 0x7E;
+    }
+    return sign | (static_cast<uint8_t>(exp) << 3) | static_cast<uint8_t>(mantissa);
 }
 
 __device__ inline float fp8_dequant_scalar(
