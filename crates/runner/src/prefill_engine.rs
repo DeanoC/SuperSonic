@@ -1175,20 +1175,46 @@ pub fn prefill_with_lookahead_attention(
         )
         .map_err(|e| anyhow::anyhow!("layer {li} q_buf h2d: {e}"))?;
 
-        // K cache. Lives at state.layers[li].kv_cache_k. Read kv_len =
-        // prompt_len (the kernel ignores rows past kv_len even though
-        // the cache may have lookahead_count - 1 extra rows from the
-        // decode steps). The cache shape is [1, kv_heads, cap, head_dim]
-        // (batch=1); with batch dim = 1, as_ptr() aliases the flat
-        // [kv_heads, cap, head_dim] layout the kernel expects. The
-        // kernel validates elem_count >= kv_heads * kv_len * head_dim,
-        // which holds because cap >= prompt_len at this point.
-        let k_cache = state.layers[li]
-            .kv_cache_k
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!(
-                "layer {li}: kv_cache_k missing after prefill — speculator must have full-attention KV"
-            ))?;
+        // K cache shape is [1, kv_heads, cap, head_dim] where cap >= prompt_len.
+        // The lookahead_attention_scores kernel expects contiguous
+        // [kv_heads, kv_len, head_dim], so we either alias the cache
+        // directly (when cap == prompt_len) or assemble a contiguous buffer.
+        let cap = state.layers[li].kv_capacity();
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let kv_k_contig;
+        let k_kernel_input: &GpuBuffer = if !state.layers[li].has_virtual_kv_cache() && cap == prompt_len {
+            state.layers[li]
+                .kv_cache_k
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "layer {li}: kv_cache_k missing after prefill — speculator must have full-attention KV"
+                ))?
+        } else {
+            kv_k_contig = GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[kv_heads, prompt_len, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("layer {li} kv_k_contig alloc: {e}"))?;
+            let cap_stride = cap * head_dim * elem_bytes;
+            let contig_stride = prompt_len * head_dim * elem_bytes;
+            let copy_bytes = prompt_len * head_dim * elem_bytes;
+            for h in 0..kv_heads {
+                let src_k = state.layers[li]
+                    .kv_cache_k_offset_ptr(h * cap_stride)
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "layer {li}: kv_cache_k_offset_ptr missing for head {h}"
+                    ))?;
+                copy_d2d_batched(
+                    ordinal,
+                    kv_k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
+                    src_k,
+                    copy_bytes,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {li} K assemble h={h}: {e}"))?;
+            }
+            &kv_k_contig
+        };
 
         let mut scores = GpuBuffer::zeros(
             ordinal,
@@ -1207,7 +1233,7 @@ pub fn prefill_with_lookahead_attention(
             head_dim,
             scale,
             &q_buf,
-            k_cache,
+            k_kernel_input,
             &mut scores,
         )?;
 
