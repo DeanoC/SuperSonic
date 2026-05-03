@@ -1142,9 +1142,11 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
                     li, kf.kv_scale_k, kf.kv_scale_v);
                 return 1;
             }
-            if (full && both && d.kv_shadow_k != nullptr && d.kv_shadow_v == nullptr) {
+            if (full && both && ((d.kv_shadow_k != nullptr) != (d.kv_shadow_v != nullptr))) {
                 fprintf(stderr,
-                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_k/v must agree\n", li);
+                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_k/v must agree "
+                    "(got %p / %p)\n",
+                    li, d.kv_shadow_k, d.kv_shadow_v);
                 return 1;
             }
         }
