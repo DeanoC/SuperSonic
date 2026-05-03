@@ -501,10 +501,7 @@ fn load_layer_weights(
 /// Infer the per-block FP8 quantization tile dimension from the shape
 /// of any q_proj scale tensor (`weight_cols / scale_cols`). Same value
 /// across all projections in a bake (bake_fp8_gemma4.py uses 128).
-fn infer_fp8_block_size(
-    store: &model_store::BakedStore,
-    weight_prefix: &str,
-) -> Result<usize> {
+fn infer_fp8_block_size(store: &model_store::BakedStore, weight_prefix: &str) -> Result<usize> {
     let q_name = format!("{weight_prefix}.layers.0.self_attn.q_proj.weight");
     let scale_name = format!("{q_name}_scale_inv");
     let w_shape = store
@@ -657,7 +654,15 @@ impl Gemma4Engine {
         batch_size: usize,
         kv_fp8: bool,
     ) -> Result<Self> {
-        Self::load_with_quant(model_dir, weight_prefix, max_t, device, batch_size, kv_fp8, false)
+        Self::load_with_quant(
+            model_dir,
+            weight_prefix,
+            max_t,
+            device,
+            batch_size,
+            kv_fp8,
+            false,
+        )
     }
 
     /// `load_with_options` plus an explicit `--fp8-runtime` toggle. Set
@@ -816,8 +821,16 @@ impl Gemma4Engine {
             let mut svs: Vec<GpuBuffer> = Vec::with_capacity(num_layers);
             for l in 0..num_layers {
                 let hd = layers[l].head_dim;
-                ks.push(GpuBuffer::zeros(device, kv_dtype, &[num_kv_heads, max_t, hd])?);
-                vs.push(GpuBuffer::zeros(device, kv_dtype, &[num_kv_heads, max_t, hd])?);
+                ks.push(GpuBuffer::zeros(
+                    device,
+                    kv_dtype,
+                    &[num_kv_heads, max_t, hd],
+                )?);
+                vs.push(GpuBuffer::zeros(
+                    device,
+                    kv_dtype,
+                    &[num_kv_heads, max_t, hd],
+                )?);
                 if kv_fp8 {
                     sks.push(GpuBuffer::zeros(
                         device,
@@ -998,8 +1011,7 @@ impl Gemma4Engine {
         let kv_fp8_descs_gpu: Option<Vec<GpuBuffer>> = if kv_fp8 {
             let mut bufs: Vec<GpuBuffer> = Vec::with_capacity(batch_size);
             for seq in 0..batch_size {
-                let mut layer_descs: Vec<Gemma4KVCacheFp8Desc> =
-                    Vec::with_capacity(num_layers);
+                let mut layer_descs: Vec<Gemma4KVCacheFp8Desc> = Vec::with_capacity(num_layers);
                 for l in 0..num_layers {
                     let w = &layers[l];
                     let src_idx = if w.shared_kv { w.kv_source } else { l };
@@ -1851,9 +1863,7 @@ impl Gemma4Engine {
                 device,
                 dtype,
                 &self.layers_gpu[seq_idx],
-                self.kv_fp8_descs_gpu
-                    .as_ref()
-                    .map(|v| &v[seq_idx]),
+                self.kv_fp8_descs_gpu.as_ref().map(|v| &v[seq_idx]),
                 self.fp8_scale_descs_gpu.as_ref(),
                 &mut self.decode_hidden_io,
                 &self.decode_pli,

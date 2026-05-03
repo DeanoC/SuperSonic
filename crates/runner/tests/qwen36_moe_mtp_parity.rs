@@ -39,8 +39,8 @@ use memmap2::Mmap;
 use model_store::BakedStore;
 use runner::qwen36_moe_decode::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 use runner::qwen36_moe_mtp::{
-    alloc_mtp_chain_scratch, alloc_mtp_forward_scratch, run_mtp_draft_chain,
-    run_mtp_draft_step, run_mtp_layer_step,
+    alloc_mtp_chain_scratch, alloc_mtp_forward_scratch, run_mtp_draft_chain, run_mtp_draft_step,
+    run_mtp_layer_step,
 };
 use runner::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
@@ -98,8 +98,7 @@ impl SafetensorsShards {
         let mut shards: Vec<Mmap> = Vec::with_capacity(shard_files.len());
         for filename in &shard_files {
             let p = model_dir.join(filename);
-            let f = File::open(&p)
-                .with_context(|| format!("open shard {}", p.display()))?;
+            let f = File::open(&p).with_context(|| format!("open shard {}", p.display()))?;
             shards.push(unsafe { Mmap::map(&f)? });
         }
         let mut index: BTreeMap<String, usize> = BTreeMap::new();
@@ -183,8 +182,7 @@ fn load_mtp_buffers_from_bake(
 
 fn open_mtp_bake(model_dir: &Path) -> Result<BakedStore> {
     let bake_dir = model_store::bake_dir_int4(model_dir);
-    BakedStore::open(&bake_dir)
-        .with_context(|| format!("open INT4 bake at {}", bake_dir.display()))
+    BakedStore::open(&bake_dir).with_context(|| format!("open INT4 bake at {}", bake_dir.display()))
 }
 
 fn parse_geom(json: &Value) -> MultiLayerGeom {
@@ -247,8 +245,7 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
     };
     let model_dir = PathBuf::from(model_dir);
 
-    let raw =
-        std::fs::read_to_string(&json_path).expect("read mtp oracle json");
+    let raw = std::fs::read_to_string(&json_path).expect("read mtp oracle json");
     let json: Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
     assert_eq!(
         json["schema"].as_str().unwrap_or(""),
@@ -277,30 +274,40 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
     let kv_max_t = 4usize;
     let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, kv_max_t)
         .expect("load MtpLayerBuffers from bake");
-    let mut scratch = alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
-        .expect("alloc mtp scratch");
+    let mut scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t).expect("alloc mtp scratch");
 
     let fused_buf = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize], &fused_bytes,
-    ).expect("upload fused");
-    let mut out_buf = GpuBuffer::zeros(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize],
-    ).expect("alloc out");
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &fused_bytes,
+    )
+    .expect("upload fused");
+    let mut out_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize]).expect("alloc out");
 
     eprintln!("[mtp parity] running layer forward (position={base_seq_len}, cache_pos=0)...");
     run_mtp_layer_step(
-        ordinal, &geom, &mut mtp,
+        ordinal,
+        &geom,
+        &mut mtp,
         /* position */ base_seq_len,
         /* cache_pos */ 0,
-        &fused_buf, &mut out_buf,
+        &fused_buf,
+        &mut out_buf,
         &mut scratch,
-    ).expect("run_mtp_layer_step");
+    )
+    .expect("run_mtp_layer_step");
 
     let mut got_bytes = vec![0u8; (geom.hidden as usize) * 2];
     copy_d2h(
-        ordinal, got_bytes.as_mut_ptr() as *mut _,
-        out_buf.as_ptr(), got_bytes.len(),
-    ).expect("d2h out");
+        ordinal,
+        got_bytes.as_mut_ptr() as *mut _,
+        out_buf.as_ptr(),
+        got_bytes.len(),
+    )
+    .expect("d2h out");
 
     // BF16 parity envelope: cos_sim ≥ 0.998 (industry-standard for
     // hidden-sized BF16 comparisons; 2048-element vectors don't
@@ -329,7 +336,11 @@ fn assert_parity(
     max_abs_tol: f32,
     cos_sim_floor: f64,
 ) {
-    assert_eq!(got_bytes.len(), want_bytes.len(), "{label}: byte length mismatch");
+    assert_eq!(
+        got_bytes.len(),
+        want_bytes.len(),
+        "{label}: byte length mismatch"
+    );
     let got = bf16_bytes_to_f32(got_bytes);
     let want = bf16_bytes_to_f32(want_bytes);
     let n = got.len();
@@ -341,7 +352,9 @@ fn assert_parity(
     let mut exact = 0usize;
     for i in 0..n {
         let d = (got[i] - want[i]).abs();
-        if d == 0.0 { exact += 1; }
+        if d == 0.0 {
+            exact += 1;
+        }
         max_abs = max_abs.max(d);
         sum_abs += d;
         dot += got[i] as f64 * want[i] as f64;
@@ -412,36 +425,41 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
     let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
     let kv_max_t = 4usize;
-    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, kv_max_t)
-        .expect("load mtp buffers");
+    let mut mtp =
+        load_mtp_buffers_from_bake(&store, ordinal, &geom, kv_max_t).expect("load mtp buffers");
     let lm_head_w = shards
         .load_bf16_to_gpu(ordinal, "lm_head.weight")
         .expect("load lm_head.weight");
 
-    let mut scratch = alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
-        .expect("alloc mtp scratch");
+    let mut scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t).expect("alloc mtp scratch");
 
     let fused_buf = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize], &fused_bytes,
-    ).expect("upload fused");
-    let mut out_buf = GpuBuffer::zeros(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize],
-    ).expect("alloc out");
-    let mut h_post_buf = GpuBuffer::zeros(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize],
-    ).expect("alloc h_post");
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &fused_bytes,
+    )
+    .expect("upload fused");
+    let mut out_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize]).expect("alloc out");
+    let mut h_post_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize]).expect("alloc h_post");
 
-    eprintln!(
-        "[mtp draft] running draft step (position={base_seq_len}, cache_pos=0)..."
-    );
+    eprintln!("[mtp draft] running draft step (position={base_seq_len}, cache_pos=0)...");
     let result = run_mtp_draft_step(
-        ordinal, &geom, &mut mtp,
+        ordinal,
+        &geom,
+        &mut mtp,
         /* position */ base_seq_len,
         /* cache_pos */ 0,
         &lm_head_w,
-        &fused_buf, &mut out_buf, &mut h_post_buf,
+        &fused_buf,
+        &mut out_buf,
+        &mut h_post_buf,
         &mut scratch,
-    ).expect("run_mtp_draft_step");
+    )
+    .expect("run_mtp_draft_step");
 
     // h_post + logits envelopes are loose (max_abs ≤ 1.0) because
     // real-prefill state produces larger magnitudes than synthetic
@@ -456,13 +474,17 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
     //     ≥ 0.9994)
     assert_parity(
         "mtp.h_post",
-        &result.h_post_bytes, &want_h_post,
-        /* max_abs */ 1.0, /* cos_sim_floor */ 0.998,
+        &result.h_post_bytes,
+        &want_h_post,
+        /* max_abs */ 1.0,
+        /* cos_sim_floor */ 0.998,
     );
     assert_parity(
         "mtp.logits",
-        &result.logits_bytes, &want_logits,
-        /* max_abs */ 1.0, /* cos_sim_floor */ 0.999,
+        &result.logits_bytes,
+        &want_logits,
+        /* max_abs */ 1.0,
+        /* cos_sim_floor */ 0.999,
     );
     if result.draft_token_id == want_draft {
         eprintln!("[mtp draft] draft_token_id={want_draft} (greedy argmax matches oracle)");
@@ -529,8 +551,8 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
     );
     let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
-        .expect("load mtp buffers");
+    let mut mtp =
+        load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1)).expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
         .expect("load embed_tokens.weight");
@@ -538,25 +560,37 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
         .load_bf16_to_gpu(ordinal, "lm_head.weight")
         .expect("load lm_head.weight");
 
-    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, k.max(1))
-        .expect("alloc mtp forward scratch");
-    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
-        .expect("alloc mtp chain scratch");
+    let mut forward_scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, k.max(1)).expect("alloc mtp forward scratch");
+    let mut chain_scratch =
+        alloc_mtp_chain_scratch(ordinal, &geom).expect("alloc mtp chain scratch");
 
     let h_base_buf = GpuBuffer::from_host_bytes(
-        ordinal, ScalarType::BF16, &[geom.hidden as usize], &h_base_bytes,
-    ).expect("upload h_base");
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &h_base_bytes,
+    )
+    .expect("upload h_base");
 
     eprintln!(
         "[mtp chain] running {k}-step recurrence (base_position={base_seq_len}, \
          first_token_id={base_next_token_id})..."
     );
     let records = run_mtp_draft_chain(
-        ordinal, &geom, &mut mtp, base_seq_len,
-        &h_base_buf, base_next_token_id, k,
-        &embed_w, &lm_head_w,
-        &mut forward_scratch, &mut chain_scratch,
-    ).expect("run_mtp_draft_chain");
+        ordinal,
+        &geom,
+        &mut mtp,
+        base_seq_len,
+        &h_base_buf,
+        base_next_token_id,
+        k,
+        &embed_w,
+        &lm_head_w,
+        &mut forward_scratch,
+        &mut chain_scratch,
+    )
+    .expect("run_mtp_draft_chain");
 
     let got_drafts: Vec<u32> = records.iter().map(|r| r.draft_token_id).collect();
     eprintln!("[mtp chain] got: {got_drafts:?}  want: {want_drafts:?}");
@@ -573,7 +607,8 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
     // tolerates the same flip class because at that level there's no
     // cascade to worry about.
     assert_eq!(records.len(), k, "chain returned wrong number of records");
-    if let Some(idx) = got_drafts.iter()
+    if let Some(idx) = got_drafts
+        .iter()
         .zip(want_drafts.iter())
         .position(|(g, w)| g != w)
     {
@@ -584,7 +619,9 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
              chain because `e_in[step{}]` reads `embed_tokens[\
              wrong_token]`. Investigate the per-step logit gap before \
              relaxing.",
-            got_drafts[idx], want_drafts[idx], idx + 1
+            got_drafts[idx],
+            want_drafts[idx],
+            idx + 1
         );
     }
 
@@ -620,12 +657,16 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
     //   synthetic K=3:        cos_sim ≥ 0.9979, max_abs ≤ 0.844
     //   real-prefill (×3):    cos_sim ≥ 0.9999, max_abs ≤ 0.156
     for (i, want_step) in json["steps"].as_array().expect("steps").iter().enumerate() {
-        if i >= k { break; }
+        if i >= k {
+            break;
+        }
         let want_logits = b64(want_step["logits_bf16"].as_str().unwrap());
         assert_parity(
             &format!("mtp.chain.step{i}.logits"),
-            &records[i].logits_bytes, &want_logits,
-            /* max_abs */ 1.0, /* cos_sim_floor */ 0.997,
+            &records[i].logits_bytes,
+            &want_logits,
+            /* max_abs */ 1.0,
+            /* cos_sim_floor */ 0.997,
         );
     }
 }
@@ -666,19 +707,24 @@ fn qwen36_moe_speculative_driver_orchestration() {
     let base_next_token_id = json["base_next_token_id"].as_i64().unwrap() as u32;
     let h_base_bytes = b64(json["h_base_step0_bf16"].as_str().unwrap());
     let want_drafts: Vec<u32> = json["draft_token_ids"]
-        .as_array().expect("draft_token_ids")
-        .iter().map(|v| v.as_u64().expect("u64") as u32).collect();
+        .as_array()
+        .expect("draft_token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("u64") as u32)
+        .collect();
     let k = want_drafts.len();
     eprintln!("[spec] K={k} oracle drafts={want_drafts:?}");
 
     set_backend(Backend::Hip);
     let ordinal = 0usize;
 
-    eprintln!("[spec] loading mtp.* from INT4 bake + embed_tokens + tied lm_head from safetensors ...");
+    eprintln!(
+        "[spec] loading mtp.* from INT4 bake + embed_tokens + tied lm_head from safetensors ..."
+    );
     let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
-        .expect("load mtp buffers");
+    let mut mtp =
+        load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1)).expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
         .expect("load embed_tokens.weight");
@@ -686,10 +732,9 @@ fn qwen36_moe_speculative_driver_orchestration() {
         .load_bf16_to_gpu(ordinal, "lm_head.weight")
         .expect("load lm_head.weight");
 
-    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, k.max(1))
-        .expect("alloc fwd scratch");
-    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
-        .expect("alloc chain scratch");
+    let mut forward_scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, k.max(1)).expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom).expect("alloc chain scratch");
 
     let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
 
@@ -698,9 +743,7 @@ fn qwen36_moe_speculative_driver_orchestration() {
     let mut step_idx = 0usize;
     let want_drafts_p1 = want_drafts.clone();
     let synth_fh_p1 = synth_fh.clone();
-    let base_step_p1 = move |_pos: i32, _input: u32|
-        -> anyhow::Result<(u32, Vec<u8>)>
-    {
+    let base_step_p1 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         let predicted = if step_idx < want_drafts_p1.len() {
             want_drafts_p1[step_idx]
         } else {
@@ -711,17 +754,28 @@ fn qwen36_moe_speculative_driver_orchestration() {
     };
     eprintln!("[spec] pass 1 (full-accept)");
     let r1 = run_speculative_decode_step(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        k,
         base_step_p1,
-    ).expect("pass 1 run");
+    )
+    .expect("pass 1 run");
     let mut want1 = want_drafts.clone();
     want1.push(bonus_token_pass1);
     assert_eq!(r1.emitted_tokens, want1);
     assert_eq!(r1.n_accepted, k);
-    eprintln!("[spec] pass 1: emitted={:?} n_accepted={}", r1.emitted_tokens, r1.n_accepted);
+    eprintln!(
+        "[spec] pass 1: emitted={:?} n_accepted={}",
+        r1.emitted_tokens, r1.n_accepted
+    );
 
     // ---- Pass 2: partial-accept (k>=2 only) ----
     if k >= 2 {
@@ -729,24 +783,33 @@ fn qwen36_moe_speculative_driver_orchestration() {
         let mut step_idx = 0usize;
         let first_match = want_drafts[0];
         let synth_fh_p2 = synth_fh.clone();
-        let base_step_p2 = move |_pos: i32, _input: u32|
-            -> anyhow::Result<(u32, Vec<u8>)>
-        {
+        let base_step_p2 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
             let predicted = if step_idx == 0 { first_match } else { bad_pred };
             step_idx += 1;
             Ok((predicted, synth_fh_p2.clone()))
         };
         eprintln!("[spec] pass 2 (reject at k=1)");
         let r2 = run_speculative_decode_step(
-            ordinal, &geom, &mut mtp,
-            &mut forward_scratch, &mut chain_scratch,
-            &embed_w, &lm_head_w,
-            &h_base_bytes, base_next_token_id, base_seq_len, k,
+            ordinal,
+            &geom,
+            &mut mtp,
+            &mut forward_scratch,
+            &mut chain_scratch,
+            &embed_w,
+            &lm_head_w,
+            &h_base_bytes,
+            base_next_token_id,
+            base_seq_len,
+            k,
             base_step_p2,
-        ).expect("pass 2 run");
+        )
+        .expect("pass 2 run");
         assert_eq!(r2.emitted_tokens, vec![want_drafts[0], bad_pred]);
         assert_eq!(r2.n_accepted, 1);
-        eprintln!("[spec] pass 2: emitted={:?} n_accepted={}", r2.emitted_tokens, r2.n_accepted);
+        eprintln!(
+            "[spec] pass 2: emitted={:?} n_accepted={}",
+            r2.emitted_tokens, r2.n_accepted
+        );
     } else {
         eprintln!("[spec] pass 2 skipped (K={k} too small)");
     }
@@ -754,22 +817,31 @@ fn qwen36_moe_speculative_driver_orchestration() {
     // ---- Pass 3: zero-accept (immediate reject) ----
     let bad_pred: u32 = 67890;
     let synth_fh_p3 = synth_fh.clone();
-    let base_step_p3 = move |_pos: i32, _input: u32|
-        -> anyhow::Result<(u32, Vec<u8>)>
-    {
+    let base_step_p3 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         Ok((bad_pred, synth_fh_p3.clone()))
     };
     eprintln!("[spec] pass 3 (reject at k=0)");
     let r3 = run_speculative_decode_step(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        k,
         base_step_p3,
-    ).expect("pass 3 run");
+    )
+    .expect("pass 3 run");
     assert_eq!(r3.emitted_tokens, vec![bad_pred]);
     assert_eq!(r3.n_accepted, 0);
-    eprintln!("[spec] pass 3: emitted={:?} n_accepted={}", r3.emitted_tokens, r3.n_accepted);
+    eprintln!(
+        "[spec] pass 3: emitted={:?} n_accepted={}",
+        r3.emitted_tokens, r3.n_accepted
+    );
 
     // The driver should produce a final-hidden buffer of the right size
     // regardless of which pass ran.
@@ -785,26 +857,38 @@ fn qwen36_moe_speculative_driver_orchestration() {
     let k0_pred: u32 = 4242;
     let synth_fh_p4 = synth_fh.clone();
     let mut p4_calls = 0usize;
-    let base_step_p4 = move |_pos: i32, _input: u32|
-        -> anyhow::Result<(u32, Vec<u8>)>
-    {
+    let base_step_p4 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         p4_calls += 1;
         assert_eq!(p4_calls, 1, "K=0 must run exactly one base step");
         Ok((k0_pred, synth_fh_p4.clone()))
     };
     eprintln!("[spec] pass 4 (K=0 fallback)");
     let r4 = run_speculative_decode_step(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, /* num_drafts */ 0,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        /* num_drafts */ 0,
         base_step_p4,
-    ).expect("pass 4 run");
-    assert_eq!(r4.emitted_tokens, vec![k0_pred],
-        "K=0 must still emit exactly one token (the contract is non-empty)");
+    )
+    .expect("pass 4 run");
+    assert_eq!(
+        r4.emitted_tokens,
+        vec![k0_pred],
+        "K=0 must still emit exactly one token (the contract is non-empty)"
+    );
     assert_eq!(r4.n_accepted, 0);
     assert_eq!(r4.final_hidden_bytes.len(), (geom.hidden as usize) * 2);
-    eprintln!("[spec] pass 4: emitted={:?} n_accepted={}", r4.emitted_tokens, r4.n_accepted);
+    eprintln!(
+        "[spec] pass 4: emitted={:?} n_accepted={}",
+        r4.emitted_tokens, r4.n_accepted
+    );
 }
 
 /// Phase 6.4b orchestration test for the batched closure variant.
@@ -842,8 +926,11 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     let base_next_token_id = json["base_next_token_id"].as_i64().unwrap() as u32;
     let h_base_bytes = b64(json["h_base_step0_bf16"].as_str().unwrap());
     let want_drafts: Vec<u32> = json["draft_token_ids"]
-        .as_array().expect("draft_token_ids")
-        .iter().map(|v| v.as_u64().expect("u64") as u32).collect();
+        .as_array()
+        .expect("draft_token_ids")
+        .iter()
+        .map(|v| v.as_u64().expect("u64") as u32)
+        .collect();
     let k = want_drafts.len();
     eprintln!("[spec batched] K={k} oracle drafts={want_drafts:?}");
 
@@ -852,18 +939,17 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
 
     let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1))
-        .expect("load mtp buffers");
+    let mut mtp =
+        load_mtp_buffers_from_bake(&store, ordinal, &geom, k.max(1)).expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
         .expect("load embed_tokens.weight");
     let lm_head_w = shards
         .load_bf16_to_gpu(ordinal, "lm_head.weight")
         .expect("load lm_head.weight");
-    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, k.max(1))
-        .expect("alloc fwd scratch");
-    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
-        .expect("alloc chain scratch");
+    let mut forward_scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, k.max(1)).expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom).expect("alloc chain scratch");
 
     let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
 
@@ -871,9 +957,7 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     let bonus_token: u32 = 999;
     let want_drafts_p1 = want_drafts.clone();
     let synth_fh_p1 = synth_fh.clone();
-    let base_step_batched_p1 = move |inputs: &[(i32, u32)]|
-        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-    {
+    let base_step_batched_p1 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), k + 1, "expected K+1 inputs");
         // Predictions: drafts[0..K] match, then bonus for K-th.
         let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
@@ -884,60 +968,80 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         Ok(out)
     };
     let r1 = run_speculative_decode_step_batched(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        k,
         base_step_batched_p1,
-    ).expect("pass 1 batched");
+    )
+    .expect("pass 1 batched");
     let mut want1 = want_drafts.clone();
     want1.push(bonus_token);
     assert_eq!(r1.emitted_tokens, want1, "full-accept emit");
     assert_eq!(r1.n_accepted, k);
-    eprintln!("[spec batched] pass 1: emitted={:?} n_accepted={}",
-        r1.emitted_tokens, r1.n_accepted);
+    eprintln!(
+        "[spec batched] pass 1: emitted={:?} n_accepted={}",
+        r1.emitted_tokens, r1.n_accepted
+    );
 
     // ---- Pass 2: partial-accept (reject at k=1, K≥2) ----
     if k >= 2 {
         let bad_pred: u32 = 12345;
         let first_match = want_drafts[0];
         let synth_fh_p2 = synth_fh.clone();
-        let base_step_batched_p2 = move |inputs: &[(i32, u32)]|
-            -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-        {
-            assert_eq!(inputs.len(), k + 1);
-            let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
-            // Index 0 matches drafts[0]
-            out.push((first_match, synth_fh_p2.clone()));
-            // Index 1 mismatches drafts[1] → reject.
-            out.push((bad_pred, synth_fh_p2.clone()));
-            // Remaining filler (would not be inspected by accept-prefix
-            // logic but must exist to satisfy the contract).
-            for _ in 2..(k + 1) {
-                out.push((0u32, synth_fh_p2.clone()));
-            }
-            Ok(out)
-        };
+        let base_step_batched_p2 =
+            move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+                assert_eq!(inputs.len(), k + 1);
+                let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+                // Index 0 matches drafts[0]
+                out.push((first_match, synth_fh_p2.clone()));
+                // Index 1 mismatches drafts[1] → reject.
+                out.push((bad_pred, synth_fh_p2.clone()));
+                // Remaining filler (would not be inspected by accept-prefix
+                // logic but must exist to satisfy the contract).
+                for _ in 2..(k + 1) {
+                    out.push((0u32, synth_fh_p2.clone()));
+                }
+                Ok(out)
+            };
         let r2 = run_speculative_decode_step_batched(
-            ordinal, &geom, &mut mtp,
-            &mut forward_scratch, &mut chain_scratch,
-            &embed_w, &lm_head_w,
-            &h_base_bytes, base_next_token_id, base_seq_len, k,
+            ordinal,
+            &geom,
+            &mut mtp,
+            &mut forward_scratch,
+            &mut chain_scratch,
+            &embed_w,
+            &lm_head_w,
+            &h_base_bytes,
+            base_next_token_id,
+            base_seq_len,
+            k,
             base_step_batched_p2,
-        ).expect("pass 2 batched");
-        assert_eq!(r2.emitted_tokens, vec![want_drafts[0], bad_pred],
-            "partial-accept emit drafts[0] + corrected");
+        )
+        .expect("pass 2 batched");
+        assert_eq!(
+            r2.emitted_tokens,
+            vec![want_drafts[0], bad_pred],
+            "partial-accept emit drafts[0] + corrected"
+        );
         assert_eq!(r2.n_accepted, 1);
-        eprintln!("[spec batched] pass 2: emitted={:?} n_accepted={}",
-            r2.emitted_tokens, r2.n_accepted);
+        eprintln!(
+            "[spec batched] pass 2: emitted={:?} n_accepted={}",
+            r2.emitted_tokens, r2.n_accepted
+        );
     }
 
     // ---- Pass 3: zero-accept (immediate reject at k=0) ----
     let bad_pred: u32 = 67890;
     let synth_fh_p3 = synth_fh.clone();
-    let base_step_batched_p3 = move |inputs: &[(i32, u32)]|
-        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-    {
+    let base_step_batched_p3 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), k + 1);
         let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
         out.push((bad_pred, synth_fh_p3.clone())); // immediate reject
@@ -947,37 +1051,55 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         Ok(out)
     };
     let r3 = run_speculative_decode_step_batched(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, k,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        k,
         base_step_batched_p3,
-    ).expect("pass 3 batched");
+    )
+    .expect("pass 3 batched");
     assert_eq!(r3.emitted_tokens, vec![bad_pred]);
     assert_eq!(r3.n_accepted, 0);
-    eprintln!("[spec batched] pass 3: emitted={:?} n_accepted={}",
-        r3.emitted_tokens, r3.n_accepted);
+    eprintln!(
+        "[spec batched] pass 3: emitted={:?} n_accepted={}",
+        r3.emitted_tokens, r3.n_accepted
+    );
 
     // ---- Pass 4: K=0 fallback ----
     let k0_pred: u32 = 4242;
     let synth_fh_p4 = synth_fh.clone();
-    let base_step_batched_p4 = move |inputs: &[(i32, u32)]|
-        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-    {
+    let base_step_batched_p4 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 1, "K=0 fallback runs exactly one base step");
         Ok(vec![(k0_pred, synth_fh_p4.clone())])
     };
     let r4 = run_speculative_decode_step_batched(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 0,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        /* K */ 0,
         base_step_batched_p4,
-    ).expect("pass 4 batched");
+    )
+    .expect("pass 4 batched");
     assert_eq!(r4.emitted_tokens, vec![k0_pred]);
     assert_eq!(r4.n_accepted, 0);
-    eprintln!("[spec batched] pass 4 (K=0): emitted={:?} n_accepted={}",
-        r4.emitted_tokens, r4.n_accepted);
+    eprintln!(
+        "[spec batched] pass 4 (K=0): emitted={:?} n_accepted={}",
+        r4.emitted_tokens, r4.n_accepted
+    );
 }
 
 /// Phase 6.4b regression: rejection at the FINAL draft index must NOT
@@ -1018,18 +1140,16 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     let ordinal = 0usize;
     let store = open_mtp_bake(&model_dir).expect("open INT4 bake");
     let shards = SafetensorsShards::open(&model_dir).expect("open safetensors");
-    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, 4)
-        .expect("load mtp buffers");
+    let mut mtp = load_mtp_buffers_from_bake(&store, ordinal, &geom, 4).expect("load mtp buffers");
     let embed_w = shards
         .load_bf16_to_gpu(ordinal, "model.language_model.embed_tokens.weight")
         .expect("load embed_tokens.weight");
     let lm_head_w = shards
         .load_bf16_to_gpu(ordinal, "lm_head.weight")
         .expect("load lm_head.weight");
-    let mut forward_scratch = alloc_mtp_forward_scratch(ordinal, &geom, 4)
-        .expect("alloc fwd scratch");
-    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom)
-        .expect("alloc chain scratch");
+    let mut forward_scratch =
+        alloc_mtp_forward_scratch(ordinal, &geom, 4).expect("alloc fwd scratch");
+    let mut chain_scratch = alloc_mtp_chain_scratch(ordinal, &geom).expect("alloc chain scratch");
     let synth_fh = vec![0u8; (geom.hidden as usize) * 2];
 
     // ---- K=1, reject at k=0 (the only and final index) ----
@@ -1039,9 +1159,7 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     let bad_pred_k1: u32 = 7777;
     let synth_fh_k1 = synth_fh.clone();
     let mut k1_calls = 0usize;
-    let base_step_k1 = move |inputs: &[(i32, u32)]|
-        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-    {
+    let base_step_k1 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
         k1_calls += 1;
         // K+1 = 2 predictions: index 0 mismatches drafts[0],
@@ -1052,17 +1170,30 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
         ])
     };
     let r_k1 = run_speculative_decode_step_batched(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 1,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        /* K */ 1,
         base_step_k1,
-    ).expect("K=1 reject-at-0");
-    assert_eq!(r_k1.emitted_tokens, vec![bad_pred_k1],
-        "K=1 reject-at-0 emits ONLY corrected, NOT bonus");
+    )
+    .expect("K=1 reject-at-0");
+    assert_eq!(
+        r_k1.emitted_tokens,
+        vec![bad_pred_k1],
+        "K=1 reject-at-0 emits ONLY corrected, NOT bonus"
+    );
     assert_eq!(r_k1.n_accepted, 0);
-    eprintln!("[spec batched reject-at-last] K=1: emitted={:?} n_accepted={}",
-        r_k1.emitted_tokens, r_k1.n_accepted);
+    eprintln!(
+        "[spec batched reject-at-last] K=1: emitted={:?} n_accepted={}",
+        r_k1.emitted_tokens, r_k1.n_accepted
+    );
 
     // ---- K=2, reject at k=1 (the FINAL index) ----
     // Pre-fix: drafts[0] accepted then drafts[1] rejected → emitted
@@ -1071,31 +1202,45 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     // Post-fix: n_accepted=1 != K=2 → no bonus, emitted=[drafts[0],
     // bad_pred].
     let oracle_drafts: Vec<u32> = json["draft_token_ids"]
-        .as_array().expect("draft_token_ids")
-        .iter().map(|v| v.as_u64().unwrap() as u32).collect();
+        .as_array()
+        .expect("draft_token_ids")
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
     let first_match = oracle_drafts[0];
     let bad_pred_k2: u32 = 8888;
     let synth_fh_k2 = synth_fh.clone();
-    let base_step_k2 = move |inputs: &[(i32, u32)]|
-        -> anyhow::Result<Vec<(u32, Vec<u8>)>>
-    {
+    let base_step_k2 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 3, "K=2 → K+1=3 verify inputs");
         Ok(vec![
-            (first_match, synth_fh_k2.clone()),    // accepts drafts[0]
-            (bad_pred_k2, synth_fh_k2.clone()),    // rejects drafts[1]
-            (99999, synth_fh_k2.clone()),          // bonus filler
+            (first_match, synth_fh_k2.clone()), // accepts drafts[0]
+            (bad_pred_k2, synth_fh_k2.clone()), // rejects drafts[1]
+            (99999, synth_fh_k2.clone()),       // bonus filler
         ])
     };
     let r_k2 = run_speculative_decode_step_batched(
-        ordinal, &geom, &mut mtp,
-        &mut forward_scratch, &mut chain_scratch,
-        &embed_w, &lm_head_w,
-        &h_base_bytes, base_next_token_id, base_seq_len, /* K */ 2,
+        ordinal,
+        &geom,
+        &mut mtp,
+        &mut forward_scratch,
+        &mut chain_scratch,
+        &embed_w,
+        &lm_head_w,
+        &h_base_bytes,
+        base_next_token_id,
+        base_seq_len,
+        /* K */ 2,
         base_step_k2,
-    ).expect("K=2 reject-at-1");
-    assert_eq!(r_k2.emitted_tokens, vec![first_match, bad_pred_k2],
-        "K=2 reject-at-final emits drafts[0]+corrected, NOT bonus");
+    )
+    .expect("K=2 reject-at-1");
+    assert_eq!(
+        r_k2.emitted_tokens,
+        vec![first_match, bad_pred_k2],
+        "K=2 reject-at-final emits drafts[0]+corrected, NOT bonus"
+    );
     assert_eq!(r_k2.n_accepted, 1);
-    eprintln!("[spec batched reject-at-last] K=2: emitted={:?} n_accepted={}",
-        r_k2.emitted_tokens, r_k2.n_accepted);
+    eprintln!(
+        "[spec batched reject-at-last] K=2: emitted={:?} n_accepted={}",
+        r_k2.emitted_tokens, r_k2.n_accepted
+    );
 }

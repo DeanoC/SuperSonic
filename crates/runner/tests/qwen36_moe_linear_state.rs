@@ -132,8 +132,7 @@ fn make_full_layer(ordinal: usize) -> Result<LayerBuffers> {
 
 fn d2h_bytes(buf: &GpuBuffer) -> Vec<u8> {
     let mut out = vec![0u8; buf.len_bytes()];
-    copy_d2h(0usize, out.as_mut_ptr() as *mut _, buf.as_ptr(), out.len())
-        .expect("d2h");
+    copy_d2h(0usize, out.as_mut_ptr() as *mut _, buf.as_ptr(), out.len()).expect("d2h");
     out
 }
 
@@ -145,7 +144,9 @@ fn live_conv_bytes(layer: &LayerBuffers) -> Vec<u8> {
 }
 fn live_rec_bytes(layer: &LayerBuffers) -> Vec<u8> {
     match &layer.attn {
-        AttnLayerBuffers::Linear { recurrent_state, .. } => d2h_bytes(recurrent_state),
+        AttnLayerBuffers::Linear {
+            recurrent_state, ..
+        } => d2h_bytes(recurrent_state),
         AttnLayerBuffers::Full { .. } => Vec::new(),
     }
 }
@@ -207,10 +208,15 @@ fn linear_attn_state_save_restore_roundtrip() {
     // ---- Initial save ----
     let snap = save_linear_attn_state(ordinal, &layers).expect("save snapshot");
     assert_eq!(
-        snap.linear_layer_count(), 2,
+        snap.linear_layer_count(),
+        2,
         "snapshot should capture exactly 2 Linear layers (full layer is None)"
     );
-    assert_eq!(snap.layers.len(), 3, "snapshot has one slot per source layer");
+    assert_eq!(
+        snap.layers.len(),
+        3,
+        "snapshot has one slot per source layer"
+    );
     assert!(snap.layers[0].is_some(), "linear layer 0 captured");
     assert!(snap.layers[1].is_none(), "full layer => None slot");
     assert!(snap.layers[2].is_some(), "linear layer 2 captured");
@@ -246,9 +252,15 @@ fn linear_attn_state_save_restore_roundtrip() {
     let post_l2_conv = live_conv_bytes(&layers[2]);
     let post_l2_rec = live_rec_bytes(&layers[2]);
 
-    assert_eq!(post_l0_conv, pre_l0_conv, "restored conv0 matches pre-mutate");
+    assert_eq!(
+        post_l0_conv, pre_l0_conv,
+        "restored conv0 matches pre-mutate"
+    );
     assert_eq!(post_l0_rec, pre_l0_rec, "restored rec0 matches pre-mutate");
-    assert_eq!(post_l2_conv, pre_l2_conv, "restored conv2 matches pre-mutate");
+    assert_eq!(
+        post_l2_conv, pre_l2_conv,
+        "restored conv2 matches pre-mutate"
+    );
     assert_eq!(post_l2_rec, pre_l2_rec, "restored rec2 matches pre-mutate");
 
     eprintln!(

@@ -97,12 +97,12 @@ pub fn build_layer_descs(
                     0.0
                 };
                 d.kv_len = seqlen_offset as i32;
-                if let Some(ref k) = ls.kv_cache_k {
-                    d.kv_cache_k = k.as_ptr() as *mut _;
-                    d.kv_max_t = k.shape()[2] as i32;
+                if let Some(ptr) = ls.kv_cache_k_ptr() {
+                    d.kv_cache_k = ptr;
+                    d.kv_max_t = ls.kv_capacity() as i32;
                 }
-                if let Some(ref v) = ls.kv_cache_v {
-                    d.kv_cache_v = v.as_ptr() as *mut _;
+                if let Some(ptr) = ls.kv_cache_v_ptr() {
+                    d.kv_cache_v = ptr;
                 }
                 if let Some(ref shadow_k) = ls.kv_shadow_k {
                     d.kv_shadow_k = shadow_k.as_ptr() as *mut _;

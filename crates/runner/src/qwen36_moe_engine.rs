@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
+use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::{Config, TextConfig};
@@ -108,6 +108,22 @@ pub struct BakeAccount {
     /// bake against the analytic INT4 projection.
     pub int4_quantized_bytes: u64,
     pub raw_bytes: u64,
+    /// Optional live VMM probe populated when requested by environment.
+    /// This loads real baked tensors into role-tagged virtual allocations
+    /// without switching decode descriptors over to VMM yet.
+    pub vmm_probe: Option<VirtualBakeProbe>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VirtualBakeProbe {
+    pub allocations: usize,
+    pub logical_bytes: usize,
+    pub reserved_bytes: usize,
+    pub resident_bytes: usize,
+    pub logical_resident_bytes: usize,
+    pub mapping_count: usize,
+    pub loaded_tensors: Vec<String>,
+    pub failed_tensors: Vec<String>,
 }
 
 pub fn run_qwen36_moe_dry_run(
@@ -119,6 +135,7 @@ pub fn run_qwen36_moe_dry_run(
     batch_size: usize,
     kv_fp8: bool,
     no_bake: bool,
+    ordinal: usize,
 ) -> Result<DryRunReport> {
     let kernel_params = match entry.params {
         FamilyParams::Qwen36Moe(p) => p,
@@ -138,7 +155,7 @@ pub fn run_qwen36_moe_dry_run(
     let layout = StateLayout::new(context_size, batch_size, kv_fp8);
     let state = StateAccount::from_config(&config.text_config, layout);
 
-    let bake = inspect_bake(model_dir, &config.text_config, weight_prefix);
+    let bake = inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal);
 
     let mut on_disk_bytes = None;
     let mut on_disk_tensor_count = None;
@@ -238,6 +255,7 @@ fn inspect_bake(
     model_dir: &Path,
     text_config: &TextConfig,
     weight_prefix: &str,
+    ordinal: usize,
 ) -> Option<BakeAccount> {
     let bake_dir = model_store::bake_dir_int4(model_dir);
     if !bake_dir.exists() {
@@ -293,6 +311,8 @@ fn inspect_bake(
         }
     }
 
+    let vmm_probe = inspect_bake_vmm_probe(&store, text_config, weight_prefix, ordinal);
+
     Some(BakeAccount {
         bake_dir,
         manifest_format_version: manifest.format_version,
@@ -304,6 +324,69 @@ fn inspect_bake(
         bad_expert_tensors,
         int4_quantized_bytes,
         raw_bytes,
+        vmm_probe,
+    })
+}
+
+fn inspect_bake_vmm_probe(
+    store: &BakedStore,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    ordinal: usize,
+) -> Option<VirtualBakeProbe> {
+    let weight_probe = std::env::var_os("SUPERSONIC_VMM_WEIGHT_PROBE").is_some();
+    let moe_probe_layers = std::env::var("SUPERSONIC_VMM_MOE_ISLAND_PROBE_LAYERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .or_else(|| std::env::var_os("SUPERSONIC_VMM_MOE_ISLAND_PROBE").map(|_| 1))
+        .unwrap_or(0);
+    if !weight_probe && moe_probe_layers == 0 {
+        return None;
+    }
+    if !gpu_hal::vmm_is_supported(gpu_hal::current_backend(), ordinal) {
+        return None;
+    }
+
+    let mut arena = BakedStore::virtual_weight_arena(ordinal);
+    let mut loaded_tensors = Vec::new();
+    let mut failed_tensors = Vec::new();
+    if weight_probe {
+        let name = resolve_qwen36_store_name(store, "lm_head.weight");
+        match store.load_to_virtual_arena(&mut arena, name.as_ref(), VirtualAllocationRole::Weights)
+        {
+            Ok(_) => loaded_tensors.push(name.into_owned()),
+            Err(err) => failed_tensors.push(format!("{name}: {err}")),
+        }
+    }
+
+    for li in 0..moe_probe_layers.min(text_config.num_hidden_layers as usize) {
+        for kind in ["gate_up_proj", "down_proj"] {
+            let requested = format!("{weight_prefix}.layers.{li}.mlp.experts.{kind}");
+            let name = resolve_qwen36_store_name(store, &requested);
+            match store.load_to_virtual_arena(
+                &mut arena,
+                name.as_ref(),
+                VirtualAllocationRole::MoeExpert,
+            ) {
+                Ok(_) => loaded_tensors.push(name.into_owned()),
+                Err(err) => failed_tensors.push(format!("{name}: {err}")),
+            }
+        }
+    }
+
+    if loaded_tensors.is_empty() && failed_tensors.is_empty() {
+        return None;
+    }
+    let stats = arena.stats();
+    Some(VirtualBakeProbe {
+        allocations: stats.allocations,
+        logical_bytes: stats.logical_bytes,
+        reserved_bytes: stats.reserved_bytes,
+        resident_bytes: stats.resident_bytes,
+        logical_resident_bytes: stats.logical_resident_bytes,
+        mapping_count: stats.mapping_count,
+        loaded_tensors,
+        failed_tensors,
     })
 }
 
@@ -578,6 +661,39 @@ pub fn print_report(report: &DryRunReport) {
         }
         let bake_ok = bake.missing_specs.is_empty() && bake.bad_expert_tensors.is_empty();
         println!("  ready-for-decode: {}", if bake_ok { "YES" } else { "NO" });
+        if let Some(vmm) = &bake.vmm_probe {
+            println!();
+            println!("  [VMM residency probe]");
+            println!(
+                "    allocations:      {}    mappings={}",
+                vmm.allocations, vmm.mapping_count
+            );
+            println!(
+                "    logical/resident: {:.2} MiB / {:.2} MiB",
+                vmm.logical_bytes as f64 / MIB,
+                vmm.resident_bytes as f64 / MIB,
+            );
+            println!(
+                "    logical resident: {:.2} MiB    reserved={:.2} MiB",
+                vmm.logical_resident_bytes as f64 / MIB,
+                vmm.reserved_bytes as f64 / MIB,
+            );
+            for name in vmm.loaded_tensors.iter().take(8) {
+                println!("    - {name}");
+            }
+            if vmm.loaded_tensors.len() > 8 {
+                println!("    ... {} more", vmm.loaded_tensors.len() - 8);
+            }
+            if !vmm.failed_tensors.is_empty() {
+                println!(
+                    "    failed loads:    {} (showing first 8)",
+                    vmm.failed_tensors.len()
+                );
+                for name in vmm.failed_tensors.iter().take(8) {
+                    println!("    ! {name}");
+                }
+            }
+        }
         println!();
     } else {
         println!(
@@ -629,6 +745,8 @@ pub fn print_report(report: &DryRunReport) {
 }
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
+    ensure_qwen36_bake(cli, entry)?;
+
     // Derive context_size + an honest source flag so the printed report can
     // tell the user which of three answers they got: explicit, prompt-derived
     // estimate, or worst-case defaults-only. The `--context-size` path is
@@ -657,6 +775,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.batch_size.max(1),
         cli.kv_fp8,
         cli.no_bake,
+        cli.device,
     )?;
     print_report(&report);
     if cli.dry_run {
@@ -678,44 +797,6 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
              or use --dry-run for analytic accounting.",
             entry.backend,
         );
-    }
-
-    // Auto-download the requested release bake if missing or stale. The
-    // qwen3.6-MoE engine had been missing this wiring for INT4 — an
-    // oversight visible during Phase 6 bring-up: 35B-A3B INT4
-    // calibration OOMs on 24 GiB hosts, so release-hosted bakes are
-    // the only realistic way to ship updates (e.g. the post-#84 bake
-    // that includes mtp.* tensors for self-speculative decode). Mirrors
-    // the Phi-4 / Llama-3.1 / Qwen3.5 paths.
-    {
-        let variant = if cli.fp8_runtime {
-            model_store::fetch::BakeVariant::Fp8Native
-        } else {
-            model_store::fetch::BakeVariant::Int4Gptq
-        };
-        let bake_dir = variant.bake_dir(&cli.model_dir);
-        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-            .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
-        // `should_fetch_exact_bake` honors --download-bake (force) and
-        // refuses to fetch when an up-to-date bake is already present.
-        let force_download = cli.download_bake;
-        if !cli.no_download
-            && crate::should_fetch_exact_bake(force_download, model_store::version_ok(&bake_dir))
-        {
-            let canonical_model = entry.model.to_string();
-            match crate::try_download_bake(cli, variant, &canonical_model, &bake_dir) {
-                Ok(true) => eprintln!(
-                    "[fetch] installed qwen3.6-MoE {} bake at {}",
-                    if cli.fp8_runtime { "FP8" } else { "INT4" },
-                    bake_dir.display()
-                ),
-                Ok(false) => {}
-                Err(e) => eprintln!(
-                    "[fetch] qwen3.6-MoE {} bake fetch failed: {e}",
-                    if cli.fp8_runtime { "FP8" } else { "INT4" }
-                ),
-            }
-        }
     }
 
     // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
@@ -760,6 +841,43 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         // opt-out for A/B comparison or bisecting megakernel regressions.
         !cli.no_persistent_decode,
     )?;
+    Ok(())
+}
+
+fn ensure_qwen36_bake(cli: &crate::Cli, entry: &RegistryEntry) -> Result<()> {
+    // Auto-download the requested release bake if missing or stale. 35B-A3B
+    // INT4 calibration OOMs on 24 GiB hosts, so release-hosted bakes are the
+    // realistic default for decode and for dry-run residency probes. Run this
+    // before dry-run reporting so `SUPERSONIC_VMM_*_PROBE` can inspect a
+    // freshly populated bake.
+    let variant = if cli.fp8_runtime {
+        model_store::fetch::BakeVariant::Fp8Native
+    } else {
+        model_store::fetch::BakeVariant::Int4Gptq
+    };
+    let bake_dir = variant.bake_dir(&cli.model_dir);
+    let _lock = model_store::BakeLock::acquire(&cli.model_dir)
+        .map_err(|e| anyhow!("acquire bake lock: {e}"))?;
+    // `should_fetch_exact_bake` honors --download-bake (force) and refuses to
+    // fetch when an up-to-date bake is already present.
+    let force_download = cli.download_bake;
+    if !cli.no_download
+        && crate::should_fetch_exact_bake(force_download, model_store::version_ok(&bake_dir))
+    {
+        let canonical_model = entry.model.to_string();
+        match crate::try_download_bake(cli, variant, &canonical_model, &bake_dir) {
+            Ok(true) => eprintln!(
+                "[fetch] installed qwen3.6-MoE {} bake at {}",
+                if cli.fp8_runtime { "FP8" } else { "INT4" },
+                bake_dir.display()
+            ),
+            Ok(false) => {}
+            Err(e) => eprintln!(
+                "[fetch] qwen3.6-MoE {} bake fetch failed: {e}",
+                if cli.fp8_runtime { "FP8" } else { "INT4" }
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -1704,9 +1822,12 @@ fn decode_text(
     // through the same pointers after the host D2D-copies fresh state
     // back into the LayerBuffer slots.
     let mut persistent_scratch = if persistent_decode {
-        let scratch =
-            crate::qwen36_moe_persistent_decode::PersistentScratch::new(ordinal, &geom, &mut layers)
-                .context("alloc PersistentScratch for --persistent-decode")?;
+        let scratch = crate::qwen36_moe_persistent_decode::PersistentScratch::new(
+            ordinal,
+            &geom,
+            &mut layers,
+        )
+        .context("alloc PersistentScratch for --persistent-decode")?;
         println!(
             "  --persistent-decode: megakernel scratch allocated \
              (descs={}KiB, workspace={}KiB, ping/pong={}KiB){}",
@@ -1833,9 +1954,7 @@ fn decode_text(
             lm_head_folded = fold.is_some();
             scratch
                 .run(ordinal, &initial_hidden, position, fold)
-                .with_context(|| {
-                    format!("persistent decode (step {step}, position {position})")
-                })?
+                .with_context(|| format!("persistent decode (step {step}, position {position})"))?
         } else {
             // Chained path doesn't support the fold; lm_head still
             // launches separately below on gen steps.
@@ -2029,19 +2148,18 @@ fn decode_text(
                             t_embed += t_embed_start.elapsed();
 
                             let t_chain_start = std::time::Instant::now();
-                            let chain_outputs =
-                                if let Some(scratch) = persistent_scratch.as_mut() {
-                                    scratch.run(ordinal, &initial_hidden, pos, None)?
-                                } else {
-                                    run_chained_decode_fast(
-                                        ordinal,
-                                        &geom,
-                                        &mut layers,
-                                        &initial_hidden,
-                                        pos,
-                                        emit_stage_timings,
-                                    )?
-                                };
+                            let chain_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
+                                scratch.run(ordinal, &initial_hidden, pos, None)?
+                            } else {
+                                run_chained_decode_fast(
+                                    ordinal,
+                                    &geom,
+                                    &mut layers,
+                                    &initial_hidden,
+                                    pos,
+                                    emit_stage_timings,
+                                )?
+                            };
                             t_chain += t_chain_start.elapsed();
                             t_chain_full_attn_us += chain_outputs.kernel_full_attn_us;
                             t_chain_linear_attn_us += chain_outputs.kernel_linear_attn_us;

@@ -403,7 +403,10 @@ mod tests {
         validate(&config).expect("validate");
         let t = &config.text_config;
 
-        assert_eq!(config.architectures, vec!["Qwen3_5MoeForConditionalGeneration"]);
+        assert_eq!(
+            config.architectures,
+            vec!["Qwen3_5MoeForConditionalGeneration"]
+        );
         assert_eq!(config.model_type.as_deref(), Some("qwen3_5_moe"));
 
         assert_eq!(t.vocab_size, 248320);

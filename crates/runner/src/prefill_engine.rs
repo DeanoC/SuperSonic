@@ -2145,32 +2145,38 @@ fn prefill_full_attention_layer(
     ls.ensure_kv_capacity(kv_len - 1, ordinal, config, kv_chunk_size, false)
         .map_err(|e| anyhow::anyhow!("layer {idx} KV alloc: {e}"))?;
 
-    if let Some(ref mut cache_k) = ls.kv_cache_k {
+    if ls.kv_cache_k_ptr().is_some() {
         let bytes_per_chunk_head = chunk_len * head_dim * elem_bytes;
-        let cap = cache_k.shape()[2];
+        let cap = ls.kv_capacity();
         let cap_stride = cap * head_dim * elem_bytes;
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
+            let dst = ls
+                .kv_cache_k_offset_ptr(h * cap_stride + dst_pos_offset)
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing K cache"))?;
             copy_d2d_batched(
                 ordinal,
-                cache_k.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
+                dst as *mut c_void,
                 scratch.attn_k.offset_ptr(h * src_stride),
                 bytes_per_chunk_head,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV cache K write h={h}: {e}"))?;
         }
     }
-    if let Some(ref mut cache_v) = ls.kv_cache_v {
+    if ls.kv_cache_v_ptr().is_some() {
         let bytes_per_chunk_head = chunk_len * head_dim * elem_bytes;
-        let cap = cache_v.shape()[2];
+        let cap = ls.kv_capacity();
         let cap_stride = cap * head_dim * elem_bytes;
         let src_stride = chunk_len * head_dim * elem_bytes;
         let dst_pos_offset = chunk_start * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
+            let dst = ls
+                .kv_cache_v_offset_ptr(h * cap_stride + dst_pos_offset)
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing V cache"))?;
             copy_d2d_batched(
                 ordinal,
-                cache_v.offset_ptr(h * cap_stride + dst_pos_offset) as *mut c_void,
+                dst as *mut c_void,
                 scratch.attn_v.offset_ptr(h * src_stride),
                 bytes_per_chunk_head,
             )
@@ -2200,19 +2206,20 @@ fn prefill_full_attention_layer(
     let scale = 1.0 / (head_dim as f32).sqrt();
     let kv_k_contig;
     let kv_v_contig;
-    let attn_k_ref;
-    let attn_v_ref;
+    let attn_k_ref: &GpuBuffer;
+    let attn_v_ref: &GpuBuffer;
+    let cap = ls.kv_capacity();
 
-    let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
-    let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
-    let cap = cache_k_ref.shape()[2];
-
-    if cap == kv_len {
+    if !ls.has_virtual_kv_cache() && cap == kv_len {
+        let cache_k_ref = ls.kv_cache_k.as_ref().unwrap();
+        let cache_v_ref = ls.kv_cache_v.as_ref().unwrap();
         // No padding — cache is already contiguous, use directly
         attn_k_ref = cache_k_ref;
         attn_v_ref = cache_v_ref;
     } else {
         // Capacity > kv_len — copy each head's kv_len entries into contiguous buffers
+        // Virtual KV also uses this path because the prefill attention FFI takes
+        // `GpuBuffer` wrappers, while the virtual cache is represented by raw VA.
         kv_k_contig =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, kv_len, head_dim])
                 .map_err(|e| anyhow::anyhow!("kv_k_contig alloc: {e}"))?;
@@ -2223,17 +2230,23 @@ fn prefill_full_attention_layer(
         let contig_stride = kv_len * head_dim * elem_bytes;
         let copy_bytes = kv_len * head_dim * elem_bytes;
         for h in 0..num_kv_heads {
+            let src_k = ls
+                .kv_cache_k_offset_ptr(h * cap_stride)
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing K cache"))?;
+            let src_v = ls
+                .kv_cache_v_offset_ptr(h * cap_stride)
+                .ok_or_else(|| anyhow::anyhow!("layer {idx} missing V cache"))?;
             copy_d2d_batched(
                 ordinal,
                 kv_k_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                cache_k_ref.offset_ptr(h * cap_stride),
+                src_k,
                 copy_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble K h={h}: {e}"))?;
             copy_d2d_batched(
                 ordinal,
                 kv_v_contig.offset_ptr(h * contig_stride) as *mut c_void,
-                cache_v_ref.offset_ptr(h * cap_stride),
+                src_v,
                 copy_bytes,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} KV assemble V h={h}: {e}"))?;

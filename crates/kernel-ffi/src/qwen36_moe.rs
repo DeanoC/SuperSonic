@@ -758,12 +758,7 @@ pub fn persistent_decode_launch(
             f.lm_head_w.as_ptr(),
             f.logits_out.as_mut_ptr(),
         ),
-        None => (
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-        ),
+        None => (0, std::ptr::null(), std::ptr::null(), std::ptr::null_mut()),
     };
 
     let status: c_int = match backend {
@@ -1912,8 +1907,7 @@ mod tests {
         // Synthesize a Qwen3.6-MoE-shaped descriptor array on the host.
         // Hybrid pattern: every 4th layer is full attention; others are
         // linear-attention. attn_output_gate is set on full layers only.
-        let mut host_descs: Vec<Qwen36MoeDecodeLayerDesc> =
-            Vec::with_capacity(num_layers);
+        let mut host_descs: Vec<Qwen36MoeDecodeLayerDesc> = Vec::with_capacity(num_layers);
         let num_experts = 256;
         let top_k = 8;
         for idx in 0..num_layers {
@@ -1938,25 +1932,19 @@ mod tests {
         let mut desc_bytes = Vec::with_capacity(desc_bytes_per * num_layers);
         for d in &host_descs {
             let p = d as *const Qwen36MoeDecodeLayerDesc as *const u8;
-            desc_bytes.extend_from_slice(unsafe {
-                std::slice::from_raw_parts(p, desc_bytes_per)
-            });
+            desc_bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(p, desc_bytes_per) });
         }
-        let layer_descs = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::U8,
-            &[desc_bytes.len()],
-            &desc_bytes,
-        )
-        .expect("upload descriptor array");
+        let layer_descs =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[desc_bytes.len()], &desc_bytes)
+                .expect("upload descriptor array");
 
         // 16 floats of workspace is enough for the documented sentinel
         // slots (5 in use, rest reserved). The real kernel will need
         // ~MiB; keeping this tiny lets the smoke test stay fast.
-        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[16])
-            .expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
-            .expect("alloc sync buf");
+        let mut workspace =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[16]).expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         stub_launch(
             ordinal,
@@ -2059,7 +2047,10 @@ mod tests {
     /// production keeps in F32 across decode steps.
     #[cfg(supersonic_backend_hip)]
     fn f32_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-        assert!(bytes.len() % 4 == 0, "qwen36_moe parity: F32 bytes must be multiple of 4");
+        assert!(
+            bytes.len() % 4 == 0,
+            "qwen36_moe parity: F32 bytes must be multiple of 4"
+        );
         bytes
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2077,8 +2068,11 @@ mod tests {
         max_abs_tol: f32,
         cos_sim_floor: f64,
     ) {
-        assert_eq!(got_bytes.len(), want_bytes.len(),
-                   "{label}: byte length mismatch");
+        assert_eq!(
+            got_bytes.len(),
+            want_bytes.len(),
+            "{label}: byte length mismatch"
+        );
         let got = f32_bytes_to_f32(got_bytes);
         let want = f32_bytes_to_f32(want_bytes);
         let n = got.len();
@@ -2090,7 +2084,9 @@ mod tests {
         let mut exact = 0usize;
         for i in 0..n {
             let d = (got[i] - want[i]).abs();
-            if d == 0.0 { exact += 1; }
+            if d == 0.0 {
+                exact += 1;
+            }
             max_abs_diff = max_abs_diff.max(d);
             sum_abs_diff += d;
             dot += got[i] as f64 * want[i] as f64;
@@ -2103,17 +2099,24 @@ mod tests {
             "[parity {label}] n={n} exact={exact} max_abs={max_abs_diff:.5e} \
              mean_abs={mean_abs_diff:.5e} cos_sim={cos_sim:.7}"
         );
-        assert!(max_abs_diff <= max_abs_tol,
-                "{label}: max_abs={max_abs_diff} exceeds tolerance {max_abs_tol}");
-        assert!(cos_sim >= cos_sim_floor,
-                "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}");
+        assert!(
+            max_abs_diff <= max_abs_tol,
+            "{label}: max_abs={max_abs_diff} exceeds tolerance {max_abs_tol}"
+        );
+        assert!(
+            cos_sim >= cos_sim_floor,
+            "{label}: cos_sim {cos_sim:.7} below floor {cos_sim_floor}"
+        );
     }
 
     /// Convert a stream of BF16 little-endian bytes to F32. The oracle
     /// stores BF16 as raw int16 → bytes, matching the kernel's ABI.
     #[cfg(supersonic_backend_hip)]
     fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-        assert!(bytes.len() % 2 == 0, "qwen36_moe parity: BF16 bytes must be even");
+        assert!(
+            bytes.len() % 2 == 0,
+            "qwen36_moe parity: BF16 bytes must be even"
+        );
         bytes
             .chunks_exact(2)
             .map(|c| {
@@ -2170,7 +2173,8 @@ mod tests {
         cos_sim_floor: f64,
     ) {
         assert_eq!(
-            got_bytes.len(), want_bytes.len(),
+            got_bytes.len(),
+            want_bytes.len(),
             "{label}: byte length mismatch"
         );
         let got = bf16_bytes_to_f32(got_bytes);
@@ -2184,7 +2188,9 @@ mod tests {
         let mut exact = 0usize;
         for i in 0..n {
             let d = (got[i] - want[i]).abs();
-            if d == 0.0 { exact += 1; }
+            if d == 0.0 {
+                exact += 1;
+            }
             max_abs_diff = max_abs_diff.max(d);
             sum_abs_diff += d;
             dot += got[i] as f64 * want[i] as f64;
@@ -2270,29 +2276,53 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let q_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
-        ).expect("upload q_proj_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[2 * h_us * d_us, hidden_us],
+            &q_proj_w_bytes,
+        )
+        .expect("upload q_proj_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 1,
@@ -2338,7 +2368,13 @@ mod tests {
         // that for matmul accumulation order drift over the 2048 reduction.
         let got_bytes_full = output.to_host_bytes().expect("download output");
         let got_bytes = &got_bytes_full[..h_us * d_us * 2];
-        assert_parity("step1 q_normed", got_bytes, &q_normed_expected_bytes, 0.04, 0.9999);
+        assert_parity(
+            "step1 q_normed",
+            got_bytes,
+            &q_normed_expected_bytes,
+            0.04,
+            0.9999,
+        );
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -2381,40 +2417,72 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let q_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
-        ).expect("upload q_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[2 * h_us * d_us, hidden_us],
+            &q_proj_w_bytes,
+        )
+        .expect("upload q_proj_w");
         let k_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
-        ).expect("upload k_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &k_proj_w_bytes,
+        )
+        .expect("upload k_proj_w");
         let v_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
-        ).expect("upload v_proj_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
-        let k_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
-        ).expect("upload k_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &v_proj_w_bytes,
+        )
+        .expect("upload v_proj_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
+        let k_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes)
+                .expect("upload k_norm_w");
 
         // Output is sized for the largest staged intermediate (H*d). Stage 2
         // writes Hkv*d BF16 elements at the start of the buffer.
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 2,
@@ -2458,7 +2526,13 @@ mod tests {
         // the output buffer. Slice down to just those bytes for parity.
         let got_bytes_full = output.to_host_bytes().expect("download output");
         let got_bytes = &got_bytes_full[..hkv_us * d_us * 2];
-        assert_parity("step2 k_normed", got_bytes, &k_normed_expected_bytes, 0.04, 0.9999);
+        assert_parity(
+            "step2 k_normed",
+            got_bytes,
+            &k_normed_expected_bytes,
+            0.04,
+            0.9999,
+        );
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -2514,38 +2588,70 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let q_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
-        ).expect("upload q_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[2 * h_us * d_us, hidden_us],
+            &q_proj_w_bytes,
+        )
+        .expect("upload q_proj_w");
         let k_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
-        ).expect("upload k_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &k_proj_w_bytes,
+        )
+        .expect("upload k_proj_w");
         let v_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
-        ).expect("upload v_proj_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
-        let k_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
-        ).expect("upload k_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &v_proj_w_bytes,
+        )
+        .expect("upload v_proj_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
+        let k_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes)
+                .expect("upload k_norm_w");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 3,
@@ -2589,10 +2695,20 @@ mod tests {
         let got_bytes_full = output.to_host_bytes().expect("download output");
         let q_end = h_us * d_us * 2;
         let k_end = q_end + hkv_us * d_us * 2;
-        assert_parity("step3 q_rot", &got_bytes_full[..q_end],
-                      &q_rot_expected_bytes, 0.04, 0.9999);
-        assert_parity("step3 k_rot", &got_bytes_full[q_end..k_end],
-                      &k_rot_expected_bytes, 0.04, 0.9999);
+        assert_parity(
+            "step3 q_rot",
+            &got_bytes_full[..q_end],
+            &q_rot_expected_bytes,
+            0.04,
+            0.9999,
+        );
+        assert_parity(
+            "step3 k_rot",
+            &got_bytes_full[q_end..k_end],
+            &k_rot_expected_bytes,
+            0.04,
+            0.9999,
+        );
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -2636,38 +2752,70 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let q_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
-        ).expect("upload q_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[2 * h_us * d_us, hidden_us],
+            &q_proj_w_bytes,
+        )
+        .expect("upload q_proj_w");
         let k_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
-        ).expect("upload k_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &k_proj_w_bytes,
+        )
+        .expect("upload k_proj_w");
         let v_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
-        ).expect("upload v_proj_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
-        let k_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
-        ).expect("upload k_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &v_proj_w_bytes,
+        )
+        .expect("upload v_proj_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
+        let k_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes)
+                .expect("upload k_norm_w");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 4,
@@ -2744,8 +2892,7 @@ mod tests {
         let q_norm_w_bytes = b64_decode(weights["q_norm_w"].as_str().unwrap());
         let k_norm_w_bytes = b64_decode(weights["k_norm_w"].as_str().unwrap());
         let o_proj_w_bytes = b64_decode(weights["o_proj_w"].as_str().unwrap());
-        let output_hidden_expected_bytes =
-            b64_decode(inters["output_hidden"].as_str().unwrap());
+        let output_hidden_expected_bytes = b64_decode(inters["output_hidden"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let h_us = geom.num_heads as usize;
@@ -2758,41 +2905,77 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let q_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[2 * h_us * d_us, hidden_us], &q_proj_w_bytes,
-        ).expect("upload q_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[2 * h_us * d_us, hidden_us],
+            &q_proj_w_bytes,
+        )
+        .expect("upload q_proj_w");
         let k_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &k_proj_w_bytes,
-        ).expect("upload k_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &k_proj_w_bytes,
+        )
+        .expect("upload k_proj_w");
         let v_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hkv_us * d_us, hidden_us], &v_proj_w_bytes,
-        ).expect("upload v_proj_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
-        let k_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
-        ).expect("upload k_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hkv_us * d_us, hidden_us],
+            &v_proj_w_bytes,
+        )
+        .expect("upload v_proj_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
+        let k_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes)
+                .expect("upload k_norm_w");
         let o_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, h_us * d_us], &o_proj_w_bytes,
-        ).expect("upload o_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, h_us * d_us],
+            &o_proj_w_bytes,
+        )
+        .expect("upload o_proj_w");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 5,
@@ -2869,15 +3052,25 @@ mod tests {
     /// Pulls (packed, scale, zero) bytes for one INT4-quantized attn tensor.
     #[cfg(supersonic_backend_hip)]
     fn decode_attn_int4_sidecar(
-        json: &serde_json::Value, name: &str,
+        json: &serde_json::Value,
+        name: &str,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let blk = &json["int4_weights"][name];
-        let packed = b64_decode(blk["packed"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")));
-        let scale = b64_decode(blk["scale"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")));
-        let zero = b64_decode(blk["zero"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")));
+        let packed = b64_decode(
+            blk["packed"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")),
+        );
+        let scale = b64_decode(
+            blk["scale"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")),
+        );
+        let zero = b64_decode(
+            blk["zero"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")),
+        );
         (packed, scale, zero)
     }
 
@@ -2926,8 +3119,7 @@ mod tests {
         let (v_packed, v_scale, v_zero) = decode_attn_int4_sidecar(&json, "v_proj_w");
         let (o_packed, o_scale, o_zero) = decode_attn_int4_sidecar(&json, "o_proj_w");
 
-        let output_hidden_expected_bytes =
-            b64_decode(inters["output_hidden"].as_str().unwrap());
+        let output_hidden_expected_bytes = b64_decode(inters["output_hidden"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let h_us = geom.num_heads as usize;
@@ -2936,11 +3128,16 @@ mod tests {
         let gsz_us = group_size as usize;
 
         // Sanity: shapes match the bake convention.
-        assert_eq!(q_packed.len(), 2 * h_us * d_us * (hidden_us / 2),
-            "q_proj packed bytes mismatch");
-        assert_eq!(q_scale.len(),
+        assert_eq!(
+            q_packed.len(),
+            2 * h_us * d_us * (hidden_us / 2),
+            "q_proj packed bytes mismatch"
+        );
+        assert_eq!(
+            q_scale.len(),
             (2 * h_us * d_us / gsz_us) * (hidden_us / gsz_us) * 2,
-            "q_proj scale bytes mismatch");
+            "q_proj scale bytes mismatch"
+        );
         assert_eq!(k_packed.len(), hkv_us * d_us * (hidden_us / 2));
         assert_eq!(v_packed.len(), hkv_us * d_us * (hidden_us / 2));
         assert_eq!(o_packed.len(), hidden_us * (h_us * d_us / 2));
@@ -2949,67 +3146,87 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
-        let q_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes,
-        ).expect("upload q_norm_w");
-        let k_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes,
-        ).expect("upload k_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
+        let q_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &q_norm_w_bytes)
+                .expect("upload q_norm_w");
+        let k_norm_w =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[d_us], &k_norm_w_bytes)
+                .expect("upload k_norm_w");
 
         // Projection weights uploaded as packed u8 + BF16 scale/zero.
-        let q_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[q_packed.len()], &q_packed,
-        ).expect("upload q packed");
-        let q_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[q_scale.len() / 2], &q_scale,
-        ).expect("upload q scale");
-        let q_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[q_zero.len() / 2], &q_zero,
-        ).expect("upload q zero");
-        let k_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[k_packed.len()], &k_packed,
-        ).expect("upload k packed");
-        let k_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[k_scale.len() / 2], &k_scale,
-        ).expect("upload k scale");
-        let k_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[k_zero.len() / 2], &k_zero,
-        ).expect("upload k zero");
-        let v_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[v_packed.len()], &v_packed,
-        ).expect("upload v packed");
-        let v_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_scale.len() / 2], &v_scale,
-        ).expect("upload v scale");
-        let v_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_zero.len() / 2], &v_zero,
-        ).expect("upload v zero");
-        let o_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[o_packed.len()], &o_packed,
-        ).expect("upload o packed");
-        let o_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[o_scale.len() / 2], &o_scale,
-        ).expect("upload o scale");
-        let o_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[o_zero.len() / 2], &o_zero,
-        ).expect("upload o zero");
+        let q_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[q_packed.len()], &q_packed)
+                .expect("upload q packed");
+        let q_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[q_scale.len() / 2], &q_scale)
+                .expect("upload q scale");
+        let q_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[q_zero.len() / 2], &q_zero)
+                .expect("upload q zero");
+        let k_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[k_packed.len()], &k_packed)
+                .expect("upload k packed");
+        let k_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[k_scale.len() / 2], &k_scale)
+                .expect("upload k scale");
+        let k_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[k_zero.len() / 2], &k_zero)
+                .expect("upload k zero");
+        let v_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[v_packed.len()], &v_packed)
+                .expect("upload v packed");
+        let v_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_scale.len() / 2], &v_scale)
+                .expect("upload v scale");
+        let v_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_zero.len() / 2], &v_zero)
+                .expect("upload v zero");
+        let o_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[o_packed.len()], &o_packed)
+                .expect("upload o packed");
+        let o_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[o_scale.len() / 2], &o_scale)
+                .expect("upload o scale");
+        let o_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[o_zero.len() / 2], &o_zero)
+                .expect("upload o zero");
 
         let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16,
-            &[parity_output_elems(geom.num_heads, geom.num_kv_heads, geom.head_dim)],
-        ).expect("alloc output");
+            ordinal,
+            ScalarType::BF16,
+            &[parity_output_elems(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+            )],
+        )
+        .expect("alloc output");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32,
-            &[parity_workspace_floats(geom.num_heads, geom.num_kv_heads, geom.head_dim, geom.hidden)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[parity_workspace_floats(
+                geom.num_heads,
+                geom.num_kv_heads,
+                geom.head_dim,
+                geom.hidden,
+            )],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeAttnStepParams {
             stage: 5,
@@ -3105,8 +3322,7 @@ mod tests {
         let json_path = std::env::var("SUPERSONIC_QWEN36_LINEAR_ORACLE_JSON").ok()?;
         let raw = std::fs::read_to_string(&json_path)
             .unwrap_or_else(|e| panic!("read linear oracle json {json_path}: {e}"));
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).expect("linear oracle json parse");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("linear oracle json parse");
         assert_eq!(
             json["dtype"].as_str().unwrap_or(""),
             "bf16",
@@ -3171,39 +3387,60 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_qkv_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
-        ).expect("upload in_proj_qkv_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, hidden_us],
+            &in_proj_qkv_w_bytes,
+        )
+        .expect("upload in_proj_qkv_w");
         let in_proj_z_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
-        ).expect("upload in_proj_z_w");
+            ordinal,
+            ScalarType::BF16,
+            &[val_dim, hidden_us],
+            &in_proj_z_w_bytes,
+        )
+        .expect("upload in_proj_z_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
 
         // Output sized for the largest staged intermediate (qkv_dim BF16
         // is the biggest until later stages bump this).
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[qkv_dim],
-        ).expect("alloc output");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim]).expect("alloc output");
         // Workspace sized for stage 1 (qkv_dim + V*v_dim + 2*V F32). Later
         // stages will need more; keep this tight to fail loudly if a stage
         // overruns.
         let workspace_floats = qkv_dim + val_dim + 2 * v_us;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 1,
@@ -3281,7 +3518,8 @@ mod tests {
         let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
         let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
         let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
-        let conv1d_bias_bytes = weights.get("conv1d_bias")
+        let conv1d_bias_bytes = weights
+            .get("conv1d_bias")
             .and_then(|v| v.as_str())
             .map(b64_decode);
         let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
@@ -3309,26 +3547,54 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_qkv_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
-        ).expect("upload in_proj_qkv_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, hidden_us],
+            &in_proj_qkv_w_bytes,
+        )
+        .expect("upload in_proj_qkv_w");
         let in_proj_z_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
-        ).expect("upload in_proj_z_w");
+            ordinal,
+            ScalarType::BF16,
+            &[val_dim, hidden_us],
+            &in_proj_z_w_bytes,
+        )
+        .expect("upload in_proj_z_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
         let conv1d_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
-        ).expect("upload conv1d_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, 1, kernel],
+            &conv1d_w_bytes,
+        )
+        .expect("upload conv1d_w");
         let conv1d_bias = match &conv1d_bias_bytes {
             Some(bytes) => Some(
                 GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
@@ -3337,19 +3603,20 @@ mod tests {
             None => None,
         };
         let mut conv_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
-        ).expect("upload conv_state");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, kstate],
+            &conv_state_before_bytes,
+        )
+        .expect("upload conv_state");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[qkv_dim],
-        ).expect("alloc output");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim]).expect("alloc output");
         let workspace_floats = qkv_dim + val_dim + 2 * v_us;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 2,
@@ -3369,7 +3636,10 @@ mod tests {
             in_proj_a_w: in_proj_a_w.as_ptr(),
             in_proj_b_w: in_proj_b_w.as_ptr(),
             conv1d_w: conv1d_w.as_ptr(),
-            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            conv1d_bias: conv1d_bias
+                .as_ref()
+                .map(|b| b.as_ptr())
+                .unwrap_or(std::ptr::null()),
             dt_bias: std::ptr::null(),
             a_log: std::ptr::null(),
             norm_w: std::ptr::null(),
@@ -3435,7 +3705,8 @@ mod tests {
         let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
         let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
         let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
-        let conv1d_bias_bytes = weights.get("conv1d_bias")
+        let conv1d_bias_bytes = weights
+            .get("conv1d_bias")
             .and_then(|v| v.as_str())
             .map(b64_decode);
         let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
@@ -3466,26 +3737,54 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_qkv_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
-        ).expect("upload in_proj_qkv_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, hidden_us],
+            &in_proj_qkv_w_bytes,
+        )
+        .expect("upload in_proj_qkv_w");
         let in_proj_z_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
-        ).expect("upload in_proj_z_w");
+            ordinal,
+            ScalarType::BF16,
+            &[val_dim, hidden_us],
+            &in_proj_z_w_bytes,
+        )
+        .expect("upload in_proj_z_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
         let conv1d_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
-        ).expect("upload conv1d_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, 1, kernel],
+            &conv1d_w_bytes,
+        )
+        .expect("upload conv1d_w");
         let conv1d_bias = match &conv1d_bias_bytes {
             Some(bytes) => Some(
                 GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
@@ -3494,23 +3793,24 @@ mod tests {
             None => None,
         };
         let mut conv_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
-        ).expect("upload conv_state");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, kstate],
+            &conv_state_before_bytes,
+        )
+        .expect("upload conv_state");
 
         // Output sized for stage 3's largest publish (q_scaled || k_rep || v_heads).
         let stage3_publish_elems = 2 * v_kdim + v_vdim;
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[stage3_publish_elems],
-        ).expect("alloc output");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[stage3_publish_elems])
+            .expect("alloc output");
         // Workspace for stage 3: stage-2 footprint plus Q_NORMED, K_NORMED,
         // Q_REP, K_REP slots.
         let workspace_floats = qkv_dim + val_dim + 2 * v_us + 2 * (k_us * kd_us) + 2 * v_kdim;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 3,
@@ -3530,7 +3830,10 @@ mod tests {
             in_proj_a_w: in_proj_a_w.as_ptr(),
             in_proj_b_w: in_proj_b_w.as_ptr(),
             conv1d_w: conv1d_w.as_ptr(),
-            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            conv1d_bias: conv1d_bias
+                .as_ref()
+                .map(|b| b.as_ptr())
+                .unwrap_or(std::ptr::null()),
             dt_bias: std::ptr::null(),
             a_log: std::ptr::null(),
             norm_w: std::ptr::null(),
@@ -3556,12 +3859,27 @@ mod tests {
         let q_end = v_kdim * 2;
         let k_end = q_end + v_kdim * 2;
         let v_end = k_end + v_vdim * 2;
-        assert_parity("linear step3 q_scaled", &got_bytes_full[..q_end],
-                      &q_scaled_expected, 0.04, 0.9999);
-        assert_parity("linear step3 k_rep", &got_bytes_full[q_end..k_end],
-                      &k_rep_expected, 0.04, 0.9999);
-        assert_parity("linear step3 v_heads", &got_bytes_full[k_end..v_end],
-                      &v_heads_expected, 0.04, 0.9999);
+        assert_parity(
+            "linear step3 q_scaled",
+            &got_bytes_full[..q_end],
+            &q_scaled_expected,
+            0.04,
+            0.9999,
+        );
+        assert_parity(
+            "linear step3 k_rep",
+            &got_bytes_full[q_end..k_end],
+            &k_rep_expected,
+            0.04,
+            0.9999,
+        );
+        assert_parity(
+            "linear step3 v_heads",
+            &got_bytes_full[k_end..v_end],
+            &v_heads_expected,
+            0.04,
+            0.9999,
+        );
     }
 
     #[cfg(supersonic_backend_hip)]
@@ -3588,7 +3906,8 @@ mod tests {
         let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
         let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
         let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
-        let conv1d_bias_bytes = weights.get("conv1d_bias")
+        let conv1d_bias_bytes = weights
+            .get("conv1d_bias")
             .and_then(|v| v.as_str())
             .map(b64_decode);
         let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
@@ -3625,26 +3944,54 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_qkv_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
-        ).expect("upload in_proj_qkv_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, hidden_us],
+            &in_proj_qkv_w_bytes,
+        )
+        .expect("upload in_proj_qkv_w");
         let in_proj_z_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
-        ).expect("upload in_proj_z_w");
+            ordinal,
+            ScalarType::BF16,
+            &[val_dim, hidden_us],
+            &in_proj_z_w_bytes,
+        )
+        .expect("upload in_proj_z_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
         let conv1d_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
-        ).expect("upload conv1d_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, 1, kernel],
+            &conv1d_w_bytes,
+        )
+        .expect("upload conv1d_w");
         let conv1d_bias = match &conv1d_bias_bytes {
             Some(bytes) => Some(
                 GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
@@ -3652,39 +3999,39 @@ mod tests {
             ),
             None => None,
         };
-        let dt_bias = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
-        ).expect("upload dt_bias");
-        let a_log = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
-        ).expect("upload a_log");
+        let dt_bias =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes)
+                .expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &a_log_bytes)
+            .expect("upload a_log");
         let mut conv_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
-        ).expect("upload conv_state");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, kstate],
+            &conv_state_before_bytes,
+        )
+        .expect("upload conv_state");
         let mut recurrent_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::F32, &[state_elems], &recurrent_state_before_bytes,
-        ).expect("upload recurrent_state");
+            ordinal,
+            ScalarType::F32,
+            &[state_elems],
+            &recurrent_state_before_bytes,
+        )
+        .expect("upload recurrent_state");
 
         // Stage 4 publishes recurrent_out [V*v_dim] BF16. The buffer is
         // sized for the largest staged intermediate (still stage 3's
         // q_scaled||k_rep||v_heads = 2*V*k_dim + V*v_dim).
         let stage_publish_max = 2 * v_kdim + v_vdim;
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[stage_publish_max],
-        ).expect("alloc output");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[stage_publish_max])
+            .expect("alloc output");
         // Workspace for stage 4 = previous + BETA + G + REC_OUT.
         let workspace_floats =
-            qkv_dim + val_dim + 2 * v_us
-            + 2 * (k_us * kd_us)
-            + 2 * v_kdim
-            + v_us + v_us
-            + v_vdim;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            qkv_dim + val_dim + 2 * v_us + 2 * (k_us * kd_us) + 2 * v_kdim + v_us + v_us + v_vdim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 4,
@@ -3704,7 +4051,10 @@ mod tests {
             in_proj_a_w: in_proj_a_w.as_ptr(),
             in_proj_b_w: in_proj_b_w.as_ptr(),
             conv1d_w: conv1d_w.as_ptr(),
-            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            conv1d_bias: conv1d_bias
+                .as_ref()
+                .map(|b| b.as_ptr())
+                .unwrap_or(std::ptr::null()),
             dt_bias: dt_bias.as_ptr(),
             a_log: a_log.as_ptr(),
             norm_w: std::ptr::null(),
@@ -3778,7 +4128,8 @@ mod tests {
         let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
         let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
         let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
-        let conv1d_bias_bytes = weights.get("conv1d_bias")
+        let conv1d_bias_bytes = weights
+            .get("conv1d_bias")
             .and_then(|v| v.as_str())
             .map(b64_decode);
         let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
@@ -3812,26 +4163,54 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_qkv_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, hidden_us], &in_proj_qkv_w_bytes,
-        ).expect("upload in_proj_qkv_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, hidden_us],
+            &in_proj_qkv_w_bytes,
+        )
+        .expect("upload in_proj_qkv_w");
         let in_proj_z_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[val_dim, hidden_us], &in_proj_z_w_bytes,
-        ).expect("upload in_proj_z_w");
+            ordinal,
+            ScalarType::BF16,
+            &[val_dim, hidden_us],
+            &in_proj_z_w_bytes,
+        )
+        .expect("upload in_proj_z_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
         let conv1d_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, 1, kernel], &conv1d_w_bytes,
-        ).expect("upload conv1d_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, 1, kernel],
+            &conv1d_w_bytes,
+        )
+        .expect("upload conv1d_w");
         let conv1d_bias = match &conv1d_bias_bytes {
             Some(bytes) => Some(
                 GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
@@ -3839,41 +4218,44 @@ mod tests {
             ),
             None => None,
         };
-        let dt_bias = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
-        ).expect("upload dt_bias");
-        let a_log = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
-        ).expect("upload a_log");
-        let norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[vd_us], &norm_w_bytes,
-        ).expect("upload norm_w");
+        let dt_bias =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes)
+                .expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &a_log_bytes)
+            .expect("upload a_log");
+        let norm_w = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[vd_us], &norm_w_bytes)
+            .expect("upload norm_w");
         let out_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, v_vdim], &out_proj_w_bytes,
-        ).expect("upload out_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, v_vdim],
+            &out_proj_w_bytes,
+        )
+        .expect("upload out_proj_w");
         let mut conv_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, kstate], &conv_state_before_bytes,
-        ).expect("upload conv_state");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, kstate],
+            &conv_state_before_bytes,
+        )
+        .expect("upload conv_state");
         let mut recurrent_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::F32, &[state_elems], &recurrent_state_before_bytes,
-        ).expect("upload recurrent_state");
+            ordinal,
+            ScalarType::F32,
+            &[state_elems],
+            &recurrent_state_before_bytes,
+        )
+        .expect("upload recurrent_state");
 
         let stage_publish_max = 2 * v_kdim + v_vdim;
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[stage_publish_max],
-        ).expect("alloc output");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[stage_publish_max])
+            .expect("alloc output");
         let workspace_floats =
-            qkv_dim + val_dim + 2 * v_us
-            + 2 * (k_us * kd_us)
-            + 2 * v_kdim
-            + v_us + v_us
-            + v_vdim;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            qkv_dim + val_dim + 2 * v_us + 2 * (k_us * kd_us) + 2 * v_kdim + v_us + v_us + v_vdim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 5,
@@ -3893,7 +4275,10 @@ mod tests {
             in_proj_a_w: in_proj_a_w.as_ptr(),
             in_proj_b_w: in_proj_b_w.as_ptr(),
             conv1d_w: conv1d_w.as_ptr(),
-            conv1d_bias: conv1d_bias.as_ref().map(|b| b.as_ptr()).unwrap_or(std::ptr::null()),
+            conv1d_bias: conv1d_bias
+                .as_ref()
+                .map(|b| b.as_ptr())
+                .unwrap_or(std::ptr::null()),
             dt_bias: dt_bias.as_ptr(),
             a_log: a_log.as_ptr(),
             norm_w: norm_w.as_ptr(),
@@ -3939,15 +4324,25 @@ mod tests {
 
     #[cfg(supersonic_backend_hip)]
     fn decode_linear_int4_sidecar(
-        json: &serde_json::Value, name: &str,
+        json: &serde_json::Value,
+        name: &str,
     ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let blk = &json["int4_weights"][name];
-        let packed = b64_decode(blk["packed"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")));
-        let scale = b64_decode(blk["scale"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")));
-        let zero = b64_decode(blk["zero"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")));
+        let packed = b64_decode(
+            blk["packed"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")),
+        );
+        let scale = b64_decode(
+            blk["scale"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")),
+        );
+        let zero = b64_decode(
+            blk["zero"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")),
+        );
         (packed, scale, zero)
     }
 
@@ -3986,7 +4381,8 @@ mod tests {
         let in_proj_a_w_bytes = b64_decode(weights["in_proj_a_w"].as_str().unwrap());
         let in_proj_b_w_bytes = b64_decode(weights["in_proj_b_w"].as_str().unwrap());
         let conv1d_w_bytes = b64_decode(weights["conv1d_w"].as_str().unwrap());
-        let conv1d_bias_bytes = weights.get("conv1d_bias")
+        let conv1d_bias_bytes = weights
+            .get("conv1d_bias")
             .and_then(|v| v.as_str())
             .map(b64_decode);
         let conv_state_before_bytes = b64_decode(weights["conv_state_before"].as_str().unwrap());
@@ -3997,12 +4393,9 @@ mod tests {
         let norm_w_bytes = b64_decode(weights["norm_w"].as_str().unwrap());
 
         // INT4 sidecars for the three projections.
-        let (qkv_packed, qkv_scale, qkv_zero) =
-            decode_linear_int4_sidecar(&json, "in_proj_qkv_w");
-        let (z_packed, z_scale, z_zero) =
-            decode_linear_int4_sidecar(&json, "in_proj_z_w");
-        let (out_packed, out_scale, out_zero) =
-            decode_linear_int4_sidecar(&json, "out_proj_w");
+        let (qkv_packed, qkv_scale, qkv_zero) = decode_linear_int4_sidecar(&json, "in_proj_qkv_w");
+        let (z_packed, z_scale, z_zero) = decode_linear_int4_sidecar(&json, "in_proj_z_w");
+        let (out_packed, out_scale, out_zero) = decode_linear_int4_sidecar(&json, "out_proj_w");
 
         let output_hidden_expected = b64_decode(inters["output_hidden"].as_str().unwrap());
 
@@ -4016,8 +4409,11 @@ mod tests {
         let val_dim = v_us * vd_us;
 
         // Sanity: shapes match the bake convention.
-        assert_eq!(qkv_packed.len(), qkv_dim * (hidden_us / 2),
-            "in_proj_qkv packed bytes mismatch");
+        assert_eq!(
+            qkv_packed.len(),
+            qkv_dim * (hidden_us / 2),
+            "in_proj_qkv packed bytes mismatch"
+        );
         assert_eq!(z_packed.len(), val_dim * (hidden_us / 2));
         assert_eq!(out_packed.len(), hidden_us * (val_dim / 2));
 
@@ -4025,88 +4421,113 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let input_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_norm_w_bytes,
-        ).expect("upload input_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_norm_w_bytes,
+        )
+        .expect("upload input_norm_w");
         let in_proj_a_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_a_w_bytes,
-        ).expect("upload in_proj_a_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_a_w_bytes,
+        )
+        .expect("upload in_proj_a_w");
         let in_proj_b_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us, hidden_us], &in_proj_b_w_bytes,
-        ).expect("upload in_proj_b_w");
+            ordinal,
+            ScalarType::BF16,
+            &[v_us, hidden_us],
+            &in_proj_b_w_bytes,
+        )
+        .expect("upload in_proj_b_w");
         let conv1d_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, conv_kernel], &conv1d_w_bytes,
-        ).expect("upload conv1d_w");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, conv_kernel],
+            &conv1d_w_bytes,
+        )
+        .expect("upload conv1d_w");
         let conv1d_bias_buf = conv1d_bias_bytes.as_ref().map(|bytes| {
             GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_dim], bytes)
                 .expect("upload conv1d_bias")
         });
         let mut conv_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_dim, conv_kernel - 1],
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_dim, conv_kernel - 1],
             &conv_state_before_bytes,
-        ).expect("upload conv_state");
-        let dt_bias = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes,
-        ).expect("upload dt_bias");
-        let a_log = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[v_us], &a_log_bytes,
-        ).expect("upload a_log");
+        )
+        .expect("upload conv_state");
+        let dt_bias =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &dt_bias_bytes)
+                .expect("upload dt_bias");
+        let a_log = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[v_us], &a_log_bytes)
+            .expect("upload a_log");
         let mut recurrent_state = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::F32, &[v_us, kd_us, vd_us],
+            ordinal,
+            ScalarType::F32,
+            &[v_us, kd_us, vd_us],
             &recurrent_state_before_bytes,
-        ).expect("upload recurrent_state");
-        let norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[kd_us], &norm_w_bytes,
-        ).expect("upload norm_w");
+        )
+        .expect("upload recurrent_state");
+        let norm_w = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[kd_us], &norm_w_bytes)
+            .expect("upload norm_w");
 
         // Projection weights uploaded as packed u8 + BF16 scale/zero.
-        let qkv_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[qkv_packed.len()], &qkv_packed,
-        ).expect("upload qkv packed");
+        let qkv_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[qkv_packed.len()], &qkv_packed)
+                .expect("upload qkv packed");
         let qkv_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_scale.len() / 2], &qkv_scale,
-        ).expect("upload qkv scale");
-        let qkv_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[qkv_zero.len() / 2], &qkv_zero,
-        ).expect("upload qkv zero");
-        let z_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[z_packed.len()], &z_packed,
-        ).expect("upload z packed");
-        let z_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[z_scale.len() / 2], &z_scale,
-        ).expect("upload z scale");
-        let z_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[z_zero.len() / 2], &z_zero,
-        ).expect("upload z zero");
-        let out_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[out_packed.len()], &out_packed,
-        ).expect("upload out packed");
+            ordinal,
+            ScalarType::BF16,
+            &[qkv_scale.len() / 2],
+            &qkv_scale,
+        )
+        .expect("upload qkv scale");
+        let qkv_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[qkv_zero.len() / 2], &qkv_zero)
+                .expect("upload qkv zero");
+        let z_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[z_packed.len()], &z_packed)
+                .expect("upload z packed");
+        let z_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[z_scale.len() / 2], &z_scale)
+                .expect("upload z scale");
+        let z_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[z_zero.len() / 2], &z_zero)
+                .expect("upload z zero");
+        let out_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[out_packed.len()], &out_packed)
+                .expect("upload out packed");
         let out_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[out_scale.len() / 2], &out_scale,
-        ).expect("upload out scale");
-        let out_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[out_zero.len() / 2], &out_zero,
-        ).expect("upload out zero");
+            ordinal,
+            ScalarType::BF16,
+            &[out_scale.len() / 2],
+            &out_scale,
+        )
+        .expect("upload out scale");
+        let out_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[out_zero.len() / 2], &out_zero)
+                .expect("upload out zero");
 
         let v_kdim = v_us * kd_us;
         let stage_publish_max = 2 * v_kdim + val_dim;
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[stage_publish_max],
-        ).expect("alloc output");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[stage_publish_max])
+            .expect("alloc output");
         let workspace_floats =
-            qkv_dim + val_dim + 2 * v_us
-            + 2 * (k_us * kd_us)
-            + 2 * v_kdim
-            + v_us + v_us
-            + val_dim;
-        let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[workspace_floats],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            qkv_dim + val_dim + 2 * v_us + 2 * (k_us * kd_us) + 2 * v_kdim + v_us + v_us + val_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
+            .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeLinearStepParams {
             stage: 5,
@@ -4126,7 +4547,9 @@ mod tests {
             in_proj_a_w: in_proj_a_w.as_ptr(),
             in_proj_b_w: in_proj_b_w.as_ptr(),
             conv1d_w: conv1d_w.as_ptr(),
-            conv1d_bias: conv1d_bias_buf.as_ref().map(|b| b.as_ptr())
+            conv1d_bias: conv1d_bias_buf
+                .as_ref()
+                .map(|b| b.as_ptr())
                 .unwrap_or(std::ptr::null()),
             dt_bias: dt_bias.as_ptr(),
             a_log: a_log.as_ptr(),
@@ -4187,8 +4610,7 @@ mod tests {
         let json_path = std::env::var("SUPERSONIC_QWEN36_FFN_ORACLE_JSON").ok()?;
         let raw = std::fs::read_to_string(&json_path)
             .unwrap_or_else(|e| panic!("read ffn oracle json {json_path}: {e}"));
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).expect("ffn oracle json parse");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("ffn oracle json parse");
         assert_eq!(
             json["dtype"].as_str().unwrap_or(""),
             "bf16",
@@ -4291,11 +4713,8 @@ mod tests {
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
         let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
-        let topk_idx_expected = i32_bytes_to_vec(
-            &b64_decode(inters["topk_idx"].as_str().unwrap())
-        );
-        let topk_weights_expected_bytes =
-            b64_decode(inters["topk_weights"].as_str().unwrap());
+        let topk_idx_expected = i32_bytes_to_vec(&b64_decode(inters["topk_idx"].as_str().unwrap()));
+        let topk_weights_expected_bytes = b64_decode(inters["topk_weights"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let e_us = geom.num_experts as usize;
@@ -4311,32 +4730,45 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
 
         // Output sized for the largest staged intermediate (hidden BF16).
         // Stage 1 publishes only `topk_weights[k]` into `output[0..k]`,
         // and `topk_idx[k]` into the separate `output_idx` buffer.
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
         // No I32 variant in `ScalarType`; U32 has the same 4-byte storage
         // and the kernel reinterprets via the FFI signature's `*mut c_int`.
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 1,
@@ -4418,16 +4850,12 @@ mod tests {
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
         let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
-        let shared_gate_proj_w_bytes =
-            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
-        let shared_up_proj_w_bytes =
-            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
-        let shared_down_proj_w_bytes =
-            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes = b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes = b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes = b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
-        let shared_out_expected_bytes =
-            b64_decode(inters["shared_out"].as_str().unwrap());
+        let shared_out_expected_bytes = b64_decode(inters["shared_out"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let e_us = geom.num_experts as usize;
@@ -4447,39 +4875,68 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let shared_gate_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
-        ).expect("upload shared_gate_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_gate_proj_w_bytes,
+        )
+        .expect("upload shared_gate_proj_w");
         let shared_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
-        ).expect("upload shared_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_up_proj_w_bytes,
+        )
+        .expect("upload shared_up_proj_w");
         let shared_down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
-        ).expect("upload shared_down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, is_us],
+            &shared_down_proj_w_bytes,
+        )
+        .expect("upload shared_down_proj_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
@@ -4552,15 +5009,11 @@ mod tests {
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
         let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
-        let gate_up_proj_w_bytes =
-            b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
+        let gate_up_proj_w_bytes = b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
         let down_proj_w_bytes = b64_decode(weights["down_proj_w"].as_str().unwrap());
-        let shared_gate_proj_w_bytes =
-            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
-        let shared_up_proj_w_bytes =
-            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
-        let shared_down_proj_w_bytes =
-            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes = b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes = b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes = b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
 
@@ -4586,45 +5039,82 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let gate_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, 2 * i_us, hidden_us], &gate_up_proj_w_bytes,
-        ).expect("upload gate_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, 2 * i_us, hidden_us],
+            &gate_up_proj_w_bytes,
+        )
+        .expect("upload gate_up_proj_w");
         let down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us, i_us], &down_proj_w_bytes,
-        ).expect("upload down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us, i_us],
+            &down_proj_w_bytes,
+        )
+        .expect("upload down_proj_w");
         let shared_gate_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
-        ).expect("upload shared_gate_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_gate_proj_w_bytes,
+        )
+        .expect("upload shared_gate_proj_w");
         let shared_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
-        ).expect("upload shared_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_up_proj_w_bytes,
+        )
+        .expect("upload shared_up_proj_w");
         let shared_down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
-        ).expect("upload shared_down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, is_us],
+            &shared_down_proj_w_bytes,
+        )
+        .expect("upload shared_down_proj_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
@@ -4695,15 +5185,11 @@ mod tests {
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
         let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
-        let gate_up_proj_w_bytes =
-            b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
+        let gate_up_proj_w_bytes = b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
         let down_proj_w_bytes = b64_decode(weights["down_proj_w"].as_str().unwrap());
-        let shared_gate_proj_w_bytes =
-            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
-        let shared_up_proj_w_bytes =
-            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
-        let shared_down_proj_w_bytes =
-            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes = b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes = b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes = b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
         let moe_out_expected_bytes = b64_decode(inters["moe_out"].as_str().unwrap());
@@ -4720,45 +5206,82 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let gate_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, 2 * i_us, hidden_us], &gate_up_proj_w_bytes,
-        ).expect("upload gate_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, 2 * i_us, hidden_us],
+            &gate_up_proj_w_bytes,
+        )
+        .expect("upload gate_up_proj_w");
         let down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us, i_us], &down_proj_w_bytes,
-        ).expect("upload down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us, i_us],
+            &down_proj_w_bytes,
+        )
+        .expect("upload down_proj_w");
         let shared_gate_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
-        ).expect("upload shared_gate_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_gate_proj_w_bytes,
+        )
+        .expect("upload shared_gate_proj_w");
         let shared_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
-        ).expect("upload shared_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_up_proj_w_bytes,
+        )
+        .expect("upload shared_up_proj_w");
         let shared_down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
-        ).expect("upload shared_down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, is_us],
+            &shared_down_proj_w_bytes,
+        )
+        .expect("upload shared_down_proj_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 4,
@@ -4829,19 +5352,14 @@ mod tests {
         let input_hidden_bytes = b64_decode(weights["input_hidden"].as_str().unwrap());
         let post_attn_norm_w_bytes = b64_decode(weights["post_attn_norm_w"].as_str().unwrap());
         let gate_w_bytes = b64_decode(weights["gate_w"].as_str().unwrap());
-        let gate_up_proj_w_bytes =
-            b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
+        let gate_up_proj_w_bytes = b64_decode(weights["gate_up_proj_w"].as_str().unwrap());
         let down_proj_w_bytes = b64_decode(weights["down_proj_w"].as_str().unwrap());
-        let shared_gate_proj_w_bytes =
-            b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
-        let shared_up_proj_w_bytes =
-            b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
-        let shared_down_proj_w_bytes =
-            b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
+        let shared_gate_proj_w_bytes = b64_decode(weights["shared_gate_proj_w"].as_str().unwrap());
+        let shared_up_proj_w_bytes = b64_decode(weights["shared_up_proj_w"].as_str().unwrap());
+        let shared_down_proj_w_bytes = b64_decode(weights["shared_down_proj_w"].as_str().unwrap());
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
-        let output_hidden_expected_bytes =
-            b64_decode(inters["output_hidden"].as_str().unwrap());
+        let output_hidden_expected_bytes = b64_decode(inters["output_hidden"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let e_us = geom.num_experts as usize;
@@ -4855,45 +5373,82 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let gate_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, 2 * i_us, hidden_us], &gate_up_proj_w_bytes,
-        ).expect("upload gate_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, 2 * i_us, hidden_us],
+            &gate_up_proj_w_bytes,
+        )
+        .expect("upload gate_up_proj_w");
         let down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us, i_us], &down_proj_w_bytes,
-        ).expect("upload down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us, i_us],
+            &down_proj_w_bytes,
+        )
+        .expect("upload down_proj_w");
         let shared_gate_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_gate_proj_w_bytes,
-        ).expect("upload shared_gate_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_gate_proj_w_bytes,
+        )
+        .expect("upload shared_gate_proj_w");
         let shared_up_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[is_us, hidden_us], &shared_up_proj_w_bytes,
-        ).expect("upload shared_up_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[is_us, hidden_us],
+            &shared_up_proj_w_bytes,
+        )
+        .expect("upload shared_up_proj_w");
         let shared_down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us, is_us], &shared_down_proj_w_bytes,
-        ).expect("upload shared_down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us, is_us],
+            &shared_down_proj_w_bytes,
+        )
+        .expect("upload shared_down_proj_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
@@ -4970,16 +5525,23 @@ mod tests {
     /// from the oracle JSON. Returns owned `Vec<u8>` buffers in their
     /// native byte representations (u8 for packed, BF16 LE for scale/zero).
     #[cfg(supersonic_backend_hip)]
-    fn decode_int4_sidecar(
-        json: &serde_json::Value, name: &str,
-    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn decode_int4_sidecar(json: &serde_json::Value, name: &str) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let blk = &json["int4_weights"][name];
-        let packed = b64_decode(blk["packed"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")));
-        let scale = b64_decode(blk["scale"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")));
-        let zero = b64_decode(blk["zero"].as_str()
-            .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")));
+        let packed = b64_decode(
+            blk["packed"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].packed")),
+        );
+        let scale = b64_decode(
+            blk["scale"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].scale")),
+        );
+        let zero = b64_decode(
+            blk["zero"]
+                .as_str()
+                .unwrap_or_else(|| panic!("missing int4_weights[{name}].zero")),
+        );
         (packed, scale, zero)
     }
 
@@ -5024,15 +5586,11 @@ mod tests {
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
 
-        let (sgp_packed, sgp_scale, sgp_zero) =
-            decode_int4_sidecar(&json, "shared_gate_proj_w");
-        let (sup_packed, sup_scale, sup_zero) =
-            decode_int4_sidecar(&json, "shared_up_proj_w");
-        let (sdp_packed, sdp_scale, sdp_zero) =
-            decode_int4_sidecar(&json, "shared_down_proj_w");
+        let (sgp_packed, sgp_scale, sgp_zero) = decode_int4_sidecar(&json, "shared_gate_proj_w");
+        let (sup_packed, sup_scale, sup_zero) = decode_int4_sidecar(&json, "shared_up_proj_w");
+        let (sdp_packed, sdp_scale, sdp_zero) = decode_int4_sidecar(&json, "shared_down_proj_w");
 
-        let shared_out_expected_bytes =
-            b64_decode(inters["shared_out"].as_str().unwrap());
+        let shared_out_expected_bytes = b64_decode(inters["shared_out"].as_str().unwrap());
 
         let hidden_us = geom.hidden as usize;
         let e_us = geom.num_experts as usize;
@@ -5041,10 +5599,16 @@ mod tests {
         let gsz_us = group_size as usize;
 
         // Sanity: shapes match the bake convention.
-        assert_eq!(sgp_packed.len(), is_us * (hidden_us / 2),
-            "shared_gate_proj packed bytes mismatch");
-        assert_eq!(sgp_scale.len(), (is_us / gsz_us) * (hidden_us / gsz_us) * 2,
-            "shared_gate_proj scale bytes mismatch");
+        assert_eq!(
+            sgp_packed.len(),
+            is_us * (hidden_us / 2),
+            "shared_gate_proj packed bytes mismatch"
+        );
+        assert_eq!(
+            sgp_scale.len(),
+            (is_us / gsz_us) * (hidden_us / gsz_us) * 2,
+            "shared_gate_proj scale bytes mismatch"
+        );
         assert_eq!(sup_packed.len(), is_us * (hidden_us / 2));
         assert_eq!(sdp_packed.len(), hidden_us * (is_us / 2));
         assert_eq!(shared_out_expected_bytes.len(), hidden_us * 2);
@@ -5053,60 +5617,89 @@ mod tests {
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
         // Packed INT4 buffers — uploaded as u8.
-        let sgp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed,
-        ).expect("upload sgp packed");
-        let sup_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed,
-        ).expect("upload sup packed");
-        let sdp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed,
-        ).expect("upload sdp packed");
+        let sgp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed)
+                .expect("upload sgp packed");
+        let sup_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed)
+                .expect("upload sup packed");
+        let sdp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed)
+                .expect("upload sdp packed");
         // BF16 scale/zero sidecars.
         let sgp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_scale.len() / 2], &sgp_scale,
-        ).expect("upload sgp scale");
-        let sgp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero,
-        ).expect("upload sgp zero");
+            ordinal,
+            ScalarType::BF16,
+            &[sgp_scale.len() / 2],
+            &sgp_scale,
+        )
+        .expect("upload sgp scale");
+        let sgp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero)
+                .expect("upload sgp zero");
         let sup_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_scale.len() / 2], &sup_scale,
-        ).expect("upload sup scale");
-        let sup_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero,
-        ).expect("upload sup zero");
+            ordinal,
+            ScalarType::BF16,
+            &[sup_scale.len() / 2],
+            &sup_scale,
+        )
+        .expect("upload sup scale");
+        let sup_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero)
+                .expect("upload sup zero");
         let sdp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_scale.len() / 2], &sdp_scale,
-        ).expect("upload sdp scale");
-        let sdp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero,
-        ).expect("upload sdp zero");
+            ordinal,
+            ScalarType::BF16,
+            &[sdp_scale.len() / 2],
+            &sdp_scale,
+        )
+        .expect("upload sdp scale");
+        let sdp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero)
+                .expect("upload sdp zero");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
@@ -5210,14 +5803,10 @@ mod tests {
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
 
-        let (gup_packed, gup_scale, gup_zero) =
-            decode_int4_sidecar(&json, "gate_up_proj_w");
-        let (sgp_packed, sgp_scale, sgp_zero) =
-            decode_int4_sidecar(&json, "shared_gate_proj_w");
-        let (sup_packed, sup_scale, sup_zero) =
-            decode_int4_sidecar(&json, "shared_up_proj_w");
-        let (sdp_packed, sdp_scale, sdp_zero) =
-            decode_int4_sidecar(&json, "shared_down_proj_w");
+        let (gup_packed, gup_scale, gup_zero) = decode_int4_sidecar(&json, "gate_up_proj_w");
+        let (sgp_packed, sgp_scale, sgp_zero) = decode_int4_sidecar(&json, "shared_gate_proj_w");
+        let (sup_packed, sup_scale, sup_zero) = decode_int4_sidecar(&json, "shared_up_proj_w");
+        let (sdp_packed, sdp_scale, sdp_zero) = decode_int4_sidecar(&json, "shared_down_proj_w");
 
         let expert_stack_expected = b64_decode(inters["expert_stack"].as_str().unwrap());
 
@@ -5230,84 +5819,128 @@ mod tests {
         let two_i = 2 * i_us;
 
         // Sanity: fused-expert packed shape is [E, 2*I, hidden/2].
-        assert_eq!(gup_packed.len(), e_us * two_i * (hidden_us / 2),
-            "gate_up_proj packed bytes mismatch");
-        assert_eq!(gup_scale.len(),
+        assert_eq!(
+            gup_packed.len(),
+            e_us * two_i * (hidden_us / 2),
+            "gate_up_proj packed bytes mismatch"
+        );
+        assert_eq!(
+            gup_scale.len(),
             e_us * (two_i / gsz_us) * (hidden_us / gsz_us) * 2,
-            "gate_up_proj scale bytes mismatch");
-        assert_eq!(down_proj_w_bytes.len(), e_us * hidden_us * i_us * 2,
-            "down_proj BF16 bytes mismatch");
+            "gate_up_proj scale bytes mismatch"
+        );
+        assert_eq!(
+            down_proj_w_bytes.len(),
+            e_us * hidden_us * i_us * 2,
+            "down_proj BF16 bytes mismatch"
+        );
 
         set_backend(Backend::Hip);
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let down_proj_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16,
-            &[e_us, hidden_us, i_us], &down_proj_w_bytes,
-        ).expect("upload down_proj_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us, i_us],
+            &down_proj_w_bytes,
+        )
+        .expect("upload down_proj_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
-        let gup_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[gup_packed.len()], &gup_packed,
-        ).expect("upload gup packed");
+        let gup_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[gup_packed.len()], &gup_packed)
+                .expect("upload gup packed");
         let gup_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[gup_scale.len() / 2], &gup_scale,
-        ).expect("upload gup scale");
-        let gup_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[gup_zero.len() / 2], &gup_zero,
-        ).expect("upload gup zero");
+            ordinal,
+            ScalarType::BF16,
+            &[gup_scale.len() / 2],
+            &gup_scale,
+        )
+        .expect("upload gup scale");
+        let gup_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[gup_zero.len() / 2], &gup_zero)
+                .expect("upload gup zero");
 
-        let sgp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed,
-        ).expect("upload sgp packed");
+        let sgp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed)
+                .expect("upload sgp packed");
         let sgp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_scale.len() / 2], &sgp_scale,
-        ).expect("upload sgp scale");
-        let sgp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero,
-        ).expect("upload sgp zero");
-        let sup_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed,
-        ).expect("upload sup packed");
+            ordinal,
+            ScalarType::BF16,
+            &[sgp_scale.len() / 2],
+            &sgp_scale,
+        )
+        .expect("upload sgp scale");
+        let sgp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero)
+                .expect("upload sgp zero");
+        let sup_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed)
+                .expect("upload sup packed");
         let sup_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_scale.len() / 2], &sup_scale,
-        ).expect("upload sup scale");
-        let sup_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero,
-        ).expect("upload sup zero");
-        let sdp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed,
-        ).expect("upload sdp packed");
+            ordinal,
+            ScalarType::BF16,
+            &[sup_scale.len() / 2],
+            &sup_scale,
+        )
+        .expect("upload sup scale");
+        let sup_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero)
+                .expect("upload sup zero");
+        let sdp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed)
+                .expect("upload sdp packed");
         let sdp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_scale.len() / 2], &sdp_scale,
-        ).expect("upload sdp scale");
-        let sdp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero,
-        ).expect("upload sdp zero");
+            ordinal,
+            ScalarType::BF16,
+            &[sdp_scale.len() / 2],
+            &sdp_scale,
+        )
+        .expect("upload sdp scale");
+        let sdp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero)
+                .expect("upload sdp zero");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
@@ -5322,8 +5955,8 @@ mod tests {
             input_hidden: input_hidden.as_ptr(),
             post_attn_norm_w: post_attn_norm_w.as_ptr(),
             gate_w: gate_w.as_ptr(),
-            gate_up_proj_w: gup_packed_buf.as_ptr(),  // packed u8 — INT4 path
-            down_proj_w: down_proj_w.as_ptr(),         // BF16 reconstruction
+            gate_up_proj_w: gup_packed_buf.as_ptr(), // packed u8 — INT4 path
+            down_proj_w: down_proj_w.as_ptr(),       // BF16 reconstruction
             shared_gate_proj_w: sgp_packed_buf.as_ptr(),
             shared_up_proj_w: sup_packed_buf.as_ptr(),
             shared_down_proj_w: sdp_packed_buf.as_ptr(),
@@ -5409,16 +6042,11 @@ mod tests {
         let shared_expert_gate_w_bytes =
             b64_decode(weights["shared_expert_gate_w"].as_str().unwrap());
 
-        let (gup_packed, gup_scale, gup_zero) =
-            decode_int4_sidecar(&json, "gate_up_proj_w");
-        let (dp_packed, dp_scale, dp_zero) =
-            decode_int4_sidecar(&json, "down_proj_w");
-        let (sgp_packed, sgp_scale, sgp_zero) =
-            decode_int4_sidecar(&json, "shared_gate_proj_w");
-        let (sup_packed, sup_scale, sup_zero) =
-            decode_int4_sidecar(&json, "shared_up_proj_w");
-        let (sdp_packed, sdp_scale, sdp_zero) =
-            decode_int4_sidecar(&json, "shared_down_proj_w");
+        let (gup_packed, gup_scale, gup_zero) = decode_int4_sidecar(&json, "gate_up_proj_w");
+        let (dp_packed, dp_scale, dp_zero) = decode_int4_sidecar(&json, "down_proj_w");
+        let (sgp_packed, sgp_scale, sgp_zero) = decode_int4_sidecar(&json, "shared_gate_proj_w");
+        let (sup_packed, sup_scale, sup_zero) = decode_int4_sidecar(&json, "shared_up_proj_w");
+        let (sdp_packed, sdp_scale, sdp_zero) = decode_int4_sidecar(&json, "shared_down_proj_w");
 
         let output_hidden_expected = b64_decode(inters["output_hidden"].as_str().unwrap());
 
@@ -5429,86 +6057,122 @@ mod tests {
         let k_us = geom.top_k as usize;
 
         // Sanity: down_proj packed shape is [E, hidden, I/2].
-        assert_eq!(dp_packed.len(), e_us * hidden_us * (i_us / 2),
-            "down_proj packed bytes mismatch");
+        assert_eq!(
+            dp_packed.len(),
+            e_us * hidden_us * (i_us / 2),
+            "down_proj packed bytes mismatch"
+        );
 
         set_backend(Backend::Hip);
         let ordinal = 0usize;
 
         let input_hidden = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &input_hidden_bytes,
-        ).expect("upload input_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &input_hidden_bytes,
+        )
+        .expect("upload input_hidden");
         let post_attn_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_us], &post_attn_norm_w_bytes,
-        ).expect("upload post_attn_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_us],
+            &post_attn_norm_w_bytes,
+        )
+        .expect("upload post_attn_norm_w");
         let gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[e_us, hidden_us], &gate_w_bytes,
-        ).expect("upload gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[e_us, hidden_us],
+            &gate_w_bytes,
+        )
+        .expect("upload gate_w");
         let shared_expert_gate_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[1, hidden_us], &shared_expert_gate_w_bytes,
-        ).expect("upload shared_expert_gate_w");
+            ordinal,
+            ScalarType::BF16,
+            &[1, hidden_us],
+            &shared_expert_gate_w_bytes,
+        )
+        .expect("upload shared_expert_gate_w");
 
         // All five INT4 tensors uploaded as packed u8 + BF16 sidecars.
-        let gup_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[gup_packed.len()], &gup_packed,
-        ).expect("upload gup packed");
+        let gup_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[gup_packed.len()], &gup_packed)
+                .expect("upload gup packed");
         let gup_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[gup_scale.len() / 2], &gup_scale,
-        ).expect("upload gup scale");
-        let gup_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[gup_zero.len() / 2], &gup_zero,
-        ).expect("upload gup zero");
-        let dp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[dp_packed.len()], &dp_packed,
-        ).expect("upload dp packed");
-        let dp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[dp_scale.len() / 2], &dp_scale,
-        ).expect("upload dp scale");
-        let dp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[dp_zero.len() / 2], &dp_zero,
-        ).expect("upload dp zero");
-        let sgp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed,
-        ).expect("upload sgp packed");
+            ordinal,
+            ScalarType::BF16,
+            &[gup_scale.len() / 2],
+            &gup_scale,
+        )
+        .expect("upload gup scale");
+        let gup_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[gup_zero.len() / 2], &gup_zero)
+                .expect("upload gup zero");
+        let dp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[dp_packed.len()], &dp_packed)
+                .expect("upload dp packed");
+        let dp_scale_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[dp_scale.len() / 2], &dp_scale)
+                .expect("upload dp scale");
+        let dp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[dp_zero.len() / 2], &dp_zero)
+                .expect("upload dp zero");
+        let sgp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sgp_packed.len()], &sgp_packed)
+                .expect("upload sgp packed");
         let sgp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_scale.len() / 2], &sgp_scale,
-        ).expect("upload sgp scale");
-        let sgp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero,
-        ).expect("upload sgp zero");
-        let sup_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed,
-        ).expect("upload sup packed");
+            ordinal,
+            ScalarType::BF16,
+            &[sgp_scale.len() / 2],
+            &sgp_scale,
+        )
+        .expect("upload sgp scale");
+        let sgp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sgp_zero.len() / 2], &sgp_zero)
+                .expect("upload sgp zero");
+        let sup_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sup_packed.len()], &sup_packed)
+                .expect("upload sup packed");
         let sup_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_scale.len() / 2], &sup_scale,
-        ).expect("upload sup scale");
-        let sup_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero,
-        ).expect("upload sup zero");
-        let sdp_packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed,
-        ).expect("upload sdp packed");
+            ordinal,
+            ScalarType::BF16,
+            &[sup_scale.len() / 2],
+            &sup_scale,
+        )
+        .expect("upload sup scale");
+        let sup_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sup_zero.len() / 2], &sup_zero)
+                .expect("upload sup zero");
+        let sdp_packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[sdp_packed.len()], &sdp_packed)
+                .expect("upload sdp packed");
         let sdp_scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_scale.len() / 2], &sdp_scale,
-        ).expect("upload sdp scale");
-        let sdp_zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero,
-        ).expect("upload sdp zero");
+            ordinal,
+            ScalarType::BF16,
+            &[sdp_scale.len() / 2],
+            &sdp_scale,
+        )
+        .expect("upload sdp scale");
+        let sdp_zero_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[sdp_zero.len() / 2], &sdp_zero)
+                .expect("upload sdp zero");
 
-        let mut output = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)],
-        ).expect("alloc output");
-        let mut output_idx = GpuBuffer::zeros(
-            ordinal, ScalarType::U32, &[k_us],
-        ).expect("alloc output_idx");
+        let mut output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_parity_output_elems(&geom)])
+                .expect("alloc output");
+        let mut output_idx =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[k_us]).expect("alloc output_idx");
         let mut workspace = GpuBuffer::zeros(
-            ordinal, ScalarType::F32, &[ffn_parity_workspace_floats(&geom)],
-        ).expect("alloc workspace");
-        let mut sync_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::U8, &[96],
-        ).expect("alloc sync buf");
+            ordinal,
+            ScalarType::F32,
+            &[ffn_parity_workspace_floats(&geom)],
+        )
+        .expect("alloc workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
 
-        let _ = (i_us, is_us);  // kept for clarity above.
+        let _ = (i_us, is_us); // kept for clarity above.
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
@@ -5610,7 +6274,10 @@ mod tests {
     /// zero [out/gs, in/gs] u16-as-BF16)`.
     #[cfg(supersonic_backend_hip)]
     fn host_minmax_int4(
-        w: &[f32], out_rows: usize, in_cols: usize, gsz: usize,
+        w: &[f32],
+        out_rows: usize,
+        in_cols: usize,
+        gsz: usize,
     ) -> (Vec<u8>, Vec<u16>, Vec<u16>) {
         assert_eq!(w.len(), out_rows * in_cols);
         assert_eq!(out_rows % gsz, 0);
@@ -5667,8 +6334,12 @@ mod tests {
     /// F32 values whose lower 16 bits are zero (i.e. exactly BF16-precision).
     #[cfg(supersonic_backend_hip)]
     fn host_dequant_recon(
-        packed: &[u8], scale: &[u16], zero: &[u16],
-        out_rows: usize, in_cols: usize, gsz: usize,
+        packed: &[u8],
+        scale: &[u16],
+        zero: &[u16],
+        out_rows: usize,
+        in_cols: usize,
+        gsz: usize,
     ) -> Vec<f32> {
         let sc = in_cols / gsz;
         let mut out = vec![0.0f32; out_rows * in_cols];
@@ -5678,11 +6349,13 @@ mod tests {
                 let s = f32_from_bf16(scale[gi]);
                 let z = f32_from_bf16(zero[gi]);
                 let byte = packed[row * (in_cols / 2) + col / 2];
-                let n = if col & 1 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+                let n = if col & 1 == 0 {
+                    byte & 0x0F
+                } else {
+                    (byte >> 4) & 0x0F
+                };
                 let v = (n as f32) * s - z * s;
-                out[row * in_cols + col] = f32::from_bits(
-                    (bf16_round_bits(v) as u32) << 16,
-                );
+                out[row * in_cols + col] = f32::from_bits((bf16_round_bits(v) as u32) << 16);
             }
         }
         out
@@ -5710,10 +6383,8 @@ mod tests {
         // Deterministic synthetic weights: a 32-bit LCG seeded by config so
         // each smoke variant uses different but reproducible values.
         let n = out_rows * in_cols;
-        let mut rng_state: u32 = 0xC0FFEE
-            ^ ((out_rows as u32) << 16)
-            ^ ((in_cols as u32) << 8)
-            ^ (gsz as u32);
+        let mut rng_state: u32 =
+            0xC0FFEE ^ ((out_rows as u32) << 16) ^ ((in_cols as u32) << 8) ^ (gsz as u32);
         let mut w = vec![0.0f32; n];
         for v in w.iter_mut() {
             // LCG (Numerical Recipes constants) → uniform [-1, 1).
@@ -5723,46 +6394,64 @@ mod tests {
         }
 
         let (packed, scale_bits, zero_bits) = host_minmax_int4(&w, out_rows, in_cols, gsz);
-        let recon_ref = host_dequant_recon(&packed, &scale_bits, &zero_bits,
-                                            out_rows, in_cols, gsz);
+        let recon_ref =
+            host_dequant_recon(&packed, &scale_bits, &zero_bits, out_rows, in_cols, gsz);
 
-        let packed_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::U8, &[packed.len()], &packed,
-        ).expect("upload packed");
+        let packed_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[packed.len()], &packed)
+                .expect("upload packed");
         let scale_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[scale_bits.len()],
+            ordinal,
+            ScalarType::BF16,
+            &[scale_bits.len()],
             &bf16_bits_to_bytes(&scale_bits),
-        ).expect("upload scale");
+        )
+        .expect("upload scale");
         let zero_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[zero_bits.len()],
+            ordinal,
+            ScalarType::BF16,
+            &[zero_bits.len()],
             &bf16_bits_to_bytes(&zero_bits),
-        ).expect("upload zero");
+        )
+        .expect("upload zero");
 
-        let mut dq_8 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n])
-            .expect("alloc dq_8");
-        let mut dq_scalar = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n])
-            .expect("alloc dq_scalar");
+        let mut dq_8 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n]).expect("alloc dq_8");
+        let mut dq_scalar =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[n]).expect("alloc dq_scalar");
 
         int4_dequant_smoke_launch(
             ordinal,
-            &packed_buf, &scale_buf, &zero_buf,
-            out_rows as i32, in_cols as i32, gsz as i32,
-            &mut dq_8, &mut dq_scalar,
-        ).expect("smoke launch");
+            &packed_buf,
+            &scale_buf,
+            &zero_buf,
+            out_rows as i32,
+            in_cols as i32,
+            gsz as i32,
+            &mut dq_8,
+            &mut dq_scalar,
+        )
+        .expect("smoke launch");
 
         let dq_8_bytes = dq_8.to_host_bytes().expect("download dq_8");
         let dq_scalar_bytes = dq_scalar.to_host_bytes().expect("download dq_scalar");
-        let dq_8_v: Vec<f32> = dq_8_bytes.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-        let dq_scalar_v: Vec<f32> = dq_scalar_bytes.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let dq_8_v: Vec<f32> = dq_8_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let dq_scalar_v: Vec<f32> = dq_scalar_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
         for i in 0..n {
             assert_eq!(
-                dq_8_v[i].to_bits(), recon_ref[i].to_bits(),
+                dq_8_v[i].to_bits(),
+                recon_ref[i].to_bits(),
                 "[{label}] int4_dequant_8 mismatch at i={i}: got {} ({:#010x}), want {} ({:#010x})",
-                dq_8_v[i], dq_8_v[i].to_bits(),
-                recon_ref[i], recon_ref[i].to_bits(),
+                dq_8_v[i],
+                dq_8_v[i].to_bits(),
+                recon_ref[i],
+                recon_ref[i].to_bits(),
             );
             assert_eq!(
                 dq_scalar_v[i].to_bits(), recon_ref[i].to_bits(),
@@ -5831,10 +6520,8 @@ mod tests {
             ((bits.wrapping_add(rounding_bias)) >> 16) as u16
         };
 
-        let final_hidden_f32: Vec<f32> =
-            (0..hidden).map(|_| xorshift(&mut rng) * 0.5).collect();
-        let final_norm_w_f32: Vec<f32> =
-            (0..hidden).map(|_| xorshift(&mut rng) * 0.02).collect();
+        let final_hidden_f32: Vec<f32> = (0..hidden).map(|_| xorshift(&mut rng) * 0.5).collect();
+        let final_norm_w_f32: Vec<f32> = (0..hidden).map(|_| xorshift(&mut rng) * 0.02).collect();
         // lm_head: ~N(0, 1/sqrt(hidden)).
         let scale = 1.0 / (hidden as f32).sqrt();
         let lm_head_f32: Vec<f32> = (0..(vocab as usize) * (hidden as usize))
@@ -5887,19 +6574,30 @@ mod tests {
 
         // GPU path.
         let final_hidden_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden as usize], &final_hidden_bytes,
-        ).expect("upload final_hidden");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden as usize],
+            &final_hidden_bytes,
+        )
+        .expect("upload final_hidden");
         let final_norm_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden as usize], &final_norm_w_bytes,
-        ).expect("upload final_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden as usize],
+            &final_norm_w_bytes,
+        )
+        .expect("upload final_norm_w");
         let lm_head_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[vocab as usize, hidden as usize], &lm_head_bytes,
-        ).expect("upload lm_head_w");
-        let mut logits_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[vocab as usize],
-        ).expect("alloc logits");
-        let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .expect("alloc counter");
+            ordinal,
+            ScalarType::BF16,
+            &[vocab as usize, hidden as usize],
+            &lm_head_bytes,
+        )
+        .expect("upload lm_head_w");
+        let mut logits_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[vocab as usize]).expect("alloc logits");
+        let mut counter_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counter");
 
         super::lm_head_launch(
             ordinal,
@@ -5912,7 +6610,8 @@ mod tests {
             &mut logits_buf,
             None,
             &mut counter_buf,
-        ).expect("lm_head launch");
+        )
+        .expect("lm_head launch");
 
         let mut got_bytes = vec![0u8; vocab as usize * 2];
         copy_d2h(
@@ -5920,17 +6619,29 @@ mod tests {
             got_bytes.as_mut_ptr() as *mut _,
             logits_buf.as_ptr(),
             got_bytes.len(),
-        ).expect("d2h logits");
+        )
+        .expect("d2h logits");
         let got_logits = bf16_to_f32(&got_bytes);
 
         // BF16 cos_sim: should be very high (≥ 0.999) because both paths
         // converge on the same dot product modulo BF16 rounding noise on
         // the GPU side. Use F64 reductions to avoid the same precision
         // pitfall the bake survey hit on lm_head (PR #67).
-        let dot: f64 = got_logits.iter().zip(want_logits_f32.iter())
-            .map(|(&a, &b)| a as f64 * b as f64).sum();
-        let na: f64 = got_logits.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
-        let nb: f64 = want_logits_f32.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let dot: f64 = got_logits
+            .iter()
+            .zip(want_logits_f32.iter())
+            .map(|(&a, &b)| a as f64 * b as f64)
+            .sum();
+        let na: f64 = got_logits
+            .iter()
+            .map(|&x| (x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let nb: f64 = want_logits_f32
+            .iter()
+            .map(|&x| (x as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         let cos_sim = dot / (na * nb);
         assert!(
             cos_sim >= 0.999,
@@ -5941,8 +6652,13 @@ mod tests {
 
         // Top-1 should agree on the F32 reference; if it disagrees, log it
         // (could be a near-tie under BF16 rounding) but don't fail the test.
-        let argmax = |v: &[f32]| v.iter().enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).map(|(i, _)| i).unwrap();
+        let argmax = |v: &[f32]| {
+            v.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i)
+                .unwrap()
+        };
         let got_top = argmax(&got_logits);
         let want_top = argmax(&want_logits_f32);
         if got_top != want_top {
@@ -5983,24 +6699,37 @@ mod tests {
         // Minimal buffers — the call should reject before touching them.
         let one_row_bytes = vec![0u8; HIDDEN as usize * 2];
         let final_norm_w = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[HIDDEN as usize], &one_row_bytes,
-        ).expect("alloc final_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[HIDDEN as usize],
+            &one_row_bytes,
+        )
+        .expect("alloc final_norm_w");
         let lm_head_w = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[VOCAB as usize, HIDDEN as usize],
-        ).expect("alloc lm_head_w");
-        let final_hidden_16 = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[16, HIDDEN as usize],
-        ).expect("alloc final_hidden");
-        let mut logits_16 = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[16, VOCAB as usize],
-        ).expect("alloc logits");
+            ordinal,
+            ScalarType::BF16,
+            &[VOCAB as usize, HIDDEN as usize],
+        )
+        .expect("alloc lm_head_w");
+        let final_hidden_16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[16, HIDDEN as usize])
+            .expect("alloc final_hidden");
+        let mut logits_16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[16, VOCAB as usize])
+            .expect("alloc logits");
 
         // M = 16 must fail with a clear actionable message.
         let err = super::lm_head_batched_launch(
-            ordinal, /* m */ 16, HIDDEN, VOCAB, EPS,
-            &final_hidden_16, &final_norm_w, &lm_head_w,
-            &mut logits_16, None,
-        ).expect_err("M=16 at hidden=2048 must reject");
+            ordinal,
+            /* m */ 16,
+            HIDDEN,
+            VOCAB,
+            EPS,
+            &final_hidden_16,
+            &final_norm_w,
+            &lm_head_w,
+            &mut logits_16,
+            None,
+        )
+        .expect_err("M=16 at hidden=2048 must reject");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("max_m=15"),
@@ -6010,20 +6739,25 @@ mod tests {
         // Sanity: M=15 should pass argument validation (we don't actually
         // launch — just confirm the LDS bound is permissive enough to
         // accept the largest still-valid M).
-        let final_hidden_15 = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[15, HIDDEN as usize],
-        ).expect("alloc final_hidden 15");
-        let mut logits_15 = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[15, VOCAB as usize],
-        ).expect("alloc logits 15");
+        let final_hidden_15 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[15, HIDDEN as usize])
+            .expect("alloc final_hidden 15");
+        let mut logits_15 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[15, VOCAB as usize])
+            .expect("alloc logits 15");
         // The launch may succeed or fail post-arg-check (kernel runs
         // and produces logits); either way the wrapper must NOT reject
         // on argument validation. Treat any post-launch error as test
         // pass since the LDS bound check is what we're validating.
         let _ = super::lm_head_batched_launch(
-            ordinal, /* m */ 15, HIDDEN, VOCAB, EPS,
-            &final_hidden_15, &final_norm_w, &lm_head_w,
-            &mut logits_15, None,
+            ordinal,
+            /* m */ 15,
+            HIDDEN,
+            VOCAB,
+            EPS,
+            &final_hidden_15,
+            &final_norm_w,
+            &lm_head_w,
+            &mut logits_15,
+            None,
         );
     }
 
@@ -6066,10 +6800,10 @@ mod tests {
         };
 
         // [M, HIDDEN] BF16 input, [HIDDEN] norm, [VOCAB, HIDDEN] lm_head.
-        let final_hidden_f32: Vec<f32> =
-            (0..(M * HIDDEN)).map(|_| xorshift(&mut rng) * 0.5).collect();
-        let final_norm_w_f32: Vec<f32> =
-            (0..HIDDEN).map(|_| xorshift(&mut rng) * 0.02).collect();
+        let final_hidden_f32: Vec<f32> = (0..(M * HIDDEN))
+            .map(|_| xorshift(&mut rng) * 0.5)
+            .collect();
+        let final_norm_w_f32: Vec<f32> = (0..HIDDEN).map(|_| xorshift(&mut rng) * 0.02).collect();
         let scale = 1.0 / (HIDDEN as f32).sqrt();
         let lm_head_f32: Vec<f32> = (0..(VOCAB as usize * HIDDEN as usize))
             .map(|_| xorshift(&mut rng) * scale)
@@ -6089,67 +6823,99 @@ mod tests {
         let lm_head_bytes = to_bf16_bytes(&lm_head_f32);
 
         let final_norm_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[HIDDEN as usize], &final_norm_w_bytes,
-        ).expect("upload final_norm_w");
+            ordinal,
+            ScalarType::BF16,
+            &[HIDDEN as usize],
+            &final_norm_w_bytes,
+        )
+        .expect("upload final_norm_w");
         let lm_head_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16,
-            &[VOCAB as usize, HIDDEN as usize], &lm_head_bytes,
-        ).expect("upload lm_head_w");
+            ordinal,
+            ScalarType::BF16,
+            &[VOCAB as usize, HIDDEN as usize],
+            &lm_head_bytes,
+        )
+        .expect("upload lm_head_w");
 
         // ---- Reference: K sequential single-M lm_head_launch calls -------
         let mut want_logits_per_row: Vec<Vec<u8>> = Vec::with_capacity(M as usize);
         for row in 0..M as usize {
-            let row_bytes = &final_hidden_bytes[row * HIDDEN as usize * 2
-                ..(row + 1) * HIDDEN as usize * 2];
+            let row_bytes =
+                &final_hidden_bytes[row * HIDDEN as usize * 2..(row + 1) * HIDDEN as usize * 2];
             let row_buf = GpuBuffer::from_host_bytes(
-                ordinal, ScalarType::BF16, &[HIDDEN as usize], row_bytes,
-            ).expect("upload final_hidden row");
-            let mut logits_buf = GpuBuffer::zeros(
-                ordinal, ScalarType::BF16, &[VOCAB as usize],
-            ).expect("alloc logits");
-            let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-                .expect("alloc counter");
+                ordinal,
+                ScalarType::BF16,
+                &[HIDDEN as usize],
+                row_bytes,
+            )
+            .expect("upload final_hidden row");
+            let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[VOCAB as usize])
+                .expect("alloc logits");
+            let mut counter_buf =
+                GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counter");
             super::lm_head_launch(
-                ordinal, HIDDEN, VOCAB, EPS,
-                &row_buf, &final_norm_w_buf, &lm_head_w_buf,
-                &mut logits_buf, None, &mut counter_buf,
-            ).expect("single-M lm_head launch");
+                ordinal,
+                HIDDEN,
+                VOCAB,
+                EPS,
+                &row_buf,
+                &final_norm_w_buf,
+                &lm_head_w_buf,
+                &mut logits_buf,
+                None,
+                &mut counter_buf,
+            )
+            .expect("single-M lm_head launch");
             let mut row_logits = vec![0u8; VOCAB as usize * 2];
             copy_d2h(
-                ordinal, row_logits.as_mut_ptr() as *mut _,
-                logits_buf.as_ptr(), row_logits.len(),
-            ).expect("d2h single-M logits");
+                ordinal,
+                row_logits.as_mut_ptr() as *mut _,
+                logits_buf.as_ptr(),
+                row_logits.len(),
+            )
+            .expect("d2h single-M logits");
             want_logits_per_row.push(row_logits);
         }
 
         // ---- Batched: one launch produces all K rows ---------------------
         let final_hidden_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[M as usize, HIDDEN as usize],
+            ordinal,
+            ScalarType::BF16,
+            &[M as usize, HIDDEN as usize],
             &final_hidden_bytes,
-        ).expect("upload [m, hidden]");
-        let mut batched_logits_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[M as usize, VOCAB as usize],
-        ).expect("alloc [m, vocab] logits");
+        )
+        .expect("upload [m, hidden]");
+        let mut batched_logits_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[M as usize, VOCAB as usize])
+                .expect("alloc [m, vocab] logits");
 
         super::lm_head_batched_launch(
-            ordinal, M, HIDDEN, VOCAB, EPS,
-            &final_hidden_buf, &final_norm_w_buf, &lm_head_w_buf,
-            &mut batched_logits_buf, None,
-        ).expect("batched lm_head launch");
+            ordinal,
+            M,
+            HIDDEN,
+            VOCAB,
+            EPS,
+            &final_hidden_buf,
+            &final_norm_w_buf,
+            &lm_head_w_buf,
+            &mut batched_logits_buf,
+            None,
+        )
+        .expect("batched lm_head launch");
 
         let batched_bytes = batched_logits_buf
             .to_host_bytes()
             .expect("d2h batched logits");
         assert_eq!(
-            batched_bytes.len(), M as usize * VOCAB as usize * 2,
+            batched_bytes.len(),
+            M as usize * VOCAB as usize * 2,
             "batched logits size"
         );
 
         // ---- Compare per-row -----------------------------------------------
         for row in 0..M as usize {
             let want = &want_logits_per_row[row];
-            let got = &batched_bytes[row * VOCAB as usize * 2
-                ..(row + 1) * VOCAB as usize * 2];
+            let got = &batched_bytes[row * VOCAB as usize * 2..(row + 1) * VOCAB as usize * 2];
             let want_f = bf16_bytes_to_f32(want);
             let got_f = bf16_bytes_to_f32(got);
 
@@ -6159,7 +6925,9 @@ mod tests {
             let mut got_sq = 0.0f64;
             for (g, w) in got_f.iter().zip(want_f.iter()) {
                 let d = (g - w).abs();
-                if d > max_abs { max_abs = d; }
+                if d > max_abs {
+                    max_abs = d;
+                }
                 dot += (*g as f64) * (*w as f64);
                 got_sq += (*g as f64).powi(2);
                 want_sq += (*w as f64).powi(2);
@@ -6212,19 +6980,18 @@ mod tests {
         };
         let raw = std::fs::read_to_string(&json_path)
             .unwrap_or_else(|e| panic!("read mtp oracle json {json_path}: {e}"));
-        let json: serde_json::Value =
-            serde_json::from_str(&raw).expect("mtp oracle json parse");
+        let json: serde_json::Value = serde_json::from_str(&raw).expect("mtp oracle json parse");
 
         assert_eq!(
-            json["schema"].as_str().unwrap_or(""), "qwen36-moe-mtp-oracle-v1",
+            json["schema"].as_str().unwrap_or(""),
+            "qwen36-moe-mtp-oracle-v1",
             "MTP parity test expects schema qwen36-moe-mtp-oracle-v1; \
              regenerate the fixture if the oracle has bumped its schema."
         );
 
         let cfg = &json["config"];
         let hidden = cfg["hidden"].as_i64().expect("config.hidden") as i32;
-        let rms_norm_eps =
-            cfg["rms_norm_eps"].as_f64().expect("config.rms_norm_eps") as f32;
+        let rms_norm_eps = cfg["rms_norm_eps"].as_f64().expect("config.rms_norm_eps") as f32;
 
         let prefusion = &json["prefusion_weights"];
         assert!(
@@ -6233,104 +7000,135 @@ mod tests {
              the Phase 6.2c.1 oracle (it adds fc_w + RMSNorm gains)"
         );
         let fc_w_bytes = b64_decode(
-            prefusion["fc_w_bf16"].as_str().expect("prefusion_weights.fc_w_bf16"),
+            prefusion["fc_w_bf16"]
+                .as_str()
+                .expect("prefusion_weights.fc_w_bf16"),
         );
         let pre_fc_norm_embedding_w_bytes = b64_decode(
             prefusion["pre_fc_norm_embedding_w_bf16"]
-                .as_str().expect("prefusion_weights.pre_fc_norm_embedding_w_bf16"),
+                .as_str()
+                .expect("prefusion_weights.pre_fc_norm_embedding_w_bf16"),
         );
         let pre_fc_norm_hidden_w_bytes = b64_decode(
             prefusion["pre_fc_norm_hidden_w_bf16"]
-                .as_str().expect("prefusion_weights.pre_fc_norm_hidden_w_bf16"),
+                .as_str()
+                .expect("prefusion_weights.pre_fc_norm_hidden_w_bf16"),
         );
 
         let h_base_bytes = b64_decode(
-            json["h_base_step0_bf16"].as_str().expect("h_base_step0_bf16"),
+            json["h_base_step0_bf16"]
+                .as_str()
+                .expect("h_base_step0_bf16"),
         );
 
         let step0 = &json["steps"][0];
         let e_in_bytes = b64_decode(
             step0["input_token_embed_bf16"]
-                .as_str().expect("steps[0].input_token_embed_bf16"),
+                .as_str()
+                .expect("steps[0].input_token_embed_bf16"),
         );
-        let want_e_norm_bytes = b64_decode(
-            step0["e_norm_bf16"].as_str().expect("steps[0].e_norm_bf16"),
-        );
-        let want_h_norm_bytes = b64_decode(
-            step0["h_norm_bf16"].as_str().expect("steps[0].h_norm_bf16"),
-        );
-        let want_fused_bytes = b64_decode(
-            step0["fused_bf16"].as_str().expect("steps[0].fused_bf16"),
-        );
+        let want_e_norm_bytes =
+            b64_decode(step0["e_norm_bf16"].as_str().expect("steps[0].e_norm_bf16"));
+        let want_h_norm_bytes =
+            b64_decode(step0["h_norm_bf16"].as_str().expect("steps[0].h_norm_bf16"));
+        let want_fused_bytes =
+            b64_decode(step0["fused_bf16"].as_str().expect("steps[0].fused_bf16"));
 
         let hidden_usz = hidden as usize;
         assert_eq!(e_in_bytes.len(), hidden_usz * 2, "e_in shape");
         assert_eq!(h_base_bytes.len(), hidden_usz * 2, "h_base shape");
         assert_eq!(
-            pre_fc_norm_embedding_w_bytes.len(), hidden_usz * 2,
+            pre_fc_norm_embedding_w_bytes.len(),
+            hidden_usz * 2,
             "pre_fc_norm_embedding_w shape"
         );
         assert_eq!(
-            pre_fc_norm_hidden_w_bytes.len(), hidden_usz * 2,
+            pre_fc_norm_hidden_w_bytes.len(),
+            hidden_usz * 2,
             "pre_fc_norm_hidden_w shape"
         );
         assert_eq!(
-            fc_w_bytes.len(), hidden_usz * 2 * hidden_usz * 2,
+            fc_w_bytes.len(),
+            hidden_usz * 2 * hidden_usz * 2,
             "fc_w shape: expected [hidden, 2*hidden] BF16"
         );
 
         set_backend(Backend::Hip);
         let ordinal = 0usize;
 
-        let e_in_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_usz], &e_in_bytes,
-        ).expect("upload e_in");
-        let h_base_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_usz], &h_base_bytes,
-        ).expect("upload h_base");
+        let e_in_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[hidden_usz], &e_in_bytes)
+                .expect("upload e_in");
+        let h_base_buf =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[hidden_usz], &h_base_bytes)
+                .expect("upload h_base");
         let pre_fc_norm_embedding_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_usz], &pre_fc_norm_embedding_w_bytes,
-        ).expect("upload pre_fc_norm_embedding_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_usz],
+            &pre_fc_norm_embedding_w_bytes,
+        )
+        .expect("upload pre_fc_norm_embedding_w");
         let pre_fc_norm_hidden_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16, &[hidden_usz], &pre_fc_norm_hidden_w_bytes,
-        ).expect("upload pre_fc_norm_hidden_w");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_usz],
+            &pre_fc_norm_hidden_w_bytes,
+        )
+        .expect("upload pre_fc_norm_hidden_w");
         let fc_w_buf = GpuBuffer::from_host_bytes(
-            ordinal, ScalarType::BF16,
-            &[hidden_usz, 2 * hidden_usz], &fc_w_bytes,
-        ).expect("upload fc_w");
-        let mut e_norm_out_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[hidden_usz],
-        ).expect("alloc e_norm_out");
-        let mut h_norm_out_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[hidden_usz],
-        ).expect("alloc h_norm_out");
-        let mut fused_out_buf = GpuBuffer::zeros(
-            ordinal, ScalarType::BF16, &[hidden_usz],
-        ).expect("alloc fused_out");
+            ordinal,
+            ScalarType::BF16,
+            &[hidden_usz, 2 * hidden_usz],
+            &fc_w_bytes,
+        )
+        .expect("upload fc_w");
+        let mut e_norm_out_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden_usz]).expect("alloc e_norm_out");
+        let mut h_norm_out_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden_usz]).expect("alloc h_norm_out");
+        let mut fused_out_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden_usz]).expect("alloc fused_out");
 
         super::mtp_pre_fusion_launch(
-            ordinal, hidden, rms_norm_eps,
-            &e_in_buf, &h_base_buf,
-            &pre_fc_norm_embedding_w_buf, &pre_fc_norm_hidden_w_buf,
+            ordinal,
+            hidden,
+            rms_norm_eps,
+            &e_in_buf,
+            &h_base_buf,
+            &pre_fc_norm_embedding_w_buf,
+            &pre_fc_norm_hidden_w_buf,
             &fc_w_buf,
-            &mut e_norm_out_buf, &mut h_norm_out_buf, &mut fused_out_buf,
-        ).expect("mtp_pre_fusion launch");
+            &mut e_norm_out_buf,
+            &mut h_norm_out_buf,
+            &mut fused_out_buf,
+        )
+        .expect("mtp_pre_fusion launch");
 
         let mut got_e_norm = vec![0u8; hidden_usz * 2];
         let mut got_h_norm = vec![0u8; hidden_usz * 2];
         let mut got_fused = vec![0u8; hidden_usz * 2];
         copy_d2h(
-            ordinal, got_e_norm.as_mut_ptr() as *mut _,
-            e_norm_out_buf.as_ptr(), got_e_norm.len(),
-        ).expect("d2h e_norm");
+            ordinal,
+            got_e_norm.as_mut_ptr() as *mut _,
+            e_norm_out_buf.as_ptr(),
+            got_e_norm.len(),
+        )
+        .expect("d2h e_norm");
         copy_d2h(
-            ordinal, got_h_norm.as_mut_ptr() as *mut _,
-            h_norm_out_buf.as_ptr(), got_h_norm.len(),
-        ).expect("d2h h_norm");
+            ordinal,
+            got_h_norm.as_mut_ptr() as *mut _,
+            h_norm_out_buf.as_ptr(),
+            got_h_norm.len(),
+        )
+        .expect("d2h h_norm");
         copy_d2h(
-            ordinal, got_fused.as_mut_ptr() as *mut _,
-            fused_out_buf.as_ptr(), got_fused.len(),
-        ).expect("d2h fused");
+            ordinal,
+            got_fused.as_mut_ptr() as *mut _,
+            fused_out_buf.as_ptr(),
+            got_fused.len(),
+        )
+        .expect("d2h fused");
 
         // The two RMSNorm outputs go through one BF16 round each — single
         // `(x * inv_rms * (1+w))` pass — so they should be effectively
@@ -6339,22 +7137,22 @@ mod tests {
         // ULP-of-BF16 at any reasonable magnitude is comfortable.
         assert_parity(
             "mtp.e_norm",
-            &got_e_norm, &want_e_norm_bytes,
-            /* max_abs */ 1e-2, /* cos_sim_floor */ 0.99999,
+            &got_e_norm,
+            &want_e_norm_bytes,
+            /* max_abs */ 1e-2,
+            /* cos_sim_floor */ 0.99999,
         );
-        assert_parity(
-            "mtp.h_norm",
-            &got_h_norm, &want_h_norm_bytes,
-            1e-2, 0.99999,
-        );
+        assert_parity("mtp.h_norm", &got_h_norm, &want_h_norm_bytes, 1e-2, 0.99999);
         // fused is a `[hidden, 2*hidden]` matvec; F32 accumulation order on
         // the GPU differs from PyTorch's per-row reduction tree. cos_sim
         // ≥ 0.999 is the bar the other Qwen3.6-MoE matvec parity tests use
         // (FFN, lm_head), and it's well within the BF16 rounding floor.
         assert_parity(
             "mtp.fused",
-            &got_fused, &want_fused_bytes,
-            /* max_abs */ 5e-2, /* cos_sim_floor */ 0.999,
+            &got_fused,
+            &want_fused_bytes,
+            /* max_abs */ 5e-2,
+            /* cos_sim_floor */ 0.999,
         );
     }
 }

@@ -43,7 +43,8 @@ impl StateAccount {
 
         let lin_qkv_dim = (config.linear_num_key_heads * config.linear_key_head_dim
             + config.linear_num_key_heads * config.linear_key_head_dim
-            + config.linear_num_value_heads * config.linear_value_head_dim) as u64;
+            + config.linear_num_value_heads * config.linear_value_head_dim)
+            as u64;
         let conv_state_bytes_per_layer =
             2 * lin_qkv_dim * (config.linear_conv_kernel_dim as u64).saturating_sub(1);
         let recurrent_state_bytes_per_layer = 4

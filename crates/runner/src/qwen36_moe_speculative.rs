@@ -121,10 +121,7 @@ impl AcceptPrefixOutcome {
 /// rejection occurred (i.e., we'd need the bonus prediction but it
 /// wasn't supplied). Use [`accept_prefix_greedy_partial`] when the
 /// caller has already terminated early.
-pub fn accept_prefix_greedy(
-    drafts: &[u32],
-    base_predictions: &[u32],
-) -> AcceptPrefixOutcome {
+pub fn accept_prefix_greedy(drafts: &[u32], base_predictions: &[u32]) -> AcceptPrefixOutcome {
     let k = drafts.len();
     let mut accepted: Vec<u32> = Vec::with_capacity(k);
     for i in 0..k {
@@ -135,7 +132,8 @@ pub fn accept_prefix_greedy(
                  the verify loop early without recording a corrected token. \
                  Use `accept_prefix_greedy_partial` for the early-termination \
                  case.",
-                base_predictions.len(), i + 1
+                base_predictions.len(),
+                i + 1
             );
         }
         let b = base_predictions[i];
@@ -159,7 +157,8 @@ pub fn accept_prefix_greedy(
             "accept_prefix_greedy: all {k} drafts accepted but \
              base_predictions has only {} entries — need at least {} \
              (one extra for the bonus token at position p+K+1).",
-            base_predictions.len(), k + 1
+            base_predictions.len(),
+            k + 1
         );
     }
     AcceptPrefixOutcome {
@@ -253,9 +252,7 @@ use anyhow::{Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use crate::qwen36_moe_decode::{MtpLayerBuffers, MultiLayerGeom};
-use crate::qwen36_moe_mtp::{
-    run_mtp_draft_chain, MtpChainScratch, MtpForwardScratch,
-};
+use crate::qwen36_moe_mtp::{run_mtp_draft_chain, MtpChainScratch, MtpForwardScratch};
 
 /// Result of one speculative-decode step.
 #[derive(Debug, Clone)]
@@ -374,13 +371,8 @@ where
     }
 
     // --- 1. Upload h_base for the MTP chain. ---
-    let h_base_buf = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[hidden],
-        h_base_in,
-    )
-    .context("speculative: upload h_base")?;
+    let h_base_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[hidden], h_base_in)
+        .context("speculative: upload h_base")?;
 
     // --- 2. Generate K MTP drafts. ---
     let drafts_records = run_mtp_draft_chain(
@@ -442,8 +434,8 @@ where
     // All K drafts accepted. Bonus base step at position p+K with
     // input = drafts[K-1] (= last accepted token).
     let pos = base_position + (num_drafts as i32);
-    let (bonus, fh) = base_step(pos, input)
-        .with_context(|| format!("speculative: bonus base step pos={pos}"))?;
+    let (bonus, fh) =
+        base_step(pos, input).with_context(|| format!("speculative: bonus base step pos={pos}"))?;
     emitted.push(bonus);
     Ok(SpeculativeStepResult {
         emitted_tokens: emitted,
@@ -548,13 +540,8 @@ where
     }
 
     // --- 1. Upload h_base for the MTP chain. ---
-    let h_base_buf = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[hidden],
-        h_base_in,
-    )
-    .context("speculative_batched: upload h_base")?;
+    let h_base_buf = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[hidden], h_base_in)
+        .context("speculative_batched: upload h_base")?;
 
     // --- 2. Generate K MTP drafts. ---
     let drafts_records = run_mtp_draft_chain(
@@ -581,8 +568,8 @@ where
     }
 
     // --- 4. Run the batched closure once. ---
-    let predictions = base_step_batched(&verify_inputs)
-        .context("speculative_batched: batched verify closure")?;
+    let predictions =
+        base_step_batched(&verify_inputs).context("speculative_batched: batched verify closure")?;
     if predictions.len() != num_drafts + 1 {
         anyhow::bail!(
             "speculative_batched: closure returned {} predictions for \
@@ -669,10 +656,7 @@ mod tests {
         // Drafts: [12, 689, 12]. Base predicts [12, 689, 999, ...].
         // First two match, third rejects. Accepted = [12, 689];
         // corrected = 999.
-        let r = accept_prefix_greedy(
-            &[12, 689, 12],
-            &[12, 689, 999, 0],
-        );
+        let r = accept_prefix_greedy(&[12, 689, 12], &[12, 689, 999, 0]);
         assert_eq!(r.accepted_drafts, vec![12, 689]);
         assert_eq!(r.corrected_token, 999);
         assert_eq!(r.n_emit(), 3);
@@ -683,10 +667,7 @@ mod tests {
     fn all_drafts_accepted_emits_bonus() {
         // Drafts: [a, b, c]. Base predicts [a, b, c, d] — full
         // agreement, bonus = d. Total emit = K+1 = 4.
-        let r = accept_prefix_greedy(
-            &[1, 2, 3],
-            &[1, 2, 3, 4],
-        );
+        let r = accept_prefix_greedy(&[1, 2, 3], &[1, 2, 3, 4]);
         assert_eq!(r.accepted_drafts, vec![1, 2, 3]);
         assert_eq!(r.corrected_token, 4);
         assert_eq!(r.n_emit(), 4);
@@ -710,10 +691,7 @@ mod tests {
         // Driver stopped after computing the first mismatching
         // prediction (i=2). base_predictions has exactly 3 entries
         // — drafts[0..2] matched, drafts[2] rejected.
-        let r = accept_prefix_greedy_partial(
-            &[12, 689, 12],
-            &[12, 689, 999],
-        );
+        let r = accept_prefix_greedy_partial(&[12, 689, 12], &[12, 689, 999]);
         assert_eq!(r.accepted_drafts, vec![12, 689]);
         assert_eq!(r.corrected_token, 999);
     }
@@ -722,10 +700,7 @@ mod tests {
     fn partial_helper_handles_all_accept_with_bonus() {
         // Driver ran through all K drafts with no rejection; supplied
         // base_predictions of length K+1 includes the bonus.
-        let r = accept_prefix_greedy_partial(
-            &[1, 2, 3],
-            &[1, 2, 3, 99],
-        );
+        let r = accept_prefix_greedy_partial(&[1, 2, 3], &[1, 2, 3, 99]);
         assert_eq!(r.accepted_drafts, vec![1, 2, 3]);
         assert_eq!(r.corrected_token, 99);
     }

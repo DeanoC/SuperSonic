@@ -208,29 +208,29 @@ pub struct LayerBuffers {
 /// 17 GiB INT4 base bake on a 24 GiB 7900 XTX.
 pub struct MtpLayerBuffers {
     /// Fusion linears + norms (top-level `mtp.*` tensors).
-    pub pre_fc_norm_hidden_w: GpuBuffer,    // [hidden]
+    pub pre_fc_norm_hidden_w: GpuBuffer, // [hidden]
     pub pre_fc_norm_embedding_w: GpuBuffer, // [hidden]
     pub fc_w: GpuBuffer,                    // [hidden, 2*hidden]
     pub norm_w: GpuBuffer,                  // [hidden]
 
     /// Single-layer full-attn block (`mtp.layers.0.*`).
-    pub input_norm_w: GpuBuffer,            // [hidden]
-    pub post_attn_norm_w: GpuBuffer,        // [hidden]
-    pub q_proj_w: GpuBuffer,                // [2*H*d, hidden]
-    pub k_proj_w: GpuBuffer,                // [Hkv*d, hidden]
-    pub v_proj_w: GpuBuffer,                // [Hkv*d, hidden]
-    pub o_proj_w: GpuBuffer,                // [hidden, H*d]
-    pub q_norm_w: GpuBuffer,                // [head_dim]
-    pub k_norm_w: GpuBuffer,                // [head_dim]
+    pub input_norm_w: GpuBuffer, // [hidden]
+    pub post_attn_norm_w: GpuBuffer, // [hidden]
+    pub q_proj_w: GpuBuffer,         // [2*H*d, hidden]
+    pub k_proj_w: GpuBuffer,         // [Hkv*d, hidden]
+    pub v_proj_w: GpuBuffer,         // [Hkv*d, hidden]
+    pub o_proj_w: GpuBuffer,         // [hidden, H*d]
+    pub q_norm_w: GpuBuffer,         // [head_dim]
+    pub k_norm_w: GpuBuffer,         // [head_dim]
 
     /// MoE FFN sub-block (`mtp.layers.0.mlp.*`).
-    pub gate_w: GpuBuffer,                  // [num_experts, hidden]
-    pub gate_up_proj_w: GpuBuffer,          // [num_experts, 2*I, hidden]
-    pub down_proj_w: GpuBuffer,             // [num_experts, hidden, I]
-    pub shared_gate_proj_w: GpuBuffer,      // [Is, hidden]
-    pub shared_up_proj_w: GpuBuffer,        // [Is, hidden]
-    pub shared_down_proj_w: GpuBuffer,      // [hidden, Is]
-    pub shared_expert_gate_w: GpuBuffer,    // [1, hidden]
+    pub gate_w: GpuBuffer, // [num_experts, hidden]
+    pub gate_up_proj_w: GpuBuffer,       // [num_experts, 2*I, hidden]
+    pub down_proj_w: GpuBuffer,          // [num_experts, hidden, I]
+    pub shared_gate_proj_w: GpuBuffer,   // [Is, hidden]
+    pub shared_up_proj_w: GpuBuffer,     // [Is, hidden]
+    pub shared_down_proj_w: GpuBuffer,   // [hidden, Is]
+    pub shared_expert_gate_w: GpuBuffer, // [1, hidden]
 
     /// Per-step KV cache for the MTP layer's self-attention. Separate
     /// from the base layers' KV caches per the vLLM reference (each
@@ -451,7 +451,11 @@ pub fn run_chained_decode(
     position: i32,
 ) -> Result<DecodeOutputs> {
     run_chained_decode_with_options(
-        ordinal, geom, layers, initial_hidden_bytes, position,
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
         ChainedDecodeOptions {
             // Existing behaviour: parity tests rely on `per_layer_*` —
             // they call this entry point directly. The fast engine path
@@ -487,7 +491,11 @@ pub fn run_chained_decode_fast(
     let mut options = ChainedDecodeOptions::from_env();
     options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_with_options(
-        ordinal, geom, layers, initial_hidden_bytes, position,
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
         options,
     )
 }
@@ -520,13 +528,9 @@ pub fn run_chained_decode_with_options(
     // them by `front` so the buffer the kernel reads is well-defined for
     // every launch; alternating `front = 1 - front` after each launch puts
     // the just-written buffer into "input" position for the next call.
-    let mut hidden_a = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[hidden],
-        initial_hidden_bytes,
-    )
-    .context("alloc hidden_a")?;
+    let mut hidden_a =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[hidden], initial_hidden_bytes)
+            .context("alloc hidden_a")?;
     let mut hidden_b =
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden]).context("alloc hidden_b")?;
 
@@ -551,7 +555,8 @@ pub fn run_chained_decode_with_options(
     };
 
     // Shared attention scratch: sized for the larger of (full, linear).
-    let attn_ws_floats = full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom)) + attn_extra;
+    let attn_ws_floats =
+        full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom)) + attn_extra;
     let attn_out_elems = full_attn_output_elems(geom).max(linear_attn_output_elems(geom));
     let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
         .context("alloc attn_output")?;
@@ -561,11 +566,11 @@ pub fn run_chained_decode_with_options(
     // Shared FFN scratch.
     let mut ffn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_output_elems(geom)])
         .context("alloc ffn_output")?;
-    let mut ffn_output_idx =
-        GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
-            .context("alloc ffn_output_idx")?;
-    let mut ffn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
-        .context("alloc ffn_workspace")?;
+    let mut ffn_output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
+        .context("alloc ffn_output_idx")?;
+    let mut ffn_workspace =
+        GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+            .context("alloc ffn_workspace")?;
 
     let mut sync_buf =
         GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc sync_buf")?;
@@ -589,7 +594,10 @@ pub fn run_chained_decode_with_options(
     let capture = options.capture_per_layer || trace_norms;
     if trace_norms {
         let init_norm = bf16_bytes_to_f32(initial_hidden_bytes)
-            .iter().map(|x| x * x).sum::<f32>().sqrt();
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
         eprintln!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
     }
 
@@ -657,13 +665,29 @@ pub fn run_chained_decode_with_options(
                         Qwen36MoeAttnStepInt4 {
                             group_size: s.group_size,
                             q_proj_scale: s.q_proj_scale.as_ptr(),
-                            q_proj_zero: if fp8 { ptr::null() } else { s.q_proj_zero.as_ptr() },
+                            q_proj_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.q_proj_zero.as_ptr()
+                            },
                             k_proj_scale: s.k_proj_scale.as_ptr(),
-                            k_proj_zero: if fp8 { ptr::null() } else { s.k_proj_zero.as_ptr() },
+                            k_proj_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.k_proj_zero.as_ptr()
+                            },
                             v_proj_scale: s.v_proj_scale.as_ptr(),
-                            v_proj_zero: if fp8 { ptr::null() } else { s.v_proj_zero.as_ptr() },
+                            v_proj_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.v_proj_zero.as_ptr()
+                            },
                             o_proj_scale: s.o_proj_scale.as_ptr(),
-                            o_proj_zero: if fp8 { ptr::null() } else { s.o_proj_zero.as_ptr() },
+                            o_proj_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.o_proj_zero.as_ptr()
+                            },
                         }
                     }
                     None => Qwen36MoeAttnStepInt4::disabled(),
@@ -737,11 +761,23 @@ pub fn run_chained_decode_with_options(
                         Qwen36MoeLinearStepInt4 {
                             group_size: s.group_size,
                             in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
-                            in_proj_qkv_zero: if fp8 { ptr::null() } else { s.in_proj_qkv_zero.as_ptr() },
+                            in_proj_qkv_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.in_proj_qkv_zero.as_ptr()
+                            },
                             in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
-                            in_proj_z_zero: if fp8 { ptr::null() } else { s.in_proj_z_zero.as_ptr() },
+                            in_proj_z_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.in_proj_z_zero.as_ptr()
+                            },
                             out_proj_scale: s.out_proj_scale.as_ptr(),
-                            out_proj_zero: if fp8 { ptr::null() } else { s.out_proj_zero.as_ptr() },
+                            out_proj_zero: if fp8 {
+                                ptr::null()
+                            } else {
+                                s.out_proj_zero.as_ptr()
+                            },
                         }
                     }
                     None => Qwen36MoeLinearStepInt4::disabled(),
@@ -788,9 +824,15 @@ pub fn run_chained_decode_with_options(
                 let v = bf16_bytes_to_f32(&attn_out_bytes);
                 let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let nan = v.iter().any(|x| !x.is_finite());
-                let kind = if matches!(layer.attn, AttnLayerBuffers::Full { .. }) { "full" } else { "lin " };
-                eprintln!("[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
-                    if nan { " NaN!" } else { "" });
+                let kind = if matches!(layer.attn, AttnLayerBuffers::Full { .. }) {
+                    "full"
+                } else {
+                    "lin "
+                };
+                eprintln!(
+                    "[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
+                    if nan { " NaN!" } else { "" }
+                );
             }
             per_layer_attn_out.push(attn_out_bytes);
         }
@@ -830,15 +872,35 @@ pub fn run_chained_decode_with_options(
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
                     gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
-                    gate_up_proj_zero: if fp8 { ptr::null() } else { s.gate_up_proj_zero.as_ptr() },
+                    gate_up_proj_zero: if fp8 {
+                        ptr::null()
+                    } else {
+                        s.gate_up_proj_zero.as_ptr()
+                    },
                     down_proj_scale: s.down_proj_scale.as_ptr(),
-                    down_proj_zero: if fp8 { ptr::null() } else { s.down_proj_zero.as_ptr() },
+                    down_proj_zero: if fp8 {
+                        ptr::null()
+                    } else {
+                        s.down_proj_zero.as_ptr()
+                    },
                     shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
-                    shared_gate_proj_zero: if fp8 { ptr::null() } else { s.shared_gate_proj_zero.as_ptr() },
+                    shared_gate_proj_zero: if fp8 {
+                        ptr::null()
+                    } else {
+                        s.shared_gate_proj_zero.as_ptr()
+                    },
                     shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
-                    shared_up_proj_zero: if fp8 { ptr::null() } else { s.shared_up_proj_zero.as_ptr() },
+                    shared_up_proj_zero: if fp8 {
+                        ptr::null()
+                    } else {
+                        s.shared_up_proj_zero.as_ptr()
+                    },
                     shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
-                    shared_down_proj_zero: if fp8 { ptr::null() } else { s.shared_down_proj_zero.as_ptr() },
+                    shared_down_proj_zero: if fp8 {
+                        ptr::null()
+                    } else {
+                        s.shared_down_proj_zero.as_ptr()
+                    },
                 }
             }
             None => Qwen36MoeFfnStepInt4::disabled(),
@@ -857,8 +919,7 @@ pub fn run_chained_decode_with_options(
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
         if options.accurate_stage_timings {
-            gpu_hal::sync(ordinal)
-                .context("sync_after_ffn_step (accurate_stage_timings)")?;
+            gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
         }
         t_ffn += t_k.elapsed();
 
@@ -879,8 +940,10 @@ pub fn run_chained_decode_with_options(
                 let v = bf16_bytes_to_f32(&ffn_out_bytes);
                 let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let nan = v.iter().any(|x| !x.is_finite());
-                eprintln!("[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
-                    if nan { " NaN!" } else { "" });
+                eprintln!(
+                    "[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
+                    if nan { " NaN!" } else { "" }
+                );
             }
             per_layer_ffn_out.push(ffn_out_bytes);
         }
@@ -967,7 +1030,11 @@ pub fn host_final_norm_lm_head(
     eps: f32,
 ) -> Vec<u8> {
     assert_eq!(hidden_bytes.len(), hidden * 2, "hidden bytes mismatch");
-    assert_eq!(final_norm_w_bytes.len(), hidden * 2, "norm_w bytes mismatch");
+    assert_eq!(
+        final_norm_w_bytes.len(),
+        hidden * 2,
+        "norm_w bytes mismatch"
+    );
     assert_eq!(
         lm_head_w_bytes.len(),
         vocab * hidden * 2,
@@ -998,7 +1065,11 @@ pub fn host_final_norm_lm_head_f32(
 ) -> Vec<u8> {
     assert_eq!(hidden_bytes.len(), hidden * 2, "hidden bytes mismatch");
     assert_eq!(final_norm_w_f32.len(), hidden, "norm_w f32 len mismatch");
-    assert_eq!(lm_head_w_f32.len(), vocab * hidden, "lm_head f32 len mismatch");
+    assert_eq!(
+        lm_head_w_f32.len(),
+        vocab * hidden,
+        "lm_head f32 len mismatch"
+    );
 
     let h_f32 = bf16_bytes_to_f32(hidden_bytes);
 
@@ -1007,8 +1078,7 @@ pub fn host_final_norm_lm_head_f32(
     // stored weight is a small delta around zero (initialized to zeros
     // in HF — line 810 of modeling_qwen3_5_moe.py) and the effective
     // scale factor is `1 + w`.
-    let mean_sq: f32 =
-        h_f32.iter().map(|&x| x * x).sum::<f32>() / hidden as f32;
+    let mean_sq: f32 = h_f32.iter().map(|&x| x * x).sum::<f32>() / hidden as f32;
     let rsqrt = 1.0 / (mean_sq + eps).sqrt();
     let normed: Vec<f32> = h_f32
         .iter()
@@ -1050,12 +1120,28 @@ pub fn dequant_int4_to_bf16_bytes(
     group_size: usize,
 ) -> Vec<u8> {
     assert_eq!(packed.len(), out_dim * in_dim / 2, "packed size mismatch");
-    assert_eq!(in_dim % group_size, 0, "in_dim must be divisible by group_size");
-    assert_eq!(out_dim % group_size, 0, "out_dim must be divisible by group_size");
+    assert_eq!(
+        in_dim % group_size,
+        0,
+        "in_dim must be divisible by group_size"
+    );
+    assert_eq!(
+        out_dim % group_size,
+        0,
+        "out_dim must be divisible by group_size"
+    );
     let n_row_tiles = out_dim / group_size;
     let n_col_tiles = in_dim / group_size;
-    assert_eq!(scale_bf16.len(), n_row_tiles * n_col_tiles * 2, "scale size mismatch");
-    assert_eq!(zero_bf16.len(), n_row_tiles * n_col_tiles * 2, "zero size mismatch");
+    assert_eq!(
+        scale_bf16.len(),
+        n_row_tiles * n_col_tiles * 2,
+        "scale size mismatch"
+    );
+    assert_eq!(
+        zero_bf16.len(),
+        n_row_tiles * n_col_tiles * 2,
+        "zero size mismatch"
+    );
 
     let scale = bf16_bytes_to_f32(scale_bf16);
     let zero = bf16_bytes_to_f32(zero_bf16);
@@ -1070,7 +1156,11 @@ pub fn dequant_int4_to_bf16_bytes(
             let s = scale[tile_idx];
             let z = zero[tile_idx];
             let byte = packed[row_base + (i / 2)];
-            let nib = if i % 2 == 0 { byte & 0x0F } else { (byte >> 4) & 0x0F };
+            let nib = if i % 2 == 0 {
+                byte & 0x0F
+            } else {
+                (byte >> 4) & 0x0F
+            };
             let q = nib as f32;
             // Single-rounding bf16(q*s - z*s) — matches the kernel's
             // `bf16_round_rne_f32_finite(n*s - zs)`.
@@ -1090,7 +1180,11 @@ pub struct XorshiftRng(u64);
 impl XorshiftRng {
     pub fn new(seed: u64) -> Self {
         // Xorshift requires a non-zero state.
-        Self(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Self(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
     pub fn next_u64(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
@@ -1128,8 +1222,11 @@ pub fn sample_bf16_logits(
     // Top-K: pick the K highest-logit indices, descending. For top_k==0
     // sort the entire vocab (slow but only paid when sampling — vocab≈248K
     // takes ~few ms per token, negligible vs the chained decode).
-    let mut indexed: Vec<(usize, f32)> =
-        logits.iter().enumerate().map(|(i, &v)| (i, v * inv_t)).collect();
+    let mut indexed: Vec<(usize, f32)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| (i, v * inv_t))
+        .collect();
     let k = if top_k == 0 || top_k > indexed.len() {
         indexed.len()
     } else {
@@ -1140,9 +1237,7 @@ pub fn sample_bf16_logits(
         top_k
     };
     indexed.truncate(k);
-    indexed.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    indexed.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // Softmax with max-stabilisation over the kept indices.
     let max_logit = indexed[0].1;

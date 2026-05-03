@@ -440,7 +440,7 @@ fn build_qwen(
                 params.kv_chunk_size,
             ));
 
-    let engine = DecodeEngine::new(
+    let mut engine = DecodeEngine::new(
         weights,
         cfg.device,
         params.proj_buf_floats,
@@ -452,6 +452,7 @@ fn build_qwen(
         1, // batch_size — serial model for v1
     )
     .with_context(|| "build Qwen3.5 DecodeEngine")?;
+    engine.set_decode_context_limit(context_tokens);
 
     Ok((InferenceSession::Qwen(engine), eos_ids))
 }

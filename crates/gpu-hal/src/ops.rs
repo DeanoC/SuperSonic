@@ -120,7 +120,7 @@ pub fn hal_profile_snapshot() -> HalProfileSnapshot {
     snapshot
 }
 
-fn hal_profile_time<T, F>(op: &'static str, bytes: usize, f: F) -> T
+pub(crate) fn hal_profile_time<T, F>(op: &'static str, bytes: usize, f: F) -> T
 where
     F: FnOnce() -> T,
 {
@@ -149,7 +149,7 @@ where
     result
 }
 
-fn with_device_impl<T>(
+pub(crate) fn with_device_impl<T>(
     backend: Backend,
     ordinal: usize,
     f: impl FnOnce() -> Result<T>,
@@ -361,10 +361,7 @@ pub(crate) fn alloc(
                             ));
                         }
                         let host_nn = NonNull::new(host_ptr).ok_or_else(|| {
-                            GpuError::backend(
-                                Backend::Hip,
-                                "hipHostMalloc returned null".into(),
-                            )
+                            GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
                         })?;
                         let mut dev_ptr = std::ptr::null_mut();
                         let status = hipHostGetDevicePointer(&mut dev_ptr, host_ptr, 0);
@@ -454,8 +451,9 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
                 if status != 0 {
                     return Err(backend_error(Backend::Cuda, "cudaHostAlloc", status));
                 }
-                NonNull::new(ptr)
-                    .ok_or_else(|| GpuError::backend(Backend::Cuda, "cudaHostAlloc returned null".into()))
+                NonNull::new(ptr).ok_or_else(|| {
+                    GpuError::backend(Backend::Cuda, "cudaHostAlloc returned null".into())
+                })
             }
             #[cfg(not(supersonic_backend_cuda))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -468,7 +466,9 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
                 if status != 0 {
                     return Err(backend_error(Backend::Hip, "hipHostMalloc", status));
                 }
-                NonNull::new(ptr).ok_or_else(|| GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into()))
+                NonNull::new(ptr).ok_or_else(|| {
+                    GpuError::backend(Backend::Hip, "hipHostMalloc returned null".into())
+                })
             }
             #[cfg(not(supersonic_backend_hip))]
             Err(GpuError::InvalidArg("HIP backend not compiled".into()))
@@ -477,7 +477,9 @@ pub fn alloc_host_pinned(ordinal: usize, len_bytes: usize) -> Result<NonNull<c_v
             let layout = Layout::from_size_align(len_bytes, 64)
                 .map_err(|e| GpuError::InvalidArg(format!("host allocation layout failed: {e}")))?;
             let ptr = unsafe { alloc_zeroed(layout) as *mut c_void };
-            NonNull::new(ptr).ok_or_else(|| GpuError::backend(Backend::Metal, "host allocation returned null".into()))
+            NonNull::new(ptr).ok_or_else(|| {
+                GpuError::backend(Backend::Metal, "host allocation returned null".into())
+            })
         }
     }
 }
@@ -500,10 +502,18 @@ pub fn host_pinned_device_ptr(
                 let mut device_ptr = std::ptr::null_mut();
                 let status = unsafe { cudaHostGetDevicePointer(&mut device_ptr, ptr, 0) };
                 if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cudaHostGetDevicePointer", status));
+                    return Err(backend_error(
+                        Backend::Cuda,
+                        "cudaHostGetDevicePointer",
+                        status,
+                    ));
                 }
-                NonNull::new(device_ptr)
-                    .ok_or_else(|| GpuError::backend(Backend::Cuda, "cudaHostGetDevicePointer returned null".into()))
+                NonNull::new(device_ptr).ok_or_else(|| {
+                    GpuError::backend(
+                        Backend::Cuda,
+                        "cudaHostGetDevicePointer returned null".into(),
+                    )
+                })
             }
             #[cfg(not(supersonic_backend_cuda))]
             Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
@@ -849,7 +859,9 @@ pub fn sync(ordinal: usize) -> Result<()> {
                 return Err(match backend {
                     Backend::Hip => backend_error(Backend::Hip, "hipDeviceSynchronize", status),
                     Backend::Cuda => backend_error(Backend::Cuda, "cudaDeviceSynchronize", status),
-                    Backend::Metal => backend_error(Backend::Metal, "metalDeviceSynchronize", status),
+                    Backend::Metal => {
+                        backend_error(Backend::Metal, "metalDeviceSynchronize", status)
+                    }
                 });
             }
             Ok(())
@@ -1016,7 +1028,11 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                 let mut props = unsafe { std::mem::zeroed::<CudaDeviceProp>() };
                 let status = unsafe { cudaGetDeviceProperties(&mut props, ordinal_i32) };
                 if status != 0 {
-                    return Err(backend_error(Backend::Cuda, "cudaGetDeviceProperties", status));
+                    return Err(backend_error(
+                        Backend::Cuda,
+                        "cudaGetDeviceProperties",
+                        status,
+                    ));
                 }
                 let arch_name = format!("sm{}{}", props.major, props.minor);
                 Ok(DeviceInfo {
@@ -1049,7 +1065,11 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
                     )
                 };
                 if status != 0 {
-                    return Err(backend_error(Backend::Metal, "metalQueryDeviceInfo", status));
+                    return Err(backend_error(
+                        Backend::Metal,
+                        "metalQueryDeviceInfo",
+                        status,
+                    ));
                 }
                 let nul_pos = arch_name
                     .iter()
@@ -1081,7 +1101,11 @@ pub fn query_device_info(backend: Backend, ordinal: usize) -> Result<DeviceInfo>
 fn metal_runtime_compile_smoke() -> Result<()> {
     let status = unsafe { supersonic_metal_compile_shader_smoke() };
     if status != 0 {
-        return Err(backend_error(Backend::Metal, "metalCompileShaderSmoke", status));
+        return Err(backend_error(
+            Backend::Metal,
+            "metalCompileShaderSmoke",
+            status,
+        ));
     }
     Ok(())
 }
@@ -1152,7 +1176,8 @@ mod tests {
     #[test]
     fn metal_rejects_nonzero_ordinal() {
         use_metal_backend();
-        let err = alloc(1, 16, BufferKind::Persistent).expect_err("metal ordinal 1 should be rejected");
+        let err =
+            alloc(1, 16, BufferKind::Persistent).expect_err("metal ordinal 1 should be rejected");
         assert!(
             err.to_string().contains("ordinal 0"),
             "unexpected error: {err}"

@@ -87,8 +87,7 @@ pub fn save_linear_attn_state(
     ordinal: usize,
     layers: &[LayerBuffers],
 ) -> Result<LinearAttnSnapshot> {
-    let mut snap_layers: Vec<Option<LinearAttnLayerSnapshot>> =
-        Vec::with_capacity(layers.len());
+    let mut snap_layers: Vec<Option<LinearAttnLayerSnapshot>> = Vec::with_capacity(layers.len());
     for (idx, layer) in layers.iter().enumerate() {
         match &layer.attn {
             AttnLayerBuffers::Full { .. } => snap_layers.push(None),
@@ -97,22 +96,13 @@ pub fn save_linear_attn_state(
                 recurrent_state,
                 ..
             } => {
-                let conv_shadow = GpuBuffer::zeros(
-                    ordinal,
-                    conv_state.dtype(),
-                    conv_state.shape(),
-                )
-                .with_context(|| {
-                    format!("alloc conv_state shadow for linear layer {idx}")
-                })?;
-                let rec_shadow = GpuBuffer::zeros(
-                    ordinal,
-                    recurrent_state.dtype(),
-                    recurrent_state.shape(),
-                )
-                .with_context(|| {
-                    format!("alloc recurrent_state shadow for linear layer {idx}")
-                })?;
+                let conv_shadow = GpuBuffer::zeros(ordinal, conv_state.dtype(), conv_state.shape())
+                    .with_context(|| format!("alloc conv_state shadow for linear layer {idx}"))?;
+                let rec_shadow =
+                    GpuBuffer::zeros(ordinal, recurrent_state.dtype(), recurrent_state.shape())
+                        .with_context(|| {
+                            format!("alloc recurrent_state shadow for linear layer {idx}")
+                        })?;
                 let mut layer_snap = LinearAttnLayerSnapshot {
                     conv_state: conv_shadow,
                     recurrent_state: rec_shadow,
@@ -195,11 +185,7 @@ pub fn restore_linear_attn_state(
             layers.len()
         );
     }
-    for (idx, (layer, slot)) in layers
-        .iter_mut()
-        .zip(snapshot.layers.iter())
-        .enumerate()
-    {
+    for (idx, (layer, slot)) in layers.iter_mut().zip(snapshot.layers.iter()).enumerate() {
         match (&mut layer.attn, slot) {
             (AttnLayerBuffers::Full { .. }, None) => {}
             (AttnLayerBuffers::Full { .. }, Some(_)) => {
@@ -252,9 +238,7 @@ pub fn restore_linear_attn_state(
                     layer_snap.recurrent_state.as_ptr(),
                     n_rec,
                 )
-                .with_context(|| {
-                    format!("restore recurrent_state for layer {idx}")
-                })?;
+                .with_context(|| format!("restore recurrent_state for layer {idx}"))?;
             }
         }
     }

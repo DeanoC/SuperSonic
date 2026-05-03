@@ -352,8 +352,8 @@ impl CheckpointAccount {
         } else {
             cb(TensorRole::LmHead)
         };
-        let per_layer_norm_bytes = cb(TensorRole::LayerInputNorm)
-            + cb(TensorRole::LayerPostAttnNorm);
+        let per_layer_norm_bytes =
+            cb(TensorRole::LayerInputNorm) + cb(TensorRole::LayerPostAttnNorm);
 
         let full_attn_bytes_per_layer = cb(TensorRole::FullQProj)
             + cb(TensorRole::FullKProj)
@@ -442,7 +442,11 @@ impl CheckpointAccount {
 
         // Full attention projections (Q,K,V,O) quantize. q_norm/k_norm don't.
         let q_dim = config.num_attention_heads as u64 * config.head_dim as u64;
-        let q_proj_out = if config.attn_output_gate { 2 * q_dim } else { q_dim };
+        let q_proj_out = if config.attn_output_gate {
+            2 * q_dim
+        } else {
+            q_dim
+        };
         let kv_dim = config.num_key_value_heads as u64 * config.head_dim as u64;
         let hidden = config.hidden_size as u64;
         let head_dim = config.head_dim as u64;
@@ -479,21 +483,14 @@ impl CheckpointAccount {
         let scalar_gate_raw = 2 * hidden;
         let moe_int = config.moe_intermediate_size as u64;
         let shared_int = config.shared_expert_intermediate_size as u64;
-        let shared_int4 =
-            int4_bytes(shared_int * hidden, shared_int, hidden, group_size) * 2 // gate+up
+        let shared_int4 = int4_bytes(shared_int * hidden, shared_int, hidden, group_size) * 2 // gate+up
             + int4_bytes(hidden * shared_int, hidden, shared_int, group_size); // down
-        // Fused-expert tile dimensions: gate_up_proj is laid out as
-        // [E, 2*moe_int, hidden] which we treat as `E` parallel
-        // [2*moe_int, hidden] tiles for INT4 packing. Same for down_proj.
-        let expert_gate_up = int4_bytes(
-            2 * moe_int * hidden,
-            2 * moe_int,
-            hidden,
-            group_size,
-        );
+                                                                               // Fused-expert tile dimensions: gate_up_proj is laid out as
+                                                                               // [E, 2*moe_int, hidden] which we treat as `E` parallel
+                                                                               // [2*moe_int, hidden] tiles for INT4 packing. Same for down_proj.
+        let expert_gate_up = int4_bytes(2 * moe_int * hidden, 2 * moe_int, hidden, group_size);
         let expert_down = int4_bytes(hidden * moe_int, hidden, moe_int, group_size);
-        let per_layer_expert_int4 =
-            config.num_experts as u64 * (expert_gate_up + expert_down);
+        let per_layer_expert_int4 = config.num_experts as u64 * (expert_gate_up + expert_down);
         total += config.num_hidden_layers as u64
             * (router_raw + scalar_gate_raw + shared_int4 + per_layer_expert_int4);
         total
