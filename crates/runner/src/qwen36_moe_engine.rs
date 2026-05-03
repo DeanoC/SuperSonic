@@ -1418,6 +1418,8 @@ impl MoeSparseTelemetry {
                 "prefetch_misses": after.stats.prefetch_misses.saturating_sub(before.stats.prefetch_misses),
                 "prefetch_page_hits": after.stats.prefetch_page_hits.saturating_sub(before.stats.prefetch_page_hits),
                 "prefetch_page_misses": after.stats.prefetch_page_misses.saturating_sub(before.stats.prefetch_page_misses),
+                "prefetch_skipped": after.stats.prefetch_skipped.saturating_sub(before.stats.prefetch_skipped),
+                "prefetch_skipped_pages": after.stats.prefetch_skipped_pages.saturating_sub(before.stats.prefetch_skipped_pages),
                 "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes.saturating_sub(before.stats.prefetch_uploaded_bytes),
             },
             "resident": {
@@ -1442,6 +1444,8 @@ impl MoeSparseTelemetry {
                 "prefetch_misses": after.stats.prefetch_misses,
                 "prefetch_page_hits": after.stats.prefetch_page_hits,
                 "prefetch_page_misses": after.stats.prefetch_page_misses,
+                "prefetch_skipped": after.stats.prefetch_skipped,
+                "prefetch_skipped_pages": after.stats.prefetch_skipped_pages,
                 "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes,
             }
         }));
@@ -1514,6 +1518,8 @@ impl MoeSparseTelemetry {
                 "prefetch_misses": final_snapshot.stats.prefetch_misses,
                 "prefetch_page_hits": final_snapshot.stats.prefetch_page_hits,
                 "prefetch_page_misses": final_snapshot.stats.prefetch_page_misses,
+                "prefetch_skipped": final_snapshot.stats.prefetch_skipped,
+                "prefetch_skipped_pages": final_snapshot.stats.prefetch_skipped_pages,
                 "prefetch_uploaded_bytes": final_snapshot.stats.prefetch_uploaded_bytes,
                 "route_summary": route_telemetry.map(MoeRouteTelemetry::to_json),
             },
@@ -3597,6 +3603,7 @@ fn decode_text(
                  hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
                  prefetch_requests={} prefetch_hits={} prefetch_misses={} \
                  prefetch_page_hits={} prefetch_page_misses={} \
+                 prefetch_skipped={} prefetch_skipped_pages={} \
                  uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
                  kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
@@ -3616,6 +3623,8 @@ fn decode_text(
                 residency.prefetch_misses,
                 residency.prefetch_page_hits,
                 residency.prefetch_page_misses,
+                residency.prefetch_skipped,
+                residency.prefetch_skipped_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
@@ -3637,7 +3646,8 @@ fn decode_text(
                  page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
                  evicted_slices={} evicted_pages={} prefetch_requests={} \
                  prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
-                 prefetch_page_misses={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 prefetch_page_misses={} prefetch_skipped={} prefetch_skipped_pages={} \
+                 uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
                  total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
                 residency.resident_slices,
@@ -3654,6 +3664,8 @@ fn decode_text(
                 residency.prefetch_misses,
                 residency.prefetch_page_hits,
                 residency.prefetch_page_misses,
+                residency.prefetch_skipped,
+                residency.prefetch_skipped_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
