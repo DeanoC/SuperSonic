@@ -12671,4 +12671,226 @@ impl DecodeEngine {
         }
         Ok(out)
     }
+
+    /// SpecPrefill (arXiv 2502.02789) speculator-side prefill with attention
+    /// export. Runs dense prefill on the first `prompt_len - 1` tokens via
+    /// the engine's own state/weights/rotary, then drives `lookahead_count`
+    /// decode steps with per-layer post-RoPE Q capture, then per
+    /// full-attention layer launches `lookahead_attention_scores` against
+    /// the layer's K cache (truncated to the prompt context, `kv_len =
+    /// prompt_len`).
+    ///
+    /// `lookahead_count` must be >= 1; the typical value is `lookahead +
+    /// 1` (paper N + 1).
+    ///
+    /// Post-conditions:
+    /// - The engine's state has been mutated by the prefill (KV cache for
+    ///   the first prompt_len-1 tokens) and by `lookahead_count` decode
+    ///   steps. Caller must NOT reuse the engine for normal decode without
+    ///   resetting/recreating it.
+    /// - Returned `layer_scores[k]` corresponds to the k-th full-attention
+    ///   layer in source-index ascending order.
+    pub fn prefill_with_lookahead_attention(
+        &mut self,
+        prompt_ids: &[u32],
+        lookahead_count: usize,
+    ) -> Result<prefill_engine::PrefillWithLookaheadResult> {
+        if lookahead_count < 1 {
+            anyhow::bail!(
+                "prefill_with_lookahead_attention: lookahead_count must be >= 1"
+            );
+        }
+        let prompt_len = prompt_ids.len();
+        if prompt_len < 2 {
+            anyhow::bail!(
+                "prefill_with_lookahead_attention: prompt_len ({prompt_len}) must be >= 2 to leave \
+                 at least one prefill token + the last-token decode"
+            );
+        }
+
+        // Phase 1: dense prefill on prompt_ids[..prompt_len - 1].
+        let prefill_ids = &prompt_ids[..prompt_len - 1];
+        let base = prefill_engine::prefill(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prefill_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            false, // trace_layers
+            None,  // debug_linear_layer
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill: {e}"))?;
+
+        // Phase 2: lookahead decode steps with per-layer Q capture.
+        let config = &self.weights.config;
+        let full_layer_idxs: Vec<usize> = (0..config.num_hidden_layers)
+            .filter(|&i| config.is_full_attention(i))
+            .collect();
+        if full_layer_idxs.is_empty() {
+            anyhow::bail!("prefill_with_lookahead_attention: no full-attention layers in the speculator");
+        }
+        let q_heads = config.num_attention_heads;
+        let head_dim = config.head_dim;
+        let kv_heads = config.num_key_value_heads;
+        let q_row_bytes = q_heads * head_dim * ScalarType::BF16.size_in_bytes();
+        let mut per_layer_q_rows: Vec<Vec<Vec<u8>>> =
+            vec![Vec::with_capacity(lookahead_count); full_layer_idxs.len()];
+
+        let mut next_id: u32 = prompt_ids[prompt_len - 1];
+        let mut last_logits = base.logits.clone();
+        for step in 0..lookahead_count {
+            if step > 0 {
+                next_id = greedy_argmax_u32(&last_logits);
+            }
+            let seqlen_offset = prompt_len - 1 + step;
+            let (logits, q_rows) =
+                self.decode_step_with_query_capture(next_id, seqlen_offset, &full_layer_idxs)?;
+            if q_rows.len() != full_layer_idxs.len() {
+                anyhow::bail!(
+                    "decode_step_with_query_capture returned {} q_rows, expected {}",
+                    q_rows.len(),
+                    full_layer_idxs.len()
+                );
+            }
+            for (slot, row) in q_rows.into_iter().enumerate() {
+                if row.len() != q_row_bytes {
+                    anyhow::bail!(
+                        "decode_step_with_query_capture returned {} bytes per Q row, expected {}",
+                        row.len(),
+                        q_row_bytes
+                    );
+                }
+                per_layer_q_rows[slot].push(row);
+            }
+            last_logits = logits;
+        }
+
+        // Phase 3: per-layer lookahead_attention_scores.
+        let scale = 1.0_f32 / (head_dim as f32).sqrt();
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let mut layer_scores: Vec<prefill_engine::LookaheadLayerScores> =
+            Vec::with_capacity(full_layer_idxs.len());
+
+        for (slot, &li) in full_layer_idxs.iter().enumerate() {
+            // Build [lookahead_count, q_heads, head_dim] BF16 Q buffer.
+            let mut q_host: Vec<u8> = Vec::with_capacity(lookahead_count * q_row_bytes);
+            for row in &per_layer_q_rows[slot] {
+                q_host.extend_from_slice(row);
+            }
+            let mut q_buf = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::BF16,
+                &[lookahead_count, q_heads, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("layer {li} q_buf alloc: {e}"))?;
+            gpu_hal::copy_h2d(
+                self.ordinal,
+                q_buf.as_mut_ptr(),
+                q_host.as_ptr() as *const _,
+                q_host.len(),
+            )
+            .map_err(|e| anyhow::anyhow!("layer {li} q_buf h2d: {e}"))?;
+
+            // K cache shape is [1, kv_heads, cap, head_dim] where cap >= prompt_len.
+            // The lookahead_attention_scores kernel expects contiguous
+            // [kv_heads, kv_len, head_dim], so we either alias the cache
+            // directly (when cap == prompt_len) or assemble a contiguous buffer.
+            let cap = self.state.layers[li].kv_capacity();
+            let kv_k_contig;
+            let k_kernel_input: &GpuBuffer =
+                if !self.state.layers[li].has_virtual_kv_cache() && cap == prompt_len {
+                    self.state.layers[li].kv_cache_k.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "layer {li}: kv_cache_k missing after prefill — speculator must have full-attention KV"
+                        )
+                    })?
+                } else {
+                    kv_k_contig = GpuBuffer::zeros(
+                        self.ordinal,
+                        ScalarType::BF16,
+                        &[kv_heads, prompt_len, head_dim],
+                    )
+                    .map_err(|e| anyhow::anyhow!("layer {li} kv_k_contig alloc: {e}"))?;
+                    let cap_stride = cap * head_dim * elem_bytes;
+                    let contig_stride = prompt_len * head_dim * elem_bytes;
+                    let copy_bytes = prompt_len * head_dim * elem_bytes;
+                    for h in 0..kv_heads {
+                        let src_k = self.state.layers[li]
+                            .kv_cache_k_offset_ptr(h * cap_stride)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "layer {li}: kv_cache_k_offset_ptr missing for head {h}"
+                                )
+                            })?;
+                        gpu_hal::copy_d2d(
+                            self.ordinal,
+                            kv_k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
+                            src_k,
+                            copy_bytes,
+                        )
+                        .map_err(|e| anyhow::anyhow!("layer {li} K assemble h={h}: {e}"))?;
+                    }
+                    &kv_k_contig
+                };
+
+            let mut scores = GpuBuffer::zeros(
+                self.ordinal,
+                ScalarType::F32,
+                &[q_heads, lookahead_count, prompt_len],
+            )
+            .map_err(|e| anyhow::anyhow!("layer {li} scores alloc: {e}"))?;
+
+            kernel_ffi::prefill_ffi::lookahead_attention_scores(
+                self.ordinal,
+                ScalarType::BF16,
+                q_heads,
+                kv_heads,
+                lookahead_count,
+                prompt_len,
+                head_dim,
+                scale,
+                &q_buf,
+                k_kernel_input,
+                &mut scores,
+            )?;
+
+            let scores_bytes = scores
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("layer {li} scores d2h: {e}"))?;
+            if scores_bytes.len() != q_heads * lookahead_count * prompt_len * 4 {
+                anyhow::bail!(
+                    "layer {li} scores d2h size {} != expected {}",
+                    scores_bytes.len(),
+                    q_heads * lookahead_count * prompt_len * 4
+                );
+            }
+            let mut host_scores = vec![0.0_f32; q_heads * lookahead_count * prompt_len];
+            for (i, chunk) in scores_bytes.chunks_exact(4).enumerate() {
+                host_scores[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            layer_scores.push(host_scores);
+        }
+
+        Ok(prefill_engine::PrefillWithLookaheadResult {
+            base,
+            layer_scores,
+            lookahead_count,
+        })
+    }
+}
+
+fn greedy_argmax_u32(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+            if v > acc.1 { (i, v) } else { acc }
+        })
+        .0 as u32
 }
