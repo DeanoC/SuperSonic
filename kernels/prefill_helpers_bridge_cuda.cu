@@ -659,9 +659,10 @@ extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
     const void* /*q*/, const void* /*k*/, void* /*scores*/
 ) {
     // SpecPrefill (arXiv 2502.02789) is HIP-first; CUDA wiring lands
-    // alongside the Phase C end-to-end work. Returning a distinct status
-    // so a caller hitting this path on CUDA gets a clear error.
-    return 318;
+    // alongside the Phase C end-to-end work. Returns 321 — deliberately
+    // outside the HIP bridge's lookahead range (316-320) so it can never
+    // be confused with HIP's own "invalid shape" (318) in prefill_helpers_bridge.cpp.
+    return 321;
 }
 
 extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
