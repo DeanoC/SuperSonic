@@ -959,6 +959,7 @@ fn allocation_prop_cuda(ordinal: usize) -> CuMemAllocationProp {
             compression_type: 0,
             gpu_direct_rdma_capable: 0,
             usage: 0,
+            reserved: [0; 4],
         },
     }
 }

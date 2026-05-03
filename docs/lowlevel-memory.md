@@ -7,9 +7,10 @@ the existing allocator.
 
 The first consumer is Qwen3.5 BF16 dense KV in single-sequence mode. When a
 context limit is known and VMM support probes successfully, full-attention K/V
-caches reserve stable virtual addresses for the full context. On the current
-HIP path Qwen uses separate K and V reservations per full-attention layer.
-HIP VMM mappings use a conservative 2 MiB minimum page size even when ROCm
+caches reserve stable virtual addresses for the full context. On HIP and CUDA,
+Qwen uses separate K and V reservations per full-attention layer. CUDA remains
+opt-in with `SUPERSONIC_VMM_KV=1` for this first runtime lane. HIP VMM mappings
+use a conservative 2 MiB minimum page size even when ROCm
 reports a smaller recommended granularity; raw HIP repro tests showed repeated
 sub-2 MiB remap/restore corrupts earlier mappings on gfx1100, while the same
 sequence with 2 MiB mappings survives. The floor can be overridden for
@@ -68,6 +69,7 @@ Current scope:
   at most `N` experts' two routed projections tracked resident at once.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 integration.
 - `SUPERSONIC_VMM_KV=1` requests it and logs if the backend cannot support it.
+  HIP may auto-enable when unset; CUDA requires this explicit opt-in.
 - `SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1` backs virtual KV to host RAM after
   prefill, unmaps the device pages, reports zero resident bytes, then restores
   decode state before decode. By default this uses a compact logical-prefix
@@ -82,16 +84,20 @@ The HAL type also carries explicit `CpuBackup` versus `Discard` backing tags.
 The Qwen3.5 dense KV proof reserves VMM-backed caches and uses compact CPU
 logical backups for the opt-in eviction policy. The lower-level HAL still
 exercises real D2H backup, unmap/release, remap, and H2D restore in focused HIP
-tests.
+and CUDA tests.
 
 ## Validation Snapshot
 
-The branch was validated on HIP/gfx1100 with ROCm VMM support:
+The branch was validated on HIP/gfx1100 with ROCm VMM support. CUDA coverage
+uses the same HAL VMM primitives and the Qwen3.5 ignored smoke test can be run
+on CUDA devices with `SUPERSONIC_VMM_KV=1`:
 
 - Raw HIP VMM repro: repeated sub-2 MiB remap/restore corrupts earlier mappings
   on gfx1100; the same sequence passes with a 2 MiB mapping floor.
 - HAL arena tests:
   `SUPERSONIC_BACKENDS=hip cargo test -p gpu-hal --test vmm_round_trip vmm_arena_ -- --nocapture`
+- CUDA HAL VMM primitive tests:
+  `SUPERSONIC_BACKENDS=cuda cargo test -p gpu-hal --test cuda_vmm_round_trip -- --nocapture`
 - Baked tensor VMM upload test:
   `SUPERSONIC_BACKENDS=hip cargo test -p model-store virtual_arena_loads_baked_weight_and_expert_tensors -- --nocapture`
 - Qwen3.6-MoE sparse residency manager tests:
