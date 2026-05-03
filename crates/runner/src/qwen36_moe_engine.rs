@@ -1349,17 +1349,22 @@ fn load_layer_buffers(
 
             let (k, v, virtual_kv_cache_k, virtual_kv_cache_v, virtual_kv_max_t,
                  kv_scale_k, kv_scale_v) = if vmm_active {
-                // VMM-backed: reserve full logical capacity, map prefix at
-                // kv_chunk_size (configured via the registry; default 256).
-                // Subsequent decode growth maps additional ranges via
-                // `map_range_bytes`.
-                let kv_chunk_size = 256usize; // matches Qwen36MoeKernelParams default
-                let map_prefix_bytes = kv_chunk_size * kv_dim;
+                // VMM-backed: reserve full logical capacity AND map all of
+                // it up front. We don't evict KV-FP8 in v1 (CpuBackup is off
+                // — VirtualBacking::Discard), and the kernel writes K/V at
+                // arbitrary `eff_cache_pos` between 0 and kv_max_t-1, so any
+                // unmapped page would page-fault mid-launch. The benefit of
+                // lazy mapping was VRAM pressure relief — but at typical
+                // sizes (e.g. ~128 MiB per K-cache, 2.56 GiB across 10
+                // full-attn layers for max_t=262144) the savings don't
+                // justify decode-time map_range_bytes calls. Map the full
+                // logical bytes once at construction.
+                let map_full_bytes = kv_max_t * kv_dim;
                 let vk = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
                     ordinal,
                     ScalarType::U8,
                     &[kv_max_t, kv_dim],
-                    map_prefix_bytes,
+                    map_full_bytes,
                     gpu_hal::VirtualBacking::Discard,
                 )
                 .with_context(|| format!("vmm reserve kv_cache_k (layer {layer_idx})"))?;
@@ -1367,7 +1372,7 @@ fn load_layer_buffers(
                     ordinal,
                     ScalarType::U8,
                     &[kv_max_t, kv_dim],
-                    map_prefix_bytes,
+                    map_full_bytes,
                     gpu_hal::VirtualBacking::Discard,
                 )
                 .with_context(|| format!("vmm reserve kv_cache_v (layer {layer_idx})"))?;
@@ -2663,23 +2668,12 @@ fn decode_text(
         let t_chain_step = t1.elapsed();
         position += 1;
 
-        // Advance the KV-FP8 sidecar shadow cursor on the first step that
-        // lands in the persistent path. Sidecar window is forced equal to
-        // kv_max_t in v1 (full sidecar) — once the first position lands,
-        // kv_shadow_start stays at 0 forever. A future windowed-mode kernel
-        // arg would advance this cursor as old positions roll out of the window.
-        if persistent_scratch.is_some() {
-            for layer in layers.iter_mut() {
-                if let AttnLayerBuffers::Full {
-                    kv_cache: Some(c), ..
-                } = &mut layer.attn
-                {
-                    if c.kv_shadow_k.is_some() && c.kv_shadow_start < 0 {
-                        c.kv_shadow_start = 0;
-                    }
-                }
-            }
-        }
+        // (KV-FP8 sidecar shadow cursor is set at desc-build time in
+        // build_layer_descs — see qwen36_moe_persistent_decode.rs. v1
+        // forces the sidecar window equal to kv_max_t, so the cursor
+        // is `0` from step 0 onward and the descs never need re-upload.
+        // A future windowed-mode kernel would need decode-time updates
+        // to the device-side desc; flag for that work then.)
 
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {
