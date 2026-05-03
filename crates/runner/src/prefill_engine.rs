@@ -905,6 +905,7 @@ pub fn prefill(
         debug_linear_layer,
         None,
         None,
+        None,
     )
 }
 
@@ -940,6 +941,7 @@ pub fn prefill_with_taps(
         debug_linear_layer,
         Some(tap_layers),
         None,
+        None,
     )
 }
 
@@ -969,6 +971,7 @@ pub fn prefill_with_target_nll(
         None,
         None,
         Some((score_hidden_start, score_targets)),
+        None,
     )
 }
 
@@ -986,9 +989,37 @@ fn prefill_inner(
     debug_linear_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
     target_nll: Option<(usize, &[u32])>,
+    kept_positions: Option<&[u32]>,  // NEW
 ) -> Result<PrefillResult> {
     let config = &weights.config;
-    let seq_len = prompt_ids.len();
+    let seq_len = if let Some(kept) = kept_positions {
+        if kept.is_empty() {
+            return Err(anyhow::anyhow!(
+                "prefill_inner: kept_positions is empty"
+            ));
+        }
+        let max_pos = *kept.iter().max().unwrap() as usize;
+        if max_pos >= prompt_ids.len() {
+            return Err(anyhow::anyhow!(
+                "prefill_inner: kept_positions max {} out of range (prompt_len={})",
+                max_pos,
+                prompt_ids.len()
+            ));
+        }
+        // Strict ascending uniqueness — the selection layer already
+        // guarantees this; we re-check defensively so future callers
+        // that hand-build kept lists fail loudly on bad input.
+        for w in kept.windows(2) {
+            if w[0] >= w[1] {
+                return Err(anyhow::anyhow!(
+                    "prefill_inner: kept_positions must be strictly ascending"
+                ));
+            }
+        }
+        kept.len()
+    } else {
+        prompt_ids.len()
+    };
     let hidden_dim = config.hidden_size;
 
     // Determine effective chunk size: 0 = no chunking (full seq_len).
@@ -1094,8 +1125,19 @@ fn prefill_inner(
         let is_last_chunk = chunk_start + chunk_len >= seq_len;
         last_chunk_len = chunk_len;
 
-        // Upload token IDs for this chunk
-        let chunk_ids = &prompt_ids[chunk_start..chunk_start + chunk_len];
+        // Upload token IDs for this chunk. When `kept_positions` is set,
+        // chunk_start/chunk_len index into the compacted kept sequence;
+        // each compacted slot's actual token ID is prompt_ids[kept_positions[slot]].
+        let chunk_ids_storage: Vec<u32>;
+        let chunk_ids: &[u32] = if let Some(kept) = kept_positions {
+            chunk_ids_storage = kept[chunk_start..chunk_start + chunk_len]
+                .iter()
+                .map(|&p| prompt_ids[p as usize])
+                .collect();
+            &chunk_ids_storage
+        } else {
+            &prompt_ids[chunk_start..chunk_start + chunk_len]
+        };
         let id_bytes: Vec<u8> = chunk_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         let token_ids_gpu =
             GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[chunk_len], &id_bytes)
