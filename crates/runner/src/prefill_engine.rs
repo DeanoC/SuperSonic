@@ -975,6 +975,48 @@ pub fn prefill_with_target_nll(
     )
 }
 
+/// SpecPrefill (arXiv 2502.02789) target sparse prefill: like `prefill`,
+/// but consumes a sorted ascending `kept_positions` slice. The compacted
+/// embedding sequence is `prompt_ids[kept_positions[i]] for i in 0..len`,
+/// each token rotates by its ORIGINAL prompt position via the
+/// RoPE-indirect kernel (Phase B), and the lower-triangular causal mask
+/// over the compacted sequence is exactly the right semantics — Phase B
+/// parity tests pin this.
+///
+/// Post-condition: `kv_filled` on every full-attention layer equals
+/// `kept_positions.len()`. The caller's decode-position cursor must
+/// nonetheless start at `prompt_ids.len()` (the original prompt's last
+/// position + 1), NOT `kept_positions.len()`.
+pub fn prefill_kept(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    kept_positions: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+) -> Result<PrefillResult> {
+    prefill_inner(
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        false,                 // trace_layers
+        None,                  // debug_linear_layer
+        None,                  // tap_layers
+        None,                  // target_nll
+        Some(kept_positions),  // kept_positions
+    )
+}
+
 fn prefill_inner(
     weights: &Qwen35Weights,
     state: &mut ModelState,
