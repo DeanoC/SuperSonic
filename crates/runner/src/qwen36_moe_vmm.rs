@@ -1,0 +1,413 @@
+use anyhow::{anyhow, Context, Result};
+use gpu_hal::Backend;
+
+use crate::qwen36_moe_decode::{AttnLayerBuffers, LayerBuffers};
+use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, VirtualKvStats};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoeExpertVmmMode {
+    Auto,
+    Disabled,
+    Force,
+}
+
+impl MoeExpertVmmMode {
+    pub(crate) fn from_env() -> Result<Self> {
+        match std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok().as_deref() {
+            None => Ok(Self::Auto),
+            Some("0") => Ok(Self::Disabled),
+            Some("1") => Ok(Self::Force),
+            Some(other) => Err(anyhow!(
+                "SUPERSONIC_VMM_MOE_ISLANDS must be unset, 0, or 1; got {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen36KvVmmMode {
+    Auto,
+    Disabled,
+    Force,
+}
+
+pub(crate) fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
+    let Some(raw) = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok() else {
+        return Ok(None);
+    };
+    let cap = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={raw:?} as positive integer")
+    })?;
+    if cap == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS must be > 0");
+    }
+    Ok(Some(cap))
+}
+
+pub(crate) fn moe_island_protected_experts_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS={raw:?} as non-negative integer")
+    })?;
+    Ok((value > 0).then_some(value))
+}
+
+pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
+    moe_island_protected_experts_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_prefetch_ranks_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+    top_k: usize,
+) -> Result<usize> {
+    match mode {
+        MoeIslandPrefetchMode::Disabled => {
+            if raw.is_some() {
+                anyhow::bail!(
+                    "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, \
+                     previous-token-resident, or transition"
+                );
+            }
+            Ok(0)
+        }
+        MoeIslandPrefetchMode::PreviousToken
+        | MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        | MoeIslandPrefetchMode::Transition => match raw {
+            None | Some("all") => Ok(top_k),
+            Some(value) => {
+                let ranks = value.parse::<usize>().with_context(|| {
+                    format!(
+                        "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
+                    )
+                })?;
+                if ranks == 0 || ranks > top_k {
+                    anyhow::bail!(
+                        "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
+                    );
+                }
+                Ok(ranks)
+            }
+        },
+    }
+}
+
+pub(crate) fn moe_island_prefetch_ranks_from_env(
+    mode: MoeIslandPrefetchMode,
+    top_k: usize,
+) -> Result<usize> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
+}
+
+pub(crate) fn moe_island_prefetch_transition_min_observations_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+) -> Result<u32> {
+    if !mode.transition_weighted() {
+        if raw.is_some() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS requires \
+                 SUPERSONIC_MOE_ISLAND_PREFETCH=transition"
+            );
+        }
+        return Ok(0);
+    }
+
+    let Some(value) = raw else {
+        return Ok(32);
+    };
+    value.parse::<u32>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS={value:?} as integer")
+    })
+}
+
+pub(crate) fn moe_island_prefetch_transition_min_observations(
+    mode: MoeIslandPrefetchMode,
+) -> Result<u32> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
+}
+
+pub(crate) fn qwen36_kv_vmm_mode_from_env_value(
+    raw: Option<&str>,
+    backend: Backend,
+) -> Result<Qwen36KvVmmMode> {
+    match raw {
+        None if backend == Backend::Hip => Ok(Qwen36KvVmmMode::Auto),
+        None => Ok(Qwen36KvVmmMode::Disabled),
+        Some("0") => Ok(Qwen36KvVmmMode::Disabled),
+        Some("1") => Ok(Qwen36KvVmmMode::Force),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_VMM_KV must be unset, 0, or 1 for Qwen3.6-MoE; got {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Result<bool> {
+    let mode = qwen36_kv_vmm_mode_from_env_value(
+        std::env::var("SUPERSONIC_VMM_KV").ok().as_deref(),
+        backend,
+    )?;
+    let requested = match mode {
+        Qwen36KvVmmMode::Disabled => return Ok(false),
+        Qwen36KvVmmMode::Auto | Qwen36KvVmmMode::Force => true,
+    };
+    if !gpu_hal::vmm_is_supported(backend, ordinal) {
+        if mode == Qwen36KvVmmMode::Force {
+            eprintln!(
+                "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
+                 device {ordinal} does not support VMM; using dense KV buffers"
+            );
+        } else {
+            eprintln!(
+                "[vmm] Qwen3.6-MoE HIP KV VMM auto-enable skipped because backend={backend} \
+                 device {ordinal} does not support VMM; using dense KV buffers"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(requested)
+}
+
+pub(crate) fn should_try_moe_expert_vmm(
+    mode: MoeExpertVmmMode,
+    backend: Backend,
+    has_int4_weights: bool,
+    weight_mode_label: &str,
+    ordinal: usize,
+) -> Result<bool> {
+    if mode == MoeExpertVmmMode::Disabled {
+        return Ok(false);
+    }
+    if !has_int4_weights {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requires Qwen3.6-MoE INT4 weights; got {weight_mode_label}"
+            );
+        }
+        return Ok(false);
+    }
+    let supported = gpu_hal::vmm_is_supported(backend, ordinal);
+    if !supported {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but backend={backend} VMM is unsupported on device {ordinal}"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(crate) fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvStats {
+    let mut out = VirtualKvStats::default();
+    for layer in layers {
+        let AttnLayerBuffers::Full {
+            kv_cache: Some(cache),
+            ..
+        } = &layer.attn
+        else {
+            continue;
+        };
+        let mut layer_has_virtual_kv = false;
+        for buffer in [
+            cache.virtual_kv_cache_k.as_ref(),
+            cache.virtual_kv_cache_v.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let stats = buffer.stats();
+            out.logical_bytes += stats.logical_bytes;
+            out.reserved_bytes += stats.reserved_bytes;
+            out.resident_bytes += stats.resident_bytes;
+            out.logical_resident_bytes += stats.logical_resident_bytes;
+            out.mappings += stats.mapping_count;
+            layer_has_virtual_kv = true;
+        }
+        if layer_has_virtual_kv {
+            out.layers += 1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        moe_island_prefetch_ranks_from_env_value,
+        moe_island_prefetch_transition_min_observations_from_env_value,
+        moe_island_protected_experts_from_env_value, qwen36_kv_vmm_mode_from_env_value,
+        Qwen36KvVmmMode,
+    };
+    use crate::qwen36_moe_telemetry::MoeIslandPrefetchMode;
+    use gpu_hal::Backend;
+
+    #[test]
+    fn qwen36_kv_vmm_defaults_to_auto_on_hip_only() {
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Hip).unwrap(),
+            Qwen36KvVmmMode::Auto
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Cuda).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Metal).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+    }
+
+    #[test]
+    fn qwen36_kv_vmm_env_override_is_explicit() {
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(Some("0"), Backend::Hip).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(Some("1"), Backend::Cuda).unwrap(),
+            Qwen36KvVmmMode::Force
+        );
+        assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("all"),
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_accept_rank_limited_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("1"),
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
+                8,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("2"),
+                MoeIslandPrefetchMode::Transition,
+                8,
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_reject_disabled_or_out_of_range_values() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(None, MoeIslandPrefetchMode::Disabled, 8)
+                .unwrap(),
+            0
+        );
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("1"),
+            MoeIslandPrefetchMode::Disabled,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("0"),
+            MoeIslandPrefetchMode::PreviousToken,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("9"),
+            MoeIslandPrefetchMode::Transition,
+            8,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn moe_protected_experts_env_accepts_unset_zero_and_positive_values() {
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("64")).unwrap(),
+            Some(64)
+        );
+        assert!(moe_island_protected_experts_from_env_value(Some("bad")).is_err());
+    }
+
+    #[test]
+    fn moe_transition_min_observations_defaults_only_for_transition_mode() {
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .is_err()
+        );
+    }
+}
