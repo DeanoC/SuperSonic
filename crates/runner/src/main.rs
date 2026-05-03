@@ -1102,6 +1102,19 @@ fn main() -> Result<()> {
     }
     // --dflash-* guard already ran before the family dispatch above.
 
+    // --specprefill-* dispatch. Validation already ran in
+    // validate_specprefill_flags; the presence of --specprefill-draft-dir
+    // is the gate that switches to the SpecPrefill orchestrator.
+    if cli.specprefill_draft_dir.is_some() {
+        return specprefill_engine::run_specprefill(
+            &cli,
+            &model_variant,
+            entry,
+            ordinal,
+            total_vram,
+        );
+    }
+
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => p,
         FamilyParams::Qwen36Moe(_) => unreachable!("qwen3.6-moe handled above"),
@@ -1481,6 +1494,19 @@ fn main() -> Result<()> {
             first,
         )
     };
+
+    if cli.dump_last_logits {
+        use std::io::Write as _;
+        print!("\nLAST_LOGITS: ");
+        for (i, x) in prefill_logits.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!("{}", x);
+        }
+        println!();
+        std::io::stdout().flush().ok();
+    }
 
     let virtual_kv_stats = engine.virtual_kv_memory_stats();
     if virtual_kv_stats.layers > 0 {
