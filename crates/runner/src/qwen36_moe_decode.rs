@@ -565,6 +565,34 @@ pub fn run_chained_decode_fast(
     )
 }
 
+pub type ExpertPrefetchCallback<'a> = dyn FnMut(usize, &[usize]) -> Result<()> + 'a;
+
+/// Production chained decode with a host-side hook between router top-k and
+/// routed expert GEMVs. The hook is intended for sparse VMM MoE residency:
+/// stage 1 computes top-k indices, the callback pins those expert slices, and
+/// the normal stage-5 FFN launch then consumes the same stable expert pointers.
+pub fn run_chained_decode_fast_with_expert_prefetch(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    accurate_stage_timings: bool,
+    expert_prefetch: &mut ExpertPrefetchCallback<'_>,
+) -> Result<DecodeOutputs> {
+    let mut options = ChainedDecodeOptions::from_env();
+    options.accurate_stage_timings = accurate_stage_timings;
+    run_chained_decode_impl(
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
+        options,
+        Some(expert_prefetch),
+    )
+}
+
 pub fn run_chained_decode_with_options(
     ordinal: usize,
     geom: &MultiLayerGeom,
@@ -572,6 +600,26 @@ pub fn run_chained_decode_with_options(
     initial_hidden_bytes: &[u8],
     position: i32,
     options: ChainedDecodeOptions,
+) -> Result<DecodeOutputs> {
+    run_chained_decode_impl(
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
+        options,
+        None,
+    )
+}
+
+fn run_chained_decode_impl(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    options: ChainedDecodeOptions,
+    mut expert_prefetch: Option<&mut ExpertPrefetchCallback<'_>>,
 ) -> Result<DecodeOutputs> {
     let hidden = geom.hidden as usize;
     if initial_hidden_bytes.len() != hidden * 2 {
@@ -911,7 +959,7 @@ pub fn run_chained_decode_with_options(
         };
 
         let ffn = &layer.ffn;
-        let params = Qwen36MoeFfnStepParams {
+        let params_stage5 = Qwen36MoeFfnStepParams {
             stage: 5,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
@@ -970,11 +1018,42 @@ pub fn run_chained_decode_with_options(
             }
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
+        if let Some(prefetch) = expert_prefetch.as_mut() {
+            let params_stage1 = Qwen36MoeFfnStepParams {
+                stage: 1,
+                ..params_stage5
+            };
+            let t_router = std::time::Instant::now();
+            ffn_step_launch(
+                ordinal,
+                ScalarType::BF16,
+                params_stage1,
+                &ffn_weights,
+                &ffn_int4_ptrs,
+                &mut ffn_output,
+                &mut ffn_output_idx,
+                &mut ffn_workspace,
+                &mut sync_buf,
+            )
+            .with_context(|| format!("ffn_step_launch router prefetch (layer {layer_idx})"))?;
+            if options.accurate_stage_timings {
+                gpu_hal::sync(ordinal)
+                    .context("sync_after_ffn_router_prefetch (accurate_stage_timings)")?;
+            }
+            t_ffn += t_router.elapsed();
+
+            let topk = download_topk_indices(&ffn_output_idx, geom.top_k as usize)
+                .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
+            prefetch(layer_idx, &topk)
+                .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
+            reset_sync_buf(ordinal, &mut sync_buf)
+                .context("reset sync_buf (ffn after prefetch)")?;
+        }
         let t_k = std::time::Instant::now();
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
-            params,
+            params_stage5,
             &ffn_weights,
             &ffn_int4_ptrs,
             &mut ffn_output,
@@ -1026,6 +1105,24 @@ pub fn run_chained_decode_with_options(
         kernel_linear_attn_us: t_linear_attn.as_micros() as u64,
         kernel_ffn_us: t_ffn.as_micros() as u64,
     })
+}
+
+fn download_topk_indices(buf: &GpuBuffer, top_k: usize) -> Result<Vec<usize>> {
+    let bytes = buf.to_host_bytes().context("d2h top-k indices")?;
+    let needed = top_k * std::mem::size_of::<u32>();
+    if bytes.len() < needed {
+        return Err(anyhow!(
+            "top-k index buffer has {} bytes, need {needed}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes[..needed]
+        .chunks_exact(4)
+        .map(|chunk| {
+            let raw = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            raw as usize
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
