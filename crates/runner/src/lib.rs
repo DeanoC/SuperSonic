@@ -23,4 +23,5 @@ pub mod qwen36_moe_residency;
 pub mod qwen36_moe_speculative;
 pub mod qwen36_moe_state;
 pub mod registry;
+pub mod specprefill;
 pub mod validate;
