@@ -186,6 +186,7 @@ __global__ void pfx_lookahead_attention_scores_kernel(
     const int q_head = row_idx / lookahead_count;
     if (q_head >= q_heads) return;
     const int kv_head = q_head / num_kv_groups;
+    if (kv_head >= kv_heads) return;
 
     // q layout: [lookahead_count, q_heads, head_dim]
     const T* q_ptr = q + (static_cast<size_t>(q_row) * q_heads + q_head) * head_dim;
@@ -206,15 +207,7 @@ __global__ void pfx_lookahead_attention_scores_kernel(
         for (int d = lane; d < head_dim; d += warpSize) {
             partial += pfx_to_float(q_ptr[d]) * pfx_to_float(k_row[d]);
         }
-        // Warp-reduction (existing supersonic_qwen35_wave_sum lives in
-        // full_attention.hip; we keep prefill_helpers.hip self-contained
-        // by inlining the reduction here.)
-        partial += __shfl_xor(partial, 16);
-        partial += __shfl_xor(partial, 8);
-        partial += __shfl_xor(partial, 4);
-        partial += __shfl_xor(partial, 2);
-        partial += __shfl_xor(partial, 1);
-        const float score = partial * scale;
+        const float score = pfx_wave_sum(partial) * scale;
         if (lane == 0) {
             lds[k_pos] = score;
             if (score > shared_max) shared_max = score;
