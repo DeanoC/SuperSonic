@@ -145,14 +145,19 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
         "supersonic-qwen36-moe-sparse-vmm-telemetry-v1"
     );
     let summary = &json["summary"];
-    let max_slices = (cap_experts * 2) as u64;
+    let max_pages = (cap_experts * 2) as u64;
     assert!(
-        summary["peak_resident_slices"].as_u64().unwrap() <= max_slices,
-        "peak slices exceeded sparse cap: {summary:?}"
+        summary["peak_resident_pages"].as_u64().unwrap() <= max_pages,
+        "peak pages exceeded sparse cap: {summary:?}"
     );
     assert!(
-        summary["final_resident_slices"].as_u64().unwrap() <= max_slices,
-        "final slices exceeded sparse cap: {summary:?}"
+        summary["final_resident_pages"].as_u64().unwrap() <= max_pages,
+        "final pages exceeded sparse cap: {summary:?}"
+    );
+    assert!(
+        summary["peak_page_backed_slices"].as_u64().unwrap()
+            >= summary["peak_resident_slices"].as_u64().unwrap(),
+        "page-backed slice telemetry should cover requested resident slices: {summary:?}"
     );
     assert!(
         summary["peak_resident_bytes"].as_u64().unwrap()
@@ -162,6 +167,10 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
     assert!(
         summary["misses"].as_u64().unwrap() > 0 && summary["uploaded_bytes"].as_u64().unwrap() > 0,
         "sparse run did not exercise uploads/misses: {summary:?}"
+    );
+    assert!(
+        summary["page_misses"].as_u64().unwrap() > 0,
+        "sparse run did not exercise page uploads: {summary:?}"
     );
     assert!(
         json["steps"].as_array().unwrap().len() >= 2,

@@ -3,9 +3,9 @@
 //! The decode descriptors need stable base pointers for the fused
 //! `experts.gate_up_proj` and `experts.down_proj` tensors. This manager
 //! reserves those full virtual address ranges up front, but only uploads and
-//! maps the expert slices that are explicitly pinned resident.
+//! maps the expert pages that are explicitly pinned resident.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
@@ -29,22 +29,21 @@ pub struct MoeExpertKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeExpertResidencyConfig {
-    /// Maximum number of logical expert slices marked resident at once.
+    /// Maximum number of VMM backing pages resident at once.
     ///
-    /// HIP maps at the VMM page granularity, so resident physical bytes can be
-    /// wider than this logical count implies. The policy tracks the logical
-    /// slices because the router naturally speaks in `(layer, expert)` terms.
-    pub max_resident_slices: usize,
+    /// The environment knob is still expressed in experts because the router
+    /// naturally speaks in `(layer, expert)` terms, but physical residency is
+    /// page-granular on HIP/CUDA. The engine converts that expert cap into this
+    /// page budget conservatively.
+    pub max_resident_pages: usize,
 }
 
 impl MoeExpertResidencyConfig {
-    pub fn new(max_resident_slices: usize) -> Result<Self> {
-        if max_resident_slices == 0 {
-            return Err(anyhow!("max_resident_slices must be > 0"));
+    pub fn new(max_resident_pages: usize) -> Result<Self> {
+        if max_resident_pages == 0 {
+            return Err(anyhow!("max_resident_pages must be > 0"));
         }
-        Ok(Self {
-            max_resident_slices,
-        })
+        Ok(Self { max_resident_pages })
     }
 }
 
@@ -52,9 +51,14 @@ impl MoeExpertResidencyConfig {
 pub struct MoeExpertResidencyStats {
     pub registered_tensors: usize,
     pub resident_slices: usize,
+    pub resident_pages: usize,
+    pub page_backed_slices: usize,
     pub hits: u64,
     pub misses: u64,
+    pub page_hits: u64,
+    pub page_misses: u64,
     pub evicted_slices: u64,
+    pub evicted_pages: u64,
     pub uploaded_bytes: usize,
     pub unmapped_bytes: usize,
 }
@@ -87,11 +91,29 @@ struct ExpertTensor {
 #[derive(Debug, Clone)]
 struct ResidentSlice {
     tensor_idx: usize,
-    logical_offset: usize,
-    logical_len: usize,
+    page_offset: usize,
+    page_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ResidentPageKey {
+    tensor_idx: usize,
+    page_offset: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ResidentPage {
+    tensor_idx: usize,
     page_offset: usize,
     page_len: usize,
     last_used: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PageSpan {
+    offset: usize,
+    len: usize,
+    copy_len: usize,
 }
 
 pub struct MoeExpertResidencyManager {
@@ -100,10 +122,14 @@ pub struct MoeExpertResidencyManager {
     tensors: Vec<ExpertTensor>,
     tensor_by_layer_projection: HashMap<(usize, MoeExpertProjection), usize>,
     resident: HashMap<MoeExpertKey, ResidentSlice>,
+    resident_pages: HashMap<ResidentPageKey, ResidentPage>,
     clock: u64,
     hits: u64,
     misses: u64,
+    page_hits: u64,
+    page_misses: u64,
     evicted_slices: u64,
+    evicted_pages: u64,
     uploaded_bytes: usize,
     unmapped_bytes: usize,
 }
@@ -116,10 +142,14 @@ impl MoeExpertResidencyManager {
             tensors: Vec::new(),
             tensor_by_layer_projection: HashMap::new(),
             resident: HashMap::new(),
+            resident_pages: HashMap::new(),
             clock: 0,
             hits: 0,
             misses: 0,
+            page_hits: 0,
+            page_misses: 0,
             evicted_slices: 0,
+            evicted_pages: 0,
             uploaded_bytes: 0,
             unmapped_bytes: 0,
         }
@@ -138,9 +168,14 @@ impl MoeExpertResidencyManager {
         MoeExpertResidencyStats {
             registered_tensors: self.tensors.len(),
             resident_slices: self.resident.len(),
+            resident_pages: self.resident_pages.len(),
+            page_backed_slices: self.page_backed_slices(),
             hits: self.hits,
             misses: self.misses,
+            page_hits: self.page_hits,
+            page_misses: self.page_misses,
             evicted_slices: self.evicted_slices,
+            evicted_pages: self.evicted_pages,
             uploaded_bytes: self.uploaded_bytes,
             unmapped_bytes: self.unmapped_bytes,
         }
@@ -222,7 +257,7 @@ impl MoeExpertResidencyManager {
 
     pub fn ensure_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
         let tensor_idx = self.tensor_idx(key.layer_idx, key.projection)?;
-        let (name, allocation_id, logical_offset, logical_len, page_offset, page_len, copy_len) = {
+        let (name, allocation_id, logical_offset, logical_len, pages) = {
             let tensor = &self.tensors[tensor_idx];
             if key.expert_idx >= tensor.expert_count {
                 return Err(anyhow!(
@@ -235,96 +270,199 @@ impl MoeExpertResidencyManager {
             }
             let logical_offset = key.expert_idx * tensor.expert_bytes;
             let logical_len = tensor.expert_bytes;
-            let (page_offset, page_len) =
-                page_range(tensor.page_bytes, logical_offset, logical_len);
-            let copy_len = page_len.min(tensor.len_bytes.saturating_sub(page_offset));
+            let pages = page_spans(
+                tensor.page_bytes,
+                logical_offset,
+                logical_len,
+                tensor.len_bytes,
+            );
             (
                 tensor.name.clone(),
                 tensor.allocation_id,
                 logical_offset,
                 logical_len,
-                page_offset,
-                page_len,
-                copy_len,
+                pages,
             )
         };
+        if pages.len() > self.config.max_resident_pages {
+            return Err(anyhow!(
+                "MoE expert slice layer={} expert={} projection={:?} spans {} VMM pages, \
+                 exceeding max_resident_pages={}",
+                key.layer_idx,
+                key.expert_idx,
+                key.projection,
+                pages.len(),
+                self.config.max_resident_pages
+            ));
+        }
+        let slice_page_offset = pages
+            .first()
+            .map(|page| page.offset)
+            .unwrap_or(logical_offset);
+        let slice_page_end = pages
+            .last()
+            .map(|page| page.offset + page.len)
+            .unwrap_or(logical_offset + logical_len);
 
         self.clock += 1;
-        if let Some(entry) = self.resident.get_mut(&key) {
-            entry.last_used = self.clock;
-            self.hits += 1;
-            return Ok(());
+        if self.resident.contains_key(&key) {
+            let all_pages_resident = pages.iter().all(|span| {
+                self.resident_pages.contains_key(&ResidentPageKey {
+                    tensor_idx,
+                    page_offset: span.offset,
+                })
+            });
+            if all_pages_resident {
+                self.hits += 1;
+                for span in &pages {
+                    self.page_hits += 1;
+                    if let Some(page) = self.resident_pages.get_mut(&ResidentPageKey {
+                        tensor_idx,
+                        page_offset: span.offset,
+                    }) {
+                        page.last_used = self.clock;
+                    }
+                }
+                return Ok(());
+            }
+            self.resident.remove(&key);
         }
 
         self.misses += 1;
-        while self.resident.len() >= self.config.max_resident_slices {
-            self.evict_lru_slice()?;
+        let mut missing_pages = Vec::new();
+        for span in &pages {
+            let page_key = ResidentPageKey {
+                tensor_idx,
+                page_offset: span.offset,
+            };
+            if let Some(page) = self.resident_pages.get_mut(&page_key) {
+                page.last_used = self.clock;
+                self.page_hits += 1;
+            } else {
+                missing_pages.push(*span);
+            }
         }
 
-        store
-            .load_range_to_virtual_arena(
-                &mut self.arena,
-                allocation_id,
-                &name,
-                page_offset,
-                copy_len,
-            )
-            .with_context(|| {
-                format!(
-                    "load MoE expert slice layer={} expert={} projection={:?}",
-                    key.layer_idx, key.expert_idx, key.projection
+        self.page_misses += missing_pages.len() as u64;
+        for span in missing_pages {
+            while self.resident_pages.len() >= self.config.max_resident_pages {
+                self.evict_lru_page()?;
+            }
+
+            store
+                .load_range_to_virtual_arena(
+                    &mut self.arena,
+                    allocation_id,
+                    &name,
+                    span.offset,
+                    span.copy_len,
                 )
-            })?;
-        self.uploaded_bytes += copy_len;
+                .with_context(|| {
+                    format!(
+                        "load MoE expert page layer={} expert={} projection={:?} offset={} len={}",
+                        key.layer_idx, key.expert_idx, key.projection, span.offset, span.copy_len
+                    )
+                })?;
+            self.uploaded_bytes += span.copy_len;
+            self.resident_pages.insert(
+                ResidentPageKey {
+                    tensor_idx,
+                    page_offset: span.offset,
+                },
+                ResidentPage {
+                    tensor_idx,
+                    page_offset: span.offset,
+                    page_len: span.len,
+                    last_used: self.clock,
+                },
+            );
+        }
         self.resident.insert(
             key,
             ResidentSlice {
                 tensor_idx,
-                logical_offset,
-                logical_len,
-                page_offset,
-                page_len,
-                last_used: self.clock,
+                page_offset: slice_page_offset,
+                page_len: slice_page_end - slice_page_offset,
             },
         );
         Ok(())
     }
 
-    fn evict_lru_slice(&mut self) -> Result<()> {
-        let Some((victim, entry)) = self
-            .resident
+    fn evict_lru_page(&mut self) -> Result<()> {
+        let Some((victim, page)) = self
+            .resident_pages
             .iter()
-            .min_by_key(|(_, entry)| entry.last_used)
-            .map(|(key, entry)| (*key, entry.clone()))
+            .min_by_key(|(_, page)| page.last_used)
+            .map(|(key, page)| (*key, page.clone()))
         else {
             return Ok(());
         };
 
-        let tensor = &self.tensors[entry.tensor_idx];
+        let tensor = &self.tensors[page.tensor_idx];
         let allocation = self
             .arena
             .allocation_mut(tensor.allocation_id)
             .ok_or_else(|| anyhow!("virtual allocation id {} missing", tensor.allocation_id))?;
         let removed_ranges = allocation
             .buffer_mut()
-            .unmap_range_discard(entry.logical_offset, entry.logical_len)
+            .unmap_range_discard(page.page_offset, page.page_len)
             .with_context(|| {
                 format!(
-                    "evict MoE expert slice layer={} expert={} projection={:?}",
-                    victim.layer_idx, victim.expert_idx, victim.projection
+                    "evict MoE expert page tensor={} offset={} len={}",
+                    tensor.name, page.page_offset, page.page_len
                 )
             })?;
         self.unmapped_bytes += removed_ranges.iter().map(|(_, len)| *len).sum::<usize>();
         if removed_ranges.is_empty() {
-            self.resident.remove(&victim);
-            self.evicted_slices += 1;
+            self.resident_pages.remove(&victim);
+            let removed_slices = self.remove_resident_slices_overlapping(
+                page.tensor_idx,
+                page.page_offset,
+                page.page_offset + page.page_len,
+            );
+            self.evicted_pages += 1;
+            self.evicted_slices += removed_slices as u64;
             return Ok(());
         }
 
+        let removed_pages =
+            self.remove_resident_pages_overlapping(page.tensor_idx, &removed_ranges);
+        let removed_slices =
+            self.remove_resident_slices_overlapping_ranges(page.tensor_idx, &removed_ranges);
+        self.evicted_pages += removed_pages as u64;
+        self.evicted_slices += removed_slices as u64;
+        Ok(())
+    }
+
+    fn remove_resident_pages_overlapping(
+        &mut self,
+        tensor_idx: usize,
+        ranges: &[(usize, usize)],
+    ) -> usize {
+        let before = self.resident_pages.len();
+        self.resident_pages.retain(|_, page| {
+            page.tensor_idx != tensor_idx
+                || !ranges.iter().any(|(offset, len)| {
+                    ranges_overlap(
+                        page.page_offset,
+                        page.page_offset + page.page_len,
+                        *offset,
+                        *offset + *len,
+                    )
+                })
+        });
+        before - self.resident_pages.len()
+    }
+
+    fn remove_resident_slices_overlapping_ranges(
+        &mut self,
+        tensor_idx: usize,
+        ranges: &[(usize, usize)],
+    ) -> usize {
         let before = self.resident.len();
         self.resident.retain(|_, resident| {
-            resident.tensor_idx != entry.tensor_idx
-                || !removed_ranges.iter().any(|(offset, len)| {
+            resident.tensor_idx != tensor_idx
+                || !ranges.iter().any(|(offset, len)| {
                     ranges_overlap(
                         resident.page_offset,
                         resident.page_offset + resident.page_len,
@@ -333,8 +471,26 @@ impl MoeExpertResidencyManager {
                     )
                 })
         });
-        self.evicted_slices += (before - self.resident.len()) as u64;
-        Ok(())
+        before - self.resident.len()
+    }
+
+    fn remove_resident_slices_overlapping(
+        &mut self,
+        tensor_idx: usize,
+        offset: usize,
+        end: usize,
+    ) -> usize {
+        let before = self.resident.len();
+        self.resident.retain(|_, resident| {
+            resident.tensor_idx != tensor_idx
+                || !ranges_overlap(
+                    resident.page_offset,
+                    resident.page_offset + resident.page_len,
+                    offset,
+                    end,
+                )
+        });
+        before - self.resident.len()
     }
 
     fn tensor(&self, layer_idx: usize, projection: MoeExpertProjection) -> Result<&ExpertTensor> {
@@ -349,6 +505,27 @@ impl MoeExpertResidencyManager {
             .ok_or_else(|| {
                 anyhow!("no MoE expert tensor registered for layer {layer_idx} {projection:?}")
             })
+    }
+
+    fn page_backed_slices(&self) -> usize {
+        let mut backed = HashSet::new();
+        for page in self.resident_pages.values() {
+            let tensor = &self.tensors[page.tensor_idx];
+            if tensor.expert_bytes == 0 || page.page_len == 0 {
+                continue;
+            }
+            let page_end = page.page_offset + page.page_len;
+            let first = page.page_offset / tensor.expert_bytes;
+            let last = (page_end - 1) / tensor.expert_bytes;
+            for expert_idx in first..=last.min(tensor.expert_count.saturating_sub(1)) {
+                let offset = expert_idx * tensor.expert_bytes;
+                let end = offset + tensor.expert_bytes;
+                if ranges_overlap(offset, end, page.page_offset, page_end) {
+                    backed.insert((page.tensor_idx, expert_idx));
+                }
+            }
+        }
+        backed.len()
     }
 }
 
@@ -366,11 +543,22 @@ impl ExpertTensor {
     }
 }
 
-fn page_range(page_bytes: usize, offset: usize, len: usize) -> (usize, usize) {
+fn page_spans(page_bytes: usize, offset: usize, len: usize, total_len: usize) -> Vec<PageSpan> {
     let end = offset + len;
-    let page_start = offset / page_bytes * page_bytes;
+    let mut cursor = offset / page_bytes * page_bytes;
     let page_end = end.div_ceil(page_bytes) * page_bytes;
-    (page_start, page_end - page_start)
+    let mut spans = Vec::new();
+    while cursor < page_end {
+        let len = page_bytes.min(page_end - cursor);
+        let copy_len = len.min(total_len.saturating_sub(cursor));
+        spans.push(PageSpan {
+            offset: cursor,
+            len,
+            copy_len,
+        });
+        cursor += len;
+    }
+    spans
 }
 
 fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
@@ -477,9 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn lru_eviction_invalidates_page_overlapping_slices() {
+    fn shared_page_reuses_backing_for_neighbor_slice() {
         with_supported_vmm_backend(
-            "lru_eviction_invalidates_page_overlapping_slices",
+            "shared_page_reuses_backing_for_neighbor_slice",
             |_backend| {
                 let tmp = synthetic_store(4, 4096);
                 let store = BakedStore::open(tmp.path()).expect("open synthetic store");
@@ -508,13 +696,20 @@ mod tests {
                 manager.ensure_resident(&store, e0).expect("load expert 0");
                 assert!(manager.is_resident(e0));
                 assert_eq!(manager.stats().resident_slices, 1);
+                assert_eq!(manager.stats().resident_pages, 1);
+                assert_eq!(manager.stats().page_misses, 1);
 
                 manager.ensure_resident(&store, e1).expect("load expert 1");
-                assert!(!manager.is_resident(e0));
+                assert!(manager.is_resident(e0));
                 assert!(manager.is_resident(e1));
-                assert_eq!(manager.stats().resident_slices, 1);
+                assert_eq!(manager.stats().resident_slices, 2);
+                assert_eq!(manager.stats().resident_pages, 1);
+                assert!(manager.stats().page_backed_slices >= 2);
                 assert_eq!(manager.stats().misses, 2);
-                assert_eq!(manager.stats().evicted_slices, 1);
+                assert_eq!(manager.stats().page_hits, 1);
+                assert_eq!(manager.stats().page_misses, 1);
+                assert_eq!(manager.stats().evicted_pages, 0);
+                assert_eq!(manager.stats().evicted_slices, 0);
 
                 let allocation_id = manager
                     .resident_weight(0, MoeExpertProjection::GateUp)
@@ -531,6 +726,77 @@ mod tests {
                 assert!(bytes.iter().all(|b| *b == 2));
             },
         );
+    }
+
+    #[test]
+    fn lru_eviction_invalidates_whole_pages() {
+        with_supported_vmm_backend("lru_eviction_invalidates_whole_pages", |_backend| {
+            let probe_tmp = synthetic_store(1, 4096);
+            let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+            let mut probe =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            probe
+                .register_tensor(
+                    &probe_store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register probe tensor");
+            let expert_bytes = probe.tensors[0].page_bytes;
+
+            let tmp = synthetic_store(3, expert_bytes);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    3,
+                )
+                .expect("register tensor");
+
+            let e0 = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 0,
+                projection: MoeExpertProjection::GateUp,
+            };
+            let e1 = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 1,
+                projection: MoeExpertProjection::GateUp,
+            };
+
+            manager.ensure_resident(&store, e0).expect("load expert 0");
+            assert!(manager.is_resident(e0));
+            assert_eq!(manager.stats().resident_pages, 1);
+
+            manager.ensure_resident(&store, e1).expect("load expert 1");
+            assert!(!manager.is_resident(e0));
+            assert!(manager.is_resident(e1));
+            assert_eq!(manager.stats().resident_pages, 1);
+            assert_eq!(manager.stats().page_misses, 2);
+            assert!(manager.stats().evicted_pages >= 1);
+            assert!(manager.stats().evicted_slices >= 1);
+
+            let allocation_id = manager
+                .resident_weight(0, MoeExpertProjection::GateUp)
+                .expect("resident weight")
+                .allocation_id()
+                .expect("virtual allocation");
+            let bytes = manager
+                .arena()
+                .allocation(allocation_id)
+                .expect("allocation")
+                .buffer()
+                .to_host_range_bytes(expert_bytes, 4096)
+                .expect("read expert 1");
+            assert!(bytes.iter().all(|b| *b == 2));
+        });
     }
 
     #[test]

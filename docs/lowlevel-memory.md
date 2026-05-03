@@ -40,10 +40,10 @@ Current scope:
   only selected byte ranges are made resident.
 - Qwen3.6-MoE has a sparse routed-expert residency manager in
   `runner::qwen36_moe_residency`. It reserves the fused
-  `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` slabs, pins individual
-  `(layer, expert, projection)` slices from the mmap-backed bake, evicts with a
-  bounded LRU policy, and invalidates every resident slice covered by an
-  unmapped VMM page.
+  `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` slabs, pins the VMM
+  backing pages that contain routed `(layer, expert, projection)` slices from
+  the mmap-backed bake, evicts with a bounded page-LRU policy, and invalidates
+  every logical resident slice covered by an unmapped VMM page.
 - Qwen3.6-MoE sparse expert residency is backend-aware at the VMM policy layer
   and is unit-tested on supported HIP/CUDA VMM backends. Full Qwen3.6-MoE
   decode kernels are still HIP-only; CUDA runtime decode remains blocked before
@@ -52,23 +52,25 @@ Current scope:
   islands for Qwen3.6-MoE INT4 decode. The chained decode path runs FFN stage 1
   first, downloads the `top_k` expert ids, pins those experts' gate/up and down
   slices, then runs the normal stage-5 FFN launch against the stable virtual
-  slab pointers. The cap is expressed in experts and reserves `2*N` logical
-  resident slices because each expert needs both fused projections. Sparse
-  islands copy the full VMM backing page for any touched expert slice, so every
-  expert sharing that resident page contains real bake data rather than zero
-  fill. Sparse islands currently disable the persistent megakernel for that
-  run; persistent router prefetch needs a future split or in-kernel residency
-  protocol.
+  slab pointers. The cap is expressed in experts, but the residency budget is
+  `2*N` VMM pages because each expert may touch both fused projections. Logical
+  slice hit/miss counters still track router demand; page hit/miss counters
+  track physical residency. Sparse islands copy the full VMM backing page for
+  any touched expert slice, so every expert sharing that resident page contains
+  real bake data rather than zero fill. Sparse islands currently disable the
+  persistent megakernel for that run; persistent router prefetch needs a future
+  split or in-kernel residency protocol.
 - `SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON=/path/report.json` records sparse
   MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
-  uploads, evictions, resident slices, resident physical bytes, plus summary
-  peaks. This is intended for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS`
-  against real prompts instead of relying on one-token smoke numbers.
-- On the HIP/gfx1100 validation machine, sparse MoE caps through 312 experts
-  passed the two-token Qwen3.6-MoE smoke, while caps around 316+ reproduced a
-  HIP page-not-present fault after retaining roughly a full token's routed
-  expert working set. Keep validation caps below that high-water mark until the
-  ROCm VMM mapping-limit behavior is isolated further.
+  uploads, evictions, resident slices, resident pages, page-backed slice count,
+  resident physical bytes, plus summary peaks. This is intended for tuning
+  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts instead of relying
+  on one-token smoke numbers.
+- On the HIP/gfx1100 validation machine, page-budgeted sparse MoE passed the
+  two-token Qwen3.6-MoE smoke at the default 256-expert cap, the smallest
+  top-k-sized 8-expert cap, and a 320-expert cap (`640` resident VMM pages).
+  The earlier high-cap page-not-present fault was tied to slice-budgeting more
+  logical residents than the physical VMM page working set could represent.
 - `SUPERSONIC_VMM_WEIGHT_PROBE=1` makes Qwen3.6-MoE dry-run load
   `lm_head.weight` into a virtual `Weights` allocation when an INT4 bake is
   present.
