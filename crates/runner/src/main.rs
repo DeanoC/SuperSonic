@@ -26,6 +26,7 @@ mod qwen36_moe_mtp;
 mod qwen36_moe_mtp_loader;
 mod qwen36_moe_output;
 mod qwen36_moe_persistent_decode;
+mod qwen36_moe_policy;
 mod qwen36_moe_prefetch;
 mod qwen36_moe_prompt;
 mod qwen36_moe_residency;

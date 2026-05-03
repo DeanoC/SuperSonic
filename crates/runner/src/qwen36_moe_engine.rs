@@ -21,9 +21,7 @@ use crate::qwen36_moe_decode::{
     argmax_bf16_logits, run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch,
     sample_bf16_logits, ExpertPrefetchPhase, ExpertRoute, XorshiftRng,
 };
-use crate::qwen36_moe_dry_run::{
-    print_report, run_qwen36_moe_dry_run, ContextSizeSource, DryRunReport,
-};
+use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
@@ -31,6 +29,9 @@ use crate::qwen36_moe_output::{
     dump_final_hidden_if_requested, dump_logits_if_requested, print_decode_stream_start,
     print_decoded_token, print_generation_summary, print_last_logits_if_requested,
     print_sampling_summary,
+};
+use crate::qwen36_moe_policy::{
+    resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_prompt::{
@@ -56,32 +57,8 @@ const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     ensure_qwen36_bake(cli, entry)?;
 
-    // Derive context_size + an honest source flag so the printed report can
-    // tell the user which of three answers they got: explicit, prompt-derived
-    // estimate, or worst-case defaults-only. The `--context-size` path is
-    // verbatim; otherwise we fall back to (prompt char count) + max_new_tokens
-    // when a prompt is given (chars are an upper bound on tokens for
-    // English-ish text), or just max_new_tokens when the user gave neither
-    // flag — that last case undercounts KV bytes for any realistic session,
-    // and the report flags it.
-    let max_new = cli.max_new_tokens.max(1);
-    let (context_size, context_size_source) = if let Some(ctx) = cli.context_size {
-        (ctx, ContextSizeSource::Explicit)
-    } else if !cli.prompt.is_empty() {
-        (
-            cli.prompt.chars().count() + max_new,
-            ContextSizeSource::EstimatedFromPrompt,
-        )
-    } else {
-        (max_new, ContextSizeSource::MaxNewTokensOnly)
-    };
-    if cli.kv_fp8 && cli.no_persistent_decode {
-        anyhow::bail!(
-            "--kv-fp8 for Qwen3.6-35B-A3B requires the persistent megakernel; \
-             remove --no-persistent-decode (persistent is on by default). The \
-             back-compat step kernels stay BF16-KV."
-        );
-    }
+    let (context_size, context_size_source) = resolve_context_size(cli);
+    validate_persistent_kv_fp8_flags(cli)?;
 
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
@@ -99,22 +76,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         return Ok(());
     }
 
-    // The decode kernels (`kernels/qwen36_moe.hip`, the per-block step
-    // launchers in `kernel-ffi`) are HIP-only. The registry currently has
-    // both HIP and CUDA entries for `qwen3.6-35b-a3b` but the CUDA branches
-    // of `attn_step_launch` / `linear_step_launch` / `ffn_step_launch` all
-    // return `InvalidArg("CUDA backend not yet wired")`. Fail here with a
-    // clear message instead of letting the engine commit to HIP buffers
-    // (which would crash later inside the kernel-ffi wrappers when the
-    // registry-selected backend disagrees).
-    if entry.backend != Backend::Hip {
-        anyhow::bail!(
-            "qwen3.6-35b-a3b decode kernels are HIP-only at this stage; \
-             registry-selected backend was {:?}. Re-run with --backend hip, \
-             or use --dry-run for analytic accounting.",
-            entry.backend,
-        );
-    }
+    validate_decode_backend(entry)?;
 
     // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
     // launches in `crate::qwen36_moe_decode::run_chained_decode` against
