@@ -921,7 +921,7 @@ int persistent_decode_fused_input_argmax_device(
     // The decode megakernel uses grid barriers, so keep it resident-sized.
     // The split LM-head tail has no grid barrier and can oversubscribe rows.
     const int argmax_blocks =
-        props.multiProcessorCount > 0 ? props.multiProcessorCount * 4 : 1;
+        props.multiProcessorCount > 0 ? props.multiProcessorCount * 64 : 1;
     constexpr int BLOCK = 256;
     const size_t lds_bytes = (BLOCK + 256) * sizeof(float);
     const size_t norm_lds_bytes = BLOCK * sizeof(float);
