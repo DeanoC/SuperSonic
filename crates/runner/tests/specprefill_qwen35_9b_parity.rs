@@ -1,0 +1,184 @@
+//! End-to-end parity: Qwen3.5-9B sparse SpecPrefill (keep=0.50,
+//! Qwen3.5-0.8B draft) vs the same prompt's dense prefill. Asserts:
+//!  - argmax(last-prefill-step logits) matches.
+//!  - cossim >= 0.90 (Phase A2 measured 0.927 at keep=0.50 on long
+//!    prompts, so 0.90 has ~30% headroom against measured noise).
+//!  - top-5 overlap >= 4/5.
+//!
+//! Skipped silently when:
+//!  - HIP backend not compiled.
+//!  - SUPERSONIC_QWEN35_9B_DIR or SUPERSONIC_QWEN35_0_8B_DIR not set or path missing.
+//!  - SUPERSONIC_SPECPREFILL_PARITY=0.
+//!
+//! Folds in the identity-parity check from the (deferred) Task 10:
+//! at keep_ratio=1.0 the kept-set is [0..T], so the sparse path must
+//! produce cossim near 1.0 (we use the same 0.90 bar -- passing both
+//! 0.50 and 1.0 in the same test catches plumbing bugs that only fire
+//! when kept_positions is set).
+
+use gpu_hal::Backend;
+use std::collections::HashSet;
+use std::process::Command;
+
+fn run_supersonic_capture_logits(args: &[&str]) -> anyhow::Result<Vec<f32>> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
+    cmd.args(args);
+    cmd.arg("--dump-last-logits");
+    let out = cmd.output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "supersonic exited {}: stderr=\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8(out.stdout)?;
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("LAST_LOGITS:"))
+        .ok_or_else(|| anyhow::anyhow!("LAST_LOGITS line not found in stdout"))?;
+    let csv = &line["LAST_LOGITS:".len()..];
+    csv.trim()
+        .split(',')
+        .map(|s| s.trim().parse::<f32>().map_err(Into::into))
+        .collect()
+}
+
+fn cossim(a: &[f32], b: &[f32]) -> f64 {
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
+    let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+            if x > a.1 {
+                (i, x)
+            } else {
+                a
+            }
+        })
+        .0
+}
+
+fn top5(v: &[f32]) -> HashSet<usize> {
+    let mut idx: Vec<(usize, f32)> = v.iter().copied().enumerate().collect();
+    idx.sort_unstable_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx.into_iter().take(5).map(|p| p.0).collect()
+}
+
+fn check_specprefill_env() -> Option<(String, String)> {
+    if !gpu_hal::is_backend_compiled(Backend::Hip) {
+        eprintln!("skipped: HIP backend not compiled");
+        return None;
+    }
+    if std::env::var("SUPERSONIC_SPECPREFILL_PARITY").as_deref() == Ok("0") {
+        eprintln!("skipped: SUPERSONIC_SPECPREFILL_PARITY=0");
+        return None;
+    }
+    let target = match std::env::var("SUPERSONIC_QWEN35_9B_DIR") {
+        Ok(d) if std::path::Path::new(&d).exists() => d,
+        _ => {
+            eprintln!("skipped: SUPERSONIC_QWEN35_9B_DIR unset or missing");
+            return None;
+        }
+    };
+    let draft = match std::env::var("SUPERSONIC_QWEN35_0_8B_DIR") {
+        Ok(d) if std::path::Path::new(&d).exists() => d,
+        _ => {
+            eprintln!("skipped: SUPERSONIC_QWEN35_0_8B_DIR unset or missing");
+            return None;
+        }
+    };
+    Some((target, draft))
+}
+
+fn run_parity_check(target: &str, draft: &str, keep_ratio: &str, expected_label: &str) {
+    let prompt = "The cosine similarity of two parallel decoding streams is";
+    let common: Vec<&str> = vec![
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        target,
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        "1",
+    ];
+
+    let dense_logits = run_supersonic_capture_logits(&common).expect("dense run");
+
+    let mut sparse_args = common.clone();
+    sparse_args.extend_from_slice(&[
+        "--specprefill-draft-dir",
+        draft,
+        "--specprefill-keep-ratio",
+        keep_ratio,
+    ]);
+    let sparse_logits = run_supersonic_capture_logits(&sparse_args).expect("sparse run");
+
+    assert_eq!(
+        dense_logits.len(),
+        sparse_logits.len(),
+        "[{expected_label}] logits length mismatch ({} vs {})",
+        dense_logits.len(),
+        sparse_logits.len()
+    );
+    let dense_argmax = argmax(&dense_logits);
+    let sparse_argmax = argmax(&sparse_logits);
+    let cs = cossim(&dense_logits, &sparse_logits);
+    let dense_top5 = top5(&dense_logits);
+    let sparse_top5 = top5(&sparse_logits);
+    let overlap = dense_top5.intersection(&sparse_top5).count();
+    eprintln!(
+        "[specprefill parity {expected_label}] cossim={:.6} dense_argmax={} sparse_argmax={} top5_overlap={}/5",
+        cs, dense_argmax, sparse_argmax, overlap
+    );
+    assert_eq!(
+        dense_argmax, sparse_argmax,
+        "[{expected_label}] argmax mismatch"
+    );
+    assert!(
+        cs >= 0.90,
+        "[{expected_label}] cossim {cs} < 0.90"
+    );
+    assert!(
+        overlap >= 4,
+        "[{expected_label}] top-5 overlap {overlap} < 4"
+    );
+}
+
+#[test]
+fn specprefill_qwen35_9b_keep_050_parity() {
+    let (target, draft) = match check_specprefill_env() {
+        Some(t) => t,
+        None => return,
+    };
+    run_parity_check(&target, &draft, "0.50", "keep=0.50");
+}
+
+#[test]
+fn specprefill_qwen35_9b_keep_100_identity() {
+    // Folds in the deferred Task 10 identity check -- at keep_ratio=1.0
+    // the kept set is [0..T] so the sparse path goes through identical
+    // RoPE-indirect + compaction logic with all positions kept. Catches
+    // plumbing bugs in Tasks 5-7 that wouldn't surface at keep=0.50.
+    let (target, draft) = match check_specprefill_env() {
+        Some(t) => t,
+        None => return,
+    };
+    run_parity_check(&target, &draft, "1.00", "keep=1.00 (identity)");
+}
