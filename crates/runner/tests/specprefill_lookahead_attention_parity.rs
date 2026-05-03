@@ -66,9 +66,9 @@ fn lookahead_attention_matches_cpu_softmax() {
     let ordinal = 0usize;
     let q_heads = 8usize;
     let kv_heads = 2usize;
-    let head_dim = 32usize;
+    let head_dim = 128usize;
     let lookahead_count = 5usize;
-    let kv_len = 17usize;
+    let kv_len = 65usize;
     let num_kv_groups = q_heads / kv_heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
@@ -136,8 +136,10 @@ fn lookahead_attention_matches_cpu_softmax() {
     let got = d2h_f32(&scores);
     assert_eq!(got.len(), want.len());
 
-    // Per-element max abs error (BF16 inputs imply ~1e-3 of dot-product
-    // noise; we expect << 1e-3 after the softmax averages it out).
+    // Per-element max abs error. 1e-3 is a conservative tolerance: BF16
+    // accumulation noise is ~1e-3 in the raw dot products, but softmax
+    // normalisation compresses this significantly in practice — the
+    // observed max_abs is typically an order of magnitude smaller.
     let mut max_abs = 0.0_f32;
     for (g, w) in got.iter().zip(want.iter()) {
         max_abs = max_abs.max((g - w).abs());
