@@ -54,11 +54,11 @@ pub fn run_specprefill(
 
     // ---- Selection config ----
     let cfg = SelectionConfig {
-        keep_ratio: cli.specprefill_keep_ratio,
-        chunk_size: cli.specprefill_chunk_size,
-        pool_window: cli.specprefill_pool_window,
-        always_keep_prefix: cli.specprefill_always_keep_prefix,
-        always_keep_suffix: cli.specprefill_always_keep_suffix,
+        keep_ratio: cli.specprefill_keep_ratio.unwrap_or(0.50),
+        chunk_size: cli.specprefill_chunk_size.unwrap_or(32),
+        pool_window: cli.specprefill_pool_window.unwrap_or(5),
+        always_keep_prefix: cli.specprefill_always_keep_prefix.unwrap_or(4),
+        always_keep_suffix: cli.specprefill_always_keep_suffix.unwrap_or(4),
     };
 
     // ---- VRAM budget (rough) ----
@@ -110,7 +110,7 @@ pub fn run_specprefill(
     eprintln!("[specprefill] draft weights loaded in {:.0}ms", t0.elapsed().as_millis());
 
     // Build draft decode engine.
-    let lookahead_count = cli.specprefill_lookahead + 1;
+    let lookahead_count = cli.specprefill_lookahead.unwrap_or(4) + 1;
     let draft_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
         draft_text_config.num_attention_heads,
         draft_text_config.head_dim,

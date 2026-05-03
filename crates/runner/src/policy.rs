@@ -87,7 +87,13 @@ pub(crate) fn validate_specprefill_flags(
     model_variant: &ModelVariant,
 ) -> Result<()> {
     let any_specprefill_flag = cli.specprefill_draft_dir.is_some()
-        || cli.specprefill_unload_draft;
+        || cli.specprefill_unload_draft
+        || cli.specprefill_keep_ratio.is_some()
+        || cli.specprefill_chunk_size.is_some()
+        || cli.specprefill_pool_window.is_some()
+        || cli.specprefill_lookahead.is_some()
+        || cli.specprefill_always_keep_prefix.is_some()
+        || cli.specprefill_always_keep_suffix.is_some();
     if cli.specprefill_draft_dir.is_some() {
         if !matches!(model_variant, ModelVariant::Qwen3_5_9B) {
             anyhow::bail!(
@@ -101,23 +107,26 @@ pub(crate) fn validate_specprefill_flags(
         if cli.dflash {
             anyhow::bail!("--specprefill-* and --dflash cannot be combined");
         }
-        if !(0.05..=1.0).contains(&cli.specprefill_keep_ratio) {
-            anyhow::bail!(
-                "--specprefill-keep-ratio must be in [0.05, 1.0] (got {})",
-                cli.specprefill_keep_ratio
-            );
+        if let Some(keep) = cli.specprefill_keep_ratio {
+            if !(0.05..=1.0).contains(&keep) {
+                anyhow::bail!(
+                    "--specprefill-keep-ratio must be in [0.05, 1.0] (got {keep})"
+                );
+            }
         }
-        if cli.specprefill_pool_window % 2 != 1 || cli.specprefill_pool_window == 0 {
-            anyhow::bail!(
-                "--specprefill-pool-window must be odd and > 0 (got {})",
-                cli.specprefill_pool_window
-            );
+        if let Some(window) = cli.specprefill_pool_window {
+            if window % 2 != 1 || window == 0 {
+                anyhow::bail!(
+                    "--specprefill-pool-window must be odd and > 0 (got {window})"
+                );
+            }
         }
-        if cli.specprefill_lookahead < 1 || cli.specprefill_lookahead > 16 {
-            anyhow::bail!(
-                "--specprefill-lookahead must be in [1, 16] (got {})",
-                cli.specprefill_lookahead
-            );
+        if let Some(lookahead) = cli.specprefill_lookahead {
+            if !(1..=16).contains(&lookahead) {
+                anyhow::bail!(
+                    "--specprefill-lookahead must be in [1, 16] (got {lookahead})"
+                );
+            }
         }
     } else if any_specprefill_flag {
         anyhow::bail!(

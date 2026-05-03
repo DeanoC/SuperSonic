@@ -603,31 +603,35 @@ pub(crate) struct Cli {
     /// SpecPrefill keep ratio per chunk: fraction of tokens kept by the
     /// chunked top-K selection. Phase A2 measurements pin 0.50 as the
     /// quality-stable default on Qwen3.5-9B (cossim ≥ 0.927, argmax
-    /// match). Range: [0.05, 1.0].
-    #[arg(long, default_value = "0.50")]
-    specprefill_keep_ratio: f32,
+    /// match). Range: [0.05, 1.0]. Default applied in run_specprefill: 0.50.
+    #[arg(long)]
+    specprefill_keep_ratio: Option<f32>,
 
     /// SpecPrefill chunk size for top-K selection (paper §3.4).
-    #[arg(long, default_value = "32")]
-    specprefill_chunk_size: usize,
+    /// Default applied in run_specprefill: 32.
+    #[arg(long)]
+    specprefill_chunk_size: Option<usize>,
 
     /// SpecPrefill 1-D average-pool window for score smoothing. Must be
-    /// odd. Paper uses 5-10.
-    #[arg(long, default_value = "5")]
-    specprefill_pool_window: usize,
+    /// odd. Paper uses 5-10. Default applied in run_specprefill: 5.
+    #[arg(long)]
+    specprefill_pool_window: Option<usize>,
 
     /// SpecPrefill look-ahead decode steps on the draft (paper §3.3
     /// default 4). Total query rows harvested = lookahead + 1.
-    #[arg(long, default_value = "4")]
-    specprefill_lookahead: usize,
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_lookahead: Option<usize>,
 
     /// SpecPrefill always-keep prefix (BOS + system) length.
-    #[arg(long, default_value = "4")]
-    specprefill_always_keep_prefix: usize,
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_always_keep_prefix: Option<usize>,
 
     /// SpecPrefill always-keep suffix (final query) length.
-    #[arg(long, default_value = "4")]
-    specprefill_always_keep_suffix: usize,
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_always_keep_suffix: Option<usize>,
 
     /// Free the draft weights after selection runs and before the target
     /// prefill, to claw back ~1.6 GiB on a tight 24 GiB budget.
