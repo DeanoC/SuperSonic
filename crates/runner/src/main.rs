@@ -20,6 +20,7 @@ mod qwen36_moe_persistent_decode;
 mod qwen36_moe_residency;
 mod qwen36_moe_speculative;
 mod qwen36_moe_state;
+mod qwen36_moe_telemetry;
 mod registry;
 mod tensor_bytes;
 mod validate;
