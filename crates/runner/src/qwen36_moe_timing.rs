@@ -16,15 +16,15 @@ pub(crate) struct SamplingParams {
 
 #[derive(Default)]
 pub(crate) struct Qwen36StageTimingTotals {
-    pub(crate) gen_steps: usize,
-    pub(crate) embed: Duration,
-    pub(crate) chain: Duration,
-    pub(crate) lm_head: Duration,
-    pub(crate) sample: Duration,
-    pub(crate) detok: Duration,
-    pub(crate) chain_full_attn_us: u64,
-    pub(crate) chain_linear_attn_us: u64,
-    pub(crate) chain_ffn_us: u64,
+    gen_steps: usize,
+    embed: Duration,
+    chain: Duration,
+    lm_head: Duration,
+    sample: Duration,
+    detok: Duration,
+    chain_full_attn_us: u64,
+    chain_linear_attn_us: u64,
+    chain_ffn_us: u64,
 }
 
 impl Qwen36StageTimingTotals {
@@ -67,5 +67,50 @@ impl Qwen36StageTimingTotals {
         self.chain_full_attn_us += outputs.kernel_full_attn_us;
         self.chain_linear_attn_us += outputs.kernel_linear_attn_us;
         self.chain_ffn_us += outputs.kernel_ffn_us;
+    }
+
+    pub(crate) fn print_if_requested(&self, emit_stage_timings: bool) {
+        if !emit_stage_timings || self.gen_steps == 0 {
+            return;
+        }
+
+        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let chain_ms = to_ms(self.chain);
+        let embed_ms = to_ms(self.embed);
+        let lm_head_ms = to_ms(self.lm_head);
+        let sample_ms = to_ms(self.sample);
+        let detok_ms = to_ms(self.detok);
+        let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
+        let n = self.gen_steps as f64;
+        let full_attn_ms = (self.chain_full_attn_us as f64) / 1000.0;
+        let linear_attn_ms = (self.chain_linear_attn_us as f64) / 1000.0;
+        let ffn_ms = (self.chain_ffn_us as f64) / 1000.0;
+        eprintln!(
+            "[qwen36-moe stage-timings] gen_steps={} \
+             embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
+             sample_ms_avg={:.3} detok_ms_avg={:.3} total_ms_avg={:.3} \
+             (chain_total_ms={:.1} lm_head_total_ms={:.1})",
+            self.gen_steps,
+            embed_ms / n,
+            chain_ms / n,
+            lm_head_ms / n,
+            sample_ms / n,
+            detok_ms / n,
+            total_ms / n,
+            chain_ms,
+            lm_head_ms,
+        );
+        eprintln!(
+            "[qwen36-moe chain-breakdown] gen_steps={} \
+             full_attn_ms_avg={:.3} linear_attn_ms_avg={:.3} ffn_ms_avg={:.3} \
+             (full_attn_total_ms={:.1} linear_attn_total_ms={:.1} ffn_total_ms={:.1})",
+            self.gen_steps,
+            full_attn_ms / n,
+            linear_attn_ms / n,
+            ffn_ms / n,
+            full_attn_ms,
+            linear_attn_ms,
+            ffn_ms,
+        );
     }
 }

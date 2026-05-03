@@ -1258,46 +1258,7 @@ fn decode_text(
             );
         }
     }
-    if emit_stage_timings && stage_timings.gen_steps > 0 {
-        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let chain_ms = to_ms(stage_timings.chain);
-        let embed_ms = to_ms(stage_timings.embed);
-        let lm_head_ms = to_ms(stage_timings.lm_head);
-        let sample_ms = to_ms(stage_timings.sample);
-        let detok_ms = to_ms(stage_timings.detok);
-        let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
-        let n = stage_timings.gen_steps as f64;
-        let full_attn_ms = (stage_timings.chain_full_attn_us as f64) / 1000.0;
-        let linear_attn_ms = (stage_timings.chain_linear_attn_us as f64) / 1000.0;
-        let ffn_ms = (stage_timings.chain_ffn_us as f64) / 1000.0;
-        eprintln!(
-            "[qwen36-moe stage-timings] gen_steps={} \
-             embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
-             sample_ms_avg={:.3} detok_ms_avg={:.3} total_ms_avg={:.3} \
-             (chain_total_ms={:.1} lm_head_total_ms={:.1})",
-            stage_timings.gen_steps,
-            embed_ms / n,
-            chain_ms / n,
-            lm_head_ms / n,
-            sample_ms / n,
-            detok_ms / n,
-            total_ms / n,
-            chain_ms,
-            lm_head_ms,
-        );
-        eprintln!(
-            "[qwen36-moe chain-breakdown] gen_steps={} \
-             full_attn_ms_avg={:.3} linear_attn_ms_avg={:.3} ffn_ms_avg={:.3} \
-             (full_attn_total_ms={:.1} linear_attn_total_ms={:.1} ffn_total_ms={:.1})",
-            stage_timings.gen_steps,
-            full_attn_ms / n,
-            linear_attn_ms / n,
-            ffn_ms / n,
-            full_attn_ms,
-            linear_attn_ms,
-            ffn_ms,
-        );
-    }
+    stage_timings.print_if_requested(emit_stage_timings);
 
     Ok(())
 }
