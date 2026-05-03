@@ -140,12 +140,13 @@ pub enum AttnLayerBuffers {
 ///     current decode position, so descriptors do not need per-step updates.
 ///
 /// Exactly one of `k` / `virtual_kv_cache_k` is `Some` (same for V).
-/// `virtual_kv_cache_k` is `Some` when `SUPERSONIC_VMM_KV=1` was set
-/// and the backend supports VMM. It can back either BF16 KV or FP8 KV.
+/// `virtual_kv_cache_k` is `Some` when Qwen3.6 KV VMM was selected
+/// (default on HIP when supported, or forced with `SUPERSONIC_VMM_KV=1`).
+/// It can back either BF16 KV or FP8 KV.
 pub struct FullAttnKvCache {
-    /// `Some` when VMM-backed KV is OFF (the default). `None` when
-    /// `virtual_kv_cache_k` is `Some` (VMM-backed). Exactly one of
-    /// `k` / `virtual_kv_cache_k` is `Some`. Same for V.
+    /// `Some` when dense KV backing was selected. `None` when
+    /// `virtual_kv_cache_k` is `Some` (VMM-backed). Exactly one of `k` /
+    /// `virtual_kv_cache_k` is `Some`. Same for V.
     pub k: Option<GpuBuffer>,
     pub v: Option<GpuBuffer>,
     pub kv_max_t: i32,
@@ -160,9 +161,9 @@ pub struct FullAttnKvCache {
     pub kv_shadow_start: i32,
     /// Rolling sidecar capacity in positions (`0` when disabled).
     pub kv_shadow_window: i32,
-    /// `Some` when `SUPERSONIC_VMM_KV=1` was set at allocation time AND
-    /// the backend supports VMM. Mutually exclusive with `k` (exactly
-    /// one is `Some`).
+    /// `Some` when Qwen3.6 KV VMM was selected at allocation time AND the
+    /// backend supports VMM. Mutually exclusive with `k` (exactly one is
+    /// `Some`).
     pub virtual_kv_cache_k: Option<gpu_hal::VirtualBuffer>,
     pub virtual_kv_cache_v: Option<gpu_hal::VirtualBuffer>,
     /// The VMM reservation's logical max_T (matches `kv_max_t` above).

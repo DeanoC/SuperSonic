@@ -26,6 +26,7 @@ fn run_supersonic_capture_logits(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.args(args);
     cmd.arg("--dump-last-logits");
+    cmd.env_remove("SUPERSONIC_VMM_KV");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

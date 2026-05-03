@@ -1097,10 +1097,22 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
-fn qwen36_kv_vmm_requested_from_env() -> Result<bool> {
-    match std::env::var("SUPERSONIC_VMM_KV").ok().as_deref() {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen36KvVmmMode {
+    Auto,
+    Disabled,
+    Force,
+}
+
+fn qwen36_kv_vmm_mode_from_env_value(
+    raw: Option<&str>,
+    backend: Backend,
+) -> Result<Qwen36KvVmmMode> {
+    match raw {
+        None if backend == Backend::Hip => Ok(Qwen36KvVmmMode::Auto),
+        None => Ok(Qwen36KvVmmMode::Disabled),
+        Some("0") => Ok(Qwen36KvVmmMode::Disabled),
+        Some("1") => Ok(Qwen36KvVmmMode::Force),
         Some(other) => Err(anyhow!(
             "SUPERSONIC_VMM_KV must be unset, 0, or 1 for Qwen3.6-MoE; got {other:?}"
         )),
@@ -1108,17 +1120,29 @@ fn qwen36_kv_vmm_requested_from_env() -> Result<bool> {
 }
 
 fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Result<bool> {
-    if !qwen36_kv_vmm_requested_from_env()? {
-        return Ok(false);
-    }
+    let mode = qwen36_kv_vmm_mode_from_env_value(
+        std::env::var("SUPERSONIC_VMM_KV").ok().as_deref(),
+        backend,
+    )?;
+    let requested = match mode {
+        Qwen36KvVmmMode::Disabled => return Ok(false),
+        Qwen36KvVmmMode::Auto | Qwen36KvVmmMode::Force => true,
+    };
     if !gpu_hal::vmm_is_supported(backend, ordinal) {
-        eprintln!(
-            "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
-             device {ordinal} does not support VMM; using dense KV buffers"
-        );
+        if mode == Qwen36KvVmmMode::Force {
+            eprintln!(
+                "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
+                 device {ordinal} does not support VMM; using dense KV buffers"
+            );
+        } else {
+            eprintln!(
+                "[vmm] Qwen3.6-MoE HIP KV VMM auto-enable skipped because backend={backend} \
+                 device {ordinal} does not support VMM; using dense KV buffers"
+            );
+        }
         return Ok(false);
     }
-    Ok(true)
+    Ok(requested)
 }
 
 fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvStats {
@@ -1401,9 +1425,10 @@ fn load_layer_buffers(
         // FP8 path: same shape but U8 (FP8 E4M3 bytes) plus F32 scales
         // [num_kv_heads, kv_max_t] for K and V, plus optional BF16 sidecar
         // [num_kv_heads, sidecar_window, head_dim] when enabled.
-        // VMM path (SUPERSONIC_VMM_KV=1): K/V are VirtualBuffer
-        // reservations with a mapped prefix; dense k/v are None. FP8 scale
-        // and sidecar buffers remain regular dense GpuBuffers.
+        // VMM path (default on HIP when supported, or
+        // SUPERSONIC_VMM_KV=1): K/V are VirtualBuffer reservations with a
+        // mapped prefix; dense k/v are None. FP8 scale and sidecar buffers
+        // remain regular dense GpuBuffers.
         let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
         let kv_cache = if kv_max_t > 0 {
             let num_kv_heads = geom.num_kv_heads as usize;
@@ -3524,4 +3549,39 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
         geom.rms_norm_eps,
     );
     Ok(argmax_bf16_logits(&logits))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{qwen36_kv_vmm_mode_from_env_value, Qwen36KvVmmMode};
+    use gpu_hal::Backend;
+
+    #[test]
+    fn qwen36_kv_vmm_defaults_to_auto_on_hip_only() {
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Hip).unwrap(),
+            Qwen36KvVmmMode::Auto
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Cuda).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(None, Backend::Metal).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+    }
+
+    #[test]
+    fn qwen36_kv_vmm_env_override_is_explicit() {
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(Some("0"), Backend::Hip).unwrap(),
+            Qwen36KvVmmMode::Disabled
+        );
+        assert_eq!(
+            qwen36_kv_vmm_mode_from_env_value(Some("1"), Backend::Cuda).unwrap(),
+            Qwen36KvVmmMode::Force
+        );
+        assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
+    }
 }
