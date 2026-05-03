@@ -118,6 +118,13 @@ Current scope:
   variant: it only refreshes the previous-token expert pair when both routed
   projections are already resident. It never uploads missing pages, so it can
   measure LRU refresh value without changing residency admission.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=transition` enables online transition-aware
+  admission for sparse MoE islands. Each layer tracks how often a previous-token
+  routed rank is reused by the current token, waits for
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS` observations per previous
+  rank (default 32), then prefetches only ranks with observed repeats. Candidate
+  ordering uses repeat probability and still honors
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS` as the maximum candidate count.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.

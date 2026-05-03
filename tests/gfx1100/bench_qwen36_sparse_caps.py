@@ -67,6 +67,8 @@ def parse_prefetch_mode_policy(raw: str) -> tuple[str, str | None]:
         "resident-previous-token",
     }:
         return ("previous-token-resident", "previous-token-resident")
+    if value in {"transition", "transition-weighted"}:
+        return ("transition", "transition")
     raise ValueError(f"unknown prefetch mode {raw!r}")
 
 
@@ -257,6 +259,7 @@ def run_case(
     env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
+    transition_min_obs = env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS", None)
     telemetry_path = tmp / f"{case.label}_telemetry.json"
     if case.cap is not None:
         env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(case.cap)
@@ -265,6 +268,14 @@ def run_case(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = case.prefetch_mode
         if case.prefetch_ranks is not None:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = case.prefetch_ranks
+        if case.prefetch_mode == "transition":
+            configured_min_obs = args.prefetch_transition_min_obs
+            if configured_min_obs is None:
+                configured_min_obs = transition_min_obs
+            if configured_min_obs is not None:
+                env["SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS"] = str(
+                    configured_min_obs
+                )
 
     cmd = [
         str(args.binary),
@@ -386,14 +397,14 @@ def main() -> int:
     parser.add_argument("--no-persistent-decode", action="store_true")
     parser.add_argument(
         "--prefetch",
-        choices=["previous-token", "previous-token-resident"],
+        choices=["previous-token", "previous-token-resident", "transition"],
         help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
     )
     parser.add_argument(
         "--prefetch-mode-sweep",
         help=(
             "comma-separated sparse prefetch modes to sweep per cap, e.g. "
-            "disabled,previous-token,previous-token-resident"
+            "disabled,previous-token,previous-token-resident,transition"
         ),
     )
     parser.add_argument(
@@ -406,6 +417,11 @@ def main() -> int:
             "comma-separated sparse prefetch policies to sweep per cap, e.g. "
             "none,1,2,4,all; overrides --prefetch/--prefetch-ranks"
         ),
+    )
+    parser.add_argument(
+        "--prefetch-transition-min-obs",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS for transition rows only",
     )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_sparse_cap_sweep.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_sparse_cap_sweep.md"))
@@ -425,6 +441,8 @@ def main() -> int:
         if ranks is None:
             parser.error("--prefetch-ranks must be a positive integer or all")
         args.prefetch_ranks = ranks
+    if args.prefetch_transition_min_obs is not None and args.prefetch_transition_min_obs < 0:
+        parser.error("--prefetch-transition-min-obs must be >= 0")
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
     if not args.model_dir.exists():
@@ -483,6 +501,7 @@ def main() -> int:
         "prefetch": args.prefetch,
         "prefetch_mode_sweep": args.prefetch_mode_sweep,
         "prefetch_rank_sweep": args.prefetch_rank_sweep,
+        "prefetch_transition_min_obs": args.prefetch_transition_min_obs,
         "rows": rows,
     }
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
