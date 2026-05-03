@@ -839,6 +839,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.speculative_decode,
         cli.fp8_runtime,
         cli.batched_spec_verify,
+        entry.backend,
         cli.device,
         // Phase 3e.4: persistent decode is now the default. The legacy
         // `--persistent-decode` flag is a hidden no-op (kept for harness
@@ -1478,6 +1479,7 @@ fn load_all_layer_buffers(
 
 fn should_try_moe_expert_vmm(
     mode: MoeExpertVmmMode,
+    backend: Backend,
     weight_mode: Qwen36WeightMode,
     ordinal: usize,
 ) -> Result<bool> {
@@ -1492,11 +1494,11 @@ fn should_try_moe_expert_vmm(
         }
         return Ok(false);
     }
-    let supported = gpu_hal::vmm_is_supported(Backend::Hip, ordinal);
+    let supported = gpu_hal::vmm_is_supported(backend, ordinal);
     if !supported {
         if mode == MoeExpertVmmMode::Force {
             anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but HIP VMM is unsupported on device {ordinal}"
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but backend={backend} VMM is unsupported on device {ordinal}"
             );
         }
         return Ok(false);
@@ -1688,6 +1690,7 @@ fn decode_text(
     speculative_decode: bool,
     fp8_runtime: bool,
     batched_spec_verify: bool,
+    backend: Backend,
     ordinal: usize,
     persistent_decode: bool,
 ) -> Result<()> {
@@ -1810,7 +1813,7 @@ fn decode_text(
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
-    set_backend(Backend::Hip);
+    set_backend(backend);
 
     // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
     // generously here since per-layer KV is small (10 full-attn layers ×
@@ -1851,7 +1854,7 @@ fn decode_text(
                 geom.top_k
             );
         }
-        if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, weight_mode, ordinal)? {
+        if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, backend, weight_mode, ordinal)? {
             unreachable!("forced VMM expert check should either return true or error");
         }
         let max_resident_slices = cap_experts
@@ -1874,8 +1877,9 @@ fn decode_text(
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
-            "  [vmm] Qwen3.6-MoE sparse routed expert residency active on device {ordinal}: \
+            "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
              tensors={} max_slices={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+            backend,
             residency_stats.registered_tensors,
             max_resident_slices,
             arena_stats.logical_bytes as f64 / MIB,
@@ -1890,7 +1894,7 @@ fn decode_text(
         }
         _moe_expert_residency = Some(manager);
         layers
-    } else if should_try_moe_expert_vmm(moe_vmm_mode, weight_mode, ordinal)? {
+    } else if should_try_moe_expert_vmm(moe_vmm_mode, backend, weight_mode, ordinal)? {
         let mut arena = BakedStore::virtual_weight_arena(ordinal);
         match load_all_layer_buffers(
             &store,
@@ -1906,8 +1910,9 @@ fn decode_text(
             Ok(layers) => {
                 let stats = arena.stats();
                 println!(
-                    "  [vmm] Qwen3.6-MoE routed expert slabs active on device {ordinal}: \
+                    "  [vmm] Qwen3.6-MoE routed expert slabs active on backend={} device {ordinal}: \
                      allocations={} mappings={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                    backend,
                     stats.allocations,
                     stats.mapping_count,
                     stats.logical_bytes as f64 / MIB,

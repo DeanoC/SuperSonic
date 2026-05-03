@@ -44,6 +44,10 @@ Current scope:
   `(layer, expert, projection)` slices from the mmap-backed bake, evicts with a
   bounded LRU policy, and invalidates every resident slice covered by an
   unmapped VMM page.
+- Qwen3.6-MoE sparse expert residency is backend-aware at the VMM policy layer
+  and is unit-tested on supported HIP/CUDA VMM backends. Full Qwen3.6-MoE
+  decode kernels are still HIP-only; CUDA runtime decode remains blocked before
+  kernel launch.
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` activates router-driven sparse MoE
   islands for Qwen3.6-MoE INT4 decode. The chained decode path runs FFN stage 1
   first, downloads the `top_k` expert ids, pins those experts' gate/up and down
@@ -102,6 +106,8 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
   `SUPERSONIC_BACKENDS=hip cargo test -p model-store virtual_arena_loads_baked_weight_and_expert_tensors -- --nocapture`
 - Qwen3.6-MoE sparse residency manager tests:
   `SUPERSONIC_BACKENDS=hip cargo test -p runner qwen36_moe_residency -- --nocapture`
+- CUDA Qwen3.6-MoE sparse residency manager tests:
+  `SUPERSONIC_BACKENDS=cuda cargo test -p runner qwen36_moe_residency -- --nocapture`
 - Qwen3.6-MoE sparse router-prefetch smoke:
   `SUPERSONIC_BACKENDS=hip SUPERSONIC_VMM_MOE_ISLANDS=1 SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=8 cargo run --release --bin supersonic -- --backend hip --model qwen3.6-35b-a3b --model-dir /mnt/data/models/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1`
   generated `[11]` and reported `resident=32.00MiB` for the 15 GiB routed
