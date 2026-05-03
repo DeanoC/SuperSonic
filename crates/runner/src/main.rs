@@ -437,25 +437,31 @@ pub(crate) struct Cli {
     #[arg(long)]
     batched_spec_verify: bool,
 
-    /// Phase 3e.2: route the Qwen3.6-MoE decode chain through the
-    /// persistent megakernel
+    /// **No-op.** The Qwen3.6-MoE persistent megakernel
     /// (`kernels/qwen36_moe_persistent/persistent_decode.hip`,
-    /// PR #126) instead of the chained per-step launcher.
+    /// PR #126) is now the default decode path; this flag is kept as
+    /// a no-op so existing benchmark harnesses don't break. Use
+    /// `--no-persistent-decode` to opt out into the legacy chained
+    /// per-step launcher.
     ///
-    /// One cooperative HIP launch processes all 40 layers ({attn or
-    /// linear-attn, FFN}) per token vs. 80 step launches in the
-    /// chained path — recovers ~30 µs × 80 = ~2.4 ms of HIP launch
-    /// overhead per token (~9% of the 27 ms chain time on local
-    /// 7900 XTX bring-up). Bit-identical greedy output to the chained
-    /// path (gated by the
-    /// `multilayer_persistent_decode_matches_chained` parity test).
-    ///
-    /// Currently HIP/qwen3.6-MoE only and only on the non-speculative
-    /// decode path. Combining with `--speculative-decode` falls back to
-    /// the chained path for the verify-loop chains; the persistent path
-    /// gates a follow-up after spec-verify perf is in.
-    #[arg(long)]
+    /// Background: one cooperative HIP launch processes all 40
+    /// layers per token vs. 80 step launches in the chained path —
+    /// recovers ~2.5-3 ms/token of HIP launch overhead. Validated
+    /// bit-identical across PG-19 + RULER × {128, 512, 2K, 4K, 8K}
+    /// at INT4 (verify-suite `chained_vs_persistent` block, all
+    /// 10/10 cases logits/hidden/generated_ids byte-identical).
+    /// Mode-agnostic: the kernel handles INT4 / BF16 / FP8 sidecars
+    /// identically. HIP/qwen3.6-MoE only.
+    #[arg(long, hide = true)]
     persistent_decode: bool,
+
+    /// Opt out of the persistent-decode megakernel and run the
+    /// legacy chained per-step launcher (~80 step launches per
+    /// token, ~2.5-3 ms/token slower than the persistent path on
+    /// gfx1100). Use for A/B perf comparison or to bisect a
+    /// suspected megakernel-side regression.
+    #[arg(long)]
+    no_persistent_decode: bool,
 
     /// Emit the generated suffix as a JSON string for benchmark harnesses.
     #[arg(long)]

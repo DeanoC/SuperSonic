@@ -754,7 +754,11 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.speculative_decode,
         cli.fp8_runtime,
         cli.batched_spec_verify,
-        cli.persistent_decode,
+        // Phase 3e.4: persistent decode is now the default. The legacy
+        // `--persistent-decode` flag is a hidden no-op (kept for harness
+        // back-compat); `--no-persistent-decode` is the documented
+        // opt-out for A/B comparison or bisecting megakernel regressions.
+        !cli.no_persistent_decode,
     )?;
     Ok(())
 }

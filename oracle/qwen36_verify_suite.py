@@ -366,9 +366,16 @@ def run_once(
         raise ValueError(f"unknown mode {mode}")
     if args.emit_stage_timings:
         cmd.append("--emit-stage-timings")
-    if decode_path == "persistent":
+    if decode_path == "chained":
+        # Persistent megakernel is the default since the post-Phase-3e.4
+        # flip; force the legacy chained path with the documented opt-out.
+        cmd.append("--no-persistent-decode")
+    elif decode_path == "persistent":
+        # `--persistent-decode` is now a hidden no-op (default-on);
+        # passing it explicitly is redundant but harmless and keeps the
+        # supersonic command line self-documenting in the captured logs.
         cmd.append("--persistent-decode")
-    elif decode_path != "chained":
+    else:
         raise ValueError(f"unknown decode_path {decode_path}")
 
     start = time.perf_counter()
