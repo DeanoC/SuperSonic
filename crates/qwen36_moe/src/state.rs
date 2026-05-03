@@ -72,8 +72,10 @@ impl StateAccount {
         let kv_scale_bytes_per_layer_per_token =
             2 * kv_heads * layout.kv_fp8_scale_bytes_per_token;
         // Per-layer BF16 sidecar bytes (FP8 + sidecar enabled only):
-        // 2 (K+V) * kv_heads * head_dim * 2 bytes per (head, position),
-        // total across the configured window.
+        // 2 (K+V) * kv_heads * head_dim * 2 bytes per scalar element
+        // (BF16 dtype), total across the configured window. head_dim is a
+        // separate factor here — contrast with the per-token scale above
+        // which is independent of head_dim.
         let kv_sidecar_bytes_per_layer = 2
             * kv_heads
             * head_dim

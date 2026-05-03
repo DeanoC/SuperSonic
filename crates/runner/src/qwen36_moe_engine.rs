@@ -152,6 +152,10 @@ pub fn run_qwen36_moe_dry_run(
     let checkpoint = CheckpointAccount::from_config(&config.text_config);
     let int4_projected_bytes = checkpoint.project_int4_total_bytes(&config.text_config, 128);
 
+    // The 4th arg is the FP8 KV BF16 sidecar window. Task 11 will replace
+    // this `None` with the env-var-derived window once `--kv-fp8` is gated
+    // through the engine; until then we accept the smaller (no-sidecar)
+    // VRAM estimate.
     let layout = StateLayout::new(context_size, batch_size, kv_fp8, None);
     let state = StateAccount::from_config(&config.text_config, layout);
 
