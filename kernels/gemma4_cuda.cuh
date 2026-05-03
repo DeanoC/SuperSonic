@@ -3259,67 +3259,80 @@ __device__ void g4_persistent_decode_body(
         // B2 wave-per-row.
         {
             const int lane = tid % warpSize;
-            const int total_mlp1 = 2 * intermediate_size;
             const int vd4 = hidden_size & ~3;
             while (true) {
                 unsigned int row;
                 if (lane == 0) row = atomicAdd(matvec_counter, 1u);
                 row = __shfl_sync(0xffffffff, row, 0);
-                if (row >= static_cast<unsigned int>(total_mlp1)) break;
+                if (row >= static_cast<unsigned int>(intermediate_size)) break;
 
-                const bool is_gate = row < static_cast<unsigned int>(intermediate_size);
-                const T* w_bf16 = is_gate ? gate_proj_w : up_proj_w;
-                const int weight_row = is_gate
-                    ? static_cast<int>(row)
-                    : static_cast<int>(row - intermediate_size);
-
-                float p = 0.0f;
+                const int weight_row = static_cast<int>(row);
+                float gate_p = 0.0f;
+                float up_p = 0.0f;
                 if (use_fp8_w) {
-                    const void* wbase = static_cast<const void*>(w_bf16);
-                    const void* sbase = is_gate ? Sfp8.gate_proj_scale : Sfp8.up_proj_scale;
+                    const void* gate_base = static_cast<const void*>(gate_proj_w);
+                    const void* up_base = static_cast<const void*>(up_proj_w);
+                    const void* gate_scale = Sfp8.gate_proj_scale;
+                    const void* up_scale = Sfp8.up_proj_scale;
                     for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c,   hidden_size, fp8_block_size, fp8_lut);
-                        float w1 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+1, hidden_size, fp8_block_size, fp8_lut);
-                        float w2 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+2, hidden_size, fp8_block_size, fp8_lut);
-                        float w3 = g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c+3, hidden_size, fp8_block_size, fp8_lut);
-                        p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
-                           + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
+                        const float x0 = b_normed_ff[c];
+                        const float x1 = b_normed_ff[c+1];
+                        const float x2 = b_normed_ff[c+2];
+                        const float x3 = b_normed_ff[c+3];
+                        float gw0 = g4_fp8_dequant_weight_lut(gate_base, gate_scale, weight_row, c,   hidden_size, fp8_block_size, fp8_lut);
+                        float gw1 = g4_fp8_dequant_weight_lut(gate_base, gate_scale, weight_row, c+1, hidden_size, fp8_block_size, fp8_lut);
+                        float gw2 = g4_fp8_dequant_weight_lut(gate_base, gate_scale, weight_row, c+2, hidden_size, fp8_block_size, fp8_lut);
+                        float gw3 = g4_fp8_dequant_weight_lut(gate_base, gate_scale, weight_row, c+3, hidden_size, fp8_block_size, fp8_lut);
+                        float uw0 = g4_fp8_dequant_weight_lut(up_base, up_scale, weight_row, c,   hidden_size, fp8_block_size, fp8_lut);
+                        float uw1 = g4_fp8_dequant_weight_lut(up_base, up_scale, weight_row, c+1, hidden_size, fp8_block_size, fp8_lut);
+                        float uw2 = g4_fp8_dequant_weight_lut(up_base, up_scale, weight_row, c+2, hidden_size, fp8_block_size, fp8_lut);
+                        float uw3 = g4_fp8_dequant_weight_lut(up_base, up_scale, weight_row, c+3, hidden_size, fp8_block_size, fp8_lut);
+                        gate_p += gw0 * x0 + gw1 * x1 + gw2 * x2 + gw3 * x3;
+                        up_p += uw0 * x0 + uw1 * x1 + uw2 * x2 + uw3 * x3;
                     }
                     for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
-                        p += g4_fp8_dequant_weight_lut(wbase, sbase, weight_row, c, hidden_size, fp8_block_size, fp8_lut)
-                             * b_normed_ff[c];
+                        const float x = b_normed_ff[c];
+                        gate_p += g4_fp8_dequant_weight_lut(gate_base, gate_scale, weight_row, c, hidden_size, fp8_block_size, fp8_lut) * x;
+                        up_p += g4_fp8_dequant_weight_lut(up_base, up_scale, weight_row, c, hidden_size, fp8_block_size, fp8_lut) * x;
                     }
                 } else {
-                    const T* wr = w_bf16 + static_cast<size_t>(weight_row) * hidden_size;
+                    const T* gate_wr =
+                        gate_proj_w + static_cast<size_t>(weight_row) * hidden_size;
+                    const T* up_wr =
+                        up_proj_w + static_cast<size_t>(weight_row) * hidden_size;
                     for (int c = lane * 4; c < vd4; c += warpSize * 4) {
-                        float w0, w1, w2, w3;
-                        g4_load_pair_as_float(wr + c, w0, w1);
-                        g4_load_pair_as_float(wr + c + 2, w2, w3);
-                        p += w0 * b_normed_ff[c]   + w1 * b_normed_ff[c+1]
-                           + w2 * b_normed_ff[c+2] + w3 * b_normed_ff[c+3];
+                        const float x0 = b_normed_ff[c];
+                        const float x1 = b_normed_ff[c+1];
+                        const float x2 = b_normed_ff[c+2];
+                        const float x3 = b_normed_ff[c+3];
+                        float gw0, gw1, gw2, gw3;
+                        float uw0, uw1, uw2, uw3;
+                        g4_load_pair_as_float(gate_wr + c, gw0, gw1);
+                        g4_load_pair_as_float(gate_wr + c + 2, gw2, gw3);
+                        g4_load_pair_as_float(up_wr + c, uw0, uw1);
+                        g4_load_pair_as_float(up_wr + c + 2, uw2, uw3);
+                        gate_p += gw0 * x0 + gw1 * x1 + gw2 * x2 + gw3 * x3;
+                        up_p += uw0 * x0 + uw1 * x1 + uw2 * x2 + uw3 * x3;
                     }
                     for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
-                        p += g4_to_float(wr[c]) * b_normed_ff[c];
+                        const float x = b_normed_ff[c];
+                        gate_p += g4_to_float(gate_wr[c]) * x;
+                        up_p += g4_to_float(up_wr[c]) * x;
                     }
                 }
-                float result = g4_wave_reduce_sum_f32(p);
-                if (lane == 0) b_gate_up[row] = result;
+                const float gate_result = g4_wave_reduce_sum_f32(gate_p);
+                const float up_result = g4_wave_reduce_sum_f32(up_p);
+                if (lane == 0) {
+                    b_gated_proj[row] =
+                        g4_gelu_tanh_scalar(gate_result) * up_result;
+                }
             }
         }
         g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_B2_GATE_UP, g4_prof);
 
-        // B3: gated_proj[i] = gelu(gate[i]) * up[i].
+        // B3: fused into B2 paired gate/up rows.
         g4_prof = g4_profile_begin(profile_cycles);
-        {
-            const float* gate_slot = b_gate_up;
-            const float* up_slot = b_gate_up + intermediate_size;
-            for (int i = tid + blockIdx.x * bs;
-                 i < intermediate_size; i += bs * nb) {
-                b_gated_proj[i] = g4_gelu_tanh_scalar(gate_slot[i]) * up_slot[i];
-            }
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
         g4_profile_end(profile_cycles, G4_PROFILE_B3_GELU_UP, g4_prof);
 
         // B4: work-stealing down_proj.
