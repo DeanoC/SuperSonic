@@ -746,4 +746,21 @@ fn multilayer_persistent_decode_matches_chained() {
         1e-3,
         0.99999,
     );
+
+    // Segmented persistent is the sparse-VMM orchestration: each layer runs
+    // attention + router top-k, returns to the host for remap, then resumes
+    // that layer's FFN. With a no-op remap callback it must match the same
+    // chained reference.
+    restore_linear_attn_state(ordinal, &mut layers, &snapshot)
+        .expect("restore_linear_attn_state before segmented persistent");
+    let segmented_outputs = scratch
+        .run_sparse_with_expert_prefetch(ordinal, &initial_hidden, position, |_layer, _topk| Ok(()))
+        .expect("PersistentScratch::run_sparse_with_expert_prefetch");
+    assert_parity_bf16(
+        "segmented persistent sparse vs chained final_hidden",
+        &segmented_outputs.final_hidden_bytes,
+        &chained.final_hidden_bytes,
+        1e-3,
+        0.99999,
+    );
 }

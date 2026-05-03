@@ -2039,8 +2039,8 @@ fn decode_text(
         );
         if persistent_decode {
             println!(
-                "  [vmm] sparse MoE residency uses chained decode for router prefetch; \
-                 persistent megakernel disabled for this run"
+                "  [vmm] sparse MoE residency will use segmented persistent decode \
+                 (router prefetch + FFN resume per layer)"
             );
         }
         _moe_expert_residency = Some(manager);
@@ -2105,8 +2105,6 @@ fn decode_text(
             None,
         )?
     };
-    let persistent_decode = persistent_decode && !sparse_moe_requested;
-
     // Phase 6 self-speculative decode: load the multi-token-prediction
     // (MTP) head from the bake when --speculative-decode is set.
     //
@@ -2410,10 +2408,54 @@ fn decode_text(
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-            lm_head_folded = fold.is_some();
-            scratch
-                .run(ordinal, &initial_hidden, position, fold)
-                .with_context(|| format!("persistent decode (step {step}, position {position})"))?
+            if let Some(manager) = _moe_expert_residency.as_mut() {
+                // Sparse VMM needs a host remap point after each layer's
+                // router top-k is known. The segmented persistent path keeps
+                // the persistent phase bodies but skips folded lm_head; the
+                // standalone lm_head launch below consumes final_hidden_bytes.
+                lm_head_folded = false;
+                drop(fold);
+                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
+                    for &expert_idx in topk {
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::GateUp,
+                            },
+                        )?;
+                        manager.ensure_resident(
+                            &store,
+                            MoeExpertKey {
+                                layer_idx,
+                                expert_idx,
+                                projection: MoeExpertProjection::Down,
+                            },
+                        )?;
+                    }
+                    Ok(())
+                };
+                scratch
+                    .run_sparse_with_expert_prefetch(
+                        ordinal,
+                        &initial_hidden,
+                        position,
+                        &mut prefetch,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "segmented persistent sparse decode (step {step}, position {position})"
+                        )
+                    })?
+            } else {
+                lm_head_folded = fold.is_some();
+                scratch
+                    .run(ordinal, &initial_hidden, position, fold)
+                    .with_context(|| {
+                        format!("persistent decode (step {step}, position {position})")
+                    })?
+            }
         } else {
             // Chained path doesn't support the fold; lm_head still
             // launches separately below on gen steps.
