@@ -28,9 +28,9 @@ use qwen36_moe::weights::{
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
     run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits,
-    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
-    LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, ResidentWeight,
-    XorshiftRng,
+    AttnLayerBuffers, ExpertPrefetchPhase, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
+    FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom,
+    ResidentWeight, XorshiftRng,
 };
 use crate::qwen36_moe_residency::{
     MoeExpertKey, MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
@@ -1098,6 +1098,37 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoeIslandPrefetchMode {
+    Disabled,
+    PreviousToken,
+}
+
+impl MoeIslandPrefetchMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::PreviousToken => "previous-token",
+        }
+    }
+
+    fn from_env() -> Result<Self> {
+        match std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
+            .ok()
+            .as_deref()
+        {
+            None | Some("0") | Some("off") | Some("disabled") => Ok(Self::Disabled),
+            Some("previous-token") | Some("previous_token") | Some("prev-token") => {
+                Ok(Self::PreviousToken)
+            }
+            Some(other) => Err(anyhow!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH must be unset, 0, off, disabled, \
+                 previous-token, previous_token, or prev-token; got {other:?}"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qwen36KvVmmMode {
     Auto,
     Disabled,
@@ -1197,6 +1228,7 @@ impl MoeSparseTelemetrySnapshot {
 struct MoeSparseTelemetry {
     dump_path: Option<PathBuf>,
     decode_path: &'static str,
+    prefetch_mode: MoeIslandPrefetchMode,
     steps: Vec<serde_json::Value>,
     peak_resident_slices: usize,
     peak_resident_pages: usize,
@@ -1206,7 +1238,11 @@ struct MoeSparseTelemetry {
 }
 
 impl MoeSparseTelemetry {
-    fn from_env(active: bool, persistent_decode: bool) -> Result<Option<Self>> {
+    fn from_env(
+        active: bool,
+        persistent_decode: bool,
+        prefetch_mode: MoeIslandPrefetchMode,
+    ) -> Result<Option<Self>> {
         if !active {
             return Ok(None);
         }
@@ -1218,6 +1254,7 @@ impl MoeSparseTelemetry {
             } else {
                 "chained"
             },
+            prefetch_mode,
             steps: Vec::new(),
             peak_resident_slices: 0,
             peak_resident_pages: 0,
@@ -1262,6 +1299,12 @@ impl MoeSparseTelemetry {
                 "evicted_pages": after.stats.evicted_pages.saturating_sub(before.stats.evicted_pages),
                 "uploaded_bytes": after.stats.uploaded_bytes.saturating_sub(before.stats.uploaded_bytes),
                 "unmapped_bytes": after.stats.unmapped_bytes.saturating_sub(before.stats.unmapped_bytes),
+                "prefetch_requests": after.stats.prefetch_requests.saturating_sub(before.stats.prefetch_requests),
+                "prefetch_hits": after.stats.prefetch_hits.saturating_sub(before.stats.prefetch_hits),
+                "prefetch_misses": after.stats.prefetch_misses.saturating_sub(before.stats.prefetch_misses),
+                "prefetch_page_hits": after.stats.prefetch_page_hits.saturating_sub(before.stats.prefetch_page_hits),
+                "prefetch_page_misses": after.stats.prefetch_page_misses.saturating_sub(before.stats.prefetch_page_misses),
+                "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes.saturating_sub(before.stats.prefetch_uploaded_bytes),
             },
             "resident": {
                 "slices": after.stats.resident_slices,
@@ -1280,6 +1323,12 @@ impl MoeSparseTelemetry {
                 "evicted_pages": after.stats.evicted_pages,
                 "uploaded_bytes": after.stats.uploaded_bytes,
                 "unmapped_bytes": after.stats.unmapped_bytes,
+                "prefetch_requests": after.stats.prefetch_requests,
+                "prefetch_hits": after.stats.prefetch_hits,
+                "prefetch_misses": after.stats.prefetch_misses,
+                "prefetch_page_hits": after.stats.prefetch_page_hits,
+                "prefetch_page_misses": after.stats.prefetch_page_misses,
+                "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes,
             }
         }));
     }
@@ -1307,6 +1356,7 @@ impl MoeSparseTelemetry {
             "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
             "summary": {
                 "decode_path": self.decode_path,
+                "prefetch_mode": self.prefetch_mode.as_str(),
                 "registered_tensors": final_snapshot.stats.registered_tensors,
                 "max_resident_pages": manager.max_resident_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
@@ -1343,6 +1393,12 @@ impl MoeSparseTelemetry {
                 "evicted_pages": final_snapshot.stats.evicted_pages,
                 "uploaded_bytes": final_snapshot.stats.uploaded_bytes,
                 "unmapped_bytes": final_snapshot.stats.unmapped_bytes,
+                "prefetch_requests": final_snapshot.stats.prefetch_requests,
+                "prefetch_hits": final_snapshot.stats.prefetch_hits,
+                "prefetch_misses": final_snapshot.stats.prefetch_misses,
+                "prefetch_page_hits": final_snapshot.stats.prefetch_page_hits,
+                "prefetch_page_misses": final_snapshot.stats.prefetch_page_misses,
+                "prefetch_uploaded_bytes": final_snapshot.stats.prefetch_uploaded_bytes,
             },
             "generated_ids": generated_ids,
             "steps": self.steps,
@@ -2266,8 +2322,12 @@ fn decode_text(
     let mut _moe_expert_arena = None;
     let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
+    let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
+    if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
     let mut moe_sparse_telemetry =
-        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode)?;
+        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode, moe_prefetch_mode)?;
     if let Some(path) = moe_sparse_telemetry
         .as_ref()
         .and_then(|telemetry| telemetry.dump_path.as_ref())
@@ -2328,6 +2388,9 @@ fn decode_text(
                 "  [vmm] sparse MoE residency will use segmented persistent decode \
                  (router prefetch + FFN resume per layer)"
             );
+        }
+        if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+            println!("  [vmm] sparse MoE previous-token lookahead prefetch active");
         }
         _moe_expert_residency = Some(manager);
         layers
@@ -2657,6 +2720,8 @@ fn decode_text(
     let mut t_chain_full_attn_us: u64 = 0;
     let mut t_chain_linear_attn_us: u64 = 0;
     let mut t_chain_ffn_us: u64 = 0;
+    let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
+        vec![Vec::new(); geom.num_layers as usize];
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -2717,6 +2782,12 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
+        let mut next_moe_topk_by_layer =
+            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+                previous_moe_topk_by_layer.clone()
+            } else {
+                Vec::new()
+            };
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
             if let Some(manager) = _moe_expert_residency.as_mut() {
                 // Sparse VMM needs a host remap point after each layer's
@@ -2725,27 +2796,52 @@ fn decode_text(
                 // standalone lm_head launch below consumes final_hidden_bytes.
                 lm_head_folded = false;
                 drop(fold);
-                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
-                    for &expert_idx in topk {
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
+                let mut prefetch =
+                    |phase: ExpertPrefetchPhase, layer_idx: usize, topk: &[usize]| -> Result<()> {
+                        let experts = match phase {
+                            ExpertPrefetchPhase::Lookahead
+                                if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            {
+                                previous_moe_topk_by_layer
+                                    .get(layer_idx)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[])
+                            }
+                            ExpertPrefetchPhase::Lookahead => &[],
+                            ExpertPrefetchPhase::Demand => topk,
+                        };
+                        for &expert_idx in experts {
+                            let gate_up = MoeExpertKey {
                                 layer_idx,
                                 expert_idx,
                                 projection: MoeExpertProjection::GateUp,
-                            },
-                        )?;
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
+                            };
+                            let down = MoeExpertKey {
                                 layer_idx,
                                 expert_idx,
                                 projection: MoeExpertProjection::Down,
-                            },
-                        )?;
-                    }
-                    Ok(())
-                };
+                            };
+                            match phase {
+                                ExpertPrefetchPhase::Lookahead => {
+                                    manager.prefetch_resident(&store, gate_up)?;
+                                    manager.prefetch_resident(&store, down)?;
+                                }
+                                ExpertPrefetchPhase::Demand => {
+                                    manager.ensure_resident(&store, gate_up)?;
+                                    manager.ensure_resident(&store, down)?;
+                                }
+                            }
+                        }
+                        if phase == ExpertPrefetchPhase::Demand
+                            && moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
+                        {
+                            if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
+                                slot.clear();
+                                slot.extend_from_slice(topk);
+                            }
+                        }
+                        Ok(())
+                    };
                 scratch
                     .run_sparse_with_expert_prefetch(
                         ordinal,
@@ -2772,27 +2868,52 @@ fn decode_text(
             lm_head_folded = false;
             drop(fold);
             if let Some(manager) = _moe_expert_residency.as_mut() {
-                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
-                    for &expert_idx in topk {
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
+                let mut prefetch =
+                    |phase: ExpertPrefetchPhase, layer_idx: usize, topk: &[usize]| -> Result<()> {
+                        let experts = match phase {
+                            ExpertPrefetchPhase::Lookahead
+                                if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            {
+                                previous_moe_topk_by_layer
+                                    .get(layer_idx)
+                                    .map(Vec::as_slice)
+                                    .unwrap_or(&[])
+                            }
+                            ExpertPrefetchPhase::Lookahead => &[],
+                            ExpertPrefetchPhase::Demand => topk,
+                        };
+                        for &expert_idx in experts {
+                            let gate_up = MoeExpertKey {
                                 layer_idx,
                                 expert_idx,
                                 projection: MoeExpertProjection::GateUp,
-                            },
-                        )?;
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
+                            };
+                            let down = MoeExpertKey {
                                 layer_idx,
                                 expert_idx,
                                 projection: MoeExpertProjection::Down,
-                            },
-                        )?;
-                    }
-                    Ok(())
-                };
+                            };
+                            match phase {
+                                ExpertPrefetchPhase::Lookahead => {
+                                    manager.prefetch_resident(&store, gate_up)?;
+                                    manager.prefetch_resident(&store, down)?;
+                                }
+                                ExpertPrefetchPhase::Demand => {
+                                    manager.ensure_resident(&store, gate_up)?;
+                                    manager.ensure_resident(&store, down)?;
+                                }
+                            }
+                        }
+                        if phase == ExpertPrefetchPhase::Demand
+                            && moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
+                        {
+                            if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
+                                slot.clear();
+                                slot.extend_from_slice(topk);
+                            }
+                        }
+                        Ok(())
+                    };
                 run_chained_decode_fast_with_expert_prefetch(
                     ordinal,
                     &geom,
@@ -2814,6 +2935,9 @@ fn decode_text(
             }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
+        if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+            previous_moe_topk_by_layer = next_moe_topk_by_layer;
+        }
         if let (Some(telemetry), Some(before), Some(manager)) = (
             moe_sparse_telemetry.as_mut(),
             moe_telemetry_before,
@@ -3299,6 +3423,8 @@ fn decode_text(
                 "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
                  resident_pages={} peak_pages={} page_backed_slices={} \
                  hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
+                 prefetch_requests={} prefetch_hits={} prefetch_misses={} \
+                 prefetch_page_hits={} prefetch_page_misses={} \
                  uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
                  kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
@@ -3313,6 +3439,11 @@ fn decode_text(
                 residency.page_misses,
                 residency.evicted_slices,
                 residency.evicted_pages,
+                residency.prefetch_requests,
+                residency.prefetch_hits,
+                residency.prefetch_misses,
+                residency.prefetch_page_hits,
+                residency.prefetch_page_misses,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
@@ -3327,7 +3458,9 @@ fn decode_text(
             println!(
                 "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
                  page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
-                 evicted_slices={} evicted_pages={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 evicted_slices={} evicted_pages={} prefetch_requests={} \
+                 prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
+                 prefetch_page_misses={} uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
                  total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
                 residency.resident_slices,
@@ -3339,6 +3472,11 @@ fn decode_text(
                 residency.page_misses,
                 residency.evicted_slices,
                 residency.evicted_pages,
+                residency.prefetch_requests,
+                residency.prefetch_hits,
+                residency.prefetch_misses,
+                residency.prefetch_page_hits,
+                residency.prefetch_page_misses,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,

@@ -48,7 +48,7 @@ pub struct LmHeadFold<'a> {
 
 use crate::qwen36_moe_decode::{
     ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
-    AttnLayerBuffers, DecodeOutputs, LayerBuffers, MultiLayerGeom,
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, LayerBuffers, MultiLayerGeom,
 };
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
@@ -286,7 +286,7 @@ impl PersistentScratch {
         mut prefetch: F,
     ) -> Result<DecodeOutputs>
     where
-        F: FnMut(usize, &[usize]) -> Result<()>,
+        F: FnMut(ExpertPrefetchPhase, usize, &[usize]) -> Result<()>,
     {
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
@@ -306,6 +306,9 @@ impl PersistentScratch {
 
         let t_launch = std::time::Instant::now();
         for layer_idx in 0..self.num_layers {
+            prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
+                format!("lookahead prefetch routed experts (layer {layer_idx})")
+            })?;
             persistent_decode_launch_range(
                 ordinal,
                 ScalarType::BF16,
@@ -331,7 +334,7 @@ impl PersistentScratch {
             let topk = self
                 .download_topk_indices(ordinal)
                 .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
-            prefetch(layer_idx, &topk)
+            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &topk)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
 
             persistent_decode_launch_range(

@@ -61,6 +61,12 @@ pub struct MoeExpertResidencyStats {
     pub evicted_pages: u64,
     pub uploaded_bytes: usize,
     pub unmapped_bytes: usize,
+    pub prefetch_requests: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_misses: u64,
+    pub prefetch_page_hits: u64,
+    pub prefetch_page_misses: u64,
+    pub prefetch_uploaded_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +139,18 @@ pub struct MoeExpertResidencyManager {
     evicted_pages: u64,
     uploaded_bytes: usize,
     unmapped_bytes: usize,
+    prefetch_requests: u64,
+    prefetch_hits: u64,
+    prefetch_misses: u64,
+    prefetch_page_hits: u64,
+    prefetch_page_misses: u64,
+    prefetch_uploaded_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidencyAccessKind {
+    Demand,
+    Prefetch,
 }
 
 impl MoeExpertResidencyManager {
@@ -153,6 +171,12 @@ impl MoeExpertResidencyManager {
             evicted_pages: 0,
             uploaded_bytes: 0,
             unmapped_bytes: 0,
+            prefetch_requests: 0,
+            prefetch_hits: 0,
+            prefetch_misses: 0,
+            prefetch_page_hits: 0,
+            prefetch_page_misses: 0,
+            prefetch_uploaded_bytes: 0,
         }
     }
 
@@ -179,6 +203,12 @@ impl MoeExpertResidencyManager {
             evicted_pages: self.evicted_pages,
             uploaded_bytes: self.uploaded_bytes,
             unmapped_bytes: self.unmapped_bytes,
+            prefetch_requests: self.prefetch_requests,
+            prefetch_hits: self.prefetch_hits,
+            prefetch_misses: self.prefetch_misses,
+            prefetch_page_hits: self.prefetch_page_hits,
+            prefetch_page_misses: self.prefetch_page_misses,
+            prefetch_uploaded_bytes: self.prefetch_uploaded_bytes,
         }
     }
 
@@ -301,6 +331,22 @@ impl MoeExpertResidencyManager {
     }
 
     pub fn ensure_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
+        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Demand)
+    }
+
+    pub fn prefetch_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
+        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Prefetch)
+    }
+
+    fn ensure_resident_with_kind(
+        &mut self,
+        store: &BakedStore,
+        key: MoeExpertKey,
+        kind: ResidencyAccessKind,
+    ) -> Result<()> {
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_requests += 1;
+        }
         let tensor_idx = self.tensor_idx(key.layer_idx, key.projection)?;
         let (name, allocation_id, logical_offset, logical_len, pages) = {
             let tensor = &self.tensors[tensor_idx];
@@ -359,8 +405,14 @@ impl MoeExpertResidencyManager {
             });
             if all_pages_resident {
                 self.hits += 1;
+                if kind == ResidencyAccessKind::Prefetch {
+                    self.prefetch_hits += 1;
+                }
                 for span in &pages {
                     self.page_hits += 1;
+                    if kind == ResidencyAccessKind::Prefetch {
+                        self.prefetch_page_hits += 1;
+                    }
                     if let Some(page) = self.resident_pages.get_mut(&ResidentPageKey {
                         tensor_idx,
                         page_offset: span.offset,
@@ -374,6 +426,9 @@ impl MoeExpertResidencyManager {
         }
 
         self.misses += 1;
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_misses += 1;
+        }
         let mut missing_pages = Vec::new();
         for span in &pages {
             let page_key = ResidentPageKey {
@@ -383,12 +438,18 @@ impl MoeExpertResidencyManager {
             if let Some(page) = self.resident_pages.get_mut(&page_key) {
                 page.last_used = self.clock;
                 self.page_hits += 1;
+                if kind == ResidencyAccessKind::Prefetch {
+                    self.prefetch_page_hits += 1;
+                }
             } else {
                 missing_pages.push(*span);
             }
         }
 
         self.page_misses += missing_pages.len() as u64;
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_page_misses += missing_pages.len() as u64;
+        }
         for span in missing_pages {
             while self.resident_pages.len() >= self.config.max_resident_pages {
                 self.evict_lru_page()?;
@@ -409,6 +470,9 @@ impl MoeExpertResidencyManager {
                     )
                 })?;
             self.uploaded_bytes += span.copy_len;
+            if kind == ResidencyAccessKind::Prefetch {
+                self.prefetch_uploaded_bytes += span.copy_len;
+            }
             self.resident_pages.insert(
                 ResidentPageKey {
                     tensor_idx,

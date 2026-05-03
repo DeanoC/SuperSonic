@@ -633,7 +633,14 @@ pub fn run_chained_decode_fast(
     )
 }
 
-pub type ExpertPrefetchCallback<'a> = dyn FnMut(usize, &[usize]) -> Result<()> + 'a;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertPrefetchPhase {
+    Lookahead,
+    Demand,
+}
+
+pub type ExpertPrefetchCallback<'a> =
+    dyn FnMut(ExpertPrefetchPhase, usize, &[usize]) -> Result<()> + 'a;
 
 /// Production chained decode with a host-side hook between router top-k and
 /// routed expert GEMVs. The hook is intended for sparse VMM MoE residency:
@@ -1087,6 +1094,9 @@ fn run_chained_decode_impl(
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
         if let Some(prefetch) = expert_prefetch.as_mut() {
+            prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
+                format!("lookahead prefetch routed experts (layer {layer_idx})")
+            })?;
             let params_stage1 = Qwen36MoeFfnStepParams {
                 stage: 1,
                 ..params_stage5
@@ -1112,7 +1122,7 @@ fn run_chained_decode_impl(
 
             let topk = download_topk_indices(&ffn_output_idx, geom.top_k as usize)
                 .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
-            prefetch(layer_idx, &topk)
+            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &topk)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
             reset_sync_buf(ordinal, &mut sync_buf)
                 .context("reset sync_buf (ffn after prefetch)")?;
