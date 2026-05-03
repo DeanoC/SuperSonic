@@ -1305,6 +1305,7 @@ struct MoeRouteTelemetry {
     observations_by_rank: Vec<u64>,
     resident_before_by_rank: Vec<u64>,
     repeated_previous_by_rank: Vec<u64>,
+    repeated_previous_rank_by_current_rank: Vec<Vec<u64>>,
     weight_sum_by_rank: Vec<f64>,
 }
 
@@ -1314,7 +1315,30 @@ impl MoeRouteTelemetry {
             observations_by_rank: vec![0; top_k],
             resident_before_by_rank: vec![0; top_k],
             repeated_previous_by_rank: vec![0; top_k],
+            repeated_previous_rank_by_current_rank: vec![vec![0; top_k]; top_k],
             weight_sum_by_rank: vec![0.0; top_k],
+        }
+    }
+
+    fn record_route_observation(&mut self, route: &ExpertRoute, previous_routes: &[usize]) {
+        if route.rank >= self.observations_by_rank.len() {
+            return;
+        }
+        self.observations_by_rank[route.rank] += 1;
+        self.weight_sum_by_rank[route.rank] += route.weight as f64;
+        if let Some(previous_rank) = previous_routes
+            .iter()
+            .position(|&expert_idx| expert_idx == route.expert_idx)
+        {
+            self.repeated_previous_by_rank[route.rank] += 1;
+            if let Some(row) = self
+                .repeated_previous_rank_by_current_rank
+                .get_mut(route.rank)
+            {
+                if let Some(cell) = row.get_mut(previous_rank) {
+                    *cell += 1;
+                }
+            }
         }
     }
 
@@ -1329,11 +1353,7 @@ impl MoeRouteTelemetry {
             if route.rank >= self.observations_by_rank.len() {
                 continue;
             }
-            self.observations_by_rank[route.rank] += 1;
-            self.weight_sum_by_rank[route.rank] += route.weight as f64;
-            if previous_routes.contains(&route.expert_idx) {
-                self.repeated_previous_by_rank[route.rank] += 1;
-            }
+            self.record_route_observation(route, previous_routes);
             let gate_up = MoeExpertKey {
                 layer_idx,
                 expert_idx: route.expert_idx,
@@ -1367,6 +1387,7 @@ impl MoeRouteTelemetry {
             "observations_by_rank": &self.observations_by_rank,
             "resident_before_by_rank": &self.resident_before_by_rank,
             "repeated_previous_by_rank": &self.repeated_previous_by_rank,
+            "repeated_previous_rank_by_current_rank": &self.repeated_previous_rank_by_current_rank,
             "avg_weight_by_rank": avg_weight_by_rank,
         })
     }
@@ -3955,8 +3976,8 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value,
-        MoeIslandPrefetchMode, Qwen36KvVmmMode,
+        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value, ExpertRoute,
+        MoeIslandPrefetchMode, MoeRouteTelemetry, Qwen36KvVmmMode,
     };
     use gpu_hal::Backend;
 
@@ -4095,5 +4116,49 @@ mod tests {
             8,
         )
         .is_err());
+    }
+
+    #[test]
+    fn moe_route_telemetry_records_previous_rank_transition_matrix() {
+        let mut telemetry = MoeRouteTelemetry::new(3);
+        let previous_routes = [7, 11, 13];
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 0,
+                expert_idx: 11,
+                weight: 0.5,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 1,
+                expert_idx: 7,
+                weight: 0.25,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 2,
+                expert_idx: 99,
+                weight: 0.125,
+            },
+            &previous_routes,
+        );
+
+        assert_eq!(telemetry.observations_by_rank, vec![1, 1, 1]);
+        assert_eq!(telemetry.repeated_previous_by_rank, vec![1, 1, 0]);
+        assert_eq!(
+            telemetry.repeated_previous_rank_by_current_rank,
+            vec![vec![0, 1, 0], vec![1, 0, 0], vec![0, 0, 0]]
+        );
+        assert_eq!(
+            telemetry
+                .to_json()
+                .get("repeated_previous_rank_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
+        );
     }
 }
