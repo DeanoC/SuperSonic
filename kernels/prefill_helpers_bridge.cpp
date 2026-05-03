@@ -412,7 +412,7 @@ extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
                 static_cast<int>(q_heads), static_cast<int>(kv_heads),
                 static_cast<int>(lookahead_count), static_cast<int>(kv_len),
                 static_cast<int>(head_dim), scale, q, k, scores);
-    default: return 320;
+    default: return 310;
     }
 }
 
