@@ -258,6 +258,30 @@ carry, so the bake is produced on a bigger box and distributed via
 GitHub releases (see [bake-distribution.md](bake-distribution.md));
 consumers pull it automatically on first run.
 
+**Sparse MoE VMM residency sweep** — measured 2026-05-03 on the same
+RX 7900 XTX with `tests/gfx1100/bench_qwen36_sparse_caps.py`, the
+canonical fox prompt, 16 generated tokens, INT4 weights, persistent decode,
+and `--emit-stage-timings`. The dense row is fully resident virtual expert
+slabs; sparse rows set `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` and capture the
+runner's VMM telemetry JSON.
+
+| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | peak pages | page misses | evicted pages | ids match |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| dense | 28.71 | 34.83 | 15.04 | 15.00 | 0.04 | - | - | - | yes |
+| cap8 | 137.95 | 7.25 | 0.07 | 0.03 | 0.04 | 16 | 13099 | 13083 | yes |
+| cap32 | 140.26 | 7.13 | 0.16 | 0.12 | 0.04 | 64 | 13099 | 13035 | yes |
+| cap64 | 152.71 | 6.55 | 0.29 | 0.25 | 0.04 | 128 | 13099 | 12971 | yes |
+| cap128 | 140.89 | 7.10 | 0.54 | 0.50 | 0.04 | 256 | 13099 | 12843 | yes |
+| cap256 | 142.70 | 7.01 | 1.04 | 1.00 | 0.04 | 512 | 13099 | 12587 | yes |
+| cap320 | 104.52 | 9.57 | 1.29 | 1.25 | 0.04 | 640 | 8357 | 7717 | yes |
+
+The curve is a memory win but not a throughput win: cap320 cuts total VMM
+resident memory from ~15.0 GiB to ~1.3 GiB, but it is still ~3.6× slower than
+dense on this short prompt because page misses dominate. Sparse islands remain
+an opt-in small-VRAM mode for now; the runtime should not auto-default to
+`SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` on gfx1100 until prefetching/reuse reduces
+the miss rate substantially.
+
 Reproduce:
 
 ```bash
