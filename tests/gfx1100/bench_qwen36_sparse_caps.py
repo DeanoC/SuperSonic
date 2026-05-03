@@ -15,11 +15,18 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+
+
+class BenchCase(NamedTuple):
+    label: str
+    cap: int | None
+    prefetch_mode: str | None
+    prefetch_ranks: str | None
 
 
 def parse_prefetch_rank_policy(raw: str) -> tuple[str, str | None]:
@@ -48,19 +55,75 @@ def parse_prefetch_rank_policies(raw: str) -> list[tuple[str, str | None]]:
     return deduped
 
 
+def parse_prefetch_mode_policy(raw: str) -> tuple[str, str | None]:
+    value = raw.strip().lower().replace("_", "-")
+    if value in {"none", "off", "disabled", "0"}:
+        return ("none", None)
+    if value in {"previous-token", "prev-token"}:
+        return ("previous-token", "previous-token")
+    if value in {
+        "previous-token-resident",
+        "prev-token-resident",
+        "resident-previous-token",
+    }:
+        return ("previous-token-resident", "previous-token-resident")
+    raise ValueError(f"unknown prefetch mode {raw!r}")
+
+
+def parse_prefetch_mode_policies(raw: str) -> list[tuple[str, str | None]]:
+    policies = [parse_prefetch_mode_policy(part) for part in raw.split(",") if part.strip()]
+    if not policies:
+        raise ValueError("prefetch mode policy list is empty")
+    seen: set[str] = set()
+    deduped: list[tuple[str, str | None]] = []
+    for label, mode in policies:
+        if label in seen:
+            continue
+        seen.add(label)
+        deduped.append((label, mode))
+    return deduped
+
+
 def build_cases(
     caps: list[int],
+    prefetch_mode_sweep: str | None,
     prefetch_rank_sweep: str | None,
+    prefetch_mode: str | None,
     prefetch_ranks: str | None,
-) -> list[tuple[str, int | None, str | None]]:
-    cases: list[tuple[str, int | None, str | None]] = [("dense", None, None)]
-    if prefetch_rank_sweep:
+) -> list[BenchCase]:
+    cases: list[BenchCase] = [BenchCase("dense", None, None, None)]
+    if prefetch_mode_sweep:
+        mode_policies = parse_prefetch_mode_policies(prefetch_mode_sweep)
+        rank_policies = (
+            parse_prefetch_rank_policies(prefetch_rank_sweep)
+            if prefetch_rank_sweep
+            else [parse_prefetch_rank_policy(prefetch_ranks or "all")]
+        )
+        for cap in caps:
+            emitted_disabled = False
+            for mode_label, mode in mode_policies:
+                if mode is None:
+                    if not emitted_disabled:
+                        cases.append(BenchCase(f"cap{cap}-none", cap, None, None))
+                        emitted_disabled = True
+                    continue
+                for rank_label, ranks in rank_policies:
+                    if ranks is None:
+                        if not emitted_disabled:
+                            cases.append(BenchCase(f"cap{cap}-none", cap, None, None))
+                            emitted_disabled = True
+                        continue
+                    cases.append(
+                        BenchCase(f"cap{cap}-{mode_label}-{rank_label}", cap, mode, ranks)
+                    )
+    elif prefetch_rank_sweep:
         rank_policies = parse_prefetch_rank_policies(prefetch_rank_sweep)
         for cap in caps:
             for policy_label, ranks in rank_policies:
-                cases.append((f"cap{cap}-{policy_label}", cap, ranks))
+                mode = prefetch_mode if ranks is not None else None
+                cases.append(BenchCase(f"cap{cap}-{policy_label}", cap, mode, ranks))
     else:
-        cases.extend((f"cap{cap}", cap, prefetch_ranks) for cap in caps)
+        cases.extend(BenchCase(f"cap{cap}", cap, prefetch_mode, prefetch_ranks) for cap in caps)
     return cases
 
 
@@ -144,9 +207,7 @@ def fmt_rank_transition_pct(
 
 def run_case(
     args: argparse.Namespace,
-    label: str,
-    cap: int | None,
-    prefetch_ranks: str | None,
+    case: BenchCase,
     tmp: Path,
     warmup: bool,
 ) -> dict[str, Any]:
@@ -157,16 +218,14 @@ def run_case(
     env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
-    telemetry_path = tmp / f"{label}_telemetry.json"
-    if cap is not None:
-        env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(cap)
+    telemetry_path = tmp / f"{case.label}_telemetry.json"
+    if case.cap is not None:
+        env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(case.cap)
         env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(telemetry_path)
-        if args.prefetch:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = args.prefetch
-        elif prefetch_ranks is not None:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = "previous-token"
-        if prefetch_ranks is not None:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = prefetch_ranks
+        if case.prefetch_mode:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = case.prefetch_mode
+        if case.prefetch_ranks is not None:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = case.prefetch_ranks
 
     cmd = [
         str(args.binary),
@@ -195,9 +254,10 @@ def run_case(
     )
     output = proc.stdout + proc.stderr
     row: dict[str, Any] = {
-        "label": label,
-        "cap_experts": cap,
-        "prefetch_ranks_requested": prefetch_ranks,
+        "label": case.label,
+        "cap_experts": case.cap,
+        "prefetch_mode_requested": case.prefetch_mode,
+        "prefetch_ranks_requested": case.prefetch_ranks,
         "returncode": proc.returncode,
         "generated_ids": parse_generated_ids(output),
         "stage": parse_stage_timings(output),
@@ -208,7 +268,7 @@ def run_case(
         row["error"] = output[-4000:]
         return row
 
-    if cap is None:
+    if case.cap is None:
         moe_resident = parse_mib_field(output, "routed expert slabs active", "resident")
         moe_reserved = parse_mib_field(output, "routed expert slabs active", "reserved")
         kv_resident = parse_mib_field(output, "KV active", "resident") or 0
@@ -289,6 +349,13 @@ def main() -> int:
         help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
     )
     parser.add_argument(
+        "--prefetch-mode-sweep",
+        help=(
+            "comma-separated sparse prefetch modes to sweep per cap, e.g. "
+            "disabled,previous-token,previous-token-resident"
+        ),
+    )
+    parser.add_argument(
         "--prefetch-ranks",
         help="set SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS for sparse cap rows",
     )
@@ -303,10 +370,12 @@ def main() -> int:
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_sparse_cap_sweep.md"))
     args = parser.parse_args()
 
-    if args.prefetch_rank_sweep and (args.prefetch or args.prefetch_ranks is not None):
-        parser.error("--prefetch-rank-sweep cannot be combined with --prefetch/--prefetch-ranks")
-    if args.prefetch_ranks is not None and not args.prefetch:
-        parser.error("--prefetch-ranks requires --prefetch")
+    if args.prefetch and args.prefetch_mode_sweep:
+        parser.error("--prefetch cannot be combined with --prefetch-mode-sweep")
+    if args.prefetch_rank_sweep and args.prefetch_ranks is not None:
+        parser.error("--prefetch-rank-sweep cannot be combined with --prefetch-ranks")
+    if args.prefetch_ranks is not None and not (args.prefetch or args.prefetch_mode_sweep):
+        parser.error("--prefetch-ranks requires --prefetch or --prefetch-mode-sweep")
     if args.prefetch_ranks is not None:
         try:
             _, ranks = parse_prefetch_rank_policy(args.prefetch_ranks)
@@ -325,17 +394,26 @@ def main() -> int:
     tmp = Path(tmp_owner.name)
 
     try:
-        cases = build_cases(caps, args.prefetch_rank_sweep, args.prefetch_ranks)
+        prefetch_mode = args.prefetch
+        if prefetch_mode is None and args.prefetch_rank_sweep and not args.prefetch_mode_sweep:
+            prefetch_mode = "previous-token"
+        cases = build_cases(
+            caps,
+            args.prefetch_mode_sweep,
+            args.prefetch_rank_sweep,
+            prefetch_mode,
+            args.prefetch_ranks,
+        )
     except ValueError as exc:
         parser.error(str(exc))
 
     rows: list[dict[str, Any]] = []
-    for label, cap, prefetch_ranks in cases:
+    for case in cases:
         if not args.no_warmup:
-            print(f"[warmup] {label}", flush=True)
-            run_case(args, label, cap, prefetch_ranks, tmp, warmup=True)
-        print(f"[bench] {label}", flush=True)
-        row = run_case(args, label, cap, prefetch_ranks, tmp, warmup=False)
+            print(f"[warmup] {case.label}", flush=True)
+            run_case(args, case, tmp, warmup=True)
+        print(f"[bench] {case.label}", flush=True)
+        row = run_case(args, case, tmp, warmup=False)
         if row.get("returncode") != 0:
             print(row.get("error") or row.get("stderr_tail") or "run failed", file=sys.stderr)
             return 1
@@ -354,13 +432,16 @@ def main() -> int:
         row["generated_ids_match"] = (row.get("generated_ids") or []) == dense_ids
 
     payload = {
-        "schema": "qwen36-moe-sparse-cap-sweep-v1",
+        "schema": "qwen36-moe-sparse-cap-sweep-v2",
         "model": "qwen3.6-35b-a3b",
         "model_dir": str(args.model_dir),
         "backend": args.backend,
         "prompt": args.prompt,
         "context_size": args.context_size,
         "max_new_tokens": args.max_new_tokens,
+        "prefetch": args.prefetch,
+        "prefetch_mode_sweep": args.prefetch_mode_sweep,
+        "prefetch_rank_sweep": args.prefetch_rank_sweep,
         "rows": rows,
     }
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

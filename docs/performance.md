@@ -282,12 +282,13 @@ an opt-in small-VRAM mode for now; the runtime should not auto-default to
 `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` on gfx1100 until prefetching/reuse reduces
 the miss rate substantially.
 
-The sweep helper can also compare previous-token prefetch policies in one run:
-add `--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across
-no lookahead, rank-limited lookahead, and full top-k lookahead rows.
-Use `--prefetch previous-token-resident --prefetch-ranks 1` to isolate LRU
-refresh of already resident previous-token routes without uploading missing
-pages.
+The sweep helper can compare prefetch policies in one run. Use
+`--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across no
+lookahead, rank-limited lookahead, and full top-k lookahead rows. Use
+`--prefetch-mode-sweep disabled,previous-token,previous-token-resident`
+together with `--prefetch-rank-sweep none,1,all` to compare normal
+previous-token prefetch with resident-only LRU refresh without hand-running
+separate commands.
 
 **Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
 non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,
