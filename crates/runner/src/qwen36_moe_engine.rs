@@ -1074,11 +1074,52 @@ fn load_layer_buffers(
         // FP8 path: same shape but U8 (FP8 E4M3 bytes) plus F32 scales
         // [num_kv_heads, kv_max_t] for K and V, plus optional BF16 sidecar
         // [num_kv_heads, sidecar_window, head_dim] when enabled.
+        // VMM-FP8 path (SUPERSONIC_VMM_KV=1): same as FP8 but K/V are
+        // VirtualBuffer reservations with a mapped prefix; dense k/v are None.
         let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
         let kv_cache = if kv_max_t > 0 {
             let num_kv_heads = geom.num_kv_heads as usize;
             let head_dim = geom.head_dim as usize;
-            let (k, v, kv_scale_k, kv_scale_v) = if kv_fp8 {
+
+            let want_vmm = std::env::var_os("SUPERSONIC_VMM_KV")
+                .and_then(|v| v.into_string().ok())
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let vmm_active = kv_fp8
+                && want_vmm
+                && gpu_hal::vmm_is_supported(gpu_hal::current_backend(), ordinal);
+
+            let (k, v, virtual_kv_cache_k, virtual_kv_cache_v, virtual_kv_max_t,
+                 kv_scale_k, kv_scale_v) = if vmm_active {
+                // VMM-backed: reserve full logical capacity, map prefix at
+                // kv_chunk_size (configured via the registry; default 256).
+                // Subsequent decode growth maps additional ranges via
+                // `map_range_bytes`.
+                let kv_chunk_size = 256usize; // matches Qwen36MoeKernelParams default
+                let map_prefix_bytes = kv_chunk_size * kv_dim;
+                let vk = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
+                    ordinal,
+                    ScalarType::U8,
+                    &[kv_max_t, kv_dim],
+                    map_prefix_bytes,
+                    gpu_hal::VirtualBacking::Discard,
+                )
+                .with_context(|| format!("vmm reserve kv_cache_k (layer {layer_idx})"))?;
+                let vv = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
+                    ordinal,
+                    ScalarType::U8,
+                    &[kv_max_t, kv_dim],
+                    map_prefix_bytes,
+                    gpu_hal::VirtualBacking::Discard,
+                )
+                .with_context(|| format!("vmm reserve kv_cache_v (layer {layer_idx})"))?;
+                let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
+                (None, None, Some(vk), Some(vv), Some(kv_max_t), Some(sk), Some(sv))
+            } else if kv_fp8 {
+                // dense FP8 path
                 let k = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
                     .with_context(|| format!("alloc kv_cache_k FP8 (layer {layer_idx})"))?;
                 let v = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
@@ -1087,13 +1128,14 @@ fn load_layer_buffers(
                     .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
                 let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
                     .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
-                (k, v, Some(sk), Some(sv))
+                (Some(k), Some(v), None, None, None, Some(sk), Some(sv))
             } else {
+                // BF16 path
                 let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
                     .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
                 let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
                     .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
-                (k, v, None, None)
+                (Some(k), Some(v), None, None, None, None, None)
             };
             let (kv_shadow_k, kv_shadow_v) = if kv_fp8
                 && qwen35::state::kv_fp8_bf16_sidecar_enabled()
@@ -1129,6 +1171,9 @@ fn load_layer_buffers(
                 kv_shadow_k,
                 kv_shadow_v,
                 kv_shadow_start: -1,
+                virtual_kv_cache_k,
+                virtual_kv_cache_v,
+                virtual_kv_max_t,
             })
         } else {
             None
@@ -1438,8 +1483,8 @@ fn load_mtp_buffers(
         let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
             .context("alloc mtp kv_cache_v")?;
         Some(FullAttnKvCache {
-            k,
-            v,
+            k: Some(k),
+            v: Some(v),
             kv_max_t: kv_max_t as i32,
             // MTP keeps BF16 KV — KV-FP8 + MTP combo not yet validated.
             kv_scale_k: None,
@@ -1447,6 +1492,9 @@ fn load_mtp_buffers(
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: -1,
+            virtual_kv_cache_k: None,
+            virtual_kv_cache_v: None,
+            virtual_kv_max_t: None,
         })
     } else {
         None

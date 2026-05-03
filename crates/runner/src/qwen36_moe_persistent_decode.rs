@@ -289,8 +289,8 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
                 d.k_norm_w = k_norm_w.as_ptr() as *const c_void;
                 d.o_proj_w = o_proj_w.as_ptr() as *const c_void;
                 if let Some(c) = kv_cache.as_mut() {
-                    d.kv_cache_k = c.k.as_mut_ptr();
-                    d.kv_cache_v = c.v.as_mut_ptr();
+                    d.kv_cache_k = c.k_device_ptr();
+                    d.kv_cache_v = c.v_device_ptr();
                     d.kv_max_t = c.kv_max_t;
                 }
             }

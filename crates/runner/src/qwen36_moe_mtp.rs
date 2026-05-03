@@ -203,8 +203,8 @@ pub fn run_mtp_layer_step(
 
     // ---- attention ----------------------------------------------------
     reset_sync_buf(ordinal, &mut scratch.sync_buf).context("reset sync_buf (mtp attn)")?;
-    let kv_k_ptr = kv.k.as_mut_ptr();
-    let kv_v_ptr = kv.v.as_mut_ptr();
+    let kv_k_ptr = kv.k_device_ptr();
+    let kv_v_ptr = kv.v_device_ptr();
     let kv_max_t = kv.kv_max_t;
     let attn_params = Qwen36MoeAttnStepParams {
         stage: 5,

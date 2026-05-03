@@ -124,7 +124,8 @@ pub enum AttnLayerBuffers {
 /// Lifetime tied to one decode session.
 ///
 /// When KV-FP8 is active (`kv_scale_k.is_some()`):
-///   - `k` and `v` are dtype `U8` with the same shape; the kernel
+///   - `k` and `v` are dtype `U8` with the same shape (or `None` when
+///     VMM-backed and `virtual_kv_cache_k` is `Some`); the kernel
 ///     reinterprets the pointer in place to read/write FP8 E4M3 bytes.
 ///   - `kv_scale_k` / `kv_scale_v` are F32 `[num_kv_heads, kv_max_t]`
 ///     per-(head, position) absmax scales.
@@ -133,9 +134,16 @@ pub enum AttnLayerBuffers {
 ///     parity-sensitive recent reads.
 ///   - `kv_shadow_start` is the first absolute position covered by the
 ///     sidecar (`-1` when the sidecar is disabled).
+///
+/// Exactly one of `k` / `virtual_kv_cache_k` is `Some` (same for V).
+/// `virtual_kv_cache_k` is only `Some` when KV-FP8 is on AND
+/// `SUPERSONIC_VMM_KV=1` was set AND the backend supports VMM.
 pub struct FullAttnKvCache {
-    pub k: GpuBuffer,
-    pub v: GpuBuffer,
+    /// `Some` when VMM-backed KV is OFF (the default). `None` when
+    /// `virtual_kv_cache_k` is `Some` (VMM-backed). Exactly one of
+    /// `k` / `virtual_kv_cache_k` is `Some`. Same for V.
+    pub k: Option<GpuBuffer>,
+    pub v: Option<GpuBuffer>,
     pub kv_max_t: i32,
     /// Some only when KV-FP8 is on.
     pub kv_scale_k: Option<GpuBuffer>,
@@ -146,6 +154,38 @@ pub struct FullAttnKvCache {
     /// First absolute KV position covered by the sidecar (`-1` when
     /// the sidecar is disabled).
     pub kv_shadow_start: i32,
+    /// `Some` when `SUPERSONIC_VMM_KV=1` was set at allocation time AND
+    /// the backend supports VMM AND `kv_fp8` is on. Mutually exclusive
+    /// with `k` (exactly one is `Some`).
+    pub virtual_kv_cache_k: Option<gpu_hal::VirtualBuffer>,
+    pub virtual_kv_cache_v: Option<gpu_hal::VirtualBuffer>,
+    /// The VMM reservation's logical max_T (matches `kv_max_t` above).
+    /// Carried separately for symmetry with the qwen35 KV-VMM pattern.
+    pub virtual_kv_max_t: Option<usize>,
+}
+
+impl FullAttnKvCache {
+    /// Device pointer to the K cache, regardless of VMM vs dense backing.
+    pub fn k_device_ptr(&mut self) -> *mut std::ffi::c_void {
+        if let Some(vk) = self.virtual_kv_cache_k.as_mut() {
+            vk.as_mut_ptr()
+        } else if let Some(b) = self.k.as_mut() {
+            b.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    /// Device pointer to the V cache, regardless of VMM vs dense backing.
+    pub fn v_device_ptr(&mut self) -> *mut std::ffi::c_void {
+        if let Some(vv) = self.virtual_kv_cache_v.as_mut() {
+            vv.as_mut_ptr()
+        } else if let Some(b) = self.v.as_mut() {
+            b.as_mut_ptr()
+        } else {
+            std::ptr::null_mut()
+        }
+    }
 }
 
 /// INT4 sidecars for a full-attention layer. Mirrors the per-block FFI
@@ -664,7 +704,7 @@ pub fn run_chained_decode_with_options(
                     cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
                 };
                 let (kv_k_ptr, kv_v_ptr, kv_max_t) = match kv_cache {
-                    Some(c) => (c.k.as_mut_ptr(), c.v.as_mut_ptr(), c.kv_max_t),
+                    Some(c) => (c.k_device_ptr(), c.v_device_ptr(), c.kv_max_t),
                     None => (ptr::null_mut(), ptr::null_mut(), 0),
                 };
                 let weights = Qwen36MoeAttnStepWeights {
