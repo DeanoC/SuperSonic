@@ -6,7 +6,7 @@ use qwen36_moe::config::TextConfig;
 use crate::qwen36_moe_decode::{AttnLayerBuffers, LayerBuffers, MultiLayerGeom};
 use crate::qwen36_moe_layers::{load_all_layer_buffers, Qwen36WeightMode};
 use crate::qwen36_moe_residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
-use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, VirtualKvStats};
+use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry, VirtualKvStats};
 
 const MIB: f64 = (1024 * 1024) as f64;
 
@@ -34,6 +34,16 @@ pub(crate) struct Qwen36DecodeLayers {
     pub(crate) layers: Vec<LayerBuffers>,
     pub(crate) moe_expert_arena: Option<VirtualArena>,
     pub(crate) moe_expert_residency: Option<MoeExpertResidencyManager>,
+}
+
+pub(crate) struct MoeRuntimeConfig {
+    pub(crate) vmm_mode: MoeExpertVmmMode,
+    pub(crate) island_cap_experts: Option<usize>,
+    pub(crate) sparse_requested: bool,
+    pub(crate) prefetch_mode: MoeIslandPrefetchMode,
+    pub(crate) prefetch_ranks: usize,
+    pub(crate) transition_min_observations: u32,
+    pub(crate) sparse_telemetry: Option<MoeSparseTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +138,60 @@ pub(crate) fn moe_island_prefetch_transition_min_observations(
 ) -> Result<u32> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
     moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
+}
+
+pub(crate) fn prepare_moe_runtime_config(
+    speculative_decode: bool,
+    persistent_decode: bool,
+    top_k: usize,
+) -> Result<MoeRuntimeConfig> {
+    let vmm_mode = MoeExpertVmmMode::from_env()?;
+    let island_cap_experts = moe_island_cap_experts_from_env()?;
+    if island_cap_experts.is_some() && speculative_decode {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
+        );
+    }
+    if island_cap_experts.is_some() && vmm_mode == MoeExpertVmmMode::Disabled {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS requires VMM expert slabs; unset SUPERSONIC_VMM_MOE_ISLANDS=0"
+        );
+    }
+
+    let sparse_requested = island_cap_experts.is_some();
+    let prefetch_mode = MoeIslandPrefetchMode::from_env()?;
+    let prefetch_ranks = moe_island_prefetch_ranks_from_env(prefetch_mode, top_k)?;
+    let transition_min_observations =
+        moe_island_prefetch_transition_min_observations(prefetch_mode)?;
+    if prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_requested {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+
+    let sparse_telemetry = MoeSparseTelemetry::from_env(
+        sparse_requested,
+        persistent_decode,
+        prefetch_mode,
+        prefetch_ranks,
+    )?;
+    if let Some(path) = sparse_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.dump_path.as_ref())
+    {
+        println!(
+            "  [vmm] sparse MoE residency telemetry will be written to {}",
+            path.display()
+        );
+    }
+
+    Ok(MoeRuntimeConfig {
+        vmm_mode,
+        island_cap_experts,
+        sparse_requested,
+        prefetch_mode,
+        prefetch_ranks,
+        transition_min_observations,
+        sparse_telemetry,
+    })
 }
 
 pub(crate) fn qwen36_kv_vmm_mode_from_env_value(

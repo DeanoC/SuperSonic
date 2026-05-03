@@ -42,15 +42,13 @@ use crate::qwen36_moe_speculative::{
 };
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::qwen36_moe_telemetry::{
-    print_and_write_moe_residency_summary, MoeIslandPrefetchMode, MoeRouteTelemetry,
-    MoeSparseTelemetry, MoeSparseTelemetrySnapshot, MoeTransitionPredictor,
+    print_and_write_moe_residency_summary, MoeRouteTelemetry, MoeSparseTelemetrySnapshot,
+    MoeTransitionPredictor,
 };
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
-    load_decode_layers_with_vmm_strategy, moe_island_cap_experts_from_env,
-    moe_island_prefetch_ranks_from_env, moe_island_prefetch_transition_min_observations,
+    load_decode_layers_with_vmm_strategy, prepare_moe_runtime_config,
     print_virtual_kv_stats_if_active, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
-    MoeExpertVmmMode,
 };
 use crate::registry::RegistryEntry;
 
@@ -240,42 +238,8 @@ fn decode_text(
         kv_max_t,
     );
 
-    let moe_vmm_mode = MoeExpertVmmMode::from_env()?;
-    let moe_island_cap_experts = moe_island_cap_experts_from_env()?;
-    if moe_island_cap_experts.is_some() && speculative_decode {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
-        );
-    }
-    if moe_island_cap_experts.is_some() && moe_vmm_mode == MoeExpertVmmMode::Disabled {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS requires VMM expert slabs; unset SUPERSONIC_VMM_MOE_ISLANDS=0"
-        );
-    }
-    let sparse_moe_requested = moe_island_cap_experts.is_some();
-    let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
-    let moe_prefetch_ranks =
-        moe_island_prefetch_ranks_from_env(moe_prefetch_mode, geom.top_k as usize)?;
-    let moe_transition_min_observations =
-        moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
-    if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
-    }
-    let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(
-        sparse_moe_requested,
-        persistent_decode,
-        moe_prefetch_mode,
-        moe_prefetch_ranks,
-    )?;
-    if let Some(path) = moe_sparse_telemetry
-        .as_ref()
-        .and_then(|telemetry| telemetry.dump_path.as_ref())
-    {
-        println!(
-            "  [vmm] sparse MoE residency telemetry will be written to {}",
-            path.display()
-        );
-    }
+    let mut moe_runtime =
+        prepare_moe_runtime_config(speculative_decode, persistent_decode, geom.top_k as usize)?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     let loaded_layers = load_decode_layers_with_vmm_strategy(
         &store,
@@ -288,11 +252,11 @@ fn decode_text(
         kv_max_t,
         kv_fp8,
         kv_vmm,
-        moe_vmm_mode,
-        moe_island_cap_experts,
-        moe_prefetch_mode,
-        moe_prefetch_ranks,
-        moe_transition_min_observations,
+        moe_runtime.vmm_mode,
+        moe_runtime.island_cap_experts,
+        moe_runtime.prefetch_mode,
+        moe_runtime.prefetch_ranks,
+        moe_runtime.transition_min_observations,
         persistent_decode,
     )?;
     let mut layers = loaded_layers.layers;
@@ -352,14 +316,19 @@ fn decode_text(
     let mut stage_timings = Qwen36StageTimingTotals::default();
     let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
         vec![Vec::new(); geom.num_layers as usize];
-    let mut moe_route_telemetry =
-        sparse_moe_requested.then(|| MoeRouteTelemetry::new(geom.top_k as usize));
-    let mut moe_transition_predictors = moe_prefetch_mode.transition_weighted().then(|| {
-        vec![
-            MoeTransitionPredictor::new(geom.top_k as usize, moe_transition_min_observations,);
-            geom.num_layers as usize
-        ]
-    });
+    let mut moe_route_telemetry = moe_runtime
+        .sparse_requested
+        .then(|| MoeRouteTelemetry::new(geom.top_k as usize));
+    let mut moe_transition_predictors =
+        moe_runtime.prefetch_mode.transition_weighted().then(|| {
+            vec![
+                MoeTransitionPredictor::new(
+                    geom.top_k as usize,
+                    moe_runtime.transition_min_observations,
+                );
+                geom.num_layers as usize
+            ]
+        });
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -421,7 +390,7 @@ fn decode_text(
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
         let track_moe_routes =
-            moe_prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
+            moe_runtime.prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
         let mut next_moe_topk_by_layer = if track_moe_routes {
             previous_moe_topk_by_layer.clone()
         } else {
@@ -442,8 +411,8 @@ fn decode_text(
                     handle_moe_expert_prefetch(
                         manager,
                         &store,
-                        moe_prefetch_mode,
-                        moe_prefetch_ranks,
+                        moe_runtime.prefetch_mode,
+                        moe_runtime.prefetch_ranks,
                         &previous_moe_topk_by_layer,
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
@@ -487,8 +456,8 @@ fn decode_text(
                     handle_moe_expert_prefetch(
                         manager,
                         &store,
-                        moe_prefetch_mode,
-                        moe_prefetch_ranks,
+                        moe_runtime.prefetch_mode,
+                        moe_runtime.prefetch_ranks,
                         &previous_moe_topk_by_layer,
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
@@ -524,7 +493,7 @@ fn decode_text(
             previous_moe_topk_by_layer = next_moe_topk_by_layer;
         }
         if let (Some(telemetry), Some(before), Some(manager)) = (
-            moe_sparse_telemetry.as_mut(),
+            moe_runtime.sparse_telemetry.as_mut(),
             moe_telemetry_before,
             _moe_expert_residency.as_ref(),
         ) {
@@ -915,7 +884,7 @@ fn decode_text(
             virtual_kv_stats,
             &generated_ids,
             moe_route_telemetry.as_ref(),
-            moe_sparse_telemetry.as_ref(),
+            moe_runtime.sparse_telemetry.as_ref(),
         )?;
     }
     stage_timings.print_if_requested(emit_stage_timings);
