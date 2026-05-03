@@ -296,6 +296,13 @@ extern "C" {
         num_layers: c_int,
         layers: *const Qwen36MoeDecodeLayerDesc,
         int4_scales: *const Qwen36MoeInt4ScaleDesc,
+        // Null when KV-FP8 is off. Otherwise an array of `num_layers`
+        // entries parallel to `layers`; full-attention layers populate
+        // `kv_scale_k` / `kv_scale_v`, linear-attention layers leave
+        // both null. The kernel ignores entries whose `kv_scale_k` is
+        // null even on full-attn layers (defensive — should not happen
+        // in practice).
+        kv_fp8_descs: *const Qwen36MoeKVCacheFp8Desc,
         hidden: c_int,
         num_heads: c_int,
         num_kv_heads: c_int,
@@ -813,6 +820,7 @@ pub fn persistent_decode_launch(
                     num_layers as c_int,
                     layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
                     int4_ptr,
+                    std::ptr::null::<Qwen36MoeKVCacheFp8Desc>(),
                     geom.hidden,
                     geom.num_heads,
                     geom.num_kv_heads,
