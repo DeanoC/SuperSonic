@@ -118,7 +118,8 @@ pub struct Qwen36MoeDecodeLayerDesc {
     /// the sidecar is disabled. The kernel reads from the sidecar (instead
     /// of dequantising FP8) when `t >= kv_shadow_start`.
     pub kv_shadow_k: *mut c_void,
-    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`.
+    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Paired with
+    /// [`Self::kv_shadow_k`]; null under the same conditions.
     pub kv_shadow_v: *mut c_void,
     /// First absolute KV position covered by the sidecar. `-1` when the
     /// sidecar is disabled (or no positions are covered yet); the kernel
@@ -1903,13 +1904,16 @@ mod tests {
     #[test]
     fn descriptor_layout_offsets_documented() {
         // Pin the size so a future field-reorder is loud. If you need to
-        // grow the struct, append fields and update this number — never
-        // reorder existing ones.
+        // grow the struct, append fields and update this exact number —
+        // never reorder existing ones. Loose ranges (e.g. [256, 512])
+        // silently absorbed forgotten field appends; we use exact sizes
+        // and the matching C++ `static_assert` ranges in
+        // `kernels/qwen36_moe_bridge.cpp` to catch drift on both sides.
         // (Numbers verified on x86_64 Linux. Pointers are 8 bytes.)
         let sz = size_of::<Qwen36MoeDecodeLayerDesc>();
-        assert!(
-            sz >= 256 && sz <= 512,
-            "Qwen36MoeDecodeLayerDesc size drift: got {sz} bytes",
+        assert_eq!(
+            sz, 344,
+            "Qwen36MoeDecodeLayerDesc size drift: got {sz} bytes (expected 344)",
         );
 
         let int4_sz = size_of::<Qwen36MoeInt4ScaleDesc>();
@@ -7200,11 +7204,14 @@ mod tests {
 
 // ABI sanity — every time `Qwen36MoeDecodeLayerDesc` grows, both this
 // const and the C++ side `static_assert` in `kernels/qwen36_moe_bridge.cpp`
-// must move together. Keep the values pinned: a silent drift here is the
-// most common Rust↔C++ bug class for this codebase.
+// must move together. Keep the bound pinned tightly: a loose range
+// (e.g. [256, 512]) silently absorbs forgotten field appends. If you
+// add or remove a field, update this exact size and the C++ side in
+// the same commit.
 #[cfg(target_pointer_width = "64")]
 const _ASSERT_DECODE_LAYER_DESC_SIZE: () = {
-    // 24 bytes added (2 ptrs + 1 int padded to 8 bytes).
-    assert!(std::mem::size_of::<Qwen36MoeDecodeLayerDesc>() <= 512);
-    assert!(std::mem::size_of::<Qwen36MoeDecodeLayerDesc>() >= 256);
+    let sz = std::mem::size_of::<Qwen36MoeDecodeLayerDesc>();
+    assert!(sz == _DECODE_LAYER_DESC_EXPECTED_BYTES);
 };
+#[cfg(target_pointer_width = "64")]
+const _DECODE_LAYER_DESC_EXPECTED_BYTES: usize = 344;
