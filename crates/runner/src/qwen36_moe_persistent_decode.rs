@@ -433,16 +433,16 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
                         .as_mut()
                         .map(|b| b.as_mut_ptr())
                         .unwrap_or(std::ptr::null_mut());
-                    // Sidecar window is forced equal to kv_max_t in v1 —
-                    // every position is covered, so the kernel guard
-                    // `t >= kv_shadow_start && kv_shadow_start >= 0`
-                    // resolves to "always read sidecar" once any sidecar
-                    // buffer is allocated. Set start = 0 from the get-go;
-                    // the descs are uploaded once and never re-uploaded.
-                    // (`c.kv_shadow_start` is left at -1 in the host
-                    // struct for v1 — it's only meaningful if a future
-                    // windowed-mode lands and the kernel grows a
-                    // kv_shadow_window arg.)
+                    d.kv_shadow_window = if c.kv_shadow_k.is_some() {
+                        c.kv_shadow_window
+                    } else {
+                        0
+                    };
+                    // The descriptor is uploaded once. For rolling windows
+                    // the kernel derives the active start each step from
+                    // `position + 1 - kv_shadow_window`, with this field as
+                    // a lower bound. A zero start preserves the previous
+                    // full-sidecar behavior when window == kv_max_t.
                     d.kv_shadow_start = if c.kv_shadow_k.is_some() { 0 } else { -1 };
                 }
             }

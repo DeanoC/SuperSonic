@@ -155,6 +155,7 @@ fn load_mtp_buffers_from_bake(
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: -1,
+            kv_shadow_window: 0,
             virtual_kv_cache_k: None,
             virtual_kv_cache_v: None,
             virtual_kv_max_t: None,

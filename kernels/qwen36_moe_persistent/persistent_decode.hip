@@ -239,6 +239,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 /* kv_shadow_k */ d.kv_shadow_k,
                 /* kv_shadow_v */ d.kv_shadow_v,
                 /* kv_shadow_start */ d.kv_shadow_start,
+                /* kv_shadow_window */ d.kv_shadow_window,
                 d.kv_max_t,
                 counters, barrier_counter, barrier_flag);
         } else {

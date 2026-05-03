@@ -24,9 +24,8 @@ pub struct StateLayout {
     /// Bytes per (head, position) element for the BF16 sidecar. 2 when
     /// kv_fp8 is on AND a sidecar window is configured, 0 otherwise.
     pub kv_fp8_sidecar_bytes_per_token: u64,
-    /// Number of positions covered by the BF16 sidecar (per layer per
-    /// kv_head). 0 when the sidecar is disabled. v1 forces this to
-    /// equal `context_tokens` when the sidecar is on.
+    /// Number of recent positions covered by the rolling BF16 sidecar
+    /// (per layer per kv_head). 0 when the sidecar is disabled.
     pub kv_fp8_sidecar_window: u64,
 }
 

@@ -135,6 +135,9 @@ pub enum AttnLayerBuffers {
 ///     parity-sensitive recent reads.
 ///   - `kv_shadow_start` is the first absolute position covered by the
 ///     sidecar (`-1` when the sidecar is disabled).
+///   - `kv_shadow_window` is the sidecar's rolling capacity in positions
+///     (`0` when disabled). The kernel computes the active start from the
+///     current decode position, so descriptors do not need per-step updates.
 ///
 /// Exactly one of `k` / `virtual_kv_cache_k` is `Some` (same for V).
 /// `virtual_kv_cache_k` is `Some` when `SUPERSONIC_VMM_KV=1` was set
@@ -155,6 +158,8 @@ pub struct FullAttnKvCache {
     /// First absolute KV position covered by the sidecar (`-1` when
     /// the sidecar is disabled).
     pub kv_shadow_start: i32,
+    /// Rolling sidecar capacity in positions (`0` when disabled).
+    pub kv_shadow_window: i32,
     /// `Some` when `SUPERSONIC_VMM_KV=1` was set at allocation time AND
     /// the backend supports VMM. Mutually exclusive with `k` (exactly
     /// one is `Some`).
