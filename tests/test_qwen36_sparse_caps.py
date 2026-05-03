@@ -119,6 +119,45 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
         self.assertEqual(fmt(summary, current_rank=1, previous_rank=1), "80.0%")
         self.assertEqual(fmt({}, current_rank=0, previous_rank=0), "-")
 
+    def test_transition_summary_formatters_use_derived_fields(self):
+        summary = {
+            "observations_by_rank": [10, 5],
+            "same_rank_repeat_probability_by_rank": [0.3, 0.8],
+            "repeated_current_probability_by_previous_rank": [0.4, 0.6],
+            "best_transition": {
+                "previous_rank": 1,
+                "current_rank": 0,
+                "probability_by_current_rank": 0.2,
+            },
+        }
+        self.assertEqual(
+            bench_qwen36_sparse_caps.fmt_same_rank_repeat_pct(summary, rank=0),
+            "30.0%",
+        )
+        self.assertEqual(
+            bench_qwen36_sparse_caps.fmt_previous_rank_reused_pct(summary, previous_rank=1),
+            "60.0%",
+        )
+        self.assertEqual(
+            bench_qwen36_sparse_caps.fmt_best_transition(summary),
+            "1->0 (20.0%)",
+        )
+
+    def test_transition_summary_formatters_fallback_to_matrix(self):
+        summary = {
+            "observations_by_rank": [10, 5],
+            "repeated_previous_rank_by_current_rank": [[3, 2], [1, 4]],
+        }
+        self.assertEqual(
+            bench_qwen36_sparse_caps.fmt_same_rank_repeat_pct(summary, rank=0),
+            "30.0%",
+        )
+        self.assertEqual(
+            bench_qwen36_sparse_caps.fmt_previous_rank_reused_pct(summary, previous_rank=0),
+            "40.0%",
+        )
+        self.assertEqual(bench_qwen36_sparse_caps.fmt_best_transition({}), "-")
+
 
 if __name__ == "__main__":
     unittest.main()

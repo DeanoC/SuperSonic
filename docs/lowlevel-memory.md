@@ -102,7 +102,8 @@ Current scope:
   at most `N` experts' two routed projections tracked resident at once. Sparse
   telemetry records ordered router rank summaries, including per-rank resident
   hits before demand loading, previous-token repeats, previous-rank to
-  current-rank repeat transitions, and average router weight.
+  current-rank repeat transitions, derived transition probabilities, and
+  average router weight.
 - `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
   previous-token routed-expert lookahead for sparse MoE islands. It preloads
   each layer's previous top-k before that layer's router runs. Set

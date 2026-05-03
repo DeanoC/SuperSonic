@@ -3797,5 +3797,41 @@ mod tests {
                 .unwrap(),
             &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
         );
+        let json = telemetry.to_json();
+        assert_eq!(
+            json.get("repeated_previous_probability_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("same_rank_repeat_probability_by_rank").unwrap(),
+            &serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            json.get("repeated_current_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 1, 0])
+        );
+        assert_eq!(
+            json.get("repeated_current_probability_by_previous_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("best_previous_rank_by_current_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_current_rank_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_transition").unwrap(),
+            &serde_json::json!({
+                "current_rank": 0,
+                "previous_rank": 1,
+                "count": 1,
+                "probability_by_current_rank": 1.0,
+            })
+        );
     }
 }

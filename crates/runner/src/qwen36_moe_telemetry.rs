@@ -173,6 +173,14 @@ impl MoeRouteTelemetry {
     }
 
     pub(crate) fn to_json(&self) -> serde_json::Value {
+        fn probability(count: u64, observations: u64) -> f64 {
+            if observations == 0 {
+                0.0
+            } else {
+                count as f64 / observations as f64
+            }
+        }
+
         let avg_weight_by_rank: Vec<f64> = self
             .weight_sum_by_rank
             .iter()
@@ -185,11 +193,107 @@ impl MoeRouteTelemetry {
                 }
             })
             .collect();
+        let repeated_previous_probability_by_current_rank: Vec<f64> = self
+            .repeated_previous_by_rank
+            .iter()
+            .zip(&self.observations_by_rank)
+            .map(|(count, observations)| probability(*count, *observations))
+            .collect();
+        let same_rank_repeat_probability_by_rank: Vec<f64> = self
+            .repeated_previous_rank_by_current_rank
+            .iter()
+            .enumerate()
+            .map(|(rank, row)| {
+                probability(
+                    row.get(rank).copied().unwrap_or(0),
+                    self.observations_by_rank.get(rank).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        let top_k = self.observations_by_rank.len();
+        let mut repeated_current_by_previous_rank = vec![0u64; top_k];
+        let mut best_previous_rank_by_current_rank = vec![None; top_k];
+        let mut best_current_rank_by_previous_rank = vec![None; top_k];
+        let mut best_transition: Option<(usize, usize, u64)> = None;
+        for (current_rank, row) in self
+            .repeated_previous_rank_by_current_rank
+            .iter()
+            .enumerate()
+        {
+            let mut best_previous: Option<(usize, u64)> = None;
+            for (previous_rank, &count) in row.iter().enumerate() {
+                if previous_rank < repeated_current_by_previous_rank.len() {
+                    repeated_current_by_previous_rank[previous_rank] += count;
+                }
+                if count > 0
+                    && best_previous
+                        .map(|(_, best_count)| count > best_count)
+                        .unwrap_or(true)
+                {
+                    best_previous = Some((previous_rank, count));
+                }
+                if count > 0
+                    && best_transition
+                        .map(|(_, _, best_count)| count > best_count)
+                        .unwrap_or(true)
+                {
+                    best_transition = Some((current_rank, previous_rank, count));
+                }
+            }
+            best_previous_rank_by_current_rank[current_rank] =
+                best_previous.map(|(previous_rank, _)| previous_rank);
+        }
+        for previous_rank in 0..top_k {
+            let mut best_current: Option<(usize, u64)> = None;
+            for (current_rank, row) in self
+                .repeated_previous_rank_by_current_rank
+                .iter()
+                .enumerate()
+            {
+                let count = row.get(previous_rank).copied().unwrap_or(0);
+                if count > 0
+                    && best_current
+                        .map(|(_, best_count)| count > best_count)
+                        .unwrap_or(true)
+                {
+                    best_current = Some((current_rank, count));
+                }
+            }
+            best_current_rank_by_previous_rank[previous_rank] =
+                best_current.map(|(current_rank, _)| current_rank);
+        }
+        let repeated_current_probability_by_previous_rank: Vec<f64> =
+            repeated_current_by_previous_rank
+                .iter()
+                .zip(&self.observations_by_rank)
+                .map(|(count, observations)| probability(*count, *observations))
+                .collect();
+        let best_transition_json = best_transition.map(|(current_rank, previous_rank, count)| {
+            serde_json::json!({
+                "current_rank": current_rank,
+                "previous_rank": previous_rank,
+                "count": count,
+                "probability_by_current_rank": probability(
+                    count,
+                    self.observations_by_rank
+                        .get(current_rank)
+                        .copied()
+                        .unwrap_or(0),
+                ),
+            })
+        });
         serde_json::json!({
             "observations_by_rank": &self.observations_by_rank,
             "resident_before_by_rank": &self.resident_before_by_rank,
             "repeated_previous_by_rank": &self.repeated_previous_by_rank,
+            "repeated_previous_probability_by_current_rank": repeated_previous_probability_by_current_rank,
             "repeated_previous_rank_by_current_rank": &self.repeated_previous_rank_by_current_rank,
+            "same_rank_repeat_probability_by_rank": same_rank_repeat_probability_by_rank,
+            "repeated_current_by_previous_rank": repeated_current_by_previous_rank,
+            "repeated_current_probability_by_previous_rank": repeated_current_probability_by_previous_rank,
+            "best_previous_rank_by_current_rank": best_previous_rank_by_current_rank,
+            "best_current_rank_by_previous_rank": best_current_rank_by_previous_rank,
+            "best_transition": best_transition_json,
             "avg_weight_by_rank": avg_weight_by_rank,
         })
     }
