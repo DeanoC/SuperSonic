@@ -380,6 +380,17 @@ mod tests {
     use super::*;
     use gpu_hal::{Backend, VirtualAllocationRole};
     use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
+    use std::sync::Mutex;
+
+    static VMM_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct BackendRestore(Backend);
+
+    impl Drop for BackendRestore {
+        fn drop(&mut self) {
+            gpu_hal::set_backend(self.0);
+        }
+    }
 
     fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -421,6 +432,11 @@ mod tests {
     }
 
     fn with_supported_vmm_backend(test_name: &str, mut f: impl FnMut(Backend)) {
+        let _lock = VMM_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore_backend = BackendRestore(gpu_hal::current_backend());
+
         for backend in vmm_backends() {
             gpu_hal::set_backend(backend);
             if !gpu_hal::vmm_is_supported(backend, 0) {
