@@ -862,6 +862,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         // opt-out for A/B comparison or bisecting megakernel regressions.
         !cli.no_persistent_decode,
         cli.kv_fp8,
+        cli.dump_last_logits,
     )?;
     Ok(())
 }
@@ -1627,6 +1628,7 @@ fn decode_text(
     batched_spec_verify: bool,
     persistent_decode: bool,
     kv_fp8: bool,
+    dump_last_logits: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -1993,6 +1995,8 @@ fn decode_text(
     std::io::stdout().flush().ok();
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
+    // Track the BF16 logits bytes from the last decode step for --dump-last-logits.
+    let mut last_logits_bytes: Vec<u8> = Vec::new();
     let mut current_token: u32 = prompt_ids[0];
     let mut position: i32 = 0;
     // Standard prefill+generate shape: feed prompt[0..N-1] as prefill (logits
@@ -2169,6 +2173,9 @@ fn decode_text(
         let logits = logits_buf
             .to_host_bytes()
             .context("d2h logits from GPU lm_head")?;
+        if dump_last_logits {
+            last_logits_bytes.clone_from(&logits);
+        }
         let t_lm_head_step = t2.elapsed();
         if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
             std::fs::write(&dump_path, &logits)
@@ -2531,6 +2538,23 @@ fn decode_text(
                 .last()
                 .expect("speculative step must emit at least one token (K=0 fallback ensured)");
         }
+    }
+
+    // Emit last-step logits for integration parity tests (--dump-last-logits).
+    // Printed BEFORE any other post-loop output so the test parser can grep for
+    // the first line starting with "LAST_LOGITS: ".
+    if dump_last_logits && !last_logits_bytes.is_empty() {
+        use std::io::Write as _;
+        let logits_f32 = crate::qwen36_moe_decode::bf16_bytes_to_f32(&last_logits_bytes);
+        print!("LAST_LOGITS: ");
+        for (i, x) in logits_f32.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!("{:.6}", x);
+        }
+        println!();
+        std::io::stdout().flush().ok();
     }
 
     println!();

@@ -690,6 +690,13 @@ pub(crate) struct Cli {
     #[arg(long, hide = true)]
     trace_kv_cache: bool,
 
+    /// When set, after the final decode step the runner prints
+    /// `LAST_LOGITS: <comma-separated f32>` to stdout exactly once.
+    /// Used by integration parity tests to compare logits across
+    /// runs (e.g., --kv-fp8 vs BF16 KV).
+    #[arg(long, default_value_t = false)]
+    dump_last_logits: bool,
+
     /// Debug-only: on the component decode path, capture the BF16 hidden state
     /// immediately before this layer and compare it to replayed prefill.
     #[arg(long, hide = true)]
