@@ -65,12 +65,10 @@ impl StateAccount {
         // Per-layer KV bytes:
         //   FP8 path: 2 (K+V) * kv_heads * head_dim * 1 byte (FP8 E4M3)
         //   BF16 path: 2 (K+V) * kv_heads * head_dim * 2 bytes (BF16)
-        let kv_bytes_per_layer_per_token =
-            2 * kv_heads * head_dim * layout.kv_dtype_bytes;
+        let kv_bytes_per_layer_per_token = 2 * kv_heads * head_dim * layout.kv_dtype_bytes;
         // Per-layer scale bytes (FP8 only): 2 (K+V) * kv_heads * 4 bytes
         // F32 per (head, position). Independent of head_dim.
-        let kv_scale_bytes_per_layer_per_token =
-            2 * kv_heads * layout.kv_fp8_scale_bytes_per_token;
+        let kv_scale_bytes_per_layer_per_token = 2 * kv_heads * layout.kv_fp8_scale_bytes_per_token;
         // Per-layer BF16 sidecar bytes (FP8 + sidecar enabled only):
         // 2 (K+V) * kv_heads * head_dim * 2 bytes per scalar element
         // (BF16 dtype), total across the configured window. head_dim is a
@@ -201,21 +199,13 @@ mod tests {
     #[test]
     fn fp8_kv_sizes_relative_to_bf16() {
         let cfg = config_35b_a3b();
-        let bf16 = StateAccount::from_config(
-            &cfg,
-            StateLayout::new(4096, 1, false, None),
-        )
-        .full_kv_bytes;
-        let fp8_no_sidecar = StateAccount::from_config(
-            &cfg,
-            StateLayout::new(4096, 1, true, None),
-        )
-        .full_kv_bytes;
-        let fp8_with_sidecar = StateAccount::from_config(
-            &cfg,
-            StateLayout::new(4096, 1, true, Some(4096)),
-        )
-        .full_kv_bytes;
+        let bf16 =
+            StateAccount::from_config(&cfg, StateLayout::new(4096, 1, false, None)).full_kv_bytes;
+        let fp8_no_sidecar =
+            StateAccount::from_config(&cfg, StateLayout::new(4096, 1, true, None)).full_kv_bytes;
+        let fp8_with_sidecar =
+            StateAccount::from_config(&cfg, StateLayout::new(4096, 1, true, Some(4096)))
+                .full_kv_bytes;
         // FP8 cache (no sidecar): half the cache plus a small per-token scale.
         // Strictly less than BF16, but greater than half.
         assert!(fp8_no_sidecar < bf16);
