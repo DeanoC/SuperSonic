@@ -70,12 +70,10 @@ fn qwen36_moe_kv_fp8_vs_bf16_self_parity() {
         "16",
     ];
 
-    let bf16_kv: Vec<f32> =
-        run_supersonic_capture_logits(&common, &[]).expect("BF16-KV decode");
+    let bf16_kv: Vec<f32> = run_supersonic_capture_logits(&common, &[]).expect("BF16-KV decode");
     let mut fp8_args = common.clone();
     fp8_args.push("--kv-fp8");
-    let fp8_kv: Vec<f32> =
-        run_supersonic_capture_logits(&fp8_args, &[]).expect("FP8-KV decode");
+    let fp8_kv: Vec<f32> = run_supersonic_capture_logits(&fp8_args, &[]).expect("FP8-KV decode");
 
     assert_eq!(
         bf16_kv.len(),
@@ -101,8 +99,5 @@ fn qwen36_moe_kv_fp8_vs_bf16_self_parity() {
         .sqrt();
     let cossim = dot / (na * nb);
     eprintln!("[kv-fp8 self-parity] cossim = {:.6}", cossim);
-    assert!(
-        cossim >= 0.999,
-        "KV-FP8 vs BF16-KV cossim {cossim} < 0.999"
-    );
+    assert!(cossim >= 0.999, "KV-FP8 vs BF16-KV cossim {cossim} < 0.999");
 }

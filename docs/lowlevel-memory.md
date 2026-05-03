@@ -32,13 +32,14 @@ Current scope:
 
 - Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV, for
   Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active,
-  and for Qwen3.6-MoE FP8 KV (opt-in via `SUPERSONIC_VMM_KV=1`).
+  and for Qwen3.6-MoE full-attention KV (BF16 or FP8, opt-in via
+  `SUPERSONIC_VMM_KV=1`).
 - Disabled for certified-KV, batch decode, Qwen3.5 4B/component decode,
   DFlash cloned states, Gemma4, and Llama3.1. Qwen3.5 KV-FP8 also remains
   disabled — enabling it is a separate effort.
-- Qwen3.6-MoE FP8 KV reserves U8 K/V VMM allocations (full logical
-  capacity, mapped prefix at kv_chunk_size=256) per full-attn layer.
-  Scale buffers (F32 [num_kv_heads, max_T]) and the optional BF16 sidecar
+- Qwen3.6-MoE full-attention KV reserves BF16 or U8 K/V VMM allocations
+  (full logical capacity mapped up front) per full-attn layer. FP8 scale
+  buffers (F32 [num_kv_heads, max_T]) and the optional BF16 sidecar
   ([num_kv_heads, kv_max_t, head_dim]) stay as dense `GpuBuffer` for v1.
   See Tasks 9–11 of `docs/superpowers/plans/2026-05-03-qwen36-moe-fp8-kv-fp8.md`.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
@@ -147,6 +148,13 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
   `SUPERSONIC_TEST_QWEN36_MOE_SPARSE_CAP_EXPERTS=8` for the smallest
   top-k-sized residency window, or with a larger value when investigating HIP
   live-mapping limits.
+- Qwen3.6-MoE BF16-KV VMM backing parity:
+  `SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_bf16_kv_vmm_smoke -- --nocapture`
+  compares `SUPERSONIC_VMM_KV=0` and `SUPERSONIC_VMM_KV=1` last-step logits
+  bit-exactly with INT4 weights and BF16 KV.
+- Qwen3.6-MoE FP8-KV VMM backing parity:
+  `SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_kv_fp8_vmm_smoke -- --nocapture`
+  runs the same backing-equivalence check with `--kv-fp8`.
 - Qwen3.5 virtual KV e2e with eviction and restore-to-VMM:
   `SUPERSONIC_VMM_KV=1 SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1 SUPERSONIC_VMM_KV_RESTORE_TO_VMM=1 ... --validate`
   passed and kept stable VMM pointers through decode.

@@ -69,11 +69,15 @@ fn qwen36_moe_fp8_weights_kv_fp8_gfx942() {
     };
 
     let common = vec![
-        "--model", "qwen3.6-35b-a3b",
-        "--model-dir", model_dir.as_str(),
+        "--model",
+        "qwen3.6-35b-a3b",
+        "--model-dir",
+        model_dir.as_str(),
         "--kv-fp8",
-        "--prompt", "When the cooperative kernel grids meet,",
-        "--max-new-tokens", "16",
+        "--prompt",
+        "When the cooperative kernel grids meet,",
+        "--max-new-tokens",
+        "16",
     ];
     let mut int4 = common.clone();
     int4.push("--int4");

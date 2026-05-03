@@ -423,10 +423,14 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
                     d.kv_cache_k = c.k_device_ptr();
                     d.kv_cache_v = c.v_device_ptr();
                     d.kv_max_t = c.kv_max_t;
-                    d.kv_shadow_k = c.kv_shadow_k.as_mut()
+                    d.kv_shadow_k = c
+                        .kv_shadow_k
+                        .as_mut()
                         .map(|b| b.as_mut_ptr())
                         .unwrap_or(std::ptr::null_mut());
-                    d.kv_shadow_v = c.kv_shadow_v.as_mut()
+                    d.kv_shadow_v = c
+                        .kv_shadow_v
+                        .as_mut()
                         .map(|b| b.as_mut_ptr())
                         .unwrap_or(std::ptr::null_mut());
                     // Sidecar window is forced equal to kv_max_t in v1 —
@@ -439,11 +443,7 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
                     // struct for v1 — it's only meaningful if a future
                     // windowed-mode lands and the kernel grows a
                     // kv_shadow_window arg.)
-                    d.kv_shadow_start = if c.kv_shadow_k.is_some() {
-                        0
-                    } else {
-                        -1
-                    };
+                    d.kv_shadow_start = if c.kv_shadow_k.is_some() { 0 } else { -1 };
                 }
             }
             AttnLayerBuffers::Linear {
@@ -550,9 +550,7 @@ pub fn build_int4_descs(layers: &[LayerBuffers]) -> Option<Vec<Qwen36MoeInt4Scal
 /// without KV-FP8). Linear-attn layers emit a zeroed descriptor
 /// (null scale pointers); the kernel checks `is_full_attention != 0`
 /// before dereferencing them.
-pub fn build_kv_fp8_descs(
-    layers: &mut [LayerBuffers],
-) -> Option<Vec<Qwen36MoeKVCacheFp8Desc>> {
+pub fn build_kv_fp8_descs(layers: &mut [LayerBuffers]) -> Option<Vec<Qwen36MoeKVCacheFp8Desc>> {
     let any_fp8 = layers.iter().any(|l| match &l.attn {
         AttnLayerBuffers::Full {
             kv_cache: Some(c), ..

@@ -137,8 +137,8 @@ pub enum AttnLayerBuffers {
 ///     sidecar (`-1` when the sidecar is disabled).
 ///
 /// Exactly one of `k` / `virtual_kv_cache_k` is `Some` (same for V).
-/// `virtual_kv_cache_k` is only `Some` when KV-FP8 is on AND
-/// `SUPERSONIC_VMM_KV=1` was set AND the backend supports VMM.
+/// `virtual_kv_cache_k` is `Some` when `SUPERSONIC_VMM_KV=1` was set
+/// and the backend supports VMM. It can back either BF16 KV or FP8 KV.
 pub struct FullAttnKvCache {
     /// `Some` when VMM-backed KV is OFF (the default). `None` when
     /// `virtual_kv_cache_k` is `Some` (VMM-backed). Exactly one of
@@ -156,8 +156,8 @@ pub struct FullAttnKvCache {
     /// the sidecar is disabled).
     pub kv_shadow_start: i32,
     /// `Some` when `SUPERSONIC_VMM_KV=1` was set at allocation time AND
-    /// the backend supports VMM AND `kv_fp8` is on. Mutually exclusive
-    /// with `k` (exactly one is `Some`).
+    /// the backend supports VMM. Mutually exclusive with `k` (exactly
+    /// one is `Some`).
     pub virtual_kv_cache_k: Option<gpu_hal::VirtualBuffer>,
     pub virtual_kv_cache_v: Option<gpu_hal::VirtualBuffer>,
     /// The VMM reservation's logical max_T (matches `kv_max_t` above).

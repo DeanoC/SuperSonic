@@ -130,6 +130,16 @@ pub struct VirtualBakeProbe {
     pub failed_tensors: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct VirtualKvStats {
+    layers: usize,
+    logical_bytes: usize,
+    reserved_bytes: usize,
+    resident_bytes: usize,
+    logical_resident_bytes: usize,
+    mappings: usize,
+}
+
 pub fn run_qwen36_moe_dry_run(
     model_dir: &Path,
     entry: &RegistryEntry,
@@ -161,11 +171,8 @@ pub fn run_qwen36_moe_dry_run(
     // window=kv_max_t (matches the kernel hard-coding); the env helper
     // would only matter for VRAM accounting if the kernel grew a
     // kv_shadow_window arg later.
-    let sidecar_window = if kv_fp8
-        && qwen35::state::kv_fp8_bf16_sidecar_enabled()
-    {
-        Some(qwen35::state::kv_fp8_bf16_sidecar_window_tokens()
-            .unwrap_or(context_size))
+    let sidecar_window = if kv_fp8 && qwen35::state::kv_fp8_bf16_sidecar_enabled() {
+        Some(qwen35::state::kv_fp8_bf16_sidecar_window_tokens().unwrap_or(context_size))
     } else {
         None
     };
@@ -1089,6 +1096,63 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
+fn qwen36_kv_vmm_requested_from_env() -> Result<bool> {
+    match std::env::var("SUPERSONIC_VMM_KV").ok().as_deref() {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_VMM_KV must be unset, 0, or 1 for Qwen3.6-MoE; got {other:?}"
+        )),
+    }
+}
+
+fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Result<bool> {
+    if !qwen36_kv_vmm_requested_from_env()? {
+        return Ok(false);
+    }
+    if !gpu_hal::vmm_is_supported(backend, ordinal) {
+        eprintln!(
+            "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
+             device {ordinal} does not support VMM; using dense KV buffers"
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvStats {
+    let mut out = VirtualKvStats::default();
+    for layer in layers {
+        let AttnLayerBuffers::Full {
+            kv_cache: Some(cache),
+            ..
+        } = &layer.attn
+        else {
+            continue;
+        };
+        let mut layer_has_virtual_kv = false;
+        for buffer in [
+            cache.virtual_kv_cache_k.as_ref(),
+            cache.virtual_kv_cache_v.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let stats = buffer.stats();
+            out.logical_bytes += stats.logical_bytes;
+            out.reserved_bytes += stats.reserved_bytes;
+            out.resident_bytes += stats.resident_bytes;
+            out.logical_resident_bytes += stats.logical_resident_bytes;
+            out.mappings += stats.mapping_count;
+            layer_has_virtual_kv = true;
+        }
+        if layer_has_virtual_kv {
+            out.layers += 1;
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MoeSparseTelemetrySnapshot {
     stats: crate::qwen36_moe_residency::MoeExpertResidencyStats,
@@ -1263,6 +1327,10 @@ fn load_layer_buffers(
     // sidecar (gated by `qwen35::state::kv_fp8_bf16_sidecar_*` env
     // helpers).
     kv_fp8: bool,
+    // When true, full-attention K/V caches use VMM reservations for
+    // their main K/V storage. Applies to BF16 and FP8 KV; FP8 scale
+    // and sidecar buffers stay dense.
+    kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
 ) -> Result<LayerBuffers> {
@@ -1332,37 +1400,40 @@ fn load_layer_buffers(
         // FP8 path: same shape but U8 (FP8 E4M3 bytes) plus F32 scales
         // [num_kv_heads, kv_max_t] for K and V, plus optional BF16 sidecar
         // [num_kv_heads, sidecar_window, head_dim] when enabled.
-        // VMM-FP8 path (SUPERSONIC_VMM_KV=1): same as FP8 but K/V are
-        // VirtualBuffer reservations with a mapped prefix; dense k/v are None.
+        // VMM path (SUPERSONIC_VMM_KV=1): K/V are VirtualBuffer
+        // reservations with a mapped prefix; dense k/v are None. FP8 scale
+        // and sidecar buffers remain regular dense GpuBuffers.
         let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
         let kv_cache = if kv_max_t > 0 {
             let num_kv_heads = geom.num_kv_heads as usize;
             let head_dim = geom.head_dim as usize;
 
-            let want_vmm = std::env::var_os("SUPERSONIC_VMM_KV")
-                .and_then(|v| v.into_string().ok())
-                .map(|v| v == "1")
-                .unwrap_or(false);
-            let vmm_active = kv_fp8
-                && want_vmm
-                && gpu_hal::vmm_is_supported(gpu_hal::current_backend(), ordinal);
-
-            let (k, v, virtual_kv_cache_k, virtual_kv_cache_v, virtual_kv_max_t,
-                 kv_scale_k, kv_scale_v) = if vmm_active {
+            let (
+                k,
+                v,
+                virtual_kv_cache_k,
+                virtual_kv_cache_v,
+                virtual_kv_max_t,
+                kv_scale_k,
+                kv_scale_v,
+            ) = if kv_vmm {
                 // VMM-backed: reserve full logical capacity AND map all of
-                // it up front. We don't evict KV-FP8 in v1 (CpuBackup is off
-                // — VirtualBacking::Discard), and the kernel writes K/V at
-                // arbitrary `eff_cache_pos` between 0 and kv_max_t-1, so any
-                // unmapped page would page-fault mid-launch. The benefit of
-                // lazy mapping was VRAM pressure relief — but at typical
-                // sizes (e.g. ~128 MiB per K-cache, 2.56 GiB across 10
-                // full-attn layers for max_t=262144) the savings don't
-                // justify decode-time map_range_bytes calls. Map the full
-                // logical bytes once at construction.
-                let map_full_bytes = kv_max_t * kv_dim;
+                // it up front. We don't evict Qwen3.6 KV in v1 (CpuBackup is
+                // off — VirtualBacking::Discard), and the kernel writes K/V
+                // at arbitrary `eff_cache_pos` between 0 and kv_max_t-1, so
+                // any unmapped page would page-fault mid-launch. The benefit
+                // here is stable VA and shared VMM descriptor plumbing, not
+                // decode-time KV paging yet.
+                let kv_dtype = if kv_fp8 {
+                    ScalarType::U8
+                } else {
+                    ScalarType::BF16
+                };
+                let kv_dtype_bytes = if kv_fp8 { 1 } else { 2 };
+                let map_full_bytes = kv_max_t * kv_dim * kv_dtype_bytes;
                 let vk = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
                     ordinal,
-                    ScalarType::U8,
+                    kv_dtype,
                     &[kv_max_t, kv_dim],
                     map_full_bytes,
                     gpu_hal::VirtualBacking::Discard,
@@ -1370,17 +1441,22 @@ fn load_layer_buffers(
                 .with_context(|| format!("vmm reserve kv_cache_k (layer {layer_idx})"))?;
                 let vv = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
                     ordinal,
-                    ScalarType::U8,
+                    kv_dtype,
                     &[kv_max_t, kv_dim],
                     map_full_bytes,
                     gpu_hal::VirtualBacking::Discard,
                 )
                 .with_context(|| format!("vmm reserve kv_cache_v (layer {layer_idx})"))?;
-                let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
-                    .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
-                let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
-                    .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
-                (None, None, Some(vk), Some(vv), Some(kv_max_t), Some(sk), Some(sv))
+                let (sk, sv) = if kv_fp8 {
+                    let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                        .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
+                    let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                        .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
+                    (Some(sk), Some(sv))
+                } else {
+                    (None, None)
+                };
+                (None, None, Some(vk), Some(vv), Some(kv_max_t), sk, sv)
             } else if kv_fp8 {
                 // dense FP8 path
                 let k = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
@@ -1409,18 +1485,12 @@ fn load_layer_buffers(
                 // size always equals kv_max_t until the kernel grows a
                 // kv_shadow_window arg.
                 let window = kv_max_t;
-                let sk = GpuBuffer::zeros(
-                    ordinal,
-                    ScalarType::BF16,
-                    &[num_kv_heads, window, head_dim],
-                )
-                .with_context(|| format!("alloc kv_shadow_k (layer {layer_idx})"))?;
-                let sv = GpuBuffer::zeros(
-                    ordinal,
-                    ScalarType::BF16,
-                    &[num_kv_heads, window, head_dim],
-                )
-                .with_context(|| format!("alloc kv_shadow_v (layer {layer_idx})"))?;
+                let sk =
+                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, window, head_dim])
+                        .with_context(|| format!("alloc kv_shadow_k (layer {layer_idx})"))?;
+                let sv =
+                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, window, head_dim])
+                        .with_context(|| format!("alloc kv_shadow_v (layer {layer_idx})"))?;
                 (Some(sk), Some(sv))
             } else {
                 (None, None)
@@ -1726,6 +1796,7 @@ fn load_all_layer_buffers(
     weight_mode: Qwen36WeightMode,
     kv_max_t: usize,
     kv_fp8: bool,
+    kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
 ) -> Result<Vec<LayerBuffers>> {
@@ -1741,6 +1812,7 @@ fn load_all_layer_buffers(
             weight_mode,
             kv_max_t,
             kv_fp8,
+            kv_vmm,
             expert_arena.as_deref_mut(),
             expert_residency.as_deref_mut(),
         )
@@ -2141,6 +2213,7 @@ fn decode_text(
             path.display()
         );
     }
+    let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     let mut layers = if let Some(cap_experts) = moe_island_cap_experts {
         if cap_experts < geom.top_k as usize {
             anyhow::bail!(
@@ -2163,6 +2236,7 @@ fn decode_text(
             weight_mode,
             kv_max_t,
             kv_fp8,
+            kv_vmm,
             None,
             Some(&mut manager),
         )
@@ -2204,6 +2278,7 @@ fn decode_text(
             weight_mode,
             kv_max_t,
             kv_fp8,
+            kv_vmm,
             Some(&mut arena),
             None,
         ) {
@@ -2236,6 +2311,7 @@ fn decode_text(
                     weight_mode,
                     kv_max_t,
                     kv_fp8,
+                    kv_vmm,
                     None,
                     None,
                 )?
@@ -2252,10 +2328,27 @@ fn decode_text(
             weight_mode,
             kv_max_t,
             kv_fp8,
+            kv_vmm,
             None,
             None,
         )?
     };
+    let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
+    if virtual_kv_stats.layers > 0 {
+        println!(
+            "  [vmm] Qwen3.6-MoE {} KV active on backend={} device {ordinal}: \
+             layers={} mappings={} logical={:.2}MiB logical_resident={:.2}MiB \
+             resident={:.2}MiB reserved={:.2}MiB",
+            if kv_fp8 { "FP8" } else { "BF16" },
+            backend,
+            virtual_kv_stats.layers,
+            virtual_kv_stats.mappings,
+            virtual_kv_stats.logical_bytes as f64 / MIB,
+            virtual_kv_stats.logical_resident_bytes as f64 / MIB,
+            virtual_kv_stats.resident_bytes as f64 / MIB,
+            virtual_kv_stats.reserved_bytes as f64 / MIB,
+        );
+    }
     // Phase 6 self-speculative decode: load the multi-token-prediction
     // (MTP) head from the bake when --speculative-decode is set.
     //
@@ -3334,6 +3427,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
             kv_fp8,
+            false,
             None,
             None,
         )
