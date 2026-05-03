@@ -49,24 +49,27 @@ Current scope:
   decode kernels are still HIP-only; CUDA runtime decode remains blocked before
   kernel launch.
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` activates router-driven sparse MoE
-  islands for Qwen3.6-MoE INT4 decode. The chained decode path runs FFN stage 1
-  first, downloads the `top_k` expert ids, pins those experts' gate/up and down
-  slices, then runs the normal stage-5 FFN launch against the stable virtual
-  slab pointers. The cap is expressed in experts; after all sparse expert
-  tensors are registered, SuperSonic derives the VMM page budget from the
-  actual worst-case gate/up and down page footprint for one routed expert.
-  Logical slice hit/miss counters still track router demand; page hit/miss
-  counters track physical residency. Sparse islands copy the full VMM backing
-  page for any touched expert slice, so every expert sharing that resident page
-  contains real bake data rather than zero fill. Sparse islands currently
-  disable the persistent megakernel for that run; persistent router prefetch
-  needs a future split or in-kernel residency protocol.
+  islands for Qwen3.6-MoE INT4 decode. With persistent decode enabled (the
+  default), SuperSonic uses a segmented persistent path: each layer first runs
+  attention or linear attention plus FFN router top-k, returns to the host to
+  pin the selected experts' gate/up and down slices, then resumes that layer's
+  FFN against the stable virtual slab pointers. If persistent decode is
+  explicitly disabled, the chained path uses the same host remap point by
+  running FFN stage 1 before the stage-5 FFN launch. The cap is expressed in
+  experts; after all sparse expert tensors are registered, SuperSonic derives
+  the VMM page budget from the actual worst-case gate/up and down page
+  footprint for one routed expert. Logical slice hit/miss counters still track
+  router demand; page hit/miss counters track physical residency. Sparse
+  islands copy the full VMM backing page for any touched expert slice, so every
+  expert sharing that resident page contains real bake data rather than zero
+  fill.
 - `SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON=/path/report.json` records sparse
   MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
   uploads, evictions, resident slices, resident pages, page-backed slice count,
-  resident physical bytes, plus summary peaks. This is intended for tuning
-  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts instead of relying
-  on one-token smoke numbers.
+  resident physical bytes, the active sparse decode path
+  (`segmented_persistent` or `chained`), plus summary peaks. This is intended
+  for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` against real prompts instead
+  of relying on one-token smoke numbers.
 - On the HIP/gfx1100 validation machine, page-budgeted sparse MoE passed the
   two-token Qwen3.6-MoE smoke at the default 256-expert cap, the smallest
   top-k-sized 8-expert cap, and a 320-expert cap (`640` resident VMM pages).
@@ -127,7 +130,8 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
 - Qwen3.6-MoE sparse router-prefetch smoke:
   `SUPERSONIC_BACKENDS=hip SUPERSONIC_VMM_MOE_ISLANDS=1 SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=8 cargo run --release --bin supersonic -- --backend hip --model qwen3.6-35b-a3b --model-dir /mnt/data/models/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1`
   generated `[11]` and reported `resident=32.00MiB` for the 15 GiB routed
-  expert VA reservation after the run.
+  expert VA reservation after the run. With persistent decode left at its
+  default, the run reports segmented persistent sparse decode.
 - Qwen3.6-MoE sparse-vs-dense VMM e2e gate:
   `SUPERSONIC_BACKENDS=hip SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_sparse_vmm_smoke -- --ignored --nocapture`
   compares dense virtual expert slabs with sparse router-prefetched slabs over

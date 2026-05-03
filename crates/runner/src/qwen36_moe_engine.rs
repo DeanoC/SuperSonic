@@ -1084,6 +1084,7 @@ impl MoeSparseTelemetrySnapshot {
 #[derive(Debug)]
 struct MoeSparseTelemetry {
     dump_path: Option<PathBuf>,
+    decode_path: &'static str,
     steps: Vec<serde_json::Value>,
     peak_resident_slices: usize,
     peak_resident_pages: usize,
@@ -1093,13 +1094,18 @@ struct MoeSparseTelemetry {
 }
 
 impl MoeSparseTelemetry {
-    fn from_env(active: bool) -> Result<Option<Self>> {
+    fn from_env(active: bool, persistent_decode: bool) -> Result<Option<Self>> {
         if !active {
             return Ok(None);
         }
         let dump_path = std::env::var_os("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON").map(PathBuf::from);
         Ok(Some(Self {
             dump_path,
+            decode_path: if persistent_decode {
+                "segmented_persistent"
+            } else {
+                "chained"
+            },
             steps: Vec::new(),
             peak_resident_slices: 0,
             peak_resident_pages: 0,
@@ -1174,6 +1180,7 @@ impl MoeSparseTelemetry {
         let payload = serde_json::json!({
             "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
             "summary": {
+                "decode_path": self.decode_path,
                 "registered_tensors": final_snapshot.stats.registered_tensors,
                 "max_resident_pages": manager.max_resident_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
@@ -1984,7 +1991,8 @@ fn decode_text(
     let mut _moe_expert_arena = None;
     let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
-    let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(sparse_moe_requested)?;
+    let mut moe_sparse_telemetry =
+        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode)?;
     if let Some(path) = moe_sparse_telemetry
         .as_ref()
         .and_then(|telemetry| telemetry.dump_path.as_ref())

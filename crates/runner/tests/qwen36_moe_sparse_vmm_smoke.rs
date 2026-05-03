@@ -128,6 +128,8 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
     );
     assert!(
         sparse_combined.contains("[vmm] Qwen3.6-MoE sparse routed expert residency active")
+            && sparse_combined
+                .contains("[vmm] sparse MoE residency will use segmented persistent decode")
             && sparse_combined.contains("peak_slices="),
         "sparse run did not report sparse residency telemetry:\n{}",
         sparse_combined
@@ -145,6 +147,10 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
         "supersonic-qwen36-moe-sparse-vmm-telemetry-v1"
     );
     let summary = &json["summary"];
+    assert_eq!(
+        summary["decode_path"], "segmented_persistent",
+        "sparse smoke should exercise the default segmented persistent path"
+    );
     let max_pages = summary["max_resident_pages"]
         .as_u64()
         .expect("sparse telemetry summary should report max_resident_pages");
