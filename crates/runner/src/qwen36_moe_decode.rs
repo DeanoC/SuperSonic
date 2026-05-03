@@ -37,6 +37,8 @@ use kernel_ffi::qwen36_moe::{
     Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 
+use crate::tensor_bytes;
+
 /// Hybrid pattern: every 4th layer is full attention. Indices 3, 7, 11, ...
 /// are full; everything else is linear. Matches Qwen3.6-MoE 35B-A3B.
 pub const HYBRID_FULL_ATTN_STRIDE: i32 = 4;
@@ -1247,13 +1249,7 @@ fn download_topk_routes(
 /// BF16 as raw int16 → bytes; this is the inverse.
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.len() % 2 == 0, "BF16 bytes must be even");
-    bytes
-        .chunks_exact(2)
-        .map(|c| {
-            let bits = u32::from(c[0]) | (u32::from(c[1]) << 8);
-            f32::from_bits(bits << 16)
-        })
-        .collect()
+    tensor_bytes::bf16_bytes_to_f32(bytes)
 }
 
 /// Round an F32 to BF16 (RNE), returning the 16 raw bits. Matches PyTorch's
@@ -1273,13 +1269,7 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
 
 /// Encode a slice of F32 values to BF16 little-endian bytes (RNE).
 pub fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 2);
-    for &v in vals {
-        let bits = f32_to_bf16_bits(v);
-        out.push((bits & 0xFF) as u8);
-        out.push((bits >> 8) as u8);
-    }
-    out
+    tensor_bytes::f32_to_bf16_bytes(vals)
 }
 
 /// Apply RMSnorm + lm_head GEMV on the host. Mirrors the multi-layer

@@ -28,6 +28,8 @@ use tokenizers::Tokenizer;
 
 #[path = "../gemma4_int4_engine.rs"]
 mod gemma4_int4_engine;
+#[path = "../tensor_bytes.rs"]
+mod tensor_bytes;
 use gemma4_int4_engine::{int4_bake_ok, Gemma4Int4Engine};
 
 #[derive(Parser, Debug)]

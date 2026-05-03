@@ -2485,7 +2485,7 @@ fn trace_persistent_full_attn_layer(
         ordinal,
         gpu_hal::ScalarType::BF16,
         &[1, q_dim],
-        &f32_to_bf16_bytes(native_gated_f32.iter().copied()),
+        &f32_to_bf16_bytes(&native_gated_f32),
     )
     .map_err(|e| anyhow::anyhow!("trace native gated H2D: {e}"))?;
     let mut native_o_proj_gpu = gpu_hal::GpuBuffer::zeros(

@@ -762,21 +762,21 @@ pub(crate) fn trace_qwen35_oracle_prefill_layer(
                 ordinal,
                 gpu_hal::ScalarType::BF16,
                 &[num_heads, 1, head_dim],
-                &f32_to_bf16_bytes(q_rope_host.iter().copied()),
+                &f32_to_bf16_bytes(&q_rope_host),
             )
             .map_err(|e| anyhow::anyhow!("trace direct attn q H2D: {e}"))?;
             let k_gpu = gpu_hal::GpuBuffer::from_host_bytes(
                 ordinal,
                 gpu_hal::ScalarType::BF16,
                 &[num_kv_heads, kv_len, head_dim],
-                &f32_to_bf16_bytes(full_k.iter().copied()),
+                &f32_to_bf16_bytes(&full_k),
             )
             .map_err(|e| anyhow::anyhow!("trace direct attn k H2D: {e}"))?;
             let v_gpu = gpu_hal::GpuBuffer::from_host_bytes(
                 ordinal,
                 gpu_hal::ScalarType::BF16,
                 &[num_kv_heads, kv_len, head_dim],
-                &f32_to_bf16_bytes(full_v.iter().copied()),
+                &f32_to_bf16_bytes(&full_v),
             )
             .map_err(|e| anyhow::anyhow!("trace direct attn v H2D: {e}"))?;
             let mut out_gpu = gpu_hal::GpuBuffer::zeros(

@@ -39,6 +39,8 @@ use clap::Parser;
 mod gemma4_engine;
 #[path = "../gemma4_int4_engine.rs"]
 mod gemma4_int4_engine;
+#[path = "../tensor_bytes.rs"]
+mod tensor_bytes;
 use gemma4_engine::Gemma4Engine;
 use gemma4_int4_engine::Gemma4Int4Engine;
 
