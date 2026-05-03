@@ -208,6 +208,7 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
             path.write_text(json.dumps({
                 "summary": {
                     "decode_path": "segmented_persistent",
+                    "prefetch_ranks": 1,
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,
@@ -222,6 +223,7 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                 load_vmm_residency(path),
                 {
                     "decode_path": "segmented_persistent",
+                    "prefetch_ranks": 1,
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,

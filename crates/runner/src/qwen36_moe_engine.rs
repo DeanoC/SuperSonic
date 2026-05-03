@@ -1128,6 +1128,45 @@ impl MoeIslandPrefetchMode {
     }
 }
 
+fn moe_island_prefetch_ranks_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+    top_k: usize,
+) -> Result<usize> {
+    match mode {
+        MoeIslandPrefetchMode::Disabled => {
+            if raw.is_some() {
+                anyhow::bail!(
+                    "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token"
+                );
+            }
+            Ok(0)
+        }
+        MoeIslandPrefetchMode::PreviousToken => match raw {
+            None | Some("all") => Ok(top_k),
+            Some(value) => {
+                let ranks = value.parse::<usize>().with_context(|| {
+                    format!(
+                        "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
+                    )
+                })?;
+                if ranks == 0 || ranks > top_k {
+                    anyhow::bail!(
+                        "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
+                    );
+                }
+                Ok(ranks)
+            }
+        },
+    }
+}
+
+fn moe_island_prefetch_ranks_from_env(mode: MoeIslandPrefetchMode, top_k: usize) -> Result<usize> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qwen36KvVmmMode {
     Auto,
@@ -1229,6 +1268,7 @@ struct MoeSparseTelemetry {
     dump_path: Option<PathBuf>,
     decode_path: &'static str,
     prefetch_mode: MoeIslandPrefetchMode,
+    prefetch_ranks: usize,
     steps: Vec<serde_json::Value>,
     peak_resident_slices: usize,
     peak_resident_pages: usize,
@@ -1314,6 +1354,7 @@ impl MoeSparseTelemetry {
         active: bool,
         persistent_decode: bool,
         prefetch_mode: MoeIslandPrefetchMode,
+        prefetch_ranks: usize,
     ) -> Result<Option<Self>> {
         if !active {
             return Ok(None);
@@ -1327,6 +1368,7 @@ impl MoeSparseTelemetry {
                 "chained"
             },
             prefetch_mode,
+            prefetch_ranks,
             steps: Vec::new(),
             peak_resident_slices: 0,
             peak_resident_pages: 0,
@@ -1430,6 +1472,7 @@ impl MoeSparseTelemetry {
             "summary": {
                 "decode_path": self.decode_path,
                 "prefetch_mode": self.prefetch_mode.as_str(),
+                "prefetch_ranks": self.prefetch_ranks,
                 "registered_tensors": final_snapshot.stats.registered_tensors,
                 "max_resident_pages": manager.max_resident_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
@@ -2397,11 +2440,17 @@ fn decode_text(
     let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
     let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
+    let moe_prefetch_ranks =
+        moe_island_prefetch_ranks_from_env(moe_prefetch_mode, geom.top_k as usize)?;
     if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
     }
-    let mut moe_sparse_telemetry =
-        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode, moe_prefetch_mode)?;
+    let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(
+        sparse_moe_requested,
+        persistent_decode,
+        moe_prefetch_mode,
+        moe_prefetch_ranks,
+    )?;
     if let Some(path) = moe_sparse_telemetry
         .as_ref()
         .and_then(|telemetry| telemetry.dump_path.as_ref())
@@ -2464,7 +2513,11 @@ fn decode_text(
             );
         }
         if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
-            println!("  [vmm] sparse MoE previous-token lookahead prefetch active");
+            println!(
+                "  [vmm] sparse MoE previous-token lookahead prefetch active \
+                 (ranks={moe_prefetch_ranks}/{})",
+                geom.top_k
+            );
         }
         _moe_expert_residency = Some(manager);
         layers
@@ -2885,6 +2938,8 @@ fn decode_text(
                                 .get(layer_idx)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[])
+                                .iter()
+                                .take(moe_prefetch_ranks)
                             {
                                 let gate_up = MoeExpertKey {
                                     layer_idx,
@@ -2976,6 +3031,8 @@ fn decode_text(
                                 .get(layer_idx)
                                 .map(Vec::as_slice)
                                 .unwrap_or(&[])
+                                .iter()
+                                .take(moe_prefetch_ranks)
                             {
                                 let gate_up = MoeExpertKey {
                                     layer_idx,
@@ -3851,7 +3908,10 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen36_kv_vmm_mode_from_env_value, Qwen36KvVmmMode};
+    use super::{
+        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value,
+        MoeIslandPrefetchMode, Qwen36KvVmmMode,
+    };
     use gpu_hal::Backend;
 
     #[test]
@@ -3881,5 +3941,76 @@ mod tests {
             Qwen36KvVmmMode::Force
         );
         assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("all"),
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_accept_rank_limited_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("1"),
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            4
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_reject_disabled_or_out_of_range_values() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(None, MoeIslandPrefetchMode::Disabled, 8)
+                .unwrap(),
+            0
+        );
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("1"),
+            MoeIslandPrefetchMode::Disabled,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("0"),
+            MoeIslandPrefetchMode::PreviousToken,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("9"),
+            MoeIslandPrefetchMode::PreviousToken,
+            8,
+        )
+        .is_err());
     }
 }
